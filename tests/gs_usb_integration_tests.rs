@@ -13,6 +13,7 @@
 // GS-USB 模块只在非 Linux 系统上可用
 #[cfg(not(target_os = "linux"))]
 use piper_sdk::can::gs_usb::GsUsbCanAdapter;
+#[cfg(not(target_os = "linux"))]
 use piper_sdk::can::{CanAdapter, PiperFrame};
 
 /// 测试 CAN 适配器基本功能
