@@ -2,15 +2,16 @@
 
 # 1. 确保代码格式化正确 (如果格式不对，这里会报错)
 echo "Running cargo fmt..."
-cargo fmt -- --check
+cargo fmt --all -- --check
 if [ $? -ne 0 ]; then
   echo "❌ Cargo fmt failed."
   exit 1
 fi
 
 # 2. 运行 Clippy (关键：加上 -D warnings 使得警告变成错误，阻止提交)
+# 使用 --all-targets --all-features 与 CI 保持一致
 echo "Running cargo clippy..."
-cargo clippy -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 if [ $? -ne 0 ]; then
   echo "❌ Cargo clippy failed."
   exit 1

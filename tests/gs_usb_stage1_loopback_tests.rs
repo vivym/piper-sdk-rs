@@ -235,7 +235,9 @@ fn test_loopback_various_data_lengths() {
     for &len in &lengths {
         let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
         let frame = PiperFrame::new_standard((0x200 + len) as u16, &data);
-        adapter.send(frame).expect(&format!("Failed to send frame with {} bytes", len));
+        adapter
+            .send(frame)
+            .unwrap_or_else(|_| panic!("Failed to send frame with {} bytes", len));
         println!("✓ Sent frame with {} bytes", len);
 
         std::thread::sleep(std::time::Duration::from_millis(20));
