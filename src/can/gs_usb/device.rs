@@ -154,21 +154,15 @@ impl GsUsbDevice {
         // 1. Detach kernel driver on Linux/macOS（在 claim 之前）
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            if self
-                .handle
-                .kernel_driver_active(self.interface_number)
-                .unwrap_or(false)
-            {
+            if self.handle.kernel_driver_active(self.interface_number).unwrap_or(false) {
                 self.handle
                     .detach_kernel_driver(self.interface_number)
-                    .map_err(|e| GsUsbError::Usb(e))?;
+                    .map_err(GsUsbError::Usb)?;
             }
         }
 
         // 2. Claim interface（必须在 reset 之前，否则可能导致段错误）
-        self.handle
-            .claim_interface(self.interface_number)
-            .map_err(|e| GsUsbError::Usb(e))?;
+        self.handle.claim_interface(self.interface_number).map_err(GsUsbError::Usb)?;
 
         self.interface_claimed = true;
 
@@ -253,8 +247,8 @@ impl GsUsbDevice {
             | GS_CAN_MODE_LOOP_BACK
             | GS_CAN_MODE_NORMAL
             | GS_CAN_MODE_HW_TIMESTAMP;
-            // 注意：不包含 GS_CAN_MODE_FD, GS_CAN_MODE_ONE_SHOT 等
-            // 因为我们只支持经典 CAN 2.0
+        // 注意：不包含 GS_CAN_MODE_FD, GS_CAN_MODE_ONE_SHOT 等
+        // 因为我们只支持经典 CAN 2.0
 
         // 5. 记录是否启用硬件时间戳
         self.hw_timestamp = (flags & GS_CAN_MODE_HW_TIMESTAMP) != 0;
@@ -288,10 +282,13 @@ impl GsUsbDevice {
         let clock = match self.device_capability() {
             Ok(cap) => cap.fclk_can,
             Err(e) => {
-                trace!("Failed to get device capability, using default clock (48MHz): {}", e);
+                trace!(
+                    "Failed to get device capability, using default clock (48MHz): {}",
+                    e
+                );
                 // 使用默认时钟：48MHz（Candlelight / STM32-based devices 最常见）
                 48_000_000
-            }
+            },
         };
 
         // 获取位定时参数（基于时钟频率）
@@ -339,7 +336,7 @@ impl GsUsbDevice {
         match timing {
             Some((prop_seg, phase_seg1, phase_seg2, sjw, brp)) => {
                 self.set_timing(prop_seg, phase_seg1, phase_seg2, sjw, brp)
-            }
+            },
             None => Err(GsUsbError::UnsupportedBitrate {
                 bitrate,
                 clock_hz: clock,
@@ -394,27 +391,21 @@ impl GsUsbDevice {
         // **超时设置**：1000ms (1秒)
         // 在 Loopback 模式下，设备 CPU 负载很高，需要足够的超时时间
         // 这不会影响正常吞吐量（正常传输是微秒级），只是给设备忙碌时的时间
-        match self
-            .handle
-            .write_bulk(self.endpoint_out, &buf, Duration::from_millis(1000))
-        {
+        match self.handle.write_bulk(self.endpoint_out, &buf, Duration::from_millis(1000)) {
             Ok(_) => Ok(()),
             Err(rusb::Error::Timeout) => {
                 // USB 批量传输超时后，endpoint 可能进入 STALL 状态
                 // 必须清除 halt 才能恢复设备，否则后续操作会失败
                 use tracing::warn;
                 if let Err(clear_err) = self.handle.clear_halt(self.endpoint_out) {
-                    warn!(
-                        "Failed to clear endpoint halt after timeout: {}",
-                        clear_err
-                    );
+                    warn!("Failed to clear endpoint halt after timeout: {}", clear_err);
                 } else {
                     // 清除成功后，延迟让设备恢复
                     // 注意：某些设备可能需要更长的恢复时间，特别是连续超时后
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(GsUsbError::WriteTimeout)
-            }
+            },
             Err(e) => Err(GsUsbError::Usb(e)),
         }
     }
@@ -492,7 +483,10 @@ impl GsUsbDevice {
 
             // 解析帧
             let mut frame = GsUsbFrame::default();
-            frame.unpack_from_bytes(bytes::Bytes::copy_from_slice(frame_bytes), self.hw_timestamp)?;
+            frame.unpack_from_bytes(
+                bytes::Bytes::copy_from_slice(frame_bytes),
+                self.hw_timestamp,
+            )?;
 
             frames.push(frame);
             offset += frame_size;

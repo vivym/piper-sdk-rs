@@ -74,7 +74,11 @@ impl GsUsbFrame {
     /// # Arguments
     /// * `data` - Bytes to unpack from
     /// * `hw_timestamp` - If true, expect hardware timestamp field (frame size = 24 bytes, otherwise 20 bytes)
-    pub fn unpack_from_bytes(&mut self, mut data: Bytes, hw_timestamp: bool) -> Result<(), GsUsbError> {
+    pub fn unpack_from_bytes(
+        &mut self,
+        mut data: Bytes,
+        hw_timestamp: bool,
+    ) -> Result<(), GsUsbError> {
         let min_size = if hw_timestamp {
             GS_USB_FRAME_SIZE_HW_TIMESTAMP
         } else {
@@ -287,9 +291,7 @@ mod tests {
         assert_eq!(buf.len(), GS_USB_FRAME_SIZE_HW_TIMESTAMP);
 
         // 验证时间戳字段（最后 4 字节）
-        let timestamp = u32::from_le_bytes([
-            buf[20], buf[21], buf[22], buf[23],
-        ]);
+        let timestamp = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
         assert_eq!(timestamp, 12345678);
     }
 

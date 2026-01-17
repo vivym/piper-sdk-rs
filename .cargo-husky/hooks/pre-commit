@@ -1,0 +1,27 @@
+#!/bin/sh
+
+# 1. 确保代码格式化正确 (如果格式不对，这里会报错)
+echo "Running cargo fmt..."
+cargo fmt -- --check
+if [ $? -ne 0 ]; then
+  echo "❌ Cargo fmt failed."
+  exit 1
+fi
+
+# 2. 运行 Clippy (关键：加上 -D warnings 使得警告变成错误，阻止提交)
+echo "Running cargo clippy..."
+cargo clippy -- -D warnings
+if [ $? -ne 0 ]; then
+  echo "❌ Cargo clippy failed."
+  exit 1
+fi
+
+# 3. 运行测试 (可选，如果测试太慢可以注释掉)
+echo "Running cargo test..."
+cargo test
+if [ $? -ne 0 ]; then
+  echo "❌ Cargo test failed."
+  exit 1
+fi
+
+echo "✅ Pre-commit checks passed!"

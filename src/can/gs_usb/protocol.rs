@@ -346,13 +346,8 @@ mod tests {
 
     #[test]
     fn test_device_bit_timing_pack_large_values() {
-        let timing = DeviceBitTiming::new(
-            0x12345678,
-            0x87654321,
-            0xABCDEF00,
-            0x00FEDCBA,
-            0x11223344,
-        );
+        let timing =
+            DeviceBitTiming::new(0x12345678, 0x87654321, 0xABCDEF00, 0x00FEDCBA, 0x11223344);
         let packed = timing.pack();
 
         // 验证 little-endian 编码
@@ -519,7 +514,10 @@ mod tests {
         // 测试模式标志的组合
         let combined = GS_CAN_MODE_LOOP_BACK | GS_CAN_MODE_HW_TIMESTAMP;
         assert_eq!(combined & GS_CAN_MODE_LOOP_BACK, GS_CAN_MODE_LOOP_BACK);
-        assert_eq!(combined & GS_CAN_MODE_HW_TIMESTAMP, GS_CAN_MODE_HW_TIMESTAMP);
+        assert_eq!(
+            combined & GS_CAN_MODE_HW_TIMESTAMP,
+            GS_CAN_MODE_HW_TIMESTAMP
+        );
 
         // 测试普通模式（无标志位）
         assert_eq!(GS_CAN_MODE_NORMAL, 0);

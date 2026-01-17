@@ -97,7 +97,10 @@ impl GsUsbCanAdapter {
                 parts.join("|")
             }
         };
-        trace!("GS-USB device started in {} mode at {} bps", mode_name, bitrate);
+        trace!(
+            "GS-USB device started in {} mode at {} bps",
+            mode_name, bitrate
+        );
         Ok(())
     }
 
@@ -200,7 +203,10 @@ impl CanAdapter for GsUsbCanAdapter {
         // 1. 优先从队列中取（如果有上次读剩下的）
         if let Some(frame) = self.rx_queue.pop_front() {
             // 调试信息：验证 rx_queue 正在工作
-            trace!("Returning frame from queue (queue size: {})", self.rx_queue.len());
+            trace!(
+                "Returning frame from queue (queue size: {})",
+                self.rx_queue.len()
+            );
             return Ok(frame);
         }
 
@@ -213,10 +219,10 @@ impl CanAdapter for GsUsbCanAdapter {
                 Ok(frames) => frames,
                 Err(crate::can::gs_usb::error::GsUsbError::ReadTimeout) => {
                     return Err(CanError::Timeout);
-                }
+                },
                 Err(e) => {
                     return Err(CanError::Device(format!("USB receive failed: {}", e)));
-                }
+                },
             };
 
             // 如果读取成功但没有帧（可能是空包），继续读下一个包
@@ -296,8 +302,12 @@ impl CanAdapter for GsUsbCanAdapter {
             // 4. 如果队列里有东西了，返回第一个；否则继续循环读 USB
             // 注意：如果这批数据都被过滤掉了（例如全是 Echo 且非 Loopback），循环继续
             if let Some(frame) = self.rx_queue.pop_front() {
-                trace!("Received CAN frame: ID=0x{:X}, len={} (queue size: {})",
-                       frame.id, frame.len, self.rx_queue.len());
+                trace!(
+                    "Received CAN frame: ID=0x{:X}, len={} (queue size: {})",
+                    frame.id,
+                    frame.len,
+                    self.rx_queue.len()
+                );
                 return Ok(frame);
             }
             // 如果这批数据都被过滤掉了，继续读下一个 USB 包

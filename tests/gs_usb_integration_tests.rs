@@ -22,9 +22,7 @@ fn test_can_adapter_basic() {
     println!("✓ Adapter created");
 
     // 2. 配置并启动
-    adapter
-        .configure(250_000)
-        .expect("Failed to configure adapter");
+    adapter.configure(250_000).expect("Failed to configure adapter");
     println!("✓ Adapter configured (250 kbps)");
 
     // 3. 发送测试帧
@@ -71,11 +69,11 @@ fn test_receive_filter_funnel() {
     match adapter.receive() {
         Ok(frame) => {
             println!("Received frame: ID=0x{:X}, len={}", frame.id, frame.len);
-        }
+        },
         Err(piper_sdk::can::CanError::Timeout) => {
             println!("✓ Timeout as expected (no CAN traffic)");
             // 超时是正常的，因为没有实际的 CAN 总线数据
-        }
+        },
         Err(e) => panic!("Unexpected error: {}", e),
     }
 
@@ -98,7 +96,7 @@ fn test_send_not_started() {
     match result {
         Err(piper_sdk::can::CanError::NotStarted) => {
             println!("✓ Correctly returned NotStarted error");
-        }
+        },
         Ok(_) => panic!("Expected NotStarted error, but send succeeded"),
         Err(e) => panic!("Expected NotStarted, got: {}", e),
     }

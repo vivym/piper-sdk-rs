@@ -38,7 +38,11 @@ fn test_1khz_send_performance() {
 
     // Fire-and-Forget 应该能达到至少 800 fps（允许 20% 误差）
     // 如果等待 Echo，这个数字会大幅下降
-    assert!(count >= 800, "Performance too low: {} fps (expected >= 800)", count);
+    assert!(
+        count >= 800,
+        "Performance too low: {} fps (expected >= 800)",
+        count
+    );
 }
 
 /// 测试发送延迟（单帧发送时间）
@@ -63,10 +67,17 @@ fn test_send_latency() {
     let min_latency = *latencies.iter().min().unwrap();
     let max_latency = *latencies.iter().max().unwrap();
 
-    println!("Send latency: avg={:.2}µs, min={}µs, max={}µs", avg_latency, min_latency, max_latency);
+    println!(
+        "Send latency: avg={:.2}µs, min={}µs, max={}µs",
+        avg_latency, min_latency, max_latency
+    );
 
     // Fire-and-Forget 应该在微秒级（< 1ms）
-    assert!(avg_latency < 1000.0, "Average latency too high: {:.2}µs", avg_latency);
+    assert!(
+        avg_latency < 1000.0,
+        "Average latency too high: {:.2}µs",
+        avg_latency
+    );
 }
 
 /// 测试接收延迟（超时场景）
@@ -84,12 +95,15 @@ fn test_receive_timeout_latency() {
             println!("Timeout latency: {:?}", elapsed);
 
             // 超时应该在 2-10ms 范围内（允许一些抖动）
-            assert!(elapsed.as_millis() >= 1 && elapsed.as_millis() < 100,
-                    "Timeout latency out of range: {:?}", elapsed);
-        }
+            assert!(
+                elapsed.as_millis() >= 1 && elapsed.as_millis() < 100,
+                "Timeout latency out of range: {:?}",
+                elapsed
+            );
+        },
         Ok(frame) => {
             println!("Received frame unexpectedly: ID=0x{:X}", frame.id);
-        }
+        },
         Err(e) => panic!("Unexpected error: {}", e),
     }
 }
@@ -111,9 +125,15 @@ fn test_batch_send_performance() {
     let elapsed = start.elapsed();
 
     let fps = batch_size as f64 / elapsed.as_secs_f64();
-    println!("Sent {} frames in {:?} ({:.1} fps)", batch_size, elapsed, fps);
+    println!(
+        "Sent {} frames in {:?} ({:.1} fps)",
+        batch_size, elapsed, fps
+    );
 
     // 批量发送应该能达到较高的吞吐量
-    assert!(fps >= 500.0, "Batch send performance too low: {:.1} fps", fps);
+    assert!(
+        fps >= 500.0,
+        "Batch send performance too low: {:.1} fps",
+        fps
+    );
 }
-

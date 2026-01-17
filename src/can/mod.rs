@@ -199,7 +199,7 @@ mod tests {
         let can_err: CanError = io_err.into();
 
         match can_err {
-            CanError::Io(_) => {}
+            CanError::Io(_) => {},
             _ => panic!("Expected Io variant"),
         }
     }

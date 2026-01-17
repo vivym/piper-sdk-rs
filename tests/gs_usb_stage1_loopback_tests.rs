@@ -62,17 +62,24 @@ fn test_loopback_end_to_end() {
     for attempt in 1..=20 {
         match adapter.receive() {
             Ok(rx_frame) => {
-                println!("✓ Frame received on attempt {}: ID=0x{:X}, len={}", attempt, rx_frame.id, rx_frame.len);
+                println!(
+                    "✓ Frame received on attempt {}: ID=0x{:X}, len={}",
+                    attempt, rx_frame.id, rx_frame.len
+                );
 
                 // 验证帧内容
                 assert_eq!(rx_frame.id, 0x123, "Frame ID mismatch");
                 assert_eq!(rx_frame.len, 4, "Frame length mismatch");
-                assert_eq!(rx_frame.data[0..4], [0x01, 0x02, 0x03, 0x04], "Frame data mismatch");
+                assert_eq!(
+                    rx_frame.data[0..4],
+                    [0x01, 0x02, 0x03, 0x04],
+                    "Frame data mismatch"
+                );
                 assert!(!rx_frame.is_extended, "Should be standard frame");
 
                 received = true;
                 break;
-            }
+            },
             Err(piper_sdk::can::CanError::Timeout) => {
                 if attempt % 5 == 0 {
                     println!("  Attempt {}: Timeout (retrying...)", attempt);
@@ -81,7 +88,7 @@ fn test_loopback_end_to_end() {
                 if attempt < 20 {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-            }
+            },
             Err(e) => panic!("Unexpected error: {}", e),
         }
     }
@@ -116,9 +123,7 @@ fn test_loopback_echo_filtering() {
     println!("=== Test: Loopback Echo Filtering ===");
 
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
-    adapter
-        .configure_loopback(250_000)
-        .expect("Failed to configure");
+    adapter.configure_loopback(250_000).expect("Failed to configure");
 
     // 发送多个帧
     for i in 0..5 {
@@ -133,7 +138,7 @@ fn test_loopback_echo_filtering() {
 
     // 在 Loopback 模式下，Echo 不应该被过滤（已修复）
     // 这里主要验证代码不会卡死，并且能够接收 Echo
-    std::thread::sleep(std::time::Duration::from_millis(50));  // 等待 Echo 返回
+    std::thread::sleep(std::time::Duration::from_millis(50)); // 等待 Echo 返回
 
     let start = std::time::Instant::now();
     let mut echo_count = 0;
@@ -150,16 +155,19 @@ fn test_loopback_echo_filtering() {
                 if echo_count >= 5 {
                     break;
                 }
-            }
+            },
             Err(piper_sdk::can::CanError::Timeout) => {
                 // 超时是正常的，可能设备还没有返回所有 Echo
                 break;
-            }
+            },
             Err(e) => panic!("Unexpected error: {}", e),
         }
     }
 
-    println!("✓ Echo filtering test completed (received {} frames/echoes)", echo_count);
+    println!(
+        "✓ Echo filtering test completed (received {} frames/echoes)",
+        echo_count
+    );
     // 注意：实际行为取决于设备固件如何标记 Loopback 模式下的 Echo
 }
 
@@ -170,9 +178,7 @@ fn test_loopback_standard_and_extended_frames() {
     println!("=== Test: Standard and Extended Frames ===");
 
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
-    adapter
-        .configure_loopback(250_000)
-        .expect("Failed to configure");
+    adapter.configure_loopback(250_000).expect("Failed to configure");
 
     // 测试标准帧（11-bit ID）
     let std_frame = PiperFrame::new_standard(0x7FF, &[0xAA, 0xBB]);
@@ -186,10 +192,10 @@ fn test_loopback_standard_and_extended_frames() {
             assert_eq!(rx_frame.id, 0x7FF);
             assert!(!rx_frame.is_extended);
             println!("✓ Received standard frame correctly");
-        }
+        },
         Err(piper_sdk::can::CanError::Timeout) => {
             println!("⚠ Standard frame echo timeout (may be filtered)");
-        }
+        },
         Err(e) => panic!("Unexpected error: {}", e),
     }
 
@@ -205,10 +211,10 @@ fn test_loopback_standard_and_extended_frames() {
             assert_eq!(rx_frame.id, 0x1FFFFFFF);
             assert!(rx_frame.is_extended);
             println!("✓ Received extended frame correctly");
-        }
+        },
         Err(piper_sdk::can::CanError::Timeout) => {
             println!("⚠ Extended frame echo timeout (may be filtered)");
-        }
+        },
         Err(e) => panic!("Unexpected error: {}", e),
     }
 
@@ -222,9 +228,7 @@ fn test_loopback_various_data_lengths() {
     println!("=== Test: Various Data Lengths ===");
 
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
-    adapter
-        .configure_loopback(250_000)
-        .expect("Failed to configure");
+    adapter.configure_loopback(250_000).expect("Failed to configure");
 
     // 测试不同的数据长度（0-8 字节）
     let lengths = [0, 1, 2, 4, 8];
@@ -238,13 +242,22 @@ fn test_loopback_various_data_lengths() {
 
         match adapter.receive() {
             Ok(rx_frame) => {
-                assert_eq!(rx_frame.len, len as u8, "Data length mismatch for {} byte frame", len);
-                assert_eq!(rx_frame.data[..len], data[..], "Data mismatch for {} byte frame", len);
+                assert_eq!(
+                    rx_frame.len, len as u8,
+                    "Data length mismatch for {} byte frame",
+                    len
+                );
+                assert_eq!(
+                    rx_frame.data[..len],
+                    data[..],
+                    "Data mismatch for {} byte frame",
+                    len
+                );
                 println!("✓ Received {}-byte frame correctly", len);
-            }
+            },
             Err(piper_sdk::can::CanError::Timeout) => {
                 println!("⚠ {}-byte frame echo timeout (may be filtered)", len);
-            }
+            },
             Err(e) => panic!("Unexpected error: {}", e),
         }
     }
@@ -280,8 +293,11 @@ fn test_loopback_fire_and_forget() {
         Ok(a) => a,
         Err(e) => {
             // 如果设备在上次测试中挂了，这里会捕捉到
-            panic!("❌ Critical: Device not found. Please re-plug device! Error: {}", e);
-        }
+            panic!(
+                "❌ Critical: Device not found. Please re-plug device! Error: {}",
+                e
+            );
+        },
     };
 
     adapter.configure_loopback(250_000).expect("Config failed");
@@ -301,7 +317,10 @@ fn test_loopback_fire_and_forget() {
         // --- STEP A: 发送 1 帧 ---
         // 在 Ping-Pong 模式下，每次循环应该是：发送 -> 接收 -> 发送 -> 接收
         if let Err(e) = adapter.send(frame) {
-            panic!("❌ Send failed at frame {}: {}. Device likely crashed.", i, e);
+            panic!(
+                "❌ Send failed at frame {}: {}. Device likely crashed.",
+                i, e
+            );
         }
 
         // 发送后延迟，让设备开始处理
@@ -320,17 +339,20 @@ fn test_loopback_fire_and_forget() {
                     assert_eq!(rx_frame.id, 0x300, "Frame ID mismatch at frame {}", i);
                     received = true;
                     break;
-                }
+                },
                 Err(piper_sdk::can::CanError::Timeout) => {
                     // 等待 100ms 再试（参考诊断测试）
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                }
+                },
                 Err(e) => panic!("❌ Receive error at frame {}: {}", i, e),
             }
         }
 
         if !received {
-            panic!("❌ Timeout: Frame {} sent but no echo received within 2 seconds", i);
+            panic!(
+                "❌ Timeout: Frame {} sent but no echo received within 2 seconds",
+                i
+            );
         }
 
         // 可选：每 20 帧打印一次进度，证明活着
@@ -345,7 +367,10 @@ fn test_loopback_fire_and_forget() {
     println!("📊 Stability Summary:");
     println!("  Total: {} frames", total_frames);
     println!("  Time:  {:.2?}", elapsed);
-    println!("  Rate:  {:.1} FPS (Limited by USB latency, which is normal for Ping-Pong)", fps);
+    println!(
+        "  Rate:  {:.1} FPS (Limited by USB latency, which is normal for Ping-Pong)",
+        fps
+    );
 
     // 4. 验证设备仍然可用
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -393,7 +418,7 @@ fn test_loopback_sanity_check() {
                 println!("  Len: {}", rx.len);
                 println!("  Data: {:?}", rx.data);
                 break; // 成功！
-            }
+            },
             Err(piper_sdk::can::CanError::Timeout) => {
                 if start.elapsed().as_secs() > 2 {
                     panic!(
@@ -408,7 +433,7 @@ fn test_loopback_sanity_check() {
                 print!("."); // 打印点号表示正在等待
                 use std::io::Write;
                 std::io::stdout().flush().unwrap();
-            }
+            },
             Err(e) => panic!("❌ Error: {}", e),
         }
     }
@@ -432,15 +457,13 @@ fn test_loopback_device_state() {
     match result {
         Err(piper_sdk::can::CanError::NotStarted) => {
             println!("✓ Correctly returned NotStarted error before configuration");
-        }
+        },
         Ok(_) => panic!("Expected NotStarted error, but send succeeded"),
         Err(e) => panic!("Expected NotStarted, got: {}", e),
     }
 
     // 配置为 Loopback 模式
-    adapter
-        .configure_loopback(250_000)
-        .expect("Failed to configure");
+    adapter.configure_loopback(250_000).expect("Failed to configure");
 
     // 现在应该可以发送
     adapter.send(frame).expect("Failed to send after configuration");
@@ -448,4 +471,3 @@ fn test_loopback_device_state() {
 
     println!("✓ Device state test completed");
 }
-

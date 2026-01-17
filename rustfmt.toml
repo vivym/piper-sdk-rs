@@ -1,24 +1,28 @@
-# rustfmt 配置文件
-
-# 代码风格
+# 基础配置
 edition = "2021"
 max_width = 100
 tab_spaces = 4
 newline_style = "Unix"
 use_small_heuristics = "Default"
 
-# 导入分组
-imports_granularity = "Crate"
-group_imports = "StdExternalCrate"
-
-# 格式化选项
-chain_width = 80
-wrap_comments = true
-format_code_in_doc_comments = true
-format_strings = true
-
-# 其他选项
-remove_nested_empty_blocks = true
+# --- 代码结构与语法糖 ---
+# 允许字段初始化简写 (Struct { x } 代替 Struct { x: x })
 use_field_init_shorthand = true
+# 允许 try 简写 (使用 ? 代替 try!())
 use_try_shorthand = true
+# 强制显式 ABI (extern "C" fn 而不是 extern fn)
 force_explicit_abi = true
+
+# --- 格式化细节 ---
+chain_width = 80
+# 派生宏 trait 列表的换行策略
+merge_derives = true
+
+# --- 尾随逗号 (仅保留 Stable 支持的选项) ---
+# match 块末尾加逗号是 Stable 支持的
+match_block_trailing_comma = true
+
+# 注意：以下导致报错的项已被移除
+# imports_granularity
+# group_imports
+# trailing_comma

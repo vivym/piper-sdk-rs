@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/piper-sdk/badge.svg)](https://docs.rs/piper-sdk)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**高性能、跨平台、零抽象开销**的 Rust SDK，专用于松灵 Piper 机械臂的高频力控（>1kHz）。
+**高性能、跨平台、零抽象开销**的 Rust SDK，专用于松灵 Piper 机械臂的高频力控（500Hz）。
 
 ## ✨ 核心特性
 
@@ -70,11 +70,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 为了优化性能，状态数据分为三类：
 
-- **实时运动数据（Hot）**：`MotionState` - 1kHz 更新频率
+- **实时运动数据（Hot）**：`MotionState`
   - 使用 `ArcSwap` 实现无锁读取
   - 包含关节位置、速度、力矩等
 
-- **低频诊断数据（Warm）**：`DiagnosticState` - 10Hz 更新频率
+- **低频诊断数据（Warm）**：`DiagnosticState`
   - 使用 `RwLock` 进行读写
   - 包含电机温度、总线电压、错误码等
 

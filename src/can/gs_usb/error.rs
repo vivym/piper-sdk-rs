@@ -70,7 +70,7 @@ mod tests {
         let gs_err: GsUsbError = rusb_err.into();
 
         match gs_err {
-            GsUsbError::Usb(_) => {}
+            GsUsbError::Usb(_) => {},
             _ => panic!("Expected Usb variant"),
         }
     }
@@ -141,7 +141,7 @@ mod tests {
         let err = GsUsbError::ControlTransfer(rusb_err);
 
         match err {
-            GsUsbError::ControlTransfer(_) => {}
+            GsUsbError::ControlTransfer(_) => {},
             _ => panic!("Expected ControlTransfer variant"),
         }
         assert!(!err.is_timeout());
@@ -153,7 +153,7 @@ mod tests {
         let err = GsUsbError::BulkTransfer(rusb_err);
 
         match err {
-            GsUsbError::BulkTransfer(_) => {}
+            GsUsbError::BulkTransfer(_) => {},
             _ => panic!("Expected BulkTransfer variant"),
         }
         assert!(!err.is_timeout());
@@ -166,7 +166,7 @@ mod tests {
         let gs_err: GsUsbError = rusb_err.into();
 
         match gs_err {
-            GsUsbError::Usb(rusb::Error::Timeout) => {}
+            GsUsbError::Usb(rusb::Error::Timeout) => {},
             _ => panic!("Expected Usb(Timeout) variant"),
         }
         assert!(gs_err.is_timeout());

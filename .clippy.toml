@@ -4,7 +4,7 @@
 # 设置为 "deny" 会将警告升级为错误
 
 # 性能相关
-disallowed_types = []
+disallowed-types = []
 
 # 代码质量
 # 根据需要添加更多规则
