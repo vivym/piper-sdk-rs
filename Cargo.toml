@@ -1,13 +1,13 @@
 [package]
 name = "piper-sdk"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 authors = ["Ming Yang"]
 license = "MIT"
-description = "松灵 Piper 机械臂的非官方 Rust SDK（Unofficial Rust SDK for AgileX Piper Robot Arm）"
+description = "High-performance cross-platform (Linux/Windows/macOS) Rust SDK for AgileX Piper Robot Arm with support for high-frequency force control"
 repository = "https://github.com/vivym/piper-sdk-rs"
 readme = "README.md"
-keywords = ["robot", "robotics", "can", "usb", "piper", "arm", "control"]
+keywords = ["robot", "piper", "can", "arm", "control"]
 categories = ["hardware-support"]
 exclude = ["tmp/", "docs", "target/"]
 
