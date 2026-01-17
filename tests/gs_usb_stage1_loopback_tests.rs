@@ -25,6 +25,8 @@
 //! - ✅ 帧编码/解码正确性
 //! - ✅ 标准帧和扩展帧支持
 
+// GS-USB 模块只在非 Linux 系统上可用
+#[cfg(not(target_os = "linux"))]
 use piper_sdk::can::gs_usb::GsUsbCanAdapter;
 use piper_sdk::can::{CanAdapter, PiperFrame};
 
@@ -34,6 +36,7 @@ use piper_sdk::can::{CanAdapter, PiperFrame};
 /// 1. 设备可以成功配置为 Loopback 模式
 /// 2. 发送的帧会在设备内部回环
 /// 3. 可以通过 receive() 接收到 Echo
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore] // 需要硬件，默认不运行
 fn test_loopback_end_to_end() {
@@ -117,6 +120,7 @@ fn test_loopback_end_to_end() {
 /// 1. send() 发送的帧会产生 Echo
 /// 2. receive() 会过滤掉 Echo（根据 echo_id 判断）
 /// 3. 只返回有效的 RX 帧（如果有外部设备发送）
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_echo_filtering() {
@@ -172,6 +176,7 @@ fn test_loopback_echo_filtering() {
 }
 
 /// 测试标准帧和扩展帧支持
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_standard_and_extended_frames() {
@@ -222,6 +227,7 @@ fn test_loopback_standard_and_extended_frames() {
 }
 
 /// 测试不同数据长度的帧
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_various_data_lengths() {
@@ -285,6 +291,7 @@ fn test_loopback_various_data_lengths() {
 /// - 驱动逻辑的正确性（发送、接收、解析）
 /// - 设备在长时间运行下的稳定性
 /// - 批量接收缓冲的正确性（即使 Ping-Pong，USB 也可能批量打包）
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_fire_and_forget() {
@@ -388,6 +395,7 @@ fn test_loopback_fire_and_forget() {
 /// 1. `GsUsbFrame` 缺少 `#[repr(packed)]`（但我们使用 `pack_to` 手动打包，应该不受影响）
 /// 2. Channel ID 设置错误
 /// 3. 设备处于僵死状态（需要物理重插拔）
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_sanity_check() {
@@ -446,6 +454,7 @@ fn test_loopback_sanity_check() {
 /// 测试设备状态检查
 ///
 /// 验证设备在 Loopback 模式下正确启动
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_device_state() {
