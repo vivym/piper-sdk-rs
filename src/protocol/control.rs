@@ -998,8 +998,8 @@ mod gripper_control_tests {
         let byte = 0b0000_0011;
         let flags = GripperControlFlags::from(u8::new(byte));
 
-        assert_eq!(flags.enable(), true);
-        assert_eq!(flags.clear_error(), true);
+        assert!(flags.enable());
+        assert!(flags.clear_error());
     }
 
     #[test]
@@ -1017,7 +1017,7 @@ mod gripper_control_tests {
         let cmd = GripperControlCommand::new(50.0, 2.5, true);
         assert_eq!(cmd.travel_mm, 50000);
         assert_eq!(cmd.torque_nm, 2500);
-        assert_eq!(cmd.control_flags.enable(), true);
+        assert!(cmd.control_flags.enable());
         assert_eq!(cmd.zero_setting, 0x00);
     }
 

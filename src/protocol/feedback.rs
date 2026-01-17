@@ -752,6 +752,18 @@ pub struct JointDriverHighSpeedFeedback {
 }
 
 impl JointDriverHighSpeedFeedback {
+    /// 关节 1-3 的力矩系数（CAN ID: 0x251~0x253）
+    ///
+    /// 根据官方 Python SDK，关节 1、2、3 使用此系数计算力矩。
+    /// 公式：torque = current * COEFFICIENT_1_3
+    pub const COEFFICIENT_1_3: f64 = 1.18125;
+
+    /// 关节 4-6 的力矩系数（CAN ID: 0x254~0x256）
+    ///
+    /// 根据官方 Python SDK，关节 4、5、6 使用此系数计算力矩。
+    /// 公式：torque = current * COEFFICIENT_4_6
+    pub const COEFFICIENT_4_6: f64 = 0.95844;
+
     /// 获取速度原始值（0.001rad/s 单位）
     pub fn speed_raw(&self) -> i16 {
         self.speed_rad_s
@@ -785,6 +797,62 @@ impl JointDriverHighSpeedFeedback {
     /// 获取位置（度）
     pub fn position_deg(&self) -> f64 {
         self.position() * 180.0 / std::f64::consts::PI
+    }
+
+    /// 计算力矩（N·m）
+    ///
+    /// 根据关节索引和电流值计算力矩。
+    /// - 关节 1-3 (CAN ID: 0x251~0x253) 使用系数 `COEFFICIENT_1_3 = 1.18125`
+    /// - 关节 4-6 (CAN ID: 0x254~0x256) 使用系数 `COEFFICIENT_4_6 = 0.95844`
+    ///
+    /// 公式：`torque = current * coefficient`
+    ///
+    /// # 参数
+    /// - `current_opt`: 可选的电流值（A）。如果为 `None`，则使用当前反馈的电流值。
+    ///
+    /// # 返回值
+    /// 计算得到的力矩值（N·m）
+    ///
+    /// # 示例
+    /// ```rust
+    /// # use piper_sdk::protocol::feedback::JointDriverHighSpeedFeedback;
+    /// # use piper_sdk::can::PiperFrame;
+    /// # let frame = PiperFrame::new_standard(0x251, &[0; 8]);
+    /// # let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+    /// // 使用反馈中的电流值计算力矩
+    /// let torque = feedback.torque(None);
+    ///
+    /// // 使用指定的电流值计算力矩
+    /// let torque = feedback.torque(Some(2.5)); // 2.5A
+    /// ```
+    pub fn torque(&self, current_opt: Option<f64>) -> f64 {
+        let current = current_opt.unwrap_or_else(|| self.current());
+        let coefficient = if self.joint_index <= 3 {
+            Self::COEFFICIENT_1_3
+        } else {
+            Self::COEFFICIENT_4_6
+        };
+        current * coefficient
+    }
+
+    /// 获取力矩原始值（0.001N·m 单位）
+    ///
+    /// 返回以 0.001N·m 为单位的力矩原始值（整数形式）。
+    /// 这对应于 Python SDK 中 `effort` 字段的单位。
+    ///
+    /// # 返回值
+    /// 力矩原始值（0.001N·m 单位，即毫牛·米）
+    ///
+    /// # 示例
+    /// ```rust
+    /// # use piper_sdk::protocol::feedback::JointDriverHighSpeedFeedback;
+    /// # use piper_sdk::can::PiperFrame;
+    /// # let frame = PiperFrame::new_standard(0x251, &[0; 8]);
+    /// # let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+    /// let torque_raw = feedback.torque_raw(); // 例如：1181 (表示 1.181 N·m)
+    /// ```
+    pub fn torque_raw(&self) -> i32 {
+        (self.torque(None) * 1000.0).round() as i32
     }
 }
 
@@ -1269,41 +1337,41 @@ mod tests {
         // 期望字节值：0b0000_0001 = 0x01
         let byte = 0x01;
         let fault = FaultCodeAngleLimit::from(u8::new(byte));
-        assert_eq!(fault.joint1_limit(), true, "1号关节应该超限位");
-        assert_eq!(fault.joint2_limit(), false, "2号关节应该正常");
-        assert_eq!(fault.joint3_limit(), false, "3号关节应该正常");
-        assert_eq!(fault.joint4_limit(), false, "4号关节应该正常");
-        assert_eq!(fault.joint5_limit(), false, "5号关节应该正常");
-        assert_eq!(fault.joint6_limit(), false, "6号关节应该正常");
+        assert!(fault.joint1_limit(), "1号关节应该超限位");
+        assert!(!fault.joint2_limit(), "2号关节应该正常");
+        assert!(!fault.joint3_limit(), "3号关节应该正常");
+        assert!(!fault.joint4_limit(), "4号关节应该正常");
+        assert!(!fault.joint5_limit(), "5号关节应该正常");
+        assert!(!fault.joint6_limit(), "6号关节应该正常");
 
         // 测试：只有 2号关节超限位
         // 协议：Bit 1 = 1，其他位 = 0
         // 期望字节值：0b0000_0010 = 0x02
         let byte = 0x02;
         let fault = FaultCodeAngleLimit::from(u8::new(byte));
-        assert_eq!(fault.joint1_limit(), false, "1号关节应该正常");
-        assert_eq!(fault.joint2_limit(), true, "2号关节应该超限位");
-        assert_eq!(fault.joint3_limit(), false, "3号关节应该正常");
+        assert!(!fault.joint1_limit(), "1号关节应该正常");
+        assert!(fault.joint2_limit(), "2号关节应该超限位");
+        assert!(!fault.joint3_limit(), "3号关节应该正常");
 
         // 测试：1号和2号关节都超限位
         // 协议：Bit 0 = 1, Bit 1 = 1，其他位 = 0
         // 期望字节值：0b0000_0011 = 0x03
         let byte = 0x03;
         let fault = FaultCodeAngleLimit::from(u8::new(byte));
-        assert_eq!(fault.joint1_limit(), true, "1号关节应该超限位");
-        assert_eq!(fault.joint2_limit(), true, "2号关节应该超限位");
-        assert_eq!(fault.joint3_limit(), false, "3号关节应该正常");
+        assert!(fault.joint1_limit(), "1号关节应该超限位");
+        assert!(fault.joint2_limit(), "2号关节应该超限位");
+        assert!(!fault.joint3_limit(), "3号关节应该正常");
 
         // 测试：所有关节都超限位（Bit 0-5 = 1）
         // 期望字节值：0b0011_1111 = 0x3F
         let byte = 0x3F;
         let fault = FaultCodeAngleLimit::from(u8::new(byte));
-        assert_eq!(fault.joint1_limit(), true, "1号关节应该超限位");
-        assert_eq!(fault.joint2_limit(), true, "2号关节应该超限位");
-        assert_eq!(fault.joint3_limit(), true, "3号关节应该超限位");
-        assert_eq!(fault.joint4_limit(), true, "4号关节应该超限位");
-        assert_eq!(fault.joint5_limit(), true, "5号关节应该超限位");
-        assert_eq!(fault.joint6_limit(), true, "6号关节应该超限位");
+        assert!(fault.joint1_limit(), "1号关节应该超限位");
+        assert!(fault.joint2_limit(), "2号关节应该超限位");
+        assert!(fault.joint3_limit(), "3号关节应该超限位");
+        assert!(fault.joint4_limit(), "4号关节应该超限位");
+        assert!(fault.joint5_limit(), "5号关节应该超限位");
+        assert!(fault.joint6_limit(), "6号关节应该超限位");
     }
 
     #[test]
@@ -1321,12 +1389,12 @@ mod tests {
         assert_eq!(encoded, 0x15, "编码值应该是 0x15 (Bit 0, 2, 4 = 1)");
 
         // 验证各个位
-        assert_eq!(fault.joint1_limit(), true);
-        assert_eq!(fault.joint2_limit(), false);
-        assert_eq!(fault.joint3_limit(), true);
-        assert_eq!(fault.joint4_limit(), false);
-        assert_eq!(fault.joint5_limit(), true);
-        assert_eq!(fault.joint6_limit(), false);
+        assert!(fault.joint1_limit());
+        assert!(!fault.joint2_limit());
+        assert!(fault.joint3_limit());
+        assert!(!fault.joint4_limit());
+        assert!(fault.joint5_limit());
+        assert!(!fault.joint6_limit());
     }
 
     #[test]
@@ -1339,12 +1407,12 @@ mod tests {
         let encoded = u8::from(fault).value();
 
         // 验证解析
-        assert_eq!(fault.joint1_limit(), false);
-        assert_eq!(fault.joint2_limit(), false);
-        assert_eq!(fault.joint3_limit(), true);
-        assert_eq!(fault.joint4_limit(), true);
-        assert_eq!(fault.joint5_limit(), true);
-        assert_eq!(fault.joint6_limit(), true);
+        assert!(!fault.joint1_limit());
+        assert!(!fault.joint2_limit());
+        assert!(fault.joint3_limit());
+        assert!(fault.joint4_limit());
+        assert!(fault.joint5_limit());
+        assert!(fault.joint6_limit());
 
         // 验证编码（保留位可能被清零，所以只比较有效位）
         assert_eq!(encoded & 0b0011_1111, original_byte & 0b0011_1111);
@@ -1357,16 +1425,16 @@ mod tests {
         // 期望字节值：0b0000_0001 = 0x01
         let byte = 0x01;
         let fault = FaultCodeCommError::from(u8::new(byte));
-        assert_eq!(fault.joint1_comm_error(), true, "1号关节应该通信异常");
-        assert_eq!(fault.joint2_comm_error(), false, "2号关节应该正常");
+        assert!(fault.joint1_comm_error(), "1号关节应该通信异常");
+        assert!(!fault.joint2_comm_error(), "2号关节应该正常");
 
         // 测试：只有 2号关节通信异常
         // 协议：Bit 1 = 1，其他位 = 0
         // 期望字节值：0b0000_0010 = 0x02
         let byte = 0x02;
         let fault = FaultCodeCommError::from(u8::new(byte));
-        assert_eq!(fault.joint1_comm_error(), false, "1号关节应该正常");
-        assert_eq!(fault.joint2_comm_error(), true, "2号关节应该通信异常");
+        assert!(!fault.joint1_comm_error(), "1号关节应该正常");
+        assert!(fault.joint2_comm_error(), "2号关节应该通信异常");
     }
 
     #[test]
@@ -1427,9 +1495,9 @@ mod tests {
         assert_eq!(status.teach_status, TeachStatus::Closed);
         assert_eq!(status.motion_status, MotionStatus::Arrived);
         assert_eq!(status.trajectory_point_index, 5);
-        assert_eq!(status.fault_code_angle_limit.joint1_limit(), true);
-        assert_eq!(status.fault_code_angle_limit.joint6_limit(), true);
-        assert_eq!(status.fault_code_comm_error.joint1_comm_error(), false);
+        assert!(status.fault_code_angle_limit.joint1_limit());
+        assert!(status.fault_code_angle_limit.joint6_limit());
+        assert!(!status.fault_code_comm_error.joint1_comm_error());
     }
 
     #[test]
@@ -1484,20 +1552,20 @@ mod tests {
         assert_eq!(status.trajectory_point_index, 0xFF);
 
         // 验证所有关节故障位
-        assert_eq!(status.fault_code_angle_limit.joint1_limit(), true);
-        assert_eq!(status.fault_code_angle_limit.joint2_limit(), true);
-        assert_eq!(status.fault_code_angle_limit.joint3_limit(), true);
-        assert_eq!(status.fault_code_angle_limit.joint4_limit(), true);
-        assert_eq!(status.fault_code_angle_limit.joint5_limit(), true);
-        assert_eq!(status.fault_code_angle_limit.joint6_limit(), true);
+        assert!(status.fault_code_angle_limit.joint1_limit());
+        assert!(status.fault_code_angle_limit.joint2_limit());
+        assert!(status.fault_code_angle_limit.joint3_limit());
+        assert!(status.fault_code_angle_limit.joint4_limit());
+        assert!(status.fault_code_angle_limit.joint5_limit());
+        assert!(status.fault_code_angle_limit.joint6_limit());
 
         // 验证所有关节通信异常位
-        assert_eq!(status.fault_code_comm_error.joint1_comm_error(), true);
-        assert_eq!(status.fault_code_comm_error.joint2_comm_error(), true);
-        assert_eq!(status.fault_code_comm_error.joint3_comm_error(), true);
-        assert_eq!(status.fault_code_comm_error.joint4_comm_error(), true);
-        assert_eq!(status.fault_code_comm_error.joint5_comm_error(), true);
-        assert_eq!(status.fault_code_comm_error.joint6_comm_error(), true);
+        assert!(status.fault_code_comm_error.joint1_comm_error());
+        assert!(status.fault_code_comm_error.joint2_comm_error());
+        assert!(status.fault_code_comm_error.joint3_comm_error());
+        assert!(status.fault_code_comm_error.joint4_comm_error());
+        assert!(status.fault_code_comm_error.joint5_comm_error());
+        assert!(status.fault_code_comm_error.joint6_comm_error());
     }
 
     // ========================================================================
@@ -1793,7 +1861,7 @@ mod tests {
         let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
-        assert!((feedback.speed() - 3.141).abs() < 0.001);
+        assert!((feedback.speed() - std::f64::consts::PI).abs() < 0.001);
         assert!((feedback.current() - 5.0).abs() < 0.001);
         // 位置：根据协议单位是 rad，直接返回 i32 转 f64
         assert_eq!(feedback.position(), position_val as f64);
@@ -1865,6 +1933,119 @@ mod tests {
         assert!((feedback.speed() - (-1.0)).abs() < 0.0001);
     }
 
+    #[test]
+    fn test_joint_driver_high_speed_feedback_torque_joints_1_3() {
+        // 测试关节 1-3 的力矩计算（使用系数 1.18125）
+        // 关节 1 (CAN ID: 0x251)
+        let current_val = 1000u16; // 1.0 A
+        let mut data = [0u8; 8];
+        data[2..4].copy_from_slice(&current_val.to_be_bytes());
+
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+
+        assert_eq!(feedback.joint_index, 1);
+        let expected_torque = 1.0 * JointDriverHighSpeedFeedback::COEFFICIENT_1_3; // 1.18125 N·m
+        assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
+        assert_eq!(
+            feedback.torque_raw(),
+            (expected_torque * 1000.0).round() as i32
+        );
+
+        // 关节 2 (CAN ID: 0x252)
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 1, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+        assert_eq!(feedback.joint_index, 2);
+        assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
+
+        // 关节 3 (CAN ID: 0x253)
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 2, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+        assert_eq!(feedback.joint_index, 3);
+        assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_joint_driver_high_speed_feedback_torque_joints_4_6() {
+        // 测试关节 4-6 的力矩计算（使用系数 0.95844）
+        // 关节 4 (CAN ID: 0x254)
+        let current_val = 1000u16; // 1.0 A
+        let mut data = [0u8; 8];
+        data[2..4].copy_from_slice(&current_val.to_be_bytes());
+
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 3, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+
+        assert_eq!(feedback.joint_index, 4);
+        let expected_torque = 1.0 * JointDriverHighSpeedFeedback::COEFFICIENT_4_6; // 0.95844 N·m
+        assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
+        assert_eq!(
+            feedback.torque_raw(),
+            (expected_torque * 1000.0).round() as i32
+        );
+
+        // 关节 5 (CAN ID: 0x255)
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 4, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+        assert_eq!(feedback.joint_index, 5);
+        assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
+
+        // 关节 6 (CAN ID: 0x256)
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 5, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+        assert_eq!(feedback.joint_index, 6);
+        assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_joint_driver_high_speed_feedback_torque_with_custom_current() {
+        // 测试使用自定义电流值计算力矩
+        let current_val = 2000u16; // 2.0 A（反馈中的电流）
+        let custom_current = 2.5; // 自定义电流值（A）
+
+        let mut data = [0u8; 8];
+        data[2..4].copy_from_slice(&current_val.to_be_bytes());
+
+        // 关节 1：使用反馈中的电流值
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+        let torque_from_feedback = feedback.torque(None);
+        let expected_from_feedback = 2.0 * JointDriverHighSpeedFeedback::COEFFICIENT_1_3;
+        assert!((torque_from_feedback - expected_from_feedback).abs() < 0.0001);
+
+        // 关节 1：使用自定义电流值
+        let torque_from_custom = feedback.torque(Some(custom_current));
+        let expected_from_custom = custom_current * JointDriverHighSpeedFeedback::COEFFICIENT_1_3;
+        assert!((torque_from_custom - expected_from_custom).abs() < 0.0001);
+
+        // 关节 4：使用自定义电流值
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 3, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+        let torque_from_custom = feedback.torque(Some(custom_current));
+        let expected_from_custom = custom_current * JointDriverHighSpeedFeedback::COEFFICIENT_4_6;
+        assert!((torque_from_custom - expected_from_custom).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_joint_driver_high_speed_feedback_torque_coefficients() {
+        // 验证系数值与 Python SDK 一致
+        assert_eq!(JointDriverHighSpeedFeedback::COEFFICIENT_1_3, 1.18125);
+        assert_eq!(JointDriverHighSpeedFeedback::COEFFICIENT_4_6, 0.95844);
+
+        // 测试具体计算值（与 Python SDK 的 cal_effort 方法一致）
+        // Python: current = 1000 (0.001A 单位) = 1.0 A
+        // Python: effort = 1000 * 1.18125 = 1181.25 (0.001N·m 单位) = 1.18125 N·m
+        let current_val = 1000u16; // 1.0 A
+        let mut data = [0u8; 8];
+        data[2..4].copy_from_slice(&current_val.to_be_bytes());
+
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
+        let torque = feedback.torque(None);
+        assert!((torque - 1.18125).abs() < 0.0001);
+        assert_eq!(feedback.torque_raw(), 1181); // 四舍五入到整数
+    }
+
     // ========================================================================
     // 夹爪反馈测试
     // ========================================================================
@@ -1878,10 +2059,10 @@ mod tests {
         let byte = 0x41;
         let status = GripperStatus::from(u8::new(byte));
 
-        assert_eq!(status.voltage_low(), true, "电压应该过低");
-        assert_eq!(status.motor_over_temp(), false, "电机应该正常");
-        assert_eq!(status.enabled(), true, "应该使能（Bit 6 = 1）");
-        assert_eq!(status.homed(), false, "应该没有回零");
+        assert!(status.voltage_low(), "电压应该过低");
+        assert!(!status.motor_over_temp(), "电机应该正常");
+        assert!(status.enabled(), "应该使能（Bit 6 = 1）");
+        assert!(!status.homed(), "应该没有回零");
     }
 
     #[test]
@@ -1918,8 +2099,8 @@ mod tests {
         assert_eq!(feedback.torque_raw(), 2500);
         assert!((feedback.travel() - 50.0).abs() < 0.0001);
         assert!((feedback.torque() - 2.5).abs() < 0.0001);
-        assert_eq!(feedback.status.voltage_low(), true);
-        assert_eq!(feedback.status.enabled(), true);
+        assert!(feedback.status.voltage_low());
+        assert!(feedback.status.enabled());
     }
 
     #[test]
@@ -1968,11 +2149,11 @@ mod tests {
         let byte = 0x55;
         let status = DriverStatus::from(u8::new(byte));
 
-        assert_eq!(status.voltage_low(), true, "电源电压应该过低");
-        assert_eq!(status.motor_over_temp(), false, "电机应该正常温度");
-        assert_eq!(status.driver_over_current(), true, "驱动器应该过流");
-        assert_eq!(status.collision_protection(), true, "碰撞保护应该触发");
-        assert_eq!(status.enabled(), true, "驱动器应该使能");
+        assert!(status.voltage_low(), "电源电压应该过低");
+        assert!(!status.motor_over_temp(), "电机应该正常温度");
+        assert!(status.driver_over_current(), "驱动器应该过流");
+        assert!(status.collision_protection(), "碰撞保护应该触发");
+        assert!(status.enabled(), "驱动器应该使能");
     }
 
     #[test]
@@ -2017,8 +2198,8 @@ mod tests {
         assert_eq!(feedback.driver_temp, 45);
         assert_eq!(feedback.motor_temp, 50);
         assert_eq!(feedback.bus_current, 5000);
-        assert_eq!(feedback.status.driver_over_current(), true);
-        assert_eq!(feedback.status.enabled(), true);
+        assert!(feedback.status.driver_over_current());
+        assert!(feedback.status.enabled());
     }
 
     #[test]

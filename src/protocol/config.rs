@@ -860,7 +860,7 @@ mod setting_response_tests {
         let response = SettingResponse::try_from(frame).unwrap();
 
         assert_eq!(response.response_index, 0x71);
-        assert_eq!(response.zero_point_success, false);
+        assert!(!response.zero_point_success);
         assert!(response.is_setting_response());
         assert!(!response.is_trajectory_response());
     }
@@ -876,7 +876,7 @@ mod setting_response_tests {
         let response = SettingResponse::try_from(frame).unwrap();
 
         assert_eq!(response.response_index, 0x75);
-        assert_eq!(response.zero_point_success, true);
+        assert!(response.zero_point_success);
     }
 
     #[test]
