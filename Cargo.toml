@@ -1,0 +1,22 @@
+[package]
+name = "piper-sdk"
+version = "0.1.0"
+edition = "2024"
+authors = ["Ming Yang"]
+license = "MIT"
+description = "松灵 Piper 机械臂的非官方 Rust SDK（Unofficial Rust SDK for AgileX Piper Robot Arm）"
+repository = "https://github.com/vivym/piper-sdk-rs"
+readme = "README.md"
+keywords = ["robot", "robotics", "can", "usb", "embedded", "piper", "arm", "control"]
+categories = ["hardware-support", "embedded"]
+exclude = ["tmp/", "docs", "target/"]
+
+[dependencies]
+arc-swap = "1.8.0"
+bilge = "0.3.0"
+bytes = "1.11.0"
+crossbeam-channel = "0.5.15"
+embedded-can = "0.4.1"
+rusb = "0.9.4"
+thiserror = "2.0.17"
+tracing = "0.1.44"

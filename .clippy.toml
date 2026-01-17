@@ -1,0 +1,11 @@
+# Clippy 配置文件
+
+# 警告级别
+# 设置为 "deny" 会将警告升级为错误
+
+# 性能相关
+disallowed_types = []
+
+# 代码质量
+# 根据需要添加更多规则
+avoid-breaking-exported-api = false
