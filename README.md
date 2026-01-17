@@ -20,8 +20,8 @@
 
 | 模块 | Crates | 用途 |
 |------|--------|------|
-| CAN 接口 | `embedded-can` | 定义统一的 `blocking::Can` Trait |
-| Linux 后端 | `socketcan` | Linux 原生 CAN 支持 |
+| CAN 接口 | 自定义 `CanAdapter` | 轻量级 CAN 适配器 Trait（无嵌入式负担） |
+| Linux 后端 | `socketcan` | Linux 原生 CAN 支持（计划中） |
 | USB 后端 | `rusb` | Windows/macOS 下操作 USB 设备，实现 GS-USB 协议 |
 | 协议解析 | `bilge` | 位操作、非对齐数据处理，替代 serde |
 | 并发模型 | `crossbeam-channel` | 高性能 MPSC 通道，用于发送控制指令 |
@@ -53,12 +53,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // 获取当前状态（无锁，纳秒级返回）
-    let state = robot.get_state();
-    println!("关节位置: {:?}", state.joint_pos);
-    println!("关节速度: {:?}", state.joint_vel);
+    let core_motion = robot.get_core_motion();
+    println!("关节位置: {:?}", core_motion.joint_pos);
 
-    // 发送力控指令
-    robot.send_command(RobotCommand::torque([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]))?;
+    let joint_dynamic = robot.get_joint_dynamic();
+    println!("关节速度: {:?}", joint_dynamic.joint_vel);
+
+    // 发送控制帧
+    let frame = piper_sdk::PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03]);
+    robot.send_frame(frame)?;
 
     Ok(())
 }
@@ -70,17 +73,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 为了优化性能，状态数据分为三类：
 
-- **实时运动数据（Hot）**：`MotionState`
-  - 使用 `ArcSwap` 实现无锁读取
-  - 包含关节位置、速度、力矩等
+- **热数据（Hot，500Hz）**：
+  - `CoreMotionState`：核心运动状态（关节位置、末端位姿）
+  - `JointDynamicState`：关节动态状态（关节速度、电流）
+  - 使用 `ArcSwap` 实现无锁读取，Frame Commit 机制保证原子性
 
-- **低频诊断数据（Warm）**：`DiagnosticState`
-  - 使用 `RwLock` 进行读写
-  - 包含电机温度、总线电压、错误码等
+- **温数据（Warm，100Hz）**：
+  - `ControlStatusState`：控制状态（控制模式、机器人状态、故障码等）
+  - 使用 `ArcSwap` 进行读写，更新频率中等
 
-- **静态配置数据（Cold）**：`ConfigState` - 几乎只读
-  - 使用 `RwLock` 进行读写
-  - 包含固件版本、关节限位、PID 参数等
+- **冷数据（Cold，10Hz 或按需）**：
+  - `DiagnosticState`：诊断信息（电机温度、总线电压、错误码等）
+  - `ConfigState`：配置信息（固件版本、关节限位、PID 参数等）
+  - 使用 `RwLock` 进行读写，更新频率低
 
 ### 核心组件
 
@@ -88,19 +93,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 piper-rs/
 ├── src/
 │   ├── lib.rs              # 库入口，模块导出
-│   ├── error.rs            # 全局 PiperError (thiserror)
-│   ├── builder.rs          # PiperBuilder (统一构造入口)
 │   ├── can/                # CAN 通讯适配层
-│   │   ├── mod.rs          # 条件编译入口 (Type Alias)
-│   │   ├── socket.rs       # [Linux] SocketCAN 封装
+│   │   ├── mod.rs          # CAN 适配器 Trait 和通用类型
 │   │   └── gs_usb/         # [Win/Mac] GS-USB 协议实现
-│   ├── protocol/           # 协议定义
+│   │       ├── mod.rs      # GS-USB CAN 适配器
+│   │       ├── device.rs   # USB 设备操作
+│   │       ├── protocol.rs # GS-USB 协议定义
+│   │       └── frame.rs    # GS-USB 帧结构
+│   ├── protocol/           # 协议定义（业务无关，纯数据）
 │   │   ├── ids.rs          # CAN ID 常量/枚举
 │   │   ├── feedback.rs     # 机械臂反馈帧 (bilge)
-│   │   └── control.rs      # 控制指令帧 (bilge)
-│   └── driver/             # 核心逻辑
-│       ├── robot.rs        # 对外的高级 Piper 对象 (API)
-│       └── pipeline.rs     # IO Loop、ArcSwap 更新逻辑
+│   │   ├── control.rs      # 控制指令帧 (bilge)
+│   │   └── config.rs       # 配置帧 (bilge)
+│   └── robot/              # 核心业务逻辑
+│       ├── mod.rs          # Robot 模块入口
+│       ├── robot_impl.rs   # 对外的高级 Piper 对象 (API)
+│       ├── pipeline.rs     # IO Loop、ArcSwap 更新逻辑
+│       ├── state.rs        # 状态结构定义（热冷数据分离）
+│       ├── builder.rs      # PiperBuilder（链式构造）
+│       └── error.rs        # RobotError（错误类型）
 ```
 
 ### 并发模型
@@ -139,10 +150,9 @@ piper-rs/
 ## 🔗 相关链接
 
 - [松灵机器人](https://www.agilex.ai/)
-- [embedded-can](https://docs.rs/embedded-can/)
 - [bilge](https://docs.rs/bilge/)
+- [rusb](https://docs.rs/rusb/)
 
 ---
 
 **注意**：本项目正在积极开发中，API 可能会有变更。建议在生产环境使用前仔细测试。
-

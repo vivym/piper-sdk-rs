@@ -4,6 +4,9 @@
 
 pub mod can;
 pub mod protocol;
+pub mod robot;
 
-// Re-export 核心类型
+// Re-export 核心类型（简化用户导入）
 pub use can::{CanAdapter, CanError, PiperFrame};
+pub use protocol::ProtocolError;
+pub use robot::{Piper, PiperBuilder, RobotError};

@@ -402,10 +402,11 @@ pub fn io_loop(
     let mut pending_joint_dynamic = JointDynamicState::default();
     let mut vel_update_mask: u8 = 0;        // 位掩码：已收到的关节（Bit 0-5 对应 Joint 1-6）
     let mut last_vel_commit_time_us: u32 = 0;  // 上次速度帧提交时间（硬件时间戳，用于判断提交）
-    let mut last_vel_packet_time_us: u32 = 0;  // 上次速度帧到达时间（硬件时间戳，用于判断超时）
+    let mut last_vel_packet_time_us: u32 = 0;  // 上次速度帧到达时间（硬件时间戳，用于判断提交）
     let mut last_vel_packet_instant = None::<std::time::Instant>;  // 上次速度帧到达时间（系统时间，用于超时检查）
 
-    let receive_timeout = Duration::from_millis(config.receive_timeout_ms);
+    // 注意：receive_timeout 当前未使用，因为 CanAdapter::receive() 的超时是在适配器内部处理的
+    // 如果需要未来扩展（例如动态调整接收超时），可以使用 config.receive_timeout_ms
     let frame_group_timeout = Duration::from_millis(config.frame_group_timeout_ms);
     let mut last_frame_time = std::time::Instant::now();
 
