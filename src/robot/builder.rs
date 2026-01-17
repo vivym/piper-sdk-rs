@@ -105,7 +105,7 @@ impl PiperBuilder {
     ///     }
     /// }
     /// ```
-    pub fn build(mut self) -> Result<Piper, RobotError> {
+    pub fn build(self) -> Result<Piper, RobotError> {
         // 创建 CAN 适配器
         #[cfg(not(target_os = "linux"))]
         {
@@ -117,7 +117,7 @@ impl PiperBuilder {
             can.configure(bitrate).map_err(RobotError::Can)?;
 
             // 创建 Piper 实例
-            Piper::new(can, self.pipeline_config.take()).map_err(RobotError::Can)
+            Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
         }
 
         #[cfg(target_os = "linux")]
