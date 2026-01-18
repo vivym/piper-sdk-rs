@@ -34,7 +34,7 @@ use crate::robot::robot_impl::Piper;
 ///     .unwrap();
 /// ```
 pub struct PiperBuilder {
-    /// CAN 接口名称（Linux: "can0", macOS/Windows: 暂不使用，自动检测）
+    /// CAN 接口名称（Linux: "can0", macOS/Windows: 用作设备序列号，用于区分多个 GS-USB 设备）
     interface: Option<String>,
     /// CAN 波特率（1M, 500K, 250K 等）
     baud_rate: Option<u32>,
@@ -63,8 +63,22 @@ impl PiperBuilder {
     /// 设置 CAN 接口（可选，默认自动检测）
     ///
     /// # 注意
-    /// - macOS/Windows (GS-USB): 此参数暂不使用，自动检测第一个设备
+    /// - macOS/Windows (GS-USB): 此参数用作设备序列号，用于区分多个 GS-USB 设备
+    ///   - 如果提供序列号，只打开匹配序列号的设备
+    ///   - 如果不提供，自动选择第一个找到的设备
     /// - Linux (SocketCAN): 未来实现时将使用此参数（如 "can0"）
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use piper_sdk::robot::PiperBuilder;
+    ///
+    /// // 通过序列号指定设备
+    /// let piper = PiperBuilder::new()
+    ///     .interface("ABC123456")
+    ///     .build()
+    ///     .unwrap();
+    /// ```
     pub fn interface(mut self, interface: impl Into<String>) -> Self {
         self.interface = Some(interface.into());
         self
@@ -110,7 +124,12 @@ impl PiperBuilder {
         #[cfg(not(target_os = "linux"))]
         {
             // macOS/Windows: 使用 GS-USB 适配器
-            let mut can = GsUsbCanAdapter::new().map_err(RobotError::Can)?;
+            // 如果指定了 interface（序列号），使用它来过滤设备
+            let mut can = match self.interface {
+                Some(serial) => GsUsbCanAdapter::new_with_serial(Some(serial.as_str()))
+                    .map_err(RobotError::Can)?,
+                None => GsUsbCanAdapter::new().map_err(RobotError::Can)?,
+            };
 
             // 配置波特率（如果指定）
             let bitrate = self.baud_rate.unwrap_or(1_000_000);

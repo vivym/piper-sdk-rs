@@ -31,12 +31,42 @@ pub struct GsUsbCanAdapter {
 
 impl GsUsbCanAdapter {
     /// 创建新的适配器（扫描并打开设备）
+    ///
+    /// 如果没有指定序列号，自动选择第一个找到的设备。
     pub fn new() -> Result<Self, CanError> {
-        let mut devices = GsUsbDevice::scan()
+        Self::new_with_serial(None)
+    }
+
+    /// 创建新的适配器（按序列号指定设备）
+    ///
+    /// # 参数
+    /// - `serial_number`: 可选的设备序列号，如果提供，只打开匹配序列号的设备
+    ///
+    /// # 错误
+    /// - `CanError::Device`: 如果没有找到匹配的设备，或者扫描失败
+    pub fn new_with_serial(serial_number: Option<&str>) -> Result<Self, CanError> {
+        let mut devices = GsUsbDevice::scan_with_filter(serial_number)
             .map_err(|e| CanError::Device(format!("Failed to scan devices: {}", e)))?;
 
         if devices.is_empty() {
-            return Err(CanError::Device("No GS-USB device found".to_string()));
+            let error_msg = if let Some(sn) = serial_number {
+                format!("No GS-USB device found with serial number: {}", sn)
+            } else {
+                "No GS-USB device found".to_string()
+            };
+            return Err(CanError::Device(error_msg));
+        }
+
+        if devices.len() > 1 {
+            let warning_msg = if let Some(sn) = serial_number {
+                format!(
+                    "Multiple GS-USB devices found with serial number '{}', using the first one",
+                    sn
+                )
+            } else {
+                "Multiple GS-USB devices found, using the first one".to_string()
+            };
+            tracing::warn!("{}", warning_msg);
         }
 
         let device = devices.remove(0);
@@ -104,25 +134,31 @@ impl GsUsbCanAdapter {
         Ok(())
     }
 
-    /// 配置并启动设备（Normal 模式）
+    /// 配置并启动设备（Normal 模式，默认启用硬件时间戳）
+    ///
+    /// 对于机械臂场景，硬件时间戳对于精确的时间测量和力控算法至关重要。
     pub fn configure(&mut self, bitrate: u32) -> Result<(), CanError> {
-        self.configure_with_mode(bitrate, GS_CAN_MODE_NORMAL)
+        self.configure_with_mode(bitrate, GS_CAN_MODE_NORMAL | GS_CAN_MODE_HW_TIMESTAMP)
     }
 
-    /// 配置并启动设备（Loopback 模式，安全测试）
+    /// 配置并启动设备（Loopback 模式，安全测试，默认启用硬件时间戳）
     ///
     /// Loopback 模式下，发送的帧会在设备内部回环，不会向 CAN 总线发送。
     /// 这允许在安全的环境中测试完整的发送/接收路径。
+    ///
+    /// 对于机械臂场景，硬件时间戳对于精确的时间测量和力控算法至关重要。
     pub fn configure_loopback(&mut self, bitrate: u32) -> Result<(), CanError> {
-        self.configure_with_mode(bitrate, GS_CAN_MODE_LOOP_BACK)
+        self.configure_with_mode(bitrate, GS_CAN_MODE_LOOP_BACK | GS_CAN_MODE_HW_TIMESTAMP)
     }
 
-    /// 配置并启动设备（Listen-Only 模式，只接收不发送）
+    /// 配置并启动设备（Listen-Only 模式，只接收不发送，默认启用硬件时间戳）
     ///
     /// Listen-Only 模式下，设备不会发送任何帧，也不会发送 ACK。
     /// 适用于安全地监听 CAN 总线上的数据。
+    ///
+    /// 对于机械臂场景，硬件时间戳对于精确的时间测量和力控算法至关重要。
     pub fn configure_listen_only(&mut self, bitrate: u32) -> Result<(), CanError> {
-        self.configure_with_mode(bitrate, GS_CAN_MODE_LISTEN_ONLY)
+        self.configure_with_mode(bitrate, GS_CAN_MODE_LISTEN_ONLY | GS_CAN_MODE_HW_TIMESTAMP)
     }
 }
 

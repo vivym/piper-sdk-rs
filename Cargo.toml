@@ -20,7 +20,6 @@ rusb = "0.9.4"
 thiserror = "2.0.17"
 tracing = "0.1.44"
 
-[dev-dependencies.cargo-husky]
-version = "1"
-default-features = false
-features = ["user-hooks"]
+[dev-dependencies]
+cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+ctrlc = "3.5"

@@ -23,6 +23,8 @@ pub struct GsUsbDevice {
     interface_claimed: bool,
     /// 是否启用硬件时间戳模式
     hw_timestamp: bool,
+    /// 设备序列号（用于设备识别）
+    serial_number: Option<String>,
 }
 
 impl GsUsbDevice {
@@ -39,6 +41,21 @@ impl GsUsbDevice {
 
     /// 扫描所有 GS-USB 设备
     pub fn scan() -> Result<Vec<GsUsbDevice>, GsUsbError> {
+        Self::scan_with_filter(None)
+    }
+
+    /// 扫描所有 GS-USB 设备，可选地按序列号过滤
+    ///
+    /// # 参数
+    /// - `serial_number_filter`: 可选的序列号过滤器，如果提供，只返回匹配序列号的设备
+    ///
+    /// # 注意
+    /// - 如果设备没有序列号（序列号索引为 0 或读取失败），序列号字段将为 `None`
+    /// - 如果提供了 `serial_number_filter`，只有序列号匹配的设备会被返回
+    /// - 序列号匹配是大小写敏感的
+    pub fn scan_with_filter(
+        serial_number_filter: Option<&str>,
+    ) -> Result<Vec<GsUsbDevice>, GsUsbError> {
         let mut devices = Vec::new();
 
         for device in rusb::devices()?.iter() {
@@ -51,6 +68,37 @@ impl GsUsbDevice {
                 let handle = match device.open() {
                     Ok(handle) => handle,
                     Err(_) => continue,
+                };
+
+                // 尝试读取序列号
+                let serial_number = match desc.serial_number_string_index() {
+                    Some(idx) if idx != 0 => {
+                        match handle.read_string_descriptor_ascii(idx) {
+                            Ok(serial) => {
+                                // 如果提供了过滤器，检查是否匹配
+                                if let Some(filter) = serial_number_filter
+                                    && serial != filter
+                                {
+                                    continue; // 序列号不匹配，跳过此设备
+                                }
+                                Some(serial)
+                            },
+                            Err(_) => {
+                                // 读取序列号失败，但如果提供了过滤器，必须匹配，所以跳过
+                                if serial_number_filter.is_some() {
+                                    continue;
+                                }
+                                None
+                            },
+                        }
+                    },
+                    _ => {
+                        // 没有序列号，但如果提供了过滤器，必须匹配，所以跳过
+                        if serial_number_filter.is_some() {
+                            continue;
+                        }
+                        None
+                    },
                 };
 
                 // 查找接口和端点
@@ -87,11 +135,17 @@ impl GsUsbDevice {
                     started: false,
                     interface_claimed: false,
                     hw_timestamp: false,
+                    serial_number,
                 });
             }
         }
 
         Ok(devices)
+    }
+
+    /// 获取设备序列号
+    pub fn serial_number(&self) -> Option<&str> {
+        self.serial_number.as_deref()
     }
 
     /// 查找 Bulk IN/OUT 端点

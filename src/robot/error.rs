@@ -48,11 +48,11 @@ mod tests {
 
     /// 测试 RobotError 的 Display 实现
     #[test]
-    fn test_driver_error_display() {
+    fn test_robot_error_display() {
         // 测试 Can 错误
         let can_error = CanError::Timeout;
-        let driver_error = RobotError::Can(can_error);
-        let msg = format!("{}", driver_error);
+        let robot_error = RobotError::Can(can_error);
+        let msg = format!("{}", robot_error);
         assert!(
             msg.contains("Read timeout") || msg.contains("CAN"),
             "Can error message: {}",
@@ -64,8 +64,8 @@ mod tests {
             expected: 8,
             actual: 4,
         };
-        let driver_error = RobotError::Protocol(protocol_error);
-        let msg = format!("{}", driver_error);
+        let robot_error = RobotError::Protocol(protocol_error);
+        let msg = format!("{}", robot_error);
         assert!(
             msg.contains("Invalid frame length"),
             "Protocol error message: {}",
@@ -73,33 +73,33 @@ mod tests {
         );
 
         // 测试 ChannelClosed
-        let driver_error = RobotError::ChannelClosed;
-        let msg = format!("{}", driver_error);
+        let robot_error = RobotError::ChannelClosed;
+        let msg = format!("{}", robot_error);
         assert_eq!(msg, "Command channel closed");
 
         // 测试 ChannelFull
-        let driver_error = RobotError::ChannelFull;
-        let msg = format!("{}", driver_error);
+        let robot_error = RobotError::ChannelFull;
+        let msg = format!("{}", robot_error);
         assert!(msg.contains("channel full") || msg.contains("ChannelFull"));
 
         // 测试 PoisonedLock
-        let driver_error = RobotError::PoisonedLock;
-        let msg = format!("{}", driver_error);
+        let robot_error = RobotError::PoisonedLock;
+        let msg = format!("{}", robot_error);
         assert!(msg.contains("Poisoned lock") || msg.contains("PoisonedLock"));
 
         // 测试 IoThread
-        let driver_error = RobotError::IoThread("test error".to_string());
-        let msg = format!("{}", driver_error);
+        let robot_error = RobotError::IoThread("test error".to_string());
+        let msg = format!("{}", robot_error);
         assert!(msg.contains("IO thread") && msg.contains("test error"));
 
         // 测试 NotImplemented
-        let driver_error = RobotError::NotImplemented("feature".to_string());
-        let msg = format!("{}", driver_error);
+        let robot_error = RobotError::NotImplemented("feature".to_string());
+        let msg = format!("{}", robot_error);
         assert!(msg.contains("Not implemented") && msg.contains("feature"));
 
         // 测试 Timeout
-        let driver_error = RobotError::Timeout;
-        let msg = format!("{}", driver_error);
+        let robot_error = RobotError::Timeout;
+        let msg = format!("{}", robot_error);
         assert_eq!(msg, "Operation timeout");
     }
 
@@ -107,8 +107,8 @@ mod tests {
     #[test]
     fn test_from_can_error() {
         let can_error = CanError::Timeout;
-        let driver_error: RobotError = can_error.into();
-        match driver_error {
+        let robot_error: RobotError = can_error.into();
+        match robot_error {
             RobotError::Can(e) => assert!(matches!(e, CanError::Timeout)),
             _ => panic!("Expected Can variant"),
         }
@@ -118,8 +118,8 @@ mod tests {
     #[test]
     fn test_from_protocol_error() {
         let protocol_error = ProtocolError::InvalidCanId { id: 0x123 };
-        let driver_error: RobotError = protocol_error.into();
-        match driver_error {
+        let robot_error: RobotError = protocol_error.into();
+        match robot_error {
             RobotError::Protocol(e) => match e {
                 ProtocolError::InvalidCanId { id } => assert_eq!(id, 0x123),
                 _ => panic!("Expected InvalidCanId variant"),
