@@ -4,6 +4,12 @@
 
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+pub mod socketcan;
+
+#[cfg(target_os = "linux")]
+pub use socketcan::SocketCanAdapter;
+
 #[cfg(not(target_os = "linux"))]
 pub mod gs_usb;
 
@@ -37,7 +43,13 @@ pub struct PiperFrame {
     /// 当启用硬件时间戳模式（GS_CAN_MODE_HW_TIMESTAMP）时，
     /// 此字段包含设备硬件提供的时间戳，用于精确测量帧收发时间。
     /// 对于力控机械臂等实时控制系统，这是关键信息。
-    pub timestamp_us: u32,
+    ///
+    /// **类型说明**：使用 `u64` 而非 `u32`，原因：
+    /// - 支持绝对时间戳（Unix 纪元开始），无需基准时间管理
+    /// - 支持相对时间戳（从适配器启动开始），可覆盖更长的时间范围（584,000+ 年）
+    /// - 与状态层设计一致（`CoreMotionState.timestamp_us: u64`）
+    /// - 内存对齐后大小相同（24 字节），无额外开销
+    pub timestamp_us: u64,
 }
 
 impl PiperFrame {

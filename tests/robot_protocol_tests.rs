@@ -191,7 +191,7 @@ fn test_joint_driver_low_speed_feedback_update() {
         data[6..8].copy_from_slice(&bus_current.to_be_bytes());
 
         let mut frame = PiperFrame::new_standard(id as u16, &data);
-        frame.timestamp_us = 3000 + joint_index as u32;
+        frame.timestamp_us = 3000 + joint_index;
         mock_can_clone.queue_frame(frame);
     }
 
@@ -263,7 +263,7 @@ fn test_motor_limit_feedback_accumulation() {
         data[5..7].copy_from_slice(&max_velocity_rad_s.to_be_bytes());
 
         let mut frame = PiperFrame::new_standard(ID_MOTOR_LIMIT_FEEDBACK as u16, &data);
-        frame.timestamp_us = 4000 + joint_index as u32;
+        frame.timestamp_us = 4000 + joint_index as u64;
         mock_can_clone.queue_frame(frame);
     }
 
@@ -296,7 +296,7 @@ fn test_motor_max_accel_feedback_accumulation() {
         // Byte 3-7: 保留
 
         let mut frame = PiperFrame::new_standard(ID_MOTOR_MAX_ACCEL_FEEDBACK as u16, &data);
-        frame.timestamp_us = 5000 + joint_index as u32;
+        frame.timestamp_us = 5000 + joint_index as u64;
         mock_can_clone.queue_frame(frame);
     }
 

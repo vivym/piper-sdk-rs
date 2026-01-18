@@ -71,8 +71,8 @@ pub fn io_loop(
     // === 关节动态状态：缓冲提交（关键改进） ===
     let mut pending_joint_dynamic = JointDynamicState::default();
     let mut vel_update_mask: u8 = 0; // 位掩码：已收到的关节（Bit 0-5 对应 Joint 1-6）
-    let mut last_vel_commit_time_us: u32 = 0; // 上次速度帧提交时间（硬件时间戳，用于判断提交）
-    let mut last_vel_packet_time_us: u32 = 0; // 上次速度帧到达时间（硬件时间戳，用于判断超时）
+    let mut last_vel_commit_time_us: u64 = 0; // 上次速度帧提交时间（硬件时间戳，用于判断提交）
+    let mut last_vel_packet_time_us: u64 = 0; // 上次速度帧到达时间（硬件时间戳，用于判断超时）
     let mut last_vel_packet_instant = None::<std::time::Instant>; // 上次速度帧到达时间（系统时间，用于超时检查）
 
     // 注意：receive_timeout 当前未使用，因为 CanAdapter::receive() 的超时是在适配器内部处理的
@@ -117,8 +117,7 @@ pub fn io_loop(
                         );
                         // 注意：这里使用上次记录的硬件时间戳（如果为 0，说明没有收到过，此时不应该提交）
                         if last_vel_packet_time_us > 0 {
-                            pending_joint_dynamic.group_timestamp_us =
-                                last_vel_packet_time_us as u64;
+                            pending_joint_dynamic.group_timestamp_us = last_vel_packet_time_us;
                             pending_joint_dynamic.valid_mask = vel_update_mask;
                             ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
 
@@ -192,11 +191,11 @@ pub fn io_loop(
 
                     // 【Frame Commit】如果两个帧组都准备好，则提交完整状态
                     // 否则，从当前状态读取另一个字段，只更新关节位置
-                    // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
+                    // 注意：硬件时间戳使用 u64（与状态层一致）
                     if end_pose_ready {
                         // 两个帧组都完整，提交完整状态
                         let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us as u64,
+                            timestamp_us: frame.timestamp_us,
                             joint_pos: pending_joint_pos,
                             end_pose: pending_end_pose,
                         };
@@ -209,7 +208,7 @@ pub fn io_loop(
                         // 只有关节位置完整，从当前状态读取 end_pose 并更新
                         let current = ctx.core_motion.load();
                         let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us as u64,
+                            timestamp_us: frame.timestamp_us,
                             joint_pos: pending_joint_pos,
                             end_pose: current.end_pose, // 保留当前值
                         };
@@ -248,11 +247,11 @@ pub fn io_loop(
 
                     // 【Frame Commit】如果两个帧组都准备好，则提交完整状态
                     // 否则，从当前状态读取另一个字段，只更新末端位姿
-                    // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
+                    // 注意：硬件时间戳使用 u64（与状态层一致）
                     if joint_pos_ready {
                         // 两个帧组都完整，提交完整状态
                         let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us as u64,
+                            timestamp_us: frame.timestamp_us,
                             joint_pos: pending_joint_pos,
                             end_pose: pending_end_pose,
                         };
@@ -265,7 +264,7 @@ pub fn io_loop(
                         // 只有末端位姿完整，从当前状态读取 joint_pos 并更新
                         let current = ctx.core_motion.load();
                         let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us as u64,
+                            timestamp_us: frame.timestamp_us,
                             joint_pos: current.joint_pos, // 保留当前值
                             end_pose: pending_end_pose,
                         };
@@ -285,21 +284,20 @@ pub fn io_loop(
                     // 1. 更新缓冲区（而不是立即提交）
                     pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                     pending_joint_dynamic.joint_current[joint_index] = feedback.current();
-                    // 注意：硬件时间戳是 u32，但状态中使用 u64（用于与其他时间戳比较）
-                    pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us as u64;
+                    // 注意：硬件时间戳使用 u64（与状态层一致）
+                    pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us;
 
                     // 2. 标记该关节已更新
                     vel_update_mask |= 1 << joint_index;
                     // 更新硬件时间戳和系统时间戳（用于不同场景的检查）
-                    last_vel_packet_time_us = frame.timestamp_us; // 硬件时间戳（u32）
+                    last_vel_packet_time_us = frame.timestamp_us; // 硬件时间戳（u64）
                     last_vel_packet_instant = Some(std::time::Instant::now()); // 系统时间（用于超时检查）
 
                     // 3. 判断是否提交（混合策略：集齐或超时）
                     let all_received = vel_update_mask == 0b111111; // 0x3F，6 个关节全部收到
                     // 注意：硬件时间戳之间可以比较（来自同一个设备），但不能与系统时间戳比较
-                    // 硬件时间戳可能回绕（u32 微秒，约 71 分钟回绕一次）
-                    // 当回绕发生时，saturating_sub 会返回 0（立即提交）
-                    // 这是安全的：即使这次不提交，下一帧（约 2ms 后，500Hz 控制周期）到来时，all_received 逻辑会处理
+                    // 使用 u64 后，回绕风险大幅降低（584,000+ 年 vs 71 分钟）
+                    // 如果使用绝对时间戳（Unix 纪元），则不存在回绕问题
                     let time_since_last_commit =
                         frame.timestamp_us.saturating_sub(last_vel_commit_time_us);
                     let timeout_threshold_us = 1200; // 1.2ms 超时（防止丢帧导致死锁，单位：硬件时间戳微秒）
@@ -308,15 +306,15 @@ pub fn io_loop(
                     // 策略 B：超时提交（容错）
                     if all_received || time_since_last_commit > timeout_threshold_us {
                         // 原子性地一次性提交所有关节的速度
-                        // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
-                        pending_joint_dynamic.group_timestamp_us = frame.timestamp_us as u64;
+                        // 注意：硬件时间戳使用 u64（与状态层一致）
+                        pending_joint_dynamic.group_timestamp_us = frame.timestamp_us;
                         pending_joint_dynamic.valid_mask = vel_update_mask;
 
                         ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
 
                         // 重置状态（准备下一轮）
                         vel_update_mask = 0;
-                        last_vel_commit_time_us = frame.timestamp_us; // 硬件时间戳（u32）
+                        last_vel_commit_time_us = frame.timestamp_us; // 硬件时间戳（u64）
                         last_vel_packet_instant = None; // 重置系统时间戳
 
                         // 如果超时提交，记录警告（可能丢帧）
@@ -340,7 +338,7 @@ pub fn io_loop(
                 if let Ok(feedback) = RobotStatusFeedback::try_from(frame) {
                     ctx.control_status.rcu(|old| {
                         let mut new = (**old).clone();
-                        new.timestamp_us = frame.timestamp_us as u64;
+                        new.timestamp_us = frame.timestamp_us;
                         new.control_mode = feedback.control_mode as u8;
                         new.robot_status = feedback.robot_status as u8;
                         new.move_mode = feedback.move_mode as u8;
@@ -411,7 +409,7 @@ pub fn io_loop(
                 {
                     let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                     if joint_idx < 6 {
-                        diag.timestamp_us = frame.timestamp_us as u64;
+                        diag.timestamp_us = frame.timestamp_us;
                         diag.motor_temps[joint_idx] = feedback.motor_temp() as f32;
                         diag.driver_temps[joint_idx] = feedback.driver_temp() as f32;
                         diag.joint_voltage[joint_idx] = feedback.voltage() as f32;

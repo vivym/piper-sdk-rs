@@ -2,6 +2,8 @@
 //!
 //! 提供链式构造 `Piper` 实例的便捷方式。
 
+#[cfg(target_os = "linux")]
+use crate::can::SocketCanAdapter;
 #[cfg(not(target_os = "linux"))]
 use crate::can::gs_usb::GsUsbCanAdapter;
 use crate::robot::error::RobotError;
@@ -66,7 +68,9 @@ impl PiperBuilder {
     /// - macOS/Windows (GS-USB): 此参数用作设备序列号，用于区分多个 GS-USB 设备
     ///   - 如果提供序列号，只打开匹配序列号的设备
     ///   - 如果不提供，自动选择第一个找到的设备
-    /// - Linux (SocketCAN): 未来实现时将使用此参数（如 "can0"）
+    /// - Linux (SocketCAN): 此参数用作 CAN 接口名称（如 "can0" 或 "vcan0"）
+    ///   - 如果提供接口名称，使用指定的接口
+    ///   - 如果不提供，默认使用 "can0"
     ///
     /// # Example
     ///
@@ -102,7 +106,6 @@ impl PiperBuilder {
     ///
     /// # Errors
     /// - `RobotError::Can`: CAN 设备初始化失败
-    /// - `RobotError::NotImplemented`: Linux 平台尚未实现 SocketCAN
     ///
     /// # Example
     ///
@@ -141,12 +144,19 @@ impl PiperBuilder {
 
         #[cfg(target_os = "linux")]
         {
-            // Linux: SocketCAN 适配器（待实现）
-            let _ = self.interface; // 暂时忽略，避免未使用警告
-            let _ = self.baud_rate;
-            Err(RobotError::NotImplemented(
-                "SocketCAN not implemented yet".to_string(),
-            ))
+            // Linux: SocketCAN 适配器
+            // 打开 SocketCAN 接口（如果未指定，默认使用 "can0"）
+            let interface = self.interface.as_deref().unwrap_or("can0");
+            let mut can = SocketCanAdapter::new(interface).map_err(RobotError::Can)?;
+
+            // SocketCAN 的波特率由系统配置，但可以调用 configure 验证接口状态
+            // 如果指定了波特率，调用 configure（虽然不会真正设置，但可以验证接口可用性）
+            if let Some(bitrate) = self.baud_rate {
+                can.configure(bitrate).map_err(RobotError::Can)?;
+            }
+
+            // 创建 Piper 实例
+            Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
         }
     }
 }

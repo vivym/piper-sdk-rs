@@ -77,7 +77,7 @@ fn create_joint_feedback_frame(id: u32, j1_deg: f64, j2_deg: f64, timestamp: u32
     data[4..8].copy_from_slice(&j2_raw.to_be_bytes());
 
     let mut frame = PiperFrame::new_standard(id as u16, &data);
-    frame.timestamp_us = timestamp;
+    frame.timestamp_us = timestamp as u64;
     frame
 }
 
@@ -243,7 +243,7 @@ fn create_end_pose_frame(id: u32, val1: f64, val2: f64, timestamp: u32) -> Piper
     data[4..8].copy_from_slice(&val2_raw.to_be_bytes());
 
     let mut frame = PiperFrame::new_standard(id as u16, &data);
-    frame.timestamp_us = timestamp;
+    frame.timestamp_us = timestamp as u64;
     frame
 }
 
@@ -264,7 +264,7 @@ fn create_velocity_frame(
 
     let id = ID_JOINT_DRIVER_HIGH_SPEED_BASE + (joint_index as u32 - 1);
     let mut frame = PiperFrame::new_standard(id as u16, &data);
-    frame.timestamp_us = timestamp;
+    frame.timestamp_us = timestamp as u64;
     frame
 }
 
@@ -552,7 +552,7 @@ fn test_piper_stress_mixed_frame_sequence() {
     for i in 0..5 {
         let status_frame = create_robot_status_frame();
         let mut frame = status_frame;
-        frame.timestamp_us = 9000 + i as u32;
+        frame.timestamp_us = 9000 + i;
         frames.push(frame);
     }
 

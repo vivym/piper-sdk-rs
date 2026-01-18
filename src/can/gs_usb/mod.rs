@@ -329,7 +329,7 @@ impl CanAdapter for GsUsbCanAdapter {
                     data: gs_frame.data,
                     len: gs_frame.can_dlc.min(8),
                     is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-                    timestamp_us: gs_frame.timestamp_us, // 保留硬件时间戳
+                    timestamp_us: gs_frame.timestamp_us as u64, // 保留硬件时间戳（GS-USB 使用 u32，转换为 u64）
                 };
 
                 self.rx_queue.push_back(frame);
