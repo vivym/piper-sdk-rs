@@ -660,6 +660,181 @@ pub struct EndLimitConfigState {
     pub is_valid: bool,
 }
 
+// ============================================================================
+// 固件版本状态
+// ============================================================================
+
+/// 固件版本状态
+///
+/// 更新频率：按需查询
+/// CAN ID：0x4AF（多帧累积）
+/// 同步机制：RwLock（冷数据，更新频率低）
+#[derive(Debug, Clone, Default)]
+pub struct FirmwareVersionState {
+    /// 硬件时间戳（微秒，最后一帧的时间）
+    pub hardware_timestamp_us: u64,
+
+    /// 系统接收时间戳（微秒）
+    pub system_timestamp_us: u64,
+
+    /// 累积的固件数据（字节数组）
+    /// 注意：版本字符串需要从累积数据中解析
+    pub firmware_data: Vec<u8>,
+
+    /// 是否已收到完整数据
+    /// 注意：判断条件需要根据实际情况确定（例如收到特定结束标记）
+    pub is_complete: bool,
+
+    /// 解析后的版本字符串（缓存）
+    /// 如果 firmware_data 中包含有效的版本字符串，这里存储解析结果
+    pub version_string: Option<String>,
+}
+
+impl FirmwareVersionState {
+    /// 尝试从累积数据中解析版本字符串
+    pub fn parse_version(&mut self) -> Option<String> {
+        // 导入 FirmwareReadFeedback 的 parse_version_string 方法
+        use crate::protocol::feedback::FirmwareReadFeedback;
+        if let Some(version) = FirmwareReadFeedback::parse_version_string(&self.firmware_data) {
+            self.version_string = Some(version.clone());
+            Some(version)
+        } else {
+            None
+        }
+    }
+
+    /// 获取版本字符串（如果已解析）
+    pub fn version_string(&self) -> Option<&String> {
+        self.version_string.as_ref()
+    }
+}
+
+// ============================================================================
+// 主从模式控制指令状态
+// ============================================================================
+
+/// 主从模式控制模式指令状态
+///
+/// 更新频率：~200Hz（取决于主臂发送频率）
+/// CAN ID：0x151
+/// 同步机制：ArcSwap（温数据，高频访问）
+#[derive(Debug, Clone, Default)]
+pub struct MasterSlaveControlModeState {
+    /// 硬件时间戳（微秒）
+    pub hardware_timestamp_us: u64,
+
+    /// 系统接收时间戳（微秒）
+    pub system_timestamp_us: u64,
+
+    /// 控制模式指令（来自 0x151）
+    pub control_mode: u8, // ControlModeCommand as u8
+    pub move_mode: u8, // MoveMode as u8
+    pub speed_percent: u8,
+    pub mit_mode: u8, // MitMode as u8
+    pub trajectory_stay_time: u8,
+    pub install_position: u8, // InstallPosition as u8
+
+    /// 是否有效（已收到至少一帧）
+    pub is_valid: bool,
+}
+
+/// 主从模式关节控制指令状态（帧组同步）
+///
+/// 更新频率：~500Hz（取决于主臂发送频率）
+/// CAN ID：0x155-0x157（帧组：J1-J2, J3-J4, J5-J6）
+/// 同步机制：ArcSwap（温数据，帧组同步）
+///
+/// **注意**：这是一个帧组，类似于 `JointPositionState`，需要集齐 3 帧后一起提交
+#[derive(Debug, Clone, Default)]
+pub struct MasterSlaveJointControlState {
+    /// 硬件时间戳（微秒，来自完整帧组的最后一帧）
+    pub hardware_timestamp_us: u64,
+
+    /// 系统接收时间戳（微秒，系统接收到完整帧组的时间）
+    pub system_timestamp_us: u64,
+
+    /// 关节目标角度（度，0.001°单位）[J1, J2, J3, J4, J5, J6]
+    pub joint_target_deg: [i32; 6],
+
+    /// 帧组有效性掩码（Bit 0-2 对应 0x155, 0x156, 0x157）
+    /// - 1 表示该CAN帧已收到
+    /// - 0 表示该CAN帧未收到（可能丢包）
+    pub frame_valid_mask: u8,
+}
+
+impl MasterSlaveJointControlState {
+    /// 检查是否接收到了完整的帧组 (0x155, 0x156, 0x157)
+    ///
+    /// **返回值**：
+    /// - `true`：所有3个CAN帧都已收到，数据完整
+    /// - `false`：部分CAN帧丢失，数据不完整
+    pub fn is_fully_valid(&self) -> bool {
+        self.frame_valid_mask == 0b0000_0111 // Bit 0-2 全部为 1
+    }
+
+    /// 获取丢失的CAN帧索引（用于调试）
+    ///
+    /// **返回值**：丢失的CAN帧索引列表（0=0x155, 1=0x156, 2=0x157）
+    pub fn missing_frames(&self) -> Vec<usize> {
+        (0..3).filter(|&i| (self.frame_valid_mask & (1 << i)) == 0).collect()
+    }
+
+    /// 获取关节目标角度（度）
+    pub fn joint_target_deg(&self, joint_index: usize) -> Option<f64> {
+        if joint_index < 6 {
+            Some(self.joint_target_deg[joint_index] as f64 / 1000.0)
+        } else {
+            None
+        }
+    }
+
+    /// 获取关节目标角度（弧度）
+    pub fn joint_target_rad(&self, joint_index: usize) -> Option<f64> {
+        self.joint_target_deg(joint_index).map(|deg| deg * std::f64::consts::PI / 180.0)
+    }
+}
+
+/// 主从模式夹爪控制指令状态
+///
+/// 更新频率：~200Hz（取决于主臂发送频率）
+/// CAN ID：0x159
+/// 同步机制：ArcSwap（温数据，高频访问）
+#[derive(Debug, Clone, Default)]
+pub struct MasterSlaveGripperControlState {
+    /// 硬件时间戳（微秒）
+    pub hardware_timestamp_us: u64,
+
+    /// 系统接收时间戳（微秒）
+    pub system_timestamp_us: u64,
+
+    /// 夹爪目标行程（mm，0.001mm单位）
+    pub gripper_target_travel_mm: i32,
+
+    /// 夹爪目标扭矩（N·m，0.001N·m单位）
+    pub gripper_target_torque_nm: i16,
+
+    /// 夹爪状态码
+    pub gripper_status_code: u8,
+
+    /// 夹爪回零设置
+    pub gripper_set_zero: u8,
+
+    /// 是否有效（已收到至少一帧）
+    pub is_valid: bool,
+}
+
+impl MasterSlaveGripperControlState {
+    /// 获取夹爪目标行程（mm）
+    pub fn gripper_target_travel(&self) -> f64 {
+        self.gripper_target_travel_mm as f64 / 1000.0
+    }
+
+    /// 获取夹爪目标扭矩（N·m）
+    pub fn gripper_target_torque(&self) -> f64 {
+        self.gripper_target_torque_nm as f64 / 1000.0
+    }
+}
+
 /// Piper 上下文（所有状态的聚合）
 pub struct PiperContext {
     // === 热数据（500Hz，高频运动数据）===
@@ -697,6 +872,20 @@ pub struct PiperContext {
 
     /// 末端限制配置状态（按需查询：0x478）
     pub end_limit_config: Arc<RwLock<EndLimitConfigState>>,
+
+    // === 冷数据（固件版本）===
+    /// 固件版本状态（按需查询：0x4AF）
+    pub firmware_version: Arc<RwLock<FirmwareVersionState>>,
+
+    // === 温数据（主从模式）===
+    /// 主从模式控制模式指令状态（主从模式：0x151）
+    pub master_slave_control_mode: Arc<ArcSwap<MasterSlaveControlModeState>>,
+
+    /// 主从模式关节控制指令状态（主从模式：0x155-0x157，帧组同步）
+    pub master_slave_joint_control: Arc<ArcSwap<MasterSlaveJointControlState>>,
+
+    /// 主从模式夹爪控制指令状态（主从模式：0x159）
+    pub master_slave_gripper_control: Arc<ArcSwap<MasterSlaveGripperControlState>>,
 
     // === FPS 统计 ===
     // 使用原子计数器，无锁读取，适合实时监控
@@ -741,6 +930,20 @@ impl PiperContext {
             joint_limit_config: Arc::new(RwLock::new(JointLimitConfigState::default())),
             joint_accel_config: Arc::new(RwLock::new(JointAccelConfigState::default())),
             end_limit_config: Arc::new(RwLock::new(EndLimitConfigState::default())),
+
+            // 冷数据：固件版本
+            firmware_version: Arc::new(RwLock::new(FirmwareVersionState::default())),
+
+            // 温数据：主从模式控制指令状态
+            master_slave_control_mode: Arc::new(ArcSwap::from_pointee(
+                MasterSlaveControlModeState::default(),
+            )),
+            master_slave_joint_control: Arc::new(ArcSwap::from_pointee(
+                MasterSlaveJointControlState::default(),
+            )),
+            master_slave_gripper_control: Arc::new(ArcSwap::from_pointee(
+                MasterSlaveGripperControlState::default(),
+            )),
 
             // FPS 统计：原子计数器
             fps_stats: Arc::new(FpsStatistics::new()),

@@ -28,6 +28,12 @@ pub struct FpsStatistics {
     pub(crate) joint_limit_config_updates: AtomicU64,
     pub(crate) joint_accel_config_updates: AtomicU64,
     pub(crate) end_limit_config_updates: AtomicU64,
+    pub(crate) firmware_version_updates: AtomicU64,
+
+    // 主从模式控制指令更新计数器
+    pub(crate) master_slave_control_mode_updates: AtomicU64,
+    pub(crate) master_slave_joint_control_updates: AtomicU64,
+    pub(crate) master_slave_gripper_control_updates: AtomicU64,
 
     // 统计窗口开始时间
     pub(crate) window_start: Instant,
@@ -47,6 +53,10 @@ impl FpsStatistics {
             joint_limit_config_updates: AtomicU64::new(0),
             joint_accel_config_updates: AtomicU64::new(0),
             end_limit_config_updates: AtomicU64::new(0),
+            firmware_version_updates: AtomicU64::new(0),
+            master_slave_control_mode_updates: AtomicU64::new(0),
+            master_slave_joint_control_updates: AtomicU64::new(0),
+            master_slave_gripper_control_updates: AtomicU64::new(0),
             window_start: Instant::now(),
         }
     }
@@ -67,6 +77,10 @@ impl FpsStatistics {
         self.joint_limit_config_updates.store(0, Ordering::Relaxed);
         self.joint_accel_config_updates.store(0, Ordering::Relaxed);
         self.end_limit_config_updates.store(0, Ordering::Relaxed);
+        self.firmware_version_updates.store(0, Ordering::Relaxed);
+        self.master_slave_control_mode_updates.store(0, Ordering::Relaxed);
+        self.master_slave_joint_control_updates.store(0, Ordering::Relaxed);
+        self.master_slave_gripper_control_updates.store(0, Ordering::Relaxed);
         self.window_start = Instant::now();
     }
 
@@ -101,6 +115,20 @@ impl FpsStatistics {
                 / elapsed_secs,
             end_limit_config: self.end_limit_config_updates.load(Ordering::Relaxed) as f64
                 / elapsed_secs,
+            firmware_version: self.firmware_version_updates.load(Ordering::Relaxed) as f64
+                / elapsed_secs,
+            master_slave_control_mode: self
+                .master_slave_control_mode_updates
+                .load(Ordering::Relaxed) as f64
+                / elapsed_secs,
+            master_slave_joint_control: self
+                .master_slave_joint_control_updates
+                .load(Ordering::Relaxed) as f64
+                / elapsed_secs,
+            master_slave_gripper_control: self
+                .master_slave_gripper_control_updates
+                .load(Ordering::Relaxed) as f64
+                / elapsed_secs,
         }
     }
 
@@ -123,6 +151,16 @@ impl FpsStatistics {
             joint_limit_config: self.joint_limit_config_updates.load(Ordering::Relaxed),
             joint_accel_config: self.joint_accel_config_updates.load(Ordering::Relaxed),
             end_limit_config: self.end_limit_config_updates.load(Ordering::Relaxed),
+            firmware_version: self.firmware_version_updates.load(Ordering::Relaxed),
+            master_slave_control_mode: self
+                .master_slave_control_mode_updates
+                .load(Ordering::Relaxed),
+            master_slave_joint_control: self
+                .master_slave_joint_control_updates
+                .load(Ordering::Relaxed),
+            master_slave_gripper_control: self
+                .master_slave_gripper_control_updates
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -168,6 +206,14 @@ pub struct FpsResult {
     pub joint_accel_config: f64,
     /// 末端限制配置状态 FPS（预期：按需查询）
     pub end_limit_config: f64,
+    /// 固件版本状态 FPS（预期：按需查询）
+    pub firmware_version: f64,
+    /// 主从模式控制模式指令状态 FPS（预期：~200Hz）
+    pub master_slave_control_mode: f64,
+    /// 主从模式关节控制指令状态 FPS（预期：~500Hz）
+    pub master_slave_joint_control: f64,
+    /// 主从模式夹爪控制指令状态 FPS（预期：~200Hz）
+    pub master_slave_gripper_control: f64,
 }
 
 /// FPS 计数器值
@@ -195,6 +241,14 @@ pub struct FpsCounts {
     pub joint_accel_config: u64,
     /// 末端限制配置状态更新次数
     pub end_limit_config: u64,
+    /// 固件版本状态更新次数
+    pub firmware_version: u64,
+    /// 主从模式控制模式指令状态更新次数
+    pub master_slave_control_mode: u64,
+    /// 主从模式关节控制指令状态更新次数
+    pub master_slave_joint_control: u64,
+    /// 主从模式夹爪控制指令状态更新次数
+    pub master_slave_gripper_control: u64,
 }
 
 #[cfg(test)]

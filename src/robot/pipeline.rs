@@ -76,6 +76,10 @@ pub fn io_loop(
     let mut last_vel_packet_time_us: u64 = 0; // 上次速度帧到达时间（硬件时间戳，用于判断超时）
     let mut last_vel_packet_instant = None::<std::time::Instant>; // 上次速度帧到达时间（系统时间，用于超时检查）
 
+    // === 主从模式关节控制指令状态：帧组同步（0x155-0x157） ===
+    let mut pending_joint_target_deg: [i32; 6] = [0; 6];
+    let mut joint_control_frame_mask: u8 = 0; // Bit 0-2 对应 0x155, 0x156, 0x157
+
     // 注意：receive_timeout 当前未使用，因为 CanAdapter::receive() 的超时是在适配器内部处理的
     // 如果需要未来扩展（例如动态调整接收超时），可以在这里使用 config.receive_timeout_ms
     let frame_group_timeout = Duration::from_millis(config.frame_group_timeout_ms);
@@ -99,6 +103,8 @@ pub fn io_loop(
                     pending_end_pose = [0.0; 6];
                     joint_pos_frame_mask = 0;
                     end_pose_frame_mask = 0;
+                    pending_joint_target_deg = [0; 6];
+                    joint_control_frame_mask = 0;
                 }
 
                 // === 检查速度帧缓冲区超时（关键：避免僵尸缓冲区） ===
@@ -108,7 +114,10 @@ pub fn io_loop(
                     && let Some(last_vel_instant) = last_vel_packet_instant
                 {
                     let elapsed_since_last_vel = last_vel_instant.elapsed();
-                    let vel_timeout_threshold = Duration::from_micros(2000); // 2ms 超时（防止僵尸数据）
+                    // 超时阈值：设置为 6ms，与正常提交逻辑的超时阈值保持一致
+                    // 如果每个关节的帧是 200Hz（5ms 周期），6 个关节的帧应该在 5ms 内全部到达
+                    // 因此超时阈值应该 >= 5ms，这里设置为 6ms 以提供一定的容错空间
+                    let vel_timeout_threshold = Duration::from_micros(6000); // 6ms 超时（防止僵尸数据）
 
                     if elapsed_since_last_vel > vel_timeout_threshold {
                         // 超时：强制提交不完整的数据（设置 valid_mask 标记不完整）
@@ -298,10 +307,13 @@ pub fn io_loop(
                     // 如果使用绝对时间戳（Unix 纪元），则不存在回绕问题
                     let time_since_last_commit =
                         frame.timestamp_us.saturating_sub(last_vel_commit_time_us);
-                    let timeout_threshold_us = 1200; // 1.2ms 超时（防止丢帧导致死锁，单位：硬件时间戳微秒）
+                    // 超时阈值：设置为 5ms（200Hz 的周期），避免在集齐 6 个关节前频繁触发超时提交
+                    // 如果每个关节的帧是 200Hz（5ms 周期），6 个关节的帧应该在 5ms 内全部到达
+                    // 因此超时阈值应该 >= 5ms，这里设置为 6ms 以提供一定的容错空间
+                    let timeout_threshold_us = 6000; // 6ms 超时（防止丢帧导致死锁，单位：硬件时间戳微秒）
 
-                    // 策略 A：集齐 6 个关节（严格同步）
-                    // 策略 B：超时提交（容错）
+                    // 策略 A：集齐 6 个关节（严格同步，优先策略）
+                    // 策略 B：超时提交（容错，仅在长时间未收到新帧时触发）
                     if all_received || time_since_last_commit > timeout_threshold_us {
                         // 原子性地一次性提交所有关节的速度
                         // 注意：硬件时间戳使用 u64（与状态层一致）
@@ -675,6 +687,145 @@ pub fn io_loop(
                         feedback.max_linear_velocity(),
                         feedback.max_angular_velocity()
                     );
+                }
+            },
+
+            // ============================================================
+            // Phase 4: 固件版本和主从模式控制指令反馈
+            // ============================================================
+            ID_FIRMWARE_READ => {
+                // FirmwareReadFeedback (0x4AF) - 累积固件版本数据
+                if let Ok(feedback) = FirmwareReadFeedback::try_from(frame) {
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    if let Ok(mut firmware_state) = ctx.firmware_version.write() {
+                        // 累积数据
+                        firmware_state.firmware_data.extend_from_slice(feedback.firmware_data());
+
+                        // 更新时间戳
+                        firmware_state.hardware_timestamp_us = frame.timestamp_us;
+                        firmware_state.system_timestamp_us = system_timestamp_us;
+
+                        // 尝试解析版本字符串
+                        firmware_state.parse_version();
+
+                        // TODO: 判断数据是否完整的逻辑（例如收到特定结束标记）
+                        // firmware_state.is_complete = ...
+                    }
+
+                    ctx.fps_stats
+                        .firmware_version_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!("FirmwareVersionState updated");
+                }
+            },
+
+            ID_CONTROL_MODE => {
+                // ControlModeCommandFeedback (0x151) - 主从模式控制模式指令反馈
+                if let Ok(feedback) = ControlModeCommandFeedback::try_from(frame) {
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    let new_state = MasterSlaveControlModeState {
+                        hardware_timestamp_us: frame.timestamp_us,
+                        system_timestamp_us,
+                        control_mode: feedback.control_mode as u8,
+                        move_mode: feedback.move_mode as u8,
+                        speed_percent: feedback.speed_percent,
+                        mit_mode: feedback.mit_mode as u8,
+                        trajectory_stay_time: feedback.trajectory_stay_time,
+                        install_position: feedback.install_position as u8,
+                        is_valid: true,
+                    };
+
+                    ctx.master_slave_control_mode.store(Arc::new(new_state));
+                    ctx.fps_stats
+                        .master_slave_control_mode_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!("MasterSlaveControlModeState updated");
+                }
+            },
+
+            ID_JOINT_CONTROL_12 => {
+                // JointControl12Feedback (0x155) - 帧组第一帧
+                if let Ok(feedback) = JointControl12Feedback::try_from(frame) {
+                    pending_joint_target_deg[0] = feedback.j1_deg;
+                    pending_joint_target_deg[1] = feedback.j2_deg;
+                    joint_control_frame_mask |= 1 << 0; // Bit 0 = 0x155
+                }
+            },
+
+            ID_JOINT_CONTROL_34 => {
+                // JointControl34Feedback (0x156) - 帧组第二帧
+                if let Ok(feedback) = JointControl34Feedback::try_from(frame) {
+                    pending_joint_target_deg[2] = feedback.j3_deg;
+                    pending_joint_target_deg[3] = feedback.j4_deg;
+                    joint_control_frame_mask |= 1 << 1; // Bit 1 = 0x156
+                }
+            },
+
+            ID_JOINT_CONTROL_56 => {
+                // JointControl56Feedback (0x157) - 帧组最后一帧
+                if let Ok(feedback) = JointControl56Feedback::try_from(frame) {
+                    pending_joint_target_deg[4] = feedback.j5_deg;
+                    pending_joint_target_deg[5] = feedback.j6_deg;
+                    joint_control_frame_mask |= 1 << 2; // Bit 2 = 0x157
+
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    // 提交新的 MasterSlaveJointControlState
+                    let new_state = MasterSlaveJointControlState {
+                        hardware_timestamp_us: frame.timestamp_us,
+                        system_timestamp_us,
+                        joint_target_deg: pending_joint_target_deg,
+                        frame_valid_mask: joint_control_frame_mask,
+                    };
+
+                    ctx.master_slave_joint_control.store(Arc::new(new_state));
+                    ctx.fps_stats
+                        .master_slave_joint_control_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!(
+                        "MasterSlaveJointControlState committed: mask={:03b}",
+                        joint_control_frame_mask
+                    );
+
+                    // 重置帧组掩码
+                    joint_control_frame_mask = 0;
+                }
+            },
+
+            ID_GRIPPER_CONTROL => {
+                // GripperControlFeedback (0x159) - 主从模式夹爪控制指令反馈
+                if let Ok(feedback) = GripperControlFeedback::try_from(frame) {
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    let new_state = MasterSlaveGripperControlState {
+                        hardware_timestamp_us: frame.timestamp_us,
+                        system_timestamp_us,
+                        gripper_target_travel_mm: feedback.travel_mm,
+                        gripper_target_torque_nm: feedback.torque_nm,
+                        gripper_status_code: feedback.status_code,
+                        gripper_set_zero: feedback.set_zero,
+                        is_valid: true,
+                    };
+
+                    ctx.master_slave_gripper_control.store(Arc::new(new_state));
+                    ctx.fps_stats
+                        .master_slave_gripper_control_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!("MasterSlaveGripperControlState updated");
                 }
             },
 

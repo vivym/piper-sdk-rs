@@ -43,6 +43,9 @@ pub const ID_JOINT_DRIVER_LOW_SPEED_BASE: u32 = 0x261;
 /// 关节末端速度/加速度反馈（0x481~0x486）
 pub const ID_JOINT_END_VELOCITY_ACCEL_BASE: u32 = 0x481;
 
+/// 固件版本读取反馈
+pub const ID_FIRMWARE_READ: u32 = 0x4AF;
+
 // ============================================================================
 // 控制帧 ID 常量
 // ============================================================================
@@ -149,8 +152,10 @@ impl FrameType {
     pub fn from_id(id: u32) -> Self {
         match id {
             // 反馈帧范围
-            0x2A1..=0x2A8 | 0x251..=0x256 | 0x261..=0x266 | 0x481..=0x486 => FrameType::Feedback,
-            // 控制帧范围
+            0x2A1..=0x2A8 | 0x251..=0x256 | 0x261..=0x266 | 0x481..=0x486 | 0x4AF => {
+                FrameType::Feedback
+            },
+            // 控制帧范围（注意：在主从模式下，0x151, 0x155-0x157, 0x159 也可能作为反馈解析）
             0x150..=0x15F => FrameType::Control,
             // 配置帧范围
             0x470..=0x47E => FrameType::Config,

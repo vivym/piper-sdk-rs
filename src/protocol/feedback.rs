@@ -4,11 +4,13 @@
 //! 和物理量转换方法。
 
 use crate::can::PiperFrame;
+use crate::protocol::control::{ControlModeCommand, InstallPosition, MitMode};
 use crate::protocol::{
     ProtocolError, bytes_to_i16_be, bytes_to_i32_be,
     ids::{
-        ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_GRIPPER_FEEDBACK,
-        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE,
+        ID_CONTROL_MODE, ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_FIRMWARE_READ,
+        ID_GRIPPER_CONTROL, ID_GRIPPER_FEEDBACK, ID_JOINT_CONTROL_12, ID_JOINT_CONTROL_34,
+        ID_JOINT_CONTROL_56, ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE,
         ID_JOINT_END_VELOCITY_ACCEL_BASE, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
         ID_JOINT_FEEDBACK_56, ID_ROBOT_STATUS,
     },
@@ -747,7 +749,7 @@ impl TryFrom<PiperFrame> for EndPoseFeedback3 {
 pub struct JointDriverHighSpeedFeedback {
     pub joint_index: u8,   // 从 ID 推导：0x251 -> 1, 0x252 -> 2, ...
     pub speed_rad_s: i16,  // Byte 0-1: 速度，单位 0.001rad/s
-    pub current_a: u16,    // Byte 2-3: 电流，单位 0.001A
+    pub current_a: i16,    // Byte 2-3: 电流，单位 0.001A（有符号 i16，支持负值表示反向电流）
     pub position_rad: i32, // Byte 4-7: 位置，单位 rad (TODO: 需要确认真实单位)
 }
 
@@ -770,7 +772,7 @@ impl JointDriverHighSpeedFeedback {
     }
 
     /// 获取电流原始值（0.001A 单位）
-    pub fn current_raw(&self) -> u16 {
+    pub fn current_raw(&self) -> i16 {
         self.current_a
     }
 
@@ -785,6 +787,8 @@ impl JointDriverHighSpeedFeedback {
     }
 
     /// 获取电流（A）
+    ///
+    /// 注意：电流可以为负值（反向电流）
     pub fn current(&self) -> f64 {
         self.current_a as f64 / 1000.0
     }
@@ -882,9 +886,9 @@ impl TryFrom<PiperFrame> for JointDriverHighSpeedFeedback {
         let speed_bytes = [frame.data[0], frame.data[1]];
         let speed_rad_s = bytes_to_i16_be(speed_bytes);
 
-        // 解析电流（Byte 2-3，大端字节序，u16）
+        // 解析电流（Byte 2-3，大端字节序，i16，支持负值表示反向电流）
         let current_bytes = [frame.data[2], frame.data[3]];
-        let current_a = u16::from_be_bytes(current_bytes);
+        let current_a = bytes_to_i16_be(current_bytes);
 
         // 解析位置（Byte 4-7，大端字节序，i32）
         let position_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
@@ -1827,7 +1831,7 @@ mod tests {
 
         assert_eq!(feedback.joint_index, 1);
         assert_eq!(feedback.speed_raw(), 1500);
-        assert_eq!(feedback.current_raw(), 2500);
+        assert_eq!(feedback.current_raw(), 2500i16); // 电流现在是有符号 i16
         assert_eq!(feedback.position_raw(), 1000000);
         assert!((feedback.speed() - 1.5).abs() < 0.0001);
         assert!((feedback.current() - 2.5).abs() < 0.0001);
@@ -1872,7 +1876,7 @@ mod tests {
         // 测试边界值
         // 最大速度：i16::MAX = 32767 = 32.767 rad/s
         let speed_val = i16::MAX;
-        let current_val = u16::MAX; // 65535 = 65.535 A
+        let current_val = i16::MAX; // 32767 = 32.767 A（最大正电流）
         let position_val = i32::MAX;
 
         let mut data = [0u8; 8];
@@ -1884,7 +1888,7 @@ mod tests {
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.speed_raw(), i16::MAX);
-        assert_eq!(feedback.current_raw(), u16::MAX);
+        assert_eq!(feedback.current_raw(), i16::MAX);
         assert_eq!(feedback.position_raw(), i32::MAX);
     }
 
@@ -2341,5 +2345,342 @@ mod tests {
         let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE as u16, &[0; 7]);
         let result = JointEndVelocityAccelFeedback::try_from(frame);
         assert!(result.is_err());
+    }
+}
+
+// ============================================================================
+// 固件版本读取反馈结构体
+// ============================================================================
+
+/// 固件版本读取反馈 (0x4AF)
+///
+/// 用于接收机械臂固件版本信息。
+/// 注意：固件版本数据可能是分多个 CAN 帧传输的，需要累积接收。
+#[derive(Debug, Clone, Default)]
+pub struct FirmwareReadFeedback {
+    pub firmware_data: [u8; 8],
+}
+
+impl FirmwareReadFeedback {
+    /// 获取固件数据原始字节
+    pub fn firmware_data(&self) -> &[u8; 8] {
+        &self.firmware_data
+    }
+
+    /// 尝试从累积的固件数据中解析版本字符串
+    ///
+    /// 固件版本字符串通常以 "S-V" 开头，后面跟版本号。
+    /// 此方法会在累积数据中查找版本字符串。
+    ///
+    /// # 参数
+    /// - `accumulated_data`: 累积的固件数据（可能包含多个 CAN 帧的数据）
+    ///
+    /// # 返回值
+    /// 如果找到版本字符串，返回 `Some(String)`，否则返回 `None`
+    pub fn parse_version_string(accumulated_data: &[u8]) -> Option<String> {
+        // 查找 "S-V" 标记
+        if let Some(version_start) = accumulated_data.windows(3).position(|w| w == b"S-V") {
+            // 从 "S-V" 后开始，查找版本字符串的结束位置（通常是换行符或字符串结束）
+            let version_start = version_start + 3;
+            let version_end = accumulated_data[version_start..]
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r' || b == 0)
+                .map(|pos| version_start + pos)
+                .unwrap_or(accumulated_data.len().min(version_start + 20)); // 最多读取20个字符
+
+            let version_bytes = &accumulated_data[version_start..version_end];
+            String::from_utf8(version_bytes.to_vec()).ok().map(|s| s.trim().to_string())
+        } else {
+            None
+        }
+    }
+}
+
+impl TryFrom<PiperFrame> for FirmwareReadFeedback {
+    type Error = ProtocolError;
+
+    fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
+        // 验证 CAN ID
+        if frame.id != ID_FIRMWARE_READ {
+            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        }
+
+        // 验证数据长度（至少需要 1 字节，最多 8 字节）
+        if frame.len == 0 {
+            return Err(ProtocolError::InvalidLength {
+                expected: 1,
+                actual: 0,
+            });
+        }
+
+        let mut firmware_data = [0u8; 8];
+        let copy_len = (frame.len as usize).min(8);
+        firmware_data[..copy_len].copy_from_slice(&frame.data[..copy_len]);
+
+        Ok(Self { firmware_data })
+    }
+}
+
+#[cfg(test)]
+mod firmware_read_tests {
+    use super::*;
+
+    #[test]
+    fn test_firmware_read_feedback_parse() {
+        // 测试数据：包含 "S-V1.6-3" 版本字符串
+        let data = b"S-V1.6-3";
+        let frame = PiperFrame::new_standard(ID_FIRMWARE_READ as u16, data);
+        let feedback = FirmwareReadFeedback::try_from(frame).unwrap();
+
+        assert_eq!(&feedback.firmware_data[..8], data);
+    }
+
+    #[test]
+    fn test_firmware_read_feedback_parse_version_string() {
+        // 测试解析版本字符串
+        let accumulated_data = b"Some prefix S-V1.6-3\nOther data";
+        let version = FirmwareReadFeedback::parse_version_string(accumulated_data);
+        assert_eq!(version, Some("1.6-3".to_string()));
+    }
+
+    #[test]
+    fn test_firmware_read_feedback_parse_version_string_not_found() {
+        // 测试未找到版本字符串
+        let accumulated_data = b"Some data without version";
+        let version = FirmwareReadFeedback::parse_version_string(accumulated_data);
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn test_firmware_read_feedback_invalid_id() {
+        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let result = FirmwareReadFeedback::try_from(frame);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_firmware_read_feedback_empty_data() {
+        let frame = PiperFrame::new_standard(ID_FIRMWARE_READ as u16, &[]);
+        let result = FirmwareReadFeedback::try_from(frame);
+        assert!(result.is_err());
+    }
+}
+
+// ============================================================================
+// 主从模式控制指令反馈（用于接收主臂发送的控制指令）
+// ============================================================================
+
+/// 主从模式控制模式指令反馈 (0x151)
+///
+/// 在主从模式下，示教输入臂会发送控制指令给运动输出臂。
+/// 此反馈用于解析从示教输入臂接收到的控制模式指令。
+///
+/// 注意：此结构与 `ControlModeCommandFrame` 相同，但用于接收而非发送。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ControlModeCommandFeedback {
+    pub control_mode: ControlModeCommand,
+    pub move_mode: MoveMode,
+    pub speed_percent: u8,
+    pub mit_mode: MitMode,
+    pub trajectory_stay_time: u8,
+    pub install_position: InstallPosition,
+}
+
+impl TryFrom<PiperFrame> for ControlModeCommandFeedback {
+    type Error = ProtocolError;
+
+    fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
+        // 验证 CAN ID
+        if frame.id != ID_CONTROL_MODE {
+            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        }
+
+        // 验证数据长度
+        if frame.len < 6 {
+            return Err(ProtocolError::InvalidLength {
+                expected: 6,
+                actual: frame.len as usize,
+            });
+        }
+
+        Ok(Self {
+            control_mode: ControlModeCommand::try_from(frame.data[0])?,
+            move_mode: MoveMode::from(frame.data[1]),
+            speed_percent: frame.data[2],
+            mit_mode: MitMode::try_from(frame.data[3])?,
+            trajectory_stay_time: frame.data[4],
+            install_position: InstallPosition::try_from(frame.data[5])?,
+        })
+    }
+}
+
+/// 主从模式关节控制指令反馈 (0x155-0x157)
+///
+/// 在主从模式下，示教输入臂会发送关节控制指令给运动输出臂。
+/// 此反馈用于解析从示教输入臂接收到的关节控制指令。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JointControlFeedback {
+    pub j1_deg: i32,
+    pub j2_deg: i32,
+    pub j3_deg: i32,
+    pub j4_deg: i32,
+    pub j5_deg: i32,
+    pub j6_deg: i32,
+}
+
+impl JointControlFeedback {
+    /// 从 0x155 (J1-J2) 帧更新
+    pub fn update_from_12(&mut self, feedback: JointControl12Feedback) {
+        self.j1_deg = feedback.j1_deg;
+        self.j2_deg = feedback.j2_deg;
+    }
+
+    /// 从 0x156 (J3-J4) 帧更新
+    pub fn update_from_34(&mut self, feedback: JointControl34Feedback) {
+        self.j3_deg = feedback.j3_deg;
+        self.j4_deg = feedback.j4_deg;
+    }
+
+    /// 从 0x157 (J5-J6) 帧更新
+    pub fn update_from_56(&mut self, feedback: JointControl56Feedback) {
+        self.j5_deg = feedback.j5_deg;
+        self.j6_deg = feedback.j6_deg;
+    }
+}
+
+/// 主从模式关节控制指令反馈12 (0x155)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JointControl12Feedback {
+    pub j1_deg: i32,
+    pub j2_deg: i32,
+}
+
+impl TryFrom<PiperFrame> for JointControl12Feedback {
+    type Error = ProtocolError;
+
+    fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
+        if frame.id != ID_JOINT_CONTROL_12 {
+            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        }
+
+        if frame.len < 8 {
+            return Err(ProtocolError::InvalidLength {
+                expected: 8,
+                actual: frame.len as usize,
+            });
+        }
+
+        let j1_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j1_deg = bytes_to_i32_be(j1_bytes);
+
+        let j2_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j2_deg = bytes_to_i32_be(j2_bytes);
+
+        Ok(Self { j1_deg, j2_deg })
+    }
+}
+
+/// 主从模式关节控制指令反馈34 (0x156)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JointControl34Feedback {
+    pub j3_deg: i32,
+    pub j4_deg: i32,
+}
+
+impl TryFrom<PiperFrame> for JointControl34Feedback {
+    type Error = ProtocolError;
+
+    fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
+        if frame.id != ID_JOINT_CONTROL_34 {
+            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        }
+
+        if frame.len < 8 {
+            return Err(ProtocolError::InvalidLength {
+                expected: 8,
+                actual: frame.len as usize,
+            });
+        }
+
+        let j3_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j3_deg = bytes_to_i32_be(j3_bytes);
+
+        let j4_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j4_deg = bytes_to_i32_be(j4_bytes);
+
+        Ok(Self { j3_deg, j4_deg })
+    }
+}
+
+/// 主从模式关节控制指令反馈56 (0x157)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JointControl56Feedback {
+    pub j5_deg: i32,
+    pub j6_deg: i32,
+}
+
+impl TryFrom<PiperFrame> for JointControl56Feedback {
+    type Error = ProtocolError;
+
+    fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
+        if frame.id != ID_JOINT_CONTROL_56 {
+            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        }
+
+        if frame.len < 8 {
+            return Err(ProtocolError::InvalidLength {
+                expected: 8,
+                actual: frame.len as usize,
+            });
+        }
+
+        let j5_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j5_deg = bytes_to_i32_be(j5_bytes);
+
+        let j6_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j6_deg = bytes_to_i32_be(j6_bytes);
+
+        Ok(Self { j5_deg, j6_deg })
+    }
+}
+
+/// 主从模式夹爪控制指令反馈 (0x159)
+///
+/// 在主从模式下，示教输入臂会发送夹爪控制指令给运动输出臂。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GripperControlFeedback {
+    pub travel_mm: i32,
+    pub torque_nm: i16,
+    pub status_code: u8,
+    pub set_zero: u8,
+}
+
+impl TryFrom<PiperFrame> for GripperControlFeedback {
+    type Error = ProtocolError;
+
+    fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
+        if frame.id != ID_GRIPPER_CONTROL {
+            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        }
+
+        if frame.len < 8 {
+            return Err(ProtocolError::InvalidLength {
+                expected: 8,
+                actual: frame.len as usize,
+            });
+        }
+
+        let travel_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let travel_mm = bytes_to_i32_be(travel_bytes);
+
+        let torque_bytes = [frame.data[4], frame.data[5]];
+        let torque_nm = bytes_to_i16_be(torque_bytes);
+
+        Ok(Self {
+            travel_mm,
+            torque_nm,
+            status_code: frame.data[6],
+            set_zero: frame.data[7],
+        })
     }
 }

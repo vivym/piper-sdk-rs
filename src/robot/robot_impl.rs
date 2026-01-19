@@ -155,6 +155,62 @@ impl Piper {
         self.ctx.joint_driver_low_speed.load().as_ref().clone()
     }
 
+    /// 获取固件版本字符串
+    ///
+    /// 从累积的固件数据中解析版本字符串。
+    /// 如果固件数据未完整或未找到版本字符串，返回 `None`。
+    ///
+    /// # 性能
+    /// - 需要获取 RwLock 读锁
+    /// - 如果已解析，直接返回缓存的版本字符串
+    /// - 如果未解析，尝试从累积数据中解析
+    pub fn get_firmware_version(&self) -> Option<String> {
+        if let Ok(mut firmware_state) = self.ctx.firmware_version.write() {
+            // 如果已经解析过，直接返回
+            if let Some(version) = firmware_state.version_string() {
+                return Some(version.clone());
+            }
+            // 否则尝试解析
+            firmware_state.parse_version()
+        } else {
+            None
+        }
+    }
+
+    /// 获取主从模式控制模式指令状态（无锁）
+    ///
+    /// 包含控制模式、运动模式、速度等（主从模式下，~200Hz更新）。
+    ///
+    /// # 性能
+    /// - 无锁读取（ArcSwap::load）
+    /// - 返回快照副本
+    pub fn get_master_slave_control_mode(&self) -> MasterSlaveControlModeState {
+        self.ctx.master_slave_control_mode.load().as_ref().clone()
+    }
+
+    /// 获取主从模式关节控制指令状态（无锁）
+    ///
+    /// 包含6个关节的目标角度（主从模式下，~500Hz更新）。
+    ///
+    /// # 性能
+    /// - 无锁读取（ArcSwap::load）
+    /// - 返回快照副本
+    /// - 帧组同步，保证6个关节数据的逻辑一致性
+    pub fn get_master_slave_joint_control(&self) -> MasterSlaveJointControlState {
+        self.ctx.master_slave_joint_control.load().as_ref().clone()
+    }
+
+    /// 获取主从模式夹爪控制指令状态（无锁）
+    ///
+    /// 包含夹爪目标行程、扭矩等（主从模式下，~200Hz更新）。
+    ///
+    /// # 性能
+    /// - 无锁读取（ArcSwap::load）
+    /// - 返回快照副本
+    pub fn get_master_slave_gripper_control(&self) -> MasterSlaveGripperControlState {
+        self.ctx.master_slave_gripper_control.load().as_ref().clone()
+    }
+
     /// 获取碰撞保护状态（读锁）
     ///
     /// 包含各关节的碰撞保护等级（按需查询）。
