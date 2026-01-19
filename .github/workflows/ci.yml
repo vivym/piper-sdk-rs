@@ -104,10 +104,13 @@ jobs:
       - name: Setup vcan0 for Linux
         if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo modprobe vcan
-          sudo ip link add dev vcan0 type vcan || true
-          sudo ip link set up vcan0 || true
-          ip link show vcan0
+          # 尝试加载 vcan 模块（如果不存在则忽略错误）
+          sudo modprobe vcan || echo "Warning: vcan module not available, tests will be skipped"
+          # 尝试创建 vcan0 接口（如果失败则忽略，测试会自动跳过）
+          sudo ip link add dev vcan0 type vcan || echo "Warning: Failed to create vcan0, tests will be skipped"
+          sudo ip link set up vcan0 || echo "Warning: Failed to bring up vcan0, tests will be skipped"
+          # 验证接口（如果不存在也不会失败，因为测试会自动跳过）
+          ip link show vcan0 || echo "Note: vcan0 not available, SocketCAN tests will be skipped"
 
       - name: Cache cargo registry
         uses: actions/cache@v3
