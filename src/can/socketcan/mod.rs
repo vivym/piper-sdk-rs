@@ -36,6 +36,9 @@ use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 use tracing::{error, trace, warn};
 
+mod interface_check;
+use interface_check::check_interface_status;
+
 /// SocketCAN 适配器
 ///
 /// 实现 `CanAdapter` trait，提供 Linux 平台下的 SocketCAN 支持。
@@ -74,12 +77,18 @@ pub struct SocketCanAdapter {
 impl SocketCanAdapter {
     /// 创建新的 SocketCAN 适配器
     ///
+    /// 在打开 socket 之前，会检查接口是否存在且已启动（UP 状态）。
+    /// 如果接口不存在或未启动，会返回清晰的错误信息，指导用户如何修复。
+    ///
     /// # 参数
     /// - `interface`: CAN 接口名称（如 "can0" 或 "vcan0"）
     ///
     /// # 错误
-    /// - `CanError::Device`: 接口不存在或无法打开
-    /// - `CanError::Io`: IO 错误（如权限不足）
+    /// - `CanError::Device`:
+    ///   - 接口不存在（会提示创建命令）
+    ///   - 接口存在但未启动（会提示启动命令）
+    ///   - 无法打开接口
+    /// - `CanError::Io`: IO 错误（如权限不足、系统调用失败）
     ///
     /// # 示例
     ///
@@ -91,7 +100,27 @@ impl SocketCanAdapter {
     pub fn new(interface: impl Into<String>) -> Result<Self, CanError> {
         let interface = interface.into();
 
-        // 打开 SocketCAN 接口
+        // 1. 检查接口状态（仅检查，不自动配置）
+        match check_interface_status(&interface) {
+            Ok(true) => {
+                trace!(
+                    "CAN interface '{}' is UP, proceeding with initialization",
+                    interface
+                );
+            },
+            Ok(false) => {
+                return Err(CanError::Device(format!(
+                    "CAN interface '{}' exists but is not UP. Please start it first:\n  sudo ip link set up {}",
+                    interface, interface
+                )));
+            },
+            Err(e) => {
+                // 接口不存在或其他错误，直接返回
+                return Err(e);
+            },
+        }
+
+        // 2. 打开 SocketCAN 接口
         let socket = CanSocket::open(&interface).map_err(|e| {
             CanError::Device(format!(
                 "Failed to open CAN interface '{}': {}",
