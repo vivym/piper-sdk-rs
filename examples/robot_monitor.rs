@@ -201,18 +201,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. 创建 Piper 实例
     // Linux: 使用 can0 接口；其他平台: 使用默认配置
-    let mut builder = PiperBuilder::new();
-
-    #[cfg(target_os = "linux")]
-    {
-        builder = builder.interface("can0");
-        println!("使用 CAN 接口: can0");
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        println!("使用默认 CAN 接口配置");
-    }
+    let builder = {
+        #[cfg(target_os = "linux")]
+        {
+            println!("使用 CAN 接口: can0");
+            PiperBuilder::new().interface("can0")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            println!("使用默认 CAN 接口配置");
+            PiperBuilder::new()
+        }
+    };
 
     let piper = builder
         .baud_rate(1_000_000)  // CAN 波特率 1M (协议要求)

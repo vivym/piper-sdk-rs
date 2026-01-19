@@ -12,12 +12,23 @@
 //! cargo run --example timestamp_verification --target x86_64-unknown-linux-gnu
 //! ```
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("该示例仅支持 Linux（SocketCAN）。");
+}
+
+#[cfg(target_os = "linux")]
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
+#[cfg(target_os = "linux")]
 use socketcan::{CanSocket, Socket};
+#[cfg(target_os = "linux")]
 use std::io::IoSliceMut;
+#[cfg(target_os = "linux")]
 use std::mem;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
+#[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("SocketCAN 硬件时间戳验证程序");
     println!("正在打开 vcan0 接口...");
