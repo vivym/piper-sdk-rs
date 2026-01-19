@@ -295,7 +295,7 @@ impl CanAdapter for GsUsbCanAdapter {
                         data: gs_frame.data,
                         len: gs_frame.can_dlc.min(8),
                         is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-                        timestamp_us: gs_frame.timestamp_us,
+                        timestamp_us: gs_frame.timestamp_us as u64, // GS-USB 使用 u32，转换为 u64
                     };
                     trace!("Received CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
                     return Ok(frame);
