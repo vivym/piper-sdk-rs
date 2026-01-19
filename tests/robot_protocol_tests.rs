@@ -38,7 +38,7 @@ impl CanAdapter for MockCanAdapter {
     }
 }
 
-/// 测试 RobotStatusFeedback (0x2A1) 更新 ControlStatusState
+/// 测试 RobotStatusFeedback (0x2A1) 更新 RobotControlState
 #[test]
 fn test_robot_status_feedback_update() {
     let mock_can = MockCanAdapter::new();
@@ -69,15 +69,15 @@ fn test_robot_status_feedback_update() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // 验证 ControlStatusState 已更新
-    let status = piper.get_control_status();
+    // 验证 RobotControlState 已更新
+    let control = piper.get_robot_control();
 
     // 验证基本字段已更新（不会崩溃）
-    assert_eq!(status.control_mode, status.control_mode);
-    assert_eq!(status.robot_status, status.robot_status);
+    assert_eq!(control.control_mode, control.control_mode);
+    assert_eq!(control.robot_status, control.robot_status);
 }
 
-/// 测试 GripperFeedback (0x2A8) 更新 ControlStatusState 和 DiagnosticState
+/// 测试 GripperFeedback (0x2A8) 更新 RobotControlState 和 GripperState
 #[test]
 fn test_gripper_feedback_update() {
     let mock_can = MockCanAdapter::new();
@@ -109,8 +109,9 @@ fn test_gripper_feedback_update() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // 验证状态已更新（不会崩溃）
-    let _status = piper.get_control_status();
-    let _diag = piper.get_diagnostic_state().unwrap();
+    let _control = piper.get_robot_control();
+    let _gripper = piper.get_gripper();
+    let _driver = piper.get_joint_driver_low_speed();
 }
 
 /// 测试命令通道处理（验证命令帧被发送）
@@ -133,16 +134,16 @@ fn test_command_channel_send() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 }
 
-/// 测试 try_write() 非阻塞行为
+/// 测试 try_write() 非阻塞行为（使用 collision_protection 测试 RwLock）
 #[test]
-fn test_diagnostic_try_write_non_blocking() {
+fn test_collision_protection_try_write_non_blocking() {
     let ctx = Arc::new(PiperContext::new());
 
-    // 用户线程持有读锁
-    let _read_guard = ctx.diagnostics.read().unwrap();
+    // 用户线程持有读锁（使用 collision_protection 测试 RwLock）
+    let _read_guard = ctx.collision_protection.read().unwrap();
 
     // IO 线程尝试写入（使用 try_write）
-    let result = ctx.diagnostics.try_write();
+    let result = ctx.collision_protection.try_write();
     assert!(
         result.is_err(),
         "try_write should fail when read lock is held"
@@ -150,20 +151,20 @@ fn test_diagnostic_try_write_non_blocking() {
 
     // 释放读锁后，写入应该成功
     drop(_read_guard);
-    let mut write_guard = ctx.diagnostics.write().unwrap();
+    let mut write_guard = ctx.collision_protection.write().unwrap();
 
     // 更新数据
-    write_guard.timestamp_us = 1000;
-    write_guard.motor_temps = [25.0; 6];
+    write_guard.hardware_timestamp_us = 1000;
+    write_guard.protection_levels = [1, 2, 3, 4, 5, 6];
 
     drop(write_guard);
 
     // 验证写入成功
-    let read_guard = ctx.diagnostics.read().unwrap();
-    assert_eq!(read_guard.timestamp_us, 1000);
+    let read_guard = ctx.collision_protection.read().unwrap();
+    assert_eq!(read_guard.hardware_timestamp_us, 1000);
 }
 
-/// 测试 JointDriverLowSpeedFeedback (0x261-0x266) 更新 DiagnosticState
+/// 测试 JointDriverLowSpeedFeedback (0x261-0x266) 更新 JointDriverLowSpeedState
 #[test]
 fn test_joint_driver_low_speed_feedback_update() {
     let mock_can = MockCanAdapter::new();
@@ -198,11 +199,11 @@ fn test_joint_driver_low_speed_feedback_update() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // 验证 DiagnosticState 已更新（不会崩溃）
-    let _diag = piper.get_diagnostic_state().unwrap();
+    // 验证 JointDriverLowSpeedState 已更新（不会崩溃）
+    let _driver = piper.get_joint_driver_low_speed();
 }
 
-/// 测试 CollisionProtectionLevelFeedback (0x47B) 更新 DiagnosticState
+/// 测试 CollisionProtectionLevelFeedback (0x47B) 更新 CollisionProtectionState
 #[test]
 fn test_collision_protection_level_feedback_update() {
     let mock_can = MockCanAdapter::new();
@@ -234,8 +235,8 @@ fn test_collision_protection_level_feedback_update() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // 验证 DiagnosticState 已更新（不会崩溃）
-    let _diag = piper.get_diagnostic_state().unwrap();
+    // 验证 JointDriverLowSpeedState 已更新（不会崩溃）
+    let _driver = piper.get_joint_driver_low_speed();
 }
 
 /// 测试 MotorLimitFeedback (0x473) 配置累积（6次查询）
@@ -270,8 +271,10 @@ fn test_motor_limit_feedback_accumulation() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // 验证 ConfigState 已更新（不会崩溃）
-    let _config = piper.get_config_state().unwrap();
+    // 验证配置状态已更新（不会崩溃）
+    let _limits = piper.get_joint_limit_config().unwrap();
+    let _accel = piper.get_joint_accel_config().unwrap();
+    let _end_limits = piper.get_end_limit_config().unwrap();
 }
 
 /// 测试 MotorMaxAccelFeedback (0x47C) 配置累积（6次查询）
@@ -303,11 +306,13 @@ fn test_motor_max_accel_feedback_accumulation() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // 验证 ConfigState 已更新（不会崩溃）
-    let _config = piper.get_config_state().unwrap();
+    // 验证配置状态已更新（不会崩溃）
+    let _limits = piper.get_joint_limit_config().unwrap();
+    let _accel = piper.get_joint_accel_config().unwrap();
+    let _end_limits = piper.get_end_limit_config().unwrap();
 }
 
-/// 测试 EndVelocityAccelFeedback (0x478) 更新 ConfigState
+/// 测试 EndVelocityAccelFeedback (0x478) 更新 EndLimitConfigState
 #[test]
 fn test_end_velocity_accel_feedback_update() {
     let mock_can = MockCanAdapter::new();
@@ -342,8 +347,10 @@ fn test_end_velocity_accel_feedback_update() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // 验证 ConfigState 已更新（不会崩溃）
-    let _config = piper.get_config_state().unwrap();
+    // 验证配置状态已更新（不会崩溃）
+    let _limits = piper.get_joint_limit_config().unwrap();
+    let _accel = piper.get_joint_accel_config().unwrap();
+    let _end_limits = piper.get_end_limit_config().unwrap();
 }
 
 /// 测试 CAN 接收错误处理（CanError::Timeout）
@@ -360,7 +367,8 @@ fn test_can_receive_error_timeout() {
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // 验证不会崩溃（超时是正常情况）
-    let _core = piper.get_core_motion();
+    let _joint_pos = piper.get_joint_position();
+    let _end_pose = piper.get_end_pose();
 }
 
 /// 测试 CAN 发送错误处理
@@ -403,5 +411,5 @@ fn test_frame_parse_error_invalid_frame() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // 验证不会崩溃（解析错误应该被捕获并记录警告）
-    let _status = piper.get_control_status();
+    let _control = piper.get_robot_control();
 }

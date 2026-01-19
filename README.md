@@ -55,8 +55,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Get current state (lock-free, nanosecond-level response)
-    let core_motion = robot.get_core_motion();
-    println!("Joint positions: {:?}", core_motion.joint_pos);
+    let joint_pos = robot.get_joint_position();
+    println!("Joint positions: {:?}", joint_pos.joint_pos);
+
+    let end_pose = robot.get_end_pose();
+    println!("End pose: {:?}", end_pose.end_pose);
 
     let joint_dynamic = robot.get_joint_dynamic();
     println!("Joint velocities: {:?}", joint_dynamic.joint_vel);
@@ -76,17 +79,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 For performance optimization, state data is divided into three categories:
 
 - **Hot Data (500Hz)**:
-  - `CoreMotionState`: Core motion state (joint positions, end-effector pose)
+  - `JointPositionState`: Joint positions (6 joints)
+  - `EndPoseState`: End-effector pose (position and orientation)
   - `JointDynamicState`: Joint dynamic state (joint velocities, currents)
   - Uses `ArcSwap` for lock-free reading, Frame Commit mechanism ensures atomicity
 
 - **Warm Data (100Hz)**:
-  - `ControlStatusState`: Control status (control mode, robot status, fault codes, etc.)
+  - `RobotControlState`: Robot control status (control mode, robot status, fault codes, etc.)
+  - `GripperState`: Gripper status (travel, torque, status codes, etc.)
   - Uses `ArcSwap` for read/write operations, medium update frequency
 
-- **Cold Data (10Hz or on-demand)**:
-  - `DiagnosticState`: Diagnostic information (motor temperature, bus voltage, error codes, etc.)
-  - `ConfigState`: Configuration information (firmware version, joint limits, PID parameters, etc.)
+- **Medium Data (40Hz)**:
+  - `JointDriverLowSpeedState`: Joint driver diagnostic state (temperatures, voltages, currents, driver status)
+  - Uses `ArcSwap` for wait-free reading, optimized for concurrent access
+
+- **Cold Data (on-demand)**:
+  - `CollisionProtectionState`: Collision protection levels
+  - `JointLimitConfigState`: Joint angle and velocity limits
+  - `JointAccelConfigState`: Joint acceleration limits
+  - `EndLimitConfigState`: End-effector velocity and acceleration limits
   - Uses `RwLock` for read/write operations, low update frequency
 
 ### Core Components

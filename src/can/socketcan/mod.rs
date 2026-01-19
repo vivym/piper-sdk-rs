@@ -540,7 +540,7 @@ impl SocketCanAdapter {
     /// 使用 `u64` 而非 `u32` 的原因：
     /// - 支持绝对时间戳（Unix 纪元开始），无需基准时间管理
     /// - 内存对齐后大小相同（24 字节），无额外开销
-    /// - 与状态层设计一致（`CoreMotionState.timestamp_us: u64`）
+    /// - 与状态层设计一致（`JointPositionState.hardware_timestamp_us: u64`）
     fn timespec_to_micros(tv_sec: i64, tv_nsec: i64) -> u64 {
         // 计算：timestamp_us = tv_sec * 1_000_000 + tv_nsec / 1000
         // u64 可以存储从 Unix 纪元开始的绝对时间戳（无需截断）
@@ -655,12 +655,32 @@ impl CanAdapter for SocketCanAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    /// 检查 CAN 接口是否存在
+    fn can_interface_exists(interface: &str) -> bool {
+        let output = Command::new("ip").args(["link", "show", interface]).output();
+
+        output.is_ok() && output.unwrap().status.success()
+    }
+
+    /// 宏：要求 vcan0 接口存在，如果不存在则跳过测试
+    macro_rules! require_vcan0 {
+        () => {{
+            if !can_interface_exists("vcan0") {
+                eprintln!("Skipping test: vcan0 interface not available");
+                return;
+            }
+            "vcan0"
+        }};
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_new_success() {
         // 注意：需要 vcan0 接口存在
-        let adapter = SocketCanAdapter::new("vcan0");
+        let interface = require_vcan0!();
+        let adapter = SocketCanAdapter::new(interface);
         assert!(adapter.is_ok());
     }
 
@@ -679,14 +699,16 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_new_stores_interface_name() {
-        let adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let adapter = SocketCanAdapter::new(interface).unwrap();
         assert_eq!(adapter.interface(), "vcan0");
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_new_sets_read_timeout() {
-        let adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let adapter = SocketCanAdapter::new(interface).unwrap();
         // 验证默认超时时间已设置（2ms，与 PipelineConfig 的默认值一致，确保 io_loop 能及时响应退出信号）
         assert_eq!(adapter.read_timeout(), Duration::from_millis(2));
     }
@@ -694,7 +716,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_new_sets_started_true() {
-        let adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let adapter = SocketCanAdapter::new(interface).unwrap();
         assert!(adapter.is_started());
     }
 
@@ -703,7 +726,8 @@ mod tests {
     fn test_socketcan_adapter_new_enables_timestamping() {
         // 测试 SO_TIMESTAMPING 是否成功启用
         // 在 vcan0 上，SO_TIMESTAMPING 应该能够成功设置
-        let adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 在支持的平台上，timestamping_enabled 应该为 true
         // 如果 setsockopt 失败，会有警告但不会阻塞初始化
@@ -718,7 +742,8 @@ mod tests {
     fn test_socketcan_adapter_new_initializes_hw_timestamp_available() {
         // 测试 hw_timestamp_available 是否正确初始化为 false
         // 初始化时不应该检测硬件支持，应该在首次接收时检测
-        let adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 初始化时应该为 false（首次接收时才会检测）
         assert!(
@@ -731,7 +756,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_timestamping_fields_exist() {
         // 验证时间戳相关字段存在且可访问
-        let adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 验证字段可以通过 getter 方法访问
         let _ts_enabled = adapter.timestamping_enabled();
@@ -744,7 +770,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_receive_with_timestamp_skeleton() {
         // 验证 receive_with_timestamp() 方法骨架存在且可调用
-        let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 设置短超时，避免无限阻塞
         adapter.set_read_timeout(Duration::from_millis(1)).unwrap();
@@ -785,7 +812,8 @@ mod tests {
         // 验证 extract_timestamp_from_cmsg() 方法已实现（不再测试骨架）
         // 实际的时间戳提取测试在 test_socketcan_adapter_receive_with_timestamp_full_flow 中
         // 此测试主要用于确认方法签名正确（编译通过即表示签名正确）
-        let adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 验证方法存在（通过编译）
         // 实际的时间戳提取在 receive_with_timestamp() 中测试
@@ -800,8 +828,9 @@ mod tests {
     fn test_socketcan_adapter_receive_with_timestamp_full_flow() {
         // 验证 receive_with_timestamp() 完整流程（发送帧 → 接收帧）
         // 注意：vcan0 默认不回环，需要使用两个 socket
-        let mut tx_adapter = SocketCanAdapter::new("vcan0").unwrap();
-        let mut rx_adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut tx_adapter = SocketCanAdapter::new(interface).unwrap();
+        let mut rx_adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 设置读超时并清空缓冲区
         rx_adapter.set_read_timeout(Duration::from_millis(1)).unwrap();
@@ -852,7 +881,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_receive_with_timestamp_timeout() {
         // 验证 receive_with_timestamp() 的超时逻辑
-        let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 清空缓冲区（持续多次，确保清空所有待处理帧）
         adapter.set_read_timeout(Duration::from_millis(1)).unwrap();
@@ -936,8 +966,9 @@ mod tests {
     fn test_socketcan_adapter_receive_with_timestamp_monotonic() {
         // 验证时间戳的单调性（发送多个帧，时间戳应该递增）
         // 参考：hardware_timestamp_implementation_plan.md:529-547
-        let mut tx_adapter = SocketCanAdapter::new("vcan0").unwrap();
-        let mut rx_adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut tx_adapter = SocketCanAdapter::new(interface).unwrap();
+        let mut rx_adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 设置读超时并清空缓冲区（持续多次，确保清空所有待处理帧）
         rx_adapter.set_read_timeout(Duration::from_millis(1)).unwrap();
@@ -1110,8 +1141,9 @@ mod tests {
     fn test_socketcan_adapter_receive_with_timestamp_extended_frame() {
         // 验证 receive_with_timestamp() 支持扩展帧
         // 注意：vcan0 默认不回环，需要使用两个 socket
-        let mut tx_adapter = SocketCanAdapter::new("vcan0").unwrap();
-        let mut rx_adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut tx_adapter = SocketCanAdapter::new(interface).unwrap();
+        let mut rx_adapter = SocketCanAdapter::new(interface).unwrap();
         rx_adapter.set_read_timeout(Duration::from_millis(100)).unwrap();
 
         // 发送扩展帧
@@ -1149,7 +1181,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_set_read_timeout() {
-        let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut adapter = SocketCanAdapter::new(interface).unwrap();
         let new_timeout = Duration::from_millis(200);
         adapter.set_read_timeout(new_timeout).unwrap();
         assert_eq!(adapter.read_timeout(), new_timeout);
@@ -1158,7 +1191,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_send_standard_frame() {
-        let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut adapter = SocketCanAdapter::new(interface).unwrap();
         let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
 
         let result = adapter.send(frame);
@@ -1168,7 +1202,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_send_extended_frame() {
-        let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut adapter = SocketCanAdapter::new(interface).unwrap();
         let frame = PiperFrame::new_extended(0x12345678, &[0xFF; 8]);
 
         let result = adapter.send(frame);
@@ -1178,7 +1213,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_send_empty_frame() {
-        let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut adapter = SocketCanAdapter::new(interface).unwrap();
         let frame = PiperFrame::new_standard(0x123, &[]);
 
         let result = adapter.send(frame);
@@ -1189,8 +1225,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_receive_timestamp() {
         // 验证 receive() 返回的 PiperFrame 包含时间戳
-        let mut tx_adapter = SocketCanAdapter::new("vcan0").unwrap();
-        let mut rx_adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut tx_adapter = SocketCanAdapter::new(interface).unwrap();
+        let mut rx_adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 清空缓冲区
         rx_adapter.set_read_timeout(Duration::from_millis(1)).unwrap();
@@ -1273,8 +1310,9 @@ mod tests {
     fn test_socketcan_adapter_receive_timestamp_monotonic() {
         // 验证 receive() 返回的时间戳单调递增（Task 4.2）
         // 参考：hardware_timestamp_implementation_plan.md:529-547
-        let mut tx_adapter = SocketCanAdapter::new("vcan0").unwrap();
-        let mut rx_adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut tx_adapter = SocketCanAdapter::new(interface).unwrap();
+        let mut rx_adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 清空缓冲区
         rx_adapter.set_read_timeout(Duration::from_millis(1)).unwrap();
@@ -1394,8 +1432,9 @@ mod tests {
         // 验证时间戳精度和系统时间轴一致性（Task 4.3）
         // 参考：hardware_timestamp_implementation_plan.md:556-625
         // 注意：vcan0 不支持真正的回环，使用两个独立的 socket（一个发送，一个接收）
-        let mut tx_adapter = SocketCanAdapter::new("vcan0").unwrap();
-        let mut rx_adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut tx_adapter = SocketCanAdapter::new(interface).unwrap();
+        let mut rx_adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 清空缓冲区
         rx_adapter.set_read_timeout(Duration::from_millis(1)).unwrap();
@@ -1509,7 +1548,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_receive_timeout() {
-        let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 设置短超时（1ms，用于清空缓冲区）
         adapter.set_read_timeout(Duration::from_millis(1)).unwrap();
@@ -1626,7 +1666,8 @@ mod tests {
         // 或者使用另一个线程/工具发送
         // 这个测试可能需要在真实 CAN 总线上运行，或使用特定的测试工具
         // 暂时标记为可能需要手动验证
-        let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
+        let interface = require_vcan0!();
+        let mut adapter = SocketCanAdapter::new(interface).unwrap();
 
         // 发送帧
         let tx_frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);

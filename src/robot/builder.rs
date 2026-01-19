@@ -115,7 +115,7 @@ impl PiperBuilder {
     /// match PiperBuilder::new().build() {
     ///     Ok(piper) => {
     ///         // 使用 piper 读取状态
-    ///         let state = piper.get_core_motion();
+    ///         let state = piper.get_joint_position();
     ///     }
     ///     Err(e) => {
     ///         eprintln!("Failed to create Piper: {}", e);

@@ -61,12 +61,13 @@ pub fn io_loop(
     ctx: Arc<PiperContext>,
     config: PipelineConfig,
 ) {
-    // === 核心运动状态：帧组同步 ===
-    // 为 joint_pos 和 end_pose 分别维护独立的 pending 状态，避免帧组交错导致的状态撕裂
+    // === 关节位置状态：帧组同步（0x2A5-0x2A7） ===
     let mut pending_joint_pos: [f64; 6] = [0.0; 6];
+    let mut joint_pos_frame_mask: u8 = 0; // Bit 0-2 对应 0x2A5, 0x2A6, 0x2A7
+
+    // === 末端位姿状态：帧组同步（0x2A2-0x2A4） ===
     let mut pending_end_pose: [f64; 6] = [0.0; 6];
-    let mut joint_pos_ready = false; // 关节位置帧组是否完整
-    let mut end_pose_ready = false; // 末端位姿帧组是否完整
+    let mut end_pose_frame_mask: u8 = 0; // Bit 0-2 对应 0x2A2, 0x2A3, 0x2A4
 
     // === 关节动态状态：缓冲提交（关键改进） ===
     let mut pending_joint_dynamic = JointDynamicState::default();
@@ -93,11 +94,11 @@ pub fn io_loop(
                 // 使用系统时间 Instant，因为它们不依赖硬件时间戳
                 let elapsed = last_frame_time.elapsed();
                 if elapsed > frame_group_timeout {
-                    // 重置核心运动状态的 pending 缓存（避免数据过期）
+                    // 重置 pending 缓存（避免数据过期）
                     pending_joint_pos = [0.0; 6];
                     pending_end_pose = [0.0; 6];
-                    joint_pos_ready = false;
-                    end_pose_ready = false;
+                    joint_pos_frame_mask = 0;
+                    end_pose_frame_mask = 0;
                 }
 
                 // === 检查速度帧缓冲区超时（关键：避免僵尸缓冲区） ===
@@ -120,6 +121,9 @@ pub fn io_loop(
                             pending_joint_dynamic.group_timestamp_us = last_vel_packet_time_us;
                             pending_joint_dynamic.valid_mask = vel_update_mask;
                             ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
+                            ctx.fps_stats
+                                .joint_dynamic_updates
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                             // 重置状态
                             vel_update_mask = 0;
@@ -160,23 +164,23 @@ pub fn io_loop(
         match frame.id {
             // === 核心运动状态（帧组同步） ===
 
-            // 关节反馈 12 (0x2A5)
+            // 关节反馈 12 (0x2A5) - 帧组第一帧
             ID_JOINT_FEEDBACK_12 => {
                 if let Ok(feedback) = JointFeedback12::try_from(frame) {
                     pending_joint_pos[0] = feedback.j1_rad();
                     pending_joint_pos[1] = feedback.j2_rad();
-                    joint_pos_ready = false; // 重置，等待完整帧组
+                    joint_pos_frame_mask |= 1 << 0; // Bit 0 = 0x2A5
                 } else {
                     warn!("Failed to parse JointFeedback12: CAN ID 0x{:X}", frame.id);
                 }
             },
 
-            // 关节反馈 34 (0x2A6)
+            // 关节反馈 34 (0x2A6) - 帧组第二帧
             ID_JOINT_FEEDBACK_34 => {
                 if let Ok(feedback) = JointFeedback34::try_from(frame) {
                     pending_joint_pos[2] = feedback.j3_rad();
                     pending_joint_pos[3] = feedback.j4_rad();
-                    joint_pos_ready = false; // 重置，等待完整帧组
+                    joint_pos_frame_mask |= 1 << 1; // Bit 1 = 0x2A6
                 } else {
                     warn!("Failed to parse JointFeedback34: CAN ID 0x{:X}", frame.id);
                 }
@@ -187,54 +191,52 @@ pub fn io_loop(
                 if let Ok(feedback) = JointFeedback56::try_from(frame) {
                     pending_joint_pos[4] = feedback.j5_rad();
                     pending_joint_pos[5] = feedback.j6_rad();
-                    joint_pos_ready = true; // 标记关节位置帧组已完整
+                    joint_pos_frame_mask |= 1 << 2; // Bit 2 = 0x2A7
 
-                    // 【Frame Commit】如果两个帧组都准备好，则提交完整状态
-                    // 否则，从当前状态读取另一个字段，只更新关节位置
-                    // 注意：硬件时间戳使用 u64（与状态层一致）
-                    if end_pose_ready {
-                        // 两个帧组都完整，提交完整状态
-                        let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us,
-                            joint_pos: pending_joint_pos,
-                            end_pose: pending_end_pose,
-                        };
-                        ctx.core_motion.store(Arc::new(new_state));
-                        trace!("Core motion committed: both joint_pos and end_pose updated");
-                        // 重置标志，准备下一轮
-                        joint_pos_ready = false;
-                        end_pose_ready = false;
-                    } else {
-                        // 只有关节位置完整，从当前状态读取 end_pose 并更新
-                        let current = ctx.core_motion.load();
-                        let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us,
-                            joint_pos: pending_joint_pos,
-                            end_pose: current.end_pose, // 保留当前值
-                        };
-                        ctx.core_motion.store(Arc::new(new_state));
-                        trace!("Core motion committed: joint_pos updated (end_pose not ready)");
-                    }
+                    // 计算系统时间戳（微秒）
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    // 提交新的 JointPositionState（独立于 end_pose）
+                    let new_joint_pos_state = JointPositionState {
+                        hardware_timestamp_us: frame.timestamp_us,
+                        system_timestamp_us,
+                        joint_pos: pending_joint_pos,
+                        frame_valid_mask: joint_pos_frame_mask,
+                    };
+                    ctx.joint_position.store(Arc::new(new_joint_pos_state));
+                    ctx.fps_stats
+                        .joint_position_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!(
+                        "JointPositionState committed: mask={:03b}",
+                        joint_pos_frame_mask
+                    );
+
+                    // 重置帧组掩码和标志
+                    joint_pos_frame_mask = 0;
                 } else {
                     warn!("Failed to parse JointFeedback56: CAN ID 0x{:X}", frame.id);
                 }
             },
 
-            // 末端位姿反馈 1 (0x2A2)
+            // 末端位姿反馈 1 (0x2A2) - 帧组第一帧
             ID_END_POSE_1 => {
                 if let Ok(feedback) = EndPoseFeedback1::try_from(frame) {
                     pending_end_pose[0] = feedback.x() / 1000.0; // mm → m
                     pending_end_pose[1] = feedback.y() / 1000.0; // mm → m
-                    end_pose_ready = false; // 重置，等待完整帧组
+                    end_pose_frame_mask |= 1 << 0; // Bit 0 = 0x2A2
                 }
             },
 
-            // 末端位姿反馈 2 (0x2A3)
+            // 末端位姿反馈 2 (0x2A3) - 帧组第二帧
             ID_END_POSE_2 => {
                 if let Ok(feedback) = EndPoseFeedback2::try_from(frame) {
                     pending_end_pose[2] = feedback.z() / 1000.0; // mm → m
                     pending_end_pose[3] = feedback.rx_rad();
-                    end_pose_ready = false; // 重置，等待完整帧组
+                    end_pose_frame_mask |= 1 << 1; // Bit 1 = 0x2A3
                 }
             },
 
@@ -243,34 +245,29 @@ pub fn io_loop(
                 if let Ok(feedback) = EndPoseFeedback3::try_from(frame) {
                     pending_end_pose[4] = feedback.ry_rad();
                     pending_end_pose[5] = feedback.rz_rad();
-                    end_pose_ready = true; // 标记末端位姿帧组已完整
+                    end_pose_frame_mask |= 1 << 2; // Bit 2 = 0x2A4
 
-                    // 【Frame Commit】如果两个帧组都准备好，则提交完整状态
-                    // 否则，从当前状态读取另一个字段，只更新末端位姿
-                    // 注意：硬件时间戳使用 u64（与状态层一致）
-                    if joint_pos_ready {
-                        // 两个帧组都完整，提交完整状态
-                        let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us,
-                            joint_pos: pending_joint_pos,
-                            end_pose: pending_end_pose,
-                        };
-                        ctx.core_motion.store(Arc::new(new_state));
-                        trace!("Core motion committed: both joint_pos and end_pose updated");
-                        // 重置标志，准备下一轮
-                        joint_pos_ready = false;
-                        end_pose_ready = false;
-                    } else {
-                        // 只有末端位姿完整，从当前状态读取 joint_pos 并更新
-                        let current = ctx.core_motion.load();
-                        let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us,
-                            joint_pos: current.joint_pos, // 保留当前值
-                            end_pose: pending_end_pose,
-                        };
-                        ctx.core_motion.store(Arc::new(new_state));
-                        trace!("Core motion committed: end_pose updated (joint_pos not ready)");
-                    }
+                    // 计算系统时间戳（微秒）
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    // 提交新的 EndPoseState（独立于 joint_pos）
+                    let new_end_pose_state = EndPoseState {
+                        hardware_timestamp_us: frame.timestamp_us,
+                        system_timestamp_us,
+                        end_pose: pending_end_pose,
+                        frame_valid_mask: end_pose_frame_mask,
+                    };
+                    ctx.end_pose.store(Arc::new(new_end_pose_state));
+                    ctx.fps_stats
+                        .end_pose_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!("EndPoseState committed: mask={:03b}", end_pose_frame_mask);
+
+                    // 重置帧组掩码和标志
+                    end_pose_frame_mask = 0;
                 }
             },
 
@@ -284,6 +281,7 @@ pub fn io_loop(
                     // 1. 更新缓冲区（而不是立即提交）
                     pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                     pending_joint_dynamic.joint_current[joint_index] = feedback.current();
+                    // 注意：扭矩通过 get_torque() 方法从电流实时计算，无需存储
                     // 注意：硬件时间戳使用 u64（与状态层一致）
                     pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us;
 
@@ -311,6 +309,9 @@ pub fn io_loop(
                         pending_joint_dynamic.valid_mask = vel_update_mask;
 
                         ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
+                        ctx.fps_stats
+                            .joint_dynamic_updates
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                         // 重置状态（准备下一轮）
                         vel_update_mask = 0;
@@ -334,66 +335,96 @@ pub fn io_loop(
             // Phase 3: 控制状态更新
             // ============================================================
             ID_ROBOT_STATUS => {
-                // RobotStatusFeedback (0x2A1) - 更新 ControlStatusState
+                // RobotStatusFeedback (0x2A1) - 更新 RobotControlState
                 if let Ok(feedback) = RobotStatusFeedback::try_from(frame) {
-                    ctx.control_status.rcu(|old| {
-                        let mut new = (**old).clone();
-                        new.timestamp_us = frame.timestamp_us;
-                        new.control_mode = feedback.control_mode as u8;
-                        new.robot_status = feedback.robot_status as u8;
-                        new.move_mode = feedback.move_mode as u8;
-                        new.teach_status = feedback.teach_status as u8;
-                        new.motion_status = feedback.motion_status as u8;
-                        new.trajectory_point_index = feedback.trajectory_point_index;
+                    // 计算系统时间戳（微秒）
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
 
-                        // 解析故障码：角度超限位（位域，每个位代表一个关节）
-                        new.fault_angle_limit = [
-                            feedback.fault_code_angle_limit.joint1_limit(),
-                            feedback.fault_code_angle_limit.joint2_limit(),
-                            feedback.fault_code_angle_limit.joint3_limit(),
-                            feedback.fault_code_angle_limit.joint4_limit(),
-                            feedback.fault_code_angle_limit.joint5_limit(),
-                            feedback.fault_code_angle_limit.joint6_limit(),
-                        ];
-                        // 解析故障码：通信异常（位域）
-                        new.fault_comm_error = [
-                            feedback.fault_code_comm_error.joint1_comm_error(),
-                            feedback.fault_code_comm_error.joint2_comm_error(),
-                            feedback.fault_code_comm_error.joint3_comm_error(),
-                            feedback.fault_code_comm_error.joint4_comm_error(),
-                            feedback.fault_code_comm_error.joint5_comm_error(),
-                            feedback.fault_code_comm_error.joint6_comm_error(),
-                        ];
-                        // 使能状态：当 robot_status 为 Normal 时为 true
-                        new.is_enabled = matches!(feedback.robot_status, RobotStatus::Normal);
-                        Arc::new(new)
-                    });
+                    // 构建故障码位掩码
+                    let fault_angle_limit_mask = feedback.fault_code_angle_limit.joint1_limit()
+                        as u8
+                        | (feedback.fault_code_angle_limit.joint2_limit() as u8) << 1
+                        | (feedback.fault_code_angle_limit.joint3_limit() as u8) << 2
+                        | (feedback.fault_code_angle_limit.joint4_limit() as u8) << 3
+                        | (feedback.fault_code_angle_limit.joint5_limit() as u8) << 4
+                        | (feedback.fault_code_angle_limit.joint6_limit() as u8) << 5;
+
+                    let fault_comm_error_mask = feedback.fault_code_comm_error.joint1_comm_error()
+                        as u8
+                        | (feedback.fault_code_comm_error.joint2_comm_error() as u8) << 1
+                        | (feedback.fault_code_comm_error.joint3_comm_error() as u8) << 2
+                        | (feedback.fault_code_comm_error.joint4_comm_error() as u8) << 3
+                        | (feedback.fault_code_comm_error.joint5_comm_error() as u8) << 4
+                        | (feedback.fault_code_comm_error.joint6_comm_error() as u8) << 5;
+
+                    // 构建新的 RobotControlState
+                    let new_robot_control_state = RobotControlState {
+                        hardware_timestamp_us: frame.timestamp_us,
+                        system_timestamp_us,
+                        control_mode: feedback.control_mode as u8,
+                        robot_status: feedback.robot_status as u8,
+                        move_mode: feedback.move_mode as u8,
+                        teach_status: feedback.teach_status as u8,
+                        motion_status: feedback.motion_status as u8,
+                        trajectory_point_index: feedback.trajectory_point_index,
+                        fault_angle_limit_mask,
+                        fault_comm_error_mask,
+                        is_enabled: matches!(feedback.robot_status, RobotStatus::Normal),
+                        feedback_counter: 0, // TODO: 如果协议支持，从反馈中提取
+                    };
+
+                    ctx.robot_control.store(Arc::new(new_robot_control_state));
+                    ctx.fps_stats
+                        .robot_control_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!(
+                        "RobotControlState committed: mode={}, status={}",
+                        feedback.control_mode as u8, feedback.robot_status as u8
+                    );
                 }
             },
 
             ID_GRIPPER_FEEDBACK => {
-                // GripperFeedback (0x2A8) - 同时更新 ControlStatusState 和 DiagnosticState
+                // GripperFeedback (0x2A8) - 更新 GripperState
                 if let Ok(feedback) = GripperFeedback::try_from(frame) {
-                    // 更新 ControlStatusState（使用 rcu）
-                    ctx.control_status.rcu(|old| {
-                        let mut new = (**old).clone();
-                        new.gripper_travel = feedback.travel();
-                        new.gripper_torque = feedback.torque();
+                    // 计算系统时间戳（微秒）
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    // 获取当前状态以保留 last_travel
+                    let current = ctx.gripper.load();
+                    let last_travel = current.last_travel;
+
+                    // 构建新的 GripperState
+                    let new_gripper_state = GripperState {
+                        hardware_timestamp_us: frame.timestamp_us,
+                        system_timestamp_us,
+                        travel: feedback.travel(),
+                        torque: feedback.torque(),
+                        status_code: u8::from(feedback.status), // 将 GripperStatus 转换为 u8
+                        last_travel,
+                    };
+
+                    // 更新状态（使用 rcu 保留 last_travel）
+                    ctx.gripper.rcu(|old| {
+                        let mut new = new_gripper_state.clone();
+                        new.last_travel = old.travel; // 保留上次的 travel 值
                         Arc::new(new)
                     });
 
-                    // 更新 DiagnosticState（使用 try_write，避免阻塞）
-                    if let Ok(mut diag) = ctx.diagnostics.try_write() {
-                        diag.gripper_voltage_low = feedback.status.voltage_low();
-                        diag.gripper_motor_over_temp = feedback.status.motor_over_temp();
-                        diag.gripper_over_current = feedback.status.driver_over_current();
-                        diag.gripper_over_temp = feedback.status.driver_over_temp();
-                        diag.gripper_sensor_error = feedback.status.sensor_error();
-                        diag.gripper_driver_error = feedback.status.driver_error();
-                        // 注意：enabled 的反向逻辑（1 使能，0 失能）
-                        diag.gripper_enabled = feedback.status.enabled();
-                        diag.gripper_homed = feedback.status.homed();
-                    }
+                    ctx.fps_stats
+                        .gripper_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!(
+                        "GripperState committed: travel={:.3}mm, torque={:.3}N·m",
+                        feedback.travel(),
+                        feedback.torque()
+                    );
                 }
             },
 
@@ -403,42 +434,122 @@ pub fn io_loop(
             id if (ID_JOINT_DRIVER_LOW_SPEED_BASE..=ID_JOINT_DRIVER_LOW_SPEED_BASE + 5)
                 .contains(&id) =>
             {
-                // JointDriverLowSpeedFeedback (0x261-0x266) - 更新 DiagnosticState
-                if let Ok(feedback) = JointDriverLowSpeedFeedback::try_from(frame)
-                    && let Ok(mut diag) = ctx.diagnostics.try_write()
-                {
+                // JointDriverLowSpeedFeedback (0x261-0x266) - 更新 JointDriverLowSpeedState
+                if let Ok(feedback) = JointDriverLowSpeedFeedback::try_from(frame) {
                     let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                     if joint_idx < 6 {
-                        diag.timestamp_us = frame.timestamp_us;
-                        diag.motor_temps[joint_idx] = feedback.motor_temp() as f32;
-                        diag.driver_temps[joint_idx] = feedback.driver_temp() as f32;
-                        diag.joint_voltage[joint_idx] = feedback.voltage() as f32;
-                        diag.joint_bus_current[joint_idx] = feedback.bus_current() as f32;
+                        // 计算系统时间戳（微秒）
+                        let system_timestamp_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
 
-                        // 更新驱动器状态（位域结构体，字段是方法）
-                        diag.driver_voltage_low[joint_idx] = feedback.status.voltage_low();
-                        diag.driver_motor_over_temp[joint_idx] = feedback.status.motor_over_temp();
-                        diag.driver_over_current[joint_idx] = feedback.status.driver_over_current();
-                        diag.driver_over_temp[joint_idx] = feedback.status.driver_over_temp();
-                        diag.driver_collision_protection[joint_idx] =
-                            feedback.status.collision_protection();
-                        diag.driver_error[joint_idx] = feedback.status.driver_error();
-                        diag.driver_enabled[joint_idx] = feedback.status.enabled();
-                        diag.driver_stall_protection[joint_idx] =
-                            feedback.status.stall_protection();
+                        // 使用 rcu 更新状态（Wait-Free）
+                        ctx.joint_driver_low_speed.rcu(|old| {
+                            let mut new = (**old).clone();
 
-                        // 连接状态：收到任何数据表示已连接
-                        diag.connection_status = true;
+                            // 更新温度、电压、电流
+                            new.motor_temps[joint_idx] = feedback.motor_temp() as f32;
+                            new.driver_temps[joint_idx] = feedback.driver_temp() as f32;
+                            new.joint_voltage[joint_idx] = feedback.voltage() as f32;
+                            new.joint_bus_current[joint_idx] = feedback.bus_current() as f32;
+
+                            // 更新时间戳
+                            new.hardware_timestamps[joint_idx] = frame.timestamp_us;
+                            new.system_timestamps[joint_idx] = system_timestamp_us;
+                            new.hardware_timestamp_us = frame.timestamp_us; // 使用最新一帧的时间戳
+                            new.system_timestamp_us = system_timestamp_us;
+
+                            // 更新有效性掩码
+                            new.valid_mask |= 1 << joint_idx;
+
+                            // 更新驱动器状态位掩码
+                            if feedback.status.voltage_low() {
+                                new.driver_voltage_low_mask |= 1 << joint_idx;
+                            } else {
+                                new.driver_voltage_low_mask &= !(1 << joint_idx);
+                            }
+
+                            if feedback.status.motor_over_temp() {
+                                new.driver_motor_over_temp_mask |= 1 << joint_idx;
+                            } else {
+                                new.driver_motor_over_temp_mask &= !(1 << joint_idx);
+                            }
+
+                            if feedback.status.driver_over_current() {
+                                new.driver_over_current_mask |= 1 << joint_idx;
+                            } else {
+                                new.driver_over_current_mask &= !(1 << joint_idx);
+                            }
+
+                            if feedback.status.driver_over_temp() {
+                                new.driver_over_temp_mask |= 1 << joint_idx;
+                            } else {
+                                new.driver_over_temp_mask &= !(1 << joint_idx);
+                            }
+
+                            if feedback.status.collision_protection() {
+                                new.driver_collision_protection_mask |= 1 << joint_idx;
+                            } else {
+                                new.driver_collision_protection_mask &= !(1 << joint_idx);
+                            }
+
+                            if feedback.status.driver_error() {
+                                new.driver_error_mask |= 1 << joint_idx;
+                            } else {
+                                new.driver_error_mask &= !(1 << joint_idx);
+                            }
+
+                            if feedback.status.enabled() {
+                                new.driver_enabled_mask |= 1 << joint_idx;
+                            } else {
+                                new.driver_enabled_mask &= !(1 << joint_idx);
+                            }
+
+                            if feedback.status.stall_protection() {
+                                new.driver_stall_protection_mask |= 1 << joint_idx;
+                            } else {
+                                new.driver_stall_protection_mask &= !(1 << joint_idx);
+                            }
+
+                            Arc::new(new)
+                        });
+
+                        ctx.fps_stats
+                            .joint_driver_low_speed_updates
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        trace!(
+                            "JointDriverLowSpeedState updated: joint={}, temp={:.1}°C",
+                            joint_idx + 1,
+                            feedback.motor_temp()
+                        );
                     }
                 }
             },
 
             ID_COLLISION_PROTECTION_LEVEL_FEEDBACK => {
-                // CollisionProtectionLevelFeedback (0x47B) - 更新 DiagnosticState
-                if let Ok(feedback) = CollisionProtectionLevelFeedback::try_from(frame)
-                    && let Ok(mut diag) = ctx.diagnostics.try_write()
-                {
-                    diag.protection_levels = feedback.levels;
+                // CollisionProtectionLevelFeedback (0x47B) - 更新 CollisionProtectionState
+                if let Ok(feedback) = CollisionProtectionLevelFeedback::try_from(frame) {
+                    // 计算系统时间戳（微秒）
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    // 更新 CollisionProtectionState
+                    if let Ok(mut collision) = ctx.collision_protection.write() {
+                        collision.hardware_timestamp_us = frame.timestamp_us;
+                        collision.system_timestamp_us = system_timestamp_us;
+                        collision.protection_levels = feedback.levels;
+                    }
+
+                    ctx.fps_stats
+                        .collision_protection_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!(
+                        "CollisionProtectionState updated: levels={:?}",
+                        feedback.levels
+                    );
                 }
             },
 
@@ -446,44 +557,124 @@ pub fn io_loop(
             // Phase 3: 配置状态更新
             // ============================================================
             ID_MOTOR_LIMIT_FEEDBACK => {
-                // MotorLimitFeedback (0x473) - 更新 ConfigState（注意：度 → 弧度转换）
-                if let Ok(feedback) = MotorLimitFeedback::try_from(frame)
-                    && let Ok(mut config) = ctx.config.try_write()
-                {
+                // MotorLimitFeedback (0x473) - 更新 JointLimitConfigState（注意：度 → 弧度转换）
+                if let Ok(feedback) = MotorLimitFeedback::try_from(frame) {
                     let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                     if joint_idx < 6 {
-                        // 注意：max_angle() 和 min_angle() 返回度，需要转换为弧度
-                        config.joint_limits_max[joint_idx] = feedback.max_angle().to_radians();
-                        config.joint_limits_min[joint_idx] = feedback.min_angle().to_radians();
-                        // max_velocity() 已经返回 rad/s，无需转换
-                        config.joint_max_velocity[joint_idx] = feedback.max_velocity();
+                        // 计算系统时间戳（微秒）
+                        let system_timestamp_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
+
+                        // 更新 JointLimitConfigState
+                        if let Ok(mut joint_limit) = ctx.joint_limit_config.write() {
+                            // 注意：max_angle() 和 min_angle() 返回度，需要转换为弧度
+                            joint_limit.joint_limits_max[joint_idx] =
+                                feedback.max_angle().to_radians();
+                            joint_limit.joint_limits_min[joint_idx] =
+                                feedback.min_angle().to_radians();
+                            // max_velocity() 已经返回 rad/s，无需转换
+                            joint_limit.joint_max_velocity[joint_idx] = feedback.max_velocity();
+
+                            // 更新时间戳
+                            joint_limit.joint_update_hardware_timestamps[joint_idx] =
+                                frame.timestamp_us;
+                            joint_limit.joint_update_system_timestamps[joint_idx] =
+                                system_timestamp_us;
+                            joint_limit.last_update_hardware_timestamp_us = frame.timestamp_us;
+                            joint_limit.last_update_system_timestamp_us = system_timestamp_us;
+
+                            // 更新有效性掩码
+                            joint_limit.valid_mask |= 1 << joint_idx;
+                        }
+
+                        ctx.fps_stats
+                            .joint_limit_config_updates
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        trace!(
+                            "JointLimitConfigState updated: joint={}, max={:.2}°, min={:.2}°",
+                            joint_idx + 1,
+                            feedback.max_angle(),
+                            feedback.min_angle()
+                        );
                     }
                 }
             },
 
             ID_MOTOR_MAX_ACCEL_FEEDBACK => {
-                // MotorMaxAccelFeedback (0x47C) - 更新 ConfigState
-                if let Ok(feedback) = MotorMaxAccelFeedback::try_from(frame)
-                    && let Ok(mut config) = ctx.config.try_write()
-                {
+                // MotorMaxAccelFeedback (0x47C) - 更新 JointAccelConfigState
+                if let Ok(feedback) = MotorMaxAccelFeedback::try_from(frame) {
                     let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                     if joint_idx < 6 {
-                        // max_accel() 已经返回 rad/s²，无需转换
-                        config.max_acc_limits[joint_idx] = feedback.max_accel();
+                        // 计算系统时间戳（微秒）
+                        let system_timestamp_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
+
+                        // 更新 JointAccelConfigState
+                        if let Ok(mut joint_accel) = ctx.joint_accel_config.write() {
+                            // max_accel() 已经返回 rad/s²，无需转换
+                            joint_accel.max_acc_limits[joint_idx] = feedback.max_accel();
+
+                            // 更新时间戳
+                            joint_accel.joint_update_hardware_timestamps[joint_idx] =
+                                frame.timestamp_us;
+                            joint_accel.joint_update_system_timestamps[joint_idx] =
+                                system_timestamp_us;
+                            joint_accel.last_update_hardware_timestamp_us = frame.timestamp_us;
+                            joint_accel.last_update_system_timestamp_us = system_timestamp_us;
+
+                            // 更新有效性掩码
+                            joint_accel.valid_mask |= 1 << joint_idx;
+                        }
+
+                        ctx.fps_stats
+                            .joint_accel_config_updates
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        trace!(
+                            "JointAccelConfigState updated: joint={}, max_accel={:.2} rad/s²",
+                            joint_idx + 1,
+                            feedback.max_accel()
+                        );
                     }
                 }
             },
 
             ID_END_VELOCITY_ACCEL_FEEDBACK => {
-                // EndVelocityAccelFeedback (0x478) - 更新 ConfigState
-                if let Ok(feedback) = EndVelocityAccelFeedback::try_from(frame)
-                    && let Ok(mut config) = ctx.config.try_write()
-                {
-                    // 所有方法已经返回标准单位，无需转换
-                    config.max_end_linear_velocity = feedback.max_linear_velocity();
-                    config.max_end_angular_velocity = feedback.max_angular_velocity();
-                    config.max_end_linear_accel = feedback.max_linear_accel();
-                    config.max_end_angular_accel = feedback.max_angular_accel();
+                // EndVelocityAccelFeedback (0x478) - 更新 EndLimitConfigState
+                if let Ok(feedback) = EndVelocityAccelFeedback::try_from(frame) {
+                    // 计算系统时间戳（微秒）
+                    let system_timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    // 更新 EndLimitConfigState
+                    if let Ok(mut end_limit) = ctx.end_limit_config.write() {
+                        // 所有方法已经返回标准单位，无需转换
+                        end_limit.max_end_linear_velocity = feedback.max_linear_velocity();
+                        end_limit.max_end_angular_velocity = feedback.max_angular_velocity();
+                        end_limit.max_end_linear_accel = feedback.max_linear_accel();
+                        end_limit.max_end_angular_accel = feedback.max_angular_accel();
+
+                        // 更新时间戳
+                        end_limit.last_update_hardware_timestamp_us = frame.timestamp_us;
+                        end_limit.last_update_system_timestamp_us = system_timestamp_us;
+
+                        // 更新有效性标记（单帧响应，收到即有效）
+                        end_limit.is_valid = true;
+                    }
+
+                    ctx.fps_stats
+                        .end_limit_config_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace!(
+                        "EndLimitConfigState updated: linear_vel={:.3} m/s, angular_vel={:.3} rad/s",
+                        feedback.max_linear_velocity(),
+                        feedback.max_angular_velocity()
+                    );
                 }
             },
 
@@ -631,10 +822,12 @@ mod tests {
 
         // 验证状态已更新（由于需要完整帧组，可能需要多次迭代）
         // 至少验证可以正常处理帧而不崩溃
-        let core = ctx.core_motion.load();
+        let joint_pos = ctx.joint_position.load();
         // 如果帧组完整，应该有时间戳更新
         // 但由于异步性，可能需要多次尝试或调整测试策略
-        assert!(core.joint_pos.iter().any(|&v| v != 0.0) || core.timestamp_us == 0);
+        assert!(
+            joint_pos.joint_pos.iter().any(|&v| v != 0.0) || joint_pos.hardware_timestamp_us == 0
+        );
     }
 
     #[test]

@@ -1,9 +1,19 @@
-//! 机械臂反馈接收示例
+//! 机器人实时监控工具
 //!
-//! 此示例演示如何连接到松灵 Piper 机械臂并接收反馈信息，
-//! 不发送任何控制指令，仅被动监听。
+//! 此示例演示如何连接到松灵 Piper 机械臂并实时监控反馈信息。
+//! 特点：
+//! - 持续循环读取状态（1Hz 刷新频率）
+//! - 显示关节位置、速度、电流等实时数据
+//! - 包含中文状态转换函数，便于理解
+//! - 支持 Ctrl+C 优雅退出
+//!
+//! **注意**：此示例用于实时监控，不发送任何控制指令，仅被动监听。
+//! 如需学习 API 用法，请参考 `state_api_demo` 示例。
 
-use piper_sdk::robot::{ControlStatusState, CoreMotionState, JointDynamicState, PiperBuilder};
+use piper_sdk::robot::{
+    EndPoseState, FpsResult, GripperState, JointDynamicState, JointPositionState, PiperBuilder,
+    RobotControlState,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -69,9 +79,12 @@ fn motion_status_to_string(status: u8) -> &'static str {
 
 /// 打印反馈信息
 fn print_feedback(
-    core_motion: &CoreMotionState,
+    joint_position: &JointPositionState,
+    end_pose: &EndPoseState,
     joint_dynamic: &JointDynamicState,
-    control_status: &ControlStatusState,
+    robot_control: &RobotControlState,
+    gripper: &GripperState,
+    fps: &FpsResult,
 ) {
     // 清屏（可选，用于实时刷新效果）
     // print!("\x1B[2J\x1B[1;1H"); // Unix/Linux/macOS
@@ -79,27 +92,32 @@ fn print_feedback(
 
     println!("========================================");
 
+    // FPS 统计
+    println!("\n状态更新频率 (FPS):");
+    println!("  关节位置状态: {:6.2} Hz", fps.joint_position);
+    println!("  末端位姿状态: {:6.2} Hz", fps.end_pose);
+    println!("  关节动态状态: {:6.2} Hz", fps.joint_dynamic);
+    println!("  机器人控制状态: {:6.2} Hz", fps.robot_control);
+    println!("  夹爪状态:     {:6.2} Hz", fps.gripper);
+
     // 控制状态
     println!(
         "控制模式: {}",
-        control_mode_to_string(control_status.control_mode)
+        control_mode_to_string(robot_control.control_mode)
     );
     println!(
         "机器人状态: {}",
-        robot_status_to_string(control_status.robot_status)
+        robot_status_to_string(robot_control.robot_status)
     );
-    println!(
-        "MOVE模式: {}",
-        move_mode_to_string(control_status.move_mode)
-    );
+    println!("MOVE模式: {}", move_mode_to_string(robot_control.move_mode));
     println!(
         "运动状态: {}",
-        motion_status_to_string(control_status.motion_status)
+        motion_status_to_string(robot_control.motion_status)
     );
 
     // 关节角度（弧度转度）
     println!("\n关节角度 (°):");
-    for (i, &angle) in core_motion.joint_pos.iter().enumerate() {
+    for (i, &angle) in joint_position.joint_pos.iter().enumerate() {
         let angle_deg = angle.to_degrees();
         print!("  J{}: {:7.2}", i + 1, angle_deg);
     }
@@ -109,13 +127,13 @@ fn print_feedback(
     println!("\n末端位置 (m):");
     println!(
         "  X: {:7.4}  Y: {:7.4}  Z: {:7.4}",
-        core_motion.end_pose[0], core_motion.end_pose[1], core_motion.end_pose[2]
+        end_pose.end_pose[0], end_pose.end_pose[1], end_pose.end_pose[2]
     );
 
     println!("\n末端姿态 (rad):");
     println!(
         "  Rx: {:7.4}  Ry: {:7.4}  Rz: {:7.4}",
-        core_motion.end_pose[3], core_motion.end_pose[4], core_motion.end_pose[5]
+        end_pose.end_pose[3], end_pose.end_pose[4], end_pose.end_pose[5]
     );
 
     // 关节速度
@@ -142,21 +160,25 @@ fn print_feedback(
 
     // 夹爪状态
     println!("\n夹爪状态:");
-    println!("  行程: {:6.2} mm", control_status.gripper_travel);
-    println!("  扭矩: {:6.3} N·m", control_status.gripper_torque);
+    println!("  行程: {:6.2} mm", gripper.travel);
+    println!("  扭矩: {:6.3} N·m", gripper.torque);
+    println!(
+        "  是否在运动: {}",
+        if gripper.is_moving() { "是" } else { "否" }
+    );
 
     // 故障检测
-    let has_faults = control_status.fault_angle_limit.iter().any(|&x| x)
-        || control_status.fault_comm_error.iter().any(|&x| x);
+    let has_faults = (0..6).any(|i| robot_control.is_angle_limit(i))
+        || (0..6).any(|i| robot_control.is_comm_error(i));
     if has_faults {
         println!("\n⚠ 故障检测:");
-        for (i, &limit) in control_status.fault_angle_limit.iter().enumerate() {
-            if limit {
+        for i in 0..6 {
+            if robot_control.is_angle_limit(i) {
                 println!("  J{} 角度超限位", i + 1);
             }
         }
-        for (i, &comm) in control_status.fault_comm_error.iter().enumerate() {
-            if comm {
+        for i in 0..6 {
+            if robot_control.is_comm_error(i) {
                 println!("  J{} 通信异常", i + 1);
             }
         }
@@ -210,13 +232,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         iteration += 1;
 
         // 读取各种状态
-        let core_motion = piper.get_core_motion();
+        let joint_position = piper.get_joint_position();
+        let end_pose = piper.get_end_pose();
         let joint_dynamic = piper.get_joint_dynamic();
-        let control_status = piper.get_control_status();
+        let robot_control = piper.get_robot_control();
+        let gripper = piper.get_gripper();
+        let fps = piper.get_fps();
 
         // 打印反馈信息
         println!("[第 {} 次更新]", iteration);
-        print_feedback(&core_motion, &joint_dynamic, &control_status);
+        print_feedback(
+            &joint_position,
+            &end_pose,
+            &joint_dynamic,
+            &robot_control,
+            &gripper,
+            &fps,
+        );
 
         // 控制刷新频率（1Hz，每秒打印一次）
         std::thread::sleep(Duration::from_secs(1));

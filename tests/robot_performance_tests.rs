@@ -67,9 +67,11 @@ fn test_lock_free_read_performance() {
 
     // 运行 100ms，测量高频读取性能
     while start.elapsed().as_millis() < 100 {
-        let _core = piper.get_core_motion();
+        let _joint_pos = piper.get_joint_position();
+        let _end_pose = piper.get_end_pose();
         let _joint = piper.get_joint_dynamic();
-        let _status = piper.get_control_status();
+        let _control = piper.get_robot_control();
+        let _gripper = piper.get_gripper();
         count += 1;
     }
 

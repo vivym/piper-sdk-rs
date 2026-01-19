@@ -265,7 +265,7 @@ let piper = PiperBuilder::new()
 ```
 examples/
 ├── README.md
-└── feedback_receiver.rs          # 主示例文件
+└── robot_monitor.rs              # 主示例文件（原 feedback_receiver.rs）
 ```
 
 ## 7. 依赖项
@@ -282,13 +282,13 @@ ctrlc = "3.4"                    # 用于 Ctrl+C 处理（可选）
 
 ```bash
 # 运行示例
-cargo run --example feedback_receiver
+cargo run --example robot_monitor
 
 # 编译但不运行
-cargo build --example feedback_receiver
+cargo build --example robot_monitor
 
 # 发布模式编译（优化）
-cargo build --example feedback_receiver --release
+cargo build --example robot_monitor --release
 ```
 
 ## 9. 下一步

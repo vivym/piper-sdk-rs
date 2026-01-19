@@ -58,6 +58,7 @@
 - Rust 1.70.0 或更高版本
 - Git
 - （可选）硬件设备用于集成测试
+- （Linux 可选）虚拟 CAN 接口 `vcan0` 用于 SocketCAN 测试
 
 ### 克隆和构建
 
@@ -75,6 +76,26 @@ cargo test
 # 运行所有测试（包括需要硬件的测试）
 cargo test -- --test-threads=1
 ```
+
+### Linux 环境设置（SocketCAN 测试）
+
+如果要在 Linux 上运行 SocketCAN 相关测试，需要设置虚拟 CAN 接口：
+
+```bash
+# 加载 vcan 内核模块
+sudo modprobe vcan
+
+# 创建虚拟 CAN 接口
+sudo ip link add dev vcan0 type vcan
+
+# 启动接口
+sudo ip link set up vcan0
+
+# 验证接口
+ip link show vcan0
+```
+
+**注意**：如果 `vcan0` 接口不存在，SocketCAN 测试会自动跳过，不会导致测试失败。这确保了测试可以在没有配置虚拟 CAN 接口的环境中正常运行。
 
 ### 文档生成
 

@@ -139,16 +139,18 @@ fn test_piper_end_to_end_joint_pos_update() {
     let mut _found_update = false;
 
     for _ in 0..max_attempts {
-        let core = piper.get_core_motion();
-        if core.timestamp_us > 0 || core.joint_pos.iter().any(|&v| v.abs() > 0.001) {
+        let joint_pos = piper.get_joint_position();
+        if joint_pos.hardware_timestamp_us > 0
+            || joint_pos.joint_pos.iter().any(|&v| v.abs() > 0.001)
+        {
             _found_update = true;
 
             // 验证关节位置数据（转换为弧度后的近似值）
             // 10° ≈ 0.1745 rad, 20° ≈ 0.3491 rad, ...
             // 允许一定的误差（由于浮点数精度和异步处理）
             assert!(
-                (core.joint_pos[0].abs() - 10.0 * std::f64::consts::PI / 180.0).abs() < 0.1
-                    || core.joint_pos.iter().any(|&v| v.abs() > 0.001),
+                (joint_pos.joint_pos[0].abs() - 10.0 * std::f64::consts::PI / 180.0).abs() < 0.1
+                    || joint_pos.joint_pos.iter().any(|&v| v.abs() > 0.001),
                 "Joint position should be updated"
             );
             break;
@@ -181,12 +183,12 @@ fn test_piper_end_to_end_robot_status_update() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // 验证控制状态已更新
-    let status = piper.get_control_status();
+    let control = piper.get_robot_control();
 
     // 验证基本字段（由于异步性，可能需要多次检查）
     // 如果处理成功，control_mode 或 robot_status 应该有值
     // 这里主要验证不会崩溃
-    assert_eq!(status.timestamp_us, status.timestamp_us); // 基本断言
+    assert_eq!(control.hardware_timestamp_us, control.hardware_timestamp_us); // 基本断言
 }
 
 /// 端到端测试：验证命令发送
@@ -225,13 +227,17 @@ fn test_piper_end_to_end_full_state_read() {
     let piper = Piper::new(can_adapter, None).unwrap();
 
     // 测试所有状态读取方法都不会崩溃
-    let _core = piper.get_core_motion();
+    let _joint_pos = piper.get_joint_position();
+    let _end_pose = piper.get_end_pose();
     let _joint = piper.get_joint_dynamic();
-    let _status = piper.get_control_status();
+    let _control = piper.get_robot_control();
+    let _gripper = piper.get_gripper();
     let _motion = piper.get_motion_state();
     let _aligned = piper.get_aligned_motion(5000);
-    let _diag = piper.get_diagnostic_state().unwrap();
-    let _config = piper.get_config_state().unwrap();
+    let _driver = piper.get_joint_driver_low_speed();
+    let _limits = piper.get_joint_limit_config().unwrap();
+    let _accel = piper.get_joint_accel_config().unwrap();
+    let _end_limits = piper.get_end_limit_config().unwrap();
 }
 
 // 辅助函数：创建末端位姿反馈帧
@@ -301,12 +307,13 @@ fn test_piper_end_to_end_complete_frame_groups() {
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     // 验证状态已更新
-    let core = piper.get_core_motion();
+    let joint_pos = piper.get_joint_position();
+    let end_pose = piper.get_end_pose();
 
     // 验证至少处理了帧（不会崩溃）
     // 由于异步性和帧组完整性要求，主要验证不会崩溃
-    assert_eq!(core.joint_pos.len(), 6);
-    assert_eq!(core.end_pose.len(), 6);
+    assert_eq!(joint_pos.joint_pos.len(), 6);
+    assert_eq!(end_pose.end_pose.len(), 6);
 }
 
 /// 端到端测试：速度帧 Buffered Commit（6 个关节全部接收）
@@ -386,9 +393,11 @@ fn test_piper_end_to_end_mixed_state_updates() {
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     // 验证所有状态都可以读取（不会崩溃）
-    let _core = piper.get_core_motion();
+    let _joint_pos = piper.get_joint_position();
+    let _end_pose = piper.get_end_pose();
     let _joint = piper.get_joint_dynamic();
-    let _status = piper.get_control_status();
+    let _control = piper.get_robot_control();
+    let _gripper = piper.get_gripper();
     let _motion = piper.get_motion_state();
 }
 
@@ -454,12 +463,13 @@ fn test_piper_stress_incomplete_joint_pos_frame_group() {
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     // 验证状态（不完整帧组不应该提交）
-    let core = piper.get_core_motion();
+    let joint_pos = piper.get_joint_position();
+    let end_pose = piper.get_end_pose();
 
     // 验证不会崩溃（即使帧组不完整）
     // 注意：由于帧组不完整，可能不会提交，但应该不会崩溃
-    assert_eq!(core.joint_pos.len(), 6);
-    assert_eq!(core.end_pose.len(), 6);
+    assert_eq!(joint_pos.joint_pos.len(), 6);
+    assert_eq!(end_pose.end_pose.len(), 6);
 }
 
 /// 压力测试：命令通道满（多次快速发送）
@@ -563,8 +573,10 @@ fn test_piper_stress_mixed_frame_sequence() {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // 验证所有状态都可以读取（不会崩溃）
-    let _core = piper.get_core_motion();
+    let _joint_pos = piper.get_joint_position();
+    let _end_pose = piper.get_end_pose();
     let _joint = piper.get_joint_dynamic();
-    let _status = piper.get_control_status();
+    let _control = piper.get_robot_control();
+    let _gripper = piper.get_gripper();
     let _motion = piper.get_motion_state();
 }

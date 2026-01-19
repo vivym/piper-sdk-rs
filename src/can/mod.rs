@@ -47,7 +47,7 @@ pub struct PiperFrame {
     /// **类型说明**：使用 `u64` 而非 `u32`，原因：
     /// - 支持绝对时间戳（Unix 纪元开始），无需基准时间管理
     /// - 支持相对时间戳（从适配器启动开始），可覆盖更长的时间范围（584,000+ 年）
-    /// - 与状态层设计一致（`CoreMotionState.timestamp_us: u64`）
+    /// - 与状态层设计一致（`JointPositionState.hardware_timestamp_us: u64`）
     /// - 内存对齐后大小相同（24 字节），无额外开销
     pub timestamp_us: u64,
 }

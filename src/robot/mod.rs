@@ -9,12 +9,14 @@
 
 mod builder;
 mod error;
+mod fps_stats;
 mod pipeline;
 mod robot_impl;
 mod state;
 
 pub use builder::PiperBuilder;
 pub use error::RobotError;
+pub use fps_stats::{FpsCounts, FpsResult};
 pub use pipeline::{PipelineConfig, io_loop};
 pub use robot_impl::Piper;
 pub use state::*;

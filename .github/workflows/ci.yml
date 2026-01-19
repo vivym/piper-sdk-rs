@@ -101,6 +101,14 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
 
+      - name: Setup vcan0 for Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo modprobe vcan
+          sudo ip link add dev vcan0 type vcan || true
+          sudo ip link set up vcan0 || true
+          ip link show vcan0
+
       - name: Cache cargo registry
         uses: actions/cache@v3
         with:

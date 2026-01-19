@@ -11,14 +11,20 @@ fn test_module_exports() {
     let _: RobotError = RobotError::Timeout;
 
     // 测试状态类型
-    let _: CoreMotionState = CoreMotionState::default();
+    let _: JointPositionState = JointPositionState::default();
+    let _: EndPoseState = EndPoseState::default();
     let _: JointDynamicState = JointDynamicState::default();
-    let _: ControlStatusState = ControlStatusState::default();
-    let _: DiagnosticState = DiagnosticState::default();
-    let _: ConfigState = ConfigState::default();
+    let _: RobotControlState = RobotControlState::default();
+    let _: GripperState = GripperState::default();
+    let _: JointDriverLowSpeedState = JointDriverLowSpeedState::default();
+    let _: CollisionProtectionState = CollisionProtectionState::default();
+    let _: JointLimitConfigState = JointLimitConfigState::default();
+    let _: JointAccelConfigState = JointAccelConfigState::default();
+    let _: EndLimitConfigState = EndLimitConfigState::default();
     let _: PiperContext = PiperContext::new();
     let _: CombinedMotionState = CombinedMotionState {
-        core: CoreMotionState::default(),
+        joint_position: JointPositionState::default(),
+        end_pose: EndPoseState::default(),
         joint_dynamic: JointDynamicState::default(),
     };
     let _: AlignedMotionState = AlignedMotionState {
