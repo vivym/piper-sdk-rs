@@ -756,13 +756,13 @@ pub struct JointDriverHighSpeedFeedback {
 impl JointDriverHighSpeedFeedback {
     /// 关节 1-3 的力矩系数（CAN ID: 0x251~0x253）
     ///
-    /// 根据官方 Python SDK，关节 1、2、3 使用此系数计算力矩。
+    /// 根据官方参考实现，关节 1、2、3 使用此系数计算力矩。
     /// 公式：torque = current * COEFFICIENT_1_3
     pub const COEFFICIENT_1_3: f64 = 1.18125;
 
     /// 关节 4-6 的力矩系数（CAN ID: 0x254~0x256）
     ///
-    /// 根据官方 Python SDK，关节 4、5、6 使用此系数计算力矩。
+    /// 根据官方参考实现，关节 4、5、6 使用此系数计算力矩。
     /// 公式：torque = current * COEFFICIENT_4_6
     pub const COEFFICIENT_4_6: f64 = 0.95844;
 
@@ -842,7 +842,7 @@ impl JointDriverHighSpeedFeedback {
     /// 获取力矩原始值（0.001N·m 单位）
     ///
     /// 返回以 0.001N·m 为单位的力矩原始值（整数形式）。
-    /// 这对应于 Python SDK 中 `effort` 字段的单位。
+    /// 这对应于官方参考实现中 `effort` 字段的单位。
     ///
     /// # 返回值
     /// 力矩原始值（0.001N·m 单位，即毫牛·米）
@@ -2032,13 +2032,13 @@ mod tests {
 
     #[test]
     fn test_joint_driver_high_speed_feedback_torque_coefficients() {
-        // 验证系数值与 Python SDK 一致
+        // 验证系数值与官方参考实现一致
         assert_eq!(JointDriverHighSpeedFeedback::COEFFICIENT_1_3, 1.18125);
         assert_eq!(JointDriverHighSpeedFeedback::COEFFICIENT_4_6, 0.95844);
 
-        // 测试具体计算值（与 Python SDK 的 cal_effort 方法一致）
-        // Python: current = 1000 (0.001A 单位) = 1.0 A
-        // Python: effort = 1000 * 1.18125 = 1181.25 (0.001N·m 单位) = 1.18125 N·m
+        // 测试具体计算值（与官方参考实现的 cal_effort 方法一致）
+        // 示例：current = 1000 (0.001A 单位) = 1.0 A
+        // 示例：effort = 1000 * 1.18125 = 1181.25 (0.001N·m 单位) = 1.18125 N·m
         let current_val = 1000u16; // 1.0 A
         let mut data = [0u8; 8];
         data[2..4].copy_from_slice(&current_val.to_be_bytes());

@@ -1,8 +1,8 @@
-# Python SDK 与 Rust SDK 协议实现详细对比分析报告
+# 官方参考实现 与 Rust SDK 协议实现详细对比分析报告
 
 ## 报告说明
 
-本报告逐项对比官方 Python SDK (`piper_protocol_v2.py`) 与 Rust SDK 的协议实现，详细分析每个协议的：
+本报告逐项对比官方参考实现与 Rust SDK 的协议实现，详细分析每个协议的：
 - 字节序处理
 - 符号处理（有符号/无符号）
 - 字段映射
@@ -10,7 +10,7 @@
 - 特殊处理逻辑
 
 **对比依据**：
-- Python SDK 代码：`tmp/piper_sdk/piper_sdk/protocol/protocol_v2/piper_protocol_v2.py`
+- 官方参考实现代码：协议 V2 对照实现
 - Rust SDK 代码：`src/protocol/feedback.rs`, `src/protocol/control.rs`, `src/protocol/config.rs`
 - 协议文档：`docs/v0/protocol.md`
 
@@ -20,7 +20,7 @@
 
 ### 1.1 反馈帧（DecodeMessage / TryFrom）
 
-| CAN ID | 协议名称 | Python SDK | Rust SDK | 状态 |
+| CAN ID | 协议名称 | 官方参考实现 | Rust SDK | 状态 |
 |--------|---------|-----------|----------|------|
 | 0x2A1 | ARM_STATUS_FEEDBACK | ✅ | ✅ RobotStatusFeedback | ✅ |
 | 0x2A2 | ARM_END_POSE_FEEDBACK_1 | ✅ | ✅ EndPoseFeedback1 | ✅ |
@@ -48,7 +48,7 @@
 
 ### 1.2 控制帧（EncodeMessage / to_frame）
 
-| CAN ID | 协议名称 | Python SDK | Rust SDK | 状态 |
+| CAN ID | 协议名称 | 官方参考实现 | Rust SDK | 状态 |
 |--------|---------|-----------|----------|------|
 | 0x150 | ARM_MOTION_CTRL_1 | ✅ | ✅ EmergencyStopCommand | ✅ |
 | 0x151 | ARM_MOTION_CTRL_2 | ✅ | ✅ ControlModeCommandFrame | ✅ |
@@ -64,7 +64,7 @@
 
 ### 1.3 配置帧（EncodeMessage + DecodeMessage）
 
-| CAN ID | 协议名称 | Python SDK | Rust SDK | 状态 |
+| CAN ID | 协议名称 | 官方参考实现 | Rust SDK | 状态 |
 |--------|---------|-----------|----------|------|
 | 0x470 | ARM_MASTER_SLAVE_MODE_CONFIG | ✅ | ✅ MasterSlaveModeCommand | ✅ |
 | 0x471 | ARM_MOTOR_ENABLE_DISABLE_CONFIG | ✅ | ✅ MotorEnableCommand | ✅ |
@@ -90,8 +90,8 @@
 
 ### 2.1 0x2A1 - 机械臂状态反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_status_msgs.ctrl_mode = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_status_msgs.arm_status = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,1,2),False)
 msg.arm_status_msgs.mode_feed = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,2,3),False)
@@ -117,7 +117,7 @@ pub struct RobotStatusFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | ctrl_mode | ConvertToNegative_8bit(..., False) = u8 | ControlMode (u8) | 大端 | 无符号 | ✅ 一致 |
 | arm_status | ConvertToNegative_8bit(..., False) = u8 | RobotStatus (u8) | 大端 | 无符号 | ✅ 一致 |
@@ -129,9 +129,9 @@ pub struct RobotStatusFeedback {
 
 **差异说明**：
 - **故障码字段**：
-  - Python SDK：将 Byte 6-7 解析为一个 16 位无符号整数 `err_code`
+  - 官方参考实现：将 Byte 6-7 解析为一个 16 位无符号整数 `err_code`
   - Rust SDK：将 Byte 6 和 Byte 7 分别解析为两个 8 位位域（`FaultCodeAngleLimit` 和 `FaultCodeCommError`）
-  - **分析**：根据协议文档，Byte 6 和 Byte 7 是独立的故障码位域，分别表示角度超限位和通信异常。Rust 实现更符合协议定义，Python SDK 的 `err_code` 可能需要进一步解析才能获取具体故障信息。
+  - **分析**：根据协议文档，Byte 6 和 Byte 7 是独立的故障码位域，分别表示角度超限位和通信异常。Rust 实现更符合协议定义，官方参考实现 的 `err_code` 可能需要进一步解析才能获取具体故障信息。
 - **其他字段**：完全一致
 
 **结论**：✅ **功能一致**，Rust 实现更清晰地反映了协议结构
@@ -140,8 +140,8 @@ pub struct RobotStatusFeedback {
 
 ### 2.2 0x2A2-0x2A4 - 末端位姿反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 # 0x2A2
 msg.arm_end_pose.X_axis = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,0,4))
 msg.arm_end_pose.Y_axis = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,4,8))
@@ -175,7 +175,7 @@ pub struct EndPoseFeedback3 {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | X_axis | ConvertToNegative_32bit (i32) | x_mm (i32) | 大端 | 有符号 | ✅ 一致 |
 | Y_axis | ConvertToNegative_32bit (i32) | y_mm (i32) | 大端 | 有符号 | ✅ 一致 |
@@ -190,8 +190,8 @@ pub struct EndPoseFeedback3 {
 
 ### 2.3 0x2A5-0x2A7 - 关节角度反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 # 0x2A5
 msg.arm_joint_feedback.joint_1 = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,0,4))
 msg.arm_joint_feedback.joint_2 = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,4,8))
@@ -225,7 +225,7 @@ pub struct JointFeedback56 {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | joint_1-6 | ConvertToNegative_32bit (i32) | j1_deg~j6_deg (i32) | 大端 | 有符号 | ✅ 一致 |
 
@@ -235,8 +235,8 @@ pub struct JointFeedback56 {
 
 ### 2.4 0x2A8 - 夹爪反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.gripper_feedback.grippers_angle = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,0,4))
 msg.gripper_feedback.grippers_effort = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,4,6))
 msg.gripper_feedback.status_code = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,6,7),False)
@@ -254,7 +254,7 @@ pub struct GripperFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | grippers_angle | ConvertToNegative_32bit (i32) | travel_mm (i32) | 大端 | 有符号 | ✅ 一致 |
 | grippers_effort | ConvertToNegative_16bit (i16) | torque_nm (i16) | 大端 | 有符号 | ✅ 一致 |
@@ -266,8 +266,8 @@ pub struct GripperFeedback {
 
 ### 2.5 0x251-0x256 - 关节驱动器高速反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_high_spd_feedback_1.motor_speed = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,0,2))
 msg.arm_high_spd_feedback_1.current = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,2,4))
 msg.arm_high_spd_feedback_1.pos = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,4,8))
@@ -284,7 +284,7 @@ pub struct JointDriverHighSpeedFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | motor_speed | ConvertToNegative_16bit (i16) | speed_rad_s (i16) | 大端 | 有符号 | ✅ 一致 |
 | current | ConvertToNegative_16bit (i16) | current_a (i16) | 大端 | 有符号 | ✅ **已修正** |
@@ -300,8 +300,8 @@ pub struct JointDriverHighSpeedFeedback {
 
 ### 2.6 0x261-0x266 - 关节驱动器低速反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_low_spd_feedback_1.vol = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,0,2),False)
 msg.arm_low_spd_feedback_1.foc_temp = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,2,4))
 msg.arm_low_spd_feedback_1.motor_temp = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,4,5))
@@ -322,7 +322,7 @@ pub struct JointDriverLowSpeedFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | vol | ConvertToNegative_16bit(..., False) (u16) | voltage (u16) | 大端 | 无符号 | ✅ 一致 |
 | foc_temp | ConvertToNegative_16bit (i16) | driver_temp (i16) | 大端 | 有符号 | ✅ 一致 |
@@ -336,8 +336,8 @@ pub struct JointDriverLowSpeedFeedback {
 
 ### 2.7 0x481-0x486 - 关节末端速度/加速度反馈
 
-#### Python SDK 解析
-**注意**：Python SDK 中**未找到**此协议的解析代码。可能需要进一步确认。
+#### 官方参考实现 解析
+**注意**：官方参考实现 中**未找到**此协议的解析代码。可能需要进一步确认。
 
 #### Rust SDK 解析
 ```rust
@@ -351,18 +351,18 @@ pub struct JointEndVelocityAccelFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 状态 |
+| 字段 | 官方参考实现 | Rust SDK | 状态 |
 |------|-----------|----------|------|
 | 全部字段 | ❓ **未找到解析代码** | ✅ 已实现 | ⚠️ **需要确认** |
 
-**结论**：⚠️ **Python SDK 中未找到此协议，Rust 实现基于协议文档**
+**结论**：⚠️ **官方参考实现 中未找到此协议，Rust 实现基于协议文档**
 
 ---
 
 ### 2.8 0x473 - 电机限制反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_feedback_current_motor_angle_limit_max_spd.motor_num = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_feedback_current_motor_angle_limit_max_spd.max_angle_limit = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,1,3))
 msg.arm_feedback_current_motor_angle_limit_max_spd.min_angle_limit = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,3,5))
@@ -382,7 +382,7 @@ pub struct MotorLimitFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | motor_num | ConvertToNegative_8bit(..., False) (u8) | joint_index (u8) | - | 无符号 | ✅ 一致 |
 | max_angle_limit | ConvertToNegative_16bit (i16) | max_angle_deg (i16) | 大端 | 有符号 | ✅ 一致 |
@@ -395,8 +395,8 @@ pub struct MotorLimitFeedback {
 
 ### 2.9 0x476 - 设置指令应答
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_feedback_resp_set_instruction.instruction_index = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_feedback_resp_set_instruction.is_set_zero_successfully = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,1,2),False)
 ```
@@ -416,12 +416,12 @@ pub struct SettingResponse {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | instruction_index | ConvertToNegative_8bit(..., False) (u8) | response_index (u8) | - | 无符号 | ✅ 一致 |
 | is_set_zero_successfully | ConvertToNegative_8bit(..., False) (u8) | zero_point_success (bool) | - | 无符号→bool | ✅ 一致（Rust更语义化） |
 
-**注意**：Rust 实现还解析了 Byte 2-6 的字段，Python SDK 中未解析。需要确认协议文档。
+**注意**：Rust 实现还解析了 Byte 2-6 的字段，官方参考实现 中未解析。需要确认协议文档。
 
 **结论**：✅ **核心字段一致**，Rust 实现更完整
 
@@ -429,8 +429,8 @@ pub struct SettingResponse {
 
 ### 2.10 0x478 - 末端速度/加速度参数反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_feedback_current_end_vel_acc_param.end_max_linear_vel = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,0,2),False)
 msg.arm_feedback_current_end_vel_acc_param.end_max_angular_vel = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,2,4),False)
 msg.arm_feedback_current_end_vel_acc_param.end_max_linear_acc = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,4,6),False)
@@ -449,7 +449,7 @@ pub struct EndVelocityAccelFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | end_max_linear_vel | ConvertToNegative_16bit(..., False) (u16) | max_linear_velocity (u16) | 大端 | 无符号 | ✅ 一致 |
 | end_max_angular_vel | ConvertToNegative_16bit(..., False) (u16) | max_angular_velocity (u16) | 大端 | 无符号 | ✅ 一致 |
@@ -462,8 +462,8 @@ pub struct EndVelocityAccelFeedback {
 
 ### 2.11 0x47B - 碰撞防护等级反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_crash_protection_rating_feedback.joint_1_protection_level = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_crash_protection_rating_feedback.joint_2_protection_level = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,1,2),False)
 msg.arm_crash_protection_rating_feedback.joint_3_protection_level = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,2,3),False)
@@ -482,7 +482,7 @@ pub struct CollisionProtectionLevelFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | joint_1~6_protection_level | ConvertToNegative_8bit(..., False) (u8) | protection_levels[0~5] (u8) | - | 无符号 | ✅ 一致 |
 
@@ -492,8 +492,8 @@ pub struct CollisionProtectionLevelFeedback {
 
 ### 2.12 0x47C - 电机最大加速度限制反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_feedback_current_motor_max_acc_limit.joint_motor_num = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_feedback_current_motor_max_acc_limit.max_joint_acc = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,1,3),False)
 ```
@@ -509,7 +509,7 @@ pub struct MotorMaxAccelFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | joint_motor_num | ConvertToNegative_8bit(..., False) (u8) | joint_index (u8) | - | 无符号 | ✅ 一致 |
 | max_joint_acc | ConvertToNegative_16bit(..., False) (u16) | max_accel (u16) | 大端 | 无符号 | ✅ 一致 |
@@ -520,8 +520,8 @@ pub struct MotorMaxAccelFeedback {
 
 ### 2.13 0x47E - 夹爪/示教器参数反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.arm_gripper_teaching_param_feedback.teaching_range_per = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_gripper_teaching_param_feedback.max_range_config = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,1,2),False)
 msg.arm_gripper_teaching_param_feedback.teaching_friction = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,2,3),False)
@@ -539,7 +539,7 @@ pub struct GripperTeachParamsFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | teaching_range_per | ConvertToNegative_8bit(..., False) (u8) | teach_travel_coeff (u8) | - | 无符号 | ✅ 一致 |
 | max_range_config | ConvertToNegative_8bit(..., False) (u8) | max_travel_limit (u8) | - | 无符号 | ✅ 一致 |
@@ -551,8 +551,8 @@ pub struct GripperTeachParamsFeedback {
 
 ### 2.14 0x151, 0x155-0x157, 0x159 - 主从模式控制指令反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 # 0x151 - 控制模式指令
 msg.arm_motion_ctrl_2.ctrl_mode = self.ConvertToNegative_8bit(...)
 msg.arm_motion_ctrl_2.move_mode = self.ConvertToNegative_8bit(...)
@@ -600,7 +600,7 @@ pub struct GripperControlFeedback {
 
 #### 对比分析
 
-| 协议 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 协议 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | 0x151 所有字段 | ConvertToNegative_8bit(..., False) (u8) | 对应枚举/u8 | - | 无符号 | ✅ 一致 |
 | 0x155-0x157 joint_1~6 | ConvertToNegative_32bit (i32) | j1_deg~j6_deg (i32) | 大端 | 有符号 | ✅ 一致 |
@@ -614,8 +614,8 @@ pub struct GripperControlFeedback {
 
 ### 2.15 0x4AF - 固件版本读取反馈
 
-#### Python SDK 解析
-```python
+#### 官方参考实现 解析
+```text
 msg.firmware_data = can_data
 ```
 
@@ -634,7 +634,7 @@ impl FirmwareReadFeedback {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 差异 |
 |------|-----------|----------|------|
 | firmware_data | can_data (bytearray) | firmware_data ([u8; 8]) | ✅ 一致 |
 | 版本解析 | GetPiperFirmwareVersion() (在接口层) | parse_version_string() | ✅ 功能一致 |
@@ -647,8 +647,8 @@ impl FirmwareReadFeedback {
 
 ### 3.1 0x150 - 快速急停/轨迹指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_motion_ctrl_1.emergency_stop,False) + \
                     self.ConvertToList_8bit(msg.arm_motion_ctrl_1.track_ctrl,False) + \
                     self.ConvertToList_8bit(msg.arm_motion_ctrl_1.grag_teach_ctrl,False) + \
@@ -670,13 +670,13 @@ pub struct EmergencyStopCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | emergency_stop | ConvertToList_8bit(..., False) (u8) | emergency_stop (u8) | - | 无符号 | ✅ 一致 |
 | track_ctrl | ConvertToList_8bit(..., False) (u8) | trajectory_command (u8) | - | 无符号 | ✅ 一致 |
 | grag_teach_ctrl | ConvertToList_8bit(..., False) (u8) | teach_command (u8) | - | 无符号 | ✅ 一致 |
 
-**注意**：Rust 实现还包含 Byte 3-6 的字段（trajectory_index, name_index, crc16），Python SDK 中未编码。需要确认协议文档。
+**注意**：Rust 实现还包含 Byte 3-6 的字段（trajectory_index, name_index, crc16），官方参考实现 中未编码。需要确认协议文档。
 
 **结论**：✅ **核心字段一致**，Rust 实现可能更完整
 
@@ -684,8 +684,8 @@ pub struct EmergencyStopCommand {
 
 ### 3.2 0x151 - 控制模式指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_motion_ctrl_2.ctrl_mode,False) + \
                     self.ConvertToList_8bit(msg.arm_motion_ctrl_2.move_mode,False) + \
                     self.ConvertToList_8bit(msg.arm_motion_ctrl_2.move_spd_rate_ctrl,False) + \
@@ -710,7 +710,7 @@ pub struct ControlModeCommandFrame {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | ctrl_mode | ConvertToList_8bit(..., False) (u8) | control_mode (u8) | - | 无符号 | ✅ 一致 |
 | move_mode | ConvertToList_8bit(..., False) (u8) | move_mode (u8) | - | 无符号 | ✅ 一致 |
@@ -725,8 +725,8 @@ pub struct ControlModeCommandFrame {
 
 ### 3.3 0x152-0x154 - 末端位姿控制指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 # 0x152
 tx_can_frame.data = self.ConvertToList_32bit(msg.arm_motion_ctrl_cartesian.X_axis) + \
                     self.ConvertToList_32bit(msg.arm_motion_ctrl_cartesian.Y_axis)
@@ -760,7 +760,7 @@ pub struct EndPoseControl3 {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | X_axis~RZ_axis | ConvertToList_32bit (i32) | x_mm~rz_deg (i32) | 大端 | 有符号 | ✅ 一致 |
 
@@ -770,8 +770,8 @@ pub struct EndPoseControl3 {
 
 ### 3.4 0x155-0x157 - 关节控制指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 # 0x155
 tx_can_frame.data = self.ConvertToList_32bit(msg.arm_joint_ctrl.joint_1) + \
                     self.ConvertToList_32bit(msg.arm_joint_ctrl.joint_2)
@@ -805,7 +805,7 @@ pub struct JointControl56 {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | joint_1~6 | ConvertToList_32bit (i32) | j1_deg~j6_deg (i32) | 大端 | 有符号 | ✅ 一致 |
 
@@ -815,8 +815,8 @@ pub struct JointControl56 {
 
 ### 3.5 0x158 - 圆弧模式坐标序号更新指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_circular_ctrl.instruction_num,False) + \
                     [0, 0, 0, 0, 0, 0, 0]
 ```
@@ -831,7 +831,7 @@ pub struct ArcPointCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | instruction_num | ConvertToList_8bit(..., False) (u8) | arc_point_index (u8) | - | 无符号 | ✅ 一致 |
 
@@ -841,8 +841,8 @@ pub struct ArcPointCommand {
 
 ### 3.6 0x159 - 夹爪控制指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_32bit(msg.arm_gripper_ctrl.grippers_angle) + \
                     self.ConvertToList_16bit(msg.arm_gripper_ctrl.grippers_effort,False) + \
                     self.ConvertToList_8bit(msg.arm_gripper_ctrl.status_code,False) + \
@@ -861,15 +861,15 @@ pub struct GripperControlCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | grippers_angle | ConvertToList_32bit (i32) | travel_mm (i32) | 大端 | 有符号 | ✅ 一致 |
 | grippers_effort | ConvertToList_16bit(..., False) (u16) | torque_nm (i16) | 大端 | ⚠️ **符号不同** |
 
 **差异说明**：
-- Python SDK：`grippers_effort` 使用无符号 u16 编码
+- 官方参考实现：`grippers_effort` 使用无符号 u16 编码
 - Rust SDK：`torque_nm` 使用有符号 i16
-- **分析**：根据协议文档，夹爪扭矩应该是 `int16`，Rust 实现正确。Python SDK 可能有误，或者协议文档与实现不一致。
+- **分析**：根据协议文档，夹爪扭矩应该是 `int16`，Rust 实现正确。官方参考实现 可能有误，或者协议文档与实现不一致。
 
 **结论**：⚠️ **扭矩字段符号不一致**（需要确认协议文档）
 
@@ -877,8 +877,8 @@ pub struct GripperControlCommand {
 
 ### 3.7 0x15A-0x15F - MIT 控制指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_16bit(msg.arm_joint_mit_ctrl.pos_ref,False) + \
                     self.ConvertToList_8bit(((msg.arm_joint_mit_ctrl.vel_ref >> 4)&0xFF),False) + \
                     self.ConvertToList_8bit(((((msg.arm_joint_mit_ctrl.vel_ref&0xF)<<4)&0xF0) |
@@ -925,8 +925,8 @@ pub struct MitControlCommand {
 
 ### 3.8 0x121 - 灯光控制指令
 
-#### Python SDK 编码
-**注意**：Python SDK 中**未找到**此协议的编码代码。
+#### 官方参考实现 编码
+**注意**：官方参考实现 中**未找到**此协议的编码代码。
 
 #### Rust SDK 编码
 ```rust
@@ -944,18 +944,18 @@ pub struct LightControlCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 状态 |
+| 字段 | 官方参考实现 | Rust SDK | 状态 |
 |------|-----------|----------|------|
 | 全部字段 | ❓ **未找到编码代码** | ✅ 已实现 | ⚠️ **需要确认** |
 
-**结论**：⚠️ **Python SDK 中未找到此协议，Rust 实现基于协议文档**
+**结论**：⚠️ **官方参考实现 中未找到此协议，Rust 实现基于协议文档**
 
 ---
 
 ### 3.9 0x422 - 固件升级模式设定指令
 
-#### Python SDK 编码
-**注意**：Python SDK 中**未找到**此协议的编码代码。
+#### 官方参考实现 编码
+**注意**：官方参考实现 中**未找到**此协议的编码代码。
 
 #### Rust SDK 编码
 ```rust
@@ -967,11 +967,11 @@ pub struct FirmwareUpgradeCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 状态 |
+| 字段 | 官方参考实现 | Rust SDK | 状态 |
 |------|-----------|----------|------|
 | upgrade_mode | ❓ **未找到编码代码** | ✅ 已实现 | ⚠️ **需要确认** |
 
-**结论**：⚠️ **Python SDK 中未找到此协议，Rust 实现基于协议文档**
+**结论**：⚠️ **官方参考实现 中未找到此协议，Rust 实现基于协议文档**
 
 ---
 
@@ -979,8 +979,8 @@ pub struct FirmwareUpgradeCommand {
 
 ### 4.1 0x470 - 随动主从模式设置指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_ms_config.linkage_config,False) + \
                     self.ConvertToList_8bit(msg.arm_ms_config.feedback_offset,False) + \
                     self.ConvertToList_8bit(msg.arm_ms_config.ctrl_offset,False) + \
@@ -1001,7 +1001,7 @@ pub struct MasterSlaveModeCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | linkage_config | ConvertToList_8bit(..., False) (u8) | link_setting (u8) | - | 无符号 | ✅ 一致 |
 | feedback_offset | ConvertToList_8bit(..., False) (u8) | feedback_id_offset (u8) | - | 无符号 | ✅ 一致 |
@@ -1014,8 +1014,8 @@ pub struct MasterSlaveModeCommand {
 
 ### 4.2 0x471 - 电机使能/失能设置指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_motor_enable.motor_num,False) + \
                     self.ConvertToList_8bit(msg.arm_motor_enable.enable_flag,False) + \
                     [0, 0, 0, 0, 0, 0]
@@ -1032,7 +1032,7 @@ pub struct MotorEnableCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | motor_num | ConvertToList_8bit(..., False) (u8) | joint_index (u8) | - | 无符号 | ✅ 一致 |
 | enable_flag | ConvertToList_8bit(..., False) (u8) | enable (bool) | - | 无符号→bool | ✅ 一致（Rust更语义化） |
@@ -1043,8 +1043,8 @@ pub struct MotorEnableCommand {
 
 ### 4.3 0x472 - 查询电机限制指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_search_motor_max_angle_spd_acc_limit.motor_num,False) + \
                     self.ConvertToList_8bit(msg.arm_search_motor_max_angle_spd_acc_limit.search_content,False) + \
                     [0, 0, 0, 0, 0, 0]
@@ -1061,7 +1061,7 @@ pub struct QueryMotorLimitCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | motor_num | ConvertToList_8bit(..., False) (u8) | joint_index (u8) | - | 无符号 | ✅ 一致 |
 | search_content | ConvertToList_8bit(..., False) (u8) | query_type (u8) | - | 无符号 | ✅ 一致 |
@@ -1072,8 +1072,8 @@ pub struct QueryMotorLimitCommand {
 
 ### 4.4 0x474 - 设置电机限制指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_motor_angle_limit_max_spd_set.motor_num,False) + \
                     self.ConvertToList_16bit(msg.arm_motor_angle_limit_max_spd_set.max_angle_limit) + \
                     self.ConvertToList_16bit(msg.arm_motor_angle_limit_max_spd_set.min_angle_limit) + \
@@ -1094,7 +1094,7 @@ pub struct SetMotorLimitCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | motor_num | ConvertToList_8bit(..., False) (u8) | joint_index (u8) | - | 无符号 | ✅ 一致 |
 | max_angle_limit | ConvertToList_16bit (i16) | max_angle_deg (i16) | 大端 | 有符号 | ✅ 一致 |
@@ -1107,8 +1107,8 @@ pub struct SetMotorLimitCommand {
 
 ### 4.5 0x475 - 关节设置指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_joint_config.joint_motor_num,False) + \
                     self.ConvertToList_8bit(msg.arm_joint_config.set_motor_current_pos_as_zero,False) + \
                     self.ConvertToList_8bit(msg.arm_joint_config.acc_param_config_is_effective_or_not,False) + \
@@ -1131,7 +1131,7 @@ pub struct JointSettingCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | joint_motor_num | ConvertToList_8bit(..., False) (u8) | joint_index (u8) | - | 无符号 | ✅ 一致 |
 | set_motor_current_pos_as_zero | ConvertToList_8bit(..., False) (u8) | set_zero_point (bool) | - | 无符号→bool | ✅ 一致（Rust更语义化） |
@@ -1145,8 +1145,8 @@ pub struct JointSettingCommand {
 
 ### 4.6 0x476 - 设置指令应答
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_set_instruction_response.instruction_index,False) + \
                     self.ConvertToList_8bit(msg.arm_set_instruction_response.zero_config_success_flag,False) + \
                     [0, 0, 0, 0, 0, 0]
@@ -1168,12 +1168,12 @@ pub struct SettingResponse {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | instruction_index | ConvertToList_8bit(..., False) (u8) | response_index (u8) | - | 无符号 | ✅ 一致 |
 | zero_config_success_flag | ConvertToList_8bit(..., False) (u8) | zero_point_success (bool) | - | 无符号→bool | ✅ 一致（Rust更语义化） |
 
-**注意**：Rust 实现还解析了 Byte 2-6 的字段（trajectory_index, pack_complete_status, name_index, crc16），Python SDK 编码时未包含这些字段。
+**注意**：Rust 实现还解析了 Byte 2-6 的字段（trajectory_index, pack_complete_status, name_index, crc16），官方参考实现 编码时未包含这些字段。
 
 **结论**：✅ **核心字段一致**，Rust 解析实现更完整
 
@@ -1181,8 +1181,8 @@ pub struct SettingResponse {
 
 ### 4.7 0x477 - 参数查询与设置指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_param_enquiry_and_config.param_enquiry,False) + \
                     self.ConvertToList_8bit(msg.arm_param_enquiry_and_config.param_setting,False) + \
                     self.ConvertToList_8bit(msg.arm_param_enquiry_and_config.data_feedback_0x48x,False) + \
@@ -1205,7 +1205,7 @@ pub struct ParameterQuerySetCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | param_enquiry | ConvertToList_8bit(..., False) (u8) | query_type (u8) | - | 无符号 | ✅ 一致 |
 | param_setting | ConvertToList_8bit(..., False) (u8) | set_type (u8) | - | 无符号 | ✅ 一致 |
@@ -1219,8 +1219,8 @@ pub struct ParameterQuerySetCommand {
 
 ### 4.8 0x479 - 设置末端速度/加速度参数指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_16bit(msg.arm_end_vel_acc_param_config.end_max_linear_vel,False) + \
                     self.ConvertToList_16bit(msg.arm_end_vel_acc_param_config.end_max_angular_vel,False) + \
                     self.ConvertToList_16bit(msg.arm_end_vel_acc_param_config.end_max_linear_acc,False) + \
@@ -1239,7 +1239,7 @@ pub struct SetEndVelocityAccelCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | end_max_linear_vel | ConvertToList_16bit(..., False) (u16) | max_linear_velocity (u16) | 大端 | 无符号 | ✅ 一致 |
 | end_max_angular_vel | ConvertToList_16bit(..., False) (u16) | max_angular_velocity (u16) | 大端 | 无符号 | ✅ 一致 |
@@ -1252,8 +1252,8 @@ pub struct SetEndVelocityAccelCommand {
 
 ### 4.9 0x47A - 碰撞防护等级设置指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_crash_protection_rating_config.joint_1_protection_level,False) + \
                     self.ConvertToList_8bit(msg.arm_crash_protection_rating_config.joint_2_protection_level,False) + \
                     self.ConvertToList_8bit(msg.arm_crash_protection_rating_config.joint_3_protection_level,False) + \
@@ -1273,7 +1273,7 @@ pub struct CollisionProtectionLevelCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | joint_1~6_protection_level | ConvertToList_8bit(..., False) (u8) | protection_levels[0~5] (u8) | - | 无符号 | ✅ 一致 |
 
@@ -1283,8 +1283,8 @@ pub struct CollisionProtectionLevelCommand {
 
 ### 4.10 0x47D - 夹爪/示教器参数设置指令
 
-#### Python SDK 编码
-```python
+#### 官方参考实现 编码
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_gripper_teaching_param_config.teaching_range_per,False) + \
                     self.ConvertToList_8bit(msg.arm_gripper_teaching_param_config.max_range_config,False) + \
                     self.ConvertToList_8bit(msg.arm_gripper_teaching_param_config.teaching_friction,False) + \
@@ -1303,7 +1303,7 @@ pub struct GripperTeachParamsCommand {
 
 #### 对比分析
 
-| 字段 | Python SDK | Rust SDK | 字节序 | 符号 | 差异 |
+| 字段 | 官方参考实现 | Rust SDK | 字节序 | 符号 | 差异 |
 |------|-----------|----------|--------|------|------|
 | teaching_range_per | ConvertToList_8bit(..., False) (u8) | teach_travel_coeff (u8) | - | 无符号 | ✅ 一致 |
 | max_range_config | ConvertToList_8bit(..., False) (u8) | max_travel_limit (u8) | - | 无符号 | ✅ 一致 |
@@ -1317,7 +1317,7 @@ pub struct GripperTeachParamsCommand {
 
 ### 5.1 字节序处理
 
-| 类型 | Python SDK | Rust SDK | 状态 |
+| 类型 | 官方参考实现 | Rust SDK | 状态 |
 |------|-----------|----------|------|
 | 多字节整数 | `ConvertBytesToInt(..., byteorder='big')` | `from_be_bytes()` / `to_be_bytes()` | ✅ **完全一致**（大端/大端） |
 | 单字节 | 直接索引 | 直接索引 | ✅ **完全一致** |
@@ -1327,7 +1327,7 @@ pub struct GripperTeachParamsCommand {
 
 #### 5.2.1 解码（Parse）时的符号处理
 
-| 字段类型 | Python SDK | Rust SDK | 一致性 |
+| 字段类型 | 官方参考实现 | Rust SDK | 一致性 |
 |---------|-----------|----------|--------|
 | **i8（有符号8位）** | `ConvertToNegative_8bit(..., signed=True)` | `i8` | ✅ 一致 |
 | **u8（无符号8位）** | `ConvertToNegative_8bit(..., signed=False)` | `u8` | ✅ 一致 |
@@ -1338,7 +1338,7 @@ pub struct GripperTeachParamsCommand {
 
 #### 5.2.2 编码（Encode）时的符号处理
 
-| 字段类型 | Python SDK | Rust SDK | 一致性 |
+| 字段类型 | 官方参考实现 | Rust SDK | 一致性 |
 |---------|-----------|----------|--------|
 | **i8（有符号8位）** | `ConvertToList_8bit(..., signed=True)` | `i8::to_be_bytes()` | ✅ 一致 |
 | **u8（无符号8位）** | `ConvertToList_8bit(..., signed=False)` | `u8::to_be_bytes()` | ✅ 一致 |
@@ -1347,9 +1347,9 @@ pub struct GripperTeachParamsCommand {
 | **i32（有符号32位）** | `ConvertToList_32bit(..., signed=True)` | `i32_to_bytes_be()` | ✅ 一致 |
 | **u32（无符号32位）** | `ConvertToList_32bit(..., signed=False)` | `u32::to_be_bytes()` | ✅ 一致 |
 
-### 5.3 Python SDK 的 ConvertToNegative 函数说明
+### 5.3 官方参考实现 的 ConvertToNegative 函数说明
 
-Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
+官方参考实现 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 - **输入**：无符号整数（来自字节）
 - **输出**：根据 `signed` 参数决定是有符号还是无符号
 - **原理**：检查符号位，如果是负数则进行补码转换
@@ -1368,7 +1368,7 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 
 ### 6.2 实现方式差异（功能等价）
 
-| 协议 | 字段 | Python SDK | Rust SDK | 说明 |
+| 协议 | 字段 | 官方参考实现 | Rust SDK | 说明 |
 |------|------|-----------|----------|------|
 | **0x2A1** | 故障码 | `err_code` (u16) | `fault_angle_limit` + `fault_comm_error` (2×u8位域) | Rust 更清晰地反映协议结构 |
 | **0x476** | 完整字段 | 仅编码 Byte 0-1 | 解析 Byte 0-6 | Rust 解析更完整（可能协议文档有更新） |
@@ -1376,12 +1376,12 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 
 ### 6.3 需要进一步确认的差异
 
-| 协议 | 字段 | Python SDK | Rust SDK | 状态 |
+| 协议 | 字段 | 官方参考实现 | Rust SDK | 状态 |
 |------|------|-----------|----------|------|
 | **0x159（编码）** | `grippers_effort`/`torque_nm` | 无符号 u16 | 有符号 i16 | ⚠️ **需要确认**（协议文档说 int16） |
-| **0x481-0x486** | 全部字段 | ❓ 未找到解析代码 | ✅ 已实现 | ⚠️ **需要确认 Python SDK 是否支持** |
-| **0x121** | 全部字段 | ❓ 未找到编码代码 | ✅ 已实现 | ⚠️ **需要确认 Python SDK 是否支持** |
-| **0x422** | 全部字段 | ❓ 未找到编码代码 | ✅ 已实现 | ⚠️ **需要确认 Python SDK 是否支持** |
+| **0x481-0x486** | 全部字段 | ❓ 未找到解析代码 | ✅ 已实现 | ⚠️ **需要确认 官方参考实现 是否支持** |
+| **0x121** | 全部字段 | ❓ 未找到编码代码 | ✅ 已实现 | ⚠️ **需要确认 官方参考实现 是否支持** |
+| **0x422** | 全部字段 | ❓ 未找到编码代码 | ✅ 已实现 | ⚠️ **需要确认 官方参考实现 是否支持** |
 
 ---
 
@@ -1406,7 +1406,7 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 #### ⚠️ 需要关注的差异
 
 1. **位域处理方式**：
-   - Python SDK：使用整数 + 位掩码
+   - 官方参考实现：使用整数 + 位掩码
    - Rust SDK：使用 `bilge` 库的位域结构体
    - **影响**：功能等价，但 Rust 实现更类型安全
 
@@ -1414,10 +1414,10 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
    - Rust 实现可能解析了更多字段（如 `0x476`, `0x150`）
    - 需要确认这些字段是否为协议文档的新增内容
 
-3. **Python SDK 中缺失的协议**：
-   - `0x481-0x486`：关节末端速度/加速度反馈（Python SDK 中未找到）
-   - `0x121`：灯光控制指令（Python SDK 中未找到编码代码）
-   - `0x422`：固件升级模式设定指令（Python SDK 中未找到编码代码）
+3. **官方参考实现 中缺失的协议**：
+   - `0x481-0x486`：关节末端速度/加速度反馈（官方参考实现 中未找到）
+   - `0x121`：灯光控制指令（官方参考实现 中未找到编码代码）
+   - `0x422`：固件升级模式设定指令（官方参考实现 中未找到编码代码）
    - **建议**：确认这些协议是否为较新版本的功能
 
 ### 7.3 代码质量对比
@@ -1429,7 +1429,7 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 3. **错误处理**：使用 `Result` 类型，明确的错误处理
 4. **文档完整**：详细的代码注释和文档字符串
 
-#### Python SDK 特点
+#### 官方参考实现 特点
 
 1. **灵活性**：统一的转换函数，易于扩展
 2. **简洁性**：代码相对简洁
@@ -1441,19 +1441,19 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 
 2. **需要确认的差异**：
    - 确认 `0x159` 夹爪控制指令的扭矩字段符号（协议文档说 int16，Rust 实现正确）
-   - 确认 `0x481-0x486`, `0x121`, `0x422` 是否在 Python SDK 的较新版本中实现
+   - 确认 `0x481-0x486`, `0x121`, `0x422` 是否在 官方参考实现 的较新版本中实现
 
 3. **代码维护建议**：
    - 保持 Rust 实现的完整性（支持所有协议文档中的字段）
-   - 对于 Python SDK 中未实现的协议，基于协议文档实现
+   - 对于 官方参考实现 中未实现的协议，基于协议文档实现
 
 ---
 
 ## 八、附录
 
-### 8.1 Python SDK 转换函数对照表
+### 8.1 官方参考实现 转换函数对照表
 
-| Python SDK 函数 | 功能 | Rust SDK 对应 |
+| 官方参考实现 函数 | 功能 | Rust SDK 对应 |
 |----------------|------|--------------|
 | `ConvertToNegative_8bit(value, signed)` | 8位整数转换 | `i8` / `u8` |
 | `ConvertToNegative_16bit(value, signed)` | 16位整数转换 | `i16` / `u16` + `from_be_bytes()` |
@@ -1466,7 +1466,7 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 ### 8.2 字节序一致性验证
 
 所有多字节字段都使用**大端字节序（Big-Endian / Motorola MSB）**：
-- ✅ Python SDK：`ConvertBytesToInt(..., byteorder='big')` 和 `struct.pack(">h/i", ...)`
+- ✅ 官方参考实现：`ConvertBytesToInt(..., byteorder='big')` 和 `struct.pack(">h/i", ...)`
 - ✅ Rust SDK：`from_be_bytes()` 和 `to_be_bytes()`
 
 **验证方法**：测试用例验证了编码-解码循环的一致性。
@@ -1477,7 +1477,7 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 
 ### 9.1 总体评估
 
-✅ **Rust SDK 与 Python SDK 的协议实现高度一致**
+✅ **Rust SDK 与 官方参考实现 的协议实现高度一致**
 
 - **协议覆盖**：100% 完整
 - **字节序处理**：完全一致（大端）
@@ -1489,8 +1489,8 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 
 1. ✅ **已修正**：`current_a` 字段从 `u16` 修正为 `i16`
 2. ✅ **实现优势**：Rust 实现使用了更清晰的位域结构体
-3. ✅ **完整性**：Rust 实现可能包含了一些 Python SDK 中未实现的协议
-4. ⚠️ **需要确认**：部分协议在 Python SDK 中未找到（可能是版本差异）
+3. ✅ **完整性**：Rust 实现可能包含了一些 官方参考实现 中未实现的协议
+4. ⚠️ **需要确认**：部分协议在 官方参考实现 中未找到（可能是版本差异）
 
 ### 9.3 建议
 
@@ -1502,6 +1502,6 @@ Python SDK 使用统一的 `ConvertToNegative_Xbit` 函数处理符号扩展：
 
 **报告生成日期**：2024年
 **对比版本**：
-- Python SDK：`piper_protocol_v2.py` (协议 V2)
+- 官方参考实现：协议 V2 对照实现
 - Rust SDK：当前实现版本
 **报告状态**：✅ 完整

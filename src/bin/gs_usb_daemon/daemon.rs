@@ -287,11 +287,19 @@ impl Daemon {
 
         // 先扫描所有设备，打印信息
         use piper_sdk::can::gs_usb::device::GsUsbDevice;
-        match GsUsbDevice::scan() {
-            Ok(devices) => {
-                eprintln!("[Daemon] Found {} GS-USB device(s):", devices.len());
-                for (i, device) in devices.iter().enumerate() {
-                    eprintln!("  [{}] Serial: {:?}", i, device.serial_number());
+        match GsUsbDevice::scan_info() {
+            Ok(infos) => {
+                eprintln!("[Daemon] Found {} GS-USB device(s):", infos.len());
+                for (i, info) in infos.iter().enumerate() {
+                    eprintln!(
+                        "  [{}] VID:PID={:04x}:{:04x} bus={} addr={} serial={:?}",
+                        i,
+                        info.vendor_id,
+                        info.product_id,
+                        info.bus_number,
+                        info.address,
+                        info.serial_number.as_deref()
+                    );
                 }
             },
             Err(e) => {
@@ -303,6 +311,16 @@ impl Daemon {
             .map_err(|e| DaemonError::DeviceInit(format!("{}", e)))?;
 
         eprintln!("[Daemon] Device found and initialized successfully");
+
+        // 1.5. 设定接收超时（避免 2ms 级别的热循环；daemon 场景建议较大值）
+        adapter.set_receive_timeout(Duration::from_millis(200));
+
+        // 打印已打开设备信息（避免后续排障只能靠枚举列表推断）
+        let (vid, pid, bus, addr, serial) = adapter.device_info();
+        eprintln!(
+            "[Daemon] Opened device: VID:PID={:04x}:{:04x} bus={} addr={} serial={:?}",
+            vid, pid, bus, addr, serial
+        );
 
         // 2. 配置设备
         eprintln!(
@@ -425,9 +443,25 @@ impl Daemon {
                             continue;
                         },
                         Err(e) => {
-                            // 其他错误：可能是设备断开，通知设备管理线程
+                            // 其他错误：根据错误类型决定是否立即进入断开/重连
                             eprintln!("[Daemon] USB receive error: {:?}", e);
-                            *device_state.write().unwrap() = DeviceState::Disconnected;
+
+                            let should_disconnect = match &e {
+                                piper_sdk::can::CanError::Device(dev) => matches!(
+                                    dev.kind,
+                                    piper_sdk::can::CanDeviceErrorKind::NoDevice
+                                        | piper_sdk::can::CanDeviceErrorKind::NotFound
+                                        | piper_sdk::can::CanDeviceErrorKind::AccessDenied
+                                ),
+                                // IO 错误通常也意味着链路不可靠，进入重连更安全
+                                piper_sdk::can::CanError::Io(_) => true,
+                                _ => true,
+                            };
+
+                            if should_disconnect {
+                                *device_state.write().unwrap() = DeviceState::Disconnected;
+                            }
+
                             // 短暂等待后重试，避免死循环
                             thread::sleep(Duration::from_millis(100));
                             continue;

@@ -7,10 +7,10 @@ pub mod error;
 pub mod frame;
 pub mod protocol;
 
-use crate::can::gs_usb::device::GsUsbDevice;
+use crate::can::gs_usb::device::{GsUsbDevice, GsUsbDeviceSelector};
 use crate::can::gs_usb::frame::GsUsbFrame;
 use crate::can::gs_usb::protocol::*;
-use crate::can::{CanAdapter, CanError, PiperFrame};
+use crate::can::{CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tracing::{error, trace};
@@ -23,6 +23,8 @@ pub struct GsUsbCanAdapter {
     started: bool,
     /// 当前设备模式（用于判断是否需要过滤 Echo）
     mode: u32,
+    /// USB Bulk IN 接收超时（用于 `receive()` 内部批量读取）
+    rx_timeout: Duration,
     /// 接收队列：用于缓存 USB 包中解包出的多余帧
     /// USB 硬件会将多个 CAN 帧打包在一个 USB Bulk 包中发送
     /// 我们需要缓存这些帧，以便逐帧返回给上层应用
@@ -45,19 +47,24 @@ impl GsUsbCanAdapter {
     /// # 错误
     /// - `CanError::Device`: 如果没有找到匹配的设备，或者扫描失败
     pub fn new_with_serial(serial_number: Option<&str>) -> Result<Self, CanError> {
-        let mut devices = GsUsbDevice::scan_with_filter(serial_number)
-            .map_err(|e| CanError::Device(format!("Failed to scan devices: {}", e)))?;
+        // 两段式：scan_info 用于决策/告警，open 才真正占用 handle
+        let infos = GsUsbDevice::scan_info_with_filter(serial_number).map_err(|e| {
+            CanError::Device(CanDeviceError::new(
+                CanDeviceErrorKind::Backend,
+                format!("Failed to scan devices: {}", e),
+            ))
+        })?;
 
-        if devices.is_empty() {
+        if infos.is_empty() {
             let error_msg = if let Some(sn) = serial_number {
                 format!("No GS-USB device found with serial number: {}", sn)
             } else {
                 "No GS-USB device found".to_string()
             };
-            return Err(CanError::Device(error_msg));
+            return Err(CanError::Device(error_msg.into()));
         }
 
-        if devices.len() > 1 {
+        if infos.len() > 1 {
             let warning_msg = if let Some(sn) = serial_number {
                 format!(
                     "Multiple GS-USB devices found with serial number '{}', using the first one",
@@ -69,48 +76,169 @@ impl GsUsbCanAdapter {
             tracing::warn!("{}", warning_msg);
         }
 
-        let device = devices.remove(0);
+        let selector = match serial_number {
+            Some(sn) => GsUsbDeviceSelector::by_serial(sn),
+            None => GsUsbDeviceSelector::any(),
+        };
+        let device = GsUsbDevice::open(&selector).map_err(|e| {
+            let kind = match e {
+                crate::can::gs_usb::error::GsUsbError::DeviceNotFound => {
+                    CanDeviceErrorKind::NotFound
+                },
+                _ => CanDeviceErrorKind::Backend,
+            };
+            CanError::Device(CanDeviceError::new(
+                kind,
+                format!("Failed to open device: {}", e),
+            ))
+        })?;
         Ok(Self {
             device,
             started: false,
             mode: 0,
+            // 默认不再使用 2ms 的超短超时，避免 macOS 上频繁 timeout 导致热循环与“看起来读不到”
+            rx_timeout: Duration::from_millis(50),
             rx_queue: VecDeque::with_capacity(64), // 初始化队列，预分配容量
         })
+    }
+
+    /// 设置 `receive()` 内部 USB Bulk IN 的超时
+    ///
+    /// - `Duration::ZERO`：阻塞等待（由底层 USB 库语义决定；不推荐在需要可取消的线程中使用）
+    /// - 建议 daemon 场景使用较大值（例如 50~200ms），避免热循环
+    pub fn set_receive_timeout(&mut self, timeout: Duration) {
+        self.rx_timeout = timeout;
+    }
+
+    /// 批量接收：一次从 USB 读取一个包，解析并返回其中所有有效 CAN 帧
+    ///
+    /// - 会应用与 `receive()` 相同的 Echo 过滤与 overflow 检测逻辑
+    /// - 返回的 Vec 可能为空（例如读到的都是 Echo 且被过滤，或读到空包）
+    pub fn receive_batch_frames(&mut self) -> Result<Vec<PiperFrame>, CanError> {
+        if !self.started {
+            return Err(CanError::NotStarted);
+        }
+
+        // 先把队列里剩余的帧吐出来（保持语义一致）
+        if !self.rx_queue.is_empty() {
+            let mut out = Vec::with_capacity(self.rx_queue.len());
+            while let Some(f) = self.rx_queue.pop_front() {
+                out.push(f);
+            }
+            return Ok(out);
+        }
+
+        let gs_frames = match self.device.receive_batch(self.rx_timeout) {
+            Ok(frames) => frames,
+            Err(crate::can::gs_usb::error::GsUsbError::ReadTimeout) => {
+                return Err(CanError::Timeout);
+            },
+            Err(e) => {
+                let kind = match e {
+                    crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
+                        CanDeviceErrorKind::NoDevice
+                    },
+                    crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::Access) => {
+                        CanDeviceErrorKind::AccessDenied
+                    },
+                    crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
+                        CanDeviceErrorKind::NotFound
+                    },
+                    crate::can::gs_usb::error::GsUsbError::InvalidFrame(_) => {
+                        CanDeviceErrorKind::InvalidFrame
+                    },
+                    crate::can::gs_usb::error::GsUsbError::InvalidResponse { .. } => {
+                        CanDeviceErrorKind::InvalidResponse
+                    },
+                    _ => CanDeviceErrorKind::Backend,
+                };
+                return Err(CanError::Device(CanDeviceError::new(
+                    kind,
+                    format!("USB receive failed: {}", e),
+                )));
+            },
+        };
+
+        if gs_frames.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let is_loopback = (self.mode & GS_CAN_MODE_LOOP_BACK) != 0;
+        let mut out = Vec::with_capacity(gs_frames.len());
+
+        for gs_frame in gs_frames {
+            if !is_loopback && gs_frame.is_tx_echo() {
+                continue;
+            }
+            if gs_frame.has_overflow() {
+                return Err(CanError::BufferOverflow);
+            }
+            out.push(PiperFrame {
+                id: gs_frame.can_id & CAN_EFF_MASK,
+                data: gs_frame.data,
+                len: gs_frame.can_dlc.min(8),
+                is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
+                timestamp_us: gs_frame.timestamp_us as u64,
+            });
+        }
+
+        Ok(out)
+    }
+
+    /// 获取当前打开设备的基础信息（用于日志/诊断）
+    pub fn device_info(&self) -> (u16, u16, u8, u8, Option<&str>) {
+        (
+            self.device.vendor_id(),
+            self.device.product_id(),
+            self.device.bus_number(),
+            self.device.address(),
+            self.device.serial_number(),
+        )
     }
 
     /// 内部方法：统一配置逻辑
     ///
     /// 所有配置方法的核心逻辑都集中在这里，消除重复代码。
     ///
-    /// **完全对齐 Python 的启动流程**：
-    /// Python: scan() -> set_bitrate() -> start()
+    /// 推荐启动流程（参考实现一致）：
+    /// open() -> set_bitrate() -> start()
     /// start() 内部: reset() -> detach_kernel_driver() -> 获取 capability -> 发送 MODE
     ///
     /// 注意：
-    /// - Python 没有发送 HOST_FORMAT，所以我们也移除它
-    /// - Python 的 set_bitrate() 在 start() 之前调用，但 start() 内部会 reset
+    /// - 默认实现不发送 HOST_FORMAT（兼容性策略见文档）
+    /// - set_bitrate() 在 start() 之前调用，但 start() 内部会 reset
     /// - reset 不会清除 bitrate 设置，因为 bitrate 是通过控制请求设置的持久化配置
     fn configure_with_mode(&mut self, bitrate: u32, mode: u32) -> Result<(), CanError> {
-        // **完全对齐 Python 流程**：
-        // 1. 先 claim interface（set_bitrate 需要接口已 claim 才能发送控制请求）
-        //    注意：Python 的 USB 库可能自动处理接口 claim，但 Rust 需要显式处理
-        //    只 claim interface，不 reset（reset 在 start() 内部进行，与 Python 一致）
-        self.device
-            .claim_interface_only()
-            .map_err(|e| CanError::Device(format!("Failed to claim interface: {}", e)))?;
+        // **对齐参考实现的推荐流程**：
+        // 1) set_bitrate() 在 start() 之前调用（set_bitrate 内部会确保 interface 已 claim）
+        // 2) start() 内部负责 reset/detach/claim/capability/MODE
+        //
+        // 说明：我们不再对外暴露“仅 claim interface”的历史接口，避免多套启动语义。
 
-        // 2. 设置波特率（在 start() 之前，与 Python 完全一致）
-        // 注意：Python 的 start() 内部会 reset，但 reset 不会清除 bitrate 设置
+        // 1. 设置波特率（在 start() 之前）
+        // 注意：start() 内部会 reset，但 reset 不会清除 bitrate 设置
         // 因为 bitrate 是通过控制请求设置的，是持久化配置
-        self.device
-            .set_bitrate(bitrate)
-            .map_err(|e| CanError::Device(format!("Failed to set bitrate: {}", e)))?;
+        self.device.set_bitrate(bitrate).map_err(|e| {
+            let kind = match e {
+                crate::can::gs_usb::error::GsUsbError::UnsupportedBitrate { .. } => {
+                    CanDeviceErrorKind::UnsupportedConfig
+                },
+                _ => CanDeviceErrorKind::Backend,
+            };
+            CanError::Device(CanDeviceError::new(
+                kind,
+                format!("Failed to set bitrate: {}", e),
+            ))
+        })?;
 
-        // 3. 启动设备（start 内部会 reset, detach, 获取 capability, 发送 MODE）
-        // 与 Python 完全一致：start() 内部会 reset，但不会清除之前设置的 bitrate
-        self.device
-            .start(mode)
-            .map_err(|e| CanError::Device(format!("Failed to start device: {}", e)))?;
+        // 2. 启动设备（start 内部会 reset, detach, 获取 capability, 发送 MODE）
+        // start() 内部会 reset，但不会清除之前设置的 bitrate
+        let start_result = self.device.start(mode).map_err(|e| {
+            CanError::Device(CanDeviceError::new(
+                CanDeviceErrorKind::Backend,
+                format!("Failed to start device: {}", e),
+            ))
+        })?;
 
         self.started = true;
         self.mode = mode;
@@ -135,8 +263,12 @@ impl GsUsbCanAdapter {
             }
         };
         trace!(
-            "GS-USB device started in {} mode at {} bps",
-            mode_name, bitrate
+            "GS-USB device started in {} mode at {} bps (effective_flags=0x{:08x}, fclk_can={}Hz, hw_timestamp={})",
+            mode_name,
+            bitrate,
+            start_result.effective_flags,
+            start_result.capability.fclk_can,
+            start_result.hw_timestamp
         );
         Ok(())
     }
@@ -182,10 +314,9 @@ impl Drop for GsUsbCanAdapter {
 
         // 1. 停止设备固件逻辑（发送 RESET 命令）
         if self.started {
-            // 发送 RESET 命令停止设备
-            // 忽略错误，因为我们都要退出了，且 device 可能已经断开了
-            let _ = self.device.start(GS_CAN_MODE_RESET);
-            trace!("[Auto-Drop] Device reset command sent");
+            // 忽略错误：析构路径中设备可能已断开
+            let _ = self.device.stop();
+            trace!("[Auto-Drop] Device stop/reset command sent");
         }
 
         // 2. 释放 USB 接口（交还给操作系统）
@@ -221,9 +352,22 @@ impl CanAdapter for GsUsbCanAdapter {
         };
 
         // 2. 发送 USB Bulk OUT（不等待 Echo）
-        self.device
-            .send_raw(&gs_frame)
-            .map_err(|e| CanError::Device(format!("USB send failed: {}", e)))?;
+        self.device.send_raw(&gs_frame).map_err(|e| {
+            let kind = match e {
+                crate::can::gs_usb::error::GsUsbError::WriteTimeout => CanDeviceErrorKind::Busy,
+                crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
+                    CanDeviceErrorKind::NoDevice
+                },
+                crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::Access) => {
+                    CanDeviceErrorKind::AccessDenied
+                },
+                crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
+                    CanDeviceErrorKind::NotFound
+                },
+                _ => CanDeviceErrorKind::Backend,
+            };
+            CanError::Device(CanDeviceError::new(kind, format!("USB send failed: {}", e)))
+        })?;
 
         trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
         Ok(())
@@ -258,13 +402,34 @@ impl CanAdapter for GsUsbCanAdapter {
         // 我们需要一次性解析所有帧，并将它们放入队列
         loop {
             // 从 USB 读取一批帧
-            let gs_frames = match self.device.receive_batch(Duration::from_millis(2)) {
+            let gs_frames = match self.device.receive_batch(self.rx_timeout) {
                 Ok(frames) => frames,
                 Err(crate::can::gs_usb::error::GsUsbError::ReadTimeout) => {
                     return Err(CanError::Timeout);
                 },
                 Err(e) => {
-                    return Err(CanError::Device(format!("USB receive failed: {}", e)));
+                    let kind = match e {
+                        crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
+                            CanDeviceErrorKind::NoDevice
+                        },
+                        crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::Access) => {
+                            CanDeviceErrorKind::AccessDenied
+                        },
+                        crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
+                            CanDeviceErrorKind::NotFound
+                        },
+                        crate::can::gs_usb::error::GsUsbError::InvalidFrame(_) => {
+                            CanDeviceErrorKind::InvalidFrame
+                        },
+                        crate::can::gs_usb::error::GsUsbError::InvalidResponse { .. } => {
+                            CanDeviceErrorKind::InvalidResponse
+                        },
+                        _ => CanDeviceErrorKind::Backend,
+                    };
+                    return Err(CanError::Device(CanDeviceError::new(
+                        kind,
+                        format!("USB receive failed: {}", e),
+                    )));
                 },
             };
 

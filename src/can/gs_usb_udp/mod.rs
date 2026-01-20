@@ -122,7 +122,7 @@ impl GsUsbUdpAdapter {
         let addr: SocketAddr = udp_addr
             .as_ref()
             .parse()
-            .map_err(|e| CanError::Device(format!("Invalid UDP address: {}", e)))?;
+            .map_err(|e| CanError::Device(format!("Invalid UDP address: {}", e).into()))?;
 
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(CanError::Io)?;
 
@@ -168,7 +168,7 @@ impl GsUsbUdpAdapter {
             0, // seq = 0 for connect
             &mut buf,
         )
-        .map_err(|e| CanError::Device(format!("Failed to encode connect: {:?}", e)))?;
+        .map_err(|e| CanError::Device(format!("Failed to encode connect: {:?}", e).into()))?;
 
         // 发送 Connect 消息
         self.send_to_daemon(encoded)?;
@@ -181,7 +181,7 @@ impl GsUsbUdpAdapter {
 
         loop {
             if start_time.elapsed() > timeout {
-                return Err(CanError::Device("Connection timeout".to_string()));
+                return Err(CanError::Device("Connection timeout".into()));
             }
 
             // 尝试接收消息（非阻塞，使用轮询）
@@ -201,17 +201,15 @@ impl GsUsbUdpAdapter {
                                     self.start_heartbeat_thread();
                                     return Ok(());
                                 } else {
-                                    return Err(CanError::Device(format!(
-                                        "Connect failed with status: {}",
-                                        status
-                                    )));
+                                    return Err(CanError::Device(
+                                        format!("Connect failed with status: {}", status).into(),
+                                    ));
                                 }
                             },
                             Message::Error { code, message } => {
-                                return Err(CanError::Device(format!(
-                                    "Connect error {:?}: {}",
-                                    code, message
-                                )));
+                                return Err(CanError::Device(
+                                    format!("Connect error {:?}: {}", code, message).into(),
+                                ));
                             },
                             _ => {
                                 // 收到非 ConnectAck 消息（可能是 CAN 帧）
@@ -296,7 +294,7 @@ impl GsUsbUdpAdapter {
             }
         }
         Err(CanError::Device(
-            "Reconnect failed after max retries".to_string(),
+            "Reconnect failed after max retries".into(),
         ))
     }
 
@@ -310,9 +308,7 @@ impl GsUsbUdpAdapter {
                 socket.send_to(data, *addr).map_err(CanError::Io)?;
             },
             _ => {
-                return Err(CanError::Device(
-                    "Socket and address type mismatch".to_string(),
-                ));
+                return Err(CanError::Device("Socket and address type mismatch".into()));
             },
         }
         Ok(())
@@ -397,7 +393,7 @@ impl CanAdapter for GsUsbUdpAdapter {
     /// 发送 CAN 帧
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
         if !self.connected {
-            return Err(CanError::Device("Not connected to daemon".to_string()));
+            return Err(CanError::Device("Not connected to daemon".into()));
         }
 
         // 获取并递增序列号
@@ -405,8 +401,9 @@ impl CanAdapter for GsUsbUdpAdapter {
 
         // 编码 SendFrame 消息
         let mut buf = [0u8; 64];
-        let encoded = protocol::encode_send_frame_with_seq(&frame, seq, &mut buf)
-            .map_err(|e| CanError::Device(format!("Failed to encode send frame: {:?}", e)))?;
+        let encoded = protocol::encode_send_frame_with_seq(&frame, seq, &mut buf).map_err(|e| {
+            CanError::Device(format!("Failed to encode send frame: {:?}", e).into())
+        })?;
 
         // 发送到守护进程（带重试）
         match self.send_to_daemon(encoded) {
@@ -422,7 +419,7 @@ impl CanAdapter for GsUsbUdpAdapter {
     /// 接收 CAN 帧
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
         if !self.connected {
-            return Err(CanError::Device("Not connected to daemon".to_string()));
+            return Err(CanError::Device("Not connected to daemon".into()));
         }
 
         // 1. 先检查缓冲区
@@ -481,11 +478,15 @@ impl CanAdapter for GsUsbUdpAdapter {
                     // 否则，先返回缓冲区中的帧，下次再返回错误
                     // 注意：由于函数立即返回，不需要增加 other_message_count
                     if self.rx_buffer.is_empty() {
-                        return Err(CanError::Device(format!("Error {:?}: {}", code, message)));
+                        return Err(CanError::Device(
+                            format!("Error {:?}: {}", code, message).into(),
+                        ));
                     } else {
                         // 将错误消息也放入缓冲区（作为特殊标记）
                         // 这里简化处理，直接返回错误
-                        return Err(CanError::Device(format!("Error {:?}: {}", code, message)));
+                        return Err(CanError::Device(
+                            format!("Error {:?}: {}", code, message).into(),
+                        ));
                     }
                 },
                 Message::SendAck { seq: _, status } => {

@@ -96,7 +96,7 @@ pub enum CanError {
 
     /// 设备相关错误（设备未找到、未启动、配置失败等）
     #[error("Device Error: {0}")]
-    Device(String),
+    Device(#[from] CanDeviceError),
 
     /// 读取超时（非致命，可以重试）
     #[error("Read timeout")]
@@ -113,6 +113,57 @@ pub enum CanError {
     /// 设备未启动
     #[error("Device not started")]
     NotStarted,
+}
+
+/// 设备/后端错误的结构化分类（不绑定具体后端实现）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanDeviceErrorKind {
+    Unknown,
+    /// 设备未找到/不存在（热拔插或枚举不到）
+    NotFound,
+    /// 设备已断开
+    NoDevice,
+    /// 权限不足/被拒绝
+    AccessDenied,
+    /// 资源忙/被占用
+    Busy,
+    /// 不支持的波特率/配置
+    UnsupportedConfig,
+    /// 设备返回无效响应
+    InvalidResponse,
+    /// 解析到无效帧
+    InvalidFrame,
+    /// 其他 IO/后端错误
+    Backend,
+}
+
+/// 结构化设备错误：kind + message（保留人类可读信息，供日志/上层策略判断）
+#[derive(Error, Debug, Clone)]
+#[error("{kind:?}: {message}")]
+pub struct CanDeviceError {
+    pub kind: CanDeviceErrorKind,
+    pub message: String,
+}
+
+impl CanDeviceError {
+    pub fn new(kind: CanDeviceErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for CanDeviceError {
+    fn from(message: String) -> Self {
+        Self::new(CanDeviceErrorKind::Unknown, message)
+    }
+}
+
+impl From<&str> for CanDeviceError {
+    fn from(message: &str) -> Self {
+        Self::new(CanDeviceErrorKind::Unknown, message)
+    }
 }
 
 /// CAN 适配器 Trait
@@ -366,7 +417,7 @@ mod tests {
         let not_started = CanError::NotStarted;
         assert!(not_started.to_string().to_lowercase().contains("start"));
 
-        let device = CanError::Device("test error".to_string());
+        let device = CanError::Device("test error".into());
         assert!(device.to_string().contains("test error"));
     }
 }

@@ -30,15 +30,18 @@ pub fn check_interface_status(interface: &str) -> Result<bool, CanError> {
     // ifr_name 通常是 IFNAMSIZ = 16 字节，包括结尾的 NUL，所以最大长度是 15
     const MAX_IFACE_NAME_LEN: usize = 15; // IFNAMSIZ - 1
     if interface.len() > MAX_IFACE_NAME_LEN {
-        return Err(CanError::Device(format!(
-            "Interface name '{}' is too long (max {} characters)",
-            interface, MAX_IFACE_NAME_LEN
-        )));
+        return Err(CanError::Device(
+            format!(
+                "Interface name '{}' is too long (max {} characters)",
+                interface, MAX_IFACE_NAME_LEN
+            )
+            .into(),
+        ));
     }
 
     // 1. 检查接口名是否包含 NUL 字符
     let c_iface = CString::new(interface)
-        .map_err(|e| CanError::Device(format!("Invalid interface name: {}", e)))?;
+        .map_err(|e| CanError::Device(format!("Invalid interface name: {}", e).into()))?;
 
     // 2. 检查接口是否存在
     let ifindex = unsafe { if_nametoindex(c_iface.as_ptr()) };
@@ -47,7 +50,7 @@ pub fn check_interface_status(interface: &str) -> Result<bool, CanError> {
         return Err(CanError::Device(format!(
             "CAN interface '{}' does not exist ({}). Please create it first:\n  sudo ip link add dev {} type can",
             interface, errno, interface
-        )));
+        ).into()));
     }
 
     // 3. 准备 ifreq 结构
@@ -204,14 +207,14 @@ mod tests {
         if let Err(CanError::Device(msg)) = result {
             // 错误消息应该包含 "does not exist" 或 "not exist"
             assert!(
-                msg.contains("does not exist")
-                    || msg.contains("not exist")
-                    || msg.contains("does not"),
+                msg.message.contains("does not exist")
+                    || msg.message.contains("not exist")
+                    || msg.message.contains("does not"),
                 "Error message should mention interface does not exist, got: {}",
                 msg
             );
             assert!(
-                msg.contains("ip link add"),
+                msg.message.contains("ip link add"),
                 "Error message should suggest creating interface, got: {}",
                 msg
             );
@@ -233,7 +236,7 @@ mod tests {
 
         if let Err(CanError::Device(msg)) = result {
             assert!(
-                msg.contains("Invalid interface name"),
+                msg.message.contains("Invalid interface name"),
                 "Error message should mention invalid name"
             );
         } else {
@@ -255,7 +258,7 @@ mod tests {
         if let Err(CanError::Device(msg)) = result {
             // 错误消息应该包含 "too long" 或 "long"
             assert!(
-                msg.contains("too long") || msg.contains("long"),
+                msg.message.contains("too long") || msg.message.contains("long"),
                 "Error message should mention name is too long, got: {}",
                 msg
             );

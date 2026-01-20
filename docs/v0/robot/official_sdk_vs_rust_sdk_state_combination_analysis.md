@@ -2,9 +2,9 @@
 
 ## 1. 执行摘要
 
-本报告深入分析了官方Python SDK (`piper_interface_v2.py`) 与Rust SDK在状态组合、FPS计算和到达时间追踪方面的核心差异。主要发现：
+本报告深入分析了官方参考实现与 Rust SDK 在状态组合、FPS 计算和到达时间追踪方面的核心差异。主要发现：
 
-- **官方SDK**：采用**细粒度FPS追踪**，每个CAN消息类型都有独立的FPS计数器，可以精确追踪组合消息各个部分的更新频率
+- **官方SDK**：采用**细粒度FPS追踪**，每个 CAN 消息类型都有独立的 FPS 计数器，可以精确追踪组合消息各个部分的更新频率
 - **Rust SDK**：采用**粗粒度FPS追踪**，只有状态级别的FPS计数器，无法区分组合消息内部各个部分的更新频率
 
 这种差异导致Rust SDK在以下场景中无法提供细粒度的性能监控：
@@ -27,7 +27,7 @@
 
 **示例：末端位姿状态**
 
-```python
+```text
 class ArmEndPose():
     def __init__(self):
         self.time_stamp: float = 0
@@ -39,7 +39,7 @@ class ArmEndPose():
 
 对于由多个CAN消息组成的组合状态（如`EndPose`由3个CAN消息组成），官方SDK采用**分别追踪 + 平均计算**的策略：
 
-```python
+```text
 def GetArmEndPoseMsgs(self):
     with self.__arm_end_pose_mtx:
         # 分别获取各个部分的FPS，然后计算平均值
@@ -60,7 +60,7 @@ def GetArmEndPoseMsgs(self):
 
 每次收到CAN消息时，立即更新对应的部分并递增对应的FPS计数器：
 
-```python
+```text
 def __UpdateArmEndPoseState(self, msg:PiperMessage):
     with self.__arm_end_pose_mtx:
         if(msg.type_ == ArmMsgType.PiperMsgEndPoseFeedback_1):
@@ -216,7 +216,7 @@ Rust SDK只有状态级别的FPS计数器：
 - 对于组合消息，时间戳反映**最新到达的部分**的时间
 
 **示例：**
-```python
+```text
 # 收到0x2A2消息时
 self.__arm_end_pose.time_stamp = msg.time_stamp  # 更新为0x2A2的时间戳
 
@@ -276,7 +276,7 @@ if joint_pos_ready {
 **问题：** 末端位姿的0x2A2消息（XY）丢失，但0x2A3和0x2A4正常
 
 **官方SDK：**
-```python
+```text
 end_pose = piper.GetArmEndPoseMsgs()
 print(f"EndPose FPS: {end_pose.Hz}")  # 可能显示 ~333Hz（只有2/3的消息）
 
@@ -302,7 +302,7 @@ println!("Core Motion FPS: {:.2}", fps.core_motion);  // 可能显示 ~333Hz
 **问题：** 需要分析各个CAN消息的更新频率，找出通信瓶颈
 
 **官方SDK：**
-```python
+```text
 # 可以分别检查各个部分的FPS
 fps_joint_12 = piper.__fps_counter.get_fps('ArmJoint_12')
 fps_joint_34 = piper.__fps_counter.get_fps('ArmJoint_34')
@@ -328,7 +328,7 @@ println!("Core Motion FPS: {:.2}", fps.core_motion);
 **问题：** 需要分析组合消息各个部分的到达时间差，判断CAN总线负载
 
 **官方SDK：**
-```python
+```text
 # 可以追踪每个部分的到达时间
 # 通过比较time_stamp的变化，可以计算各个部分的时间差
 # 例如：0x2A2和0x2A3之间的时间差
@@ -517,7 +517,7 @@ pub struct MessageLevelFps {
 ### A.1 末端位姿FPS计算对比
 
 **官方SDK：**
-```python
+```text
 def GetArmEndPoseMsgs(self):
     with self.__arm_end_pose_mtx:
         # 分别获取各个部分的FPS
@@ -544,7 +544,7 @@ pub fn get_fps(&self) -> FpsResult {
 ### A.2 状态更新对比
 
 **官方SDK：**
-```python
+```text
 def __UpdateArmEndPoseState(self, msg:PiperMessage):
     if(msg.type_ == ArmMsgType.PiperMsgEndPoseFeedback_1):
         # 立即更新，立即计数
@@ -574,7 +574,7 @@ ID_END_POSE_1 => {
 
 官方SDK明确区分了高速反馈和低速反馈：
 
-```python
+```text
 # 高速反馈（0x251-0x256，~200Hz）
 def GetArmHighSpdInfoMsgs(self):
     # 使用 cal_average 计算6个关节的平均FPS
@@ -648,6 +648,6 @@ id if (ID_JOINT_DRIVER_LOW_SPEED_BASE..=ID_JOINT_DRIVER_LOW_SPEED_BASE + 5)
 ---
 
 **报告生成时间：** 2024年
-**分析对象：** `tmp/piper_sdk/piper_sdk/interface/piper_interface_v2.py` vs Rust SDK实现
+**分析对象：** 官方参考实现（接口层） vs Rust SDK 实现
 **分析范围：** 状态组合机制、FPS计算、到达时间追踪、高速/低速反馈区分
 

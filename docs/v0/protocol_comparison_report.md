@@ -1,6 +1,6 @@
 # Piper 协议 V2 对比分析报告
 
-本报告对比官方 Python SDK (`piper_protocol_v2.py`) 与 Rust 实现的协议解析功能，重点分析：
+本报告对比官方参考实现与 Rust 实现的协议解析功能，重点分析：
 1. 缺失的协议
 2. 每个协议解析的正确性（字节序、符号处理等）
 
@@ -12,7 +12,7 @@
 - ✅ **协议覆盖完整性**：100% (57/57)
 - ✅ **所有缺失协议已实现**：固件版本读取、主从模式控制指令反馈
 - ✅ **符号处理正确性**：Rust 实现与协议文档完全一致
-- ⚠️ **Python SDK 符号处理问题**：部分字段（电流、故障码）与协议文档不符，Rust 实现正确
+- ⚠️ **参考实现符号处理问题**：部分字段（电流、故障码）与协议文档不符，Rust 实现正确
 
 ---
 
@@ -20,7 +20,7 @@
 
 ### 1.1 反馈帧（DecodeMessage - 接收/解析）
 
-| CAN ID | Python SDK 协议名称 | Rust 实现 | 状态 |
+| CAN ID | 参考实现协议名称 | Rust 实现 | 状态 |
 |--------|-------------------|----------|------|
 | 0x2A1 | ARM_STATUS_FEEDBACK | RobotStatusFeedback | ✅ |
 | 0x2A2 | ARM_END_POSE_FEEDBACK_1 | EndPoseFeedback1 | ✅ |
@@ -46,7 +46,7 @@
 
 ### 1.2 控制帧（EncodeMessage - 发送/编码）
 
-| CAN ID | Python SDK 消息类型 | Rust 实现 | 状态 |
+| CAN ID | 参考实现消息类型 | Rust 实现 | 状态 |
 |--------|-------------------|----------|------|
 | 0x150 | PiperMsgMotionCtrl_1 | EmergencyStopCommand | ✅ |
 | 0x151 | PiperMsgMotionCtrl_2 | ControlModeCommandFrame | ✅ |
@@ -80,8 +80,8 @@
 
 #### ✅ 2.1.1 0x2A1 - 机械臂状态反馈
 
-**Python SDK 解析**：
-```python
+**参考实现解析**：
+```text
 msg.arm_status_msgs.ctrl_mode = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_status_msgs.arm_status = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,1,2),False)
 msg.arm_status_msgs.mode_feed = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,2,3),False)
@@ -104,14 +104,14 @@ fault_code_comm_error: FaultCodeCommError::from(u8::new(frame.data[7])),
 ```
 
 **对比分析**：
-- ✅ **字节序**：Python SDK 使用 `ConvertBytesToInt` 默认大端，Rust 直接读取字节（正确）
-- ⚠️ **符号处理**：Python SDK 对 `err_code` 使用 `ConvertToNegative_16bit(..., False)`（无符号），但 Rust 实现将其分为两个 8 位位域（`fault_code_angle_limit` 和 `fault_code_comm_error`）
-- ✅ **结论**：根据协议文档，Byte 6-7 应该是两个故障码位域，**Rust 实现正确**，Python SDK 可能有问题
+- ✅ **字节序**：参考实现使用 `ConvertBytesToInt` 默认大端，Rust 直接读取字节（正确）
+- ⚠️ **符号处理**：参考实现对 `err_code` 使用 `ConvertToNegative_16bit(..., False)`（无符号），但 Rust 实现将其分为两个 8 位位域（`fault_code_angle_limit` 和 `fault_code_comm_error`）
+- ✅ **结论**：根据协议文档，Byte 6-7 应该是两个故障码位域，**Rust 实现正确**，参考实现可能有问题
 
 #### ✅ 2.1.2 0x2A2-0x2A4 - 末端位姿反馈
 
-**Python SDK 解析**：
-```python
+**参考实现解析**：
+```text
 # 0x2A2
 msg.arm_end_pose.X_axis = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,0,4))
 msg.arm_end_pose.Y_axis = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,4,8))
@@ -130,8 +130,8 @@ let x_mm = bytes_to_i32_be(x_bytes);
 ```
 
 **对比分析**：
-- ✅ **字节序**：两者都使用大端字节序（Python `ConvertBytesToInt` 默认大端，Rust `bytes_to_i32_be`）
-- ✅ **符号处理**：两者都使用有符号 i32（Python `ConvertToNegative_32bit` 默认 signed=True，Rust `i32`）
+- ✅ **字节序**：两者都使用大端字节序（参考实现 `ConvertBytesToInt` 默认大端，Rust `bytes_to_i32_be`）
+- ✅ **符号处理**：两者都使用有符号 i32（参考实现 `ConvertToNegative_32bit` 默认 signed=True，Rust `i32`）
 - ✅ **结论**：**完全一致，正确**
 
 #### ✅ 2.1.3 0x2A5-0x2A7 - 关节反馈
@@ -143,8 +143,8 @@ let x_mm = bytes_to_i32_be(x_bytes);
 
 #### ✅ 2.1.4 0x2A8 - 夹爪反馈
 
-**Python SDK 解析**：
-```python
+**参考实现解析**：
+```text
 msg.gripper_feedback.grippers_angle = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,0,4))
 msg.gripper_feedback.grippers_effort = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,4,6))
 msg.gripper_feedback.status_code = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,6,7),False)
@@ -163,14 +163,14 @@ let status = GripperStatus::from(u8::new(frame.data[6]));
 - ✅ **字节序**：两者都使用大端字节序
 - ✅ **符号处理**：
   - `grippers_angle`/`travel_mm`：有符号 i32 ✅
-  - `grippers_effort`/`torque_nm`：Python SDK 使用有符号 i16，Rust 使用有符号 i16 ✅
-  - `status_code`：无符号 u8（Python `False`，Rust `u8`）✅
+  - `grippers_effort`/`torque_nm`：参考实现使用有符号 i16，Rust 使用有符号 i16 ✅
+  - `status_code`：无符号 u8（参考实现 `False`，Rust `u8`）✅
 - ✅ **结论**：**完全一致，正确**
 
 #### ✅ 2.1.5 0x251-0x256 - 关节驱动器高速反馈
 
-**Python SDK 解析**：
-```python
+**参考实现解析**：
+```text
 msg.arm_high_spd_feedback_1.motor_speed = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,0,2))
 msg.arm_high_spd_feedback_1.current = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,2,4))
 msg.arm_high_spd_feedback_1.pos = self.ConvertToNegative_32bit(self.ConvertBytesToInt(can_data,4,8))
@@ -190,14 +190,14 @@ let position_rad = bytes_to_i32_be(position_bytes);
 - ✅ **字节序**：两者都使用大端字节序
 - ⚠️ **符号处理差异**：
   - `motor_speed`：两者都使用有符号 i16 ✅
-  - `current`：**Python SDK 使用有符号 i16**，**Rust 使用无符号 u16** ⚠️
+  - `current`：**参考实现使用有符号 i16**，**Rust 使用无符号 u16** ⚠️
   - `pos`：两者都使用有符号 i32 ✅
-- 📝 **结论**：根据协议文档（`protocol.md` 第642行），电流应该是 `unsigned int16`，**Rust 实现正确**，Python SDK 可能有误
+- 📝 **结论**：根据协议文档（`protocol.md` 第642行），电流应该是 `unsigned int16`，**Rust 实现正确**，参考实现可能有误
 
 #### ✅ 2.1.6 0x261-0x266 - 关节驱动器低速反馈
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 msg.arm_low_spd_feedback_1.vol = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,0,2),False)
 msg.arm_low_spd_feedback_1.foc_temp = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,2,4))
 msg.arm_low_spd_feedback_1.motor_temp = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,4,5))
@@ -229,8 +229,8 @@ let bus_current = u16::from_be_bytes(bus_current_bytes);
 
 #### ✅ 2.1.7 0x473 - 反馈当前电机限制角度/最大速度
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 msg.arm_feedback_current_motor_angle_limit_max_spd.motor_num = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_feedback_current_motor_angle_limit_max_spd.max_angle_limit = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,1,3))
 msg.arm_feedback_current_motor_angle_limit_max_spd.min_angle_limit = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,3,5))
@@ -259,8 +259,8 @@ let max_velocity_rad_s = u16::from_be_bytes(max_velocity_bytes);
 
 #### ✅ 2.1.8 0x476 - 设置指令应答
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 msg.arm_feedback_resp_set_instruction.instruction_index = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_feedback_resp_set_instruction.is_set_zero_successfully = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,1,2),False)
 ```
@@ -279,8 +279,8 @@ let zero_point_success = frame.data[1] == 0x01;
 
 #### ✅ 2.1.9 0x478 - 反馈当前末端速度/加速度参数
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 msg.arm_feedback_current_end_vel_acc_param.end_max_linear_vel = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,0,2),False)
 msg.arm_feedback_current_end_vel_acc_param.end_max_angular_vel = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,2,4),False)
 msg.arm_feedback_current_end_vel_acc_param.end_max_linear_acc = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,4,6),False)
@@ -302,8 +302,8 @@ let max_angular_accel = u16::from_be_bytes([frame.data[6], frame.data[7]]);
 
 #### ✅ 2.1.10 0x47B - 碰撞防护等级反馈
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 msg.arm_crash_protection_rating_feedback.joint_1_protection_level = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 # ... 类似处理 joint_2~6
 ```
@@ -321,8 +321,8 @@ levels.copy_from_slice(&frame.data[0..6]);
 
 #### ✅ 2.1.11 0x47C - 反馈当前电机最大加速度限制
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 msg.arm_feedback_current_motor_max_acc_limit.joint_motor_num = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_feedback_current_motor_max_acc_limit.max_joint_acc = self.ConvertToNegative_16bit(self.ConvertBytesToInt(can_data,1,3),False)
 ```
@@ -341,8 +341,8 @@ let max_accel_rad_s2 = u16::from_be_bytes(max_accel_bytes);
 
 #### ✅ 2.1.12 0x47E - 夹爪/示教器参数反馈
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 msg.arm_gripper_teaching_param_feedback.teaching_range_per = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,0,1),False)
 msg.arm_gripper_teaching_param_feedback.max_range_config = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,1,2),False)
 msg.arm_gripper_teaching_param_feedback.teaching_friction = self.ConvertToNegative_8bit(self.ConvertBytesToInt(can_data,2,3),False)
@@ -364,8 +364,8 @@ Ok(Self {
 
 #### ✅ 2.1.13 0x4AF - 固件版本读取
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 elif(can_id == CanIDPiper.ARM_FIRMWARE_READ.value):
     msg.type_ = ArmMessageMapping.get_mapping(can_id=can_id)
     msg.time_stamp = can_time_now
@@ -382,7 +382,7 @@ pub struct FirmwareReadFeedback {
 
 **对比分析**：
 - ✅ **数据格式**：两者都直接保存原始字节数据
-- ✅ **版本解析**：Rust 实现提供了 `parse_version_string()` 方法，与 Python SDK 的 `GetPiperFirmwareVersion()` 功能类似
+- ✅ **版本解析**：Rust 实现提供了 `parse_version_string()` 方法，与 官方参考实现 的 `GetPiperFirmwareVersion()` 功能类似
 - ✅ **结论**：**已实现，功能完整**
 
 #### ✅ 2.1.14 0x151, 0x155-0x157, 0x159 - 主从模式控制指令反馈
@@ -392,8 +392,8 @@ pub struct FirmwareReadFeedback {
 - **示教输入臂**（主臂）：在联动示教输入模式下，**会主动发送关节模式控制指令**给运动输出臂
 - **运动输出臂**（从臂）：需要接收并解析这些控制指令
 
-**Python SDK 解析**：
-```python
+**官方参考实现 解析**：
+```text
 # 0x151 - 控制模式指令
 elif(can_id == CanIDPiper.ARM_MOTION_CTRL_2.value):
     msg.arm_motion_ctrl_2.ctrl_mode = self.ConvertToNegative_8bit(...)
@@ -435,8 +435,8 @@ pub struct GripperControlFeedback { ... }
 
 #### ✅ 2.2.1 0x150 - 快速急停/轨迹指令
 
-**Python SDK 编码**：
-```python
+**官方参考实现 编码**：
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_motion_ctrl_1.emergency_stop,False) + \
                     self.ConvertToList_8bit(msg.arm_motion_ctrl_1.track_ctrl,False) + \
                     self.ConvertToList_8bit(msg.arm_motion_ctrl_1.grag_teach_ctrl,False) + \
@@ -459,8 +459,8 @@ data[3] = self.trajectory_index;
 
 #### ✅ 2.2.2 0x151 - 控制模式指令
 
-**Python SDK 编码**：
-```python
+**官方参考实现 编码**：
+```text
 tx_can_frame.data = self.ConvertToList_8bit(msg.arm_motion_ctrl_2.ctrl_mode,False) + \
                     self.ConvertToList_8bit(msg.arm_motion_ctrl_2.move_mode,False) + \
                     self.ConvertToList_8bit(msg.arm_motion_ctrl_2.move_spd_rate_ctrl,False) + \
@@ -495,8 +495,8 @@ data[5] = self.install_position as u8;
 
 #### ✅ 2.2.4 0x159 - 夹爪控制
 
-**Python SDK 编码**：
-```python
+**官方参考实现 编码**：
+```text
 tx_can_frame.data = self.ConvertToList_32bit(msg.arm_gripper_ctrl.grippers_angle) + \
                     self.ConvertToList_16bit(msg.arm_gripper_ctrl.grippers_effort,False) + \
                     self.ConvertToList_8bit(msg.arm_gripper_ctrl.status_code,False) + \
@@ -517,21 +517,21 @@ data[7] = self.zero_setting;
 - ✅ **字节序**：两者都使用大端字节序
 - ✅ **符号处理**：
   - `grippers_angle`/`travel_mm`：有符号 i32 ✅
-  - `grippers_effort`/`torque_nm`：Python SDK 使用无符号 u16（`False`），Rust 使用有符号 i16 ⚠️
+  - `grippers_effort`/`torque_nm`：官方参考实现 使用无符号 u16（`False`），Rust 使用有符号 i16 ⚠️
   - `status_code`/`control_flags`：无符号 u8（位域）✅
   - `set_zero`/`zero_setting`：无符号 u8 ✅
-- 📝 **结论**：根据协议文档，夹爪扭矩应该是 `int16`，**Rust 实现正确**，Python SDK 可能有误
+- 📝 **结论**：根据协议文档，夹爪扭矩应该是 `int16`，**Rust 实现正确**，官方参考实现 可能有误
 
 #### ✅ 2.2.5 0x15A-0x15F - MIT 控制
 
-**Python SDK 编码**：复杂的跨字节位域打包，包括 CRC 计算
+**官方参考实现 编码**：复杂的跨字节位域打包，包括 CRC 计算
 
 **Rust 实现**：同样实现了复杂的位域打包和 CRC 计算
 
 **对比分析**：
 - ✅ **字节序**：大端字节序
 - ✅ **位域打包**：实现逻辑一致
-- ✅ **CRC 计算**：Rust 实现包含 CRC 计算（与 Python SDK 逻辑相同）
+- ✅ **CRC 计算**：Rust 实现包含 CRC 计算（与 官方参考实现 逻辑相同）
 - ✅ **结论**：**完全一致，正确**
 
 #### ✅ 2.2.6 0x470-0x47E - 配置指令
@@ -549,24 +549,24 @@ data[7] = self.zero_setting;
 ### 3.1 缺失的协议
 
 ~~1. **0x4AF - 固件版本读取反馈**~~ ✅ **已实现**
-   - Python SDK 支持解析此反馈帧
+   - 官方参考实现 支持解析此反馈帧
    - Rust 实现：已添加 `FirmwareReadFeedback` 结构体
 
 ~~2. **0x151, 0x155-0x157, 0x159 - 主从模式控制指令反馈**~~ ✅ **已实现**
    - **用途**：支持松灵 Piper 机械臂主从遥操模式
-   - Python SDK 在 `DecodeMessage` 中支持解析这些控制帧作为反馈
+   - 官方参考实现 在 `DecodeMessage` 中支持解析这些控制帧作为反馈
    - Rust 实现：已添加相应的反馈结构体（`ControlModeCommandFeedback`, `JointControl12Feedback`, `JointControl34Feedback`, `JointControl56Feedback`, `GripperControlFeedback`）
    - **说明**：这是标准协议的一部分，用于主从模式下的指令同步
 
 ### 3.2 符号处理差异（可能的问题）
 
 1. **0x2A8 - 夹爪反馈的 `grippers_effort`**：
-   - Python SDK：有符号 i16
+   - 官方参考实现：有符号 i16
    - Rust：有符号 i16
    - ✅ **一致**
 
 2. **0x251-0x256 - 高速反馈的 `current`**：
-   - Python SDK：有符号 i16
+   - 官方参考实现：有符号 i16
    - Rust：无符号 u16
    - 📝 **协议文档**（`protocol.md` 第644行）：`unsigned int16`
    - 🔍 **深入分析**：
@@ -575,32 +575,32 @@ data[7] = self.zero_setting;
        - **方向信息**：通过**速度**（`motor_speed`，有符号 i16）来体现
      - **力矩计算**：根据 Rust 实现中的力矩计算逻辑（`torque = current * coefficient`），电流是**绝对值**，方向由速度决定
      - **实际应用**：在代码中，速度字段（`speed_rad_s: i16`）可以表示正向/反向旋转，电流仅表示大小
-   - ✅ **结论**：**已修正为 i16**（有符号整数，支持反向电流）。根据用户确认，Python SDK 的实现是正确的，电流可以为负值（反向电流）。
+   - ✅ **结论**：**已修正为 i16**（有符号整数，支持反向电流）。根据用户确认，官方参考实现 的实现是正确的，电流可以为负值（反向电流）。
    - 📌 **修正说明**：
      - CAN 帧中电流字段为 2 字节（Byte 2-3）
-     - 解析为有符号 i16（与 Python SDK 的 `ConvertToNegative_16bit` 一致）
+     - 解析为有符号 i16（与 官方参考实现 的 `ConvertToNegative_16bit` 一致）
      - 支持正负电流值，表示正向和反向电流（范围：-32.768A 到 32.767A）
 
 3. **0x159 - 夹爪控制的 `grippers_effort`**：
-   - Python SDK：无符号 u16（`False`）
+   - 官方参考实现：无符号 u16（`False`）
    - Rust：有符号 i16
    - 📝 **根据协议文档**（`protocol.md` 第347行），应该是 `int16`，**Rust 实现正确**
 
 4. **0x2A1 - 状态反馈的故障码**：
-   - Python SDK：将 Byte 6-7 作为一个 16 位无符号整数解析
+   - 官方参考实现：将 Byte 6-7 作为一个 16 位无符号整数解析
    - Rust：将 Byte 6-7 分别作为两个 8 位位域解析
    - ✅ **根据协议文档**（`protocol.md` 第125-142行），应该是两个独立的 8 位位域，**Rust 实现正确**
 
-### 3.3 Python SDK 中可能存在的问题
+### 3.3 官方参考实现 中可能存在的问题
 
 1. **0x251-0x256 高速反馈的电流字段**：
-   - Python SDK 使用有符号 i16，但协议文档规定为无符号 u16
+   - 官方参考实现 使用有符号 i16，但协议文档规定为无符号 u16
 
 2. **0x159 夹爪控制的扭矩字段**：
-   - Python SDK 使用无符号 u16，但协议文档规定为有符号 i16
+   - 官方参考实现 使用无符号 u16，但协议文档规定为有符号 i16
 
 3. **0x2A1 状态反馈的故障码字段**：
-   - Python SDK 将 Byte 6-7 作为一个 16 位整数，但协议文档明确说明是两个独立的 8 位位域
+   - 官方参考实现 将 Byte 6-7 作为一个 16 位整数，但协议文档明确说明是两个独立的 8 位位域
 
 ---
 
@@ -608,7 +608,7 @@ data[7] = self.zero_setting;
 
 ### 4.1 总体评价
 
-Rust 实现的协议解析**整体正确性很高**，在符号处理和字节序方面与协议文档高度一致。Python SDK 在某些字段的符号处理上存在与协议文档不符的情况。
+Rust 实现的协议解析**整体正确性很高**，在符号处理和字节序方面与协议文档高度一致。官方参考实现 在某些字段的符号处理上存在与协议文档不符的情况。
 
 ### 4.2 需要补充的协议
 
@@ -629,9 +629,9 @@ Rust 实现的协议解析**整体正确性很高**，在符号处理和字节�
    - 已实现所有相关的反馈结构体
    - 支持主从模式下的控制指令解析
 
-3. **验证 Python SDK 中的符号处理问题**
-   - 可以联系官方确认 Python SDK 的实现是否符合最新协议文档
-   - 特别是电流字段：Python SDK 使用有符号 i16，但协议文档和实际应用（力矩计算）都表明应该是无符号 u16
+3. **验证 官方参考实现 中的符号处理问题**
+   - 可以联系官方确认 官方参考实现 的实现是否符合最新协议文档
+   - 特别是电流字段：官方参考实现 使用有符号 i16，但协议文档和实际应用（力矩计算）都表明应该是无符号 u16
 
 4. **保持 Rust 实现的符号处理逻辑**
    - Rust 实现与协议文档一致，不建议修改
@@ -651,7 +651,7 @@ Rust 实现的协议解析**整体正确性很高**，在符号处理和字节�
 
 **报告生成时间**：2024年
 **对比版本**：
-- Python SDK: `piper_protocol_v2.py`
+- 官方参考实现：协议 V2 对照实现
 - Rust SDK: `src/protocol/` 模块
 - 协议文档: `docs/v0/protocol.md`
 

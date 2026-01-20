@@ -138,13 +138,13 @@ pub struct JointDynamicState {
 impl JointDynamicState {
     /// 关节 1-3 的力矩系数（CAN ID: 0x251~0x253）
     ///
-    /// 根据官方 Python SDK，关节 1、2、3 使用此系数计算力矩。
+    /// 根据官方参考实现，关节 1、2、3 使用此系数计算力矩。
     /// 公式：torque = current * COEFFICIENT_1_3
     pub const COEFFICIENT_1_3: f64 = 1.18125;
 
     /// 关节 4-6 的力矩系数（CAN ID: 0x254~0x256）
     ///
-    /// 根据官方 Python SDK，关节 4、5、6 使用此系数计算力矩。
+    /// 根据官方参考实现，关节 4、5、6 使用此系数计算力矩。
     /// 公式：torque = current * COEFFICIENT_4_6
     pub const COEFFICIENT_4_6: f64 = 0.95844;
 

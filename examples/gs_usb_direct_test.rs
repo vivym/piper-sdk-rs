@@ -1,6 +1,6 @@
-//! 直接使用 rusb 和我们的结构体，完全按照 Python 实现 GS-USB 协议
+//! 直接使用 rusb 和我们的结构体，按 GS-USB 协议进行直连调试
 //!
-//! 这个脚本完全对齐 Python 的 gs_usb.py 实现，用于调试和对比
+//! 用途：用于验证启动序列、位定时参数与帧解析链路是否正确（对照实现/设备行为）
 //!
 //! 运行方式：
 //!   sudo cargo run --example gs_usb_direct_test
@@ -9,7 +9,7 @@ use piper_sdk::can::gs_usb::protocol::*;
 use rusb::{DeviceHandle, GlobalContext};
 use std::time::Duration;
 
-// 常量定义（与 Python 完全一致）
+// 常量定义（与协议定义一致）
 const GS_USB_ID_VENDOR: u16 = 0x1D50;
 const GS_USB_ID_PRODUCT: u16 = 0x606F;
 const GS_USB_CANDLELIGHT_VENDOR_ID: u16 = 0x1209;
@@ -97,8 +97,7 @@ fn get_device_capability(
 }
 
 fn set_bitrate(handle: &DeviceHandle<GlobalContext>, bitrate: u32) -> Result<(), rusb::Error> {
-    // **完全对齐 Python**：set_bitrate() 在 start() 之前调用
-    // Python 的 USB 库在发送控制请求时自动处理接口 claim
+    // 推荐：set_bitrate() 在 start() 之前调用
     // Rust 需要显式处理：如果 kernel driver 是 active 的，先 detach 再 claim
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -107,13 +106,13 @@ fn set_bitrate(handle: &DeviceHandle<GlobalContext>, bitrate: u32) -> Result<(),
         }
     }
 
-    // 然后 claim interface（Python 的 USB 库自动处理，Rust 需要显式处理）
+    // 然后 claim interface（Rust 需要显式处理）
     handle.claim_interface(0)?;
 
     // 获取设备能力（需要接口已 claim）
     let capability = get_device_capability(handle)?;
 
-    // 根据时钟频率选择位定时参数（与 Python 完全一致）
+    // 根据时钟频率选择位定时参数（推荐表）
     let timing = match capability.fclk_can {
         48_000_000 => match bitrate {
             10_000 => Some((1, 12, 2, 1, 300)),
@@ -160,12 +159,12 @@ fn set_bitrate(handle: &DeviceHandle<GlobalContext>, bitrate: u32) -> Result<(),
 }
 
 fn start_device(handle: &DeviceHandle<GlobalContext>, flags: u32) -> Result<u32, rusb::Error> {
-    // **完全对齐 Python 的 start() 方法**：
+    // 推荐的 start() 行为：
     // 1. reset() - 重置设备（最前面）
     handle.reset()?;
 
     // 2. detach_kernel_driver() - 在 reset 之后（如果 kernel driver active）
-    // 注意：Python 的 USB 库可能自动处理接口 claim，但 Rust 需要显式处理
+    // 注意：Rust 需要显式处理接口 claim
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if handle.kernel_driver_active(0).unwrap_or(false) {
@@ -173,7 +172,7 @@ fn start_device(handle: &DeviceHandle<GlobalContext>, flags: u32) -> Result<u32,
         }
     }
 
-    // 3. Claim interface（Python 的 USB 库自动处理，Rust 需要显式处理）
+    // 3. Claim interface（Rust 需要显式处理）
     // 注意：必须在 detach_kernel_driver 之后，否则会失败
     handle.claim_interface(0)?;
 
@@ -183,13 +182,13 @@ fn start_device(handle: &DeviceHandle<GlobalContext>, flags: u32) -> Result<u32,
     // 5. 过滤 flags：只保留设备支持的功能
     let mut flags = flags & capability.feature;
 
-    // 6. 过滤 flags：只保留驱动支持的功能（与 Python 完全一致）
+    // 6. 过滤 flags：只保留驱动支持的功能
     flags &= GS_CAN_MODE_LISTEN_ONLY
         | GS_CAN_MODE_LOOP_BACK
         | GS_CAN_MODE_ONE_SHOT
         | GS_CAN_MODE_HW_TIMESTAMP;
 
-    // 7. 打印调试信息（与 Python 一致）
+    // 7. 打印调试信息
     let hw_timestamp = (flags & GS_CAN_MODE_HW_TIMESTAMP) != 0;
     eprintln!(
         "[RUST DEBUG] Device capability.feature: 0x{:08X}, requested flags: 0x{:08X}, final flags: 0x{:08X}, hw_timestamp: {}",
@@ -238,7 +237,7 @@ fn read_frame(
         len
     );
 
-    // 解析帧（与 Python 完全一致：Little-Endian）
+    // 解析帧（Little-Endian）
     let mut data = [0u8; 8];
     data.copy_from_slice(&buf[12..20]);
     let timestamp_us = if hw_timestamp {
@@ -275,7 +274,7 @@ fn read_frame(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "=".repeat(60));
-    println!("GS USB 直接测试（完全对齐 Python 实现）");
+    println!("GS USB 直接测试（直连调试）");
     println!("{}", "=".repeat(60));
 
     // 1. 查找设备
@@ -283,12 +282,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = find_device().ok_or("未找到 GS-USB 设备")?;
     println!("✓ 找到设备");
 
-    // 2. 设置波特率（在 start() 之前，与 Python 完全一致）
+    // 2. 设置波特率（在 start() 之前）
     println!("\n[2] 设置波特率为 1000000 bps...");
     set_bitrate(&handle, 1_000_000)?;
     println!("✓ 波特率设置成功");
 
-    // 3. 启动设备（与 Python 完全一致）
+    // 3. 启动设备
     println!("\n[3] 启动设备...");
     let flags = start_device(&handle, GS_CAN_MODE_NORMAL | GS_CAN_MODE_HW_TIMESTAMP)?;
     let hw_timestamp = (flags & GS_CAN_MODE_HW_TIMESTAMP) != 0;
@@ -310,8 +309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(frame) => {
                 frame_count += 1;
 
-                // 提取 CAN ID（移除标志位，与 Python 的 arbitration_id 一致）
-                // Python: arbitration_id = can_id & CAN_EFF_MASK
+                // 提取 CAN ID（移除标志位）
                 let can_id = frame.can_id & CAN_EFF_MASK;
 
                 // 格式化数据

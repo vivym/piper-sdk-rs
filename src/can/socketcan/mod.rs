@@ -112,7 +112,7 @@ impl SocketCanAdapter {
                 return Err(CanError::Device(format!(
                     "CAN interface '{}' exists but is not UP. Please start it first:\n  sudo ip link set up {}",
                     interface, interface
-                )));
+                ).into()));
             },
             Err(e) => {
                 // 接口不存在或其他错误，直接返回
@@ -126,6 +126,7 @@ impl SocketCanAdapter {
                 "Failed to open CAN interface '{}': {}",
                 interface, e
             ))
+            .into()
         })?;
 
         // 设置读超时（默认 2ms，与 PipelineConfig 的默认值一致，确保 io_loop 能及时响应退出信号）
@@ -453,23 +454,27 @@ impl SocketCanAdapter {
 
         if is_extended {
             // 扩展帧
-            let id = ExtendedId::new(id_bits)
-                .ok_or_else(|| CanError::Device(format!("Invalid extended ID: 0x{:X}", id_bits)))?;
+            let id = ExtendedId::new(id_bits).ok_or_else(|| {
+                CanError::Device(format!("Invalid extended ID: 0x{:X}", id_bits).into())
+            })?;
             CanFrame::new(id, data_slice).ok_or_else(|| {
                 CanError::Device(format!(
                     "Failed to create extended frame with ID 0x{:X}",
                     id_bits
                 ))
+                .into()
             })
         } else {
             // 标准帧
-            let id = StandardId::new(id_bits as u16)
-                .ok_or_else(|| CanError::Device(format!("Invalid standard ID: 0x{:X}", id_bits)))?;
+            let id = StandardId::new(id_bits as u16).ok_or_else(|| {
+                CanError::Device(format!("Invalid standard ID: 0x{:X}", id_bits).into())
+            })?;
             CanFrame::new(id, data_slice).ok_or_else(|| {
                 CanError::Device(format!(
                     "Failed to create standard frame with ID 0x{:X}",
                     id_bits
                 ))
+                .into()
             })
         }
     }
@@ -610,6 +615,7 @@ impl CanAdapter for SocketCanAdapter {
                         "Failed to create extended frame with ID 0x{:X}",
                         frame.id
                     ))
+                    .into()
                 })?
         } else {
             // 标准帧
@@ -620,6 +626,7 @@ impl CanAdapter for SocketCanAdapter {
                         "Failed to create standard frame with ID 0x{:X}",
                         frame.id
                     ))
+                    .into()
                 })?
         };
 
@@ -719,7 +726,7 @@ mod tests {
         let result = SocketCanAdapter::new("nonexistent_can99");
         assert!(result.is_err());
         if let Err(CanError::Device(msg)) = result {
-            assert!(msg.contains("nonexistent_can99"));
+            assert!(msg.message.contains("nonexistent_can99"));
         } else {
             panic!("Expected Device error");
         }

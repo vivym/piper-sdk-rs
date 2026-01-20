@@ -336,7 +336,7 @@ classDiagram
 
 #### Step 1: 定义结构体
 
-我们不需要 Python 那么多的类，只需要聚合为核心的几个。
+我们不需要 参考实现 那么多的类，只需要聚合为核心的几个。
 
 ```rust
 use bilge::prelude::*;
@@ -487,8 +487,8 @@ fn io_loop(can: &mut impl Can, motion_writer: &Arc<ArcSwap<MotionState>>) {
 
 ### 5. 总结
 
-回答你的问题：**有必要拆分，但不要像 Python 那样拆得那么碎。**
+回答你的问题：**有必要拆分，但不要像 参考实现 那样拆得那么碎。**
 
 1. **MotionState (合并):** 必须包含所有参与控制算法的变量（关节、末端、速度）。**必须使用 `ArcSwap` 并配合 Frame Commit 机制**，以保证原子快照的一致性。
 2. **Diagnostic/Config (拆分):** 剥离出去。因为这些数据不需要高频读取，也不需要和关节角度保持微秒级同步。使用 `RwLock` 或独立的 `ArcSwap`，避免污染高频数据的 Cache 和 Clone 开销。
-3. **不要模仿 Python 的 Mutex:** Python 用那么多 Mutex 是为了减少锁粒度以应对 GIL。Rust 没有 GIL，在 1kHz 循环中，**无锁的原子快照**才是王道。
+3. **不要模仿 参考实现 的 Mutex:** 参考实现 用那么多 Mutex 是为了减少锁粒度以应对 GIL。Rust 没有 GIL，在 1kHz 循环中，**无锁的原子快照**才是王道。

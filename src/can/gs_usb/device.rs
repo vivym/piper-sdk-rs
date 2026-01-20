@@ -10,15 +10,68 @@ use crate::can::gs_usb::error::GsUsbError;
 use crate::can::gs_usb::frame::GsUsbFrame;
 use crate::can::gs_usb::protocol::*;
 
+/// 轻量的设备枚举信息（不持有 USB 句柄）
+#[derive(Debug, Clone)]
+pub struct GsUsbDeviceInfo {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub bus_number: u8,
+    pub address: u8,
+    pub serial_number: Option<String>,
+}
+
+/// 打开设备时的选择器（避免枚举阶段持有 handle）
+#[derive(Debug, Clone, Default)]
+pub struct GsUsbDeviceSelector {
+    pub serial_number: Option<String>,
+    pub bus_number: Option<u8>,
+    pub address: Option<u8>,
+}
+
+impl GsUsbDeviceSelector {
+    pub fn any() -> Self {
+        Self::default()
+    }
+
+    pub fn by_serial(serial: impl Into<String>) -> Self {
+        Self {
+            serial_number: Some(serial.into()),
+            bus_number: None,
+            address: None,
+        }
+    }
+
+    pub fn by_bus_address(bus_number: u8, address: u8) -> Self {
+        Self {
+            serial_number: None,
+            bus_number: Some(bus_number),
+            address: Some(address),
+        }
+    }
+}
+
+/// `start()` 的协商结果（用于让上层可见“最终生效配置”）
+#[derive(Debug, Clone, Copy)]
+pub struct StartResult {
+    /// 设备能力（来自 BT_CONST）
+    pub capability: DeviceCapability,
+    /// 传入 flags 在 capability/驱动支持过滤后的最终生效值
+    pub effective_flags: u32,
+    /// 是否启用硬件时间戳（由 effective_flags 决定）
+    pub hw_timestamp: bool,
+}
+
 /// GS-USB 设备句柄
 pub struct GsUsbDevice {
     handle: DeviceHandle<GlobalContext>,
+    vendor_id: u16,
+    product_id: u16,
+    bus_number: u8,
+    address: u8,
     interface_number: u8,
     endpoint_in: u8,
     endpoint_out: u8,
     capability: Option<DeviceCapability>,
-    last_timing: Option<DeviceBitTiming>,
-    started: bool,
     /// 记录是否已经 claim 了接口（用于正确的资源清理）
     interface_claimed: bool,
     /// 是否启用硬件时间戳模式
@@ -39,24 +92,101 @@ impl GsUsbDevice {
         )
     }
 
-    /// 扫描所有 GS-USB 设备
-    pub fn scan() -> Result<Vec<GsUsbDevice>, GsUsbError> {
-        Self::scan_with_filter(None)
+    /// 打开一个 GS-USB 设备（按选择器匹配）
+    ///
+    /// - 若 `selector.serial_number` 存在，则仅打开 serial 匹配的设备（大小写敏感，与 scan 逻辑一致）
+    /// - 若 `selector.bus_number/address` 存在，则仅打开匹配 bus/address 的设备
+    /// - 若都未指定，则打开找到的第一个 GS-USB 设备
+    pub fn open(selector: &GsUsbDeviceSelector) -> Result<GsUsbDevice, GsUsbError> {
+        for device in rusb::devices()?.iter() {
+            let desc = match device.device_descriptor() {
+                Ok(desc) => desc,
+                Err(_) => continue,
+            };
+
+            let vendor_id = desc.vendor_id();
+            let product_id = desc.product_id();
+            if !Self::is_gs_usb_device(vendor_id, product_id) {
+                continue;
+            }
+
+            // bus/address 过滤（如果指定）
+            if let (Some(bus), Some(addr)) = (selector.bus_number, selector.address)
+                && (device.bus_number() != bus || device.address() != addr)
+            {
+                continue;
+            }
+
+            let bus_number = device.bus_number();
+            let address = device.address();
+
+            // 打开 handle（后续还需要读取 serial / 查端点）
+            let handle = match device.open() {
+                Ok(handle) => handle,
+                Err(_) => continue,
+            };
+
+            // 读取 serial（如需要）
+            let serial_number = match desc.serial_number_string_index() {
+                Some(idx) if idx != 0 => handle.read_string_descriptor_ascii(idx).ok(),
+                _ => None,
+            };
+
+            if let Some(filter) = selector.serial_number.as_deref()
+                && serial_number.as_deref() != Some(filter)
+            {
+                continue;
+            }
+
+            // 查找接口和端点（沿用 scan_with_filter 的逻辑）
+            let config_desc = match device.config_descriptor(0) {
+                Ok(config) => config,
+                Err(_) => continue,
+            };
+
+            let interface = match config_desc
+                .interfaces()
+                .next()
+                .and_then(|iface| iface.descriptors().next())
+            {
+                Some(iface) => iface,
+                None => continue,
+            };
+
+            let interface_number = 0u8;
+            let (endpoint_in, endpoint_out) = match Self::find_bulk_endpoints(&interface) {
+                Some((in_ep, out_ep)) => (in_ep, out_ep),
+                None => continue,
+            };
+
+            return Ok(GsUsbDevice {
+                handle,
+                vendor_id,
+                product_id,
+                bus_number,
+                address,
+                interface_number,
+                endpoint_in,
+                endpoint_out,
+                capability: None,
+                interface_claimed: false,
+                hw_timestamp: false,
+                serial_number,
+            });
+        }
+
+        Err(GsUsbError::DeviceNotFound)
     }
 
-    /// 扫描所有 GS-USB 设备，可选地按序列号过滤
+    /// 扫描设备信息（不持有 USB 句柄），可选按序列号过滤
     ///
-    /// # 参数
-    /// - `serial_number_filter`: 可选的序列号过滤器，如果提供，只返回匹配序列号的设备
-    ///
-    /// # 注意
-    /// - 如果设备没有序列号（序列号索引为 0 或读取失败），序列号字段将为 `None`
-    /// - 如果提供了 `serial_number_filter`，只有序列号匹配的设备会被返回
-    /// - 序列号匹配是大小写敏感的
-    pub fn scan_with_filter(
+    /// 说明：
+    /// - 为了读取序列号，仍需要短暂 open handle 读取 descriptor；读取完成后立即释放，不返回持有 handle 的对象。
+    /// - 适用于 daemon/CLI 的“列出设备”与选择逻辑，避免枚举阶段占用设备资源。
+    pub fn scan_info_with_filter(
         serial_number_filter: Option<&str>,
-    ) -> Result<Vec<GsUsbDevice>, GsUsbError> {
-        let mut devices = Vec::new();
+    ) -> Result<Vec<GsUsbDeviceInfo>, GsUsbError> {
+        let mut infos = Vec::new();
 
         for device in rusb::devices()?.iter() {
             let desc = match device.device_descriptor() {
@@ -64,88 +194,66 @@ impl GsUsbDevice {
                 Err(_) => continue,
             };
 
-            if Self::is_gs_usb_device(desc.vendor_id(), desc.product_id()) {
-                let handle = match device.open() {
-                    Ok(handle) => handle,
-                    Err(_) => continue,
-                };
-
-                // 尝试读取序列号
-                let serial_number = match desc.serial_number_string_index() {
-                    Some(idx) if idx != 0 => {
-                        match handle.read_string_descriptor_ascii(idx) {
-                            Ok(serial) => {
-                                // 如果提供了过滤器，检查是否匹配
-                                if let Some(filter) = serial_number_filter
-                                    && serial != filter
-                                {
-                                    continue; // 序列号不匹配，跳过此设备
-                                }
-                                Some(serial)
-                            },
-                            Err(_) => {
-                                // 读取序列号失败，但如果提供了过滤器，必须匹配，所以跳过
-                                if serial_number_filter.is_some() {
-                                    continue;
-                                }
-                                None
-                            },
-                        }
-                    },
-                    _ => {
-                        // 没有序列号，但如果提供了过滤器，必须匹配，所以跳过
-                        if serial_number_filter.is_some() {
-                            continue;
-                        }
-                        None
-                    },
-                };
-
-                // 查找接口和端点
-                let config_desc = match device.config_descriptor(0) {
-                    Ok(config) => config,
-                    Err(_) => continue,
-                };
-
-                let interface = match config_desc
-                    .interfaces()
-                    .next()
-                    .and_then(|iface| iface.descriptors().next())
-                {
-                    Some(iface) => iface,
-                    None => continue,
-                };
-
-                // GS-USB 设备通常只有一个接口，接口号为 0
-                let interface_number = 0u8;
-
-                // 查找 Bulk IN/OUT 端点
-                let (endpoint_in, endpoint_out) = match Self::find_bulk_endpoints(&interface) {
-                    Some((in_ep, out_ep)) => (in_ep, out_ep),
-                    None => continue,
-                };
-
-                devices.push(GsUsbDevice {
-                    handle,
-                    interface_number,
-                    endpoint_in,
-                    endpoint_out,
-                    capability: None,
-                    last_timing: None,
-                    started: false,
-                    interface_claimed: false,
-                    hw_timestamp: false,
-                    serial_number,
-                });
+            let vendor_id = desc.vendor_id();
+            let product_id = desc.product_id();
+            if !Self::is_gs_usb_device(vendor_id, product_id) {
+                continue;
             }
+
+            // 尝试读取序列号（需要短暂 open）
+            let serial_number = match device.open() {
+                Ok(handle) => match desc.serial_number_string_index() {
+                    Some(idx) if idx != 0 => handle.read_string_descriptor_ascii(idx).ok(),
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+
+            // 过滤（大小写敏感，与 scan_with_filter 保持一致）
+            if let Some(filter) = serial_number_filter && serial_number.as_deref() != Some(filter) {
+                continue;
+            }
+
+            infos.push(GsUsbDeviceInfo {
+                vendor_id,
+                product_id,
+                bus_number: device.bus_number(),
+                address: device.address(),
+                serial_number,
+            });
         }
 
-        Ok(devices)
+        Ok(infos)
+    }
+
+    /// 扫描设备信息（不持有 USB 句柄）
+    pub fn scan_info() -> Result<Vec<GsUsbDeviceInfo>, GsUsbError> {
+        Self::scan_info_with_filter(None)
     }
 
     /// 获取设备序列号
     pub fn serial_number(&self) -> Option<&str> {
         self.serial_number.as_deref()
+    }
+
+    /// 设备 VID
+    pub fn vendor_id(&self) -> u16 {
+        self.vendor_id
+    }
+
+    /// 设备 PID
+    pub fn product_id(&self) -> u16 {
+        self.product_id
+    }
+
+    /// USB bus number
+    pub fn bus_number(&self) -> u8 {
+        self.bus_number
+    }
+
+    /// USB address
+    pub fn address(&self) -> u8 {
+        self.address
     }
 
     /// 查找 Bulk IN/OUT 端点
@@ -170,47 +278,15 @@ impl GsUsbDevice {
         }
     }
 
-    /// 发送 Host Format (0xBEEF) 进行握手
-    ///
-    /// **重要性**：虽然设备和主机都是 Little Endian，但这个请求充当：
-    /// 1. 协议握手信号 - 某些固件在收到此命令前可能处于未初始化状态
-    /// 2. 字节序配置 - 告知设备主机的字节序（虽然现代设备通常默认 LE）
-    ///
-    /// **策略**：Fire-and-Forget for Handshake
-    /// - 尝试发送，但忽略错误（设备可能不支持或已默认 LE）
-    /// - 即使失败也不阻断后续流程
-    pub fn send_host_format(&self) -> Result<(), GsUsbError> {
-        let val: u32 = 0x0000_BEEF;
-        let data = val.to_le_bytes();
-
-        // 短超时（100ms），忽略错误
-        let _ = self.handle.write_control(
-            GS_USB_REQ_OUT,
-            GS_USB_BREQ_HOST_FORMAT,
-            0, // Value（参考实现使用 0）
-            0, // wIndex（大多数控制请求使用 0）
-            &data,
-            Duration::from_millis(100),
-        );
-
-        Ok(()) // 始终返回成功，不阻断流程
-    }
-
-    /// 只 claim interface（不 reset），用于在 set_bitrate 之前准备接口
-    ///
-    /// **完全对齐 Python 流程**：Python 的 set_bitrate() 在 start() 之前调用，
-    /// 但 start() 内部会 reset。此方法只 claim interface，不 reset。
-    ///
-    /// 注意：Python 的 USB 库可能自动处理接口 claim，但 Rust 需要显式处理。
-    /// 为了确保 set_bitrate() 能成功，如果 kernel driver 是 active 的，先 detach 再 claim。
-    pub fn claim_interface_only(&mut self) -> Result<(), GsUsbError> {
+    /// 确保接口已 detach/claim，供控制传输使用（内部辅助）
+    fn ensure_interface_claimed(&mut self) -> Result<(), GsUsbError> {
         // 如果接口已经 claim 了，跳过
         if self.interface_claimed {
             return Ok(());
         }
 
-        // 如果 kernel driver 是 active 的，先 detach（与 Python 的 start() 行为一致）
-        // 注意：Python 的 start() 中，detach_kernel_driver() 在 reset() 之后执行
+        // 如果 kernel driver 是 active 的，先 detach（与推荐启动流程一致）
+        // 注意：detach_kernel_driver() 在 reset() 之后执行
         // 但为了确保 set_bitrate() 能成功，我们在这里也处理
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -224,75 +300,6 @@ impl GsUsbDevice {
         // 然后 claim interface
         self.handle.claim_interface(self.interface_number).map_err(GsUsbError::Usb)?;
         self.interface_claimed = true;
-        Ok(())
-    }
-
-    /// 准备接口（detach driver 和 claim interface）
-    ///
-    /// 提取为独立方法，以便在需要时提前调用（例如在 set_bitrate 之前）
-    pub fn prepare_interface(&mut self) -> Result<(), GsUsbError> {
-        // 如果接口已经 claim 了，跳过（避免重复 claim）
-        if self.interface_claimed {
-            return Ok(());
-        }
-
-        // 1. Detach kernel driver on Linux/macOS（在 claim 之前）
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            if self.handle.kernel_driver_active(self.interface_number).unwrap_or(false) {
-                self.handle
-                    .detach_kernel_driver(self.interface_number)
-                    .map_err(GsUsbError::Usb)?;
-            }
-        }
-
-        // 2. Claim interface（必须在 reset 之前，否则可能导致段错误）
-        self.handle.claim_interface(self.interface_number).map_err(GsUsbError::Usb)?;
-
-        self.interface_claimed = true;
-
-        // 3. Reset 设备（参考实现在最前面，但我们先 claim interface 避免段错误）
-        // 注意：某些设备需要在 reset 后才能正确响应控制传输
-        // 但在 macOS 上，reset 必须在 claim interface 之后
-        if let Err(e) = self.handle.reset() {
-            trace!("Device reset failed (may be normal): {}", e);
-            // 不立即返回错误，继续尝试后续步骤
-        }
-
-        // 4. 短暂延迟，让设备稳定（特别是 reset 后）
-        std::thread::sleep(Duration::from_millis(100));
-
-        Ok(())
-    }
-
-    /// 清除 USB 端点的 Halt 状态和 Data Toggle
-    ///
-    /// **重要性**：在 macOS 上，当程序非正常退出或超时后，USB 端点可能处于 Halt/Stall 状态，
-    /// 或者 Host 和 Device 的 Data Toggle 不同步（Host 认为应该是 DATA0，Device 认为是 DATA1）。
-    ///
-    /// **现象**：主机发送数据成功（USB 物理层 ACK），但设备硬件检查 Data Toggle 位发现不对，
-    /// 直接丢弃数据包，固件层收不到任何数据，自然不会返回 Echo。
-    ///
-    /// **解决方案**：`clear_halt()` 会强制将 Host 和 Device 的 Data Toggle 都重置为 DATA0，
-    /// 并清除端点的 Halt 状态，让双方重新握手。
-    ///
-    /// **调用时机**：在 `prepare_interface()` 之后，执行任何 USB 传输之前调用。
-    pub fn clear_usb_endpoints(&mut self) -> Result<(), GsUsbError> {
-        // 清除 IN 端点（接收端）
-        if let Err(e) = self.handle.clear_halt(self.endpoint_in) {
-            trace!("Failed to clear halt on IN endpoint: {}", e);
-            // 不立即返回错误，尝试继续清除 OUT 端点
-        }
-
-        // 清除 OUT 端点（发送端）
-        if let Err(e) = self.handle.clear_halt(self.endpoint_out) {
-            trace!("Failed to clear halt on OUT endpoint: {}", e);
-            // 即使失败也继续，因为这可能是端点尚未初始化的正常情况
-        }
-
-        // 短暂延迟，让端点状态稳定
-        std::thread::sleep(Duration::from_millis(10));
-
         Ok(())
     }
 
@@ -315,20 +322,19 @@ impl GsUsbDevice {
 
     /// 启动设备
     ///
-    /// **完全对齐 Python 的 start() 方法**：
+    /// 推荐的 start() 行为（与参考实现一致）：
     /// 1. reset() - 重置设备
     /// 2. detach_kernel_driver() - 在 Linux/Unix 上 detach kernel driver（在 reset 之后）
     /// 3. 获取 device_capability - 检查设备支持的功能
     /// 4. 过滤 flags - 只保留设备支持的功能
     /// 5. 发送 MODE 命令 - 启动设备
     ///
-    /// 注意：Python 的 start() 内部会 reset，但 reset 不会清除之前设置的 bitrate
+    /// 注意：start() 内部会 reset，但 reset 不会清除之前设置的 bitrate
     /// 因为 bitrate 是通过控制请求设置的，是持久化配置
-    pub fn start(&mut self, flags: u32) -> Result<(), GsUsbError> {
-        // **完全对齐 Python 流程**：
-        // Python: reset() -> detach_kernel_driver() -> 获取 capability -> 过滤 flags -> 发送 MODE
+    pub fn start(&mut self, flags: u32) -> Result<StartResult, GsUsbError> {
+        // 推荐流程：reset() -> detach_kernel_driver() -> 获取 capability -> 过滤 flags -> 发送 MODE
 
-        // 1. Reset 设备（与 Python 完全一致，在 start() 内部 reset，最前面）
+        // 1. Reset 设备（start() 内部 reset，最前面）
         // 注意：reset 不会清除之前设置的 bitrate，因为 bitrate 是持久化配置
         // 但 reset 可能会清除接口 claim 状态，所以需要在 reset 后重新处理接口
         if let Err(e) = self.handle.reset() {
@@ -336,8 +342,8 @@ impl GsUsbDevice {
             // 不立即返回错误，继续尝试后续步骤
         }
 
-        // 2. Detach kernel driver on Linux/macOS（在 reset 之后，与 Python 完全一致）
-        // 注意：Python 的 start() 中，detach_kernel_driver() 在 reset() 之后执行
+        // 2. Detach kernel driver on Linux/macOS（在 reset 之后）
+        // 注意：detach_kernel_driver() 在 reset() 之后执行
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             // reset 后，接口状态可能被清除，需要检查并重新处理
@@ -347,7 +353,7 @@ impl GsUsbDevice {
 
             if kernel_driver_active {
                 // Kernel driver 是 active 的，说明 reset 清除了接口状态
-                // 需要 detach 和 claim（与 Python 一致）
+                // 需要 detach 和 claim（与推荐流程一致）
                 self.interface_claimed = false;
                 self.handle
                     .detach_kernel_driver(self.interface_number)
@@ -386,12 +392,15 @@ impl GsUsbDevice {
         let mode = DeviceMode::new(GS_CAN_MODE_START, flags);
         self.control_out(GS_USB_BREQ_MODE, 0, &mode.pack())?;
 
-        self.started = true;
         trace!(
             "GS-USB device started with flags: 0x{:08x}, hw_timestamp={}",
             flags, self.hw_timestamp
         );
-        Ok(())
+        Ok(StartResult {
+            capability,
+            effective_flags: flags,
+            hw_timestamp: self.hw_timestamp,
+        })
     }
 
     /// 停止设备
@@ -399,22 +408,24 @@ impl GsUsbDevice {
         let mode = DeviceMode::new(GS_CAN_MODE_RESET, 0);
         // 忽略错误（设备可能已经停止）
         let _ = self.control_out(GS_USB_BREQ_MODE, 0, &mode.pack());
-        self.started = false;
         trace!("GS-USB device stopped");
         Ok(())
     }
 
     /// 设置 CAN 波特率
     ///
-    /// 使用预定义的波特率映射表（**对齐 Python `gs_usb.py` 的位定时表**）
+    /// 使用预定义的波特率映射表（推荐表，sample point 87.5%）
     ///
     /// 关键点：
-    /// - Python 参考实现使用 sample point = 87.5%
+    /// - sample point = 87.5%
     /// - 并依据 `device_capability().fclk_can`（常见 48MHz / 80MHz）选择参数
     /// - 如果位定时参数不匹配，典型现象是：设备能 start，但总线错误/无 ACK，导致“收不到帧”
     ///
     /// 如果无法查询设备能力，将使用默认时钟（48MHz）作为 fallback
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), GsUsbError> {
+        // 确保接口已 claim，避免控制请求失败
+        self.ensure_interface_claimed()?;
+
         // 尝试获取设备能力，如果失败则使用默认时钟（48MHz）
         let clock = match self.device_capability() {
             Ok(cap) => cap.fclk_can,
@@ -428,7 +439,7 @@ impl GsUsbDevice {
             },
         };
 
-        // 位定时表：对齐 Python `GsUsb.set_bitrate()`（sample point 87.5%）
+        // 位定时表：推荐配置（sample point 87.5%）
         // 返回顺序：(prop_seg, phase_seg1, phase_seg2, sjw, brp)
         let timing = match clock {
             // 48 MHz clock (Candlelight / STM32-based devices)
@@ -484,7 +495,6 @@ impl GsUsbDevice {
     ) -> Result<(), GsUsbError> {
         let timing = DeviceBitTiming::new(prop_seg, phase_seg1, phase_seg2, sjw, brp);
         self.control_out(GS_USB_BREQ_BITTIMING, 0, &timing.pack())?;
-        self.last_timing = Some(timing);
         trace!(
             "Set bit timing: prop_seg={}, phase_seg1={}, phase_seg2={}, sjw={}, brp={}",
             prop_seg, phase_seg1, phase_seg2, sjw, brp
@@ -537,37 +547,6 @@ impl GsUsbDevice {
             },
             Err(e) => Err(GsUsbError::Usb(e)),
         }
-    }
-
-    /// 接收原始 GS-USB 帧（带超时）
-    ///
-    /// **注意**：此方法只读取 USB 包中的第一个帧。如果 USB 包包含多个帧，后续帧会被丢弃。
-    /// 对于高吞吐量场景，请使用 `receive_batch()` 方法。
-    pub fn receive_raw(&self, timeout: Duration) -> Result<GsUsbFrame, GsUsbError> {
-        let frame_size = if self.hw_timestamp {
-            GS_USB_FRAME_SIZE_HW_TIMESTAMP
-        } else {
-            GS_USB_FRAME_SIZE
-        };
-        let mut buf = vec![0u8; frame_size];
-
-        let len = match self.handle.read_bulk(self.endpoint_in, &mut buf, timeout) {
-            Ok(len) => len,
-            Err(rusb::Error::Timeout) => return Err(GsUsbError::ReadTimeout),
-            Err(e) => return Err(GsUsbError::Usb(e)),
-        };
-
-        if len < frame_size {
-            return Err(GsUsbError::InvalidFrame(format!(
-                "Frame too short: {} bytes (expected at least {})",
-                len, frame_size
-            )));
-        }
-
-        let mut frame = GsUsbFrame::default();
-        frame.unpack_from_bytes(bytes::Bytes::from(buf), self.hw_timestamp)?;
-
-        Ok(frame)
     }
 
     /// 批量接收：读取一个 USB Bulk 包，并解析其中所有帧
@@ -688,8 +667,8 @@ mod tests {
     }
 
     #[test]
-    fn test_send_host_format_format() {
-        // 验证 HOST_FORMAT 的数据格式
+    fn test_host_format_bytes_le() {
+        // 历史上存在 HOST_FORMAT 相关实现，这里仅保留字节序格式验证（不再要求实际发送该请求）
         let val: u32 = 0x0000_BEEF;
         let data = val.to_le_bytes();
 

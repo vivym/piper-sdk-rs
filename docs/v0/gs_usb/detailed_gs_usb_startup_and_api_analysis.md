@@ -6,7 +6,7 @@
 
 ## 1. 现象与复现实验结论
 
-- **`examples/gs_usb_direct_test.rs`**（直连、完全对齐 Python）：
+- **`examples/gs_usb_direct_test.rs`**（直连调试、对照验证）：
   - 成功读取 20 帧，且原始字节与解析字段完全一致（echo_id / can_id / can_dlc / data / timestamp）。
   - 说明：`read_bulk(0x81)`、帧长度（20/24）、小端解析、hw_timestamp 选择逻辑都没问题。
 
@@ -16,7 +16,7 @@
 
 ---
 
-## 2. 根因 1（最关键）：SDK 的 `set_bitrate()` 位定时表与 Python 不一致
+## 2. 根因 1（最关键）：SDK 的 `set_bitrate()` 位定时表与推荐配置不一致
 
 ### 2.1 为什么这会导致“读不到帧”
 
@@ -32,9 +32,9 @@ GS-USB 设备在 `set_bitrate()` 时，本质是在配置 CAN 控制器的 bit t
 
 ### 2.2 代码证据与差异
 
-- Python（`tmp/gs_usb/gs_usb/gs_usb.py`）在 48MHz 且 1Mbps 时使用：
+- 对照实现/验证脚本在 48MHz 且 1Mbps 时使用：
   - `prop_seg=1, phase_seg1=12, phase_seg2=2, sjw=1, brp=3`
-- 你这次成功的 `gs_usb_direct_test.rs` 也使用了相同表（对齐 Python）。
+- 你这次成功的 `gs_usb_direct_test.rs` 也使用了相同表（对照验证一致）。
 - 但 SDK 原先 `src/can/gs_usb/device.rs::set_bitrate()` 使用的是另一套完全不同的映射（尤其 BRP/TSEG 值差异巨大），这几乎必然造成总线配置错误。
 
 ### 2.3 已修复
@@ -42,9 +42,9 @@ GS-USB 设备在 `set_bitrate()` 时，本质是在配置 CAN 控制器的 bit t
 我已将 `src/can/gs_usb/device.rs::set_bitrate()` 的映射表改为：
 
 - 48MHz：10k/20k/50k/83.333k/100k/125k/250k/500k/800k/1M
-- 80MHz：同 Python 覆盖集合
+- 80MHz：同推荐配置覆盖集合
 
-与 Python `gs_usb.py` 对齐（sample point 87.5% 的 Candlelight 表）。
+采用推荐配置（sample point 87.5% 的 Candlelight 表）。
 
 ---
 
@@ -98,7 +98,7 @@ GS-USB 设备在 `set_bitrate()` 时，本质是在配置 CAN 控制器的 bit t
 
 你这次 `gs_usb_direct_test` 之所以能读到，是因为它：
 
-- 使用了 Python 对齐的位定时表（配置正确）
+- 使用了 参考实现 对齐的位定时表（配置正确）
 - 读超时用 1000ms（更稳）
 - 按 hw_timestamp=24 字节解析（与你设备 capability 过滤后的 flags 一致）
 
@@ -122,7 +122,7 @@ GS-USB 设备在 `set_bitrate()` 时，本质是在配置 CAN 控制器的 bit t
   - 建议把“设备层错误（USB）”与“CAN 层状态（bus error）”拆分建模
 - **功能声明不一致**：
   - `protocol.rs` 声称 `GS_USB_BREQ_HOST_FORMAT` “必须发送，但可忽略错误”
-  - 但你已有对齐结论：Python 并不发送它，且目前 SDK 已选择不依赖它
+  - 但你已有对齐结论：参考实现 并不发送它，且目前 SDK 已选择不依赖它
   - 建议在文档与代码注释里统一立场（推荐：默认不发送，仅作为可选兼容策略）
 
 ---
@@ -156,7 +156,7 @@ GS-USB 设备在 `set_bitrate()` 时，本质是在配置 CAN 控制器的 bit t
 
 ## 7. 立即可落地的工程建议（按收益排序）
 
-- **P0（已完成）**：`GsUsbDevice::set_bitrate()` 位定时表对齐 Python（修复根因）
+- **P0（已完成）**：`GsUsbDevice::set_bitrate()` 位定时表对齐 参考实现（修复根因）
 - **P1**：把 `GsUsbCanAdapter::receive()` 的 2ms 超时改为可配置，默认 >= 50ms
 - **P1**：在 `configure_with_mode()` 返回（或记录）`effective_flags`，并在日志中打印
 - **P2**：把 `start()` 的 reset 行为从“必做”改为可选（例如 `StartOptions { reset: bool }`）
@@ -179,7 +179,7 @@ GS-USB 设备在 `set_bitrate()` 时，本质是在配置 CAN 控制器的 bit t
 ## 9. 总结
 
 - **“已经可以了吗？”**：底层读帧链路已证明 OK；就 SDK 而言，修复位定时表后，**大概率已经能读到真实 CAN 帧**。
-- **“为什么 Rust SDK 无法读取 can frame？”**：最核心是 **位定时表与 Python 不一致导致总线配置错误**，叠加 **2ms 超时与过滤策略**让问题表现为“读不到”。
+- **“为什么 Rust SDK 无法读取 can frame？”**：最核心是 **位定时表与 参考实现 不一致导致总线配置错误**，叠加 **2ms 超时与过滤策略**让问题表现为“读不到”。
 - **“启动流程接口是否不合理？”**：是的，当前接口存在 **隐式状态多、reset 副作用不透明、配置/启动耦合、超时硬编码** 等问题；建议按第 6 节重构为显式会话与配置对象。
 
 
