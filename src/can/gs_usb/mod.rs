@@ -81,26 +81,33 @@ impl GsUsbCanAdapter {
     /// 内部方法：统一配置逻辑
     ///
     /// 所有配置方法的核心逻辑都集中在这里，消除重复代码。
+    ///
+    /// **完全对齐 Python 的启动流程**：
+    /// Python: scan() -> set_bitrate() -> start()
+    /// start() 内部: reset() -> detach_kernel_driver() -> 获取 capability -> 发送 MODE
+    ///
+    /// 注意：
+    /// - Python 没有发送 HOST_FORMAT，所以我们也移除它
+    /// - Python 的 set_bitrate() 在 start() 之前调用，但 start() 内部会 reset
+    /// - reset 不会清除 bitrate 设置，因为 bitrate 是通过控制请求设置的持久化配置
     fn configure_with_mode(&mut self, bitrate: u32, mode: u32) -> Result<(), CanError> {
-        // 1. 发送 HOST_FORMAT（协议握手 + 字节序配置）
-        //
-        // **关键**：这个请求不仅仅是字节序配置，更是协议握手信号。
-        // 某些固件在收到此命令前可能处于未初始化状态，拒绝后续配置命令。
-        //
-        // **策略**：Fire-and-Forget for Handshake
-        // - 必须尝试发送，以兼容需要握手的固件
-        // - 忽略错误，因为：
-        //   * 现代设备可能不支持此命令（默认 LE）
-        //   * 设备可能已处于正确状态
-        //   * 不应因握手失败阻断整个初始化流程
-        let _ = self.device.send_host_format();
+        // **完全对齐 Python 流程**：
+        // 1. 先 claim interface（set_bitrate 需要接口已 claim 才能发送控制请求）
+        //    注意：Python 的 USB 库可能自动处理接口 claim，但 Rust 需要显式处理
+        //    只 claim interface，不 reset（reset 在 start() 内部进行，与 Python 一致）
+        self.device
+            .claim_interface_only()
+            .map_err(|e| CanError::Device(format!("Failed to claim interface: {}", e)))?;
 
-        // 2. 设置波特率
+        // 2. 设置波特率（在 start() 之前，与 Python 完全一致）
+        // 注意：Python 的 start() 内部会 reset，但 reset 不会清除 bitrate 设置
+        // 因为 bitrate 是通过控制请求设置的，是持久化配置
         self.device
             .set_bitrate(bitrate)
             .map_err(|e| CanError::Device(format!("Failed to set bitrate: {}", e)))?;
 
-        // 3. 启动设备
+        // 3. 启动设备（start 内部会 reset, detach, 获取 capability, 发送 MODE）
+        // 与 Python 完全一致：start() 内部会 reset，但不会清除之前设置的 bitrate
         self.device
             .start(mode)
             .map_err(|e| CanError::Device(format!("Failed to start device: {}", e)))?;

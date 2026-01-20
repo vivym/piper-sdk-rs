@@ -19,12 +19,23 @@ crossbeam-channel = "0.5.15"
 rusb = "0.9.4"
 thiserror = "2.0.17"
 tracing = "0.1.44"
+ctrlc = "3.5"
+
+clap = { version = "4.5", features = ["derive"] }
+fs4 = { version = "0.13", features = ["sync"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 nix = { version = "0.30", features = ["uio", "socket", "poll"] }
 socketcan = "3.5"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+nix = { version = "0.30", features = ["fs"] }
+
+[[bin]]
+name = "gs_usb_daemon"
+path = "src/bin/gs_usb_daemon/main.rs"
+
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
-ctrlc = "3.5"

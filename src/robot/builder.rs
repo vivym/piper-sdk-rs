@@ -6,6 +6,8 @@
 use crate::can::SocketCanAdapter;
 #[cfg(not(target_os = "linux"))]
 use crate::can::gs_usb::GsUsbCanAdapter;
+#[cfg(not(target_os = "linux"))]
+use crate::can::gs_usb_udp::GsUsbUdpAdapter;
 use crate::robot::error::RobotError;
 use crate::robot::pipeline::PipelineConfig;
 use crate::robot::robot_impl::Piper;
@@ -42,6 +44,10 @@ pub struct PiperBuilder {
     baud_rate: Option<u32>,
     /// Pipeline 配置
     pipeline_config: Option<PipelineConfig>,
+    /// 守护进程地址（如果设置，使用守护进程模式）
+    /// - UDS 路径（如 "/tmp/gs_usb_daemon.sock"）
+    /// - UDP 地址（如 "127.0.0.1:8888"）
+    daemon_addr: Option<String>,
 }
 
 impl PiperBuilder {
@@ -59,6 +65,7 @@ impl PiperBuilder {
             interface: None,
             baud_rate: None,
             pipeline_config: None,
+            daemon_addr: None,
         }
     }
 
@@ -100,6 +107,39 @@ impl PiperBuilder {
         self
     }
 
+    /// 使用守护进程模式（可选）
+    ///
+    /// 当指定守护进程地址时，使用 `GsUsbUdpAdapter` 通过守护进程访问 GS-USB 设备。
+    /// 这解决了 macOS 下 GS-USB 设备重连后无法正常工作的限制。
+    ///
+    /// # 参数
+    /// - `daemon_addr`: 守护进程地址
+    ///   - UDS 路径（如 "/tmp/gs_usb_daemon.sock"）
+    ///   - UDP 地址（如 "127.0.0.1:8888"）
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use piper_sdk::robot::PiperBuilder;
+    ///
+    /// // 使用 UDS 连接守护进程
+    /// let piper = PiperBuilder::new()
+    ///     .with_daemon("/tmp/gs_usb_daemon.sock")
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// // 使用 UDP 连接守护进程（用于跨机器调试）
+    /// let piper = PiperBuilder::new()
+    ///     .with_daemon("127.0.0.1:8888")
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[cfg(not(target_os = "linux"))]
+    pub fn with_daemon(mut self, daemon_addr: impl Into<String>) -> Self {
+        self.daemon_addr = Some(daemon_addr.into());
+        self
+    }
+
     /// 构建 Piper 实例
     ///
     /// 创建并启动 `Piper` 实例，启动后台 IO 线程。
@@ -126,20 +166,39 @@ impl PiperBuilder {
         // 创建 CAN 适配器
         #[cfg(not(target_os = "linux"))]
         {
-            // macOS/Windows: 使用 GS-USB 适配器
-            // 如果指定了 interface（序列号），使用它来过滤设备
-            let mut can = match self.interface {
-                Some(serial) => GsUsbCanAdapter::new_with_serial(Some(serial.as_str()))
-                    .map_err(RobotError::Can)?,
-                None => GsUsbCanAdapter::new().map_err(RobotError::Can)?,
-            };
+            // 检查是否使用守护进程模式
+            if let Some(daemon_addr) = self.daemon_addr {
+                // 守护进程模式：使用 GsUsbUdpAdapter
+                let mut can = if daemon_addr.starts_with('/') || daemon_addr.starts_with("unix:") {
+                    // UDS 模式
+                    let path = daemon_addr.strip_prefix("unix:").unwrap_or(&daemon_addr);
+                    GsUsbUdpAdapter::new_uds(path).map_err(RobotError::Can)?
+                } else {
+                    // UDP 模式
+                    GsUsbUdpAdapter::new_udp(&daemon_addr).map_err(RobotError::Can)?
+                };
 
-            // 配置波特率（如果指定）
-            let bitrate = self.baud_rate.unwrap_or(1_000_000);
-            can.configure(bitrate).map_err(RobotError::Can)?;
+                // 连接到守护进程（使用空的过滤规则，接收所有帧）
+                can.connect(vec![]).map_err(RobotError::Can)?;
 
-            // 创建 Piper 实例
-            Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
+                // 创建 Piper 实例
+                Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
+            } else {
+                // 传统模式：直接使用 GS-USB 适配器
+                // 如果指定了 interface（序列号），使用它来过滤设备
+                let mut can = match self.interface {
+                    Some(serial) => GsUsbCanAdapter::new_with_serial(Some(serial.as_str()))
+                        .map_err(RobotError::Can)?,
+                    None => GsUsbCanAdapter::new().map_err(RobotError::Can)?,
+                };
+
+                // 配置波特率（如果指定）
+                let bitrate = self.baud_rate.unwrap_or(1_000_000);
+                can.configure(bitrate).map_err(RobotError::Can)?;
+
+                // 创建 Piper 实例
+                Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
+            }
         }
 
         #[cfg(target_os = "linux")]
@@ -179,6 +238,8 @@ mod tests {
         // 注意：不直接比较 pipeline_config，因为它没有实现 PartialEq
         // 但可以通过 is_none() 检查
         assert!(builder.pipeline_config.is_none());
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(builder.daemon_addr, None);
     }
 
     #[test]
@@ -241,5 +302,46 @@ mod tests {
 
         // 验证最后一次设置生效
         assert_eq!(builder2.baud_rate, Some(500_000));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_piper_builder_with_daemon_uds() {
+        let builder = PiperBuilder::new().with_daemon("/tmp/gs_usb_daemon.sock");
+        assert_eq!(
+            builder.daemon_addr,
+            Some("/tmp/gs_usb_daemon.sock".to_string())
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_piper_builder_with_daemon_udp() {
+        let builder = PiperBuilder::new().with_daemon("127.0.0.1:8888");
+        assert_eq!(builder.daemon_addr, Some("127.0.0.1:8888".to_string()));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_piper_builder_with_daemon_chaining() {
+        let builder1 = PiperBuilder::new().with_daemon("/tmp/test1.sock");
+        let builder2 = builder1.with_daemon("127.0.0.1:8888");
+
+        // 验证最后一次设置生效
+        assert_eq!(builder2.daemon_addr, Some("127.0.0.1:8888".to_string()));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_piper_builder_daemon_and_interface() {
+        // 守护进程模式和 interface 可以同时设置（虽然 interface 在守护进程模式下会被忽略）
+        let builder =
+            PiperBuilder::new().with_daemon("/tmp/gs_usb_daemon.sock").interface("ABC123");
+
+        assert_eq!(
+            builder.daemon_addr,
+            Some("/tmp/gs_usb_daemon.sock".to_string())
+        );
+        assert_eq!(builder.interface, Some("ABC123".to_string()));
     }
 }

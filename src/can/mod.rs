@@ -17,6 +17,9 @@ pub mod gs_usb;
 #[cfg(not(target_os = "linux"))]
 pub use gs_usb::GsUsbCanAdapter;
 
+// GS-USB 守护进程客户端库（UDS/UDP）
+pub mod gs_usb_udp;
+
 /// SDK 通用的 CAN 帧定义（只针对 CAN 2.0）
 ///
 /// 设计要点：

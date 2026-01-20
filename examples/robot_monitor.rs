@@ -6,10 +6,24 @@
 //! - 显示关节位置、速度、电流等实时数据
 //! - 包含中文状态转换函数，便于理解
 //! - 支持 Ctrl+C 优雅退出
+//! - 支持通过 UDS 连接守护进程（macOS/Windows）
 //!
 //! **注意**：此示例用于实时监控，不发送任何控制指令，仅被动监听。
 //! 如需学习 API 用法，请参考 `state_api_demo` 示例。
+//!
+//! 使用方式：
+//! ```bash
+//! # 直接连接（Linux: SocketCAN, macOS/Windows: GS-USB）
+//! cargo run --example robot_monitor
+//!
+//! # 通过 UDS 连接守护进程（macOS/Windows）
+//! cargo run --example robot_monitor -- --uds /tmp/gs_usb_daemon.sock
+//!
+//! # 指定 CAN 接口（Linux）
+//! cargo run --example robot_monitor -- --interface can0
+//! ```
 
+use clap::Parser;
 use piper_sdk::robot::{
     EndPoseState, FpsResult, GripperState, JointDynamicState, JointPositionState, PiperBuilder,
     RobotControlState,
@@ -17,6 +31,27 @@ use piper_sdk::robot::{
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// 命令行参数
+#[derive(Parser, Debug)]
+#[command(name = "robot_monitor")]
+#[command(about = "机器人实时监控工具")]
+struct Args {
+    /// CAN 接口名称（Linux: "can0", macOS/Windows: 设备序列号）
+    #[arg(long)]
+    interface: Option<String>,
+
+    /// CAN 波特率（默认: 1000000）
+    #[arg(long, default_value = "1000000")]
+    baud_rate: u32,
+
+    /// UDS Socket 路径（通过守护进程连接，macOS/Windows）
+    ///
+    /// 如果指定此参数，将通过 gs_usb_daemon 连接，而不是直接连接 GS-USB 设备。
+    /// 默认: /tmp/gs_usb_daemon.sock
+    #[arg(long)]
+    uds: Option<String>,
+}
 
 /// 控制模式转换为字符串
 fn control_mode_to_string(mode: u8) -> &'static str {
@@ -188,6 +223,9 @@ fn print_feedback(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 解析命令行参数
+    let args = Args::parse();
+
     // 设置 Ctrl+C 处理
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -200,22 +238,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("正在连接到机械臂...");
 
     // 1. 创建 Piper 实例
-    // Linux: 使用 can0 接口；其他平台: 使用默认配置
     let builder = {
         #[cfg(target_os = "linux")]
         {
-            println!("使用 CAN 接口: can0");
-            PiperBuilder::new().interface("can0")
+            // Linux: SocketCAN
+            let interface = args.interface.as_deref().unwrap_or("can0");
+            println!("使用 CAN 接口: {}", interface);
+            PiperBuilder::new().interface(interface)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            println!("使用默认 CAN 接口配置");
-            PiperBuilder::new()
+            // macOS/Windows: GS-USB 或守护进程模式
+            if let Some(uds_path) = &args.uds {
+                // 守护进程模式（UDS）
+                println!("使用守护进程模式 (UDS): {}", uds_path);
+                PiperBuilder::new().with_daemon(uds_path)
+            } else if let Some(interface) = &args.interface {
+                // 直接连接，指定设备序列号
+                println!("使用设备序列号: {}", interface);
+                PiperBuilder::new().interface(interface)
+            } else {
+                // 直接连接，自动检测设备
+                println!("使用默认 CAN 接口配置（自动检测设备）");
+                PiperBuilder::new()
+            }
         }
     };
 
     let piper = builder
-        .baud_rate(1_000_000)  // CAN 波特率 1M (协议要求)
+        .baud_rate(args.baud_rate)  // CAN 波特率（默认 1M）
         .build()
         .map_err(|e| format!("连接失败: {}", e))?;
 

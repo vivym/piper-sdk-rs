@@ -196,6 +196,37 @@ impl GsUsbDevice {
         Ok(()) // 始终返回成功，不阻断流程
     }
 
+    /// 只 claim interface（不 reset），用于在 set_bitrate 之前准备接口
+    ///
+    /// **完全对齐 Python 流程**：Python 的 set_bitrate() 在 start() 之前调用，
+    /// 但 start() 内部会 reset。此方法只 claim interface，不 reset。
+    ///
+    /// 注意：Python 的 USB 库可能自动处理接口 claim，但 Rust 需要显式处理。
+    /// 为了确保 set_bitrate() 能成功，如果 kernel driver 是 active 的，先 detach 再 claim。
+    pub fn claim_interface_only(&mut self) -> Result<(), GsUsbError> {
+        // 如果接口已经 claim 了，跳过
+        if self.interface_claimed {
+            return Ok(());
+        }
+
+        // 如果 kernel driver 是 active 的，先 detach（与 Python 的 start() 行为一致）
+        // 注意：Python 的 start() 中，detach_kernel_driver() 在 reset() 之后执行
+        // 但为了确保 set_bitrate() 能成功，我们在这里也处理
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if self.handle.kernel_driver_active(self.interface_number).unwrap_or(false) {
+                self.handle
+                    .detach_kernel_driver(self.interface_number)
+                    .map_err(GsUsbError::Usb)?;
+            }
+        }
+
+        // 然后 claim interface
+        self.handle.claim_interface(self.interface_number).map_err(GsUsbError::Usb)?;
+        self.interface_claimed = true;
+        Ok(())
+    }
+
     /// 准备接口（detach driver 和 claim interface）
     ///
     /// 提取为独立方法，以便在需要时提前调用（例如在 set_bitrate 之前）
@@ -283,11 +314,55 @@ impl GsUsbDevice {
     }
 
     /// 启动设备
+    ///
+    /// **完全对齐 Python 的 start() 方法**：
+    /// 1. reset() - 重置设备
+    /// 2. detach_kernel_driver() - 在 Linux/Unix 上 detach kernel driver（在 reset 之后）
+    /// 3. 获取 device_capability - 检查设备支持的功能
+    /// 4. 过滤 flags - 只保留设备支持的功能
+    /// 5. 发送 MODE 命令 - 启动设备
+    ///
+    /// 注意：Python 的 start() 内部会 reset，但 reset 不会清除之前设置的 bitrate
+    /// 因为 bitrate 是通过控制请求设置的，是持久化配置
     pub fn start(&mut self, flags: u32) -> Result<(), GsUsbError> {
-        // 1. 准备接口（如果还未声明）
-        // 注意：prepare_interface() 内部会处理 detach_kernel_driver, claim_interface, reset
-        // 如果接口已声明，则跳过（避免重复操作）
-        let _ = self.prepare_interface();
+        // **完全对齐 Python 流程**：
+        // Python: reset() -> detach_kernel_driver() -> 获取 capability -> 过滤 flags -> 发送 MODE
+
+        // 1. Reset 设备（与 Python 完全一致，在 start() 内部 reset，最前面）
+        // 注意：reset 不会清除之前设置的 bitrate，因为 bitrate 是持久化配置
+        // 但 reset 可能会清除接口 claim 状态，所以需要在 reset 后重新处理接口
+        if let Err(e) = self.handle.reset() {
+            trace!("Device reset failed (may be normal): {}", e);
+            // 不立即返回错误，继续尝试后续步骤
+        }
+
+        // 2. Detach kernel driver on Linux/macOS（在 reset 之后，与 Python 完全一致）
+        // 注意：Python 的 start() 中，detach_kernel_driver() 在 reset() 之后执行
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // reset 后，接口状态可能被清除，需要检查并重新处理
+            // 检查 kernel driver 是否 active，如果是，说明接口状态被 reset 清除了
+            let kernel_driver_active =
+                self.handle.kernel_driver_active(self.interface_number).unwrap_or(false);
+
+            if kernel_driver_active {
+                // Kernel driver 是 active 的，说明 reset 清除了接口状态
+                // 需要 detach 和 claim（与 Python 一致）
+                self.interface_claimed = false;
+                self.handle
+                    .detach_kernel_driver(self.interface_number)
+                    .map_err(GsUsbError::Usb)?;
+            }
+
+            // 如果接口未 claim，需要 claim（可能在 reset 前已 claim，但 reset 后状态被清除）
+            if !self.interface_claimed {
+                self.handle.claim_interface(self.interface_number).map_err(GsUsbError::Usb)?;
+                self.interface_claimed = true;
+            }
+        }
+
+        // 3. 短暂延迟，让设备稳定（特别是 reset 后）
+        std::thread::sleep(Duration::from_millis(100));
 
         // 2. 获取设备能力（检查功能支持）
         let capability = self.device_capability()?;
@@ -312,7 +387,10 @@ impl GsUsbDevice {
         self.control_out(GS_USB_BREQ_MODE, 0, &mode.pack())?;
 
         self.started = true;
-        trace!("GS-USB device started with flags: 0x{:08x}", flags);
+        trace!(
+            "GS-USB device started with flags: 0x{:08x}, hw_timestamp={}",
+            flags, self.hw_timestamp
+        );
         Ok(())
     }
 
@@ -328,7 +406,12 @@ impl GsUsbDevice {
 
     /// 设置 CAN 波特率
     ///
-    /// 使用预定义的波特率映射表（80MHz、48MHz 和 40MHz 时钟）
+    /// 使用预定义的波特率映射表（**对齐 Python `gs_usb.py` 的位定时表**）
+    ///
+    /// 关键点：
+    /// - Python 参考实现使用 sample point = 87.5%
+    /// - 并依据 `device_capability().fclk_can`（常见 48MHz / 80MHz）选择参数
+    /// - 如果位定时参数不匹配，典型现象是：设备能 start，但总线错误/无 ACK，导致“收不到帧”
     ///
     /// 如果无法查询设备能力，将使用默认时钟（48MHz）作为 fallback
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), GsUsbError> {
@@ -345,43 +428,35 @@ impl GsUsbDevice {
             },
         };
 
-        // 获取位定时参数（基于时钟频率）
-        // 公式：bitrate = clock_hz / (brp * (1 + prop_seg + phase_seg1 + phase_seg2))
+        // 位定时表：对齐 Python `GsUsb.set_bitrate()`（sample point 87.5%）
+        // 返回顺序：(prop_seg, phase_seg1, phase_seg2, sjw, brp)
         let timing = match clock {
-            // 80 MHz clock (PEAK Systems)
-            80_000_000 => match bitrate {
-                10_000 => Some((87, 87, 25, 12, 40)),
-                20_000 => Some((87, 87, 25, 12, 20)),
-                50_000 => Some((87, 87, 25, 12, 8)),
-                100_000 => Some((87, 87, 25, 12, 4)),
-                125_000 => Some((69, 70, 20, 10, 4)),
-                250_000 => Some((69, 70, 20, 10, 2)),
-                500_000 => Some((69, 70, 20, 10, 1)),
-                1_000_000 => Some((29, 30, 20, 10, 1)),
-                _ => None,
-            },
             // 48 MHz clock (Candlelight / STM32-based devices)
             48_000_000 => match bitrate {
-                10_000 => Some((87, 87, 25, 12, 24)),
-                20_000 => Some((87, 87, 25, 12, 12)),
-                50_000 => Some((87, 87, 25, 12, 5)),
-                100_000 => Some((87, 87, 25, 12, 2)),
-                125_000 => Some((69, 70, 20, 10, 2)),
-                250_000 => Some((69, 70, 20, 10, 1)),
-                500_000 => Some((34, 35, 10, 5, 1)),
-                1_000_000 => Some((14, 15, 10, 5, 1)),
+                10_000 => Some((1, 12, 2, 1, 300)),
+                20_000 => Some((1, 12, 2, 1, 150)),
+                50_000 => Some((1, 12, 2, 1, 60)),
+                83_333 => Some((1, 12, 2, 1, 36)),
+                100_000 => Some((1, 12, 2, 1, 30)),
+                125_000 => Some((1, 12, 2, 1, 24)),
+                250_000 => Some((1, 12, 2, 1, 12)),
+                500_000 => Some((1, 12, 2, 1, 6)),
+                800_000 => Some((1, 11, 2, 1, 4)),
+                1_000_000 => Some((1, 12, 2, 1, 3)),
                 _ => None,
             },
-            // 40 MHz clock (CF3 / candleLight)
-            40_000_000 => match bitrate {
-                10_000 => Some((87, 87, 25, 12, 20)),
-                20_000 => Some((87, 87, 25, 12, 10)),
-                50_000 => Some((87, 87, 25, 12, 4)),
-                100_000 => Some((87, 87, 25, 12, 2)),
-                125_000 => Some((69, 70, 20, 10, 2)),
-                250_000 => Some((69, 70, 20, 10, 1)),
-                500_000 => Some((34, 35, 10, 5, 1)),
-                1_000_000 => Some((14, 15, 10, 5, 1)),
+            // 80 MHz clock
+            80_000_000 => match bitrate {
+                10_000 => Some((1, 12, 2, 1, 500)),
+                20_000 => Some((1, 12, 2, 1, 250)),
+                50_000 => Some((1, 12, 2, 1, 100)),
+                83_333 => Some((1, 12, 2, 1, 60)),
+                100_000 => Some((1, 12, 2, 1, 50)),
+                125_000 => Some((1, 12, 2, 1, 40)),
+                250_000 => Some((1, 12, 2, 1, 20)),
+                500_000 => Some((1, 12, 2, 1, 10)),
+                800_000 => Some((1, 7, 1, 1, 10)),
+                1_000_000 => Some((1, 12, 2, 1, 5)),
                 _ => None,
             },
             _ => None,
