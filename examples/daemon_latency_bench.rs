@@ -72,7 +72,10 @@ impl LatencyStats {
 fn test_send_latency() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 测试场景 2: 发送延迟（仅发送路径）===");
 
+    #[cfg(unix)]
     let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock")?;
+    #[cfg(not(unix))]
+    let mut adapter = GsUsbUdpAdapter::new_udp("127.0.0.1:18888")?;
     adapter.connect(vec![])?;
 
     println!("已连接到 daemon，开始测试...");
@@ -125,7 +128,10 @@ fn test_receive_latency() -> Result<(), Box<dyn std::error::Error>> {
     println!("注意：此测试需要 daemon 持续发送数据");
     println!("如果没有数据源，此测试会超时");
 
+    #[cfg(unix)]
     let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock")?;
+    #[cfg(not(unix))]
+    let mut adapter = GsUsbUdpAdapter::new_udp("127.0.0.1:18888")?;
     adapter.connect(vec![])?;
 
     println!("已连接到 daemon，等待接收数据...");
@@ -180,7 +186,10 @@ fn test_receive_latency() -> Result<(), Box<dyn std::error::Error>> {
 fn test_throughput() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 测试场景 4: 吞吐量测试 ===");
 
+    #[cfg(unix)]
     let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock")?;
+    #[cfg(not(unix))]
+    let mut adapter = GsUsbUdpAdapter::new_udp("127.0.0.1:18888")?;
     adapter.connect(vec![])?;
 
     println!("已连接到 daemon，开始测试...");
@@ -245,7 +254,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 检查 daemon 是否运行
     println!("检查 daemon 连接...");
-    match GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock") {
+    #[cfg(unix)]
+    let daemon_check = GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock");
+    #[cfg(not(unix))]
+    let daemon_check = GsUsbUdpAdapter::new_udp("127.0.0.1:18888");
+
+    match daemon_check {
         Ok(_) => println!("✅ Daemon socket 存在"),
         Err(e) => {
             eprintln!("❌ 无法连接到 daemon: {}", e);

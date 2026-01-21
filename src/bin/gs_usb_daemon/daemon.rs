@@ -131,7 +131,9 @@ struct DetailedStats {
     is_error_passive: AtomicBool,             // Error Passive 状态标志（用于防抖）
 
     // 客户端健康度
-    client_degraded: AtomicU64, // 降频的客户端数
+    /// 降频的客户端数（仅在 Unix 平台上使用）
+    #[cfg_attr(not(unix), allow(dead_code))]
+    client_degraded: AtomicU64,
 
     // 系统资源
     cpu_usage_percent: AtomicU32, // CPU 占用率（0-100）
@@ -531,6 +533,7 @@ pub struct Daemon {
     device_state: Arc<RwLock<DeviceState>>,
 
     /// UDS Socket（Unix Domain Socket）
+    #[cfg(unix)]
     socket_uds: Option<std::os::unix::net::UnixDatagram>,
 
     /// UDP Socket（可选，用于跨机器调试）
@@ -557,6 +560,7 @@ impl Daemon {
             rx_adapter: Arc::new(Mutex::new(None)),
             tx_adapter: Arc::new(Mutex::new(None)),
             device_state: Arc::new(RwLock::new(DeviceState::Disconnected)),
+            #[cfg(unix)]
             socket_uds: None,
             socket_udp: None,
             uds_path: config.uds_path.clone(),
@@ -589,6 +593,7 @@ impl Daemon {
     /// 初始化 Socket（UDS 优先，UDP 可选）
     fn init_sockets(&mut self) -> Result<(), DaemonError> {
         // 初始化 UDS Socket
+        #[cfg(unix)]
         if let Some(ref uds_path) = self.config.uds_path {
             // 如果 socket 文件已存在，先删除它（可能是上次异常退出留下的）
             if std::path::Path::new(uds_path).exists() {
@@ -614,6 +619,12 @@ impl Daemon {
             })?;
 
             self.socket_uds = Some(socket);
+        }
+        #[cfg(not(unix))]
+        if self.config.uds_path.is_some() {
+            return Err(DaemonError::SocketInit(
+                "Unix Domain Sockets are not supported on this platform".to_string(),
+            ));
         }
 
         // 初始化 UDP Socket（可选）
@@ -848,7 +859,8 @@ impl Daemon {
         rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
         device_state: Arc<RwLock<DeviceState>>,
         clients: Arc<RwLock<ClientManager>>,
-        socket_uds: Option<std::os::unix::net::UnixDatagram>,
+        #[cfg(unix)] socket_uds: Option<std::os::unix::net::UnixDatagram>,
+        #[cfg(not(unix))] _socket_uds: Option<()>,
         socket_udp: Option<std::net::UdpSocket>,
         stats: Arc<RwLock<DaemonStats>>,
     ) {
@@ -954,6 +966,7 @@ impl Daemon {
                     // 根据客户端地址类型发送，处理 WouldBlock/ENOBUFS/EPIPE 等错误
                     // 自适应降级机制
                     let send_failed = match &client.addr {
+                        #[cfg(unix)]
                         ClientAddr::Unix(uds_path) => {
                             if let Some(ref socket) = socket_uds {
                                 // 检查是否需要降级发送（跳过某些帧）
@@ -989,8 +1002,57 @@ impl Daemon {
                                         false
                                     },
                                     Err(e)
-                                        if e.kind() == std::io::ErrorKind::WouldBlock
-                                            || matches!(e.raw_os_error(), Some(libc::ENOBUFS)) =>
+                                        if e.kind() == std::io::ErrorKind::NotFound
+                                            || e.kind()
+                                                == std::io::ErrorKind::ConnectionRefused =>
+                                    {
+                                        // ✅ 客户端 socket 文件不存在或连接被拒绝（进程已退出）
+                                        eprintln!(
+                                            "[Client {}] Socket not found or refused, removing immediately",
+                                            client.id
+                                        );
+                                        stats
+                                            .read()
+                                            .unwrap()
+                                            .client_disconnected
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        true // 立即清理
+                                    },
+                                    Err(e)
+                                        if {
+                                            #[cfg(unix)]
+                                            {
+                                                matches!(e.raw_os_error(), Some(libc::EPIPE))
+                                            }
+                                            #[cfg(not(unix))]
+                                            {
+                                                false
+                                            }
+                                        } =>
+                                    {
+                                        // ✅ Broken pipe：客户端进程已退出
+                                        eprintln!(
+                                            "[Client {}] Pipe broken (process exited), removing immediately",
+                                            client.id
+                                        );
+                                        stats
+                                            .read()
+                                            .unwrap()
+                                            .client_disconnected
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        true // 立即清理
+                                    },
+                                    Err(e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock || {
+                                            #[cfg(unix)]
+                                            {
+                                                matches!(e.raw_os_error(), Some(libc::ENOBUFS))
+                                            }
+                                            #[cfg(not(unix))]
+                                            {
+                                                false
+                                            }
+                                        } =>
                                     {
                                         // WouldBlock 或 ENOBUFS（缓冲区满）
                                         let error_count = client
@@ -1063,36 +1125,6 @@ impl Daemon {
                                             false // 继续尝试
                                         }
                                     },
-                                    Err(e)
-                                        if e.kind() == std::io::ErrorKind::NotFound
-                                            || e.kind()
-                                                == std::io::ErrorKind::ConnectionRefused =>
-                                    {
-                                        // ✅ 客户端 socket 文件不存在或连接被拒绝（进程已退出）
-                                        eprintln!(
-                                            "[Client {}] Socket not found or refused, removing immediately",
-                                            client.id
-                                        );
-                                        stats
-                                            .read()
-                                            .unwrap()
-                                            .client_disconnected
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        true // 立即清理
-                                    },
-                                    Err(e) if matches!(e.raw_os_error(), Some(libc::EPIPE)) => {
-                                        // ✅ Broken pipe：客户端进程已退出
-                                        eprintln!(
-                                            "[Client {}] Pipe broken (process exited), removing immediately",
-                                            client.id
-                                        );
-                                        stats
-                                            .read()
-                                            .unwrap()
-                                            .client_disconnected
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        true // 立即清理
-                                    },
                                     Err(e) => {
                                         // 其他错误，记录但不立即清理
                                         eprintln!("[Client {}] Send error: {}", client.id, e);
@@ -1146,6 +1178,7 @@ impl Daemon {
     /// **严禁**：不要使用 sleep 或轮询
     ///
     /// 使用 TX adapter，与 RX 完全隔离
+    #[cfg(unix)]
     fn ipc_receive_loop(
         socket: std::os::unix::net::UnixDatagram,
         tx_adapter: Arc<Mutex<Option<GsUsbTxAdapter>>>,
@@ -1182,6 +1215,7 @@ impl Daemon {
                 },
                 Err(e) => {
                     // ✅ 非阻塞socket：WouldBlock/EAGAIN 是正常情况，不应该作为错误
+                    let e: std::io::Error = e;
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         // 没有数据可读，继续循环（不打印、不sleep，避免日志刷屏）
                         continue;
@@ -1236,6 +1270,7 @@ impl Daemon {
                 },
                 Err(e) => {
                     // ✅ 非阻塞socket：WouldBlock/EAGAIN 是正常情况
+                    let e: std::io::Error = e;
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         continue;
                     }
@@ -1250,6 +1285,7 @@ impl Daemon {
     /// 处理 IPC 消息
     ///
     /// 使用 TX adapter，与 RX 完全隔离
+    #[cfg(unix)]
     fn handle_ipc_message(
         msg: piper_sdk::can::gs_usb_udp::protocol::Message,
         client_addr: std::os::unix::net::SocketAddr,
@@ -1877,7 +1913,13 @@ impl Daemon {
         let rx_adapter_clone = Arc::clone(&self.rx_adapter);
         let device_state_clone = Arc::clone(&self.device_state);
         let clients_clone = Arc::clone(&self.clients);
-        let socket_uds_clone = self.socket_uds.as_ref().and_then(|s| s.try_clone().ok());
+        #[cfg(unix)]
+        let socket_uds_clone = self
+            .socket_uds
+            .as_ref()
+            .and_then(|s: &std::os::unix::net::UnixDatagram| s.try_clone().ok());
+        #[cfg(not(unix))]
+        let socket_uds_clone = None;
         let socket_udp_clone = self.socket_udp.as_ref().and_then(|s| s.try_clone().ok());
         let stats_clone = Arc::clone(&self.stats);
 
@@ -1907,6 +1949,7 @@ impl Daemon {
             })?;
 
         // 启动 IPC 接收线程（处理客户端消息）
+        #[cfg(unix)]
         if let Some(socket_uds) = self.socket_uds.take() {
             let tx_adapter_clone = Arc::clone(&self.tx_adapter);
             let device_state_clone = Arc::clone(&self.device_state);

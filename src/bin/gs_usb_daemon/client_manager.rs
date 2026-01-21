@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 /// 注意：UnixSocketAddr 不实现 Hash，所以我们使用 String 表示 UDS 路径
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientAddr {
-    Unix(String),    // UDS 路径（如 "/tmp/gs_usb_daemon.sock"）
+    #[cfg(unix)]
+    Unix(String), // UDS 路径（如 "/tmp/gs_usb_daemon.sock"）
     Udp(SocketAddr), // UDP 地址（如 "127.0.0.1:8888"）
 }
 
@@ -40,6 +41,8 @@ pub struct Client {
 
     /// 客户端发送频率降级级别（0=正常, 1=100Hz, 2=10Hz）
     /// 用于自适应降级机制
+    /// 注意：此字段仅在 Unix 平台上使用（UDS 客户端）
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub send_frequency_level: AtomicU32,
 
     /// 客户端创建时间（便于调试和追踪）
@@ -98,6 +101,7 @@ pub struct ClientManager {
     timeout: Duration,
     /// Unix Domain Socket 地址映射（client_id -> UnixSocketAddr）
     /// 注意：由于 UnixSocketAddr 不实现 Hash，我们使用 client_id 作为键
+    #[cfg(unix)]
     unix_addr_map: HashMap<u32, std::os::unix::net::SocketAddr>,
 }
 
@@ -108,6 +112,7 @@ impl ClientManager {
             clients: HashMap::new(),
             next_id: AtomicU32::new(1), // 从 1 开始（0 保留为无效 ID）
             timeout: Duration::from_secs(30),
+            #[cfg(unix)]
             unix_addr_map: HashMap::new(),
         }
     }
@@ -118,6 +123,7 @@ impl ClientManager {
             clients: HashMap::new(),
             next_id: AtomicU32::new(1), // 从 1 开始（0 保留为无效 ID）
             timeout,
+            #[cfg(unix)]
             unix_addr_map: HashMap::new(),
         }
     }
@@ -201,6 +207,7 @@ impl ClientManager {
     ///
     /// # 参数
     /// - `unix_addr`: Unix Socket 地址（接收所有权，因为 SocketAddr 不实现 Copy/Clone）
+    #[cfg(unix)]
     pub fn register_with_unix_addr(
         &mut self,
         id: u32,
@@ -240,7 +247,10 @@ impl ClientManager {
     /// 注销客户端
     pub fn unregister(&mut self, id: u32) {
         self.clients.remove(&id);
-        self.unix_addr_map.remove(&id);
+        #[cfg(unix)]
+        {
+            self.unix_addr_map.remove(&id);
+        }
     }
 
     /// 更新客户端活动时间（用于心跳）
@@ -286,7 +296,10 @@ impl ClientManager {
         // 移除超时的客户端
         for id in timeout_ids {
             self.clients.remove(&id);
-            self.unix_addr_map.remove(&id);
+            #[cfg(unix)]
+            {
+                self.unix_addr_map.remove(&id);
+            }
         }
     }
 
@@ -309,6 +322,7 @@ impl ClientManager {
     /// 为已注册的客户端设置 Unix Socket 地址（用于自动分配的 UDS 客户端）
     ///
     /// 此方法用于在自动分配 ID 后，为 UDS 客户端存储 Unix Socket 地址
+    #[cfg(unix)]
     pub fn set_unix_addr(&mut self, id: u32, unix_addr: std::os::unix::net::SocketAddr) {
         self.unix_addr_map.insert(id, unix_addr);
     }

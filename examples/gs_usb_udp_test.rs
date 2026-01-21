@@ -1,6 +1,6 @@
 //! GS-USB UDP/UDS 适配器测试示例
 //!
-//! 此示例演示如何通过 UDS (Unix Domain Socket) 连接到 gs_usb_daemon 并测试 CAN 总线功能。
+//! 此示例演示如何通过 UDP 或 UDS (Unix Domain Socket) 连接到 gs_usb_daemon 并测试 CAN 总线功能。
 //!
 //! 使用前请确保：
 //! 1. gs_usb_daemon 已经启动（默认 UDP 地址: 127.0.0.1:18888）
@@ -8,14 +8,17 @@
 //!
 //! 运行方式：
 //! ```bash
+//! # 使用默认 UDP 地址
 //! cargo run --example gs_usb_udp_test
-//! ```
 //!
-//! 或者指定自定义 UDS 路径：
-//! ```bash
+//! # 指定 UDP 地址
 //! cargo run --example gs_usb_udp_test -- --uds 127.0.0.1:18888
-//! # 或使用 UDS 路径
+//!
+//! # 在 Unix 系统上使用 UDS 路径
 //! cargo run --example gs_usb_udp_test -- --uds /tmp/custom_daemon.sock
+//! # 或使用 unix: 前缀
+//! cargo run --example gs_usb_udp_test -- --uds unix:/tmp/custom_daemon.sock
+//! ```
 //!
 
 use clap::Parser;
@@ -30,7 +33,10 @@ use std::time::{Duration, Instant};
 #[command(name = "gs_usb_udp_test")]
 #[command(about = "测试 GS-USB UDP/UDS 适配器功能")]
 struct Args {
-    /// UDS Socket 路径
+    /// UDS Socket 路径或 UDP 地址
+    ///
+    /// - UDS 路径: 以 `/` 开头（如 `/tmp/gs_usb_daemon.sock`）或使用 `unix:` 前缀
+    /// - UDP 地址: IP:PORT 格式（如 `127.0.0.1:18888`）
     ///
     /// 默认: 127.0.0.1:18888 (UDP)
     #[arg(long, default_value = "127.0.0.1:18888")]
@@ -378,14 +384,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("GS-USB UDP/UDS 适配器测试");
     println!("================================");
-    println!("UDS 路径: {}", args.uds);
+    println!(
+        "地址: {} ({})",
+        args.uds,
+        if args.uds.starts_with('/') || args.uds.starts_with("unix:") {
+            "UDS"
+        } else {
+            "UDP"
+        }
+    );
     println!("测试模式: {}", args.mode);
     println!();
 
-    // 1. 创建适配器
+    // 1. 创建适配器（根据地址格式自动选择 UDS 或 UDP）
     println!("正在创建适配器...");
-    let mut adapter =
-        GsUsbUdpAdapter::new_uds(&args.uds).map_err(|e| format!("创建适配器失败: {}", e))?;
+    let mut adapter = if args.uds.starts_with('/') || args.uds.starts_with("unix:") {
+        // UDS 模式
+        #[cfg(unix)]
+        {
+            let path = args.uds.strip_prefix("unix:").unwrap_or(&args.uds);
+            GsUsbUdpAdapter::new_uds(path).map_err(|e| format!("创建 UDS 适配器失败: {}", e))?
+        }
+        #[cfg(not(unix))]
+        {
+            return Err("Unix Domain Sockets are not supported on this platform. Please use UDP address format (e.g., 127.0.0.1:18888)".into());
+        }
+    } else {
+        // UDP 模式
+        GsUsbUdpAdapter::new_udp(&args.uds).map_err(|e| format!("创建 UDP 适配器失败: {}", e))?
+    };
     println!("✓ 适配器创建成功");
 
     // 2. 连接到守护进程
@@ -399,8 +426,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!();
             eprintln!("请确保:");
             eprintln!("  1. gs_usb_daemon 已经启动");
-            eprintln!("  2. UDS 路径正确: {}", args.uds);
-            eprintln!("  3. 守护进程正在监听该路径");
+            eprintln!("  2. 地址正确: {}", args.uds);
+            eprintln!("  3. 守护进程正在监听该地址");
             return Err(Box::new(e));
         },
     }

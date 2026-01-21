@@ -118,12 +118,13 @@ mod tests {
         // 验证文件已创建
         assert!(lock_path.exists());
 
-        // 验证文件包含 PID
-        let content = fs::read_to_string(&lock_path).unwrap();
+        // 在 Windows 上，文件被排他锁定时无法读取，需要先释放锁
         let pid = std::process::id();
-        assert!(content.contains(&pid.to_string()));
-
         drop(lock);
+
+        // 验证文件包含 PID（在锁释放后读取）
+        let content = fs::read_to_string(&lock_path).unwrap();
+        assert!(content.contains(&pid.to_string()));
 
         // 清理
         let _ = fs::remove_file(&lock_path);

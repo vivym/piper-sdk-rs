@@ -321,8 +321,17 @@ impl PiperBuilder {
     fn build_gs_usb_daemon(&self, daemon_addr: String) -> Result<Piper, RobotError> {
         let mut can = if daemon_addr.starts_with('/') || daemon_addr.starts_with("unix:") {
             // UDS 模式
-            let path = daemon_addr.strip_prefix("unix:").unwrap_or(&daemon_addr);
-            GsUsbUdpAdapter::new_uds(path).map_err(RobotError::Can)?
+            #[cfg(unix)]
+            {
+                let path = daemon_addr.strip_prefix("unix:").unwrap_or(&daemon_addr);
+                GsUsbUdpAdapter::new_uds(path).map_err(RobotError::Can)?
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(RobotError::Can(CanError::Device(
+                    "Unix Domain Sockets are not supported on this platform. Please use UDP address format (e.g., 127.0.0.1:8888)".into(),
+                )));
+            }
         } else {
             // UDP 模式
             GsUsbUdpAdapter::new_udp(&daemon_addr).map_err(RobotError::Can)?

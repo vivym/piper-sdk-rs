@@ -10,11 +10,16 @@ use crate::can::{CanAdapter, CanError, PiperFrame};
 use protocol::{CanIdFilter, Message};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// GS-USB UDP/UDS 适配器
 ///
@@ -48,12 +53,14 @@ pub struct GsUsbUdpAdapter {
 /// 守护进程地址（支持 UDS 和 UDP）
 #[derive(Debug, Clone)]
 enum DaemonAddr {
-    Unix(String),    // UDS 路径
+    #[cfg(unix)]
+    Unix(String), // UDS 路径
     Udp(SocketAddr), // UDP 地址
 }
 
 /// Socket（支持 UDS 和 UDP）
 enum Socket {
+    #[cfg(unix)]
     Unix(UnixDatagram),
     Udp(std::net::UdpSocket),
 }
@@ -67,6 +74,7 @@ impl GsUsbUdpAdapter {
     /// # 返回
     /// - `Ok(Self)`: 成功创建适配器
     /// - `Err`: Socket 创建失败
+    #[cfg(unix)]
     pub fn new_uds(uds_path: impl AsRef<str>) -> Result<Self, CanError> {
         // 创建临时路径用于客户端 socket（守护进程需要知道这个路径才能发送数据）
         // 使用进程ID、时间戳和计数器确保唯一性，避免测试并行运行时的竞争条件
@@ -304,12 +312,14 @@ impl GsUsbUdpAdapter {
     /// 发送数据到守护进程
     fn send_to_daemon(&self, data: &[u8]) -> Result<(), CanError> {
         match (&self.socket, &self.daemon_addr) {
+            #[cfg(unix)]
             (Socket::Unix(socket), DaemonAddr::Unix(path)) => {
                 socket.send_to(data, path).map_err(CanError::Io)?;
             },
             (Socket::Udp(socket), DaemonAddr::Udp(addr)) => {
                 socket.send_to(data, *addr).map_err(CanError::Io)?;
             },
+            #[cfg(unix)]
             _ => {
                 return Err(CanError::Device("Socket and address type mismatch".into()));
             },
@@ -320,6 +330,7 @@ impl GsUsbUdpAdapter {
     /// 从守护进程接收数据
     fn recv_from_daemon(&self, buf: &mut [u8]) -> Result<usize, CanError> {
         match &self.socket {
+            #[cfg(unix)]
             Socket::Unix(socket) => {
                 // Unix Domain Socket 使用非阻塞模式
                 match socket.recv(buf) {
@@ -334,7 +345,7 @@ impl GsUsbUdpAdapter {
                     },
                 }
             },
-            Socket::Udp(socket) => socket.recv(buf).map_err(|e| {
+            Socket::Udp(socket) => socket.recv(buf).map_err(|e: std::io::Error| {
                 if e.kind() == std::io::ErrorKind::TimedOut {
                     CanError::Timeout
                 } else {
@@ -365,12 +376,14 @@ impl GsUsbUdpAdapter {
 
                     // 发送心跳
                     match (&socket, &daemon_addr) {
+                        #[cfg(unix)]
                         (Socket::Unix(s), DaemonAddr::Unix(path)) => {
                             let _ = s.send_to(encoded, path);
                         },
                         (Socket::Udp(s), DaemonAddr::Udp(addr)) => {
                             let _ = s.send_to(encoded, *addr);
                         },
+                        #[cfg(unix)]
                         _ => break,
                     }
 
@@ -393,6 +406,7 @@ impl GsUsbUdpAdapter {
     /// 克隆 Socket（用于心跳线程）
     fn clone_socket(&self) -> Socket {
         match &self.socket {
+            #[cfg(unix)]
             Socket::Unix(s) => Socket::Unix(s.try_clone().expect("Failed to clone Unix socket")),
             Socket::Udp(s) => Socket::Udp(s.try_clone().expect("Failed to clone UDP socket")),
         }
@@ -553,6 +567,7 @@ impl Drop for GsUsbUdpAdapter {
         }
 
         // 清理客户端 socket 文件（如果使用 UDS）
+        #[cfg(unix)]
         if let Socket::Unix(_) = &self.socket {
             let client_socket_path = format!("/tmp/gs_usb_client_{}.sock", std::process::id());
             if std::path::Path::new(&client_socket_path).exists() {
@@ -566,6 +581,7 @@ impl Drop for GsUsbUdpAdapter {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn test_gs_usb_udp_adapter_new_uds() {
         let adapter = GsUsbUdpAdapter::new_uds("/tmp/test_gs_usb_daemon.sock");
@@ -584,6 +600,7 @@ mod tests {
         assert!(adapter.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_gs_usb_udp_adapter_connection_state() {
         let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/test_gs_usb_daemon.sock").unwrap();
@@ -596,6 +613,7 @@ mod tests {
         assert!(!adapter.is_connected());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_gs_usb_udp_adapter_send_not_connected() {
         let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/test_gs_usb_daemon.sock").unwrap();
@@ -606,6 +624,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_gs_usb_udp_adapter_receive_not_connected() {
         let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/test_gs_usb_daemon.sock").unwrap();
@@ -615,6 +634,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_gs_usb_udp_adapter_sequence_number() {
         let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/test_gs_usb_daemon.sock").unwrap();
@@ -634,6 +654,7 @@ mod tests {
         assert_eq!(seq2, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_gs_usb_udp_adapter_reconnect_logic() {
         let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/test_gs_usb_daemon.sock").unwrap();
@@ -643,6 +664,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_gs_usb_udp_adapter_disconnect() {
         let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/test_gs_usb_daemon.sock").unwrap();
