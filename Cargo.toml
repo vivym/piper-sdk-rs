@@ -16,13 +16,18 @@ arc-swap = "1.8.0"
 bilge = "0.3.0"
 bytes = "1.11.0"
 crossbeam-channel = "0.5.15"
-rusb = "0.9.4"
+rusb = { version = "0.9.4", features = ["vendored"] }
 thiserror = "2.0.17"
 tracing = "0.1.44"
 ctrlc = "3.5"
+thread-priority = { version = "3.0.0", optional = true }
 
 clap = { version = "4.5", features = ["derive"] }
 fs4 = { version = "0.13", features = ["sync"] }
+
+[features]
+default = []
+realtime = ["thread-priority"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -39,3 +44,4 @@ path = "src/bin/gs_usb_daemon/main.rs"
 
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+rand = "0.8"

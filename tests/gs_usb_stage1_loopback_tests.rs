@@ -1,4 +1,4 @@
-//! GS-USB 第一阶段测试：Loopback 模式端到端测试
+//! GS-USB Loopback 模式端到端测试
 //!
 //! ## 测试目标
 //! 使用 Loopback 模式进行端到端测试，验证 GS-USB 协议的正确性。
@@ -9,7 +9,7 @@
 //! ## 运行方式
 //! ```bash
 //! # ⚠️ 重要：设备是独占的，必须串行运行测试（--test-threads=1）
-//! # 运行所有第一阶段测试（串行）
+//! # 运行所有 Loopback 测试（串行）
 //! cargo test --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1
 //!
 //! # 运行单个测试
@@ -25,10 +25,8 @@
 //! - ✅ 帧编码/解码正确性
 //! - ✅ 标准帧和扩展帧支持
 
-// GS-USB 模块只在非 Linux 系统上可用
-#[cfg(not(target_os = "linux"))]
+// GS-USB 模块在所有平台可用
 use piper_sdk::can::gs_usb::GsUsbCanAdapter;
-#[cfg(not(target_os = "linux"))]
 use piper_sdk::can::{CanAdapter, PiperFrame};
 
 /// 测试 Loopback 模式端到端流程
@@ -37,7 +35,6 @@ use piper_sdk::can::{CanAdapter, PiperFrame};
 /// 1. 设备可以成功配置为 Loopback 模式
 /// 2. 发送的帧会在设备内部回环
 /// 3. 可以通过 receive() 接收到 Echo
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore] // 需要硬件，默认不运行
 fn test_loopback_end_to_end() {
@@ -121,7 +118,6 @@ fn test_loopback_end_to_end() {
 /// 1. send() 发送的帧会产生 Echo
 /// 2. receive() 会过滤掉 Echo（根据 echo_id 判断）
 /// 3. 只返回有效的 RX 帧（如果有外部设备发送）
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_echo_filtering() {
@@ -177,7 +173,6 @@ fn test_loopback_echo_filtering() {
 }
 
 /// 测试标准帧和扩展帧支持
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_standard_and_extended_frames() {
@@ -228,7 +223,6 @@ fn test_loopback_standard_and_extended_frames() {
 }
 
 /// 测试不同数据长度的帧
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_various_data_lengths() {
@@ -292,7 +286,6 @@ fn test_loopback_various_data_lengths() {
 /// - 驱动逻辑的正确性（发送、接收、解析）
 /// - 设备在长时间运行下的稳定性
 /// - 批量接收缓冲的正确性（即使 Ping-Pong，USB 也可能批量打包）
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_fire_and_forget() {
@@ -389,73 +382,9 @@ fn test_loopback_fire_and_forget() {
     println!("✓ Device survived 100 frames Ping-Pong test");
 }
 
-/// 极简诊断测试：验证基本的发送/接收通信是否正常
-///
-/// 此测试专门用于诊断"发送成功但无 Echo"的问题。
-/// 可能的原因：
-/// 1. `GsUsbFrame` 缺少 `#[repr(packed)]`（但我们使用 `pack_to` 手动打包，应该不受影响）
-/// 2. Channel ID 设置错误
-/// 3. 设备处于僵死状态（需要物理重插拔）
-#[cfg(not(target_os = "linux"))]
-#[test]
-#[ignore]
-fn test_loopback_sanity_check() {
-    println!("=== Test: Sanity Check (Send 1 Frame) ===");
-
-    let mut adapter = GsUsbCanAdapter::new().expect("No Device");
-
-    // 2. 配置
-    println!("Configuring Loopback...");
-    adapter.configure_loopback(250_000).expect("Config failed");
-    std::thread::sleep(std::time::Duration::from_millis(500)); // 给足时间
-
-    // 3. 构造帧
-    // 使用全 0 数据，避免数据内容导致的问题
-    let frame = PiperFrame::new_standard(0x123, &[0x00, 0x00, 0x00, 0x00]);
-
-    println!("Sending Frame 1...");
-    if let Err(e) = adapter.send(frame) {
-        panic!("❌ Send failed: {}", e);
-    }
-    println!("✓ Send OK. Waiting for Echo...");
-
-    // 4. 尝试接收，打印任何收到的东西
-    let start = std::time::Instant::now();
-    loop {
-        match adapter.receive() {
-            Ok(rx) => {
-                println!("✓ RECEIVED FRAME!");
-                println!("  ID: 0x{:X}", rx.id);
-                println!("  Len: {}", rx.len);
-                println!("  Data: {:?}", rx.data);
-                break; // 成功！
-            },
-            Err(piper_sdk::can::CanError::Timeout) => {
-                if start.elapsed().as_secs() > 2 {
-                    panic!(
-                        "❌ Timeout: Waited 2 seconds, no Echo. \n\
-                        POSSIBLE CAUSES:\n\
-                        1. struct GsUsbFrame missing #[repr(packed)]\n\
-                        2. Device needs physical Re-plug\n\
-                        3. Firmware buggy in Loopback mode"
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                print!("."); // 打印点号表示正在等待
-                use std::io::Write;
-                std::io::stdout().flush().unwrap();
-            },
-            Err(e) => panic!("❌ Error: {}", e),
-        }
-    }
-
-    println!("✓ Sanity check passed!");
-}
-
 /// 测试设备状态检查
 ///
 /// 验证设备在 Loopback 模式下正确启动
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_loopback_device_state() {

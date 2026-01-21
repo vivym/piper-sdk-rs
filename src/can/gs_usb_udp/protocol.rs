@@ -225,7 +225,32 @@ pub enum Message {
     },
     DisconnectAck,
     GetStatus,
-    StatusResponse {/* TODO: 定义状态字段 */},
+    StatusResponse {
+        /// 设备状态（0=Disconnected, 1=Connected, 2=Reconnecting）
+        device_state: u8,
+        /// RX 帧率（FPS，编码为 u32，实际值为 fps * 1000）
+        rx_fps_x1000: u32,
+        /// TX 帧率（FPS，编码为 u32，实际值为 fps * 1000）
+        tx_fps_x1000: u32,
+        /// IPC 发送到客户端的帧率（FPS * 1000）
+        ipc_sent_fps_x1000: u32,
+        /// IPC 从客户端接收的帧率（FPS * 1000）
+        ipc_received_fps_x1000: u32,
+        /// 健康度评分（0-100）
+        health_score: u8,
+        /// USB STALL 计数
+        usb_stall_count: u64,
+        /// CAN Bus Off 计数
+        can_bus_off_count: u64,
+        /// CAN Error Passive 计数
+        can_error_passive_count: u64,
+        /// CPU 占用率（0-100）
+        cpu_usage_percent: u8,
+        /// 客户端数量
+        client_count: u32,
+        /// 客户端发送阻塞次数
+        client_send_blocked: u64,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -425,6 +450,93 @@ pub fn encode_get_status(seq: u32, buf: &mut [u8; 8]) -> &[u8] {
     &buf[..8]
 }
 
+/// 编码 StatusResponse 消息
+pub fn encode_status_response<'a>(
+    status: &StatusResponse,
+    seq: u32,
+    buf: &'a mut [u8; 64],
+) -> Result<&'a [u8], ProtocolError> {
+    // 计算消息长度：8 (header) + 状态字段
+    // 状态字段：1 (device_state) + 4*4 (4个fps_x1000) + 1 (health_score) + 8*3 (3个u64计数) + 1 (cpu_usage) + 4 (client_count) + 8 (client_send_blocked) = 51
+    let length = 8 + 51;
+
+    if length > buf.len() {
+        return Err(ProtocolError::InvalidData);
+    }
+
+    let header = MessageHeader::new(MessageType::StatusResponse, length as u16, seq);
+    header.encode(&mut buf[..8]);
+
+    let mut offset = 8;
+
+    // 编码字段
+    buf[offset] = status.device_state;
+    offset += 1;
+
+    buf[offset..offset + 4].copy_from_slice(&status.rx_fps_x1000.to_le_bytes());
+    offset += 4;
+
+    buf[offset..offset + 4].copy_from_slice(&status.tx_fps_x1000.to_le_bytes());
+    offset += 4;
+
+    buf[offset..offset + 4].copy_from_slice(&status.ipc_sent_fps_x1000.to_le_bytes());
+    offset += 4;
+
+    buf[offset..offset + 4].copy_from_slice(&status.ipc_received_fps_x1000.to_le_bytes());
+    offset += 4;
+
+    buf[offset] = status.health_score;
+    offset += 1;
+
+    buf[offset..offset + 8].copy_from_slice(&status.usb_stall_count.to_le_bytes());
+    offset += 8;
+
+    buf[offset..offset + 8].copy_from_slice(&status.can_bus_off_count.to_le_bytes());
+    offset += 8;
+
+    buf[offset..offset + 8].copy_from_slice(&status.can_error_passive_count.to_le_bytes());
+    offset += 8;
+
+    buf[offset] = status.cpu_usage_percent;
+    offset += 1;
+
+    buf[offset..offset + 4].copy_from_slice(&status.client_count.to_le_bytes());
+    offset += 4;
+
+    buf[offset..offset + 8].copy_from_slice(&status.client_send_blocked.to_le_bytes());
+
+    Ok(&buf[..length])
+}
+
+/// 状态响应结构体
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusResponse {
+    /// 设备状态（0=Disconnected, 1=Connected, 2=Reconnecting）
+    pub device_state: u8,
+    /// RX 帧率（FPS，编码为 u32，实际值为 fps * 1000）
+    pub rx_fps_x1000: u32,
+    /// TX 帧率（FPS，编码为 u32，实际值为 fps * 1000）
+    pub tx_fps_x1000: u32,
+    /// IPC 发送到客户端的帧率（FPS * 1000）
+    pub ipc_sent_fps_x1000: u32,
+    /// IPC 从客户端接收的帧率（FPS * 1000）
+    pub ipc_received_fps_x1000: u32,
+    /// 健康度评分（0-100）
+    pub health_score: u8,
+    /// USB STALL 计数
+    pub usb_stall_count: u64,
+    /// CAN Bus Off 计数
+    pub can_bus_off_count: u64,
+    /// CAN Error Passive 计数
+    pub can_error_passive_count: u64,
+    /// CPU 占用率（0-100）
+    pub cpu_usage_percent: u8,
+    /// 客户端数量
+    pub client_count: u32,
+    /// 客户端发送阻塞次数
+    pub client_send_blocked: u64,
+}
+
 // ============================================================================
 // Decoding Functions
 // ============================================================================
@@ -596,7 +708,123 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
             Ok(Message::SetFilter { client_id, filters })
         },
         MessageType::GetStatus => Ok(Message::GetStatus),
-        _ => Err(ProtocolError::InvalidMessageType),
+        MessageType::StatusResponse => {
+            if data.len() < 59 {
+                return Err(ProtocolError::Incomplete);
+            }
+            let mut offset = 8;
+
+            let device_state = data[offset];
+            offset += 1;
+
+            let rx_fps_x1000 = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+
+            let tx_fps_x1000 = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+
+            let ipc_sent_fps_x1000 = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+
+            let ipc_received_fps_x1000 = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+
+            let health_score = data[offset];
+            offset += 1;
+
+            let usb_stall_count = u64::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            offset += 8;
+
+            let can_bus_off_count = u64::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            offset += 8;
+
+            let can_error_passive_count = u64::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            offset += 8;
+
+            let cpu_usage_percent = data[offset];
+            offset += 1;
+
+            let client_count = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+
+            let client_send_blocked = u64::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+
+            Ok(Message::StatusResponse {
+                device_state,
+                rx_fps_x1000,
+                tx_fps_x1000,
+                ipc_sent_fps_x1000,
+                ipc_received_fps_x1000,
+                health_score,
+                usb_stall_count,
+                can_bus_off_count,
+                can_error_passive_count,
+                cpu_usage_percent,
+                client_count,
+                client_send_blocked,
+            })
+        },
     }
 }
 

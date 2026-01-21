@@ -890,7 +890,10 @@ pub struct PiperContext {
     // === FPS 统计 ===
     // 使用原子计数器，无锁读取，适合实时监控
     /// FPS 统计（各状态的更新频率统计）
-    pub fps_stats: Arc<FpsStatistics>,
+    ///
+    /// 使用 `ArcSwap` 支持在运行中原子性“重置统计窗口”（替换为新的 `FpsStatistics`），
+    /// 且不引入每帧的锁开销。
+    pub fps_stats: Arc<ArcSwap<FpsStatistics>>,
 }
 
 impl PiperContext {
@@ -946,7 +949,7 @@ impl PiperContext {
             )),
 
             // FPS 统计：原子计数器
-            fps_stats: Arc::new(FpsStatistics::new()),
+            fps_stats: Arc::new(ArcSwap::from_pointee(FpsStatistics::new())),
         }
     }
 

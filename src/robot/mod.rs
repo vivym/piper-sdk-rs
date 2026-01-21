@@ -8,15 +8,19 @@
 //! - 对外 API：提供简洁的 `Piper` 结构体，封装底层细节
 
 mod builder;
+pub mod command;
 mod error;
 mod fps_stats;
-mod pipeline;
+pub mod metrics;
+pub mod pipeline;
 mod robot_impl;
-mod state;
+pub mod state;
 
-pub use builder::PiperBuilder;
+pub use builder::{DriverType, PiperBuilder};
+pub use command::{CommandPriority, PiperCommand};
 pub use error::RobotError;
 pub use fps_stats::{FpsCounts, FpsResult};
-pub use pipeline::{PipelineConfig, io_loop};
+pub use metrics::{MetricsSnapshot, PiperMetrics};
+pub use pipeline::{PipelineConfig, io_loop, rx_loop, tx_loop, tx_loop_mailbox};
 pub use robot_impl::Piper;
 pub use state::*;

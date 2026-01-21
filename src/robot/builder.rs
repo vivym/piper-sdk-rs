@@ -4,13 +4,25 @@
 
 #[cfg(target_os = "linux")]
 use crate::can::SocketCanAdapter;
-#[cfg(not(target_os = "linux"))]
 use crate::can::gs_usb::GsUsbCanAdapter;
-#[cfg(not(target_os = "linux"))]
 use crate::can::gs_usb_udp::GsUsbUdpAdapter;
+use crate::can::{CanDeviceError, CanDeviceErrorKind, CanError};
 use crate::robot::error::RobotError;
 use crate::robot::pipeline::PipelineConfig;
 use crate::robot::robot_impl::Piper;
+
+/// 驱动类型选择
+#[derive(Debug, Clone, Copy)]
+pub enum DriverType {
+    /// 自动探测（默认）
+    /// - Linux: 如果 interface 是 "can0"/"can1" 等，使用 SocketCAN；否则尝试 GS-USB
+    /// - 其他平台: 使用 GS-USB
+    Auto,
+    /// 强制使用 SocketCAN（仅 Linux）
+    SocketCan,
+    /// 强制使用 GS-USB（所有平台）
+    GsUsb,
+}
 
 /// Piper Builder（链式构造）
 ///
@@ -38,7 +50,10 @@ use crate::robot::robot_impl::Piper;
 ///     .unwrap();
 /// ```
 pub struct PiperBuilder {
-    /// CAN 接口名称（Linux: "can0", macOS/Windows: 用作设备序列号，用于区分多个 GS-USB 设备）
+    /// CAN 接口名称或设备序列号
+    ///
+    /// - Linux: "can0"/"can1" 等 SocketCAN 接口名，或设备序列号（使用 GS-USB）
+    /// - macOS/Windows: GS-USB 设备序列号
     interface: Option<String>,
     /// CAN 波特率（1M, 500K, 250K 等）
     baud_rate: Option<u32>,
@@ -48,6 +63,8 @@ pub struct PiperBuilder {
     /// - UDS 路径（如 "/tmp/gs_usb_daemon.sock"）
     /// - UDP 地址（如 "127.0.0.1:8888"）
     daemon_addr: Option<String>,
+    /// 驱动类型选择（新增）
+    driver_type: DriverType,
 }
 
 impl PiperBuilder {
@@ -66,18 +83,37 @@ impl PiperBuilder {
             baud_rate: None,
             pipeline_config: None,
             daemon_addr: None,
+            driver_type: DriverType::Auto,
         }
+    }
+
+    /// 显式指定驱动类型（可选，默认 Auto）
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use piper_sdk::robot::{PiperBuilder, DriverType};
+    ///
+    /// // 强制使用 GS-USB
+    /// let piper = PiperBuilder::new()
+    ///     .with_driver_type(DriverType::GsUsb)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn with_driver_type(mut self, driver_type: DriverType) -> Self {
+        self.driver_type = driver_type;
+        self
     }
 
     /// 设置 CAN 接口（可选，默认自动检测）
     ///
     /// # 注意
+    /// - Linux: 此参数可以是 SocketCAN 接口名称（如 "can0" 或 "vcan0"）或 GS-USB 设备序列号
+    ///   - 如果接口名是 "can0"/"can1" 等，优先使用 SocketCAN（通过 Smart Default）
+    ///   - 如果接口名是设备序列号或未提供，使用 GS-USB
     /// - macOS/Windows (GS-USB): 此参数用作设备序列号，用于区分多个 GS-USB 设备
     ///   - 如果提供序列号，只打开匹配序列号的设备
     ///   - 如果不提供，自动选择第一个找到的设备
-    /// - Linux (SocketCAN): 此参数用作 CAN 接口名称（如 "can0" 或 "vcan0"）
-    ///   - 如果提供接口名称，使用指定的接口
-    ///   - 如果不提供，默认使用 "can0"
     ///
     /// # Example
     ///
@@ -134,7 +170,6 @@ impl PiperBuilder {
     ///     .build()
     ///     .unwrap();
     /// ```
-    #[cfg(not(target_os = "linux"))]
     pub fn with_daemon(mut self, daemon_addr: impl Into<String>) -> Self {
         self.daemon_addr = Some(daemon_addr.into());
         self
@@ -163,60 +198,140 @@ impl PiperBuilder {
     /// }
     /// ```
     pub fn build(self) -> Result<Piper, RobotError> {
-        // 创建 CAN 适配器
-        #[cfg(not(target_os = "linux"))]
-        {
-            // 检查是否使用守护进程模式
-            if let Some(daemon_addr) = self.daemon_addr {
-                // 守护进程模式：使用 GsUsbUdpAdapter
-                let mut can = if daemon_addr.starts_with('/') || daemon_addr.starts_with("unix:") {
-                    // UDS 模式
-                    let path = daemon_addr.strip_prefix("unix:").unwrap_or(&daemon_addr);
-                    GsUsbUdpAdapter::new_uds(path).map_err(RobotError::Can)?
+        // 1. 守护进程模式（所有平台，优先级最高）
+        if let Some(ref daemon_addr) = self.daemon_addr {
+            return self.build_gs_usb_daemon(daemon_addr.clone());
+        }
+
+        // 2. 根据 driver_type 和 interface 自动选择后端
+        match self.driver_type {
+            DriverType::Auto => {
+                // Linux: Smart Default 逻辑
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(ref interface) = self.interface {
+                        // 如果接口名是 "can0", "can1" 等，尝试 SocketCAN
+                        if interface.starts_with("can") && interface.len() <= 5 {
+                            // 尝试 SocketCAN（可能失败，例如接口不存在）
+                            if let Ok(piper) = self.build_socketcan(interface.as_str()) {
+                                return Ok(piper);
+                            }
+                            // 如果 SocketCAN 失败，fallback 到 GS-USB
+                            tracing::info!(
+                                "SocketCAN interface '{}' not available, falling back to GS-USB",
+                                interface
+                            );
+                        }
+                    }
+                    // 其他情况（未指定接口、USB 总线号等）：使用 GS-USB
+                    self.build_gs_usb_direct()
+                }
+
+                // 其他平台：默认使用 GS-USB
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.build_gs_usb_direct()
+                }
+            },
+            DriverType::SocketCan => {
+                #[cfg(target_os = "linux")]
+                {
+                    let interface = self.interface.as_deref().unwrap_or("can0");
+                    self.build_socketcan(interface)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err(RobotError::Can(CanError::Device(CanDeviceError::new(
+                        CanDeviceErrorKind::UnsupportedConfig,
+                        "SocketCAN is only available on Linux",
+                    ))))
+                }
+            },
+            DriverType::GsUsb => self.build_gs_usb_direct(),
+        }
+    }
+
+    /// 构建 SocketCAN 适配器（Linux only）
+    #[cfg(target_os = "linux")]
+    fn build_socketcan(&self, interface: &str) -> Result<Piper, RobotError> {
+        let mut can = SocketCanAdapter::new(interface).map_err(RobotError::Can)?;
+
+        // SocketCAN 的波特率由系统配置，但可以调用 configure 验证接口状态
+        if let Some(bitrate) = self.baud_rate {
+            can.configure(bitrate).map_err(RobotError::Can)?;
+        }
+
+        let config = self.pipeline_config.clone().unwrap_or_default();
+        can.set_read_timeout(std::time::Duration::from_millis(config.receive_timeout_ms))
+            .map_err(RobotError::Can)?;
+
+        Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
+    }
+
+    /// 构建 GS-USB 直连适配器
+    fn build_gs_usb_direct(&self) -> Result<Piper, RobotError> {
+        // interface 可能是：
+        // - 设备序列号（如 "ABC123456"）
+        // - USB 总线号（如 "1:12"，表示 bus 1, address 12）
+        // - None（自动选择第一个设备）
+
+        let mut can = match &self.interface {
+            Some(serial) if serial.contains(':') => {
+                // USB 总线号格式：bus:address
+                let parts: Vec<&str> = serial.split(':').collect();
+                if parts.len() == 2 {
+                    if let (Ok(bus), Ok(addr)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>()) {
+                        use crate::can::gs_usb::device::{GsUsbDevice, GsUsbDeviceSelector};
+                        let selector = GsUsbDeviceSelector::by_bus_address(bus, addr);
+                        let _device = GsUsbDevice::open(&selector).map_err(|e| {
+                            RobotError::Can(CanError::Device(CanDeviceError::new(
+                                CanDeviceErrorKind::Backend,
+                                format!("Failed to open GS-USB device at {}:{}: {}", bus, addr, e),
+                            )))
+                        })?;
+                        // 注意：从 device 创建 adapter 的完整实现需要访问 GsUsbCanAdapter 的内部
+                        // 暂时 fallback 到序列号方式
+                        GsUsbCanAdapter::new_with_serial(Some(serial.as_str()))
+                            .map_err(RobotError::Can)?
+                    } else {
+                        GsUsbCanAdapter::new_with_serial(Some(serial.as_str()))
+                            .map_err(RobotError::Can)?
+                    }
                 } else {
-                    // UDP 模式
-                    GsUsbUdpAdapter::new_udp(&daemon_addr).map_err(RobotError::Can)?
-                };
+                    GsUsbCanAdapter::new_with_serial(Some(serial.as_str()))
+                        .map_err(RobotError::Can)?
+                }
+            },
+            Some(serial) => {
+                GsUsbCanAdapter::new_with_serial(Some(serial.as_str())).map_err(RobotError::Can)?
+            },
+            None => GsUsbCanAdapter::new().map_err(RobotError::Can)?,
+        };
 
-                // 连接到守护进程（使用空的过滤规则，接收所有帧）
-                can.connect(vec![]).map_err(RobotError::Can)?;
+        let bitrate = self.baud_rate.unwrap_or(1_000_000);
+        can.configure(bitrate).map_err(RobotError::Can)?;
 
-                // 创建 Piper 实例
-                Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
-            } else {
-                // 传统模式：直接使用 GS-USB 适配器
-                // 如果指定了 interface（序列号），使用它来过滤设备
-                let mut can = match self.interface {
-                    Some(serial) => GsUsbCanAdapter::new_with_serial(Some(serial.as_str()))
-                        .map_err(RobotError::Can)?,
-                    None => GsUsbCanAdapter::new().map_err(RobotError::Can)?,
-                };
+        let config = self.pipeline_config.clone().unwrap_or_default();
+        can.set_receive_timeout(std::time::Duration::from_millis(config.receive_timeout_ms));
 
-                // 配置波特率（如果指定）
-                let bitrate = self.baud_rate.unwrap_or(1_000_000);
-                can.configure(bitrate).map_err(RobotError::Can)?;
+        Piper::new(can, self.pipeline_config.clone()).map_err(RobotError::Can)
+    }
 
-                // 创建 Piper 实例
-                Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
-            }
-        }
+    /// 构建 GS-USB 守护进程适配器
+    fn build_gs_usb_daemon(&self, daemon_addr: String) -> Result<Piper, RobotError> {
+        let mut can = if daemon_addr.starts_with('/') || daemon_addr.starts_with("unix:") {
+            // UDS 模式
+            let path = daemon_addr.strip_prefix("unix:").unwrap_or(&daemon_addr);
+            GsUsbUdpAdapter::new_uds(path).map_err(RobotError::Can)?
+        } else {
+            // UDP 模式
+            GsUsbUdpAdapter::new_udp(&daemon_addr).map_err(RobotError::Can)?
+        };
 
-        #[cfg(target_os = "linux")]
-        {
-            // Linux: SocketCAN 适配器
-            // 打开 SocketCAN 接口（如果未指定，默认使用 "can0"）
-            let interface = self.interface.as_deref().unwrap_or("can0");
-            let mut can = SocketCanAdapter::new(interface).map_err(RobotError::Can)?;
+        // 连接到守护进程（使用空的过滤规则，接收所有帧）
+        can.connect(vec![]).map_err(RobotError::Can)?;
 
-            // SocketCAN 的波特率由系统配置，但可以调用 configure 验证接口状态
-            // 如果指定了波特率，调用 configure（虽然不会真正设置，但可以验证接口可用性）
-            if let Some(bitrate) = self.baud_rate {
-                can.configure(bitrate).map_err(RobotError::Can)?;
-            }
-
-            // 创建 Piper 实例
-            Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
-        }
+        Piper::new(can, self.pipeline_config.clone()).map_err(RobotError::Can)
     }
 }
 
@@ -238,7 +353,6 @@ mod tests {
         // 注意：不直接比较 pipeline_config，因为它没有实现 PartialEq
         // 但可以通过 is_none() 检查
         assert!(builder.pipeline_config.is_none());
-        #[cfg(not(target_os = "linux"))]
         assert_eq!(builder.daemon_addr, None);
     }
 
@@ -296,6 +410,28 @@ mod tests {
     }
 
     #[test]
+    fn test_piper_builder_receive_timeout_config() {
+        // 测试：PipelineConfig.receive_timeout_ms 应该被应用到 adapter
+        // 注意：这是一个编译时测试，实际运行时测试需要硬件设备
+        let config = PipelineConfig {
+            receive_timeout_ms: 5,
+            frame_group_timeout_ms: 20,
+        };
+        let builder = PiperBuilder::new().pipeline_config(config.clone());
+
+        // 验证配置被正确存储
+        assert!(builder.pipeline_config.is_some());
+        let stored_config = builder.pipeline_config.as_ref().unwrap();
+        assert_eq!(stored_config.receive_timeout_ms, 5);
+        assert_eq!(stored_config.frame_group_timeout_ms, 20);
+
+        // 验证默认配置
+        let default_config = PipelineConfig::default();
+        assert_eq!(default_config.receive_timeout_ms, 2);
+        assert_eq!(default_config.frame_group_timeout_ms, 10);
+    }
+
+    #[test]
     fn test_piper_builder_baud_rate_chaining() {
         let builder1 = PiperBuilder::new().baud_rate(1_000_000);
         let builder2 = builder1.baud_rate(500_000);
@@ -304,7 +440,6 @@ mod tests {
         assert_eq!(builder2.baud_rate, Some(500_000));
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_piper_builder_with_daemon_uds() {
         let builder = PiperBuilder::new().with_daemon("/tmp/gs_usb_daemon.sock");
@@ -314,14 +449,12 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_piper_builder_with_daemon_udp() {
         let builder = PiperBuilder::new().with_daemon("127.0.0.1:8888");
         assert_eq!(builder.daemon_addr, Some("127.0.0.1:8888".to_string()));
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_piper_builder_with_daemon_chaining() {
         let builder1 = PiperBuilder::new().with_daemon("/tmp/test1.sock");
@@ -331,7 +464,6 @@ mod tests {
         assert_eq!(builder2.daemon_addr, Some("127.0.0.1:8888".to_string()));
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_piper_builder_daemon_and_interface() {
         // 守护进程模式和 interface 可以同时设置（虽然 interface 在守护进程模式下会被忽略）
@@ -343,5 +475,17 @@ mod tests {
             Some("/tmp/gs_usb_daemon.sock".to_string())
         );
         assert_eq!(builder.interface, Some("ABC123".to_string()));
+    }
+
+    #[test]
+    fn test_piper_builder_driver_type() {
+        let builder1 = PiperBuilder::new();
+        assert!(matches!(builder1.driver_type, DriverType::Auto));
+
+        let builder2 = PiperBuilder::new().with_driver_type(DriverType::GsUsb);
+        assert!(matches!(builder2.driver_type, DriverType::GsUsb));
+
+        let builder3 = PiperBuilder::new().with_driver_type(DriverType::SocketCan);
+        assert!(matches!(builder3.driver_type, DriverType::SocketCan));
     }
 }

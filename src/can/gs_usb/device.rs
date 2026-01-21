@@ -3,6 +3,7 @@
 //! 提供 USB 设备扫描、配置、数据传输等功能
 
 use rusb::{DeviceHandle, GlobalContext};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::trace;
 
@@ -62,8 +63,11 @@ pub struct StartResult {
 }
 
 /// GS-USB 设备句柄
+///
+/// 使用 `Arc<DeviceHandle>` 支持多线程共享
+/// 根据 `rusb` 源码，`DeviceHandle` 实现了 `Sync`，可以在不同线程间安全共享
 pub struct GsUsbDevice {
-    handle: DeviceHandle<GlobalContext>,
+    handle: Arc<DeviceHandle<GlobalContext>>,
     vendor_id: u16,
     product_id: u16,
     bus_number: u8,
@@ -78,6 +82,10 @@ pub struct GsUsbDevice {
     hw_timestamp: bool,
     /// 设备序列号（用于设备识别）
     serial_number: Option<String>,
+    /// USB Bulk OUT 发送超时（支持实时模式）
+    write_timeout: Duration,
+    /// USB STALL 计数回调（可选）
+    stall_count_callback: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl GsUsbDevice {
@@ -160,7 +168,7 @@ impl GsUsbDevice {
             };
 
             return Ok(GsUsbDevice {
-                handle,
+                handle: Arc::new(handle), // 使用 Arc 包裹，支持多线程共享
                 vendor_id,
                 product_id,
                 bus_number,
@@ -172,6 +180,8 @@ impl GsUsbDevice {
                 interface_claimed: false,
                 hw_timestamp: false,
                 serial_number,
+                write_timeout: Duration::from_millis(1000), // 默认 1000ms（向后兼容）
+                stall_count_callback: None,                 // USB STALL 计数回调（可选）
             });
         }
 
@@ -210,7 +220,9 @@ impl GsUsbDevice {
             };
 
             // 过滤（大小写敏感，与 scan_with_filter 保持一致）
-            if let Some(filter) = serial_number_filter && serial_number.as_deref() != Some(filter) {
+            if let Some(filter) = serial_number_filter
+                && serial_number.as_deref() != Some(filter)
+            {
                 continue;
             }
 
@@ -254,6 +266,39 @@ impl GsUsbDevice {
     /// USB address
     pub fn address(&self) -> u8 {
         self.address
+    }
+
+    /// 设置 USB Bulk OUT 发送超时（支持实时模式）
+    ///
+    /// # 参数
+    /// - `timeout`: 发送超时时间
+    ///   - 默认模式：1000ms（适合高负载/loopback 场景，提高可靠性）
+    ///   - 实时模式：5ms（快速失败，适合力控场景）
+    ///
+    /// # 使用场景
+    /// - **实时模式（5ms）**：力控/高频控制，需要快速失败而非长阻塞
+    /// - **默认模式（1000ms）**：状态监控/调试，更可靠但可能阻塞
+    pub fn set_write_timeout(&mut self, timeout: Duration) {
+        self.write_timeout = timeout;
+    }
+
+    /// 获取当前写超时设置
+    pub fn write_timeout(&self) -> Duration {
+        self.write_timeout
+    }
+
+    /// 设置 USB STALL 计数回调
+    ///
+    /// 当设备发生 USB STALL 并被成功清除时，会调用此回调。
+    /// 用于统计 STALL 事件，帮助诊断 USB 通信问题。
+    ///
+    /// # 参数
+    /// - `callback`: 回调函数，在 STALL 清除成功时调用
+    pub fn set_stall_count_callback<F>(&mut self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.stall_count_callback = Some(Arc::new(callback));
     }
 
     /// 查找 Bulk IN/OUT 端点
@@ -354,6 +399,10 @@ impl GsUsbDevice {
             if kernel_driver_active {
                 // Kernel driver 是 active 的，说明 reset 清除了接口状态
                 // 需要 detach 和 claim（与推荐流程一致）
+                tracing::info!(
+                    "Detaching kernel driver for GS-USB device to enable userspace mode. \
+                     Note: CAN network interface (can0) will temporarily disappear."
+                );
                 self.interface_claimed = false;
                 self.handle
                     .detach_kernel_driver(self.interface_number)
@@ -522,15 +571,13 @@ impl GsUsbDevice {
         let mut buf = bytes::BytesMut::new();
         frame.pack_to(&mut buf, self.hw_timestamp);
 
-        // **关键修复**：增加发送超时时间
+        // 使用可配置的写超时（支持实时模式）
+        // 默认 1000ms（向后兼容），实时模式下可设为 5ms（快速失败）
         // 在 Loopback 模式下，设备 CPU 负载很高（收->拷->发），USB 控制器可能返回 NAK
         // 如果超时设置太短，会导致偶发的 Write timeout 错误
         // 注意：这里的超时是最大允许等待时间，正常情况下传输是微秒级的
         // 只有在设备忙碌时才会等待，所以增加超时不会影响正常吞吐量
-        // **超时设置**：1000ms (1秒)
-        // 在 Loopback 模式下，设备 CPU 负载很高，需要足够的超时时间
-        // 这不会影响正常吞吐量（正常传输是微秒级），只是给设备忙碌时的时间
-        match self.handle.write_bulk(self.endpoint_out, &buf, Duration::from_millis(1000)) {
+        match self.handle.write_bulk(self.endpoint_out, &buf, self.write_timeout) {
             Ok(_) => Ok(()),
             Err(rusb::Error::Timeout) => {
                 // USB 批量传输超时后，endpoint 可能进入 STALL 状态
@@ -539,6 +586,10 @@ impl GsUsbDevice {
                 if let Err(clear_err) = self.handle.clear_halt(self.endpoint_out) {
                     warn!("Failed to clear endpoint halt after timeout: {}", clear_err);
                 } else {
+                    // 清除 STALL 成功，表示发生了 STALL，统计计数
+                    if let Some(ref callback) = self.stall_count_callback {
+                        callback();
+                    }
                     // 清除成功后，延迟让设备恢复
                     // 注意：某些设备可能需要更长的恢复时间，特别是连续超时后
                     std::thread::sleep(Duration::from_millis(50));

@@ -1012,8 +1012,8 @@ impl TryFrom<u8> for Feedback48XSetting {
 }
 
 /// 末端负载设置
-#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::enum_variant_names)]
 pub enum EndLoadSetting {
     /// 空载
     #[default]

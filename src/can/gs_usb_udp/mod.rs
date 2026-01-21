@@ -157,13 +157,14 @@ impl GsUsbUdpAdapter {
             let _ = self.disconnect();
         }
 
-        // 生成客户端 ID（简单实现：使用进程 ID + 时间戳）
-        self.client_id = std::process::id();
+        // 统一使用自动 ID 分配（client_id = 0 表示自动分配）
+        // 这样无论 UDS 还是 UDP 都使用相同策略，避免冲突
+        let request_client_id = 0u32;
 
         // 编码 Connect 消息
         let mut buf = [0u8; 256];
         let encoded = protocol::encode_connect(
-            self.client_id,
+            request_client_id,
             &filters,
             0, // seq = 0 for connect
             &mut buf,
@@ -192,10 +193,12 @@ impl GsUsbUdpAdapter {
                     if let Ok(msg) = protocol::decode_message(&ack_buf[..len]) {
                         match msg {
                             Message::ConnectAck {
-                                client_id: _,
+                                client_id, // 守护进程分配的 ID
                                 status,
                             } => {
                                 if status == 0 {
+                                    // 连接成功，保存守护进程分配的 ID
+                                    self.client_id = client_id;
                                     self.connected = true;
                                     // 启动心跳线程
                                     self.start_heartbeat_thread();
@@ -371,8 +374,15 @@ impl GsUsbUdpAdapter {
                         _ => break,
                     }
 
-                    // 每 5 秒发送一次心跳
-                    thread::sleep(Duration::from_secs(5));
+                    // 每 5 秒发送一次心跳，但要支持快速退出：
+                    // Drop() 会 join() 该线程；如果这里直接 sleep(5s)，退出时会“卡住”最多 5 秒。
+                    // 这里使用分段睡眠（总计 5s），每 100ms 检查一次 stop_flag，保证快速退出。
+                    for _ in 0..50 {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
                 }
             })
             .ok();

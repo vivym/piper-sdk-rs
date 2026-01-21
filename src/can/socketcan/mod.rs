@@ -37,7 +37,10 @@ use std::time::Duration;
 use tracing::{error, trace, warn};
 
 mod interface_check;
+mod split;
+
 use interface_check::check_interface_status;
+pub use split::{SocketCanRxAdapter, SocketCanTxAdapter};
 
 /// SocketCAN 适配器
 ///
@@ -266,7 +269,7 @@ impl SocketCanAdapter {
 
         let fd = self.socket.as_raw_fd();
 
-        // Phase 2.1: 使用 poll 实现超时
+        // 使用 poll 实现超时
         // 注意：nix 0.30 的 PollFd::new 需要 BorrowedFd，PollTimeout 需要毫秒数
         use std::os::fd::BorrowedFd;
         let pollfd = PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, PollFlags::POLLIN);
@@ -289,7 +292,7 @@ impl SocketCanAdapter {
             },
         }
 
-        // Phase 2.2: 准备缓冲区（防御性编程：使用编译时计算的大小）
+        // 准备缓冲区（防御性编程：使用编译时计算的大小）
         const CAN_FRAME_LEN: usize = std::mem::size_of::<libc::can_frame>();
         let mut frame_buf = [0u8; CAN_FRAME_LEN];
         let mut cmsg_buf = [0u8; 1024]; // CMSG 缓冲区
@@ -297,7 +300,7 @@ impl SocketCanAdapter {
         // 构建 IO 向量
         let mut iov = [IoSliceMut::new(&mut frame_buf)];
 
-        // Phase 2.2: 调用 recvmsg
+        // 调用 recvmsg
         let msg = match recvmsg::<SockaddrStorage>(
             fd,
             &mut iov,
@@ -329,15 +332,15 @@ impl SocketCanAdapter {
             )));
         }
 
-        // Phase 3: 先提取时间戳（在解析 CAN 帧之前，避免生命周期冲突）
+        // 先提取时间戳（在解析 CAN 帧之前，避免生命周期冲突）
         let timestamp_us = self.extract_timestamp_from_cmsg(&msg)?;
 
         // 在 recvmsg 调用完成后，iov 不再使用，可以安全地使用 frame_buf
-        // Phase 2.3: 解析 CAN 帧
+        // 解析 CAN 帧
         let received_bytes = msg.bytes;
         let can_frame = self.parse_raw_can_frame(&frame_buf[..received_bytes])?;
 
-        // Phase 2.4: 过滤错误帧（与 receive() 方法保持一致）
+        // 过滤错误帧（与 receive() 方法保持一致）
         if can_frame.is_error_frame() {
             // 处理错误帧（与 receive() 方法逻辑一致）
             if let Ok(error_frame) = CanErrorFrame::try_from(can_frame) {
@@ -378,7 +381,7 @@ impl SocketCanAdapter {
     ///
     /// 从 `recvmsg` 接收的原始字节数组解析为 `CanFrame`。
     ///
-    /// **实现状态**：Phase 2 - 已实现，使用 `std::ptr::copy_nonoverlapping` 安全地解析 `libc::can_frame` 结构。
+    /// **实现说明**：使用 `std::ptr::copy_nonoverlapping` 安全地解析 `libc::can_frame` 结构。
     ///
     /// # 参数
     /// - `data`: 原始 CAN 帧数据（`libc::can_frame` 的字节表示）
@@ -483,7 +486,7 @@ impl SocketCanAdapter {
     ///
     /// 从 `recvmsg` 返回的控制消息（CMSG）中提取硬件/软件时间戳。
     ///
-    /// **实现状态**：Phase 3 - 已实现完整的时间戳提取逻辑，包括优先级选择。
+    /// **实现说明**：已实现完整的时间戳提取逻辑，包括优先级选择。
     ///
     /// # 参数
     /// - `msg`: `recvmsg` 返回的消息对象，包含 CMSG 控制消息
@@ -593,6 +596,63 @@ impl Drop for SocketCanAdapter {
     }
 }
 
+// 实现 SplittableAdapter trait
+use crate::can::{RxAdapter, SplittableAdapter, TxAdapter};
+use std::mem::ManuallyDrop;
+
+impl SplittableAdapter for SocketCanAdapter {
+    type RxAdapter = SocketCanRxAdapter;
+    type TxAdapter = SocketCanTxAdapter;
+
+    /// 分离为独立的 RX 和 TX 适配器
+    ///
+    /// # 前置条件
+    /// - 设备必须已启动（`is_started() == true`）
+    ///
+    /// # 错误
+    /// - `CanError::NotStarted`: 适配器未启动
+    /// - `CanError::Io`: 克隆 socket 或配置失败
+    ///
+    /// # ⚠️ 关键警告：`try_clone()` 的共享状态陷阱
+    ///
+    /// 分离后的 RX 和 TX 适配器通过 `dup()` 共享同一个"打开文件描述"（Open File Description），
+    /// 这意味着：
+    ///
+    /// 1. **文件状态标志共享**：`O_NONBLOCK` 等标志保存在"打开文件描述"中。
+    ///    - **严禁使用 `set_nonblocking()`**：如果在 RX 线程设置非阻塞模式，TX 线程也会受影响。
+    ///    - **正确做法**：严格依赖 `SO_RCVTIMEO` 和 `SO_SNDTIMEO` 实现超时。
+    ///
+    /// 2. **过滤器共享**：RX 适配器设置的硬件过滤器会影响所有共享该打开文件描述的 FD。
+    ///    - **现状**：当前设计是安全的（TX 只写不读），但需知晓此特性。
+    ///
+    /// # 注意
+    /// - 分离后，原适配器不再可用（消费 `self`）
+    /// - RX 和 TX 适配器可以在不同线程中并发使用
+    /// - FD 通过 RAII 自动管理，无需手动关闭
+    fn split(mut self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+        if !self.started {
+            return Err(CanError::NotStarted);
+        }
+
+        // 使用 ManuallyDrop 防止 Drop 被调用
+        // 因为我们要移动 socket 到分离的适配器中
+        let mut adapter = ManuallyDrop::new(self);
+
+        // 创建 RX 适配器（会克隆 socket）
+        let rx_adapter = SocketCanRxAdapter::new(&adapter.socket, adapter.read_timeout)?;
+
+        // 创建 TX 适配器（会克隆 socket）
+        let tx_adapter = SocketCanTxAdapter::new(&adapter.socket)?;
+
+        trace!(
+            "SocketCanAdapter split into RX and TX adapters (interface: {})",
+            adapter.interface
+        );
+
+        Ok((rx_adapter, tx_adapter))
+    }
+}
+
 impl CanAdapter for SocketCanAdapter {
     /// 发送帧（Fire-and-Forget）
     ///
@@ -655,7 +715,7 @@ impl CanAdapter for SocketCanAdapter {
     /// - `CanError::Io`: IO 错误
     ///
     /// # 实现
-    /// - 使用 `receive_with_timestamp()` 接收帧并提取时间戳（Phase 4）
+    /// - 使用 `receive_with_timestamp()` 接收帧并提取时间戳（包含硬件/软件时间戳提取）
     /// - 错误帧过滤由 `receive_with_timestamp()` 处理
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
         if !self.started {
@@ -685,6 +745,54 @@ impl CanAdapter for SocketCanAdapter {
             piper_frame.id, piper_frame.len, piper_frame.timestamp_us
         );
         Ok(piper_frame)
+    }
+
+    /// 设置接收超时
+    fn set_receive_timeout(&mut self, timeout: Duration) {
+        if let Err(e) = self.set_read_timeout(timeout) {
+            warn!("Failed to set receive timeout: {}", e);
+        }
+    }
+
+    /// 带超时的接收
+    fn receive_timeout(&mut self, timeout: Duration) -> Result<PiperFrame, CanError> {
+        // 保存原超时
+        let old_timeout = self.read_timeout;
+
+        // 设置新超时
+        self.set_read_timeout(timeout)?;
+
+        // 接收
+        let result = self.receive();
+
+        // 恢复原超时
+        let _ = self.set_read_timeout(old_timeout);
+
+        result
+    }
+
+    /// 非阻塞接收
+    fn try_receive(&mut self) -> Result<Option<PiperFrame>, CanError> {
+        // 使用零超时模拟非阻塞
+        match self.receive_timeout(Duration::ZERO) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(CanError::Timeout) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 带超时的发送
+    fn send_timeout(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
+        // SocketCAN 支持发送超时（通过 SO_SNDTIMEO）
+        // 临时设置发送超时
+        self.socket.set_write_timeout(timeout).map_err(CanError::Io)?;
+
+        let result = self.send(frame);
+
+        // 恢复默认发送超时（5ms，与 SocketCanTxAdapter 一致）
+        let _ = self.socket.set_write_timeout(Duration::from_millis(5));
+
+        result
     }
 }
 
@@ -836,7 +944,7 @@ mod tests {
             },
             Ok((_frame, _timestamp_us)) => {
                 // 如果收到了帧（可能来自其他测试），验证时间戳格式
-                // Phase 3 已实现：时间戳应该被提取（可能非零，也可能溢出为 u32::MAX）
+                // 时间戳应该被提取（可能非零，也可能溢出为 u32::MAX）
             },
             Err(e) => panic!("Expected Timeout or Ok, got: {:?}", e),
         }
@@ -903,7 +1011,7 @@ mod tests {
             "Frame data should match"
         );
 
-        // 验证时间戳（Phase 3 已实现：vcan0 上至少应该有软件时间戳）
+        // 验证时间戳（vcan0 上至少应该有软件时间戳）
         // 注意：软件时间戳是系统时间（从 Unix 纪元开始），可能超过 u32::MAX
         // 我们的实现会截断为 u32::MAX，这是预期的行为
         // 实际使用中，可能需要使用相对时间戳（从某个基准时间开始）

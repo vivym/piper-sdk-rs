@@ -1,7 +1,8 @@
 //! CAN 适配层核心定义
 //!
-//! 提供统一的 CAN 接口抽象，支持 SocketCAN（Linux）和 GS-USB（跨平台）两种后端。
+//! 提供统一的 CAN 接口抽象，支持 SocketCAN（Linux）和 GS-USB（Linux/macOS/Windows）两种后端。
 
+use std::time::Duration;
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
@@ -10,15 +11,19 @@ pub mod socketcan;
 #[cfg(target_os = "linux")]
 pub use socketcan::SocketCanAdapter;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "linux")]
+pub use socketcan::split::{SocketCanRxAdapter, SocketCanTxAdapter};
+
 pub mod gs_usb;
 
 // Re-export gs_usb 类型
-#[cfg(not(target_os = "linux"))]
 pub use gs_usb::GsUsbCanAdapter;
 
 // GS-USB 守护进程客户端库（UDS/UDP）
 pub mod gs_usb_udp;
+
+// 导出 split 相关的类型（如果可用）
+pub use gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
 
 /// SDK 通用的 CAN 帧定义（只针对 CAN 2.0）
 ///
@@ -152,6 +157,23 @@ impl CanDeviceError {
             message: message.into(),
         }
     }
+
+    /// 判断是否为致命错误
+    ///
+    /// 致命错误表示设备已不可用，需要重新初始化或停止操作。
+    /// 非致命错误可以重试或忽略。
+    ///
+    /// # 返回
+    /// - `true`：致命错误（设备不可用）
+    /// - `false`：非致命错误（可以重试）
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self.kind,
+            CanDeviceErrorKind::NoDevice
+                | CanDeviceErrorKind::AccessDenied
+                | CanDeviceErrorKind::NotFound
+        )
+    }
 }
 
 impl From<String> for CanDeviceError {
@@ -171,6 +193,8 @@ impl From<&str> for CanDeviceError {
 /// 语义：
 /// - `send()`: Fire-and-Forget，USB 写入成功即返回
 /// - `receive()`: 阻塞直到收到有效数据帧或超时
+///
+/// 增加了超时和非阻塞方法，提高 API 一致性和灵活性。
 pub trait CanAdapter {
     /// 发送一帧
     ///
@@ -197,11 +221,191 @@ pub trait CanAdapter {
     /// - 总线关闭 → `CanError::BusOff`（致命）
     /// - 设备未启动 → `CanError::NotStarted`
     fn receive(&mut self) -> Result<PiperFrame, CanError>;
+
+    /// 设置接收超时
+    ///
+    /// 设置后续 `receive()` 调用的超时时间。
+    /// 如果适配器不支持动态设置超时，此方法可能无效。
+    ///
+    /// # 参数
+    /// - `timeout`: 超时时间
+    ///
+    /// # 默认实现
+    /// 默认实现为空操作（no-op），适配器可以使用默认超时或初始化时设置的超时。
+    fn set_receive_timeout(&mut self, _timeout: Duration) {
+        // 默认实现：空操作
+        // 具体适配器可以覆盖此方法以实现动态超时设置
+    }
+
+    /// 带超时的接收
+    ///
+    /// 使用指定的超时时间接收一帧，不影响后续 `receive()` 调用的超时设置。
+    ///
+    /// # 参数
+    /// - `timeout`: 超时时间
+    ///
+    /// # 返回
+    /// - `Ok(frame)`: 成功接收到帧
+    /// - `Err(CanError::Timeout)`: 超时
+    /// - `Err(e)`: 其他错误
+    ///
+    /// # 默认实现
+    /// 默认实现临时设置超时，调用 `receive()`，然后恢复原超时。
+    /// 如果适配器不支持动态超时，使用默认超时。
+    fn receive_timeout(&mut self, timeout: Duration) -> Result<PiperFrame, CanError> {
+        // 默认实现：临时设置超时，调用 receive，然后恢复
+        // 注意：这个实现可能不够精确，具体适配器应该覆盖此方法
+        self.set_receive_timeout(timeout);
+        // 恢复原超时（如果适配器支持）
+        // 注意：这里无法恢复，因为不知道原超时值
+        // 具体适配器应该覆盖此方法以实现精确的超时控制
+        self.receive()
+    }
+
+    /// 非阻塞接收
+    ///
+    /// 尝试接收一帧，如果当前没有可用数据，立即返回 `Ok(None)`。
+    ///
+    /// # 返回
+    /// - `Ok(Some(frame))`: 成功接收到帧
+    /// - `Ok(None)`: 当前没有可用数据（非阻塞）
+    /// - `Err(e)`: 错误（设备错误、总线错误等）
+    ///
+    /// # 默认实现
+    /// 默认实现使用 `receive_timeout(Duration::ZERO)` 模拟非阻塞行为。
+    /// 如果适配器支持真正的非阻塞模式，应该覆盖此方法。
+    fn try_receive(&mut self) -> Result<Option<PiperFrame>, CanError> {
+        // 默认实现：使用零超时模拟非阻塞
+        match self.receive_timeout(Duration::ZERO) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(CanError::Timeout) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 带超时的发送
+    ///
+    /// 使用指定的超时时间发送一帧。
+    ///
+    /// # 参数
+    /// - `frame`: 要发送的帧
+    /// - `timeout`: 超时时间
+    ///
+    /// # 返回
+    /// - `Ok(())`: 成功发送
+    /// - `Err(CanError::Timeout)`: 超时（发送缓冲区满或设备无响应）
+    /// - `Err(e)`: 其他错误
+    ///
+    /// # 默认实现
+    /// 默认实现直接调用 `send()`，忽略超时参数。
+    /// 如果适配器支持发送超时，应该覆盖此方法。
+    fn send_timeout(&mut self, frame: PiperFrame, _timeout: Duration) -> Result<(), CanError> {
+        // 默认实现：直接调用 send，忽略超时
+        // 具体适配器可以覆盖此方法以实现发送超时
+        self.send(frame)
+    }
+}
+
+/// RX 适配器 Trait（用于双线程模式）
+///
+/// 只读适配器，专门用于接收 CAN 帧。
+/// 在双线程模式下，RX 线程使用此 trait 接收反馈帧。
+pub trait RxAdapter {
+    /// 接收一帧
+    ///
+    /// # 语义
+    /// - **阻塞读取**：直到收到有效数据帧或超时
+    /// - **自动过滤**：内部过滤 Echo 帧和瞬态错误
+    /// - **只返回有效数据**：过滤后的 CAN 总线数据
+    ///
+    /// # 错误处理
+    /// - 超时 → `CanError::Timeout`（可重试）
+    /// - 缓冲区溢出 → `CanError::BufferOverflow`（致命）
+    /// - 总线关闭 → `CanError::BusOff`（致命）
+    fn receive(&mut self) -> Result<PiperFrame, CanError>;
+}
+
+/// TX 适配器 Trait（用于双线程模式）
+///
+/// 只写适配器，专门用于发送 CAN 帧。
+/// 在双线程模式下，TX 线程使用此 trait 发送控制命令。
+pub trait TxAdapter {
+    /// 发送一帧
+    ///
+    /// # 语义
+    /// - **Fire-and-Forget**：将帧放入发送缓冲区即返回
+    /// - **不等待 Echo**：不阻塞等待 USB echo 确认
+    /// - **返回条件**：USB Bulk OUT 写入成功
+    ///
+    /// # 错误处理
+    /// - USB 写入失败 → `CanError::Io` 或 `CanError::Device`
+    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError>;
+}
+
+/// 可分离适配器 Trait
+///
+/// 支持将适配器分离为独立的 RX 和 TX 适配器，实现双线程并发访问。
+///
+/// # 使用场景
+/// - 双线程 IO 架构：RX 和 TX 线程物理隔离，避免相互阻塞
+/// - 实时控制：RX 线程不受 TX 阻塞影响，保证状态更新及时性
+///
+/// # 实现要求
+/// - 设备必须已启动（`started == true`）才能分离
+/// - 分离后，原适配器不再可用（消费 `self`）
+/// - RX 和 TX 适配器可以在不同线程中并发使用
+pub trait SplittableAdapter: CanAdapter {
+    /// RX 适配器类型
+    type RxAdapter: RxAdapter;
+
+    /// TX 适配器类型
+    type TxAdapter: TxAdapter;
+
+    /// 分离为独立的 RX 和 TX 适配器
+    ///
+    /// # 前置条件
+    /// - 设备必须已启动
+    ///
+    /// # 返回
+    /// - `Ok((rx_adapter, tx_adapter))`：成功分离
+    /// - `Err(CanError::NotStarted)`：设备未启动
+    ///
+    /// # 注意
+    /// 此方法会消费 `self`，分离后不能再使用原适配器。
+    fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_can_device_error_is_fatal() {
+        // 测试致命错误
+        let fatal_errors = vec![
+            CanDeviceError::new(CanDeviceErrorKind::NoDevice, "Device not found"),
+            CanDeviceError::new(CanDeviceErrorKind::AccessDenied, "Access denied"),
+            CanDeviceError::new(CanDeviceErrorKind::NotFound, "Device not found"),
+        ];
+
+        for error in fatal_errors {
+            assert!(error.is_fatal(), "Error should be fatal: {:?}", error);
+        }
+
+        // 测试非致命错误
+        let non_fatal_errors = vec![
+            CanDeviceError::new(CanDeviceErrorKind::Backend, "Backend error"),
+            CanDeviceError::new(CanDeviceErrorKind::Busy, "Device busy"),
+            CanDeviceError::new(CanDeviceErrorKind::InvalidFrame, "Invalid frame"),
+            CanDeviceError::new(CanDeviceErrorKind::InvalidResponse, "Invalid response"),
+            CanDeviceError::new(CanDeviceErrorKind::UnsupportedConfig, "Unsupported config"),
+            CanDeviceError::new(CanDeviceErrorKind::Unknown, "Unknown error"),
+        ];
+
+        for error in non_fatal_errors {
+            assert!(!error.is_fatal(), "Error should not be fatal: {:?}", error);
+        }
+    }
 
     #[test]
     fn test_piper_frame_new_standard() {

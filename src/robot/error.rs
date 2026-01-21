@@ -23,6 +23,12 @@ pub enum RobotError {
     #[error("Command channel full (buffer size: 10)")]
     ChannelFull,
 
+    /// 未使用双线程模式
+    ///
+    /// 某些方法（如 `send_realtime()`）只能在双线程模式下使用。
+    #[error("Not in dual-thread mode. Use `new_dual_thread()` instead of `new()`")]
+    NotDualThread,
+
     /// 锁被毒化（线程 panic）
     #[error("Poisoned lock (thread panic)")]
     PoisonedLock,

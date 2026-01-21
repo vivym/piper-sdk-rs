@@ -13,14 +13,18 @@
 //!
 //! 使用方式：
 //! ```bash
-//! # 直接连接（Linux: SocketCAN, macOS/Windows: GS-USB）
+//! # 直接连接（Linux: 默认尝试 SocketCAN，其他平台: GS-USB）
 //! cargo run --example robot_monitor
 //!
-//! # 通过 UDS 连接守护进程（macOS/Windows）
+//! # 通过守护进程连接（所有平台，默认使用 UDP）
+//! cargo run --example robot_monitor -- --uds 127.0.0.1:18888
+//!
+//! # 或使用 UDS 路径
 //! cargo run --example robot_monitor -- --uds /tmp/gs_usb_daemon.sock
 //!
-//! # 指定 CAN 接口（Linux）
+//! # 指定 CAN 接口（Linux: SocketCAN）或设备序列号（所有平台: GS-USB）
 //! cargo run --example robot_monitor -- --interface can0
+//! cargo run --example robot_monitor -- --interface ABC123456  # 使用 GS-USB 设备序列号
 //! ```
 
 use clap::Parser;
@@ -37,7 +41,10 @@ use std::time::Duration;
 #[command(name = "robot_monitor")]
 #[command(about = "机器人实时监控工具")]
 struct Args {
-    /// CAN 接口名称（Linux: "can0", macOS/Windows: 设备序列号）
+    /// CAN 接口名称或设备序列号
+    ///
+    /// - Linux: "can0"/"can1" 等 SocketCAN 接口名，或设备序列号（使用 GS-USB）
+    /// - macOS/Windows: GS-USB 设备序列号
     #[arg(long)]
     interface: Option<String>,
 
@@ -45,12 +52,13 @@ struct Args {
     #[arg(long, default_value = "1000000")]
     baud_rate: u32,
 
-    /// UDS Socket 路径（通过守护进程连接，macOS/Windows）
+    /// 守护进程地址（通过守护进程连接，所有平台）
     ///
-    /// 如果指定此参数，将通过 gs_usb_daemon 连接，而不是直接连接 GS-USB 设备。
-    /// 默认: /tmp/gs_usb_daemon.sock
-    #[arg(long)]
-    uds: Option<String>,
+    /// 如果指定此参数，将通过 gs_usb_daemon 连接，而不是直接连接设备。
+    /// 支持 UDS 路径（如 "/tmp/gs_usb_daemon.sock"）或 UDP 地址（如 "127.0.0.1:18888"）
+    /// 默认: 127.0.0.1:18888 (UDP)
+    #[arg(long, default_value = "127.0.0.1:18888")]
+    uds: String,
 }
 
 /// 控制模式转换为字符串
@@ -238,31 +246,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("正在连接到机械臂...");
 
     // 1. 创建 Piper 实例
-    let builder = {
+    // 使用 Smart Default 机制：Linux 上如果 interface 是 "can0"/"can1"，优先使用 SocketCAN；否则使用 GS-USB
+    // 默认使用守护进程模式（UDP），也可以通过 --interface 直接连接设备
+    let builder = if let Some(interface) = &args.interface {
+        // 指定接口/设备序列号（所有平台）
         #[cfg(target_os = "linux")]
         {
-            // Linux: SocketCAN
-            let interface = args.interface.as_deref().unwrap_or("can0");
-            println!("使用 CAN 接口: {}", interface);
-            PiperBuilder::new().interface(interface)
+            println!(
+                "使用 CAN 接口: {} (将尝试 SocketCAN，失败时自动切换到 GS-USB)",
+                interface
+            );
         }
         #[cfg(not(target_os = "linux"))]
         {
-            // macOS/Windows: GS-USB 或守护进程模式
-            if let Some(uds_path) = &args.uds {
-                // 守护进程模式（UDS）
-                println!("使用守护进程模式 (UDS): {}", uds_path);
-                PiperBuilder::new().with_daemon(uds_path)
-            } else if let Some(interface) = &args.interface {
-                // 直接连接，指定设备序列号
-                println!("使用设备序列号: {}", interface);
-                PiperBuilder::new().interface(interface)
-            } else {
-                // 直接连接，自动检测设备
-                println!("使用默认 CAN 接口配置（自动检测设备）");
-                PiperBuilder::new()
-            }
+            println!("使用设备序列号: {}", interface);
         }
+        PiperBuilder::new().interface(interface)
+    } else {
+        // 守护进程模式（UDS/UDP）- 所有平台支持
+        // 代码会自动识别是 UDS 路径还是 UDP 地址
+        println!("使用守护进程模式: {}", args.uds);
+        PiperBuilder::new().with_daemon(&args.uds)
     };
 
     let piper = builder
@@ -276,6 +280,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. 等待初始反馈（给设备一点时间建立连接）
     std::thread::sleep(Duration::from_millis(100));
+
+    // FPS 统计：每 5 秒重置一次（丢弃历史窗口）
+    piper.reset_fps_stats();
+    let mut fps_window_start = std::time::Instant::now();
 
     // 3. 主循环：定期读取并打印反馈
     let mut iteration = 0u64;
@@ -300,6 +308,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gripper,
             &fps,
         );
+
+        // ✅ 每隔 5 秒在打印结束之后重置 Piper 内部 FPS 计数器
+        if fps_window_start.elapsed() >= Duration::from_secs(5) {
+            fps_window_start = std::time::Instant::now();
+            piper.reset_fps_stats();
+        }
 
         // 控制刷新频率（1Hz，每秒打印一次）
         std::thread::sleep(Duration::from_secs(1));

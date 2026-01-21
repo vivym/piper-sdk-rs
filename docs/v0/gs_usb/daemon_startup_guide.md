@@ -190,6 +190,16 @@ launchctl unload ~/Library/LaunchAgents/com.piper.gs_usb_daemon.plist
 
 ## 使用客户端连接
 
+### 客户端 ID 分配（自动模式）
+
+**重要更新**：所有客户端（UDS 和 UDP）现在统一使用**自动 ID 分配**模式：
+
+- ✅ **自动分配**：客户端发送 `client_id = 0` 请求守护进程自动分配唯一 ID
+- ✅ **无冲突**：守护进程保证分配的 ID 唯一性，特别适合 UDP 跨网络场景
+- ✅ **向后兼容**：仍支持手动指定 ID（不推荐）
+
+客户端会自动从 `ConnectAck` 获取守护进程分配的 ID，无需手动管理。
+
 ### 使用 UDS（推荐，延迟最低）
 
 ```rust
@@ -200,6 +210,8 @@ let robot = PiperBuilder::new()
     .build()
     .unwrap();
 ```
+
+**注意**：客户端会自动请求 ID 分配，无需手动指定。
 
 ### 使用 UDP（用于跨机器调试）
 
@@ -212,7 +224,9 @@ let robot = PiperBuilder::new()
     .unwrap();
 ```
 
-**注意**：当前守护进程默认不启用 UDP，需要修改代码启用。
+**注意**：
+- UDP 场景下**必须**使用自动 ID 分配（跨网络，进程 ID 可能冲突）
+- 客户端自动处理 ID 分配，无需手动指定
 
 ## 故障排除
 

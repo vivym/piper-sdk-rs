@@ -13,7 +13,7 @@
 ### 方法 1：使用 `--test-threads=1`（推荐）
 
 ```bash
-# Stage 1: Loopback 模式测试
+# Loopback 模式测试
 cargo test --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1
 
 # 集成测试
@@ -34,7 +34,7 @@ cargo test --test gs_usb_stage1_loopback_tests -- --ignored test_loopback_end_to
 
 | 测试文件 | 描述 | 是否需要硬件 |
 |---------|------|-------------|
-| `gs_usb_stage1_loopback_tests.rs` | Stage 1: Loopback 模式端到端测试 | ✅ 是 |
+| `gs_usb_stage1_loopback_tests.rs` | Loopback 模式端到端测试 | ✅ 是 |
 | `gs_usb_integration_tests.rs` | 集成测试（基本功能验证） | ✅ 是 |
 | `gs_usb_performance_tests.rs` | 性能测试（1kHz 等） | ✅ 是 |
 | `gs_usb_debug_scan.rs` | 设备扫描诊断工具 | ✅ 是 |

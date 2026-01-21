@@ -15,16 +15,22 @@
 - 🔄 **Lock-Free Concurrency**: RCU (Read-Copy-Update) mechanism for efficient state sharing
 - 🎯 **Type Safety**: Bit-level protocol parsing using `bilge`, compile-time data correctness guarantees
 - 🌍 **Cross-Platform Support (Linux/Windows/macOS)**:
-  - **Linux**: Based on SocketCAN (kernel-level performance)
-  - **Windows/macOS**: User-space GS-USB driver implementation using `rusb` (driver-free/universal)
+  - **Linux**: Supports both SocketCAN (kernel-level performance) and GS-USB (userspace via libusb)
+  - **Windows/macOS**: GS-USB driver implementation using `rusb` (driver-free/universal)
+- 📊 **Advanced Health Monitoring** (gs_usb_daemon):
+  - **CAN Bus Off Detection**: Detects CAN Bus Off events (critical system failure) with debounce mechanism
+  - **Error Passive Monitoring**: Monitors Error Passive state (pre-Bus Off warning) for early detection
+  - **USB STALL Tracking**: Tracks USB endpoint STALL errors for USB communication health
+  - **Performance Baseline**: Dynamic FPS baseline tracking with EWMA for anomaly detection
+  - **Health Score**: Comprehensive health scoring (0-100) based on multiple metrics
 
 ## 🛠️ Tech Stack
 
 | Module | Crates | Purpose |
 |--------|--------|---------|
 | CAN Interface | Custom `CanAdapter` | Lightweight CAN adapter Trait (no embedded burden) |
-| Linux Backend | `socketcan` | Native Linux CAN support (planned) |
-| USB Backend | `rusb` | USB device operations on Windows/macOS, implementing GS-USB protocol |
+| Linux Backend | `socketcan` | Native Linux CAN support (SocketCAN interface) |
+| USB Backend | `rusb` | USB device operations on all platforms, implementing GS-USB protocol |
 | Protocol Parsing | `bilge` | Bit operations, unaligned data processing, alternative to serde |
 | Concurrency Model | `crossbeam-channel` | High-performance MPSC channel for sending control commands |
 | State Sharing | `arc-swap` | RCU mechanism for lock-free reading of latest state |
@@ -40,6 +46,24 @@ Add the dependency to your `Cargo.toml`:
 piper-sdk = "0.0.1"
 ```
 
+### Optional: Real-time Thread Priority Support
+
+For high-frequency control scenarios (500Hz-1kHz), you can enable the `realtime` feature to set RX thread to maximum priority:
+
+```toml
+[dependencies]
+piper-sdk = { version = "0.0.1", features = ["realtime"] }
+```
+
+**Note**: On Linux, setting thread priority requires appropriate permissions:
+- Run with `CAP_SYS_NICE` capability: `sudo setcap cap_sys_nice+ep /path/to/your/binary`
+- Or use `rtkit` (RealtimeKit) for user-space priority elevation
+- Or run as root (not recommended for production)
+
+If permission is insufficient, the SDK will log a warning but continue to function normally.
+
+See [Real-time Configuration Guide](docs/v0/realtime_configuration.md) for detailed setup instructions.
+
 ## 🚀 Quick Start
 
 ### Basic Usage
@@ -50,7 +74,7 @@ use piper_sdk::PiperBuilder;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create Piper instance
     let robot = PiperBuilder::new()
-        .interface("can0")?  // Linux: SocketCAN interface name
+        .interface("can0")?  // Linux: SocketCAN interface name (or GS-USB device serial)
         .baud_rate(1_000_000)?  // CAN baud rate
         .build()?;
 
@@ -76,29 +100,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Hot/Cold Data Splitting
 
-For performance optimization, state data is divided into three categories:
+For performance optimization, state data is divided into two categories:
 
-- **Hot Data (500Hz)**:
+- **High-frequency Data (200Hz)**:
   - `JointPositionState`: Joint positions (6 joints)
   - `EndPoseState`: End-effector pose (position and orientation)
   - `JointDynamicState`: Joint dynamic state (joint velocities, currents)
-  - Uses `ArcSwap` for lock-free reading, Frame Commit mechanism ensures atomicity
-
-- **Warm Data (100Hz)**:
   - `RobotControlState`: Robot control status (control mode, robot status, fault codes, etc.)
   - `GripperState`: Gripper status (travel, torque, status codes, etc.)
-  - Uses `ArcSwap` for read/write operations, medium update frequency
+  - Uses `ArcSwap` for lock-free reading, optimized for high-frequency control loops
 
-- **Medium Data (40Hz)**:
+- **Low-frequency Data (40Hz)**:
   - `JointDriverLowSpeedState`: Joint driver diagnostic state (temperatures, voltages, currents, driver status)
-  - Uses `ArcSwap` for wait-free reading, optimized for concurrent access
-
-- **Cold Data (on-demand)**:
-  - `CollisionProtectionState`: Collision protection levels
-  - `JointLimitConfigState`: Joint angle and velocity limits
-  - `JointAccelConfigState`: Joint acceleration limits
-  - `EndLimitConfigState`: End-effector velocity and acceleration limits
-  - Uses `RwLock` for read/write operations, low update frequency
+  - `CollisionProtectionState`: Collision protection levels (on-demand)
+  - `JointLimitConfigState`: Joint angle and velocity limits (on-demand)
+  - `JointAccelConfigState`: Joint acceleration limits (on-demand)
+  - `EndLimitConfigState`: End-effector velocity and acceleration limits (on-demand)
+  - Uses `ArcSwap` for diagnostic data, `RwLock` for configuration data
 
 ### Core Components
 
@@ -141,8 +159,13 @@ Check the `examples/` directory for more examples:
 
 > **Note**: Example code is under development. See [examples/](examples/) directory for more examples.
 
+Available examples:
+- `state_api_demo.rs` - Simple state reading and printing
+- `realtime_control_demo.rs` - Real-time control with dual-threaded architecture
+- `robot_monitor.rs` - Robot state monitoring
+- `timestamp_verification.rs` - Timestamp synchronization verification
+
 Planned examples:
-- `read_state.rs` - Simple state reading and printing
 - `torque_control.rs` - Force control demonstration
 - `configure_can.rs` - CAN baud rate configuration tool
 
@@ -159,6 +182,8 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 For detailed design documentation, see:
 - [Architecture Design Document](docs/v0/TDD.md)
 - [Protocol Document](docs/v0/protocol.md)
+- [Real-time Configuration Guide](docs/v0/realtime_configuration.md)
+- [Real-time Optimization Guide](docs/v0/realtime_optimization.md)
 
 ## 🔗 Related Links
 

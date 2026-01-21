@@ -10,14 +10,11 @@
 //! cargo test --test gs_usb_performance_tests -- --ignored --test-threads=1
 //! ```
 
-// GS-USB 模块只在非 Linux 系统上可用
-#[cfg(not(target_os = "linux"))]
+// GS-USB 模块在所有平台可用
 use piper_sdk::can::gs_usb::GsUsbCanAdapter;
-#[cfg(not(target_os = "linux"))]
 use piper_sdk::can::{CanAdapter, PiperFrame};
 
 /// 测试 1kHz 发送性能（Fire-and-Forget）
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_1khz_send_performance() {
@@ -50,7 +47,6 @@ fn test_1khz_send_performance() {
 }
 
 /// 测试发送延迟（单帧发送时间）
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_send_latency() {
@@ -86,7 +82,6 @@ fn test_send_latency() {
 }
 
 /// 测试接收延迟（超时场景）
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_receive_timeout_latency() {
@@ -115,7 +110,6 @@ fn test_receive_timeout_latency() {
 }
 
 /// 测试批量发送性能（连续发送 1000 帧）
-#[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore]
 fn test_batch_send_performance() {

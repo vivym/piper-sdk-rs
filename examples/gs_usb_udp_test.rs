@@ -3,7 +3,7 @@
 //! 此示例演示如何通过 UDS (Unix Domain Socket) 连接到 gs_usb_daemon 并测试 CAN 总线功能。
 //!
 //! 使用前请确保：
-//! 1. gs_usb_daemon 已经启动（默认 UDS 路径: /tmp/gs_usb_daemon.sock）
+//! 1. gs_usb_daemon 已经启动（默认 UDP 地址: 127.0.0.1:18888）
 //! 2. GS-USB 设备已连接并配置好
 //!
 //! 运行方式：
@@ -13,6 +13,8 @@
 //!
 //! 或者指定自定义 UDS 路径：
 //! ```bash
+//! cargo run --example gs_usb_udp_test -- --uds 127.0.0.1:18888
+//! # 或使用 UDS 路径
 //! cargo run --example gs_usb_udp_test -- --uds /tmp/custom_daemon.sock
 //!
 
@@ -30,8 +32,8 @@ use std::time::{Duration, Instant};
 struct Args {
     /// UDS Socket 路径
     ///
-    /// 默认: /tmp/gs_usb_daemon.sock
-    #[arg(long, default_value = "/tmp/gs_usb_daemon.sock")]
+    /// 默认: 127.0.0.1:18888 (UDP)
+    #[arg(long, default_value = "127.0.0.1:18888")]
     uds: String,
 
     /// 测试模式

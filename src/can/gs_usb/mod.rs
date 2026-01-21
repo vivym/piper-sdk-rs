@@ -1,17 +1,23 @@
 //! GS-USB CAN 适配器实现
 //!
-//! 支持 macOS/Windows 平台的 GS-USB 协议实现
+//! 支持 Linux/macOS/Windows 平台的 GS-USB 协议实现
 
 pub mod device;
 pub mod error;
 pub mod frame;
 pub mod protocol;
+pub mod split;
 
 use crate::can::gs_usb::device::{GsUsbDevice, GsUsbDeviceSelector};
 use crate::can::gs_usb::frame::GsUsbFrame;
 use crate::can::gs_usb::protocol::*;
-use crate::can::{CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame};
+use crate::can::gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
+use crate::can::{
+    CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, SplittableAdapter,
+};
 use std::collections::VecDeque;
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, trace};
 
@@ -19,7 +25,7 @@ use tracing::{error, trace};
 ///
 /// 实现 `CanAdapter` trait，提供统一的 CAN 接口
 pub struct GsUsbCanAdapter {
-    device: GsUsbDevice,
+    device: GsUsbDevice, // 在 split 时包裹为 Arc
     started: bool,
     /// 当前设备模式（用于判断是否需要过滤 Echo）
     mode: u32,
@@ -29,6 +35,12 @@ pub struct GsUsbCanAdapter {
     /// USB 硬件会将多个 CAN 帧打包在一个 USB Bulk 包中发送
     /// 我们需要缓存这些帧，以便逐帧返回给上层应用
     rx_queue: VecDeque<PiperFrame>,
+    /// 实时模式标志
+    /// - `true`：写超时设为 5ms（快速失败）
+    /// - `false`：写超时保持 1000ms（默认，更可靠）
+    realtime_mode: bool,
+    /// 连续写超时计数（用于检测设备故障）
+    consecutive_write_timeouts: u32,
 }
 
 impl GsUsbCanAdapter {
@@ -81,24 +93,39 @@ impl GsUsbCanAdapter {
             None => GsUsbDeviceSelector::any(),
         };
         let device = GsUsbDevice::open(&selector).map_err(|e| {
-            let kind = match e {
+            let (kind, message) = match e {
                 crate::can::gs_usb::error::GsUsbError::DeviceNotFound => {
-                    CanDeviceErrorKind::NotFound
+                    (CanDeviceErrorKind::NotFound, format!("Failed to open device: {}", e))
                 },
-                _ => CanDeviceErrorKind::Backend,
+                crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::Access) => {
+                    let msg = format!(
+                        "Permission denied accessing GS-USB device. \
+                         Please install udev rules: sudo cp scripts/99-piper-gs-usb.rules /etc/udev/rules.d/ && \
+                         sudo udevadm control --reload-rules && sudo udevadm trigger. \
+                         Or run the installation script: ./scripts/install-udev-rules.sh. \
+                         See docs/v0/gs_usb_linux_conditional_compilation_analysis.md for details. \
+                         Original error: {}",
+                        e
+                    );
+                    (CanDeviceErrorKind::AccessDenied, msg)
+                },
+                _ => {
+                    (CanDeviceErrorKind::Backend, format!("Failed to open device: {}", e))
+                },
             };
-            CanError::Device(CanDeviceError::new(
-                kind,
-                format!("Failed to open device: {}", e),
-            ))
+            CanError::Device(CanDeviceError::new(kind, message))
         })?;
         Ok(Self {
-            device,
+            device, // 保持为 GsUsbDevice，在 split 时包裹为 Arc
             started: false,
             mode: 0,
-            // 默认不再使用 2ms 的超短超时，避免 macOS 上频繁 timeout 导致热循环与“看起来读不到”
-            rx_timeout: Duration::from_millis(50),
+            // 统一默认超时为 2ms（与 PipelineConfig 默认值一致）
+            // 对于力控/高频控制场景，2ms 超时能确保命令及时发送
+            // 对于非实时场景，用户可通过 set_receive_timeout() 显式设置更大的值
+            rx_timeout: Duration::from_millis(2),
             rx_queue: VecDeque::with_capacity(64), // 初始化队列，预分配容量
+            realtime_mode: false,                  // 默认非实时模式
+            consecutive_write_timeouts: 0,
         })
     }
 
@@ -108,6 +135,68 @@ impl GsUsbCanAdapter {
     /// - 建议 daemon 场景使用较大值（例如 50~200ms），避免热循环
     pub fn set_receive_timeout(&mut self, timeout: Duration) {
         self.rx_timeout = timeout;
+    }
+
+    /// 设置实时模式
+    ///
+    /// 实时模式下，USB Bulk OUT 写超时从 1000ms 降到 5ms，实现快速失败。
+    /// 这对于力控/高频控制场景很重要，可以避免长时间阻塞。
+    ///
+    /// # 参数
+    /// - `enabled`: 是否启用实时模式
+    ///
+    /// # 使用场景
+    /// - **实时模式（true）**：力控/高频控制，需要快速失败（< 10ms）
+    /// - **默认模式（false）**：状态监控/调试，更可靠但可能阻塞（最多 1000ms）
+    ///
+    /// # 注意事项
+    /// - 实时模式下，如果 USB 设备忙碌或总线拥塞，可能会频繁出现写超时
+    /// - 连续超时超过阈值（10 次）时，建议检查设备状态或切换到默认模式
+    pub fn set_realtime_mode(&mut self, enabled: bool) {
+        self.realtime_mode = enabled;
+        if enabled {
+            self.device.set_write_timeout(Duration::from_millis(5));
+            tracing::info!("GS-USB realtime mode enabled: write timeout set to 5ms");
+        } else {
+            self.device.set_write_timeout(Duration::from_millis(1000));
+            tracing::info!("GS-USB realtime mode disabled: write timeout set to 1000ms");
+        }
+        // 重置连续超时计数
+        self.consecutive_write_timeouts = 0;
+    }
+
+    /// 获取实时模式状态
+    pub fn is_realtime_mode(&self) -> bool {
+        self.realtime_mode
+    }
+
+    /// 分离为独立的 RX 和 TX 适配器
+    ///
+    /// 返回的适配器可以在不同线程中并发使用，实现物理隔离。
+    ///
+    /// **注意**：此方法会消费 `self`，分离后不能再使用 `GsUsbCanAdapter`。
+    ///
+    /// # 前置条件
+    /// - 设备必须已启动（`started == true`）
+    ///
+    /// # 返回
+    /// - `Ok((rx_adapter, tx_adapter))`：成功分离
+    /// - `Err(CanError::NotStarted)`：设备未启动
+    pub fn split(self) -> Result<(GsUsbRxAdapter, GsUsbTxAdapter), CanError> {
+        if !self.started {
+            return Err(CanError::NotStarted);
+        }
+
+        // 使用 ManuallyDrop 避免 Drop，然后移动 device
+        let adapter = ManuallyDrop::new(self);
+
+        // 将 device 包裹为 Arc，支持多线程共享
+        let device_arc = Arc::new(unsafe { std::ptr::read(&adapter.device) });
+
+        Ok((
+            GsUsbRxAdapter::new(device_arc.clone(), adapter.rx_timeout, adapter.mode),
+            GsUsbTxAdapter::new(device_arc.clone()),
+        ))
     }
 
     /// 批量接收：一次从 USB 读取一个包，解析并返回其中所有有效 CAN 帧
@@ -194,6 +283,20 @@ impl GsUsbCanAdapter {
             self.device.address(),
             self.device.serial_number(),
         )
+    }
+
+    /// 设置 USB STALL 计数回调
+    ///
+    /// 当设备发生 USB STALL 并被成功清除时，会调用此回调。
+    /// 必须在 `split()` 之前调用，因为 `split()` 会移动设备。
+    ///
+    /// # 参数
+    /// - `callback`: 回调函数，在 STALL 清除成功时调用
+    pub fn set_stall_count_callback<F>(&mut self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.device.set_stall_count_callback(callback);
     }
 
     /// 内部方法：统一配置逻辑
@@ -301,6 +404,15 @@ impl GsUsbCanAdapter {
     }
 }
 
+impl SplittableAdapter for GsUsbCanAdapter {
+    type RxAdapter = GsUsbRxAdapter;
+    type TxAdapter = GsUsbTxAdapter;
+
+    fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+        GsUsbCanAdapter::split(self)
+    }
+}
+
 impl Drop for GsUsbCanAdapter {
     /// 自动清理：当适配器离开作用域时，自动停止设备并释放资源
     ///
@@ -352,22 +464,54 @@ impl CanAdapter for GsUsbCanAdapter {
         };
 
         // 2. 发送 USB Bulk OUT（不等待 Echo）
-        self.device.send_raw(&gs_frame).map_err(|e| {
-            let kind = match e {
-                crate::can::gs_usb::error::GsUsbError::WriteTimeout => CanDeviceErrorKind::Busy,
-                crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
-                    CanDeviceErrorKind::NoDevice
-                },
-                crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::Access) => {
-                    CanDeviceErrorKind::AccessDenied
-                },
-                crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
-                    CanDeviceErrorKind::NotFound
-                },
-                _ => CanDeviceErrorKind::Backend,
-            };
-            CanError::Device(CanDeviceError::new(kind, format!("USB send failed: {}", e)))
-        })?;
+        match self.device.send_raw(&gs_frame) {
+            Ok(_) => {
+                // 发送成功，重置连续超时计数
+                self.consecutive_write_timeouts = 0;
+            },
+            Err(crate::can::gs_usb::error::GsUsbError::WriteTimeout) => {
+                // 写超时，增加计数
+                self.consecutive_write_timeouts += 1;
+
+                // 如果连续超时超过阈值（10 次），记录警告
+                if self.consecutive_write_timeouts >= 10 {
+                    tracing::warn!(
+                        "GS-USB consecutive write timeouts: {} (threshold: 10). \
+                        Device may be busy or USB connection unstable. \
+                        Consider checking device status or disabling realtime mode.",
+                        self.consecutive_write_timeouts
+                    );
+                }
+
+                return Err(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::Busy,
+                    format!(
+                        "USB send timeout (consecutive: {})",
+                        self.consecutive_write_timeouts
+                    ),
+                )));
+            },
+            Err(e) => {
+                // 其他错误，重置计数
+                self.consecutive_write_timeouts = 0;
+                let kind = match e {
+                    crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
+                        CanDeviceErrorKind::NoDevice
+                    },
+                    crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::Access) => {
+                        CanDeviceErrorKind::AccessDenied
+                    },
+                    crate::can::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
+                        CanDeviceErrorKind::NotFound
+                    },
+                    _ => CanDeviceErrorKind::Backend,
+                };
+                return Err(CanError::Device(CanDeviceError::new(
+                    kind,
+                    format!("USB send failed: {}", e),
+                )));
+            },
+        }
 
         trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
         Ok(())
@@ -491,11 +635,11 @@ impl CanAdapter for GsUsbCanAdapter {
                     return Err(CanError::BufferOverflow);
                 }
 
-                // 3.3 检查致命错误：Bus Off（需要通过 DeviceCapability 查询）
-                // 这里假设通过 flags 或其他机制检测
-                // 如果设备支持 GET_STATE，可以查询状态
+                // 注意：Bus Off 和 Error Passive 检测功能已在 `GsUsbRxAdapter::receive()` 中实现
+                // （通过回调机制，详见 `src/can/gs_usb/split.rs`）
+                // 如果需要 Bus Off 检测，请使用 `split()` 后的 `GsUsbRxAdapter`
 
-                // 3.4 转换格式并放入队列（保留硬件时间戳）
+                // 3.3 转换格式并放入队列（保留硬件时间戳）
                 let frame = PiperFrame {
                     id: gs_frame.can_id & CAN_EFF_MASK, // 移除标志位
                     data: gs_frame.data,
@@ -520,5 +664,56 @@ impl CanAdapter for GsUsbCanAdapter {
             }
             // 如果这批数据都被过滤掉了，继续读下一个 USB 包
         }
+    }
+
+    /// 设置接收超时
+    fn set_receive_timeout(&mut self, timeout: Duration) {
+        // 直接设置 rx_timeout 字段
+        // 注意：GsUsbDevice 的接收超时是在 read_bulk 时使用的，这里只更新适配器的超时
+        self.rx_timeout = timeout;
+    }
+
+    /// 带超时的接收
+    fn receive_timeout(&mut self, timeout: Duration) -> Result<PiperFrame, CanError> {
+        // 保存原超时
+        let old_timeout = self.rx_timeout;
+
+        // 设置新超时
+        self.set_receive_timeout(timeout);
+
+        // 接收
+        let result = self.receive();
+
+        // 恢复原超时
+        self.set_receive_timeout(old_timeout);
+
+        result
+    }
+
+    /// 非阻塞接收
+    fn try_receive(&mut self) -> Result<Option<PiperFrame>, CanError> {
+        // 使用零超时模拟非阻塞
+        match self.receive_timeout(Duration::ZERO) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(CanError::Timeout) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 带超时的发送
+    fn send_timeout(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
+        // 保存原写超时
+        let old_timeout = self.device.write_timeout();
+
+        // 设置新写超时
+        self.device.set_write_timeout(timeout);
+
+        // 发送
+        let result = self.send(frame);
+
+        // 恢复原写超时
+        self.device.set_write_timeout(old_timeout);
+
+        result
     }
 }
