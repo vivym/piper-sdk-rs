@@ -99,7 +99,7 @@ pub const GS_CAN_FLAG_OVERFLOW: u8 = 1 << 0;
 // CAN Error Frame Constants (Linux can.h compatible)
 // ============================================================================
 
-/// CAN Error Frame - Controller Error Status (data[1])
+/// CAN Error Frame - Controller Error Status (`data[1]`)
 /// These flags indicate the controller error state
 pub const CAN_ERR_CRTL_RX_WARNING: u8 = 0x04; // RX Error Warning (REC > 96)
 pub const CAN_ERR_CRTL_TX_WARNING: u8 = 0x08; // TX Error Warning (TEC > 96)
@@ -108,7 +108,7 @@ pub const CAN_ERR_CRTL_TX_PASSIVE: u8 = 0x20; // TX Error Passive (TEC > 127)
 pub const CAN_ERR_CRTL_TX_BUS_OFF: u8 = 0x40; // TX Bus Off (TEC > 255)
 pub const CAN_ERR_CRTL_RX_BUS_OFF: u8 = 0x80; // RX Bus Off (rare, some controllers)
 
-/// CAN Error Frame - Protocol Error Type (data[2])
+/// CAN Error Frame - Protocol Error Type (`data[2]`)
 /// These flags indicate the type of protocol error
 pub const CAN_ERR_PROT_BIT: u8 = 0x01; // Single bit error
 pub const CAN_ERR_PROT_FORM: u8 = 0x02; // Format error (e.g., bitrate mismatch)
