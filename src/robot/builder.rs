@@ -265,7 +265,7 @@ impl PiperBuilder {
         can.set_read_timeout(std::time::Duration::from_millis(config.receive_timeout_ms))
             .map_err(RobotError::Can)?;
 
-        Piper::new(can, self.pipeline_config).map_err(RobotError::Can)
+        Piper::new(can, self.pipeline_config.clone()).map_err(RobotError::Can)
     }
 
     /// 构建 GS-USB 直连适配器

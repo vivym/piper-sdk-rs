@@ -99,6 +99,7 @@ fn test_command_latency_quiet_bus() {
 #[test]
 #[ignore]
 fn test_socketcan_timeout_config() {
+    use piper_sdk::can::CanAdapter;
     use piper_sdk::can::SocketCanAdapter;
     use std::time::Duration;
 

@@ -26,14 +26,28 @@ use crate::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socketcan::{
-    CanError as SocketCanError, CanErrorFrame, CanFilter, CanFrame, CanSocket, EmbeddedFrame,
-    ExtendedId, Frame, StandardId,
+    BlockingCan, CanError as SocketCanError, CanErrorFrame, CanFilter, CanFrame, CanSocket,
+    EmbeddedFrame, ExtendedId, Frame, Socket, SocketOptions, StandardId,
 };
 use std::io::IoSliceMut;
 use std::os::fd::BorrowedFd;
-use std::os::unix::io::AsRawFd;
+use std::os::fd::OwnedFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::time::Duration;
 use tracing::{error, trace, warn};
+
+/// 使用 dup() 复制底层 FD，生成新的 `CanSocket`
+fn dup_socket(socket: &CanSocket) -> Result<CanSocket, CanError> {
+    let fd = unsafe { libc::dup(socket.as_raw_fd()) };
+    if fd < 0 {
+        return Err(CanError::Io(std::io::Error::last_os_error()));
+    }
+
+    // SAFETY: dup 返回全新的 FD，调用方负责关闭，`OwnedFd::from_raw_fd`
+    // 接管所有权，RAII 关闭。
+    let owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(fd) };
+    Ok(CanSocket::from(owned))
+}
 
 /// 只读适配器（用于 RX 线程）
 ///
@@ -65,12 +79,7 @@ impl SocketCanRxAdapter {
     /// - `CanError::Io`: 克隆 socket 或配置过滤器失败
     pub fn new(socket: &CanSocket, read_timeout: Duration) -> Result<Self, CanError> {
         // 克隆 socket（使用 dup() 系统调用）
-        let rx_socket = socket.try_clone().map_err(|e| {
-            CanError::Io(std::io::Error::other(format!(
-                "Failed to clone SocketCAN socket for RX: {}",
-                e
-            )))
-        })?;
+        let rx_socket = dup_socket(socket)?;
 
         // 设置读超时（使用 SO_RCVTIMEO，避免依赖 O_NONBLOCK）
         rx_socket.set_read_timeout(read_timeout).map_err(|e| {
@@ -187,44 +196,48 @@ impl RxAdapter for SocketCanRxAdapter {
         let mut cmsg_buf = [0u8; 1024]; // CMSG 缓冲区
 
         // 构建 IO 向量
-        let mut iov = [IoSliceMut::new(&mut frame_buf)];
+        // 将 IoSliceMut 的借用限制在局部作用域，避免与后续使用 frame_buf 冲突
+        let (msg_bytes, timestamp_us) = {
+            let mut iov = [IoSliceMut::new(&mut frame_buf)];
 
-        // 调用 recvmsg 获取帧和控制消息（CMSG）
-        let msg = match recvmsg::<SockaddrStorage>(
-            fd,
-            &mut iov,
-            Some(&mut cmsg_buf),
-            MsgFlags::empty(),
-        ) {
-            Ok(msg) => msg,
-            Err(nix::errno::Errno::EAGAIN) => {
-                // 超时（虽然 poll 已检查，但作为防御性编程保留）
-                return Err(CanError::Timeout);
-            },
-            Err(e) => {
-                return Err(CanError::Io(std::io::Error::other(format!(
-                    "recvmsg failed: {}",
-                    e
-                ))));
-            },
+            // 调用 recvmsg 获取帧和控制消息（CMSG）
+            let msg = match recvmsg::<SockaddrStorage>(
+                fd,
+                &mut iov,
+                Some(&mut cmsg_buf),
+                MsgFlags::empty(),
+            ) {
+                Ok(msg) => msg,
+                Err(nix::errno::Errno::EAGAIN) => {
+                    // 超时（虽然 poll 已检查，但作为防御性编程保留）
+                    return Err(CanError::Timeout);
+                },
+                Err(e) => {
+                    return Err(CanError::Io(std::io::Error::other(format!(
+                        "recvmsg failed: {}",
+                        e
+                    ))));
+                },
+            };
+
+            // 先提取时间戳，确保 CMSG 生命周期结束后再解析帧
+            let timestamp_us = self.extract_timestamp_from_cmsg(&msg)?;
+            (msg.bytes, timestamp_us)
         };
 
         // 验证数据长度
-        if msg.bytes < CAN_FRAME_LEN {
+        if msg_bytes < CAN_FRAME_LEN {
             return Err(CanError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "Incomplete CAN frame: {} bytes (expected at least {})",
-                    msg.bytes, CAN_FRAME_LEN
+                    msg_bytes, CAN_FRAME_LEN
                 ),
             )));
         }
 
-        // 先提取时间戳（在解析 CAN 帧之前，避免生命周期冲突）
-        let timestamp_us = self.extract_timestamp_from_cmsg(&msg)?;
-
         // 解析 CAN 帧
-        let can_frame = self.parse_raw_can_frame(&frame_buf[..msg.bytes])?;
+        let can_frame = self.parse_raw_can_frame(&frame_buf[..msg_bytes])?;
 
         // 过滤错误帧（与 SocketCanAdapter 一致）
         if can_frame.is_error_frame() {
@@ -439,11 +452,9 @@ impl SocketCanRxAdapter {
                 CanError::Device(format!("Invalid extended ID: 0x{:X}", id_bits).into())
             })?;
             CanFrame::new(id, data_slice).ok_or_else(|| {
-                CanError::Device(format!(
-                    "Failed to create extended frame with ID 0x{:X}",
-                    id_bits
-                ))
-                .into()
+                CanError::Device(
+                    format!("Failed to create extended frame with ID 0x{:X}", id_bits).into(),
+                )
             })
         } else {
             // 标准帧
@@ -451,11 +462,9 @@ impl SocketCanRxAdapter {
                 CanError::Device(format!("Invalid standard ID: 0x{:X}", id_bits).into())
             })?;
             CanFrame::new(id, data_slice).ok_or_else(|| {
-                CanError::Device(format!(
-                    "Failed to create standard frame with ID 0x{:X}",
-                    id_bits
-                ))
-                .into()
+                CanError::Device(
+                    format!("Failed to create standard frame with ID 0x{:X}", id_bits).into(),
+                )
             })
         }
     }
@@ -493,12 +502,7 @@ impl SocketCanTxAdapter {
     /// - `CanError::Io`: 克隆 socket 或设置写超时失败
     pub fn new(socket: &CanSocket) -> Result<Self, CanError> {
         // 克隆 socket（使用 dup() 系统调用）
-        let tx_socket = socket.try_clone().map_err(|e| {
-            CanError::Io(std::io::Error::other(format!(
-                "Failed to clone SocketCAN socket for TX: {}",
-                e
-            )))
-        })?;
+        let tx_socket = dup_socket(socket)?;
 
         // 设置发送超时（5ms，快速失败）
         // 关键：避免 TX 线程在总线错误（Error Passive/Bus Off）或缓冲区满时无限阻塞
@@ -523,27 +527,28 @@ impl TxAdapter for SocketCanTxAdapter {
             ExtendedId::new(frame.id)
                 .and_then(|id| CanFrame::new(id, &frame.data[..frame.len as usize]))
                 .ok_or_else(|| {
-                    CanError::Device(format!(
-                        "Failed to create extended frame with ID 0x{:X}",
-                        frame.id
-                    ))
+                    CanError::Device(
+                        format!("Failed to create extended frame with ID 0x{:X}", frame.id).into(),
+                    )
                 })?
         } else {
             // 标准帧
             StandardId::new(frame.id as u16)
                 .and_then(|id| CanFrame::new(id, &frame.data[..frame.len as usize]))
                 .ok_or_else(|| {
-                    CanError::Device(format!(
-                        "Failed to create standard frame with ID 0x{:X}",
-                        frame.id
-                    ))
+                    CanError::Device(
+                        format!("Failed to create standard frame with ID 0x{:X}", frame.id).into(),
+                    )
                 })?
         };
 
         // 发送（带超时，由 SO_SNDTIMEO 控制）
         self.socket.transmit(&can_frame).map_err(|e| {
             // 检查是否为超时错误
-            if e.kind() == std::io::ErrorKind::TimedOut {
+            if let socketcan::Error::Io(io_err) = &e
+                && (io_err.kind() == std::io::ErrorKind::TimedOut
+                    || io_err.kind() == std::io::ErrorKind::WouldBlock)
+            {
                 return CanError::Timeout;
             }
             CanError::Io(std::io::Error::other(format!(

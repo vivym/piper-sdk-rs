@@ -37,7 +37,7 @@ use std::time::Duration;
 use tracing::{error, trace, warn};
 
 mod interface_check;
-mod split;
+pub mod split;
 
 use interface_check::check_interface_status;
 pub use split::{SocketCanRxAdapter, SocketCanTxAdapter};
@@ -125,11 +125,7 @@ impl SocketCanAdapter {
 
         // 2. 打开 SocketCAN 接口
         let socket = CanSocket::open(&interface).map_err(|e| {
-            CanError::Device(format!(
-                "Failed to open CAN interface '{}': {}",
-                interface, e
-            ))
-            .into()
+            CanError::Device(format!("Failed to open CAN interface '{}': {}", interface, e).into())
         })?;
 
         // 设置读超时（默认 2ms，与 PipelineConfig 的默认值一致，确保 io_loop 能及时响应退出信号）
@@ -461,11 +457,9 @@ impl SocketCanAdapter {
                 CanError::Device(format!("Invalid extended ID: 0x{:X}", id_bits).into())
             })?;
             CanFrame::new(id, data_slice).ok_or_else(|| {
-                CanError::Device(format!(
-                    "Failed to create extended frame with ID 0x{:X}",
-                    id_bits
-                ))
-                .into()
+                CanError::Device(
+                    format!("Failed to create extended frame with ID 0x{:X}", id_bits).into(),
+                )
             })
         } else {
             // 标准帧
@@ -473,11 +467,9 @@ impl SocketCanAdapter {
                 CanError::Device(format!("Invalid standard ID: 0x{:X}", id_bits).into())
             })?;
             CanFrame::new(id, data_slice).ok_or_else(|| {
-                CanError::Device(format!(
-                    "Failed to create standard frame with ID 0x{:X}",
-                    id_bits
-                ))
-                .into()
+                CanError::Device(
+                    format!("Failed to create standard frame with ID 0x{:X}", id_bits).into(),
+                )
             })
         }
     }
@@ -597,7 +589,7 @@ impl Drop for SocketCanAdapter {
 }
 
 // 实现 SplittableAdapter trait
-use crate::can::{RxAdapter, SplittableAdapter, TxAdapter};
+use crate::can::SplittableAdapter;
 use std::mem::ManuallyDrop;
 
 impl SplittableAdapter for SocketCanAdapter {
@@ -629,14 +621,14 @@ impl SplittableAdapter for SocketCanAdapter {
     /// - 分离后，原适配器不再可用（消费 `self`）
     /// - RX 和 TX 适配器可以在不同线程中并发使用
     /// - FD 通过 RAII 自动管理，无需手动关闭
-    fn split(mut self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+    fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
         if !self.started {
             return Err(CanError::NotStarted);
         }
 
         // 使用 ManuallyDrop 防止 Drop 被调用
         // 因为我们要移动 socket 到分离的适配器中
-        let mut adapter = ManuallyDrop::new(self);
+        let adapter = ManuallyDrop::new(self);
 
         // 创建 RX 适配器（会克隆 socket）
         let rx_adapter = SocketCanRxAdapter::new(&adapter.socket, adapter.read_timeout)?;
@@ -671,22 +663,18 @@ impl CanAdapter for SocketCanAdapter {
             ExtendedId::new(frame.id)
                 .and_then(|id| CanFrame::new(id, &frame.data[..frame.len as usize]))
                 .ok_or_else(|| {
-                    CanError::Device(format!(
-                        "Failed to create extended frame with ID 0x{:X}",
-                        frame.id
-                    ))
-                    .into()
+                    CanError::Device(
+                        format!("Failed to create extended frame with ID 0x{:X}", frame.id).into(),
+                    )
                 })?
         } else {
             // 标准帧
             StandardId::new(frame.id as u16)
                 .and_then(|id| CanFrame::new(id, &frame.data[..frame.len as usize]))
                 .ok_or_else(|| {
-                    CanError::Device(format!(
-                        "Failed to create standard frame with ID 0x{:X}",
-                        frame.id
-                    ))
-                    .into()
+                    CanError::Device(
+                        format!("Failed to create standard frame with ID 0x{:X}", frame.id).into(),
+                    )
                 })?
         };
 

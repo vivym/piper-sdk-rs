@@ -1703,6 +1703,9 @@ impl Daemon {
 
         #[cfg(not(target_os = "macos"))]
         {
+            // 参数在非 macOS 下暂未使用，显式忽略避免告警
+            let _ = &stats;
+
             // 其他平台：简化实现
             loop {
                 thread::sleep(Duration::from_secs(1));
