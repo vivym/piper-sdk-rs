@@ -342,10 +342,13 @@ pub struct JointControl12 {
 
 impl JointControl12 {
     /// 从物理量（度）创建关节控制指令
+    ///
+    /// **注意**：使用 `round()` 进行四舍五入，与 Python SDK 保持一致。
+    /// Python SDK 使用 `round(pos_deg * 1e3)` 进行转换。
     pub fn new(j1: f64, j2: f64) -> Self {
         Self {
-            j1_deg: (j1 * 1000.0) as i32,
-            j2_deg: (j2 * 1000.0) as i32,
+            j1_deg: (j1 * 1000.0).round() as i32,
+            j2_deg: (j2 * 1000.0).round() as i32,
         }
     }
 
@@ -372,10 +375,13 @@ pub struct JointControl34 {
 
 impl JointControl34 {
     /// 从物理量（度）创建关节控制指令
+    ///
+    /// **注意**：使用 `round()` 进行四舍五入，与 Python SDK 保持一致。
+    /// Python SDK 使用 `round(pos_deg * 1e3)` 进行转换。
     pub fn new(j3: f64, j4: f64) -> Self {
         Self {
-            j3_deg: (j3 * 1000.0) as i32,
-            j4_deg: (j4 * 1000.0) as i32,
+            j3_deg: (j3 * 1000.0).round() as i32,
+            j4_deg: (j4 * 1000.0).round() as i32,
         }
     }
 
@@ -402,10 +408,13 @@ pub struct JointControl56 {
 
 impl JointControl56 {
     /// 从物理量（度）创建关节控制指令
+    ///
+    /// **注意**：使用 `round()` 进行四舍五入，与 Python SDK 保持一致。
+    /// Python SDK 使用 `round(pos_deg * 1e3)` 进行转换。
     pub fn new(j5: f64, j6: f64) -> Self {
         Self {
-            j5_deg: (j5 * 1000.0) as i32,
-            j6_deg: (j6 * 1000.0) as i32,
+            j5_deg: (j5 * 1000.0).round() as i32,
+            j6_deg: (j6 * 1000.0).round() as i32,
         }
     }
 

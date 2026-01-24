@@ -6,8 +6,8 @@
 //! 3. 实时命令支持覆盖（Overwrite 策略）
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
-use piper_sdk::robot::command::{CommandPriority, PiperCommand};
-use piper_sdk::robot::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop};
+use piper_sdk::driver::command::{CommandPriority, PiperCommand};
+use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

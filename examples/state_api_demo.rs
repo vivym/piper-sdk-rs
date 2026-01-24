@@ -10,7 +10,7 @@
 //! **注意**：此示例一次性读取所有状态后退出，适合学习 API 用法。
 //! 如需实时监控，请使用 `robot_monitor` 示例。
 
-use piper_sdk::robot::PiperBuilder;
+use piper_sdk::driver::PiperBuilder;
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

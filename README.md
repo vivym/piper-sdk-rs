@@ -66,13 +66,46 @@ See [Real-time Configuration Guide](docs/v0/realtime_configuration.md) for detai
 
 ## 🚀 Quick Start
 
-### Basic Usage
+### Basic Usage (Client API - Recommended)
+
+Most users should use the high-level client API for type-safe, easy-to-use control:
 
 ```rust
-use piper_sdk::PiperBuilder;
+use piper_sdk::prelude::*;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create Piper instance
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Connect using Builder API (automatically handles platform differences)
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .baud_rate(1_000_000)
+        .build()?;
+    let robot = robot.enable_mit_mode()?;
+
+    // Get motion commander and observer
+    let motion = robot.motion_commander();
+    let observer = robot.observer();
+
+    // Read state (lock-free, nanosecond-level response)
+    let joint_pos = observer.get_joint_position();
+    println!("Joint positions: {:?}", joint_pos);
+
+    // Send position command with type-safe units
+    let target = JointArray::from([Rad(0.5), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)]);
+    motion.command_positions(target)?;
+
+    Ok(())
+}
+```
+
+### Advanced Usage (Driver API)
+
+For direct CAN frame control or maximum performance, use the driver API:
+
+```rust
+use piper_sdk::driver::PiperBuilder;
+
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Create driver instance
     let robot = PiperBuilder::new()
         .interface("can0")?  // Linux: SocketCAN interface name (or GS-USB device serial)
         .baud_rate(1_000_000)?  // CAN baud rate
@@ -81,12 +114,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get current state (lock-free, nanosecond-level response)
     let joint_pos = robot.get_joint_position();
     println!("Joint positions: {:?}", joint_pos.joint_pos);
-
-    let end_pose = robot.get_end_pose();
-    println!("End pose: {:?}", end_pose.end_pose);
-
-    let joint_dynamic = robot.get_joint_dynamic();
-    println!("Joint velocities: {:?}", joint_dynamic.joint_vel);
 
     // Send control frame
     let frame = piper_sdk::PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03]);
@@ -118,31 +145,44 @@ For performance optimization, state data is divided into two categories:
   - `EndLimitConfigState`: End-effector velocity and acceleration limits (on-demand)
   - Uses `ArcSwap` for diagnostic data, `RwLock` for configuration data
 
+### Architecture Layers
+
+The SDK uses a layered architecture from low-level to high-level:
+
+- **CAN Layer** (`can`): CAN hardware abstraction, supports SocketCAN and GS-USB
+- **Protocol Layer** (`protocol`): Type-safe protocol encoding/decoding
+- **Driver Layer** (`driver`): IO thread management, state synchronization, frame parsing
+- **Client Layer** (`client`): Type-safe, user-friendly control interface
+
 ### Core Components
 
 ```
 piper-rs/
 ├── src/
-│   ├── lib.rs              # Library entry, module exports
+│   ├── lib.rs              # Library entry, Facade Pattern exports
+│   ├── prelude.rs          # Convenient imports for common types
 │   ├── can/                # CAN communication adapter layer
 │   │   ├── mod.rs          # CAN adapter Trait and common types
 │   │   └── gs_usb/         # [Win/Mac] GS-USB protocol implementation
-│   │       ├── mod.rs      # GS-USB CAN adapter
-│   │       ├── device.rs   # USB device operations
-│   │       ├── protocol.rs # GS-USB protocol definitions
-│   │       └── frame.rs    # GS-USB frame structure
 │   ├── protocol/           # Protocol definitions (business-agnostic, pure data)
 │   │   ├── ids.rs          # CAN ID constants/enums
 │   │   ├── feedback.rs     # Robot arm feedback frames (bilge)
 │   │   ├── control.rs      # Control command frames (bilge)
 │   │   └── config.rs       # Configuration frames (bilge)
-│   └── robot/              # Core business logic
-│       ├── mod.rs          # Robot module entry
-│       ├── robot_impl.rs   # High-level Piper object (API)
-│       ├── pipeline.rs     # IO Loop, ArcSwap update logic
-│       ├── state.rs        # State structure definitions (hot/cold data splitting)
-│       ├── builder.rs      # PiperBuilder (fluent construction)
-│       └── error.rs        # RobotError (error types)
+│   ├── driver/             # Driver layer (IO management, state sync)
+│   │   ├── mod.rs          # Driver module entry
+│   │   ├── piper.rs        # Driver-level Piper object (API)
+│   │   ├── pipeline.rs     # IO Loop, ArcSwap update logic
+│   │   ├── state.rs        # State structure definitions (hot/cold data splitting)
+│   │   ├── builder.rs      # PiperBuilder (fluent construction)
+│   │   └── error.rs        # DriverError (error types)
+│   └── client/             # Client layer (type-safe, user-friendly API)
+│       ├── mod.rs          # Client module entry
+│       ├── motion.rs        # MotionCommander (command interface)
+│       ├── observer.rs      # Observer (read-only state access)
+│       ├── state/           # Type State Pattern state machine
+│       ├── control/         # Controllers and trajectory planning
+│       └── types/           # Type system (units, joints, errors)
 ```
 
 ### Concurrency Model
@@ -184,6 +224,7 @@ For detailed design documentation, see:
 - [Protocol Document](docs/v0/protocol.md)
 - [Real-time Configuration Guide](docs/v0/realtime_configuration.md)
 - [Real-time Optimization Guide](docs/v0/realtime_optimization.md)
+- [Migration Guide](docs/v0/MIGRATION_GUIDE.md) - Guide for migrating from v0.1.x to v0.2.0+
 
 ## 🔗 Related Links
 

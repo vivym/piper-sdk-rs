@@ -154,7 +154,7 @@ fn demonstrate_gripper_api() {
     // 6. 完整示例
     println!("📝 完整示例代码:\n");
     println!("```rust");
-    println!("use piper_sdk::high_level::{{");
+    println!("use piper_sdk::client::{{");
     println!("    state::{{Piper, Active, MitMode}},");
     println!("    types::Result,");
     println!("}};");

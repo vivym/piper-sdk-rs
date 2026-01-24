@@ -8,13 +8,11 @@
 //! cargo run --example high_level_pid_control
 //! ```
 
-use piper_sdk::high_level::{
-    control::{Controller, PidController},
-    types::{JointArray, Rad},
-};
+use piper_sdk::client::control::{Controller, PidController};
+use piper_sdk::client::types::{JointArray, Rad};
 use std::time::Duration;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("🎯 Piper SDK - PID Control Example");
     println!("===================================\n");
 

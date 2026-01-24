@@ -2,7 +2,7 @@
 //!
 //! 测试新状态结构在多线程环境下的并发安全性，特别是 `ArcSwap` 的 Wait-Free 特性。
 
-use piper_sdk::robot::*;
+use piper_sdk::driver::*;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

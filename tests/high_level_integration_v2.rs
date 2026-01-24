@@ -10,10 +10,10 @@
 //! **注意：** 这些测试使用 MockCanAdapter，可能无法完全模拟真实连接。
 //! 实际集成测试需要真实的 CAN 适配器。
 
-use piper_sdk::high_level::state::*;
+use piper_sdk::client::state::*;
 // 注意：不导入 types::* 以避免 Result 类型别名冲突
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
-use piper_sdk::high_level::types::{Joint, NewtonMeter, Rad};
+use piper_sdk::client::types::{Joint, NewtonMeter, Rad};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 

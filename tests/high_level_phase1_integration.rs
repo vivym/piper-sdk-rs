@@ -5,7 +5,7 @@
 #[path = "high_level/common/mod.rs"]
 mod common;
 
-use piper_sdk::high_level::types::*;
+use piper_sdk::client::types::*;
 
 #[test]
 fn test_full_joint_command() {

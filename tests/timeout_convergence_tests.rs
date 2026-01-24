@@ -14,7 +14,7 @@
 //! cargo test --test timeout_convergence_tests test_command_latency_quiet_bus -- --ignored
 //! ```
 
-use piper_sdk::robot::{PipelineConfig, PiperBuilder};
+use piper_sdk::driver::{PipelineConfig, PiperBuilder};
 use std::time::{Duration, Instant};
 
 /// 计算延迟分布的百分位数

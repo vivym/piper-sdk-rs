@@ -8,7 +8,7 @@
 //! 5. 生成测试报告（Markdown）
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
-use piper_sdk::robot::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop};
+use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

@@ -13,10 +13,16 @@
 //!
 //! 使用方式：
 //! ```bash
-//! # 直接连接（Linux: 默认尝试 SocketCAN，其他平台: GS-USB）
+//! # Linux 平台：默认使用 can0（SocketCAN）
 //! cargo run --example robot_monitor
 //!
-//! # 通过守护进程连接（所有平台，默认使用 UDP）
+//! # macOS 平台：默认使用 UDP 守护进程模式（127.0.0.1:18888）
+//! cargo run --example robot_monitor
+//!
+//! # 其他平台：自动扫描 GS-USB 设备
+//! cargo run --example robot_monitor
+//!
+//! # 通过守护进程连接（所有平台）
 //! cargo run --example robot_monitor -- --uds 127.0.0.1:18888
 //!
 //! # 或使用 UDS 路径
@@ -28,7 +34,7 @@
 //! ```
 
 use clap::Parser;
-use piper_sdk::robot::{
+use piper_sdk::driver::{
     EndPoseState, FpsResult, GripperState, JointDynamicState, JointPositionState, PiperBuilder,
     RobotControlState,
 };
@@ -56,9 +62,9 @@ struct Args {
     ///
     /// 如果指定此参数，将通过 gs_usb_daemon 连接，而不是直接连接设备。
     /// 支持 UDS 路径（如 "/tmp/gs_usb_daemon.sock"）或 UDP 地址（如 "127.0.0.1:18888"）
-    /// 默认: 127.0.0.1:18888 (UDP)
-    #[arg(long, default_value = "127.0.0.1:18888")]
-    uds: String,
+    /// 如果不指定此参数，在 Linux 平台下将默认使用 can0 接口（SocketCAN）
+    #[arg(long)]
+    uds: Option<String>,
 }
 
 /// 控制模式转换为字符串
@@ -246,9 +252,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("正在连接到机械臂...");
 
     // 1. 创建 Piper 实例
-    // 使用 Smart Default 机制：Linux 上如果 interface 是 "can0"/"can1"，优先使用 SocketCAN；否则使用 GS-USB
-    // 默认使用守护进程模式（UDP），也可以通过 --interface 直接连接设备
-    let builder = if let Some(interface) = &args.interface {
+    // 优先级：
+    // 1. 如果指定了 --uds，使用守护进程模式
+    // 2. 如果指定了 --interface，使用指定的接口/设备序列号
+    // 3. 在 Linux 平台下，默认使用 can0（SocketCAN）
+    // 4. 在 macOS 平台下，默认使用 UDP 守护进程模式（127.0.0.1:18888）
+    // 5. 在其他平台下，自动扫描 GS-USB 设备
+    let builder = if let Some(daemon_addr) = &args.uds {
+        // 守护进程模式（UDS/UDP）- 所有平台支持
+        // 代码会自动识别是 UDS 路径还是 UDP 地址
+        println!("使用守护进程模式: {}", daemon_addr);
+        PiperBuilder::new().with_daemon(daemon_addr)
+    } else if let Some(interface) = &args.interface {
         // 指定接口/设备序列号（所有平台）
         #[cfg(target_os = "linux")]
         {
@@ -263,10 +278,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         PiperBuilder::new().interface(interface)
     } else {
-        // 守护进程模式（UDS/UDP）- 所有平台支持
-        // 代码会自动识别是 UDS 路径还是 UDP 地址
-        println!("使用守护进程模式: {}", args.uds);
-        PiperBuilder::new().with_daemon(&args.uds)
+        // 未指定任何参数，使用平台默认值
+        #[cfg(target_os = "linux")]
+        {
+            // Linux 平台：默认使用 can0（SocketCAN）
+            println!("使用默认 CAN 接口: can0 (SocketCAN)");
+            PiperBuilder::new().interface("can0")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS 平台：默认使用 UDP 守护进程模式
+            let default_daemon = "127.0.0.1:18888";
+            println!("使用默认守护进程模式: {} (UDP)", default_daemon);
+            PiperBuilder::new().with_daemon(default_daemon)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // 其他平台：自动扫描 GS-USB 设备
+            println!("自动扫描 GS-USB 设备...");
+            PiperBuilder::new()
+        }
     };
 
     let piper = builder

@@ -66,13 +66,46 @@ piper-sdk = { version = "0.0.1", features = ["realtime"] }
 
 ## 🚀 快速开始
 
-### 基本使用
+### 基本使用（客户端 API - 推荐）
+
+大多数用户应该使用高级客户端 API，提供类型安全、易于使用的控制接口：
 
 ```rust
-use piper_sdk::PiperBuilder;
+use piper_sdk::prelude::*;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 创建 Piper 实例
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 使用 Builder API 连接（自动处理平台差异）
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .baud_rate(1_000_000)
+        .build()?;
+    let robot = robot.enable_mit_mode()?;
+
+    // 获取运动命令器和观察器
+    let motion = robot.motion_commander();
+    let observer = robot.observer();
+
+    // 读取状态（无锁，纳秒级返回）
+    let joint_pos = observer.get_joint_position();
+    println!("关节位置: {:?}", joint_pos);
+
+    // 使用类型安全的单位发送位置命令
+    let target = JointArray::from([Rad(0.5), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)]);
+    motion.command_positions(target)?;
+
+    Ok(())
+}
+```
+
+### 高级使用（驱动层 API）
+
+需要直接控制 CAN 帧或追求最高性能时，使用驱动层 API：
+
+```rust
+use piper_sdk::driver::PiperBuilder;
+
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 创建驱动实例
     let robot = PiperBuilder::new()
         .interface("can0")?  // Linux: SocketCAN 接口名（或 GS-USB 设备序列号）
         .baud_rate(1_000_000)?  // CAN 波特率
@@ -81,12 +114,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 获取当前状态（无锁，纳秒级返回）
     let joint_pos = robot.get_joint_position();
     println!("关节位置: {:?}", joint_pos.joint_pos);
-
-    let end_pose = robot.get_end_pose();
-    println!("末端位姿: {:?}", end_pose.end_pose);
-
-    let joint_dynamic = robot.get_joint_dynamic();
-    println!("关节速度: {:?}", joint_dynamic.joint_vel);
 
     // 发送控制帧
     let frame = piper_sdk::PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03]);
@@ -118,31 +145,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   - `EndLimitConfigState`：末端执行器速度和加速度限制（按需）
   - 诊断数据使用 `ArcSwap`，配置数据使用 `RwLock`
 
+### 架构层次
+
+SDK 采用分层架构，从底层到高层：
+
+- **CAN 层** (`can`): CAN 硬件抽象，支持 SocketCAN 和 GS-USB
+- **协议层** (`protocol`): 类型安全的协议编码/解码
+- **驱动层** (`driver`): IO 线程管理、状态同步、帧解析
+- **客户端层** (`client`): 类型安全、易用的控制接口
+
 ### 核心组件
 
 ```
 piper-rs/
 ├── src/
-│   ├── lib.rs              # 库入口，模块导出
+│   ├── lib.rs              # 库入口，Facade Pattern 导出
+│   ├── prelude.rs          # 常用类型的便捷导入
 │   ├── can/                # CAN 通讯适配层
 │   │   ├── mod.rs          # CAN 适配器 Trait 和通用类型
 │   │   └── gs_usb/         # [Win/Mac] GS-USB 协议实现
-│   │       ├── mod.rs      # GS-USB CAN 适配器
-│   │       ├── device.rs   # USB 设备操作
-│   │       ├── protocol.rs # GS-USB 协议定义
-│   │       └── frame.rs    # GS-USB 帧结构
 │   ├── protocol/           # 协议定义（业务无关，纯数据）
 │   │   ├── ids.rs          # CAN ID 常量/枚举
 │   │   ├── feedback.rs     # 机械臂反馈帧 (bilge)
 │   │   ├── control.rs      # 控制指令帧 (bilge)
 │   │   └── config.rs       # 配置帧 (bilge)
-│   └── robot/              # 核心业务逻辑
-│       ├── mod.rs          # Robot 模块入口
-│       ├── robot_impl.rs   # 对外的高级 Piper 对象 (API)
-│       ├── pipeline.rs     # IO Loop、ArcSwap 更新逻辑
-│       ├── state.rs        # 状态结构定义（热冷数据分离）
-│       ├── builder.rs      # PiperBuilder（链式构造）
-│       └── error.rs        # RobotError（错误类型）
+│   ├── driver/             # 驱动层（IO 管理、状态同步）
+│   │   ├── mod.rs          # 驱动模块入口
+│   │   ├── piper.rs        # 驱动层 Piper 对象 (API)
+│   │   ├── pipeline.rs     # IO Loop、ArcSwap 更新逻辑
+│   │   ├── state.rs        # 状态结构定义（热冷数据分离）
+│   │   ├── builder.rs      # PiperBuilder（链式构造）
+│   │   └── error.rs        # DriverError（错误类型）
+│   └── client/             # 客户端层（类型安全、用户友好 API）
+│       ├── mod.rs          # 客户端模块入口
+│       ├── motion.rs        # MotionCommander（命令接口）
+│       ├── observer.rs      # Observer（只读状态访问）
+│       ├── state/           # Type State Pattern 状态机
+│       ├── control/         # 控制器和轨迹规划
+│       └── types/           # 类型系统（单位、关节、错误）
 ```
 
 ### 并发模型
@@ -184,6 +224,7 @@ piper-rs/
 - [协议文档](docs/v0/protocol.md)
 - [实时配置指南](docs/v0/realtime_configuration.md)
 - [实时优化指南](docs/v0/realtime_optimization.md)
+- [迁移指南](docs/v0/MIGRATION_GUIDE.md) - 从 v0.1.x 迁移到 v0.2.0+ 的指南
 
 ## 🔗 相关链接
 

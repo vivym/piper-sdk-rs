@@ -5,7 +5,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use piper_sdk::high_level::types::{Rad, Deg, NewtonMeter};
+use piper_sdk::client::types::{Rad, Deg, NewtonMeter};
 use proptest::prelude::*;
 
 proptest! {

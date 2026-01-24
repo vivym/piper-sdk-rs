@@ -3,8 +3,9 @@
 //! 使用 MockCanAdapter 模拟 CAN 帧输入，验证完整的状态更新流程。
 
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
+use piper_sdk::driver::DriverError;
+use piper_sdk::driver::*;
 use piper_sdk::protocol::ids::*;
-use piper_sdk::robot::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -492,7 +493,7 @@ fn test_piper_stress_command_channel_full() {
         let cmd_frame = PiperFrame::new_standard(0x150 + i, &[i as u8; 4]);
         match piper.send_frame(cmd_frame) {
             Ok(()) => sent_count += 1,
-            Err(RobotError::ChannelFull) => {
+            Err(DriverError::ChannelFull) => {
                 // ChannelFull 是预期的行为
             },
             Err(e) => panic!("Unexpected error: {:?}", e),

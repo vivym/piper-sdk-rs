@@ -89,8 +89,10 @@ impl SocketCanRxAdapter {
             )))
         })?;
 
-        // 配置硬件过滤器（降低 CPU 占用）
-        Self::configure_hardware_filters(&rx_socket)?;
+        // 注意：硬件过滤器默认关闭，因为 feedback_ids 列表可能不完整
+        // 如果需要启用硬件过滤器以降低 CPU 占用，可以取消下面的注释
+        // 但需要确保 feedback_ids 列表包含所有需要的 CAN ID
+        // Self::configure_hardware_filters(&rx_socket)?;
 
         // 检查时间戳是否已启用（从原始 socket 继承）
         // 注意：SocketCanAdapter 在初始化时已启用 SO_TIMESTAMPING
@@ -118,10 +120,34 @@ impl SocketCanRxAdapter {
     ///
     /// # 错误
     /// - `CanError::Io`: 设置过滤器失败
+    ///
+    /// # 注意
+    /// 此函数当前未使用（硬件过滤器默认关闭），但保留以备将来需要时使用。
+    #[allow(dead_code)]
     fn configure_hardware_filters(socket: &CanSocket) -> Result<(), CanError> {
         // 定义需要接收的 CAN ID 列表
-        // 这些是机械臂反馈帧的典型 ID 范围（根据实际协议调整）
-        let feedback_ids: Vec<u32> = (0x251..=0x256).collect();
+        // 包括所有机械臂反馈帧：
+        // - 关节位置反馈: 0x2A5, 0x2A6, 0x2A7
+        // - 关节动态状态: 0x251-0x256
+        // - 末端位姿反馈: 0x2A2, 0x2A3, 0x2A4
+        // - 机器人状态: 0x2A1
+        // - 夹爪反馈: 0x2A8
+        let mut feedback_ids = Vec::new();
+
+        // 关节位置反馈 (0x2A5-0x2A7)
+        feedback_ids.extend_from_slice(&[0x2A5, 0x2A6, 0x2A7]);
+
+        // 关节动态状态 (0x251-0x256)
+        feedback_ids.extend((0x251..=0x256).collect::<Vec<u32>>());
+
+        // 末端位姿反馈 (0x2A2-0x2A4)
+        feedback_ids.extend_from_slice(&[0x2A2, 0x2A3, 0x2A4]);
+
+        // 机器人状态 (0x2A1)
+        feedback_ids.push(0x2A1);
+
+        // 夹爪反馈 (0x2A8)
+        feedback_ids.push(0x2A8);
 
         // 创建过滤器（精确匹配）
         let filters: Vec<CanFilter> = feedback_ids
@@ -142,7 +168,7 @@ impl SocketCanRxAdapter {
         })?;
 
         trace!(
-            "SocketCAN hardware filters configured: {} IDs (0x251-0x256)",
+            "SocketCAN hardware filters configured: {} IDs (0x2A1, 0x2A2-0x2A4, 0x2A5-0x2A7, 0x2A8, 0x251-0x256)",
             filters.len()
         );
 

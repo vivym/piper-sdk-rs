@@ -3,7 +3,7 @@
 //! 测试高频读取性能（500Hz 控制循环）
 
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
-use piper_sdk::robot::*;
+use piper_sdk::driver::*;
 use std::time::Instant;
 
 // Mock CanAdapter 用于性能测试

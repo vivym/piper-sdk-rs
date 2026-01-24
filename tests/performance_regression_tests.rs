@@ -7,8 +7,8 @@
 //! 4. 可集成到 CI，作为性能门禁
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
-use piper_sdk::robot::command::PiperCommand;
-use piper_sdk::robot::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop};
+use piper_sdk::driver::command::PiperCommand;
+use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

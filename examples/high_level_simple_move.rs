@@ -8,13 +8,11 @@
 //! cargo run --example high_level_simple_move
 //! ```
 
-use piper_sdk::high_level::{
-    control::TrajectoryPlanner,
-    types::{JointArray, Rad},
-};
+use piper_sdk::client::control::TrajectoryPlanner;
+use piper_sdk::client::types::{JointArray, Rad};
 use std::time::Duration;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Piper SDK - Simple Move Example");
     println!("===================================\n");
 

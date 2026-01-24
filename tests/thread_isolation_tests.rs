@@ -8,7 +8,7 @@
 use piper_sdk::can::{
     CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RxAdapter, TxAdapter,
 };
-use piper_sdk::robot::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop};
+use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

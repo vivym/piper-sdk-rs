@@ -10,8 +10,7 @@
 //! - Thread health checking
 
 use piper_sdk::can::PiperFrame;
-use piper_sdk::robot::PiperBuilder;
-use piper_sdk::robot::command::PiperCommand;
+use piper_sdk::driver::{PiperBuilder, PiperCommand};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -161,8 +160,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Simulate control computation
 fn compute_control(
-    _joint_pos: &piper_sdk::robot::JointPositionState,
-    _joint_dynamic: &piper_sdk::robot::JointDynamicState,
+    _joint_pos: &piper_sdk::driver::JointPositionState,
+    _joint_dynamic: &piper_sdk::driver::JointDynamicState,
 ) -> [f64; 6] {
     // In real application, this would compute control commands
     // based on current state and desired trajectory
