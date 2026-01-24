@@ -79,19 +79,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .interface("can0")
         .baud_rate(1_000_000)
         .build()?;
-    let robot = robot.enable_mit_mode()?;
+    let robot = robot.enable_position_mode(PositionModeConfig::default())?;
 
-    // Get motion commander and observer
-    let motion = robot.Piper;
+    // Get observer for reading state
     let observer = robot.observer();
 
     // Read state (lock-free, nanosecond-level response)
-    let joint_pos = observer.get_joint_position();
+    let joint_pos = observer.joint_positions();
     println!("Joint positions: {:?}", joint_pos);
 
-    // Send position command with type-safe units
+    // Send position command with type-safe units (methods are directly on robot)
     let target = JointArray::from([Rad(0.5), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)]);
-    motion.command_positions(target)?;
+    robot.send_position_command(&target)?;
 
     Ok(())
 }
@@ -178,9 +177,9 @@ piper-rs/
 │   │   └── error.rs        # DriverError (error types)
 │   └── client/             # Client layer (type-safe, user-friendly API)
 │       ├── mod.rs          # Client module entry
-│       ├── motion.rs        # Piper (command interface)
 │       ├── observer.rs      # Observer (read-only state access)
 │       ├── state/           # Type State Pattern state machine
+│       │   └── machine.rs   # Piper state machine (command methods)
 │       ├── control/         # Controllers and trajectory planning
 │       └── types/           # Type system (units, joints, errors)
 ```

@@ -79,19 +79,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .interface("can0")
         .baud_rate(1_000_000)
         .build()?;
-    let robot = robot.enable_mit_mode()?;
+    let robot = robot.enable_position_mode(PositionModeConfig::default())?;
 
-    // 获取运动命令器和观察器
-    let motion = robot.Piper;
+    // 获取观察器用于读取状态
     let observer = robot.observer();
 
     // 读取状态（无锁，纳秒级返回）
-    let joint_pos = observer.get_joint_position();
+    let joint_pos = observer.joint_positions();
     println!("关节位置: {:?}", joint_pos);
 
-    // 使用类型安全的单位发送位置命令
+    // 使用类型安全的单位发送位置命令（方法直接在 robot 上调用）
     let target = JointArray::from([Rad(0.5), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)]);
-    motion.command_positions(target)?;
+    robot.send_position_command(&target)?;
 
     Ok(())
 }
@@ -178,9 +177,9 @@ piper-rs/
 │   │   └── error.rs        # DriverError（错误类型）
 │   └── client/             # 客户端层（类型安全、用户友好 API）
 │       ├── mod.rs          # 客户端模块入口
-│       ├── motion.rs        # Piper（命令接口）
 │       ├── observer.rs      # Observer（只读状态访问）
 │       ├── state/           # Type State Pattern 状态机
+│       │   └── machine.rs   # Piper 状态机（命令方法）
 │       ├── control/         # 控制器和轨迹规划
 │       └── types/           # 类型系统（单位、关节、错误）
 ```
