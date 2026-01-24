@@ -118,7 +118,7 @@
 
 ### Phase 2: 读写分离 + 性能优化 (100% 完成)
 
-**审查内容**: StateTracker, RawCommander, MotionCommander, Observer, StateMonitor
+**审查内容**: StateTracker, RawCommander, Piper, Observer, StateMonitor
 
 #### ✅ 任务 2.1: StateTracker（无锁状态跟踪）(`src/high_level/client/state_tracker.rs`)
 
@@ -149,7 +149,7 @@
 
 **评分**: 10/10
 
-#### ✅ 任务 2.3: MotionCommander (`src/high_level/client/motion_commander.rs`)
+#### ✅ 任务 2.3: Piper (`src/high_level/client/motion_commander.rs`)
 
 **关键验收标准**（TODO LIST 第 1090-1192 行）:
 - ✅ 包装 `RawCommander`，仅暴露运动方法
@@ -211,7 +211,7 @@
   - `Piper<Standby>::enable_mit_mode()` → `Piper<Active<MitMode>>`
   - `Piper<Active<MitMode>>::disable()` → `Piper<Standby>`
 - ✅ `Drop` trait 自动失能（安全性保证）
-- ✅ 每个状态提供适当的方法（`motion_commander()`, `observer()`）
+- ✅ 每个状态提供适当的方法（`Piper`, `observer()`）
 
 **亮点**:
 - Type State Pattern 完美应用

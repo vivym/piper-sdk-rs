@@ -99,7 +99,7 @@ motion.set_control_mode();  // error[E0599]
 ### 2. 读写分离
 
 ```
-写路径: MotionCommander → RawCommander → CAN Bus
+写路径: Piper → RawCommander → CAN Bus
 读路径: Observer → RwLock<RobotState>
 
 完全独立，无竞争，高并发
@@ -187,7 +187,7 @@ robot.enable()?;  // error: already enabled
 ### 功能完整性
 
 - ✅ RawCommander 所有方法
-- ✅ MotionCommander 完整 API
+- ✅ Piper 完整 API
 - ✅ Observer 夹爪反馈
 - ✅ 批量命令支持
 

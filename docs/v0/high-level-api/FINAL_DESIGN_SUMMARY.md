@@ -103,7 +103,7 @@ for point in trajectory {
                         ↓
 ┌───────────────────────────────────────────────────────┐
 │  Layer 3: Concurrent Client (Reader-Writer Split)     │
-│  - MotionCommander (受限权限，公开)                     │
+│  - Piper (受限权限，公开)                     │
 │  - RawCommander (完全权限，内部)                        │
 │  - Observer (Clone-able 状态读取)                      │
 │  - HeartbeatManager (独立线程)                         │
@@ -194,7 +194,7 @@ pub struct RawCommander {  // pub(crate)，内部使用
     pub(crate) fn set_motor_enable(...) { ... }
 }
 
-pub struct MotionCommander {  // pub，公开给用户
+pub struct Piper {  // pub，公开给用户
     pub fn send_mit_command(...) { ... }  // 仅运动指令
     // ❌ 没有 set_control_mode()
     // ❌ 没有 disable_arm()
@@ -330,7 +330,7 @@ std::thread::spawn(move || {
 
 **目标**: 并发友好的底层架构
 
-- [ ] 实现 `RawCommander` (内部) 和 `MotionCommander` (公开)
+- [ ] 实现 `RawCommander` (内部) 和 `Piper` (公开)
 - [ ] 实现 `Observer` (Clone-able 状态读取)
 - [ ] 实现 `HeartbeatManager` (后台线程)
 - [ ] 实现 `StateTracker` (物理状态追踪)
@@ -504,7 +504,7 @@ fn main() -> Result<(), RobotError> {
         .enable_mit_mode(Duration::from_secs(10))?;
 
     // 4. 线程 1: 控制
-    let motion_cmd = piper.motion_commander();
+    let motion_cmd = piper.Piper;
     let control_thread = std::thread::spawn(move || {
         loop {
             motion_cmd.send_mit_command(

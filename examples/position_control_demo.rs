@@ -106,8 +106,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // 发送位置命令（只发送一次，与 Python SDK 一致）
-    let motion = robot.motion_commander();
-    motion.send_position_command_batch(&target_positions)?;
+    robot.send_position_command(&target_positions)?;
     println!("   ✅ 位置命令已发送");
 
     // 等待运动完成（简单方法：等待一段时间）
@@ -153,7 +152,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // 在保持期间，持续发送位置命令以保持位置
     while hold_start.elapsed() < hold_duration {
-        motion.send_position_command_batch(&target_positions)?;
+        robot.send_position_command(&target_positions)?;
         std::thread::sleep(Duration::from_millis(200)); // 5Hz 控制频率
     }
 
@@ -179,7 +178,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // ==================== 步骤 6: 移动回原位置 ====================
     println!("🔙 步骤 6: 移动回原位置...");
-    motion.send_position_command_batch(&current_positions)?;
+    robot.send_position_command(&current_positions)?;
     println!("   ✅ 位置命令已发送");
     println!("   ⏳ 等待运动完成...");
     std::thread::sleep(Duration::from_secs(10));

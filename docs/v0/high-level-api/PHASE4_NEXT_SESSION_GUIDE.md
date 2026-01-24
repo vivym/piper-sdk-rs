@@ -108,7 +108,7 @@ pub fn run_controller<C: Controller>(
 
         let current = piper.observer().joint_positions();
         let cmd = controller.tick(&current, dt)?;
-        piper.motion_commander().command_torques(cmd)?;
+        piper.Piper.command_torques(cmd)?;
 
         last_time = now;
         spin_sleep::sleep(interval);

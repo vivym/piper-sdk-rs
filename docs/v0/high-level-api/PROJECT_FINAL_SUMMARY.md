@@ -54,7 +54,7 @@
 ✅ Phase 2: 读写分离 + 性能优化    (~1,440 行, 47 测试)
    • StateTracker (~18ns, 超标 5.4x) ⚡
    • RawCommander (内部权限)
-   • MotionCommander (公开接口)
+   • Piper (公开接口)
    • Observer (~11ns, 超标 4.5x) ⚡
 
 ✅ Phase 3: Type State 核心        (~1,000 行, 12 测试)
@@ -94,7 +94,7 @@ robot.command_torques(...)?;                  // ✅ 编译通过
 
 ```rust
 // RawCommander: 内部完整权限 (pub(crate))
-// MotionCommander: 公开受限权限 (pub, 只能发送运动指令)
+// Piper: 公开受限权限 (pub, 只能发送运动指令)
 ```
 
 **创新点**: 防御"后门"攻击

@@ -127,17 +127,19 @@ impl From<u8> for RobotStatus {
 /// MOVE 模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MoveMode {
-    /// MOVE P
+    /// MOVE P - 点位模式（末端位姿控制）
     #[default]
     MoveP = 0x00,
-    /// MOVE J
+    /// MOVE J - 关节模式
     MoveJ = 0x01,
-    /// MOVE L
+    /// MOVE L - 直线运动
     MoveL = 0x02,
-    /// MOVE C
+    /// MOVE C - 圆弧运动
     MoveC = 0x03,
-    /// MOVE M
+    /// MOVE M - MIT 模式（V1.5-2+）
     MoveM = 0x04,
+    /// MOVE CPV - 连续位置速度模式（V1.8-1+）
+    MoveCpv = 0x05,
 }
 
 impl From<u8> for MoveMode {
@@ -148,6 +150,7 @@ impl From<u8> for MoveMode {
             0x02 => MoveMode::MoveL,
             0x03 => MoveMode::MoveC,
             0x04 => MoveMode::MoveM,
+            0x05 => MoveMode::MoveCpv,
             _ => MoveMode::MoveP, // 默认值
         }
     }
@@ -1277,8 +1280,31 @@ mod tests {
         assert_eq!(MoveMode::from(0x02), MoveMode::MoveL);
         assert_eq!(MoveMode::from(0x03), MoveMode::MoveC);
         assert_eq!(MoveMode::from(0x04), MoveMode::MoveM);
+        assert_eq!(MoveMode::from(0x05), MoveMode::MoveCpv);
         // 无效值应该返回默认值
         assert_eq!(MoveMode::from(0xFF), MoveMode::MoveP);
+    }
+
+    #[test]
+    fn test_move_mode_cpv() {
+        assert_eq!(MoveMode::from(0x05), MoveMode::MoveCpv);
+        assert_eq!(MoveMode::MoveCpv as u8, 0x05);
+    }
+
+    #[test]
+    fn test_move_mode_all_values() {
+        // 验证所有枚举值
+        for (value, expected) in [
+            (0x00, MoveMode::MoveP),
+            (0x01, MoveMode::MoveJ),
+            (0x02, MoveMode::MoveL),
+            (0x03, MoveMode::MoveC),
+            (0x04, MoveMode::MoveM),
+            (0x05, MoveMode::MoveCpv),
+        ] {
+            assert_eq!(MoveMode::from(value), expected);
+            assert_eq!(expected as u8, value);
+        }
     }
 
     #[test]
@@ -1315,6 +1341,7 @@ mod tests {
 
         assert_eq!(MoveMode::MoveP as u8, 0x00);
         assert_eq!(MoveMode::MoveM as u8, 0x04);
+        assert_eq!(MoveMode::MoveCpv as u8, 0x05);
     }
 
     // ========================================================================

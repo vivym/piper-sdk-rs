@@ -69,11 +69,11 @@ robot.command_position(Joint::J1, Rad(0.5))?;
 ### 1.4 当前使用情况
 
 **使用位置**：
-1. `src/client/motion.rs` 第 160 行：`MotionCommander::send_position_command`
+1. `src/client/motion.rs` 第 160 行：`Piper::send_position_command`
 2. `src/client/state/machine.rs` 第 713 行：`Piper<Active<PositionMode>>::command_position`
 
 **影响范围**：
-- 所有通过 `MotionCommander::send_position_command` 发送单个关节的代码
+- 所有通过 `Piper::send_position_command` 发送单个关节的代码
 - 所有通过 `Piper::command_position` 发送单个关节的代码
 
 ## 2. 解决方案分析
@@ -154,7 +154,7 @@ let mut new_positions = current;
 new_positions[Joint::J1] = Rad(0.5);
 motion.send_position_command_batch(&new_positions)?;
 
-// 方法 2：使用辅助函数（可以添加到 MotionCommander）
+// 方法 2：使用辅助函数（可以添加到 Piper）
 pub fn update_single_joint(
     &self,
     observer: &Observer,
@@ -175,7 +175,7 @@ pub fn update_single_joint(
 
 ### 步骤 2：修改 `motion.rs`
 
-修改 `MotionCommander::send_position_command`，改为使用批量发送：
+修改 `Piper::send_position_command`，改为使用批量发送：
 
 ```rust
 pub fn send_position_command(
@@ -200,7 +200,7 @@ pub fn send_position_command(
 pub fn command_position(&self, joint: Joint, position: Rad) -> Result<()> {
     let mut positions = self.observer.joint_positions();
     positions[joint] = position;
-    let motion = self.motion_commander();
+    let motion = self.Piper;
     motion.send_position_command_batch(&positions)
 }
 ```
@@ -215,7 +215,7 @@ pub fn command_position(&self, joint: Joint, position: Rad) -> Result<()> {
 ### 5.1 Breaking Change 影响
 
 **受影响的代码**：
-- 所有使用 `MotionCommander::send_position_command` 的代码
+- 所有使用 `Piper::send_position_command` 的代码
 - 所有使用 `Piper::command_position` 的代码
 
 **迁移难度**：

@@ -186,7 +186,7 @@
 #### ✅ Phase 2: 读写分离 + 性能优化（1 天）
 - StateTracker (原子优化)
 - RawCommander (内部完全权限)
-- MotionCommander (公开受限权限)
+- Piper (公开受限权限)
 - Observer (状态观察器)
 - 性能基准测试
 
@@ -260,7 +260,7 @@
 
 3. **Capability-based Security**
    - `RawCommander`: 内部完全权限
-   - `MotionCommander`: 公开受限权限
+   - `Piper`: 公开受限权限
    - 编译期强制执行
 
 4. **Zero-Cost Abstraction**

@@ -14,7 +14,6 @@
 pub mod builder; // Client 层 Builder
 pub mod control;
 pub mod heartbeat;
-pub mod motion; // 原 motion_commander.rs
 pub mod observer;
 pub(crate) mod raw_commander;
 pub mod state;
@@ -22,7 +21,6 @@ pub mod types;
 
 // 重新导出常用类型
 pub use builder::PiperBuilder;
-pub use motion::MotionCommander;
 pub use observer::Observer;
 pub use state::Piper; // Type State Pattern 的状态机
 pub use types::*;

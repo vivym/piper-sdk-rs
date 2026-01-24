@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::client::types::*;
-use crate::client::{motion::MotionCommander, observer::Observer, raw_commander::RawCommander};
+use crate::client::{observer::Observer, raw_commander::RawCommander};
 use crate::protocol::control::InstallPosition;
 
 // ==================== 状态类型（零大小类型）====================
@@ -45,6 +45,62 @@ pub struct PositionMode;
 /// 在此状态下，不允许发送任何运动控制命令。
 pub struct ErrorState;
 
+// ==================== 运动类型 ====================
+
+/// 运动类型
+///
+/// 决定机械臂如何规划运动轨迹。
+///
+/// **注意**：此枚举用于配置 `PositionModeConfig`，与 `MoveMode` 协议枚举对应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MotionType {
+    /// 关节空间运动
+    ///
+    /// 各关节独立运动到目标角度，末端轨迹不可预测。
+    /// 对应 MoveMode::MoveJ (0x01)，使用指令 0x155-0x157。
+    #[default]
+    Joint,
+
+    /// 笛卡尔空间运动（点位模式）
+    ///
+    /// 末端从当前位置运动到目标位姿，轨迹由机械臂内部规划。
+    /// 对应 MoveMode::MoveP (0x00)，使用指令 0x152-0x154。
+    Cartesian,
+
+    /// 直线运动
+    ///
+    /// 末端沿直线轨迹运动到目标位姿。
+    /// 对应 MoveMode::MoveL (0x02)，使用指令 0x152-0x154。
+    Linear,
+
+    /// 圆弧运动
+    ///
+    /// 末端沿圆弧轨迹运动，需要指定起点、中点、终点。
+    /// 对应 MoveMode::MoveC (0x03)，使用指令 0x152-0x154 + 0x158。
+    Circular,
+
+    /// 连续位置速度模式（V1.8-1+）
+    ///
+    /// 连续的位置和速度控制，适用于轨迹跟踪等场景。
+    /// 对应 MoveMode::MoveCpv (0x05)。
+    ///
+    /// **注意**：此模式也属于 `Active<PositionMode>` 状态。
+    ContinuousPositionVelocity,
+}
+
+impl From<MotionType> for crate::protocol::feedback::MoveMode {
+    fn from(motion_type: MotionType) -> Self {
+        use crate::protocol::feedback::MoveMode;
+        match motion_type {
+            MotionType::Joint => MoveMode::MoveJ,
+            MotionType::Cartesian => MoveMode::MoveP,
+            MotionType::Linear => MoveMode::MoveL,
+            MotionType::Circular => MoveMode::MoveC,
+            MotionType::ContinuousPositionVelocity => MoveMode::MoveCpv,
+        }
+    }
+}
+
 // ==================== 连接配置 ====================
 
 /// 连接配置
@@ -74,6 +130,14 @@ pub struct MitModeConfig {
     pub debounce_threshold: usize,
     /// 轮询间隔
     pub poll_interval: Duration,
+    /// 运动速度百分比（0-100）
+    ///
+    /// 用于设置 0x151 指令的 Byte 2（speed_percent）。
+    /// 默认值为 100，表示 100% 的运动速度。
+    /// **重要**：不应设为 0，否则某些固件版本可能会锁死关节或报错。
+    /// 虽然在纯 MIT 模式下（0x15A-0x15F），速度通常由控制指令本身携带，
+    /// 但在发送 0x151 切换模式时，speed_percent 可能会作为安全限速或预设速度生效。
+    pub speed_percent: u8,
 }
 
 impl Default for MitModeConfig {
@@ -82,11 +146,15 @@ impl Default for MitModeConfig {
             timeout: Duration::from_secs(2),
             debounce_threshold: 3,
             poll_interval: Duration::from_millis(10),
+            speed_percent: 100,
         }
     }
 }
 
 /// 位置模式配置（带 Debounce 参数）
+///
+/// **术语说明**：虽然名为 "PositionMode"，但实际支持多种运动规划模式
+/// （关节空间、笛卡尔空间、直线、圆弧等），与 MIT 混合控制模式相对。
 #[derive(Debug, Clone)]
 pub struct PositionModeConfig {
     /// 使能超时
@@ -114,6 +182,16 @@ pub struct PositionModeConfig {
     ///
     /// 注意：此参数基于 V1.5-2 版本后支持，注意接线朝后。
     pub install_position: InstallPosition,
+    /// 运动类型（新增）
+    ///
+    /// 默认为 `Joint`（关节空间运动），保持向后兼容。
+    ///
+    /// **重要**：必须根据 `motion_type` 使用对应的控制方法：
+    /// - `Joint`: 使用 `command_joint_positions()` 或 `motion_commander().send_position_command()`
+    /// - `Cartesian`/`Linear`: 使用 `command_cartesian_pose()`
+    /// - `Circular`: 使用 `move_circular()` 方法
+    /// - `ContinuousPositionVelocity`: 待实现
+    pub motion_type: MotionType,
 }
 
 impl Default for PositionModeConfig {
@@ -124,6 +202,7 @@ impl Default for PositionModeConfig {
             poll_interval: Duration::from_millis(10),
             speed_percent: 50,                          // 默认 50% 速度
             install_position: InstallPosition::Invalid, // 默认无效值（不设置安装位置）
+            motion_type: MotionType::Joint,             // ✅ 默认关节模式，向后兼容
         }
     }
 }
@@ -244,11 +323,13 @@ impl Piper<Standby> {
         )?;
 
         // 3. 设置 MIT 模式
+        // ✅ 关键修正：MoveMode 必须设为 MoveM (0x04)
+        // 注意：需要固件版本 >= V1.5-2
         let control_cmd = ControlModeCommandFrame::new(
             ControlModeCommand::CanControl,
-            MoveMode::MoveP,
-            0,
-            MitMode::Mit,
+            MoveMode::MoveM,      // ✅ 修正：从 MoveP 改为 MoveM
+            config.speed_percent, // ✅ 修正：使用配置的速度（默认100），避免设为0导致锁死
+            MitMode::Mit,         // MIT 控制器 (0xAD)
             0,
             InstallPosition::Invalid,
         );
@@ -296,15 +377,16 @@ impl Piper<Standby> {
         )?;
 
         // 3. 设置位置模式
-        // 注意：位置控制必须使用 MOVE J（关节模式），而不是 MOVE P（点位模式）
-        // MOVE P 模式期望接收末端位姿指令（0x152-0x154），而不是关节角度指令（0x155-0x157）
+        // ✅ 修改：使用配置的 motion_type
+        let move_mode: MoveMode = config.motion_type.into();
+
         let control_cmd = ControlModeCommandFrame::new(
             ControlModeCommand::CanControl,
-            MoveMode::MoveJ,           // ✅ 修复：使用关节模式（MOVE J）
-            config.speed_percent,      // ✅ 修复：使用配置的速度百分比（默认 50）
-            MitMode::PositionVelocity, // 位置模式
+            move_mode, // ✅ 使用配置的运动类型
+            config.speed_percent,
+            MitMode::PositionVelocity,
             0,
-            config.install_position, // ✅ 使用配置的安装位置（默认 Invalid）
+            config.install_position,
         );
         self.driver.send_reliable(control_cmd.to_frame())?;
 
@@ -584,16 +666,17 @@ impl<State> Piper<State> {
 // ==================== Active<MitMode> 状态 ====================
 
 impl Piper<Active<MitMode>> {
-    /// 发送 MIT 模式力矩指令
+    /// 发送 MIT 模式控制指令
+    ///
+    /// 对所有关节发送位置、速度、力矩的混合控制指令。
     ///
     /// # 参数
     ///
-    /// - `joint`: 目标关节
-    /// - `position`: 目标位置（Rad）
-    /// - `velocity`: 目标速度（rad/s）
-    /// - `kp`: 位置增益
-    /// - `kd`: 速度增益
-    /// - `torque`: 前馈力矩（NewtonMeter）
+    /// - `positions`: 各关节目标位置（Rad）
+    /// - `velocities`: 各关节目标速度（rad/s）
+    /// - `kp`: 位置增益（所有关节相同）
+    /// - `kd`: 速度增益（所有关节相同）
+    /// - `torques`: 各关节前馈力矩（NewtonMeter）
     ///
     /// # 示例
     ///
@@ -601,36 +684,81 @@ impl Piper<Active<MitMode>> {
     /// # use piper_sdk::client::state::*;
     /// # use piper_sdk::client::types::*;
     /// # fn example(robot: Piper<Active<MitMode>>) -> Result<()> {
-    /// robot.command_torques(
-    ///     Joint::J1,
-    ///     Rad(1.0),
-    ///     0.5,
-    ///     10.0,
-    ///     2.0,
-    ///     NewtonMeter(5.0),
-    /// )?;
+    /// let positions = JointArray::from([
+    ///     Rad(1.0), Rad(0.5), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)
+    /// ]);
+    /// let velocities = JointArray::from([0.5, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    /// let torques = JointArray::from([
+    ///     NewtonMeter(5.0), NewtonMeter(0.0), NewtonMeter(0.0),
+    ///     NewtonMeter(0.0), NewtonMeter(0.0), NewtonMeter(0.0)
+    /// ]);
+    /// robot.command_torques(&positions, &velocities, 10.0, 2.0, &torques)?;
     /// # Ok(())
     /// # }
     /// ```
     pub fn command_torques(
         &self,
-        joint: Joint,
-        position: Rad,
-        velocity: f64,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
         kp: f64,
         kd: f64,
-        torque: NewtonMeter,
+        torques: &JointArray<NewtonMeter>,
     ) -> Result<()> {
-        // ✅ 优化：使用引用而不是 Arc::clone，零开销
-        let raw_commander = RawCommander::new(&self.driver);
-        raw_commander.send_mit_command(joint, position, velocity, kp, kd, torque)
+        // ✅ 直接使用 RawCommander，避免创建 MotionCommander
+        let raw = RawCommander::new(&self.driver);
+        raw.send_mit_command_batch(positions, velocities, kp, kd, torques)
     }
 
-    /// 获取 MotionCommander（受限权限）
+    /// 控制夹爪
     ///
-    /// 返回一个可以克隆和传递的命令接口，但无法修改状态机。
-    pub fn motion_commander(&self) -> MotionCommander {
-        MotionCommander::new(self.driver.clone())
+    /// # 参数
+    ///
+    /// - `position`: 夹爪开口（0.0-1.0，1.0 = 完全打开）
+    /// - `effort`: 夹持力度（0.0-1.0，1.0 = 最大力度）
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_sdk::client::state::*;
+    /// # use piper_sdk::client::types::*;
+    /// # fn example(robot: Piper<Active<MitMode>>) -> Result<()> {
+    /// // 完全打开，低力度
+    /// robot.set_gripper(1.0, 0.3)?;
+    ///
+    /// // 夹取物体，中等力度
+    /// robot.set_gripper(0.2, 0.5)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_gripper(&self, position: f64, effort: f64) -> Result<()> {
+        // 参数验证
+        if !(0.0..=1.0).contains(&position) {
+            return Err(RobotError::ConfigError(
+                "Gripper position must be in [0.0, 1.0]".to_string(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&effort) {
+            return Err(RobotError::ConfigError(
+                "Gripper effort must be in [0.0, 1.0]".to_string(),
+            ));
+        }
+
+        let raw = RawCommander::new(&self.driver);
+        raw.send_gripper_command(position, effort)
+    }
+
+    /// 打开夹爪
+    ///
+    /// 便捷方法，相当于 `set_gripper(1.0, 0.3)`
+    pub fn open_gripper(&self) -> Result<()> {
+        self.set_gripper(1.0, 0.3)
+    }
+
+    /// 关闭夹爪
+    ///
+    /// 便捷方法，相当于 `set_gripper(0.0, effort)`
+    pub fn close_gripper(&self, effort: f64) -> Result<()> {
+        self.set_gripper(0.0, effort)
     }
 
     /// 获取 Observer（只读）
@@ -688,6 +816,141 @@ impl Piper<Active<MitMode>> {
 // ==================== Active<PositionMode> 状态 ====================
 
 impl Piper<Active<PositionMode>> {
+    /// 发送位置命令（批量发送所有关节）
+    ///
+    /// 一次性发送所有 6 个关节的目标位置。
+    ///
+    /// # 参数
+    ///
+    /// - `positions`: 各关节目标位置
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_sdk::client::state::*;
+    /// # use piper_sdk::client::types::*;
+    /// # fn example(robot: Piper<Active<PositionMode>>) -> Result<()> {
+    /// let positions = JointArray::from([
+    ///     Rad(1.0), Rad(0.5), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)
+    /// ]);
+    /// robot.send_position_command(&positions)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn send_position_command(&self, positions: &JointArray<Rad>) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        raw.send_position_command_batch(positions)
+    }
+
+    /// 发送末端位姿命令（笛卡尔空间控制）
+    ///
+    /// **前提条件**：必须使用 `MotionType::Cartesian` 或 `MotionType::Linear` 配置。
+    ///
+    /// # 参数
+    ///
+    /// - `position`: 末端位置（米）
+    /// - `orientation`: 末端姿态（欧拉角，度）
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// let config = PositionModeConfig {
+    ///     motion_type: MotionType::Cartesian,
+    ///     ..Default::default()
+    /// };
+    /// let robot = robot.enable_position_mode(config)?;
+    ///
+    /// // 发送末端位姿
+    /// robot.command_cartesian_pose(
+    ///     Position3D::new(0.3, 0.0, 0.2),           // x, y, z (米)
+    ///     EulerAngles::new(0.0, 180.0, 0.0),        // roll, pitch, yaw (度)
+    /// )?;
+    /// ```
+    pub fn command_cartesian_pose(
+        &self,
+        position: Position3D,
+        orientation: EulerAngles,
+    ) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        raw.send_end_pose_command(position, orientation)
+    }
+
+    /// 发送直线运动命令
+    ///
+    /// 末端沿直线轨迹运动到目标位姿。
+    ///
+    /// **前提条件**：必须使用 `MotionType::Linear` 配置。
+    ///
+    /// # 参数
+    ///
+    /// - `position`: 目标位置（米）
+    /// - `orientation`: 目标姿态（欧拉角，度）
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// let config = PositionModeConfig {
+    ///     motion_type: MotionType::Linear,
+    ///     ..Default::default()
+    /// };
+    /// let robot = robot.enable_position_mode(config)?;
+    ///
+    /// // 发送直线运动
+    /// robot.move_linear(
+    ///     Position3D::new(0.3, 0.0, 0.2),           // x, y, z (米)
+    ///     EulerAngles::new(0.0, 180.0, 0.0),        // roll, pitch, yaw (度)
+    /// )?;
+    /// ```
+    pub fn move_linear(&self, position: Position3D, orientation: EulerAngles) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        raw.send_end_pose_command(position, orientation)
+    }
+
+    /// 发送圆弧运动命令
+    ///
+    /// 末端沿圆弧轨迹运动，需要指定中间点和终点。
+    ///
+    /// **前提条件**：必须使用 `MotionType::Circular` 配置。
+    ///
+    /// # 参数
+    ///
+    /// - `via_position`: 中间点位置（米）
+    /// - `via_orientation`: 中间点姿态（欧拉角，度）
+    /// - `target_position`: 终点位置（米）
+    /// - `target_orientation`: 终点姿态（欧拉角，度）
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// let config = PositionModeConfig {
+    ///     motion_type: MotionType::Circular,
+    ///     ..Default::default()
+    /// };
+    /// let robot = robot.enable_position_mode(config)?;
+    ///
+    /// // 发送圆弧运动
+    /// robot.move_circular(
+    ///     Position3D::new(0.2, 0.1, 0.2),          // via: 中间点
+    ///     EulerAngles::new(0.0, 90.0, 0.0),
+    ///     Position3D::new(0.3, 0.0, 0.2),          // target: 终点
+    ///     EulerAngles::new(0.0, 180.0, 0.0),
+    /// )?;
+    /// ```
+    pub fn move_circular(
+        &self,
+        via_position: Position3D,
+        via_orientation: EulerAngles,
+        target_position: Position3D,
+        target_orientation: EulerAngles,
+    ) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        raw.send_circular_motion(
+            via_position,
+            via_orientation,
+            target_position,
+            target_orientation,
+        )
+    }
     /// 更新单个关节位置（保持其他关节不变）
     ///
     /// **注意**：此方法会先读取当前所有关节位置，然后只更新目标关节。
@@ -713,7 +976,7 @@ impl Piper<Active<PositionMode>> {
     /// let mut positions = robot.observer().joint_positions();
     /// positions[Joint::J1] = Rad(1.0);
     /// positions[Joint::J2] = Rad(0.5);
-    /// robot.motion_commander().send_position_command_batch(&positions)?;
+    /// robot.motion_commander().send_position_command(&positions)?;
     /// ```
     pub fn command_position(&self, joint: Joint, position: Rad) -> Result<()> {
         // 读取当前所有关节位置
@@ -721,13 +984,44 @@ impl Piper<Active<PositionMode>> {
         // 只更新目标关节
         positions[joint] = position;
         // 批量发送所有关节（包括更新的和未更新的）
-        let motion = self.motion_commander();
-        motion.send_position_command_batch(&positions)
+        self.send_position_command(&positions)
     }
 
-    /// 获取 MotionCommander（受限权限）
-    pub fn motion_commander(&self) -> MotionCommander {
-        MotionCommander::new(self.driver.clone())
+    /// 控制夹爪
+    ///
+    /// # 参数
+    ///
+    /// - `position`: 夹爪开口（0.0-1.0，1.0 = 完全打开）
+    /// - `effort`: 夹持力度（0.0-1.0，1.0 = 最大力度）
+    pub fn set_gripper(&self, position: f64, effort: f64) -> Result<()> {
+        // 参数验证
+        if !(0.0..=1.0).contains(&position) {
+            return Err(RobotError::ConfigError(
+                "Gripper position must be in [0.0, 1.0]".to_string(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&effort) {
+            return Err(RobotError::ConfigError(
+                "Gripper effort must be in [0.0, 1.0]".to_string(),
+            ));
+        }
+
+        let raw = RawCommander::new(&self.driver);
+        raw.send_gripper_command(position, effort)
+    }
+
+    /// 打开夹爪
+    ///
+    /// 便捷方法，相当于 `set_gripper(1.0, 0.3)`
+    pub fn open_gripper(&self) -> Result<()> {
+        self.set_gripper(1.0, 0.3)
+    }
+
+    /// 关闭夹爪
+    ///
+    /// 便捷方法，相当于 `set_gripper(0.0, effort)`
+    pub fn close_gripper(&self, effort: f64) -> Result<()> {
+        self.set_gripper(0.0, effort)
     }
 
     /// 获取 Observer（只读）
@@ -839,6 +1133,41 @@ mod tests {
     fn test_phantom_data_overhead() {
         assert_eq!(std::mem::size_of::<PhantomData<Disconnected>>(), 0);
         assert_eq!(std::mem::size_of::<PhantomData<Active<MitMode>>>(), 0);
+    }
+
+    #[test]
+    fn test_mit_mode_config_default() {
+        let config = MitModeConfig::default();
+        assert_eq!(config.timeout, Duration::from_secs(2));
+        assert_eq!(config.debounce_threshold, 3);
+        assert_eq!(config.poll_interval, Duration::from_millis(10));
+        assert_eq!(config.speed_percent, 100);
+    }
+
+    #[test]
+    fn test_motion_type_to_move_mode() {
+        use crate::protocol::feedback::MoveMode;
+
+        assert_eq!(MoveMode::from(MotionType::Joint), MoveMode::MoveJ);
+        assert_eq!(MoveMode::from(MotionType::Cartesian), MoveMode::MoveP);
+        assert_eq!(MoveMode::from(MotionType::Linear), MoveMode::MoveL);
+        assert_eq!(MoveMode::from(MotionType::Circular), MoveMode::MoveC);
+        assert_eq!(
+            MoveMode::from(MotionType::ContinuousPositionVelocity),
+            MoveMode::MoveCpv
+        );
+    }
+
+    #[test]
+    fn test_position_mode_config_default() {
+        let config = PositionModeConfig::default();
+        assert_eq!(config.motion_type, MotionType::Joint); // 向后兼容
+        assert_eq!(config.speed_percent, 50);
+    }
+
+    #[test]
+    fn test_motion_type_default() {
+        assert_eq!(MotionType::default(), MotionType::Joint);
     }
 
     // 注意：集成测试位于 tests/ 目录

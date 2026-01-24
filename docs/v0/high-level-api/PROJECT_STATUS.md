@@ -97,7 +97,7 @@
 
 **待完成**:
 - ⏳ RawCommander 实现（内部命令发送器）
-- ⏳ MotionCommander 实现（公开运动接口）
+- ⏳ Piper 实现（公开运动接口）
 - ⏳ Observer 实现（状态观察器）
 - ⏳ Phase 2 性能基准测试
 
@@ -197,7 +197,7 @@ if norm_sq < 1e-10 {
   - 控制模式设置
 - **测试**: 单元测试 + Mock 集成测试
 
-#### 任务 2.3: MotionCommander 实现
+#### 任务 2.3: Piper 实现
 - **目标**: 公开的运动命令接口
 - **功能**:
   - MIT 模式控制
@@ -250,7 +250,7 @@ if norm_sq < 1e-10 {
 
 ### 继续当前会话
 如果继续实施，建议：
-1. 完成 Phase 2 剩余任务（RawCommander, MotionCommander, Observer）
+1. 完成 Phase 2 剩余任务（RawCommander, Piper, Observer）
 2. 编写 Phase 2 完成报告
 3. 准备 Phase 3（阅读设计文档）
 

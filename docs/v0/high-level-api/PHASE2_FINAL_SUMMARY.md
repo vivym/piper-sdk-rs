@@ -25,7 +25,7 @@
 |------|------|------|------|
 | **StateTracker** | 180 | 10 | ~18ns (54M ops/s) |
 | **RawCommander** | 380 | 10 | 完整权限，内部可见 |
-| **MotionCommander** | 400 | 13 | 能力安全，公开接口 |
+| **Piper** | 400 | 13 | 能力安全，公开接口 |
 | **Observer** | 480 | 14 | ~11ns (90M ops/s) |
 | **性能测试** | 226 | 6场景 | 全部达标 |
 
@@ -33,7 +33,7 @@
 
 #### 1️⃣ 读写分离架构
 ```
-写路径: MotionCommander → RawCommander → CAN
+写路径: Piper → RawCommander → CAN
 读路径: Observer → RwLock<RobotState>
 ```
 - ✅ 完全独立
@@ -143,7 +143,7 @@ Observer读取:   11ns    (90M ops/s, 超标 4.5x)
 │  [Phase 2: 读写分离]                   │
 │  ├─ StateTracker (原子状态)            │
 │  ├─ RawCommander (内部完全权限)        │
-│  ├─ MotionCommander (公开受限权限)     │
+│  ├─ Piper (公开受限权限)     │
 │  └─ Observer (只读观察器)              │
 │                                         │
 └─────────────────────────────────────────┘
@@ -298,7 +298,7 @@ robot.enable()?;  // error: already enabled
 
 ### 功能验收
 - ✅ RawCommander 所有方法实现
-- ✅ MotionCommander 完整 API
+- ✅ Piper 完整 API
 - ✅ Observer 夹爪反馈
 - ✅ 批量命令支持
 - ✅ 性能基准测试
@@ -343,7 +343,7 @@ pub struct StateTracker {
 pub(crate) struct RawCommander { ... }
 
 // 公开：受限权限
-pub struct MotionCommander {
+pub struct Piper {
     raw: Arc<RawCommander>,  // 不暴露
 }
 ```
@@ -354,7 +354,7 @@ pub struct MotionCommander {
 
 ```rust
 // 写：独占访问
-impl MotionCommander {
+impl Piper {
     pub fn send_mit_command(...) -> Result<()>;
 }
 

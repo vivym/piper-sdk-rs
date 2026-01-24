@@ -394,7 +394,7 @@ pub mod control;
 pub mod types;
 
 // 重新导出常用类型
-pub use motion::MotionCommander;
+pub use motion::Piper;
 pub use observer::Observer;
 pub use state::Piper;  // Type State Pattern 的状态机
 pub use types::*;
@@ -483,7 +483,7 @@ grep -r "use.*high_level" src/
 
 // 客户端层（推荐使用）
 pub use crate::client::Piper;
-pub use crate::client::{MotionCommander, Observer};
+pub use crate::client::{Piper, Observer};
 pub use crate::client::{JointArray, Rad, Deg, NewtonMeter};
 
 // CAN 层（常用 Trait）
@@ -524,7 +524,7 @@ pub use crate::driver::DriverError;
 //! ```rust
 //! use piper_sdk::prelude::*;
 //! // 或
-//! use piper_sdk::{Piper, MotionCommander, Observer};
+//! use piper_sdk::{Piper, Piper, Observer};
 //! ```
 //!
 //! 需要直接控制 CAN 帧或需要更高性能的用户可以使用驱动层：
@@ -561,7 +561,7 @@ pub use driver::{PiperBuilder, DriverError};
 // 导出 client::Piper 为 Piper（这是大多数用户应该使用的）
 pub use client::Piper;  // Type State Pattern 的状态机
 pub use client::{
-    MotionCommander, Observer,
+    Piper, Observer,
     JointArray, Rad, Deg, NewtonMeter,
     // ... 其他常用类型（根据实际需要添加）
 };
@@ -869,7 +869,7 @@ cargo doc --all-features --open
 use piper_sdk::prelude::*;
 
 // 普通用户：直接导入
-use piper_sdk::{Piper, MotionCommander, Observer};
+use piper_sdk::{Piper, Piper, Observer};
 
 // 高级用户：驱动层
 use piper_sdk::driver::{Piper as Driver, PiperBuilder};

@@ -10,7 +10,7 @@
 
 继续 Phase 2 实施，完成读写分离架构的核心组件：
 - RawCommander（内部命令发送器）
-- MotionCommander（公开运动接口）
+- Piper（公开运动接口）
 - Observer（状态观察器）
 - 性能基准测试
 
@@ -33,7 +33,7 @@
 | 组件 | 测试数量 | 通过率 |
 |------|---------|--------|
 | RawCommander | 10 | 100% |
-| MotionCommander | 13 | 100% |
+| Piper | 13 | 100% |
 | Observer | 14 | 100% |
 | **总计** | **37** | **100%** |
 
@@ -155,7 +155,7 @@ for joint in [Joint::J1, Joint::J2, Joint::J3, Joint::J4, Joint::J5, Joint::J6] 
 
 ```
 Commander 路径（写）:
-MotionCommander → RawCommander → StateTracker → CAN Bus
+Piper → RawCommander → StateTracker → CAN Bus
 
 Observer 路径（读）:
 Observer → RwLock<RobotState> → 用户代码
@@ -167,7 +167,7 @@ Observer → RwLock<RobotState> → 用户代码
 
 ```rust
 // ✅ 用户可以做：
-let motion = MotionCommander::new(...);
+let motion = Piper::new(...);
 motion.send_mit_command(...)?;
 motion.set_gripper(0.5, 0.8)?;
 

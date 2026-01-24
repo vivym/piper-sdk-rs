@@ -201,7 +201,7 @@ let planner = TrajectoryPlanner::new(
 
 // 2. 执行轨迹
 for (position, _velocity) in planner {
-    piper.motion_commander().command_positions(position)?;
+    piper.Piper.command_positions(position)?;
     thread::sleep(Duration::from_millis(10));
 }
 ```
@@ -225,7 +225,7 @@ let mut pid = PidController::new(target_position)
 loop {
     let current = piper.observer().joint_positions();
     let output = pid.tick(&current, dt)?;
-    piper.motion_commander().command_torques(output)?;
+    piper.Piper.command_torques(output)?;
     thread::sleep(Duration::from_millis(10));
 }
 ```

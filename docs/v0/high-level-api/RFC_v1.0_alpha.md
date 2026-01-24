@@ -82,7 +82,7 @@
                     ↓
 ┌─────────────────────────────────────────────┐
 │   Layer 1: Reader-Writer Split (读写分离)     │
-│   - MotionCommander (write, 公开)           │
+│   - Piper (write, 公开)           │
 │   - Observer (read, 线程安全)                │
 │   - RawCommander (full, 内部)               │
 └─────────────────────────────────────────────┘
@@ -161,11 +161,11 @@ impl RawCommander {
 }
 
 // 公开受限权限（pub）
-pub struct MotionCommander {
+pub struct Piper {
     raw: Arc<RawCommander>,
 }
 
-impl MotionCommander {
+impl Piper {
     // ✅ 只暴露运动相关方法
     pub fn command_torques(&self, torques: JointArray<NewtonMeter>)
         -> Result<(), RobotError> {
@@ -203,7 +203,7 @@ impl Observer {
 
 // 使用示例
 let observer = piper.observer();
-let commander = piper.motion_commander();
+let commander = piper.Piper;
 
 // ✅ 并发: 控制线程 + 监控线程
 thread::spawn(move || {
@@ -280,7 +280,7 @@ impl Iterator for TrajectoryPlanner {
 
 // ✅ 使用: O(1) 内存，按需生成
 for (position, velocity) in trajectory_planner {
-    piper.motion_commander().command_positions(position)?;
+    piper.Piper.command_positions(position)?;
 }
 ```
 
@@ -357,7 +357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. 执行轨迹
     for (position, _velocity) in planner {
-        piper.motion_commander().command_positions(position)?;
+        piper.Piper.command_positions(position)?;
         thread::sleep(Duration::from_millis(10));
     }
 
@@ -387,7 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     run_controller(
         piper.observer(),
-        piper.motion_commander(),
+        piper.Piper,
         pid,
         config,
     )?;

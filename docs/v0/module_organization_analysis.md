@@ -536,7 +536,7 @@ src/
 //! ```rust
 //! use piper_sdk::prelude::*;
 //! // 或
-//! use piper_sdk::{Piper, MotionCommander, Observer};
+//! use piper_sdk::{Piper, Piper, Observer};
 //! ```
 //!
 //! 需要直接控制 CAN 帧或需要更高性能的用户可以使用驱动层：
@@ -573,7 +573,7 @@ pub use driver::{PiperBuilder, DriverError};
 // 导出 client::Piper 为 Piper（这是大多数用户应该使用的）
 pub use client::Piper;  // Type State Pattern 的状态机
 pub use client::{
-    MotionCommander, Observer,
+    Piper, Observer,
     JointArray, Rad, Deg, NewtonMeter,
     // ... 其他常用类型
 };
@@ -705,17 +705,17 @@ client/
 **更新前**：
 ```rust
 use piper_sdk::robot::Piper;
-use piper_sdk::high_level::MotionCommander;
+use piper_sdk::high_level::Piper;
 ```
 
 **更新后（推荐方式）**：
 ```rust
 // 方式 1：使用 prelude（推荐）
 use piper_sdk::prelude::*;
-// 现在可以直接使用 Piper, MotionCommander, Observer 等
+// 现在可以直接使用 Piper, Piper, Observer 等
 
 // 方式 2：直接导入（普通用户）
-use piper_sdk::{Piper, MotionCommander, Observer};
+use piper_sdk::{Piper, Piper, Observer};
 // 注意：这里的 Piper 是 client::Piper（Type State API）
 
 // 方式 3：高级用户使用驱动层
@@ -728,7 +728,7 @@ use piper_sdk::Driver;
 ```rust
 // 客户端层（Type State API）
 use piper_sdk::client::Piper;
-use piper_sdk::client::MotionCommander;
+use piper_sdk::client::Piper;
 
 // 驱动层（低层 API）
 use piper_sdk::driver::Piper as Driver;
@@ -737,13 +737,13 @@ use piper_sdk::driver::Piper as Driver;
 **向后兼容（过渡期）**：
 ```rust
 use piper_sdk::robot::Piper;  // 仍然可用，但会显示 deprecation 警告
-use piper_sdk::high_level::MotionCommander;  // 仍然可用，但会显示 deprecation 警告
+use piper_sdk::high_level::Piper;  // 仍然可用，但会显示 deprecation 警告
 ```
 
 **迁移指南**：
 - `robot::Piper` → `driver::Piper` 或使用类型别名 `Driver`（注意：与 `client::Piper` 不同）
 - `high_level::Piper` → `client::Piper` 或直接使用根模块的 `Piper`（这是 Type State API）
-- `high_level::MotionCommander` → `client::MotionCommander` 或直接使用根模块的 `MotionCommander`
+- `high_level::Piper` → `client::Piper` 或直接使用根模块的 `Piper`
 
 **重要提示**：
 - `driver::Piper` 和 `client::Piper` 是不同的类型，服务于不同的使用场景
@@ -805,7 +805,7 @@ use piper_sdk::high_level::MotionCommander;  // 仍然可用，但会显示 depr
 //! # 示例
 //!
 //! ```rust
-//! use piper_sdk::client::{MotionCommander, Observer};
+//! use piper_sdk::client::{Piper, Observer};
 //! ```
 ```
 
@@ -858,7 +858,7 @@ pub type Driver = driver::Piper;
 
 // 客户端层（推荐使用）
 pub use crate::client::Piper;
-pub use crate::client::{MotionCommander, Observer};
+pub use crate::client::{Piper, Observer};
 pub use crate::client::{JointArray, Rad, Deg, NewtonMeter};
 
 // CAN 层（常用 Trait）
@@ -878,7 +878,7 @@ pub use crate::driver::DriverError;
 // 用户代码
 use piper_sdk::prelude::*;
 
-// 现在可以直接使用 Piper, MotionCommander, Observer 等
+// 现在可以直接使用 Piper, Piper, Observer 等
 let robot = Piper::connect(...)?;
 ```
 
@@ -964,7 +964,7 @@ robot (L3)
 
 high_level (L4)
   ├── 依赖: robot, protocol
-  └── 提供: MotionCommander, Observer, Type State API
+  └── 提供: Piper, Observer, Type State API
 ```
 
 ---

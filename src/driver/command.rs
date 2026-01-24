@@ -19,18 +19,25 @@ const _: () = {
 
 /// 帧缓冲区类型
 ///
-/// 使用 SmallVec 在栈上预留 4 个位置，足以覆盖：
+/// 使用 SmallVec 在栈上预留 6 个位置，足以覆盖：
+/// - MIT 控制：6 帧（0x15A, 0x15B, 0x15C, 0x15D, 0x15E, 0x15F）- **高频控制协议**
 /// - 位置控制：3 帧（0x155, 0x156, 0x157）
 /// - 末端位姿控制：3 帧（0x152, 0x153, 0x154）
 /// - 单个帧：1 帧（向后兼容）
 ///
-/// 占用空间约：24 bytes * 4 + overhead ≈ 100 bytes，对于 Mutex 内容来说非常轻量
+/// **为什么是 6？**
+/// - MIT 控制是高频控制协议（通常 500Hz-1kHz），需要同时控制所有 6 个关节
+/// - 每个关节需要 1 帧（CAN ID: 0x15A + joint_index）
+/// - 总共需要 6 帧，必须一次性打包发送以避免覆盖问题
+/// - 使用栈缓冲区（6 帧）可以避免堆分配，确保实时性能
+///
+/// 占用空间约：24 bytes * 6 + overhead ≈ 150 bytes，对于 Mutex 内容来说仍然轻量
 ///
 /// **性能要求**：`PiperFrame` 必须实现 `Copy` Trait，这样 `SmallVec` 在收集和迭代时
 /// 会编译为高效的内存拷贝指令（`memcpy`），避免调用 `Clone::clone`。
 ///
 /// **确认**：`PiperFrame` 已实现 `Copy` Trait（见 `src/can/mod.rs:35`），满足性能要求。
-pub type FrameBuffer = SmallVec<[PiperFrame; 4]>;
+pub type FrameBuffer = SmallVec<[PiperFrame; 6]>;
 
 /// 实时命令类型（统一使用 FrameBuffer）
 ///
@@ -50,7 +57,7 @@ impl RealtimeCommand {
     #[inline]
     pub fn single(frame: PiperFrame) -> Self {
         let mut buffer = FrameBuffer::new();
-        buffer.push(frame); // 不会分配堆内存（len=1 < 4）
+        buffer.push(frame); // 不会分配堆内存（len=1 < 6）
         RealtimeCommand { frames: buffer }
     }
 
@@ -59,7 +66,7 @@ impl RealtimeCommand {
     /// **性能优化**：添加 `#[inline]` 属性，因为此方法处于热路径（Hot Path）上。
     ///
     /// **注意**：如果用户传入 `Vec<PiperFrame>`，`into_iter()` 会消耗这个 `Vec`。
-    /// 如果 `Vec` 长度 > 4，`SmallVec` 可能会尝试重用 `Vec` 的堆内存或重新分配。
+    /// 如果 `Vec` 长度 > 6，`SmallVec` 可能会尝试重用 `Vec` 的堆内存或重新分配。
     /// 虽然这是安全的，但为了最佳性能，建议用户传入数组（栈分配）。
     #[inline]
     pub fn package(frames: impl IntoIterator<Item = PiperFrame>) -> Self {

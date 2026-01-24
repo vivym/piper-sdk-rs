@@ -1087,14 +1087,14 @@ fn test_state_check_integration() {
 
 ---
 
-### 任务 2.3: MotionCommander（公开受限权限）
+### 任务 2.3: Piper（公开受限权限）
 
 **目标**: 用户可访问的运动控制接口
 
 **文件**: `src/client/commander.rs`
 
 **清单**:
-- [ ] 实现 `MotionCommander` 结构
+- [ ] 实现 `Piper` 结构
 - [ ] 包装 `RawCommander` 的运动方法
 - [ ] 实现夹爪控制方法
 - [ ] 确保无状态变更能力
@@ -1105,11 +1105,11 @@ fn test_state_check_integration() {
 
 /// 运动控制器（仅运动指令，无状态变更能力）
 #[derive(Clone)]
-pub struct MotionCommander {
+pub struct Piper {
     pub(crate) raw: Arc<RawCommander>,
 }
 
-impl MotionCommander {
+impl Piper {
     /// 发送 MIT 模式指令
     pub fn send_mit_command(
         &self,
@@ -1159,7 +1159,7 @@ impl MotionCommander {
 
 #[test]
 fn test_capability_restriction() {
-    let (commander, _mock) = setup_motion_commander();
+    let (commander, _mock) = setup_Piper;
 
     // ✅ 可以发送运动指令
     assert!(commander.send_mit_command(...).is_ok());
@@ -1174,7 +1174,7 @@ fn test_capability_restriction() {
 
 #[test]
 fn test_gripper_control() {
-    let (commander, mock) = setup_motion_commander();
+    let (commander, mock) = setup_Piper;
 
     commander.open_gripper(10.0).unwrap();
     assert_eq!(mock.get_gripper_position(), GRIPPER_MAX_POSITION);
@@ -1730,9 +1730,9 @@ impl Piper<MitMode> {
         self.raw_commander.send_mit_command(joint, position, velocity, kp, kd, torque)
     }
 
-    /// 获取 MotionCommander（受限权限）
-    pub fn motion_commander(&self) -> MotionCommander {
-        MotionCommander {
+    /// 获取 Piper（受限权限）
+    pub fn Piper -> Piper {
+        Piper {
             raw: self.raw_commander.clone(),
         }
     }
@@ -2105,7 +2105,7 @@ pub struct SafePidController {
 
     // 配置
     target: Rad,
-    commander: MotionCommander,
+    commander: Piper,
     joint: Joint,
 }
 
@@ -2960,7 +2960,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|&joint| SafePidController::new(
             PidGains { kp: 10.0, ki: 0.1, kd: 1.0 },
             Rad(0.0),  // 目标位置
-            piper.motion_commander(),
+            piper.Piper,
             joint,
         ))
         .collect();
@@ -3045,7 +3045,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # 参见
 ///
 /// - [`PositionMode`] - 位置控制模式
-/// - [`MotionCommander`] - 受限权限接口
+/// - [`Piper`] - 受限权限接口
 pub struct Piper<MitMode> { ... }
 ```
 

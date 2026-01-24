@@ -143,7 +143,7 @@ use piper_sdk::prelude::*;
 
 // 现在可以直接使用：
 // - Piper (客户端 API)
-// - MotionCommander, Observer
+// - Piper, Observer
 // - JointArray, Rad, Deg, NewtonMeter
 // - CanAdapter
 // - Driver (驱动层类型别名)

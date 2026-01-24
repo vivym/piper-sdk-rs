@@ -142,18 +142,18 @@ impl RawCommander {
 }
 ```
 
-#### 1.2 公开的 MotionCommander（受限权限）
+#### 1.2 公开的 Piper（受限权限）
 
 ```rust
 // src/client/motion_commander.rs
 
 /// 运动命令器（公开给用户，仅能发送运动指令）
 #[derive(Clone)]
-pub struct MotionCommander {
+pub struct Piper {
     raw: Arc<RawCommander>,
 }
 
-impl MotionCommander {
+impl Piper {
     pub(crate) fn new(raw: Arc<RawCommander>) -> Self {
         Self { raw }
     }
@@ -191,13 +191,13 @@ impl PiperClient {
     /// 创建客户端（不再返回完全权限的 Commander）
     pub fn new(
         config: ClientConfig,
-    ) -> Result<(MotionCommander, Observer, HeartbeatManager), RobotError> {
+    ) -> Result<(Piper, Observer, HeartbeatManager), RobotError> {
         let raw_commander = Arc::new(RawCommander::new(config.can_interface)?);
         let observer = Observer::new(raw_commander.state_tracker.clone());
         let heartbeat = HeartbeatManager::new(raw_commander.clone());
 
-        // 只返回受限的 MotionCommander
-        let motion_commander = MotionCommander::new(raw_commander.clone());
+        // 只返回受限的 Piper
+        let motion_commander = Piper::new(raw_commander.clone());
 
         Ok((motion_commander, observer, heartbeat))
     }
@@ -244,9 +244,9 @@ impl Piper<Standby> {
 }
 
 impl Piper<MitMode> {
-    /// 用户可以获取受限的 MotionCommander
-    pub fn motion_commander(&self) -> MotionCommander {
-        MotionCommander::new(self.raw_commander.clone())
+    /// 用户可以获取受限的 Piper
+    pub fn Piper -> Piper {
+        Piper::new(self.raw_commander.clone())
     }
 
     /// 发送力矩命令（直接使用内部方法）
@@ -272,15 +272,15 @@ impl Piper<MitMode> {
 // ✅ 用户无法获取完全权限的 Commander
 let (motion_cmd, observer, heartbeat) = PiperClient::new(config)?;
 
-// ❌ 编译错误：MotionCommander 没有 disable_arm() 方法
+// ❌ 编译错误：Piper 没有 disable_arm() 方法
 motion_cmd.disable_arm()?;  // ERROR: no method `disable_arm`
 
 // ✅ 只能通过状态机操作
 let piper = Piper::<Disconnected>::connect("can0")?
     .enable_mit_mode(timeout)?;
 
-// ✅ 可以获取受限的 MotionCommander 用于多线程
-let motion_cmd = piper.motion_commander();
+// ✅ 可以获取受限的 Piper 用于多线程
+let motion_cmd = piper.Piper;
 std::thread::spawn(move || {
     motion_cmd.send_mit_command(...)?;  // OK: 仅运动指令
     // motion_cmd.disable_arm()?;  // ERROR: 方法不存在
@@ -990,7 +990,7 @@ use piper_sdk::prelude::*;
 use std::time::Duration;
 
 fn main() -> Result<(), RobotError> {
-    // 1. 连接（使用受限的 MotionCommander）
+    // 1. 连接（使用受限的 Piper）
     let (motion_cmd, observer, mut heartbeat) = PiperClient::new(
         ClientConfig::new("can0")
     )?;
@@ -1059,7 +1059,7 @@ fn main() -> Result<(), RobotError> {
 
 | 问题 | v3.0 设计 | v3.1 防御性改进 | 效果 |
 |------|-----------|----------------|------|
-| **后门漏洞** | Commander 公开可用 | RawCommander(内部) + MotionCommander(受限) | ✅ 无法绕过 Type State |
+| **后门漏洞** | Commander 公开可用 | RawCommander(内部) + Piper(受限) | ✅ 无法绕过 Type State |
 | **状态断裂** | 无检测机制 | StateTracker + StateMonitor | ✅ 检测物理与类型不一致 |
 | **dt 抖动** | 原始 dt | dt 钳位 + 自动重置 | ✅ 防止积分饱和和微分噪声 |
 
@@ -1070,7 +1070,7 @@ fn main() -> Result<(), RobotError> {
 ### Priority 0 (立即实施)
 
 1. **收紧 Commander 权限** (1 天)
-   - 实现 `RawCommander` (内部) 和 `MotionCommander` (公开)
+   - 实现 `RawCommander` (内部) 和 `Piper` (公开)
    - 修改 `PiperClient::new()` 返回值
    - 影响：防止绕过 Type State
 

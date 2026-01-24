@@ -82,7 +82,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let robot = robot.enable_mit_mode()?;
 
     // Get motion commander and observer
-    let motion = robot.motion_commander();
+    let motion = robot.Piper;
     let observer = robot.observer();
 
     // Read state (lock-free, nanosecond-level response)
@@ -178,7 +178,7 @@ piper-rs/
 │   │   └── error.rs        # DriverError (error types)
 │   └── client/             # Client layer (type-safe, user-friendly API)
 │       ├── mod.rs          # Client module entry
-│       ├── motion.rs        # MotionCommander (command interface)
+│       ├── motion.rs        # Piper (command interface)
 │       ├── observer.rs      # Observer (read-only state access)
 │       ├── state/           # Type State Pattern state machine
 │       ├── control/         # Controllers and trajectory planning
@@ -225,6 +225,7 @@ For detailed design documentation, see:
 - [Real-time Configuration Guide](docs/v0/realtime_configuration.md)
 - [Real-time Optimization Guide](docs/v0/realtime_optimization.md)
 - [Migration Guide](docs/v0/MIGRATION_GUIDE.md) - Guide for migrating from v0.1.x to v0.2.0+
+- [Position Control & MOVE Mode User Guide](docs/v0/position_control_user_guide.md) - Complete guide for position control and motion types
 
 ## 🔗 Related Links
 

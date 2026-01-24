@@ -82,7 +82,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let robot = robot.enable_mit_mode()?;
 
     // 获取运动命令器和观察器
-    let motion = robot.motion_commander();
+    let motion = robot.Piper;
     let observer = robot.observer();
 
     // 读取状态（无锁，纳秒级返回）
@@ -178,7 +178,7 @@ piper-rs/
 │   │   └── error.rs        # DriverError（错误类型）
 │   └── client/             # 客户端层（类型安全、用户友好 API）
 │       ├── mod.rs          # 客户端模块入口
-│       ├── motion.rs        # MotionCommander（命令接口）
+│       ├── motion.rs        # Piper（命令接口）
 │       ├── observer.rs      # Observer（只读状态访问）
 │       ├── state/           # Type State Pattern 状态机
 │       ├── control/         # 控制器和轨迹规划
@@ -225,6 +225,7 @@ piper-rs/
 - [实时配置指南](docs/v0/realtime_configuration.md)
 - [实时优化指南](docs/v0/realtime_optimization.md)
 - [迁移指南](docs/v0/MIGRATION_GUIDE.md) - 从 v0.1.x 迁移到 v0.2.0+ 的指南
+- [位置控制与 MOVE 模式用户指南](docs/v0/position_control_user_guide.md) - 位置控制和运动类型完整指南
 
 ## 🔗 相关链接
 

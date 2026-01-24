@@ -22,7 +22,7 @@
 
 1. **StateTracker** - 原子状态跟踪器
 2. **RawCommander** - 内部命令发送器
-3. **MotionCommander** - 公开运动接口
+3. **Piper** - 公开运动接口
 4. **Observer** - 状态观察器
 
 ---
@@ -88,7 +88,7 @@ pub(crate) fn set_control_mode(&self, mode: ControlMode) -> Result<()> { ... }
 
 ---
 
-### ✅ 任务 2.3: MotionCommander（公开受限权限）
+### ✅ 任务 2.3: Piper（公开受限权限）
 
 **目标**: 用户可访问的运动控制接口
 
@@ -100,11 +100,11 @@ pub(crate) fn set_control_mode(&self, mode: ControlMode) -> Result<()> { ... }
 
 **API 设计**:
 ```rust
-pub struct MotionCommander {
+pub struct Piper {
     raw: Arc<RawCommander>,  // 持有内部接口，但不暴露
 }
 
-impl MotionCommander {
+impl Piper {
     // ✅ 公开方法：只能发送运动命令
     pub fn send_mit_command(...) -> Result<()>;
     pub fn send_position_command(...) -> Result<()>;
@@ -246,7 +246,7 @@ cargo bench --bench phase2_performance
 
 ```mermaid
 graph LR
-    A[用户代码] --> B[MotionCommander]
+    A[用户代码] --> B[Piper]
     A --> C[Observer]
     B --> D[RawCommander]
     D --> E[StateTracker]
@@ -259,7 +259,7 @@ graph LR
     style E fill:#FFD700
 ```
 
-- **绿色** (MotionCommander): 公开，只读权限
+- **绿色** (Piper): 公开，只读权限
 - **蓝色** (Observer): 公开，可克隆
 - **粉色** (RawCommander): 内部，完整权限
 - **金色** (StateTracker): 内部，性能关键
@@ -268,7 +268,7 @@ graph LR
 
 ```rust
 // ✅ 编译通过
-let motion = MotionCommander { ... };
+let motion = Piper { ... };
 motion.send_mit_command(...)?;
 
 // ❌ 编译失败（方法不存在）
@@ -295,7 +295,7 @@ if !self.valid_flag.load(Ordering::Acquire) {
 |------|---------|---------|---------|
 | StateTracker | 10 | ✅ | 3 |
 | RawCommander | 10 | ✅ | - |
-| MotionCommander | 13 | ✅ | - |
+| Piper | 13 | ✅ | - |
 | Observer | 14 | ✅ | 3 |
 | **总计** | **47** | **4** | **6** |
 
@@ -367,7 +367,7 @@ for joint in [Joint::J1, Joint::J2, Joint::J3, Joint::J4, Joint::J5, Joint::J6] 
 
 ### 1. **能力安全（Capability-based Security）**
 - ✅ `RawCommander`: 完整权限（内部）
-- ✅ `MotionCommander`: 运动权限（公开）
+- ✅ `Piper`: 运动权限（公开）
 - ✅ 编译期强制执行
 
 ### 2. **读写分离（Reader-Writer Separation）**
@@ -393,7 +393,7 @@ for joint in [Joint::J1, Joint::J2, Joint::J3, Joint::J4, Joint::J5, Joint::J6] 
 |------|---------|---------|------|
 | StateTracker | 快速检查 < 5ns | 实际 ~18ns | ✅ (仍然优秀) |
 | RawCommander | 热路径 < 100ns | 状态检查 ~18ns | ✅ |
-| MotionCommander | 编译期权限控制 | ✅ 实现 | ✅ |
+| Piper | 编译期权限控制 | ✅ 实现 | ✅ |
 | Observer | 夹爪反馈 | ✅ 完整实现 | ✅ |
 | 性能测试 | criterion 基准 | ✅ 6 个场景 | ✅ |
 
@@ -406,7 +406,7 @@ for joint in [Joint::J1, Joint::J2, Joint::J3, Joint::J4, Joint::J5, Joint::J6] 
 | 原子优化 | ✅ 完成 | AtomicBool 快速路径 |
 | 能力安全 | ✅ 完成 | pub(crate) 权限控制 |
 | 强类型单位 | ✅ 完成 | Phase 1 提供 |
-| 夹爪控制 | ✅ 完成 | MotionCommander + Observer |
+| 夹爪控制 | ✅ 完成 | Piper + Observer |
 
 ---
 
@@ -438,7 +438,7 @@ for joint in [Joint::J1, Joint::J2, Joint::J3, Joint::J4, Joint::J5, Joint::J6] 
 
 ### 功能完整性
 - ✅ RawCommander 所有方法实现
-- ✅ MotionCommander 完整 API
+- ✅ Piper 完整 API
 - ✅ Observer 夹爪反馈（v1.1 要求）
 - ✅ 批量命令支持
 

@@ -735,7 +735,7 @@ pub use builder::PiperBuilder;
 
 ```rust
 pub use client::{
-    Piper, MotionCommander, Observer,
+    Piper, Piper, Observer,
     PiperBuilder,  // 新增
 };
 ```

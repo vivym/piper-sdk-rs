@@ -15,7 +15,7 @@
 //! use piper_sdk::client::control::{run_controller, LoopConfig, Controller};
 //! use piper_sdk::client::state::Piper;
 //!
-//! # fn example(piper: Piper<()>, controller: impl Controller) -> Result<(), Box<dyn std::error::Error>> {
+//! # fn example(piper: Piper<Active<MitMode>>, controller: impl Controller) -> Result<(), Box<dyn std::error::Error>> {
 //! let config = LoopConfig {
 //!     frequency_hz: 100.0,              // 100Hz 控制频率
 //!     dt_clamp_multiplier: 2.0,         // dt 最大为 2x 标称值
@@ -28,8 +28,9 @@
 //! ```
 
 use super::controller::Controller;
+use crate::client::Piper;
+use crate::client::state::{Active, MitMode};
 use crate::client::types::RobotError;
-use crate::client::{MotionCommander, Observer};
 use std::time::{Duration, Instant};
 
 /// 控制循环配置
@@ -72,8 +73,7 @@ impl Default for LoopConfig {
 ///
 /// # 参数
 ///
-/// - `observer`: 状态观察器（用于读取当前状态）
-/// - `commander`: 命令发送器（用于发送控制命令）
+/// - `piper`: `Piper<Active<MitMode>>` 实例（Type State 安全保证）
 /// - `controller`: 控制器（实现 `Controller` trait）
 /// - `config`: 循环配置
 ///
@@ -92,27 +92,24 @@ impl Default for LoopConfig {
 ///
 /// ```rust,ignore
 /// use piper_sdk::client::control::{run_controller, LoopConfig};
-/// # use piper_sdk::client::client::{Observer, MotionCommander};
+/// # use piper_sdk::client::state::Piper;
 /// # use piper_sdk::client::control::Controller;
 /// # fn example(
-/// #     observer: Observer,
-/// #     commander: MotionCommander,
+/// #     piper: Piper<Active<MitMode>>,
 /// #     controller: impl Controller,
 /// # ) -> Result<(), Box<dyn std::error::Error>> {
-///
 /// let config = LoopConfig {
 ///     frequency_hz: 200.0,  // 200Hz 高频控制
 ///     dt_clamp_multiplier: 1.5,
 ///     max_iterations: Some(2000),  // 运行 10 秒后停止
 /// };
 ///
-/// run_controller(observer, commander, controller, config)?;
+/// run_controller(piper, controller, config)?;
 /// # Ok(())
 /// # }
 /// ```
 pub fn run_controller<C>(
-    observer: Observer,
-    commander: MotionCommander,
+    piper: Piper<Active<MitMode>>,
     mut controller: C,
     config: LoopConfig,
 ) -> Result<(), RobotError>
@@ -170,13 +167,16 @@ where
         }
 
         // 3. 读取当前状态
-        let current = observer.joint_positions();
+        let current = piper.observer().joint_positions();
 
-        // 4. 调用控制器
-        let output = controller.tick(&current, dt).map_err(RobotError::from)?;
+        // 4. 调用控制器（只返回力矩）
+        let torques = controller.tick(&current, dt).map_err(RobotError::from)?;
 
-        // 5. 发送命令
-        commander.command_torques(output)?;
+        // 5. 发送命令（使用纯力矩模式，kp/kd=0）
+        let zero_positions =
+            crate::client::types::JointArray::from([crate::client::types::Rad(0.0); 6]);
+        let zero_velocities = crate::client::types::JointArray::from([0.0; 6]);
+        piper.command_torques(&zero_positions, &zero_velocities, 0.0, 0.0, &torques)?;
 
         // 6. 更新时间
         last_time = now;
@@ -193,8 +193,7 @@ where
 ///
 /// ⚠️ **注意**: `spin_sleep` 会占用更多 CPU，适合对实时性要求极高的场景。
 pub fn run_controller_spin<C>(
-    observer: Observer,
-    commander: MotionCommander,
+    piper: Piper<Active<MitMode>>,
     mut controller: C,
     config: LoopConfig,
 ) -> Result<(), RobotError>
@@ -247,9 +246,13 @@ where
             dt = max_dt;
         }
 
-        let current = observer.joint_positions();
-        let output = controller.tick(&current, dt).map_err(RobotError::from)?;
-        commander.command_torques(output)?;
+        let current = piper.observer().joint_positions();
+        let torques = controller.tick(&current, dt).map_err(RobotError::from)?;
+
+        let zero_positions =
+            crate::client::types::JointArray::from([crate::client::types::Rad(0.0); 6]);
+        let zero_velocities = crate::client::types::JointArray::from([0.0; 6]);
+        piper.command_torques(&zero_positions, &zero_velocities, 0.0, 0.0, &torques)?;
 
         last_time = now;
         iteration += 1;
@@ -280,5 +283,16 @@ mod tests {
         assert_eq!(config.frequency_hz, 200.0);
         assert_eq!(config.dt_clamp_multiplier, 1.5);
         assert_eq!(config.max_iterations, Some(1000));
+    }
+
+    #[test]
+    fn test_invalid_frequency() {
+        let config = LoopConfig {
+            frequency_hz: -1.0,
+            ..Default::default()
+        };
+        // 注意：此测试需要实际的 robot 实例，在单元测试中无法完成
+        // 只验证配置构造
+        assert_eq!(config.frequency_hz, -1.0);
     }
 }

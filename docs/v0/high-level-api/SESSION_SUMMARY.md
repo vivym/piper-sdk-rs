@@ -91,7 +91,7 @@
    - 性能基准测试
 
 **待完成任务**:
-- ⏳ MotionCommander 实现
+- ⏳ Piper 实现
 - ⏳ Observer 实现
 - ⏳ 性能基准测试套件
 
@@ -273,7 +273,7 @@ let scaled = positions.map_with_joint(|joint, rad| {
 
 ### 立即可做
 1. 继续 Phase 2 剩余任务
-   - MotionCommander 实现
+   - Piper 实现
    - Observer 实现
    - 完整性能基准测试
 
@@ -315,7 +315,7 @@ let scaled = positions.map_with_joint(|joint, rad| {
 ## 🎯 下一步行动
 
 ### Phase 2 剩余工作（预计 2-3 天）
-1. MotionCommander 实现
+1. Piper 实现
 2. Observer 实现
 3. 性能基准测试套件
 4. Phase 2 完成报告

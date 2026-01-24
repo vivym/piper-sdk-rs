@@ -79,7 +79,7 @@ pub trait Controller {
 ```rust
 pub fn run_controller<C: Controller>(
     observer: Observer,
-    commander: MotionCommander,
+    commander: Piper,
     controller: C,
     config: LoopConfig,
 ) -> Result<(), RobotError>
@@ -367,7 +367,7 @@ impl<T: Copy> Copy for JointArray<T> {}
 
 **影响**: 简化了 API 使用
 
-### 问题 2: MotionCommander 缺少 command_torques
+### 问题 2: Piper 缺少 command_torques
 
 **问题**: `run_controller` 需要发送力矩命令
 

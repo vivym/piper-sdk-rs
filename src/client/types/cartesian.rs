@@ -276,6 +276,54 @@ impl fmt::Display for CartesianPose {
     }
 }
 
+/// 欧拉角（用于表示3D旋转姿态）
+///
+/// 使用 **Intrinsic RPY (Roll-Pitch-Yaw)** 顺序，即：
+/// - 先绕 X 轴旋转（Roll）
+/// - 再绕 Y 轴旋转（Pitch）
+/// - 最后绕 Z 轴旋转（Yaw）
+///
+/// **协议映射**：
+/// - Roll (RX): 对应协议 0x153 的 RX 角度
+/// - Pitch (RY): 对应协议 0x154 的 RY 角度
+/// - Yaw (RZ): 对应协议 0x154 的 RZ 角度
+///
+/// **单位**：度（degree）
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EulerAngles {
+    /// Roll：绕 X 轴旋转（度）
+    pub roll: f64,
+    /// Pitch：绕 Y 轴旋转（度）
+    pub pitch: f64,
+    /// Yaw：绕 Z 轴旋转（度）
+    pub yaw: f64,
+}
+
+impl EulerAngles {
+    /// 创建新的欧拉角
+    pub fn new(roll: f64, pitch: f64, yaw: f64) -> Self {
+        EulerAngles { roll, pitch, yaw }
+    }
+
+    /// 零角度（无旋转）
+    pub const ZERO: Self = EulerAngles {
+        roll: 0.0,
+        pitch: 0.0,
+        yaw: 0.0,
+    };
+}
+
+impl fmt::Display for EulerAngles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Euler(roll: {:.2}°, pitch: {:.2}°, yaw: {:.2}°)",
+            self.roll, self.pitch, self.yaw
+        )
+    }
+}
+
 /// 笛卡尔空间速度（线速度 + 角速度）
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -383,6 +431,30 @@ mod tests {
         assert!((roll.0 - r2.0).abs() < 1e-10);
         assert!((pitch.0 - p2.0).abs() < 1e-10);
         assert!((yaw.0 - y2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_euler_angles_new() {
+        let euler = EulerAngles::new(10.0, 20.0, 30.0);
+        assert_eq!(euler.roll, 10.0);
+        assert_eq!(euler.pitch, 20.0);
+        assert_eq!(euler.yaw, 30.0);
+    }
+
+    #[test]
+    fn test_euler_angles_zero() {
+        let euler = EulerAngles::ZERO;
+        assert_eq!(euler.roll, 0.0);
+        assert_eq!(euler.pitch, 0.0);
+        assert_eq!(euler.yaw, 0.0);
+    }
+
+    #[test]
+    fn test_euler_angles_default() {
+        let euler = EulerAngles::default();
+        assert_eq!(euler.roll, 0.0);
+        assert_eq!(euler.pitch, 0.0);
+        assert_eq!(euler.yaw, 0.0);
     }
 
     #[test]

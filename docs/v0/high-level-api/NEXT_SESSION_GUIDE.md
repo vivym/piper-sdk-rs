@@ -57,7 +57,7 @@ impl RawCommander {
 
 ---
 
-**任务 2.3: MotionCommander 实现**
+**任务 2.3: Piper 实现**
 - **文件**: `src/high_level/client/motion_commander.rs`
 - **功能**: 公开的运动命令接口
 - **依赖**: RawCommander
@@ -66,11 +66,11 @@ impl RawCommander {
 
 **关键点**:
 ```rust
-pub struct MotionCommander {
+pub struct Piper {
     raw: Arc<RawCommander>,
 }
 
-impl MotionCommander {
+impl Piper {
     pub fn send_mit_command(...) -> Result<()> {
         self.raw.send_mit_command(...)
     }
@@ -149,7 +149,7 @@ impl Observer {
 4. 编写单元测试（目标：15+ 测试）
 5. 验证性能（快速路径 < 100ns）
 
-### Step 3: 实施 MotionCommander（1 天）
+### Step 3: 实施 Piper（1 天）
 1. 创建 `src/high_level/client/motion_commander.rs`
 2. 实现公开 API
 3. 验证权限控制（无状态修改方法）
@@ -186,7 +186,7 @@ impl Observer {
    - 使用已有的 RobotError 类型
    - 区分 Fatal vs Recoverable
 
-### MotionCommander 实现挑战
+### Piper 实现挑战
 1. **权限控制**:
    - 确保无法调用状态修改方法
    - 只能通过 RawCommander 内部调用
@@ -226,7 +226,7 @@ impl Observer {
 
 ### Phase 2 完成标准
 - ✅ RawCommander 实现并测试
-- ✅ MotionCommander 实现并测试
+- ✅ Piper 实现并测试
 - ✅ Observer 实现并测试
 - ✅ 所有单元测试通过
 - ✅ 性能基准达标
@@ -279,7 +279,7 @@ cat docs/v0/high-level-api/PROJECT_STATUS.md
 # RawCommander
 touch src/high_level/client/raw_commander.rs
 
-# MotionCommander
+# Piper
 touch src/high_level/client/motion_commander.rs
 
 # Observer
@@ -312,7 +312,7 @@ pub mod observer;
 ### 如果时间紧张
 **最小完成**:
 - RawCommander（基本功能）
-- MotionCommander（薄包装）
+- Piper（薄包装）
 - Observer（简单版本）
 - 基础测试
 

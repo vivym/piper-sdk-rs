@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **读写分离架构**:
 - ✨ `RawCommander`: 内部完整权限命令发送器 (pub(crate))
-- ✨ `MotionCommander`: 公开受限权限运动控制器 (只能发送运动指令)
+- ✨ `Piper`: 公开受限权限运动控制器 (只能发送运动指令)
 - ✨ `Observer`: 线程安全只读状态观察器
 - ✨ 支持并发: 控制线程 + 监控线程同时运行
 
@@ -106,7 +106,7 @@ robot.command_torques(...)?;                  // ✅ 编译通过
 raw_commander.enable_arm()?;         // ✅ 内部可用
 raw_commander.disable_arm()?;        // ✅ 内部可用
 
-// MotionCommander: 公开受限权限 (pub)
+// Piper: 公开受限权限 (pub)
 motion_commander.command_torques()?; // ✅ 公开可用
 // motion_commander.enable_arm()?;   // ❌ 不存在此方法
 ```
@@ -189,7 +189,7 @@ let piper = Piper::connect(config)?
     .enable_mit_mode(config)?;
 
 // 直接使用类型安全的 API
-piper.motion_commander().command_torques(torques)?;
+piper.Piper.command_torques(torques)?;
 
 // 线程安全的状态读取
 let positions = piper.observer().joint_positions();

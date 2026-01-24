@@ -181,7 +181,7 @@ assert!(v_end.abs() < 1e-10);
 **位置**: Phase 1（基础类型系统）
 
 **问题**:
-- v3.2 设计中 `MotionCommander` 有 `send_cartesian_command(pose: CartesianPose)` 方法
+- v3.2 设计中 `Piper` 有 `send_cartesian_command(pose: CartesianPose)` 方法
 - 但实施清单中缺少 `CartesianPose` 等笛卡尔空间类型的实现任务
 
 **解决方案**:

@@ -14,6 +14,7 @@ use piper_sdk::client::state::*;
 // 注意：不导入 types::* 以避免 Result 类型别名冲突
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
 use piper_sdk::client::types::{Joint, NewtonMeter, Rad};
+use piper_sdk::prelude::JointArray;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -151,8 +152,10 @@ fn test_enable_mit_mode() {
 
         if let Ok(active_robot) = result {
             // 测试在 Active 状态下可以调用 command_torques
-            let result =
-                active_robot.command_torques(Joint::J1, Rad(0.0), 0.0, 10.0, 0.8, NewtonMeter(0.0));
+            let positions = JointArray::from([Rad(0.0); 6]);
+            let velocities = JointArray::from([0.0; 6]);
+            let torques = JointArray::from([NewtonMeter(0.0); 6]);
+            let result = active_robot.command_torques(&positions, &velocities, 10.0, 0.8, &torques);
             assert!(result.is_ok() || result.is_err());
         }
     }
@@ -249,8 +252,11 @@ fn test_type_state_safety() {
 
         // 转换为 Active 状态后可以调用 command_*
         if let Ok(active_robot) = robot.enable_all() {
+            let positions = JointArray::from([Rad(0.0); 6]);
+            let velocities = JointArray::from([0.0; 6]);
+            let torques = JointArray::from([NewtonMeter(0.0); 6]);
             let _result =
-                active_robot.command_torques(Joint::J1, Rad(0.0), 0.0, 10.0, 0.8, NewtonMeter(0.0));
+                active_robot.command_torques(&positions, &velocities, 10.0, 0.8, &torques);
         }
     }
 }

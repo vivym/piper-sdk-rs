@@ -34,7 +34,7 @@ high_level/
 
 - **Type State Pattern**: 使用零大小类型（ZST）在编译期强制执行状态转换
 - **读写分离**: Commander/Observer 模式，支持高频读取
-- **能力安全**: `RawCommander` 内部可见，外部只能获得受限的 `MotionCommander`
+- **能力安全**: `RawCommander` 内部可见，外部只能获得受限的 `Piper`
 
 ---
 
