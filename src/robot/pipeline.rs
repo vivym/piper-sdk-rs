@@ -732,11 +732,8 @@ pub fn io_loop(
                         firmware_state.hardware_timestamp_us = frame.timestamp_us;
                         firmware_state.system_timestamp_us = system_timestamp_us;
 
-                        // 尝试解析版本字符串
+                        // 尝试解析版本字符串（会自动更新 is_complete 状态）
                         firmware_state.parse_version();
-
-                        // TODO: 判断数据是否完整的逻辑（例如收到特定结束标记）
-                        // firmware_state.is_complete = ...
                     }
 
                     ctx.fps_stats

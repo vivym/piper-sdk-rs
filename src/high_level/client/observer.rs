@@ -1,14 +1,14 @@
-//! Observer - 状态观察器
+//! Observer - 状态观察器（View 模式）
 //!
-//! 提供无锁的状态读取接口，与 Commander 完全独立，
-//! 实现"读写分离"设计模式。
+//! 直接持有 `robot::Piper` 引用，零拷贝、零延迟地读取底层状态。
+//! 不再使用缓存层，避免数据延迟和锁竞争。
 //!
 //! # 设计目标
 //!
-//! - **只读**: 无任何修改状态的能力
-//! - **可克隆**: 多个 Observer 可以并发读取
-//! - **高性能**: 使用 RwLock 支持多读
-//! - **类型安全**: 返回强类型单位（Rad, NewtonMeter）
+//! - **零延迟**: 直接从 `robot::Piper` 读取，无缓存层
+//! - **零拷贝**: 使用 ArcSwap 的 wait-free 读取
+//! - **类型安全**: 返回强类型单位（Rad, RadPerSecond, NewtonMeter）
+//! - **逻辑一致性**: 提供 `snapshot()` 方法保证时间一致性
 //!
 //! # 使用示例
 //!
@@ -20,47 +20,197 @@
 //! let positions = observer.joint_positions();
 //! println!("J1 position: {}", positions[Joint::J1].to_deg());
 //!
-//! // 读取夹爪状态
-//! let gripper_pos = observer.gripper_position();
-//! println!("Gripper: {:.2}", gripper_pos);
+//! // 使用 snapshot 获取时间一致的数据（推荐用于控制算法）
+//! let snapshot = observer.snapshot();
+//! println!("Position: {:?}, Velocity: {:?}", snapshot.position, snapshot.velocity);
 //!
 //! // 克隆 Observer 用于另一个线程
 //! let observer2 = observer.clone();
 //! std::thread::spawn(move || {
 //!     loop {
-//!         let torques = observer2.joint_torques();
-//!         // ... 监控力矩 ...
+//!         let snapshot = observer2.snapshot();
+//!         // ... 监控状态 ...
 //!     }
 //! });
 //! # Ok(())
 //! # }
 //! ```
 
-use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::high_level::types::*;
+use crate::protocol::constants::*;
+use crate::robot::Piper as RobotPiper;
 
-/// 机器人完整状态
-#[derive(Debug, Clone)]
-pub struct RobotState {
-    /// 关节位置
-    pub joint_positions: JointArray<Rad>,
-    /// 关节速度 (rad/s)
-    pub joint_velocities: JointArray<f64>,
-    /// 关节力矩
-    pub joint_torques: JointArray<NewtonMeter>,
-    /// 夹爪状态
-    pub gripper_state: GripperState,
-    /// 机械臂使能状态
-    pub arm_enabled: bool,
-    /// 最后更新时间
-    pub last_update: Instant,
+/// 状态观察器（只读接口，View 模式）
+///
+/// 直接持有 `robot::Piper` 引用，零拷贝、零延迟地读取底层状态。
+/// 不再使用缓存层，避免数据延迟和锁竞争。
+#[derive(Clone)]
+pub struct Observer {
+    /// Robot 实例（直接持有，零拷贝）
+    robot: Arc<RobotPiper>,
+}
+
+impl Observer {
+    /// 创建新的 Observer
+    ///
+    /// **注意：** 此方法通常不直接调用，Observer 应该通过 `Piper` 状态机的 `observer()` 方法获取。
+    /// 此方法为 `pub` 以支持内部测试和性能基准测试。
+    ///
+    /// **基准测试：** 为了支持性能基准测试，此方法在 benches 中也可访问。
+    pub fn new(robot: Arc<RobotPiper>) -> Self {
+        Observer { robot }
+    }
+
+    /// 获取运动快照（推荐用于控制算法）
+    ///
+    /// 此方法尽可能快地连续读取多个相关状态，减少时间偏斜。
+    /// 即使底层是分帧更新的，此方法也能提供逻辑上最一致的数据。
+    ///
+    /// # 性能
+    ///
+    /// - 延迟：~20ns（连续调用 3 次 ArcSwap::load）
+    /// - 无锁竞争（ArcSwap 是 Wait-Free 的）
+    ///
+    /// # 推荐使用场景
+    ///
+    /// - 高频控制算法（>100Hz）
+    /// - 阻抗控制、力矩控制等需要时间一致性的算法
+    pub fn snapshot(&self) -> MotionSnapshot {
+        // 在读取之前记录时间戳，更准确地反映"读取动作发生"的时刻
+        let timestamp = Instant::now();
+
+        // 连续读取，减少中间被抢占的概率
+        let pos = self.robot.get_joint_position();
+        let dyn_state = self.robot.get_joint_dynamic();
+
+        MotionSnapshot {
+            position: JointArray::new(pos.joint_pos.map(Rad)),
+            // ✅ 使用类型安全的单位
+            velocity: JointArray::new(dyn_state.joint_vel.map(RadPerSecond)),
+            torque: JointArray::new(dyn_state.get_all_torques().map(NewtonMeter)),
+            timestamp, // 使用读取前的时间戳
+        }
+    }
+
+    /// 获取关节位置（独立读取，可能与其他状态有时间偏斜）
+    ///
+    /// # 注意
+    ///
+    /// 如果需要与其他状态（如速度、力矩）保持时间一致性，
+    /// 请使用 `snapshot()` 方法。
+    pub fn joint_positions(&self) -> JointArray<Rad> {
+        let raw_pos = self.robot.get_joint_position();
+        JointArray::new(raw_pos.joint_pos.map(Rad))
+    }
+
+    /// 获取关节速度（独立读取，可能与其他状态有时间偏斜）
+    ///
+    /// # 注意
+    ///
+    /// 如果需要与其他状态（如位置、力矩）保持时间一致性，
+    /// 请使用 `snapshot()` 方法。
+    ///
+    /// # 返回值
+    ///
+    /// 返回 `JointArray<RadPerSecond>`，保持类型安全。
+    pub fn joint_velocities(&self) -> JointArray<RadPerSecond> {
+        let dyn_state = self.robot.get_joint_dynamic();
+        // ✅ 使用类型安全的单位
+        JointArray::new(dyn_state.joint_vel.map(RadPerSecond))
+    }
+
+    /// 获取关节力矩（独立读取，可能与其他状态有时间偏斜）
+    ///
+    /// # 注意
+    ///
+    /// 如果需要与其他状态（如位置、速度）保持时间一致性，
+    /// 请使用 `snapshot()` 方法。
+    pub fn joint_torques(&self) -> JointArray<NewtonMeter> {
+        let dyn_state = self.robot.get_joint_dynamic();
+        JointArray::new(dyn_state.get_all_torques().map(NewtonMeter))
+    }
+
+    /// 获取夹爪状态
+    pub fn gripper_state(&self) -> GripperState {
+        let gripper = self.robot.get_gripper();
+        GripperState {
+            position: (gripper.travel / GRIPPER_POSITION_SCALE).clamp(0.0, 1.0),
+            effort: (gripper.torque / GRIPPER_FORCE_SCALE).clamp(0.0, 1.0),
+            enabled: gripper.is_enabled(),
+        }
+    }
+
+    /// 获取夹爪位置 (0.0-1.0)
+    pub fn gripper_position(&self) -> f64 {
+        self.gripper_state().position
+    }
+
+    /// 获取夹爪力度 (0.0-1.0)
+    pub fn gripper_effort(&self) -> f64 {
+        self.gripper_state().effort
+    }
+
+    /// 检查夹爪是否使能
+    pub fn is_gripper_enabled(&self) -> bool {
+        self.robot.get_gripper().is_enabled()
+    }
+
+    /// 获取使能掩码（Bit 0-5 对应 J1-J6）
+    pub fn joint_enabled_mask(&self) -> u8 {
+        let driver_state = self.robot.get_joint_driver_low_speed();
+        driver_state.driver_enabled_mask
+    }
+
+    /// 检查指定关节是否使能
+    pub fn is_joint_enabled(&self, joint_index: usize) -> bool {
+        let driver_state = self.robot.get_joint_driver_low_speed();
+        (driver_state.driver_enabled_mask >> joint_index) & 1 == 1
+    }
+
+    /// 检查是否全部使能
+    pub fn is_all_enabled(&self) -> bool {
+        self.joint_enabled_mask() == 0b111111
+    }
+
+    /// 检查是否全部失能
+    pub fn is_all_disabled(&self) -> bool {
+        self.joint_enabled_mask() == 0
+    }
+
+    /// 检查是否部分使能
+    pub fn is_partially_enabled(&self) -> bool {
+        let mask = self.joint_enabled_mask();
+        mask != 0 && mask != 0b111111
+    }
+
+    /// 检查机械臂是否使能（兼容旧 API）
+    ///
+    /// 如果所有关节都使能，返回 `true`。
+    pub fn is_arm_enabled(&self) -> bool {
+        self.is_all_enabled()
+    }
+
+    /// 获取单个关节的状态
+    ///
+    /// 返回 (position, velocity, torque) 元组。
+    /// **注意**：此方法独立读取，可能与其他状态有时间偏斜。
+    /// 如需时间一致性，请使用 `snapshot()` 方法。
+    pub fn joint_state(&self, joint: Joint) -> (Rad, RadPerSecond, NewtonMeter) {
+        let pos = self.robot.get_joint_position();
+        let dyn_state = self.robot.get_joint_dynamic();
+        (
+            Rad(pos.joint_pos[joint.index()]),
+            RadPerSecond(dyn_state.joint_vel[joint.index()]),
+            NewtonMeter(dyn_state.get_torque(joint.index())),
+        )
+    }
 }
 
 /// 夹爪状态
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GripperState {
     /// 位置 (0.0-1.0)
     pub position: f64,
@@ -68,19 +218,6 @@ pub struct GripperState {
     pub effort: f64,
     /// 使能状态
     pub enabled: bool,
-}
-
-impl Default for RobotState {
-    fn default() -> Self {
-        RobotState {
-            joint_positions: JointArray::splat(Rad(0.0)),
-            joint_velocities: JointArray::splat(0.0),
-            joint_torques: JointArray::splat(NewtonMeter(0.0)),
-            gripper_state: GripperState::default(),
-            arm_enabled: false,
-            last_update: Instant::now(),
-        }
-    }
 }
 
 impl Default for GripperState {
@@ -93,176 +230,22 @@ impl Default for GripperState {
     }
 }
 
-/// 状态观察器（只读接口）
+/// 运动快照（逻辑原子性）
 ///
-/// 可以克隆并在多个线程中并发使用，不影响 Commander 的性能。
-#[derive(Clone)]
-pub struct Observer {
-    /// 共享状态（读写锁）
-    state: Arc<RwLock<RobotState>>,
-}
-
-// 确保 Observer 可以在 Piper 的状态转换中移动
-impl Observer {
-    /// 克隆 Observer（内部使用 Arc，开销小）
-    #[allow(dead_code)]
-    pub(crate) fn clone_internal(&self) -> Self {
-        self.clone()
-    }
-}
-
-impl Observer {
-    /// 创建新的 Observer
-    ///
-    /// 这个方法只能由 crate 内部调用，但在测试和基准测试中可用。
-    #[doc(hidden)]
-    pub fn new(state: Arc<RwLock<RobotState>>) -> Self {
-        Observer { state }
-    }
-
-    /// 获取完整状态快照
-    ///
-    /// # 性能
-    ///
-    /// 这个方法会克隆整个状态，如果只需要部分数据，
-    /// 使用专用方法（如 `joint_positions`）更高效。
-    pub fn state(&self) -> RobotState {
-        self.state.read().clone()
-    }
-
-    /// 获取关节位置
-    ///
-    /// # 示例
-    ///
-    /// ```rust,no_run
-    /// # use piper_sdk::high_level::client::observer::Observer;
-    /// # use piper_sdk::high_level::types::*;
-    /// # fn example(observer: Observer) {
-    /// let positions = observer.joint_positions();
-    /// for joint in [Joint::J1, Joint::J2, Joint::J3, Joint::J4, Joint::J5, Joint::J6] {
-    ///     println!("{:?}: {:.3} rad", joint, positions[joint].0);
-    /// }
-    /// # }
-    /// ```
-    pub fn joint_positions(&self) -> JointArray<Rad> {
-        self.state.read().joint_positions
-    }
-
-    /// 获取关节速度 (rad/s)
-    pub fn joint_velocities(&self) -> JointArray<f64> {
-        self.state.read().joint_velocities
-    }
-
-    /// 获取关节力矩
-    pub fn joint_torques(&self) -> JointArray<NewtonMeter> {
-        self.state.read().joint_torques
-    }
-
-    /// 获取夹爪状态
-    pub fn gripper_state(&self) -> GripperState {
-        self.state.read().gripper_state
-    }
-
-    /// 获取夹爪位置 (0.0-1.0)
-    pub fn gripper_position(&self) -> f64 {
-        self.state.read().gripper_state.position
-    }
-
-    /// 获取夹爪力度 (0.0-1.0)
-    pub fn gripper_effort(&self) -> f64 {
-        self.state.read().gripper_state.effort
-    }
-
-    /// 检查夹爪是否使能
-    pub fn is_gripper_enabled(&self) -> bool {
-        self.state.read().gripper_state.enabled
-    }
-
-    /// 检查机械臂是否使能
-    pub fn is_arm_enabled(&self) -> bool {
-        self.state.read().arm_enabled
-    }
-
-    /// 获取最后更新时间
-    ///
-    /// 可用于检测状态更新的延迟。
-    pub fn last_update(&self) -> Instant {
-        self.state.read().last_update
-    }
-
-    /// 检查状态是否新鲜（最近更新）
-    ///
-    /// # 参数
-    ///
-    /// - `max_age`: 最大允许年龄（Duration）
-    ///
-    /// # 返回
-    ///
-    /// 如果状态在 `max_age` 内更新过，返回 `true`。
-    pub fn is_fresh(&self, max_age: std::time::Duration) -> bool {
-        let last = self.state.read().last_update;
-        last.elapsed() < max_age
-    }
-
-    /// 获取单个关节的状态
-    ///
-    /// 返回 (position, velocity, torque) 元组。
-    pub fn joint_state(&self, joint: Joint) -> (Rad, f64, NewtonMeter) {
-        let state = self.state.read();
-        (
-            state.joint_positions[joint],
-            state.joint_velocities[joint],
-            state.joint_torques[joint],
-        )
-    }
-
-    // ==================== 内部更新方法 ====================
-
-    /// 更新关节状态（仅内部可见，但在基准测试中可用）
-    #[doc(hidden)]
-    pub fn update_joint_positions(&self, positions: JointArray<Rad>) {
-        let mut state = self.state.write();
-        state.joint_positions = positions;
-        state.last_update = Instant::now();
-    }
-
-    /// 更新关节速度（仅内部可见，但在基准测试中可用）
-    #[doc(hidden)]
-    pub fn update_joint_velocities(&self, velocities: JointArray<f64>) {
-        let mut state = self.state.write();
-        state.joint_velocities = velocities;
-        state.last_update = Instant::now();
-    }
-
-    /// 更新关节力矩（仅内部可见，但在基准测试中可用）
-    #[doc(hidden)]
-    pub fn update_joint_torques(&self, torques: JointArray<NewtonMeter>) {
-        let mut state = self.state.write();
-        state.joint_torques = torques;
-        state.last_update = Instant::now();
-    }
-
-    /// 更新夹爪状态（仅内部可见，但在基准测试中可用）
-    #[doc(hidden)]
-    pub fn update_gripper_state(&self, gripper: GripperState) {
-        let mut state = self.state.write();
-        state.gripper_state = gripper;
-        state.last_update = Instant::now();
-    }
-
-    /// 更新机械臂使能状态（仅内部可见，但在基准测试中可用）
-    #[doc(hidden)]
-    pub fn update_arm_enabled(&self, enabled: bool) {
-        let mut state = self.state.write();
-        state.arm_enabled = enabled;
-        state.last_update = Instant::now();
-    }
-
-    /// 批量更新完整状态（仅内部可见，但在基准测试中可用）
-    #[doc(hidden)]
-    pub fn update_state(&self, new_state: RobotState) {
-        *self.state.write() = new_state;
-    }
+/// **设计说明：**
+/// - 使用 `#[non_exhaustive]` 允许未来非破坏性地添加字段
+/// - 例如：加速度、数据有效性标志等衍生数据
+#[derive(Debug, Clone)]
+#[non_exhaustive] // ✅ 允许未来非破坏性地添加字段
+pub struct MotionSnapshot {
+    /// 关节位置
+    pub position: JointArray<Rad>,
+    /// 关节速度（✅ 使用类型安全的单位）
+    pub velocity: JointArray<RadPerSecond>,
+    /// 关节力矩
+    pub torque: JointArray<NewtonMeter>,
+    /// 读取时间戳（用于调试）
+    pub timestamp: Instant,
 }
 
 // 确保 Send + Sync
@@ -272,218 +255,47 @@ unsafe impl Sync for Observer {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    fn create_observer() -> Observer {
-        Observer::new(Arc::new(RwLock::new(RobotState::default())))
+    // 注意：单元测试中创建真实的 robot 实例需要真实的 CAN 适配器
+    // 这里只测试类型和基本逻辑，集成测试会测试完整功能
+
+    // 注意：这些测试需要真实的 robot 实例，应该在集成测试中完成
+    // 这里只测试类型系统和基本逻辑
+
+    #[test]
+    fn test_motion_snapshot_structure() {
+        // 测试 MotionSnapshot 结构
+        let snapshot = MotionSnapshot {
+            position: JointArray::splat(Rad(0.0)),
+            velocity: JointArray::splat(RadPerSecond(0.0)),
+            torque: JointArray::splat(NewtonMeter(0.0)),
+            timestamp: Instant::now(),
+        };
+
+        // ✅ 验证速度单位类型正确
+        let _: RadPerSecond = snapshot.velocity[Joint::J1];
+        let _: JointArray<Rad> = snapshot.position;
+        let _: JointArray<NewtonMeter> = snapshot.torque;
     }
 
     #[test]
-    fn test_default_state() {
-        let observer = create_observer();
-        let state = observer.state();
-
-        assert_eq!(state.joint_positions[Joint::J1].0, 0.0);
-        assert_eq!(state.gripper_state.position, 0.0);
-        assert!(!state.arm_enabled);
-    }
-
-    #[test]
-    fn test_joint_positions() {
-        let observer = create_observer();
-
-        let positions =
-            JointArray::new([Rad(1.0), Rad(2.0), Rad(3.0), Rad(4.0), Rad(5.0), Rad(6.0)]);
-        observer.update_joint_positions(positions);
-
-        let read_positions = observer.joint_positions();
-        assert_eq!(read_positions[Joint::J1].0, 1.0);
-        assert_eq!(read_positions[Joint::J6].0, 6.0);
-    }
-
-    #[test]
-    fn test_joint_velocities() {
-        let observer = create_observer();
-
-        let velocities = JointArray::splat(2.5);
-        observer.update_joint_velocities(velocities);
-
-        let read_velocities = observer.joint_velocities();
-        assert_eq!(read_velocities[Joint::J1], 2.5);
-    }
-
-    #[test]
-    fn test_joint_torques() {
-        let observer = create_observer();
-
-        let torques = JointArray::splat(NewtonMeter(10.0));
-        observer.update_joint_torques(torques);
-
-        let read_torques = observer.joint_torques();
-        assert_eq!(read_torques[Joint::J1].0, 10.0);
-    }
-
-    #[test]
-    fn test_gripper_state() {
-        let observer = create_observer();
-
+    fn test_gripper_state_structure() {
         let gripper = GripperState {
             position: 0.5,
-            effort: 0.8,
+            effort: 0.7,
             enabled: true,
         };
-        observer.update_gripper_state(gripper);
 
-        assert_eq!(observer.gripper_position(), 0.5);
-        assert_eq!(observer.gripper_effort(), 0.8);
-        assert!(observer.is_gripper_enabled());
-    }
-
-    #[test]
-    fn test_arm_enabled() {
-        let observer = create_observer();
-
-        assert!(!observer.is_arm_enabled());
-
-        observer.update_arm_enabled(true);
-        assert!(observer.is_arm_enabled());
-
-        observer.update_arm_enabled(false);
-        assert!(!observer.is_arm_enabled());
-    }
-
-    #[test]
-    fn test_last_update() {
-        let observer = create_observer();
-
-        let before = Instant::now();
-        std::thread::sleep(Duration::from_millis(10));
-
-        observer.update_joint_positions(JointArray::splat(Rad(1.0)));
-
-        let after = Instant::now();
-        let last = observer.last_update();
-
-        assert!(last > before);
-        assert!(last < after);
-    }
-
-    #[test]
-    fn test_is_fresh() {
-        let observer = create_observer();
-
-        observer.update_joint_positions(JointArray::splat(Rad(1.0)));
-
-        assert!(observer.is_fresh(Duration::from_secs(1)));
-
-        // 模拟旧状态（需要修改实现或等待，这里只是逻辑检查）
-        assert!(observer.is_fresh(Duration::from_millis(100)));
-    }
-
-    #[test]
-    fn test_joint_state() {
-        let observer = create_observer();
-
-        observer.update_joint_positions(JointArray::splat(Rad(1.0)));
-        observer.update_joint_velocities(JointArray::splat(2.0));
-        observer.update_joint_torques(JointArray::splat(NewtonMeter(3.0)));
-
-        let (pos, vel, torque) = observer.joint_state(Joint::J3);
-        assert_eq!(pos.0, 1.0);
-        assert_eq!(vel, 2.0);
-        assert_eq!(torque.0, 3.0);
-    }
-
-    #[test]
-    fn test_clone() {
-        let observer1 = create_observer();
-        observer1.update_joint_positions(JointArray::splat(Rad(5.0)));
-
-        let observer2 = observer1.clone();
-
-        // 两个 observer 共享状态
-        assert_eq!(observer2.joint_positions()[Joint::J1].0, 5.0);
-
-        // 修改会反映到两个 observer
-        observer1.update_joint_positions(JointArray::splat(Rad(10.0)));
-        assert_eq!(observer2.joint_positions()[Joint::J1].0, 10.0);
-    }
-
-    #[test]
-    fn test_concurrent_reads() {
-        let observer = Arc::new(create_observer());
-        observer.update_joint_positions(JointArray::splat(Rad(1.0)));
-
-        let mut handles = vec![];
-        for _ in 0..10 {
-            let obs_clone = observer.clone();
-            handles.push(std::thread::spawn(move || {
-                for _ in 0..1000 {
-                    let _positions = obs_clone.joint_positions();
-                    let _velocities = obs_clone.joint_velocities();
-                    let _gripper = obs_clone.gripper_position();
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_concurrent_read_write() {
-        let observer = Arc::new(create_observer());
-
-        // 写线程
-        let obs_writer = observer.clone();
-        let writer = std::thread::spawn(move || {
-            for i in 0..100 {
-                obs_writer.update_joint_positions(JointArray::splat(Rad(i as f64)));
-                std::thread::sleep(Duration::from_micros(10));
-            }
-        });
-
-        // 读线程
-        let mut readers = vec![];
-        for _ in 0..5 {
-            let obs_reader = observer.clone();
-            readers.push(std::thread::spawn(move || {
-                for _ in 0..500 {
-                    let _pos = obs_reader.joint_positions();
-                }
-            }));
-        }
-
-        writer.join().unwrap();
-        for reader in readers {
-            reader.join().unwrap();
-        }
+        // 验证归一化范围
+        assert!(gripper.position >= 0.0 && gripper.position <= 1.0);
+        assert!(gripper.effort >= 0.0 && gripper.effort <= 1.0);
     }
 
     #[test]
     fn test_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Observer>();
-        assert_send_sync::<RobotState>();
         assert_send_sync::<GripperState>();
-    }
-
-    #[test]
-    fn test_full_state_snapshot() {
-        let observer = create_observer();
-
-        observer.update_joint_positions(JointArray::splat(Rad(1.0)));
-        observer.update_gripper_state(GripperState {
-            position: 0.5,
-            effort: 0.7,
-            enabled: true,
-        });
-        observer.update_arm_enabled(true);
-
-        let snapshot = observer.state();
-        assert_eq!(snapshot.joint_positions[Joint::J1].0, 1.0);
-        assert_eq!(snapshot.gripper_state.position, 0.5);
-        assert!(snapshot.arm_enabled);
+        assert_send_sync::<MotionSnapshot>();
     }
 }

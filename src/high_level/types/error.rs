@@ -116,9 +116,17 @@ pub enum RobotError {
     SerializationError(String),
 
     // ==================== Protocol Errors ====================
-    /// 协议错误
-    #[error("Protocol error: {0}")]
-    ProtocolError(String),
+    /// 协议错误（自动转换自 protocol::ProtocolError）
+    #[error("Protocol encoding error: {0}")]
+    Protocol(#[from] crate::protocol::ProtocolError),
+
+    /// Robot 模块错误（自动转换自 robot::RobotError）
+    #[error("Robot infrastructure error: {0}")]
+    Infrastructure(#[from] crate::robot::RobotError),
+
+    /// CAN 适配器错误（自动转换自 can::CanError）
+    #[error("CAN adapter error: {0}")]
+    CanAdapter(#[from] crate::can::CanError),
 
     /// 无效的帧ID
     #[error("Invalid CAN frame ID: 0x{id:03X}")]
@@ -176,7 +184,7 @@ impl RobotError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::Timeout { .. } | Self::CanIoError(_) | Self::ProtocolError(_)
+            Self::Timeout { .. } | Self::CanIoError(_) | Self::Protocol(_)
         )
     }
 

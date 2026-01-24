@@ -76,10 +76,6 @@ pub struct TrajectoryPlanner {
     /// 轨迹总时长
     duration: Duration,
 
-    /// 采样频率（Hz）（保留用于未来扩展）
-    #[allow(dead_code)]
-    frequency_hz: f64,
-
     /// 当前迭代索引
     current_index: usize,
 
@@ -95,12 +91,16 @@ impl TrajectoryPlanner {
     /// - `start`: 起始位置
     /// - `end`: 终止位置
     /// - `duration`: 轨迹时长
-    /// - `frequency_hz`: 采样频率
+    /// - `frequency_hz`: 采样频率（Hz）
     ///
     /// # 边界条件
     ///
     /// - 起始速度: 0
     /// - 终止速度: 0
+    ///
+    /// # 错误
+    ///
+    /// 如果 `frequency_hz` 不是正数，将 panic。
     ///
     /// # 示例
     ///
@@ -123,6 +123,13 @@ impl TrajectoryPlanner {
         duration: Duration,
         frequency_hz: f64,
     ) -> Self {
+        // ✅ 输入验证
+        assert!(
+            frequency_hz > 0.0,
+            "frequency_hz must be positive, got: {}",
+            frequency_hz
+        );
+
         let duration_sec = duration.as_secs_f64();
 
         // ⚠️ 重要：未来支持 Via Points（途径点）时，
@@ -141,7 +148,6 @@ impl TrajectoryPlanner {
         TrajectoryPlanner {
             spline_coeffs,
             duration,
-            frequency_hz,
             current_index: 0,
             total_samples,
         }

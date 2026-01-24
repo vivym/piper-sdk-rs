@@ -27,8 +27,6 @@ pub mod client;
 pub mod control;
 pub mod state;
 pub mod types;
-// pub mod state;
-// pub mod control;
 
 // 重新导出常用类型
 pub use client::*;

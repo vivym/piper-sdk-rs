@@ -4,11 +4,13 @@
 //! 以及将 Rust 结构体编码为 CAN 帧数据。
 
 pub mod config;
+pub mod constants; // ✅ 新增
 pub mod control;
 pub mod feedback;
 pub mod ids;
 
 pub use config::*;
+pub use constants::*; // ✅ 新增
 pub use control::*;
 pub use feedback::*;
 pub use ids::*;

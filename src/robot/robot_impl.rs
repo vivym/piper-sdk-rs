@@ -321,6 +321,65 @@ impl Piper {
         }
     }
 
+    /// 查询固件版本
+    ///
+    /// 发送固件版本查询指令到机械臂，并清空之前的固件数据缓存。
+    /// 查询和反馈使用相同的 CAN ID (0x4AF)。
+    ///
+    /// **注意**：
+    /// - 发送查询命令后会自动清空固件数据缓存（与 Python SDK 一致）
+    /// - 需要等待一段时间（推荐 30-50ms）让机械臂返回反馈数据
+    /// - 之后可以调用 `get_firmware_version()` 获取解析后的版本字符串
+    ///
+    /// # 错误
+    /// - `RobotError::ChannelFull`: 命令通道已满（单线程模式）
+    /// - `RobotError::ChannelClosed`: 命令通道已关闭
+    /// - `RobotError::NotDualThread`: 双线程模式下使用错误的方法
+    ///
+    /// # 示例
+    ///
+    /// ```no_run
+    /// # use piper_sdk::robot::Piper;
+    /// # use piper_sdk::protocol::FirmwareVersionQueryCommand;
+    /// # // 注意：此示例需要实际的 CAN 适配器，仅供参考
+    /// # // let piper = Piper::new(/* ... */).unwrap();
+    /// # // 发送查询命令
+    /// # // piper.query_firmware_version().unwrap();
+    /// # // 等待反馈数据累积
+    /// # // std::thread::sleep(std::time::Duration::from_millis(50));
+    /// # // 获取版本字符串
+    /// # // if let Some(version) = piper.get_firmware_version() {
+    /// # //     println!("Firmware version: {}", version);
+    /// # // }
+    /// ```
+    pub fn query_firmware_version(&self) -> Result<(), RobotError> {
+        use crate::protocol::FirmwareVersionQueryCommand;
+
+        // 创建查询命令
+        let cmd = FirmwareVersionQueryCommand::new();
+        let frame = cmd.to_frame();
+
+        // 发送命令（使用可靠命令模式，确保命令被发送）
+        // 注意：固件版本查询不是高频实时命令，使用可靠命令模式更合适
+        if let Some(reliable_tx) = &self.reliable_tx {
+            // 双线程模式：使用可靠命令队列
+            reliable_tx.try_send(frame).map_err(|e| match e {
+                crossbeam_channel::TrySendError::Full(_) => RobotError::ChannelFull,
+                crossbeam_channel::TrySendError::Disconnected(_) => RobotError::ChannelClosed,
+            })?;
+        } else {
+            // 单线程模式：使用普通命令通道
+            self.send_frame(frame)?;
+        }
+
+        // 清空固件数据缓存
+        if let Ok(mut firmware_state) = self.ctx.firmware_version.write() {
+            firmware_state.clear();
+        }
+
+        Ok(())
+    }
+
     /// 获取主从模式控制模式指令状态（无锁）
     ///
     /// 包含控制模式、运动模式、速度等（主从模式下，~200Hz更新）。

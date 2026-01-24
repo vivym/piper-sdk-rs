@@ -34,7 +34,6 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 default = []
 realtime = ["thread-priority"]
 serde = ["dep:serde"]
-spin_sleep = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -51,6 +50,10 @@ path = "src/bin/gs_usb_daemon/main.rs"
 
 [[bench]]
 name = "phase2_performance"
+harness = false
+
+[[bench]]
+name = "observer_bench"
 harness = false
 
 [dev-dependencies]

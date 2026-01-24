@@ -217,6 +217,10 @@ impl Controller for PidController {
 
         // 防止除零
         if dt_sec <= 0.0 {
+            tracing::warn!(
+                "PID controller received zero or negative dt: {:?}, returning zero output",
+                dt
+            );
             return Ok(JointArray::from([NewtonMeter(0.0); 6]));
         }
 
@@ -250,7 +254,12 @@ impl Controller for PidController {
         Ok(clamped_output)
     }
 
-    fn on_time_jump(&mut self, _dt: Duration) -> Result<(), Self::Error> {
+    fn on_time_jump(&mut self, dt: Duration) -> Result<(), Self::Error> {
+        tracing::warn!(
+            "PID controller detected time jump: {:?}, resetting derivative term only",
+            dt
+        );
+
         // ✅ 只重置微分项
         self.last_error = JointArray::from([0.0; 6]);
 

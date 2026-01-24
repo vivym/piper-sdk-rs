@@ -2372,6 +2372,8 @@ impl FirmwareReadFeedback {
     /// 固件版本字符串通常以 "S-V" 开头，后面跟版本号。
     /// 此方法会在累积数据中查找版本字符串。
     ///
+    /// **注意**：与 Python SDK 对齐，固定提取 8 字节长度（从 S-V 开始，包括 S-V）。
+    ///
     /// # 参数
     /// - `accumulated_data`: 累积的固件数据（可能包含多个 CAN 帧的数据）
     ///
@@ -2380,16 +2382,17 @@ impl FirmwareReadFeedback {
     pub fn parse_version_string(accumulated_data: &[u8]) -> Option<String> {
         // 查找 "S-V" 标记
         if let Some(version_start) = accumulated_data.windows(3).position(|w| w == b"S-V") {
-            // 从 "S-V" 后开始，查找版本字符串的结束位置（通常是换行符或字符串结束）
-            let version_start = version_start + 3;
-            let version_end = accumulated_data[version_start..]
-                .iter()
-                .position(|&b| b == b'\n' || b == b'\r' || b == 0)
-                .map(|pos| version_start + pos)
-                .unwrap_or(accumulated_data.len().min(version_start + 20)); // 最多读取20个字符
+            // 固定长度为 8 字节（从 S-V 开始，包括 S-V），与 Python SDK 对齐
+            let version_length = 8;
+            // 确保不会超出数组长度
+            let version_end = (version_start + version_length).min(accumulated_data.len());
 
+            // 提取版本信息，截取固定长度的字节数据
             let version_bytes = &accumulated_data[version_start..version_end];
-            String::from_utf8(version_bytes.to_vec()).ok().map(|s| s.trim().to_string())
+
+            // 使用 UTF-8 解码，忽略错误（与 Python SDK 的 errors='ignore' 对应）
+            // 使用 from_utf8_lossy 而不是 from_utf8，以处理无效 UTF-8 字符
+            Some(String::from_utf8_lossy(version_bytes).trim().to_string())
         } else {
             None
         }
@@ -2437,10 +2440,41 @@ mod firmware_read_tests {
 
     #[test]
     fn test_firmware_read_feedback_parse_version_string() {
-        // 测试解析版本字符串
+        // 测试解析版本字符串（固定 8 字节长度，包括 S-V）
         let accumulated_data = b"Some prefix S-V1.6-3\nOther data";
         let version = FirmwareReadFeedback::parse_version_string(accumulated_data);
-        assert_eq!(version, Some("1.6-3".to_string()));
+        // 应该返回 "S-V1.6-3"（8 字节，包括 S-V），与 Python SDK 对齐
+        assert_eq!(version, Some("S-V1.6-3".to_string()));
+    }
+
+    #[test]
+    fn test_firmware_read_feedback_parse_version_string_fixed_length() {
+        // 测试固定 8 字节长度解析（包括 S-V）
+        let accumulated_data = b"Some prefix S-V1.6-3\nOther data";
+        let version = FirmwareReadFeedback::parse_version_string(accumulated_data);
+        // 应该返回 "S-V1.6-3"（8 字节，包括 S-V）
+        assert_eq!(version, Some("S-V1.6-3".to_string()));
+    }
+
+    #[test]
+    fn test_firmware_read_feedback_parse_version_string_short() {
+        // 测试数据不足 8 字节的情况
+        let accumulated_data = b"S-V1.6";
+        let version = FirmwareReadFeedback::parse_version_string(accumulated_data);
+        // 应该返回 "S-V1.6"（实际长度，不超过 8 字节）
+        assert_eq!(version, Some("S-V1.6".to_string()));
+    }
+
+    #[test]
+    fn test_firmware_read_feedback_parse_version_string_invalid_utf8() {
+        // 测试包含无效 UTF-8 字符的情况
+        let data = vec![b'S', b'-', b'V', 0xFF, 0xFE, b'1', b'.', b'6'];
+        let version = FirmwareReadFeedback::parse_version_string(&data);
+        // 应该使用 lossy 解码，不会 panic，返回包含替换字符的字符串
+        assert!(version.is_some());
+        let version_str = version.unwrap();
+        // 验证包含替换字符（通常显示为）
+        assert!(version_str.contains("S-V"));
     }
 
     #[test]

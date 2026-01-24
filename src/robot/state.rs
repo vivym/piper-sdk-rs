@@ -691,14 +691,50 @@ pub struct FirmwareVersionState {
 }
 
 impl FirmwareVersionState {
+    /// 清空累积的固件数据（用于开始新的查询）
+    ///
+    /// 在发送新的固件版本查询命令前调用此方法，清空之前累积的数据。
+    pub fn clear(&mut self) {
+        self.firmware_data.clear();
+        self.version_string = None;
+        self.is_complete = false;
+        self.hardware_timestamp_us = 0;
+        self.system_timestamp_us = 0;
+    }
+
+    /// 检查数据是否完整（是否找到 S-V 标记且有足够数据）
+    ///
+    /// 数据完整的条件：
+    /// 1. 找到 "S-V" 标记
+    /// 2. 从 S-V 开始至少有 8 字节数据
+    ///
+    /// # 返回值
+    /// 如果数据完整，返回 `true` 并更新 `is_complete` 字段
+    pub fn check_completeness(&mut self) -> bool {
+        if let Some(version_start) = self.firmware_data.windows(3).position(|w| w == b"S-V") {
+            // 找到 S-V 标记，检查是否有足够的数据（至少 8 字节）
+            let required_length = version_start + 8;
+            self.is_complete = self.firmware_data.len() >= required_length;
+        } else {
+            self.is_complete = false;
+        }
+        self.is_complete
+    }
+
     /// 尝试从累积数据中解析版本字符串
+    ///
+    /// 解析成功时会自动更新 `version_string` 和 `is_complete` 状态。
     pub fn parse_version(&mut self) -> Option<String> {
         // 导入 FirmwareReadFeedback 的 parse_version_string 方法
         use crate::protocol::feedback::FirmwareReadFeedback;
         if let Some(version) = FirmwareReadFeedback::parse_version_string(&self.firmware_data) {
             self.version_string = Some(version.clone());
+            // 同时更新完整性状态
+            self.check_completeness();
             Some(version)
         } else {
+            self.version_string = None;
+            self.is_complete = false;
             None
         }
     }
@@ -2156,5 +2192,110 @@ mod tests {
         assert_eq!(state.max_end_linear_accel, 0.0);
         assert_eq!(state.max_end_angular_accel, 0.0);
         assert!(!state.is_valid);
+    }
+
+    // ============================================================
+    // 测试固件版本状态：FirmwareVersionState
+    // ============================================================
+
+    #[test]
+    fn test_firmware_version_state_default() {
+        let state = FirmwareVersionState::default();
+        assert_eq!(state.hardware_timestamp_us, 0);
+        assert_eq!(state.system_timestamp_us, 0);
+        assert!(state.firmware_data.is_empty());
+        assert!(!state.is_complete);
+        assert!(state.version_string.is_none());
+    }
+
+    #[test]
+    fn test_firmware_version_state_clear() {
+        let mut state = FirmwareVersionState {
+            hardware_timestamp_us: 1000,
+            system_timestamp_us: 2000,
+            firmware_data: vec![b'S', b'-', b'V', b'1', b'.', b'6', b'-', b'3'],
+            is_complete: true,
+            version_string: Some("S-V1.6-3".to_string()),
+        };
+
+        state.clear();
+
+        assert_eq!(state.hardware_timestamp_us, 0);
+        assert_eq!(state.system_timestamp_us, 0);
+        assert!(state.firmware_data.is_empty());
+        assert!(!state.is_complete);
+        assert!(state.version_string.is_none());
+    }
+
+    #[test]
+    fn test_firmware_version_state_check_completeness() {
+        // 测试：没有 S-V 标记
+        let mut state = FirmwareVersionState {
+            firmware_data: b"Some data".to_vec(),
+            ..Default::default()
+        };
+        assert!(!state.check_completeness());
+        assert!(!state.is_complete);
+
+        // 测试：有 S-V 标记但数据不足 8 字节
+        state.firmware_data = b"S-V1.6".to_vec();
+        assert!(!state.check_completeness());
+        assert!(!state.is_complete);
+
+        // 测试：有 S-V 标记且数据足够（正好 8 字节）
+        state.firmware_data = b"S-V1.6-3".to_vec();
+        assert!(state.check_completeness());
+        assert!(state.is_complete);
+
+        // 测试：有 S-V 标记且数据足够（超过 8 字节）
+        state.firmware_data = b"Prefix S-V1.6-3\nSuffix".to_vec();
+        assert!(state.check_completeness());
+        assert!(state.is_complete);
+    }
+
+    #[test]
+    fn test_firmware_version_state_parse_version() {
+        // 测试：成功解析版本
+        let mut state = FirmwareVersionState {
+            firmware_data: b"Some prefix S-V1.6-3\nOther data".to_vec(),
+            ..Default::default()
+        };
+        let version = state.parse_version();
+        assert_eq!(version, Some("S-V1.6-3".to_string()));
+        assert_eq!(state.version_string, Some("S-V1.6-3".to_string()));
+        assert!(state.is_complete);
+
+        // 测试：未找到版本
+        state.firmware_data = b"Some data without version".to_vec();
+        let version = state.parse_version();
+        assert_eq!(version, None);
+        assert!(state.version_string.is_none());
+        assert!(!state.is_complete);
+    }
+
+    #[test]
+    fn test_firmware_version_state_version_string() {
+        let mut state = FirmwareVersionState::default();
+
+        // 测试：未解析时返回 None
+        assert!(state.version_string().is_none());
+
+        // 测试：解析后可以获取版本字符串
+        state.firmware_data = b"S-V1.6-3".to_vec();
+        state.parse_version();
+        assert_eq!(state.version_string(), Some(&"S-V1.6-3".to_string()));
+    }
+
+    #[test]
+    fn test_piper_context_firmware_version() {
+        let ctx = PiperContext::new();
+
+        // 验证 firmware_version 字段存在且为默认值
+        let state = ctx.firmware_version.read().unwrap();
+        assert_eq!(state.hardware_timestamp_us, 0);
+        assert_eq!(state.system_timestamp_us, 0);
+        assert!(state.firmware_data.is_empty());
+        assert!(!state.is_complete);
+        assert!(state.version_string.is_none());
     }
 }

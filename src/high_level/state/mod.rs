@@ -57,11 +57,16 @@ pub mod machine;
 
 pub use machine::{
     Active,
+    // 配置类型
+    ConnectionConfig,
+    DisableConfig,
     // 状态类型
     Disconnected,
     // 控制模式
     MitMode,
+    MitModeConfig,
     Piper,
     PositionMode,
+    PositionModeConfig,
     Standby,
 };

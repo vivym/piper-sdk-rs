@@ -26,6 +26,11 @@
 use super::units::Rad;
 use std::fmt;
 
+/// 四元数归一化阈值（避免除零）
+///
+/// 当四元数的模平方小于此值时，归一化会返回单位四元数。
+const QUATERNION_NORM_THRESHOLD: f64 = 1e-10;
+
 /// 三维位置向量（米）
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -173,9 +178,17 @@ impl Quaternion {
         let norm_sq = self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z;
 
         // ✅ 数值稳定性检查：避免除零
-        if norm_sq < 1e-10 {
+        if norm_sq < QUATERNION_NORM_THRESHOLD {
             // 返回默认单位四元数（无旋转）
-            tracing::warn!("Normalizing near-zero quaternion, returning identity");
+            tracing::warn!(
+                "Normalizing near-zero quaternion (norm²={:.2e} < {:.2e}): Q({:.3}, {:.3}, {:.3}, {:.3}), returning identity",
+                norm_sq,
+                QUATERNION_NORM_THRESHOLD,
+                self.w,
+                self.x,
+                self.y,
+                self.z
+            );
             return Quaternion::IDENTITY;
         }
 
@@ -421,6 +434,12 @@ mod tests {
         assert!(!normalized_zero.w.is_nan());
         assert!(!normalized_zero.x.is_nan());
         assert_eq!(normalized_zero.w, 1.0);
+    }
+
+    #[test]
+    fn test_quaternion_norm_threshold() {
+        // 验证阈值常量的正确使用
+        assert_eq!(QUATERNION_NORM_THRESHOLD, 1e-10);
     }
 
     #[test]

@@ -2059,3 +2059,78 @@ mod firmware_upgrade_tests {
         }
     }
 }
+
+// ============================================================================
+// 固件版本查询指令
+// ============================================================================
+
+/// 固件版本查询指令 (0x4AF)
+///
+/// 用于查询机械臂固件版本信息。
+/// 查询和反馈使用相同的 CAN ID (0x4AF)。
+/// 查询命令的数据负载为固定值：`[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]`
+///
+/// **注意**：发送查询命令前应清空固件数据缓存，以便接收新的反馈数据。
+#[derive(Debug, Clone, Copy)]
+pub struct FirmwareVersionQueryCommand;
+
+impl FirmwareVersionQueryCommand {
+    /// 创建固件版本查询指令
+    ///
+    /// 返回一个查询命令，用于向机械臂查询固件版本信息。
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// 转换为 CAN 帧
+    ///
+    /// 根据 Python SDK 的实现，查询命令的数据为：
+    /// `[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]`
+    pub fn to_frame(self) -> PiperFrame {
+        // 与 Python SDK 对齐：data = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        let data = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        PiperFrame::new_standard(ID_FIRMWARE_READ as u16, &data)
+    }
+}
+
+impl Default for FirmwareVersionQueryCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod firmware_version_query_tests {
+    use super::*;
+
+    #[test]
+    fn test_firmware_version_query_command_new() {
+        let cmd = FirmwareVersionQueryCommand::new();
+        let frame = cmd.to_frame();
+
+        assert_eq!(frame.id, ID_FIRMWARE_READ);
+        assert_eq!(frame.len, 8);
+        assert_eq!(frame.data[0], 0x01);
+        assert_eq!(frame.data[1..8], [0x00; 7]);
+    }
+
+    #[test]
+    fn test_firmware_version_query_command_default() {
+        let cmd = FirmwareVersionQueryCommand;
+        let frame = cmd.to_frame();
+
+        assert_eq!(frame.id, ID_FIRMWARE_READ);
+        assert_eq!(frame.data, [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_firmware_version_query_command_data_format() {
+        // 验证数据格式与 Python SDK 一致
+        let cmd = FirmwareVersionQueryCommand::new();
+        let frame = cmd.to_frame();
+
+        // Python SDK: [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        let expected_data = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(frame.data, expected_data);
+    }
+}

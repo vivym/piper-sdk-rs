@@ -120,6 +120,26 @@ where
     C: Controller,
     RobotError: From<C::Error>,
 {
+    // ✅ 输入验证
+    if config.frequency_hz <= 0.0 {
+        return Err(RobotError::ConfigError(format!(
+            "Invalid frequency_hz: {} (must be > 0)",
+            config.frequency_hz
+        )));
+    }
+    if config.frequency_hz > 10000.0 {
+        tracing::warn!(
+            "Very high control frequency: {} Hz. This may cause performance issues.",
+            config.frequency_hz
+        );
+    }
+    if config.dt_clamp_multiplier <= 0.0 {
+        return Err(RobotError::ConfigError(format!(
+            "Invalid dt_clamp_multiplier: {} (must be > 0)",
+            config.dt_clamp_multiplier
+        )));
+    }
+
     // 计算标称周期和最大 dt
     let nominal_period = Duration::from_secs_f64(1.0 / config.frequency_hz);
     let max_dt = nominal_period.mul_f64(config.dt_clamp_multiplier);
@@ -172,15 +192,6 @@ where
 /// 与 `run_controller()` 类似，但使用 `spin_sleep` 实现更低的延时抖动。
 ///
 /// ⚠️ **注意**: `spin_sleep` 会占用更多 CPU，适合对实时性要求极高的场景。
-///
-/// # 依赖
-///
-/// 需要在 `Cargo.toml` 中添加：
-/// ```toml
-/// [dependencies]
-/// spin_sleep = "1.1"
-/// ```
-#[cfg(feature = "spin_sleep")]
 pub fn run_controller_spin<C>(
     observer: Observer,
     commander: MotionCommander,
@@ -192,6 +203,26 @@ where
     RobotError: From<C::Error>,
 {
     use spin_sleep::SpinSleeper;
+
+    // ✅ 输入验证
+    if config.frequency_hz <= 0.0 {
+        return Err(RobotError::ConfigError(format!(
+            "Invalid frequency_hz: {} (must be > 0)",
+            config.frequency_hz
+        )));
+    }
+    if config.frequency_hz > 10000.0 {
+        tracing::warn!(
+            "Very high control frequency: {} Hz. This may cause performance issues.",
+            config.frequency_hz
+        );
+    }
+    if config.dt_clamp_multiplier <= 0.0 {
+        return Err(RobotError::ConfigError(format!(
+            "Invalid dt_clamp_multiplier: {} (must be > 0)",
+            config.dt_clamp_multiplier
+        )));
+    }
 
     let nominal_period = Duration::from_secs_f64(1.0 / config.frequency_hz);
     let max_dt = nominal_period.mul_f64(config.dt_clamp_multiplier);

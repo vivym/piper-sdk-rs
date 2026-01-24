@@ -481,6 +481,147 @@ impl DivAssign<f64> for NewtonMeter {
     }
 }
 
+/// 角速度单位（弧度/秒）
+///
+/// 表示角速度值。使用 NewType 模式提供类型安全。
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RadPerSecond(pub f64);
+
+impl RadPerSecond {
+    /// 零角速度常量
+    pub const ZERO: Self = RadPerSecond(0.0);
+
+    /// 创建新的角速度值
+    #[inline]
+    pub const fn new(value: f64) -> Self {
+        RadPerSecond(value)
+    }
+
+    /// 获取内部值（弧度/秒）
+    #[inline]
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+
+    /// 从弧度/秒创建
+    #[inline]
+    pub fn from_rad_per_sec(value: f64) -> Self {
+        RadPerSecond(value)
+    }
+
+    /// 取绝对值
+    #[inline]
+    pub fn abs(self) -> Self {
+        RadPerSecond(self.0.abs())
+    }
+
+    /// 限制范围
+    #[inline]
+    pub fn clamp(self, min: Self, max: Self) -> Self {
+        RadPerSecond(self.0.clamp(min.0, max.0))
+    }
+}
+
+impl fmt::Display for RadPerSecond {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.4} rad/s", self.0)
+    }
+}
+
+// 运算符重载
+impl Add for RadPerSecond {
+    type Output = Self;
+    #[inline]
+    fn add(self, rhs: RadPerSecond) -> Self {
+        RadPerSecond(self.0 + rhs.0)
+    }
+}
+
+impl Sub for RadPerSecond {
+    type Output = Self;
+    #[inline]
+    fn sub(self, rhs: RadPerSecond) -> Self {
+        RadPerSecond(self.0 - rhs.0)
+    }
+}
+
+impl Mul<f64> for RadPerSecond {
+    type Output = Self;
+    #[inline]
+    fn mul(self, rhs: f64) -> Self {
+        RadPerSecond(self.0 * rhs)
+    }
+}
+
+impl Mul<RadPerSecond> for f64 {
+    type Output = RadPerSecond;
+    #[inline]
+    fn mul(self, rhs: RadPerSecond) -> RadPerSecond {
+        RadPerSecond(self * rhs.0)
+    }
+}
+
+impl Div<f64> for RadPerSecond {
+    type Output = Self;
+    #[inline]
+    fn div(self, rhs: f64) -> Self {
+        RadPerSecond(self.0 / rhs)
+    }
+}
+
+impl Div<RadPerSecond> for RadPerSecond {
+    type Output = f64;
+    #[inline]
+    fn div(self, rhs: RadPerSecond) -> f64 {
+        self.0 / rhs.0
+    }
+}
+
+impl Neg for RadPerSecond {
+    type Output = Self;
+    #[inline]
+    fn neg(self) -> Self {
+        RadPerSecond(-self.0)
+    }
+}
+
+impl AddAssign for RadPerSecond {
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+impl SubAssign for RadPerSecond {
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
+    }
+}
+
+impl MulAssign<f64> for RadPerSecond {
+    #[inline]
+    fn mul_assign(&mut self, rhs: f64) {
+        self.0 *= rhs;
+    }
+}
+
+impl DivAssign<f64> for RadPerSecond {
+    #[inline]
+    fn div_assign(&mut self, rhs: f64) {
+        self.0 /= rhs;
+    }
+}
+
+// 实现与 Duration 的除法，用于计算加速度
+impl Div<std::time::Duration> for RadPerSecond {
+    type Output = f64; // 结果单位：弧度/秒²
+    fn div(self, rhs: std::time::Duration) -> Self::Output {
+        self.0 / rhs.as_secs_f64()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +750,57 @@ mod tests {
 
         rad /= 2.0;
         assert_eq!(rad, Rad(2.0));
+    }
+
+    // RadPerSecond 测试
+    #[test]
+    fn test_rad_per_second_operations() {
+        let v1 = RadPerSecond(10.0);
+        let v2 = RadPerSecond(5.0);
+
+        assert_eq!(v1 + v2, RadPerSecond(15.0));
+        assert_eq!(v1 - v2, RadPerSecond(5.0));
+        assert_eq!(v1 * 2.0, RadPerSecond(20.0));
+        assert_eq!(v1 / 2.0, RadPerSecond(5.0));
+        assert_eq!(-v1, RadPerSecond(-10.0));
+    }
+
+    #[test]
+    fn test_rad_per_second_assign_operators() {
+        let mut vel = RadPerSecond(1.0);
+        vel += RadPerSecond(2.0);
+        assert_eq!(vel, RadPerSecond(3.0));
+
+        vel -= RadPerSecond(1.0);
+        assert_eq!(vel, RadPerSecond(2.0));
+
+        vel *= 2.0;
+        assert_eq!(vel, RadPerSecond(4.0));
+
+        vel /= 2.0;
+        assert_eq!(vel, RadPerSecond(2.0));
+    }
+
+    #[test]
+    fn test_rad_per_second_div_duration() {
+        let vel = RadPerSecond(10.0);
+        let duration = std::time::Duration::from_secs(2);
+        let accel = vel / duration;
+        assert!((accel - 5.0).abs() < 1e-10); // 10 rad/s / 2s = 5 rad/s²
+    }
+
+    #[test]
+    fn test_rad_per_second_display() {
+        let vel = RadPerSecond(std::f64::consts::PI);
+        assert_eq!(format!("{}", vel), "3.1416 rad/s");
+    }
+
+    #[test]
+    fn test_rad_per_second_clamp() {
+        let vel = RadPerSecond(10.0);
+        assert_eq!(
+            vel.clamp(RadPerSecond(-5.0), RadPerSecond(5.0)),
+            RadPerSecond(5.0)
+        );
     }
 }
