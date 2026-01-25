@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 /// GS-USB CAN 适配器
 ///
@@ -44,6 +44,10 @@ pub struct GsUsbCanAdapter {
 }
 
 impl GsUsbCanAdapter {
+    /// Maximum RX queue size to prevent unbounded memory growth
+    /// When exceeded, oldest frames are dropped
+    const MAX_QUEUE_SIZE: usize = 256;
+
     /// 创建新的适配器（扫描并打开设备）
     ///
     /// 如果没有指定序列号，自动选择第一个找到的设备。
@@ -170,6 +174,21 @@ impl GsUsbCanAdapter {
         self.realtime_mode
     }
 
+    /// Push frame to RX queue with bounded size check
+    ///
+    /// If the queue is full, drops the oldest frame to make room.
+    /// This prevents unbounded memory growth if consumer stops consuming.
+    fn push_to_rx_queue(&mut self, frame: PiperFrame) {
+        if self.rx_queue.len() >= Self::MAX_QUEUE_SIZE {
+            warn!(
+                "RX queue full ({} frames), dropping oldest frame",
+                Self::MAX_QUEUE_SIZE
+            );
+            self.rx_queue.pop_front();
+        }
+        self.rx_queue.push_back(frame);
+    }
+
     /// 分离为独立的 RX 和 TX 适配器
     ///
     /// 返回的适配器可以在不同线程中并发使用，实现物理隔离。
@@ -187,15 +206,30 @@ impl GsUsbCanAdapter {
             return Err(CanError::NotStarted);
         }
 
-        // 使用 ManuallyDrop 避免 Drop，然后移动 device
+        // ⚠️ CRITICAL: GsUsbCanAdapter implements Drop (for USB cleanup).
+        // We MUST use ManuallyDrop to prevent Drop from running when we
+        // extract fields. We cannot use simple field extraction because
+        // Rust prevents moving out of Drop types.
         let adapter = ManuallyDrop::new(self);
 
+        // SAFETY:
+        // 1. `adapter.device` is a `GsUsbDevice` struct with no self-references
+        // 2. `GsUsbDevice` has no Drop impl that relies on field values
+        // 3. `adapter` is wrapped in ManuallyDrop, so it will never be dropped
+        // 4. We are moving `device` out, which is equivalent to a move operation
+        // 5. This is the standard pattern for extracting fields from Drop types
+        let device = unsafe { std::ptr::read(&adapter.device) };
+
+        // rx_timeout and mode are Copy types, safe to read
+        let rx_timeout = adapter.rx_timeout;
+        let mode = adapter.mode;
+
         // 将 device 包裹为 Arc，支持多线程共享
-        let device_arc = Arc::new(unsafe { std::ptr::read(&adapter.device) });
+        let device_arc = Arc::new(device);
 
         Ok((
-            GsUsbRxAdapter::new(device_arc.clone(), adapter.rx_timeout, adapter.mode),
-            GsUsbTxAdapter::new(device_arc.clone()),
+            GsUsbRxAdapter::new(device_arc.clone(), rx_timeout, mode),
+            GsUsbTxAdapter::new(device_arc),
         ))
     }
 
@@ -259,9 +293,19 @@ impl GsUsbCanAdapter {
             if !is_loopback && gs_frame.is_tx_echo() {
                 continue;
             }
+
+            // Check for overflow flag but DON'T return early - log and continue
+            // The overflow flag indicates PAST data loss (before this batch),
+            // not a problem with the current frames. Processing valid frames
+            // prevents compounding the data loss.
             if gs_frame.has_overflow() {
-                return Err(CanError::BufferOverflow);
+                warn!(
+                    "CAN Controller Buffer Overflow detected - some frames were lost BEFORE this batch. \
+                     Processing remaining valid frames in this batch."
+                );
+                // NOTE: Don't return Err here - we still want to process valid frames
             }
+
             out.push(PiperFrame {
                 id: gs_frame.can_id & CAN_EFF_MASK,
                 data: gs_frame.data,
@@ -271,6 +315,10 @@ impl GsUsbCanAdapter {
             });
         }
 
+        // Note: We don't return a special error for overflow_detected because:
+        // 1. The overflow was for PAST frames (before this batch)
+        // 2. We've already preserved all valid frames in THIS batch
+        // 3. Applications can monitor the warn!() log for overflow events
         Ok(out)
     }
 
@@ -648,7 +696,7 @@ impl CanAdapter for GsUsbCanAdapter {
                     timestamp_us: gs_frame.timestamp_us as u64, // 保留硬件时间戳（GS-USB 使用 u32，转换为 u64）
                 };
 
-                self.rx_queue.push_back(frame);
+                self.push_to_rx_queue(frame);
             }
 
             // 4. 如果队列里有东西了，返回第一个；否则继续循环读 USB

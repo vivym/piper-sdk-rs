@@ -1702,23 +1702,14 @@ mod mit_control_tests {
 // ============================================================================
 
 /// 灯光控制使能标志
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, num_enum::FromPrimitive)]
+#[repr(u8)]
 pub enum LightControlEnable {
     /// 控制指令无效
     #[default]
     Disabled = 0x00,
     /// 灯光控制使能
     Enabled = 0x01,
-}
-
-impl From<u8> for LightControlEnable {
-    fn from(value: u8) -> Self {
-        match value {
-            0x00 => Self::Disabled,
-            0x01 => Self::Enabled,
-            _ => Self::Disabled, // 默认无效
-        }
-    }
 }
 
 /// 灯光控制指令 (0x121)

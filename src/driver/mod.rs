@@ -15,6 +15,7 @@ mod builder;
 pub mod command;
 mod error;
 mod fps_stats;
+pub mod heartbeat;
 pub mod metrics;
 pub mod pipeline;
 mod piper; // 原 robot_impl.rs
@@ -24,6 +25,7 @@ pub use builder::{DriverType, PiperBuilder};
 pub use command::{CommandPriority, PiperCommand};
 pub use error::DriverError; // 原 DriverError
 pub use fps_stats::{FpsCounts, FpsResult};
+pub use heartbeat::ConnectionMonitor;
 pub use metrics::{MetricsSnapshot, PiperMetrics};
 pub use pipeline::{PipelineConfig, io_loop, rx_loop, tx_loop, tx_loop_mailbox};
 pub use piper::Piper;

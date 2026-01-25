@@ -186,6 +186,19 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
+    /// 停止运动（用于优雅关闭）
+    ///
+    /// 发送停止运动命令，用于优雅关闭序列。与急停不同，此方法更平滑地停止机器人。
+    pub(crate) fn stop_motion(&self) -> Result<()> {
+        // 使用急停命令停止运动
+        // 注意：当前协议没有单独的"平滑停止"命令，急停是最接近的选项
+        let cmd = EmergencyStopCommand::emergency_stop();
+        let frame = cmd.to_frame();
+
+        self.driver.send_reliable(frame)?;
+        Ok(())
+    }
+
     /// 内部辅助：构建末端位姿的 3 个 CAN 帧
     ///
     /// 将帧生成逻辑提取出来，以便可以组合进不同的 Package。

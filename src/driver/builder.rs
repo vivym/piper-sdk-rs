@@ -42,6 +42,7 @@ pub enum DriverType {
 /// let config = PipelineConfig {
 ///     receive_timeout_ms: 5,
 ///     frame_group_timeout_ms: 20,
+///     velocity_buffer_timeout_us: 20_000,
 /// };
 /// let piper = PiperBuilder::new()
 ///     .baud_rate(500_000)
@@ -391,6 +392,7 @@ mod tests {
         let config = PipelineConfig {
             receive_timeout_ms: 5,
             frame_group_timeout_ms: 20,
+            velocity_buffer_timeout_us: 10_000,
         };
         let builder = PiperBuilder::new().pipeline_config(config.clone());
 
@@ -406,6 +408,7 @@ mod tests {
         let config = PipelineConfig {
             receive_timeout_ms: 3,
             frame_group_timeout_ms: 15,
+            velocity_buffer_timeout_us: 10_000,
         };
         let builder =
             PiperBuilder::new().interface("can1").baud_rate(250_000).pipeline_config(config);
@@ -431,6 +434,7 @@ mod tests {
         let config = PipelineConfig {
             receive_timeout_ms: 5,
             frame_group_timeout_ms: 20,
+            velocity_buffer_timeout_us: 10_000,
         };
         let builder = PiperBuilder::new().pipeline_config(config.clone());
 

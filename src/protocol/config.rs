@@ -1925,7 +1925,8 @@ mod gripper_teach_params_tests {
 // ============================================================================
 
 /// 固件升级模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, num_enum::FromPrimitive)]
+#[repr(u8)]
 pub enum FirmwareUpgradeMode {
     /// 退出固件升级模式（默认状态）
     #[default]
@@ -1935,17 +1936,6 @@ pub enum FirmwareUpgradeMode {
     /// 进入内外网组合升级模式（用于升级主控以及内网设备）
     /// 内外网总线静默，主控进入内外网 CAN 透传模式，退出后恢复数据反馈
     CombinedUpgrade = 0x02,
-}
-
-impl From<u8> for FirmwareUpgradeMode {
-    fn from(value: u8) -> Self {
-        match value {
-            0x00 => Self::Exit,
-            0x01 => Self::CanUpgradeSilent,
-            0x02 => Self::CombinedUpgrade,
-            _ => Self::Exit, // 默认退出
-        }
-    }
 }
 
 /// 固件升级模式设定指令 (0x422)

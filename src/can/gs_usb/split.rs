@@ -39,6 +39,10 @@ pub struct GsUsbRxAdapter {
 }
 
 impl GsUsbRxAdapter {
+    /// Maximum RX queue size to prevent unbounded memory growth
+    /// When exceeded, oldest frames are dropped
+    const MAX_QUEUE_SIZE: usize = 256;
+
     /// 创建新的 RX 适配器
     pub fn new(device: Arc<GsUsbDevice>, rx_timeout: Duration, mode: u32) -> Self {
         Self {
@@ -67,6 +71,21 @@ impl GsUsbRxAdapter {
         F: Fn(bool) + Send + Sync + 'static,
     {
         self.error_passive_callback = Some(Arc::new(callback));
+    }
+
+    /// Push frame to RX queue with bounded size check
+    ///
+    /// If the queue is full, drops the oldest frame to make room.
+    /// This prevents unbounded memory growth if consumer stops consuming.
+    fn push_to_rx_queue(&mut self, frame: PiperFrame) {
+        if self.rx_queue.len() >= Self::MAX_QUEUE_SIZE {
+            warn!(
+                "RX queue full ({} frames), dropping oldest frame",
+                Self::MAX_QUEUE_SIZE
+            );
+            self.rx_queue.pop_front();
+        }
+        self.rx_queue.push_back(frame);
     }
 
     /// 接收 CAN 帧（带 Echo 帧过滤）
@@ -255,7 +274,7 @@ impl GsUsbRxAdapter {
 
                 // 转换为 PiperFrame
                 let piper_frame = self.convert_to_piper_frame(&gs_frame)?;
-                self.rx_queue.push_back(piper_frame);
+                self.push_to_rx_queue(piper_frame);
             }
 
             // 4. 返回第一帧（如果有）

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::client::types::*;
 use crate::client::{observer::Observer, raw_commander::RawCommander};
 use crate::protocol::control::InstallPosition;
+use tracing::{info, trace};
 
 // ==================== 状态类型（零大小类型）====================
 
@@ -284,6 +285,60 @@ impl Piper<Disconnected> {
             _state: PhantomData,
         })
     }
+
+    /// 重新连接到机械臂（用于连接丢失后重新建立连接）
+    ///
+    /// # 参数
+    ///
+    /// - `can_adapter`: 新的 CAN 适配器（或重用现有的）
+    /// - `config`: 连接配置
+    ///
+    /// # 返回
+    ///
+    /// - `Ok(Piper<Standby>)`: 成功重新连接
+    /// - `Err(RobotError)`: 重新连接失败
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_sdk::client::state::*;
+    /// # fn example() -> Result<()> {
+    /// let robot = Piper::connect(can_adapter, config)?;
+    /// // ... 连接丢失 ...
+    /// // 在某些情况下，你可能需要手动重新连接
+    /// // 注意：这需要一个处于 Disconnected 状态的 Piper 实例
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// **注意**: 由于 `Disconnected` 是 ZST，`self` 参数本质上只是类型标记。
+    /// 此方法与 `connect()` 功能相同，但语义上表示"重新连接"操作。
+    pub fn reconnect<C>(self, can_adapter: C, config: ConnectionConfig) -> Result<Piper<Standby>>
+    where
+        C: crate::can::SplittableAdapter + Send + 'static,
+        C::RxAdapter: Send + 'static,
+        C::TxAdapter: Send + 'static,
+    {
+        info!("Attempting to reconnect to robot");
+
+        // 1. 创建新的 driver 实例
+        use crate::driver::Piper as RobotPiper;
+        let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
+
+        // 2. 等待反馈
+        driver.wait_for_feedback(config.timeout)?;
+
+        // 3. 创建 observer
+        let observer = Observer::new(driver.clone());
+
+        // 4. 返回到 Standby 状态
+        info!("Reconnection successful");
+        Ok(Piper {
+            driver,
+            observer,
+            _state: PhantomData,
+        })
+    }
 }
 
 // ==================== Standby 状态 ====================
@@ -311,6 +366,8 @@ impl Piper<Standby> {
         use crate::protocol::control::*;
         use crate::protocol::feedback::MoveMode;
 
+        // === PHASE 1: All operations that can panic ===
+
         // 1. 发送使能指令
         let enable_cmd = MotorEnableCommand::enable_all();
         self.driver.send_reliable(enable_cmd.to_frame())?;
@@ -335,16 +392,27 @@ impl Piper<Standby> {
         );
         self.driver.send_reliable(control_cmd.to_frame())?;
 
-        // 4. 状态转移（先 clone 字段，然后 forget self，避免 Drop 被调用）
-        // 注意：由于 Piper 实现了 Drop，我们不能直接移动字段，需要先 clone
-        let driver = self.driver.clone();
-        let observer = self.observer.clone();
+        // === PHASE 2: No-panic zone - must not panic after this point ===
 
-        // 5. 阻止 Drop 执行（避免状态转换时自动 disable）
-        // 注意：所有可能 panic 的操作（如 send_reliable, wait_for_enabled）都已经完成
-        std::mem::forget(self);
+        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
+        let this = std::mem::ManuallyDrop::new(self);
 
-        // 6. 构造新结构体
+        // SAFETY: `this.driver` is a valid Arc<crate::driver::Piper>.
+        // We're moving it out of ManuallyDrop, which prevents the original
+        // `self` from being dropped. This is safe because:
+        // 1. `this.driver` is immediately moved into the returned Piper
+        // 2. No other access to `this.driver` occurs after this read
+        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
+        let driver = unsafe { std::ptr::read(&this.driver) };
+
+        // SAFETY: `this.observer` is a valid Arc<Observer>.
+        // Same safety reasoning as driver above.
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
+        // `this` is dropped here, but since it's ManuallyDrop,
+        // the inner `self` is NOT dropped, preventing double-disable
+
+        // Construct new state (no Arc ref count increase!)
         Ok(Piper {
             driver,
             observer,
@@ -364,6 +432,8 @@ impl Piper<Standby> {
     ) -> Result<Piper<Active<PositionMode>>> {
         use crate::protocol::control::*;
         use crate::protocol::feedback::MoveMode;
+
+        // === PHASE 1: All operations that can panic ===
 
         // 1. 发送使能指令
         let enable_cmd = MotorEnableCommand::enable_all();
@@ -390,16 +460,27 @@ impl Piper<Standby> {
         );
         self.driver.send_reliable(control_cmd.to_frame())?;
 
-        // 4. 状态转移（先 clone 字段，然后 forget self，避免 Drop 被调用）
-        // 注意：由于 Piper 实现了 Drop，我们不能直接移动字段，需要先 clone
-        let driver = self.driver.clone();
-        let observer = self.observer.clone();
+        // === PHASE 2: No-panic zone - must not panic after this point ===
 
-        // 5. 阻止 Drop 执行（避免状态转换时自动 disable）
-        // 注意：所有可能 panic 的操作（如 send_reliable, wait_for_enabled）都已经完成
-        std::mem::forget(self);
+        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
+        let this = std::mem::ManuallyDrop::new(self);
 
-        // 6. 构造新结构体
+        // SAFETY: `this.driver` is a valid Arc<crate::driver::Piper>.
+        // We're moving it out of ManuallyDrop, which prevents the original
+        // `self` from being dropped. This is safe because:
+        // 1. `this.driver` is immediately moved into the returned Piper
+        // 2. No other access to `this.driver` occurs after this read
+        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
+        let driver = unsafe { std::ptr::read(&this.driver) };
+
+        // SAFETY: `this.observer` is a valid Arc<Observer>.
+        // Same safety reasoning as driver above.
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
+        // `this` is dropped here, but since it's ManuallyDrop,
+        // the inner `self` is NOT dropped, preventing double-disable
+
+        // Construct new state (no Arc ref count increase!)
         Ok(Piper {
             driver,
             observer,
@@ -588,16 +669,33 @@ impl<State> Piper<State> {
     /// // robot.command_torques(...); // ❌ 编译错误
     /// ```
     pub fn emergency_stop(self) -> Result<Piper<ErrorState>> {
+        // === PHASE 1: All operations that can panic ===
+
         // 发送急停指令（可靠队列，安全优先）
         let raw_commander = RawCommander::new(&self.driver);
         raw_commander.emergency_stop()?;
 
-        // 状态转移：消耗旧 self，返回 ErrorState
-        // 注意：所有可能 panic 的操作（如 send_reliable）都已经完成
-        let driver = self.driver.clone();
-        let observer = self.observer.clone();
-        std::mem::forget(self);
+        // === PHASE 2: No-panic zone - must not panic after this point ===
 
+        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
+        let this = std::mem::ManuallyDrop::new(self);
+
+        // SAFETY: `this.driver` is a valid Arc<crate::driver::Piper>.
+        // We're moving it out of ManuallyDrop, which prevents the original
+        // `self` from being dropped. This is safe because:
+        // 1. `this.driver` is immediately moved into the returned Piper
+        // 2. No other access to `this.driver` occurs after this read
+        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
+        let driver = unsafe { std::ptr::read(&this.driver) };
+
+        // SAFETY: `this.observer` is a valid Arc<Observer>.
+        // Same safety reasoning as driver above.
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
+        // `this` is dropped here, but since it's ManuallyDrop,
+        // the inner `self` is NOT dropped, preventing double-disable
+
+        // Construct new state (no Arc ref count increase!)
         Ok(Piper {
             driver,
             observer,
@@ -660,6 +758,92 @@ impl<State> Piper<State> {
 
             std::thread::sleep(sleep_duration);
         }
+    }
+}
+
+// ==================== Active<Mode> 状态（通用方法） ====================
+
+impl<M> Piper<Active<M>> {
+    /// 优雅关闭机械臂
+    ///
+    /// 执行完整的关闭序列：
+    /// 1. 停止运动
+    /// 2. 等待机器人停止（允许 CAN 命令传播）
+    /// 3. 失能电机
+    /// 4. 等待失能确认
+    /// 5. 返回到 Standby 状态
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_sdk::client::state::*;
+    /// # fn example(robot: Piper<Active<MitMode>>) -> Result<()> {
+    /// let standby_robot = robot.shutdown()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn shutdown(self) -> Result<Piper<Standby>> {
+        use crate::protocol::control::*;
+        use std::time::Duration;
+
+        info!("Starting graceful robot shutdown");
+
+        // === PHASE 1: All operations that can panic ===
+
+        // 1. 停止运动
+        trace!("Sending stop command");
+        let raw = RawCommander::new(&self.driver);
+        raw.stop_motion()?;
+
+        // 2. 等待机器人停止
+        //
+        // ⚠️ INTENTIONAL HARD WAIT:
+        // 这 100ms 的 sleep 允许 CAN 命令通过总线传播，
+        // 并让机器人硬件处理停止命令，然后我们才失能电机。
+        // 在关闭上下文中，硬等待是可接受的，因为：
+        // - 关闭不是性能关键路径
+        // - 我们需要确保硬件达到安全状态
+        // - 替代方案（轮询"已停止"状态）不可靠
+        trace!("Waiting for robot to stop (allowing CAN command propagation)");
+        std::thread::sleep(Duration::from_millis(100));
+
+        // 3. 失能电机
+        trace!("Disabling motors");
+        let disable_cmd = MotorEnableCommand::disable_all();
+        self.driver.send_reliable(disable_cmd.to_frame())?;
+
+        // 4. 等待失能确认
+        trace!("Waiting for disable confirmation");
+        self.wait_for_disabled(
+            Duration::from_secs(1),
+            1, // debounce_threshold
+            Duration::from_millis(10),
+        )?;
+
+        info!("Robot shutdown complete");
+
+        // === PHASE 2: No-panic zone - must not panic after this point ===
+
+        // 使用 ManuallyDrop 模式转换到 Standby 状态
+        let this = std::mem::ManuallyDrop::new(self);
+
+        // SAFETY: `this.driver` is a valid Arc<crate::driver::Piper>.
+        // We're moving it out of ManuallyDrop, which prevents the original
+        // `self` from being dropped. This is safe because:
+        // 1. `this.driver` is immediately moved into the returned Piper
+        // 2. No other access to `this.driver` occurs after this read
+        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
+        let driver = unsafe { std::ptr::read(&this.driver) };
+
+        // SAFETY: `this.observer` is a valid Arc<Observer>.
+        // Same safety reasoning as driver above.
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
+        Ok(Piper {
+            driver,
+            observer,
+            _state: PhantomData,
+        })
     }
 }
 
@@ -784,6 +968,8 @@ impl Piper<Active<MitMode>> {
     pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby>> {
         use crate::protocol::control::*;
 
+        // === PHASE 1: All operations that can panic ===
+
         // 1. 失能机械臂
         let disable_cmd = MotorEnableCommand::disable_all();
         self.driver.send_reliable(disable_cmd.to_frame())?;
@@ -795,16 +981,27 @@ impl Piper<Active<MitMode>> {
             config.poll_interval,
         )?;
 
-        // 3. 状态转移（先 clone 字段，然后 forget self，避免 Drop 被调用）
-        // 注意：由于 Piper 实现了 Drop，我们不能直接移动字段，需要先 clone
-        let driver = self.driver.clone();
-        let observer = self.observer.clone();
+        // === PHASE 2: No-panic zone - must not panic after this point ===
 
-        // 4. 阻止 Drop 执行（避免重复 disable）
-        // 注意：所有可能 panic 的操作（如 send_reliable, wait_for_disabled）都已经完成
-        std::mem::forget(self);
+        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
+        let this = std::mem::ManuallyDrop::new(self);
 
-        // 5. 构造新结构体
+        // SAFETY: `this.driver` is a valid Arc<crate::driver::Piper>.
+        // We're moving it out of ManuallyDrop, which prevents the original
+        // `self` from being dropped. This is safe because:
+        // 1. `this.driver` is immediately moved into the returned Piper
+        // 2. No other access to `this.driver` occurs after this read
+        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
+        let driver = unsafe { std::ptr::read(&this.driver) };
+
+        // SAFETY: `this.observer` is a valid Arc<Observer>.
+        // Same safety reasoning as driver above.
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
+        // `this` is dropped here, but since it's ManuallyDrop,
+        // the inner `self` is NOT dropped, preventing double-disable
+
+        // Construct new state (no Arc ref count increase!)
         Ok(Piper {
             driver,
             observer,
@@ -1043,6 +1240,8 @@ impl Piper<Active<PositionMode>> {
     pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby>> {
         use crate::protocol::control::*;
 
+        // === PHASE 1: All operations that can panic ===
+
         // 1. 失能机械臂
         let disable_cmd = MotorEnableCommand::disable_all();
         self.driver.send_reliable(disable_cmd.to_frame())?;
@@ -1054,16 +1253,27 @@ impl Piper<Active<PositionMode>> {
             config.poll_interval,
         )?;
 
-        // 3. 状态转移（先 clone 字段，然后 forget self，避免 Drop 被调用）
-        // 注意：由于 Piper 实现了 Drop，我们不能直接移动字段，需要先 clone
-        let driver = self.driver.clone();
-        let observer = self.observer.clone();
+        // === PHASE 2: No-panic zone - must not panic after this point ===
 
-        // 4. 阻止 Drop 执行（避免重复 disable）
-        // 注意：所有可能 panic 的操作（如 send_reliable, wait_for_disabled）都已经完成
-        std::mem::forget(self);
+        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
+        let this = std::mem::ManuallyDrop::new(self);
 
-        // 5. 构造新结构体
+        // SAFETY: `this.driver` is a valid Arc<crate::driver::Piper>.
+        // We're moving it out of ManuallyDrop, which prevents the original
+        // `self` from being dropped. This is safe because:
+        // 1. `this.driver` is immediately moved into the returned Piper
+        // 2. No other access to `this.driver` occurs after this read
+        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
+        let driver = unsafe { std::ptr::read(&this.driver) };
+
+        // SAFETY: `this.observer` is a valid Arc<Observer>.
+        // Same safety reasoning as driver above.
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
+        // `this` is dropped here, but since it's ManuallyDrop,
+        // the inner `self` is NOT dropped, preventing double-disable
+
+        // Construct new state (no Arc ref count increase!)
         Ok(Piper {
             driver,
             observer,

@@ -207,6 +207,51 @@ impl Observer {
             NewtonMeter(dyn_state.get_torque(joint.index())),
         )
     }
+
+    // ============================================================
+    // 连接监控 API
+    // ============================================================
+
+    /// 检查机器人是否仍在响应
+    ///
+    /// 如果在超时窗口内收到反馈，返回 `true`。
+    /// 这可用于检测机器人是否断电、CAN 线缆断开或固件崩溃。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_sdk::client::observer::Observer;
+    /// # fn example(observer: Observer) {
+    /// if observer.is_connected() {
+    ///     println!("Robot is still responding");
+    /// } else {
+    ///     println!("Robot connection lost!");
+    /// }
+    /// # }
+    /// ```
+    pub fn is_connected(&self) -> bool {
+        self.driver.is_connected()
+    }
+
+    /// 获取自上次反馈以来的时间
+    ///
+    /// 返回自上次成功处理 CAN 帧以来的时间。
+    /// 可用于连接质量监控或诊断。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_sdk::client::observer::Observer;
+    /// # fn example(observer: Observer) {
+    /// let age = observer.connection_age();
+    /// if age.as_millis() > 100 {
+    ///     println!("Connection is degrading: {}ms since last feedback", age.as_millis());
+    /// }
+    /// # }
+    /// ```
+    pub fn connection_age(&self) -> std::time::Duration {
+        self.driver.connection_age()
+    }
 }
 
 /// 夹爪状态

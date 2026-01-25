@@ -14,7 +14,49 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{JoinHandle, spawn};
+use std::time::Duration;
 use tracing::{error, info, warn};
+
+/// Extension trait for timeout-capable thread joins
+trait JoinTimeout {
+    fn join_timeout(self, timeout: Duration) -> std::thread::Result<()>;
+}
+
+impl<T: std::marker::Send + 'static> JoinTimeout for JoinHandle<T> {
+    fn join_timeout(self, timeout: Duration) -> std::thread::Result<()> {
+        use std::sync::mpsc;
+
+        // Create a channel for signaling completion
+        let (tx, rx) = mpsc::channel();
+
+        // Spawn a watchdog thread that joins the target thread
+        spawn(move || {
+            let result = self.join();
+            // Send result (ignore send errors - receiver may have timed out)
+            let _ = tx.send(result);
+        });
+
+        // Block with timeout - no busy waiting!
+        match rx.recv_timeout(timeout) {
+            Ok(join_result) => join_result.map(|_| ()), // Thread finished
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Timeout: watchdog thread continues running
+                // This is acceptable - OS will clean up on process exit
+                Err(std::boxed::Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Thread join timeout",
+                )))
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Channel disconnected unexpectedly - thread panicked
+                Err(std::boxed::Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "Thread panicked during join",
+                )))
+            },
+        }
+    }
+}
 
 /// Piper 机械臂驱动（对外 API）
 ///
@@ -649,6 +691,30 @@ impl Piper {
             .store(Arc::new(crate::driver::fps_stats::FpsStatistics::new()));
     }
 
+    // ============================================================
+    // 连接监控 API
+    // ============================================================
+
+    /// 检查机器人是否仍在响应
+    ///
+    /// 如果在超时窗口内收到反馈，返回 `true`。
+    /// 这可用于检测机器人是否断电、CAN 线缆断开或固件崩溃。
+    ///
+    /// # 性能
+    /// - 无锁读取（AtomicU64::load）
+    /// - O(1) 时间复杂度
+    pub fn is_connected(&self) -> bool {
+        self.ctx.connection_monitor.check_connection()
+    }
+
+    /// 获取自上次反馈以来的时间
+    ///
+    /// 返回自上次成功处理 CAN 帧以来的时间。
+    /// 可用于连接质量监控或诊断。
+    pub fn connection_age(&self) -> std::time::Duration {
+        self.ctx.connection_monitor.time_since_last_feedback()
+    }
+
     /// 发送控制帧（非阻塞）
     ///
     /// # 参数
@@ -916,7 +982,8 @@ impl Piper {
 impl Drop for Piper {
     fn drop(&mut self) {
         // 设置运行标志为 false，通知所有线程退出
-        self.is_running.store(false, Ordering::Relaxed);
+        // 使用 Release 确保所有之前的写入对其他线程可见
+        self.is_running.store(false, Ordering::Release);
 
         // 关闭命令通道（通知 IO 线程退出）
         // 关键：必须在 join 线程之前真正 drop 掉 Sender，否则接收端不会 Disconnected。
@@ -924,50 +991,36 @@ impl Drop for Piper {
             ManuallyDrop::drop(&mut self.cmd_tx);
         }
 
-        // 等待 RX 线程退出
-        if let Some(handle) = self.rx_thread.take() {
-            let start = std::time::Instant::now();
-            while start.elapsed().as_secs() < 2 {
-                if handle.is_finished() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+        let join_timeout = Duration::from_secs(2);
 
-            if let Err(_e) = handle.join() {
-                error!("RX thread panicked");
-            }
+        // 等待 RX 线程退出（使用 join_timeout 替代 polling）
+        if let Some(handle) = self.rx_thread.take()
+            && let Err(_e) = handle.join_timeout(join_timeout)
+        {
+            error!(
+                "RX thread panicked or failed to shut down within {:?}",
+                join_timeout
+            );
         }
 
-        // 等待 TX 线程退出
-        if let Some(handle) = self.tx_thread.take() {
-            let start = std::time::Instant::now();
-            while start.elapsed().as_secs() < 2 {
-                if handle.is_finished() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-
-            if let Err(_e) = handle.join() {
-                error!("TX thread panicked");
-            }
+        // 等待 TX 线程退出（使用 join_timeout 替代 polling）
+        if let Some(handle) = self.tx_thread.take()
+            && let Err(_e) = handle.join_timeout(join_timeout)
+        {
+            error!(
+                "TX thread panicked or failed to shut down within {:?}",
+                join_timeout
+            );
         }
 
-        // 等待 IO 线程退出（单线程模式）
-        if let Some(handle) = self.io_thread.take() {
-            // 设置超时，避免测试无限等待
-            let start = std::time::Instant::now();
-            while start.elapsed().as_secs() < 2 {
-                if handle.is_finished() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-
-            if let Err(_e) = handle.join() {
-                error!("IO thread panicked");
-            }
+        // 等待 IO 线程退出（单线程模式，使用 join_timeout 替代 polling）
+        if let Some(handle) = self.io_thread.take()
+            && let Err(_e) = handle.join_timeout(join_timeout)
+        {
+            error!(
+                "IO thread panicked or failed to shut down within {:?}",
+                join_timeout
+            );
         }
     }
 }

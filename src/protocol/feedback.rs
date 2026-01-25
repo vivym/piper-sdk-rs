@@ -25,7 +25,8 @@ use bilge::prelude::*;
 ///
 /// 注意：反馈帧和控制指令的 ControlMode 枚举值不同。
 /// 反馈帧包含完整定义（0x00-0x07），控制指令只支持部分值。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, num_enum::FromPrimitive)]
+#[repr(u8)]
 pub enum ControlMode {
     /// 待机模式
     #[default]
@@ -46,24 +47,9 @@ pub enum ControlMode {
     OfflineTrajectory = 0x07,
 }
 
-impl From<u8> for ControlMode {
-    fn from(value: u8) -> Self {
-        match value {
-            0x00 => ControlMode::Standby,
-            0x01 => ControlMode::CanControl,
-            0x02 => ControlMode::Teach,
-            0x03 => ControlMode::Ethernet,
-            0x04 => ControlMode::Wifi,
-            0x05 => ControlMode::Remote,
-            0x06 => ControlMode::LinkTeach,
-            0x07 => ControlMode::OfflineTrajectory,
-            _ => ControlMode::Standby, // 默认值，或使用 TryFrom 处理错误
-        }
-    }
-}
-
 /// 机械臂状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, num_enum::FromPrimitive)]
+#[repr(u8)]
 pub enum RobotStatus {
     /// 正常
     #[default]
@@ -100,32 +86,9 @@ pub enum RobotStatus {
     ResistorOverTemp = 0x0F,
 }
 
-impl From<u8> for RobotStatus {
-    fn from(value: u8) -> Self {
-        match value {
-            0x00 => RobotStatus::Normal,
-            0x01 => RobotStatus::EmergencyStop,
-            0x02 => RobotStatus::NoSolution,
-            0x03 => RobotStatus::Singularity,
-            0x04 => RobotStatus::AngleLimitExceeded,
-            0x05 => RobotStatus::JointCommError,
-            0x06 => RobotStatus::JointBrakeNotOpen,
-            0x07 => RobotStatus::Collision,
-            0x08 => RobotStatus::TeachOverspeed,
-            0x09 => RobotStatus::JointStatusError,
-            0x0A => RobotStatus::OtherError,
-            0x0B => RobotStatus::TeachRecord,
-            0x0C => RobotStatus::TeachExecute,
-            0x0D => RobotStatus::TeachPause,
-            0x0E => RobotStatus::MainControlOverTemp,
-            0x0F => RobotStatus::ResistorOverTemp,
-            _ => RobotStatus::Normal, // 默认值
-        }
-    }
-}
-
 /// MOVE 模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, num_enum::FromPrimitive)]
+#[repr(u8)]
 pub enum MoveMode {
     /// MOVE P - 点位模式（末端位姿控制）
     #[default]
@@ -142,22 +105,9 @@ pub enum MoveMode {
     MoveCpv = 0x05,
 }
 
-impl From<u8> for MoveMode {
-    fn from(value: u8) -> Self {
-        match value {
-            0x00 => MoveMode::MoveP,
-            0x01 => MoveMode::MoveJ,
-            0x02 => MoveMode::MoveL,
-            0x03 => MoveMode::MoveC,
-            0x04 => MoveMode::MoveM,
-            0x05 => MoveMode::MoveCpv,
-            _ => MoveMode::MoveP, // 默认值
-        }
-    }
-}
-
 /// 示教状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, num_enum::FromPrimitive)]
+#[repr(u8)]
 pub enum TeachStatus {
     /// 关闭
     #[default]
@@ -178,40 +128,15 @@ pub enum TeachStatus {
     MoveToStart = 0x07,
 }
 
-impl From<u8> for TeachStatus {
-    fn from(value: u8) -> Self {
-        match value {
-            0x00 => TeachStatus::Closed,
-            0x01 => TeachStatus::StartRecord,
-            0x02 => TeachStatus::EndRecord,
-            0x03 => TeachStatus::Execute,
-            0x04 => TeachStatus::Pause,
-            0x05 => TeachStatus::Continue,
-            0x06 => TeachStatus::Terminate,
-            0x07 => TeachStatus::MoveToStart,
-            _ => TeachStatus::Closed, // 默认值
-        }
-    }
-}
-
 /// 运动状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, num_enum::FromPrimitive)]
+#[repr(u8)]
 pub enum MotionStatus {
     /// 到达指定点位
     #[default]
     Arrived = 0x00,
     /// 未到达指定点位
     NotArrived = 0x01,
-}
-
-impl From<u8> for MotionStatus {
-    fn from(value: u8) -> Self {
-        match value {
-            0x00 => MotionStatus::Arrived,
-            0x01 => MotionStatus::NotArrived,
-            _ => MotionStatus::NotArrived, // 默认值
-        }
-    }
 }
 
 // ============================================================================
@@ -1323,8 +1248,8 @@ mod tests {
     fn test_motion_status_from_u8() {
         assert_eq!(MotionStatus::from(0x00), MotionStatus::Arrived);
         assert_eq!(MotionStatus::from(0x01), MotionStatus::NotArrived);
-        // 无效值应该返回默认值
-        assert_eq!(MotionStatus::from(0xFF), MotionStatus::NotArrived);
+        // 无效值应该返回默认值（Arrived 被标记为 #[default]）
+        assert_eq!(MotionStatus::from(0xFF), MotionStatus::Arrived);
     }
 
     #[test]

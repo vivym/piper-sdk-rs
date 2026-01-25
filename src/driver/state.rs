@@ -927,9 +927,15 @@ pub struct PiperContext {
     // 使用原子计数器，无锁读取，适合实时监控
     /// FPS 统计（各状态的更新频率统计）
     ///
-    /// 使用 `ArcSwap` 支持在运行中原子性“重置统计窗口”（替换为新的 `FpsStatistics`），
+    /// 使用 `ArcSwap` 支持在运行中原子性"重置统计窗口"（替换为新的 `FpsStatistics`），
     /// 且不引入每帧的锁开销。
     pub fps_stats: Arc<ArcSwap<FpsStatistics>>,
+
+    // === 连接监控 ===
+    /// 连接监控（用于检测机器人是否仍在响应）
+    ///
+    /// 使用 App Start Relative Time 模式，确保时间单调性。
+    pub connection_monitor: crate::driver::heartbeat::ConnectionMonitor,
 }
 
 impl PiperContext {
@@ -986,6 +992,11 @@ impl PiperContext {
 
             // FPS 统计：原子计数器
             fps_stats: Arc::new(ArcSwap::from_pointee(FpsStatistics::new())),
+
+            // 连接监控：1秒超时（如果1秒内没有收到任何反馈帧，认为连接丢失）
+            connection_monitor: crate::driver::heartbeat::ConnectionMonitor::new(
+                std::time::Duration::from_secs(1),
+            ),
         }
     }
 
