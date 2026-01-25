@@ -1,0 +1,32 @@
+[package]
+name = "piper-can"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+
+# CAN 后端选择（互斥，通常通过目标平台自动选择）
+socketcan = []  # Linux: 由 target cfg 自动包含
+gs_usb = []     # macOS/Windows: 由 target cfg 自动包含
+mock = []       # 测试: 完全移除硬件依赖
+
+# Serde 序列化支持
+serde = ["dep:serde", "piper-protocol/serde"]
+
+[dependencies]
+piper-protocol = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true, optional = true }
+
+# 平台特定依赖（不标记为 optional，由 target cfg 自动包含）
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rusb = { workspace = true, features = ["vendored"] }
+libc = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "piper-client"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde", "piper-protocol/serde"]
+
+[dependencies]
+piper-driver = { workspace = true }
+piper-can = { workspace = true }
+piper-protocol = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+spin_sleep = { workspace = true }
+serde = { workspace = true, optional = true }

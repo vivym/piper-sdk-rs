@@ -1,0 +1,14 @@
+[package]
+name = "piper-protocol"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+bilge = { workspace = true }
+num_enum = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, optional = true }

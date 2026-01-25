@@ -1,55 +1,70 @@
-[package]
-name = "piper-sdk"
-version = "0.0.2"
+[workspace]
+resolver = "2"
+members = [
+    "crates/piper-protocol",
+    "crates/piper-can",
+    "crates/piper-driver",
+    "crates/piper-client",
+    "crates/piper-sdk",
+    "apps/daemon",
+]
+
+[workspace.package]
+version = "0.0.3"
 edition = "2024"
 authors = ["Ming Yang"]
 license = "MIT"
-description = "High-performance cross-platform (Linux/Windows/macOS) Rust SDK for AgileX Piper Robot Arm with support for high-frequency force control"
 repository = "https://github.com/vivym/piper-sdk-rs"
 readme = "README.md"
 keywords = ["robot", "piper", "can", "arm", "control"]
 categories = ["hardware-support"]
-exclude = ["tmp/", "docs", "target/"]
 
-[dependencies]
-arc-swap = "1.8.0"
+[workspace.dependencies]
+# 内部 crates
+piper-protocol = { path = "crates/piper-protocol" }
+piper-can = { path = "crates/piper-can" }
+piper-driver = { path = "crates/piper-driver" }
+piper-client = { path = "crates/piper-client" }
+piper-sdk = { path = "crates/piper-sdk" }
+
+# 协议层外部依赖
 bilge = "0.3.0"
-bytes = "1.11.0"
-crossbeam-channel = "0.5.15"
-rusb = { version = "0.9.4", features = ["vendored"] }
-thiserror = "2.0.17"
-tracing = "0.1.44"
-ctrlc = "3.5"
-thread-priority = { version = "3.0.0", optional = true }
-spin_sleep = "1.3.3"
-parking_lot = "0.12"
-serde = { version = "1.0", features = ["derive"], optional = true }
-smallvec = "1.15.1"
 num_enum = "0.7"
+thiserror = "2.0.17"
 
+# 并发和状态管理
+arc-swap = "1.8.0"
+crossbeam-channel = "0.5.15"
+parking_lot = "0.12"
+spin_sleep = "1.3.3"
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.11.0"
+
+# 工具库
+smallvec = "1.15.1"
+
+# 日志
+tracing = "0.1.44"
+tracing-subscriber = "0.3.19"
+
+# CLI
 clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.5"
+
+# 文件系统
 fs4 = { version = "0.13", features = ["sync"] }
 
-[features]
-default = []
-realtime = ["thread-priority"]
-serde = ["dep:serde"]
-
-[target.'cfg(target_os = "linux")'.dependencies]
+# 平台特定依赖（所有平台都声明，具体 crate 按需选择）
 libc = "0.2"
-nix = { version = "0.30", features = ["uio", "socket", "poll"] }
+nix = "0.30"
 socketcan = "3.5"
+rusb = { version = "0.9.4", features = ["vendored"] }
+thread-priority = "1.0"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-nix = { version = "0.30", features = ["fs"] }
-
-[[bin]]
-name = "gs_usb_daemon"
-path = "src/bin/gs_usb_daemon/main.rs"
-
-[dev-dependencies]
-cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+# 开发依赖
 rand = "0.8"
 criterion = "0.5"
 proptest = "1.4"

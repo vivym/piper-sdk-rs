@@ -24,6 +24,40 @@
   - **Performance Baseline**: Dynamic FPS baseline tracking with EWMA for anomaly detection
   - **Health Score**: Comprehensive health scoring (0-100) based on multiple metrics
 
+## 🏗️ Architecture
+
+Piper SDK uses a modular workspace architecture with clear separation of concerns:
+
+```
+piper-sdk-rs/
+├── crates/
+│   ├── piper-protocol/    # Protocol layer (bit-level CAN protocol)
+│   ├── piper-can/         # CAN abstraction (SocketCAN/GS-USB)
+│   ├── piper-driver/      # Driver layer (I/O threads, state sync)
+│   ├── piper-client/      # Client layer (type-safe user API)
+│   └── piper-sdk/         # Compatibility layer (re-exports all)
+└── apps/
+    └── daemon/            # GS-USB daemon binary
+```
+
+### Layer Overview
+
+| Layer | Crate | Purpose | Test Coverage |
+|-------|-------|---------|---------------|
+| Protocol | `piper-protocol` | Type-safe CAN protocol encoding/decoding | 214 tests ✅ |
+| CAN | `piper-can` | Hardware abstraction for CAN adapters | 97 tests ✅ |
+| Driver | `piper-driver` | I/O management, state synchronization | 127 tests ✅ |
+| Client | `piper-client` | High-level type-safe API | 105 tests ✅ |
+| SDK | `piper-sdk` | Compatibility layer (re-exports) | 543 tests ✅ |
+
+**Benefits**:
+- ✅ **Faster compilation**: Only recompile modified layers (up to 88% faster)
+- ✅ **Flexible dependencies**: Depend on specific layers to reduce bloat
+- ✅ **Clear boundaries**: Each layer has well-defined responsibilities
+- ✅ **100% backward compatible**: Existing code requires zero changes
+
+See [Workspace Migration Guide](docs/v0/workspace/USER_MIGRATION_GUIDE.md) for details.
+
 ## 🛠️ Tech Stack
 
 | Module | Crates | Purpose |
@@ -43,26 +77,92 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-piper-sdk = "0.0.1"
+piper-sdk = "0.1"
 ```
 
-### Optional: Real-time Thread Priority Support
+### Optional Features
 
-For high-frequency control scenarios (500Hz-1kHz), you can enable the `realtime` feature to set RX thread to maximum priority:
+#### Serde Serialization Support
+
+Enable serialization/deserialization for data types:
 
 ```toml
 [dependencies]
-piper-sdk = { version = "0.0.1", features = ["realtime"] }
+piper-sdk = { version = "0.1", features = ["serde"] }
 ```
 
-**Note**: On Linux, setting thread priority requires appropriate permissions:
-- Run with `CAP_SYS_NICE` capability: `sudo setcap cap_sys_nice+ep /path/to/your/binary`
-- Or use `rtkit` (RealtimeKit) for user-space priority elevation
-- Or run as root (not recommended for production)
+This adds `Serialize` and `Deserialize` implementations to:
+- Type units (`Rad`, `Deg`, `NewtonMeter`, etc.)
+- Joint arrays and joint indices
+- Cartesian pose and quaternion types
+- **CAN frames (`PiperFrame`, `GsUsbFrame`)** - for frame dump/replay
 
-If permission is insufficient, the SDK will log a warning but continue to function normally.
+Example usage:
 
-See [Real-time Configuration Guide](docs/v0/realtime_configuration.md) for detailed setup instructions.
+```rust
+use piper_sdk::prelude::*;
+use serde_json;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Serialize joint positions
+    let positions = JointArray::from([
+        Rad(0.0), Rad(0.5), Rad(0.0),
+        Rad(0.0), Rad(0.0), Rad(0.0)
+    ]);
+
+    let json = serde_json::to_string(&positions)?;
+    println!("Serialized: {}", json);
+
+    // Deserialize back
+    let deserialized: JointArray<Rad> = serde_json::from_str(&json)?;
+
+    Ok(())
+}
+```
+
+#### Frame Dump Example
+
+For CAN frame recording and replay:
+
+```bash
+# Run frame dump example
+cargo run -p piper-sdk --example frame_dump --features serde
+```
+
+This demonstrates:
+- Recording CAN frames to JSON
+- Saving/loading frame data
+- Debugging CAN bus communication
+
+See [examples/frame_dump.rs](../crates/piper-sdk/examples/frame_dump.rs) for details.
+
+### Platform-Specific Features
+
+Features are automatically selected based on your target platform:
+- **Linux**: `socketcan` (SocketCAN support)
+- **Linux/macOS/Windows**: `gs_usb` (GS-USB USB adapter)
+
+No manual feature configuration needed for platform selection!
+
+### Advanced Usage: Depending on Specific Layers
+
+For reduced dependencies, you can depend on specific layers directly:
+
+```toml
+# Use only the client layer (most common)
+[dependencies]
+piper-client = "0.1"
+
+# Use only the driver layer (for advanced users)
+[dependencies]
+piper-driver = "0.1"
+```
+
+**Note**: When using specific layers, update your imports:
+- `piper_sdk::Piper` → `piper_client::Piper`
+- `piper_sdk::Driver` → `piper_driver::Piper`
+
+See [Workspace Migration Guide](docs/v0/workspace/USER_MIGRATION_GUIDE.md) for migration details.
 
 ## 🚀 Quick Start
 

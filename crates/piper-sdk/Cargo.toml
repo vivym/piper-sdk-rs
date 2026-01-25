@@ -1,0 +1,23 @@
+[package]
+name = "piper-sdk"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+serde = ["piper-client/serde", "piper-can/serde", "piper-protocol/serde"]
+
+[dependencies]
+piper-client = { workspace = true }
+piper-driver = { workspace = true }
+piper-can = { workspace = true }
+piper-protocol = { workspace = true }
+
+[dev-dependencies]
+crossbeam-channel = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+rusb = { workspace = true }
+proptest = { workspace = true }
+ctrlc = { workspace = true }
+rand = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "gs_usb_daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gs_usb_daemon"
+path = "src/main.rs"
+
+[dependencies]
+piper-sdk = { workspace = true }
+piper-driver = { workspace = true }
+piper-protocol = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+ctrlc = { workspace = true }
+fs4 = { workspace = true }
+libc = { workspace = true }

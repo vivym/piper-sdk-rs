@@ -1,0 +1,20 @@
+[package]
+name = "piper-driver"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Real-time thread priority support (Linux/macOS/Windows)
+realtime = ["dep:thread-priority"]
+
+[dependencies]
+piper-protocol = { workspace = true }
+piper-can = { workspace = true }
+crossbeam-channel = { workspace = true }
+arc-swap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+smallvec = { workspace = true }
+thread-priority = { workspace = true, optional = true }
