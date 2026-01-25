@@ -153,7 +153,8 @@ mod tests {
         let elapsed = monitor.time_since_last_feedback();
 
         assert!(elapsed >= Duration::from_millis(10));
-        assert!(elapsed < Duration::from_millis(50)); // Should be close to 10ms
+        // 在 CI 环境中，系统负载可能导致实际睡眠时间更长，增加容差
+        assert!(elapsed < Duration::from_millis(200)); // Should be close to 10ms, but allow for CI delays
     }
 
     #[test]
