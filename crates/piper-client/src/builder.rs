@@ -142,7 +142,7 @@ impl PiperBuilder {
         Ok(Piper {
             driver,
             observer,
-            _state: std::marker::PhantomData,
+            _state: machine::Standby,
         })
     }
 }

@@ -7,6 +7,7 @@
 //! - `RawCommander` 现在只负责"纯指令发送"，不负责状态管理
 //! - 使用引用而不是 Arc，避免高频调用时的原子操作开销
 
+use crate::state::machine::SendStrategy;
 use crate::types::*;
 use piper_can::PiperFrame;
 use piper_driver::Piper as RobotPiper;
@@ -132,7 +133,12 @@ impl<'a> RawCommander<'a> {
     /// # 参数
     ///
     /// - `positions`: 各关节目标位置（弧度）
-    pub(crate) fn send_position_command_batch(&self, positions: &JointArray<Rad>) -> Result<()> {
+    /// - `strategy`: 发送策略（默认使用 Auto，即可靠模式）
+    pub(crate) fn send_position_command_batch(
+        &self,
+        positions: &JointArray<Rad>,
+        strategy: SendStrategy,
+    ) -> Result<()> {
         use piper_protocol::control::{JointControl12, JointControl34, JointControl56};
 
         // 准备所有关节的角度（度）
@@ -150,8 +156,20 @@ impl<'a> RawCommander<'a> {
             JointControl56::new(j5_deg, j6_deg).to_frame(), // 0x157
         ];
 
-        // 原子性发送所有帧（传入数组，内部转为 SmallVec，全程无堆分配）
-        self.driver.send_realtime_package(frames)?;
+        // 根据策略选择发送方式
+        match strategy {
+            SendStrategy::Realtime => {
+                // 实时模式：邮箱模式，零延迟，可覆盖
+                self.driver.send_realtime_package(frames)?;
+            },
+            SendStrategy::Auto | SendStrategy::Reliable { .. } => {
+                // 可靠模式：队列模式，按顺序，不丢失
+                // 对于多个帧，需要逐个发送到可靠队列
+                for frame in frames {
+                    self.driver.send_reliable(frame)?;
+                }
+            },
+        }
 
         Ok(())
     }
@@ -238,14 +256,29 @@ impl<'a> RawCommander<'a> {
     ///
     /// - `position`: 末端位置（米）
     /// - `orientation`: 末端姿态（欧拉角，度）
+    /// - `strategy`: 发送策略（默认使用 Auto，即可靠模式）
     pub(crate) fn send_end_pose_command(
         &self,
         position: Position3D,
         orientation: EulerAngles,
+        strategy: SendStrategy,
     ) -> Result<()> {
         let frames = Self::build_end_pose_frames(&position, &orientation);
-        // ✅ 使用实时通道，非阻塞，高性能
-        self.driver.send_realtime_package(frames)?;
+
+        // 根据策略选择发送方式
+        match strategy {
+            SendStrategy::Realtime => {
+                // 实时模式：邮箱模式，零延迟，可覆盖
+                self.driver.send_realtime_package(frames)?;
+            },
+            SendStrategy::Auto | SendStrategy::Reliable { .. } => {
+                // 可靠模式：队列模式，按顺序，不丢失
+                for frame in frames {
+                    self.driver.send_reliable(frame)?;
+                }
+            },
+        }
+
         Ok(())
     }
 
@@ -324,6 +357,7 @@ impl<'a> RawCommander<'a> {
     /// - `via_orientation`: 中间点姿态（欧拉角，度）
     /// - `target_position`: 终点位置（米）
     /// - `target_orientation`: 终点姿态（欧拉角，度）
+    /// - `strategy`: 发送策略（默认使用 Auto，即可靠模式）
     ///
     /// # 协议说明
     ///
@@ -360,6 +394,7 @@ impl<'a> RawCommander<'a> {
         via_orientation: EulerAngles,
         target_position: Position3D,
         target_orientation: EulerAngles,
+        strategy: SendStrategy,
     ) -> Result<()> {
         use piper_protocol::control::{ArcPointCommand, ArcPointIndex};
 
@@ -390,12 +425,24 @@ impl<'a> RawCommander<'a> {
             target_index_frame,    // 0x158: index=0x03 (End)
         ];
 
-        // ✅ 使用实时通道一次性发送，保证顺序且无阻塞
-        // CAN 总线仲裁机制确保：
-        // - 中间点位姿帧（0x152, 0x153, 0x154）先于中间点序号帧（0x158）发送
-        // - 终点位姿帧（0x152, 0x153, 0x154）先于终点序号帧（0x158）发送
-        // - 中间点相关帧先于终点相关帧发送（因为它们在数组中的顺序）
-        self.driver.send_realtime_package(package)?;
+        // 根据策略选择发送方式
+        match strategy {
+            SendStrategy::Realtime => {
+                // 实时模式：邮箱模式，零延迟，可覆盖
+                // CAN 总线仲裁机制确保：
+                // - 中间点位姿帧（0x152, 0x153, 0x154）先于中间点序号帧（0x158）发送
+                // - 终点位姿帧（0x152, 0x153, 0x154）先于终点序号帧（0x158）发送
+                // - 中间点相关帧先于终点相关帧发送（因为它们在数组中的顺序）
+                self.driver.send_realtime_package(package)?;
+            },
+            SendStrategy::Auto | SendStrategy::Reliable { .. } => {
+                // 可靠模式：队列模式，按顺序，不丢失
+                // 对于多个帧，需要逐个发送到可靠队列
+                for frame in package {
+                    self.driver.send_reliable(frame)?;
+                }
+            },
+        }
 
         Ok(())
     }

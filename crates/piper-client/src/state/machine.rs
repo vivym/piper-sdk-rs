@@ -2,7 +2,6 @@
 //!
 //! 使用零大小类型（ZST）标记实现状态机，在编译期防止非法状态转换。
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +25,7 @@ pub struct Standby;
 /// 活动状态（带控制模式）
 ///
 /// 机械臂已使能，可以发送运动命令。
-pub struct Active<Mode>(PhantomData<Mode>);
+pub struct Active<Mode>(Mode);
 
 // ==================== 控制模式类型（零大小类型）====================
 
@@ -38,7 +37,17 @@ pub struct MitMode;
 /// 位置模式
 ///
 /// 纯位置控制模式。
-pub struct PositionMode;
+pub struct PositionMode {
+    /// 发送策略配置
+    pub(crate) send_strategy: SendStrategy,
+}
+
+impl PositionMode {
+    /// 使用指定策略创建位置模式
+    pub(crate) fn with_strategy(send_strategy: SendStrategy) -> Self {
+        Self { send_strategy }
+    }
+}
 
 /// 错误状态
 ///
@@ -193,6 +202,16 @@ pub struct PositionModeConfig {
     /// - `Circular`: 使用 `move_circular()` 方法
     /// - `ContinuousPositionVelocity`: 待实现
     pub motion_type: MotionType,
+    /// 发送策略（新增）
+    ///
+    /// 默认为 `SendStrategy::Auto`，根据命令类型自动选择：
+    /// - 位置命令：使用 Reliable（队列模式，不丢失）
+    /// - MIT 力控命令：使用 Realtime（邮箱模式，零延迟）
+    ///
+    /// **配置建议**：
+    /// - 轨迹控制：保持 `Auto` 或显式设置为 `Reliable`
+    /// - 高频力控：仅在 MIT 模式下设置为 `Realtime`
+    pub send_strategy: SendStrategy,
 }
 
 impl Default for PositionModeConfig {
@@ -204,8 +223,47 @@ impl Default for PositionModeConfig {
             speed_percent: 50,                          // 默认 50% 速度
             install_position: InstallPosition::Invalid, // 默认无效值（不设置安装位置）
             motion_type: MotionType::Joint,             // ✅ 默认关节模式，向后兼容
+            send_strategy: SendStrategy::Auto,          // 默认自动选择策略
         }
     }
+}
+
+/// 发送策略配置
+///
+/// 决定不同类型命令的发送方式：
+/// - **Realtime**：邮箱模式，零延迟，可覆盖（适用于高频力控）
+/// - **Reliable**：队列模式，按顺序，不丢失（适用于轨迹控制）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendStrategy {
+    /// 自动选择（推荐）
+    ///
+    /// 根据控制模式自动选择最优策略：
+    /// - MIT 模式：使用 Realtime
+    /// - Position 模式：使用 Reliable
+    #[default]
+    Auto,
+
+    /// 强制实时模式
+    ///
+    /// **使用场景**：超高频力控（>1kHz）
+    /// **风险**：命令可能被覆盖
+    Realtime,
+
+    /// 强制可靠模式
+    ///
+    /// **使用场景**：轨迹控制、序列指令
+    /// **保证**：命令按顺序发送，不丢失
+    /// **配置**：可设置超时和到达确认
+    Reliable {
+        /// 单个命令发送超时（默认 10ms）
+        timeout: Duration,
+
+        /// 是否确认到达（默认 true）
+        ///
+        /// 如果启用，会阻塞等待每个命令完成（增加延迟）
+        /// 如果禁用，只保证进入队列，不保证已发送
+        check_arrival: bool,
+    },
 }
 
 /// 失能配置（带 Debounce 参数）
@@ -239,13 +297,13 @@ impl Default for DisableConfig {
 ///
 /// - `State`: 当前状态（`Disconnected`, `Standby`, `Active<Mode>`）
 ///
-/// # 零开销
+/// # 内存开销
 ///
-/// 状态类型是零大小类型（ZST），不占用任何运行时内存。
+/// 大部分状态是零大小类型（ZST），除了 `Active<PositionMode>` 包含 `send_strategy` 配置。
 pub struct Piper<State = Disconnected> {
     pub(crate) driver: Arc<piper_driver::Piper>,
     pub(crate) observer: Observer,
-    pub(crate) _state: PhantomData<State>, // pub(crate) 以支持 builder 模块构造
+    pub(crate) _state: State, // 改为直接存储状态（不再使用 PhantomData）
 }
 
 // ==================== Disconnected 状态 ====================
@@ -282,7 +340,7 @@ impl Piper<Disconnected> {
         Ok(Piper {
             driver,
             observer,
-            _state: PhantomData,
+            _state: Standby,
         })
     }
 
@@ -336,7 +394,7 @@ impl Piper<Disconnected> {
         Ok(Piper {
             driver,
             observer,
-            _state: PhantomData,
+            _state: Standby,
         })
     }
 }
@@ -416,7 +474,7 @@ impl Piper<Standby> {
         Ok(Piper {
             driver,
             observer,
-            _state: PhantomData,
+            _state: Active(MitMode),
         })
     }
 
@@ -480,11 +538,12 @@ impl Piper<Standby> {
         // `this` is dropped here, but since it's ManuallyDrop,
         // the inner `self` is NOT dropped, preventing double-disable
 
-        // Construct new state (no Arc ref count increase!)
+        // Construct new state with send_strategy from config (no Arc ref count increase!)
+        let position_mode = PositionMode::with_strategy(config.send_strategy);
         Ok(Piper {
             driver,
             observer,
-            _state: PhantomData,
+            _state: Active(position_mode),
         })
     }
 
@@ -699,7 +758,7 @@ impl<State> Piper<State> {
         Ok(Piper {
             driver,
             observer,
-            _state: PhantomData,
+            _state: ErrorState,
         })
     }
 
@@ -842,7 +901,7 @@ impl<M> Piper<Active<M>> {
         Ok(Piper {
             driver,
             observer,
-            _state: PhantomData,
+            _state: Standby,
         })
     }
 }
@@ -1005,7 +1064,7 @@ impl Piper<Active<MitMode>> {
         Ok(Piper {
             driver,
             observer,
-            _state: PhantomData,
+            _state: Standby,
         })
     }
 }
@@ -1036,7 +1095,7 @@ impl Piper<Active<PositionMode>> {
     /// ```
     pub fn send_position_command(&self, positions: &JointArray<Rad>) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_position_command_batch(positions)
+        raw.send_position_command_batch(positions, self._state.0.send_strategy)
     }
 
     /// 发送末端位姿命令（笛卡尔空间控制）
@@ -1069,7 +1128,7 @@ impl Piper<Active<PositionMode>> {
         orientation: EulerAngles,
     ) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_end_pose_command(position, orientation)
+        raw.send_end_pose_command(position, orientation, self._state.0.send_strategy)
     }
 
     /// 发送直线运动命令
@@ -1100,7 +1159,7 @@ impl Piper<Active<PositionMode>> {
     /// ```
     pub fn move_linear(&self, position: Position3D, orientation: EulerAngles) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_end_pose_command(position, orientation)
+        raw.send_end_pose_command(position, orientation, self._state.0.send_strategy)
     }
 
     /// 发送圆弧运动命令
@@ -1146,6 +1205,7 @@ impl Piper<Active<PositionMode>> {
             via_orientation,
             target_position,
             target_orientation,
+            self._state.0.send_strategy,
         )
     }
     /// 更新单个关节位置（保持其他关节不变）
@@ -1277,7 +1337,7 @@ impl Piper<Active<PositionMode>> {
         Ok(Piper {
             driver,
             observer,
-            _state: PhantomData,
+            _state: Standby,
         })
     }
 }
@@ -1323,26 +1383,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_state_types_are_zero_sized() {
+    fn test_state_type_sizes() {
+        // 大部分状态类型是 ZST（零大小类型）
         assert_eq!(std::mem::size_of::<Disconnected>(), 0);
         assert_eq!(std::mem::size_of::<Standby>(), 0);
-        assert_eq!(std::mem::size_of::<Active<MitMode>>(), 0);
-        assert_eq!(std::mem::size_of::<Active<PositionMode>>(), 0);
+        assert_eq!(std::mem::size_of::<MitMode>(), 0);
         assert_eq!(std::mem::size_of::<ErrorState>(), 0);
-        assert_eq!(std::mem::size_of::<MitMode>(), 0);
-        assert_eq!(std::mem::size_of::<PositionMode>(), 0);
-    }
 
-    #[test]
-    fn test_mode_types_are_zero_sized() {
-        assert_eq!(std::mem::size_of::<MitMode>(), 0);
-        assert_eq!(std::mem::size_of::<PositionMode>(), 0);
-    }
+        // Active<MitMode> 包含 MitMode（ZST），所以也是 ZST
+        assert_eq!(std::mem::size_of::<Active<MitMode>>(), 0);
 
-    #[test]
-    fn test_phantom_data_overhead() {
-        assert_eq!(std::mem::size_of::<PhantomData<Disconnected>>(), 0);
-        assert_eq!(std::mem::size_of::<PhantomData<Active<MitMode>>>(), 0);
+        // PositionMode 包含 SendStrategy，不是 ZST
+        assert!(std::mem::size_of::<PositionMode>() > 0);
+        assert!(std::mem::size_of::<Active<PositionMode>>() > 0);
     }
 
     #[test]
