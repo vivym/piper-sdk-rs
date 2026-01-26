@@ -509,6 +509,7 @@ fn test_tx_latency_benchmark() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
 
     // 启动 TX 线程
+    let ctx_tx = _ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -518,6 +519,7 @@ fn test_tx_latency_benchmark() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -598,6 +600,7 @@ fn test_send_duration_benchmark() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
 
     // 启动 TX 线程
+    let ctx_tx = _ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -607,6 +610,7 @@ fn test_send_duration_benchmark() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 

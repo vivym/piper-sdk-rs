@@ -143,6 +143,7 @@ fn test_rx_unaffected_by_tx_timeout() {
     });
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -152,6 +153,7 @@ fn test_rx_unaffected_by_tx_timeout() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -234,6 +236,7 @@ fn test_tx_detects_rx_failure() {
     });
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -243,6 +246,7 @@ fn test_tx_detects_rx_failure() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -325,6 +329,7 @@ fn test_thread_lifecycle_linkage() {
     });
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -334,6 +339,7 @@ fn test_thread_lifecycle_linkage() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 

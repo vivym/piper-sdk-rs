@@ -154,8 +154,10 @@ fn test_enable_mit_mode() {
             // 测试在 Active 状态下可以调用 command_torques
             let positions = JointArray::from([Rad(0.0); 6]);
             let velocities = JointArray::from([0.0; 6]);
+            let kp = JointArray::from([10.0; 6]);
+            let kd = JointArray::from([0.8; 6]);
             let torques = JointArray::from([NewtonMeter(0.0); 6]);
-            let result = active_robot.command_torques(&positions, &velocities, 10.0, 0.8, &torques);
+            let result = active_robot.command_torques(&positions, &velocities, &kp, &kd, &torques);
             assert!(result.is_ok() || result.is_err());
         }
     }
@@ -254,9 +256,10 @@ fn test_type_state_safety() {
         if let Ok(active_robot) = robot.enable_all() {
             let positions = JointArray::from([Rad(0.0); 6]);
             let velocities = JointArray::from([0.0; 6]);
+            let kp = JointArray::from([10.0; 6]);
+            let kd = JointArray::from([0.8; 6]);
             let torques = JointArray::from([NewtonMeter(0.0); 6]);
-            let _result =
-                active_robot.command_torques(&positions, &velocities, 10.0, 0.8, &torques);
+            let _result = active_robot.command_torques(&positions, &velocities, &kp, &kd, &torques);
         }
     }
 }

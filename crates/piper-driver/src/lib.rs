@@ -5,6 +5,7 @@
 //! - 状态同步（ArcSwap 无锁读取）
 //! - 帧解析与聚合
 //! - 命令优先级管理
+//! - 钩子系统（v1.2.1）：异步录制、自定义回调
 //!
 //! # 使用场景
 //!
@@ -16,9 +17,11 @@ pub mod command;
 mod error;
 mod fps_stats;
 pub mod heartbeat;
+pub mod hooks;
 pub mod metrics;
 pub mod pipeline;
 mod piper; // 原 robot_impl.rs
+pub mod recording;
 pub mod state;
 
 pub use builder::{DriverType, PiperBuilder};
@@ -26,7 +29,9 @@ pub use command::{CommandPriority, PiperCommand};
 pub use error::DriverError; // 原 DriverError
 pub use fps_stats::{FpsCounts, FpsResult};
 pub use heartbeat::ConnectionMonitor;
+pub use hooks::{FrameCallback, HookManager};
 pub use metrics::{MetricsSnapshot, PiperMetrics};
 pub use pipeline::{PipelineConfig, io_loop, rx_loop, tx_loop, tx_loop_mailbox};
 pub use piper::Piper;
+pub use recording::{AsyncRecordingHook, TimestampedFrame};
 pub use state::*;

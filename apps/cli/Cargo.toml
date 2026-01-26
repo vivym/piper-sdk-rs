@@ -1,0 +1,51 @@
+[package]
+name = "piper-cli"
+version.workspace = true
+edition.workspace = true
+authors = ["Piper SDK Team"]
+license = "MIT OR Apache-2.0"
+description = "Command-line interface for Piper robot arm control"
+repository = "https://github.com/yourusername/piper-sdk-rs"
+readme = "README.md"
+
+[[bin]]
+name = "piper-cli"
+path = "src/main.rs"
+
+[dependencies]
+# ✅ Piper SDK
+piper-sdk = { workspace = true }
+piper-client = { workspace = true }
+piper-tools = { workspace = true, features = ["full"] }  # CLI 需要统计功能
+
+# ✅ 命令行解析
+clap = { version = "4.5", features = ["derive"] }
+
+# ✅ REPL（方案 B：专用输入线程）
+rustyline = "14.0"
+
+# ✅ 异步运行时
+tokio = { version = "1.42", features = ["full"] }
+
+# ✅ 通道（用于 REPL 方案 B）
+crossbeam-channel = "0.5"
+
+# ✅ 错误处理
+anyhow = "1.0"
+thiserror = { workspace = true }
+
+# ✅ 序列化
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+
+# ✅ 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ✅ 配置目录
+dirs = "5.0"
+
+[dev-dependencies]
+# 测试
+assert_cmd = "2.0"
+predicates = "3.1"

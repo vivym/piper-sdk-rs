@@ -52,15 +52,15 @@ impl<'a> RawCommander<'a> {
     ///
     /// - `positions`: 各关节目标位置
     /// - `velocities`: 各关节目标速度
-    /// - `kp`: 位置增益（所有关节相同）
-    /// - `kd`: 速度增益（所有关节相同）
+    /// - `kp`: 位置增益（每个关节独立）
+    /// - `kd`: 速度增益（每个关节独立）
     /// - `torques`: 各关节前馈力矩
     pub(crate) fn send_mit_command_batch(
         &self,
         positions: &JointArray<Rad>,
         velocities: &JointArray<f64>,
-        kp: f64,
-        kd: f64,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
         torques: &JointArray<NewtonMeter>,
     ) -> Result<()> {
         use piper_protocol::control::MitControlCommand;
@@ -91,8 +91,8 @@ impl<'a> RawCommander<'a> {
             let joint_index = joint.index() as u8;
             let pos_ref = positions[joint].0 as f32;
             let vel_ref = velocities[joint] as f32;
-            let kp_f32 = kp as f32;
-            let kd_f32 = kd as f32;
+            let kp_f32 = kp[joint] as f32; // 每个关节独立的 kp 增益
+            let kd_f32 = kd[joint] as f32; // 每个关节独立的 kd 增益
             let t_ref = torques[joint].0 as f32;
 
             // ✅ v2.1 重构：简化为两行，自动计算 CRC

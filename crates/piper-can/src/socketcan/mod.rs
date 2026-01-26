@@ -128,6 +128,45 @@ impl SocketCanAdapter {
             CanError::Device(format!("Failed to open CAN interface '{}': {}", interface, e).into())
         })?;
 
+        // 🛡️ v1.2.1: 禁用 Loopback，防止 TX 帧回环到 RX，导致重复录制
+        // 默认情况下，SocketCAN 会将发送的帧回环到接收端（用于测试和诊断）
+        // 但对于录制场景，这会导致：
+        //   1. TX 帧被录制两次（TX 钩子 + RX 回环）
+        //   2. 无法区分真实 RX 帧和回环的 TX 帧
+        //
+        // 禁用 loopback 后：
+        //   - TX 帧不会回环到 RX 接收端
+        //   - 只有真实的外部 CAN 帧会被 RX 钩子录制
+        //   - TX 帧只能通过 TX 钩子（on_frame_sent）录制
+        //
+        // 注意：这需要 socketcan crate 3.x 支持，通过 raw setsockopt 调用实现
+        let loopback_enabled: libc::c_int = 0; // 0 = 禁用，1 = 启用
+        let loopback_result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_CAN_RAW,
+                libc::CAN_RAW_LOOPBACK,
+                &loopback_enabled as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+
+        if loopback_result < 0 {
+            // 警告：设置失败，但不阻塞初始化（某些系统可能不支持此选项）
+            warn!(
+                "Failed to disable CAN_RAW_LOOPBACK on '{}': {}",
+                interface,
+                std::io::Error::last_os_error()
+            );
+            // 不返回错误，继续初始化
+            // 用户可能仍能正常使用，但 TX 帧可能会被回环（需要业务层过滤）
+        } else {
+            trace!(
+                "SocketCAN interface '{}' loopback disabled (CAN_RAW_LOOPBACK=0)",
+                interface
+            );
+        }
+
         // 设置读超时（默认 2ms，与 PipelineConfig 的默认值一致，确保 io_loop 能及时响应退出信号）
         // 较短的超时时间可以确保在收到退出信号时，io_loop 能快速检查命令通道状态
         let read_timeout = Duration::from_millis(2);

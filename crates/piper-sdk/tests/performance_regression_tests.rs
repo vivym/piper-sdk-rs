@@ -342,6 +342,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     });
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -351,6 +352,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -502,7 +504,7 @@ fn test_command_priority_performance() {
     let test_duration = Duration::from_secs(2);
     let _frequency_hz = 500;
 
-    let _ctx = Arc::new(PiperContext::new());
+    let ctx = Arc::new(PiperContext::new());
     let _config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
@@ -515,6 +517,7 @@ fn test_command_priority_performance() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -524,6 +527,7 @@ fn test_command_priority_performance() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -558,6 +562,7 @@ fn test_command_priority_performance() {
     let (realtime_tx2, realtime_rx2) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx2, reliable_rx2) = crossbeam_channel::bounded::<PiperFrame>(10);
 
+    let ctx_tx2 = ctx.clone();
     let is_running_tx2 = is_running2.clone();
     let metrics_tx2 = metrics2.clone();
     let tx_handle2 = thread::spawn(move || {
@@ -567,6 +572,7 @@ fn test_command_priority_performance() {
             reliable_rx2,
             is_running_tx2,
             metrics_tx2,
+            ctx_tx2,
         );
     });
 

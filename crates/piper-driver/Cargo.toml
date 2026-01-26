@@ -18,3 +18,4 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 smallvec = { workspace = true }
 thread-priority = { workspace = true, optional = true }
+spin_sleep = { workspace = true }

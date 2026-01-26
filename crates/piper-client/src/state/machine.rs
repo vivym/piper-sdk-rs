@@ -917,8 +917,8 @@ impl Piper<Active<MitMode>> {
     ///
     /// - `positions`: 各关节目标位置（Rad）
     /// - `velocities`: 各关节目标速度（rad/s）
-    /// - `kp`: 位置增益（所有关节相同）
-    /// - `kd`: 速度增益（所有关节相同）
+    /// - `kp`: 位置增益（每个关节独立）
+    /// - `kd`: 速度增益（每个关节独立）
     /// - `torques`: 各关节前馈力矩（NewtonMeter）
     ///
     /// # 示例
@@ -931,11 +931,13 @@ impl Piper<Active<MitMode>> {
     ///     Rad(1.0), Rad(0.5), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)
     /// ]);
     /// let velocities = JointArray::from([0.5, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    /// let kp = JointArray::from([10.0; 6]);  // 每个关节独立的 kp
+    /// let kd = JointArray::from([2.0; 6]);   // 每个关节独立的 kd
     /// let torques = JointArray::from([
     ///     NewtonMeter(5.0), NewtonMeter(0.0), NewtonMeter(0.0),
     ///     NewtonMeter(0.0), NewtonMeter(0.0), NewtonMeter(0.0)
     /// ]);
-    /// robot.command_torques(&positions, &velocities, 10.0, 2.0, &torques)?;
+    /// robot.command_torques(&positions, &velocities, &kp, &kd, &torques)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -943,8 +945,8 @@ impl Piper<Active<MitMode>> {
         &self,
         positions: &JointArray<Rad>,
         velocities: &JointArray<f64>,
-        kp: f64,
-        kd: f64,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
         torques: &JointArray<NewtonMeter>,
     ) -> Result<()> {
         // ✅ 直接使用 RawCommander，避免创建 MotionCommander

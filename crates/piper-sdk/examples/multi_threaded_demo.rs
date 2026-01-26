@@ -89,9 +89,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // ✅ 获取锁并发送命令
             if let Ok(robot) = robot_clone.lock() {
                 let velocities = JointArray::from([0.0; 6]);
+                let kp = JointArray::from([0.0; 6]);
+                let kd = JointArray::from([0.0; 6]);
                 let torques = JointArray::from([NewtonMeter(0.0); 6]);
 
-                if let Err(e) = robot.command_torques(&positions, &velocities, 0.0, 0.0, &torques) {
+                if let Err(e) = robot.command_torques(&positions, &velocities, &kp, &kd, &torques) {
                     eprintln!("   ❌ 发送命令失败: {:?}", e);
                     break;
                 }

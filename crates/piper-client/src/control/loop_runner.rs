@@ -175,7 +175,15 @@ where
         // 5. 发送命令（使用纯力矩模式，kp/kd=0）
         let zero_positions = crate::types::JointArray::from([crate::types::Rad(0.0); 6]);
         let zero_velocities = crate::types::JointArray::from([0.0; 6]);
-        piper.command_torques(&zero_positions, &zero_velocities, 0.0, 0.0, &torques)?;
+        let zero_kp = crate::types::JointArray::from([0.0; 6]);
+        let zero_kd = crate::types::JointArray::from([0.0; 6]);
+        piper.command_torques(
+            &zero_positions,
+            &zero_velocities,
+            &zero_kp,
+            &zero_kd,
+            &torques,
+        )?;
 
         // 6. 更新时间
         last_time = now;
@@ -250,7 +258,15 @@ where
 
         let zero_positions = crate::types::JointArray::from([crate::types::Rad(0.0); 6]);
         let zero_velocities = crate::types::JointArray::from([0.0; 6]);
-        piper.command_torques(&zero_positions, &zero_velocities, 0.0, 0.0, &torques)?;
+        let zero_kp = crate::types::JointArray::from([0.0; 6]);
+        let zero_kd = crate::types::JointArray::from([0.0; 6]);
+        piper.command_torques(
+            &zero_positions,
+            &zero_velocities,
+            &zero_kp,
+            &zero_kd,
+            &torques,
+        )?;
 
         last_time = now;
         iteration += 1;

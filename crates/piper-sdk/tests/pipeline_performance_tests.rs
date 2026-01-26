@@ -237,7 +237,7 @@ fn test_rx_update_period_distribution() {
 fn test_tx_command_latency_distribution() {
     // 测试场景：测量 TX 命令延迟分布
 
-    let _ctx = Arc::new(PiperContext::new());
+    let ctx = Arc::new(PiperContext::new());
     let _config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
@@ -250,6 +250,7 @@ fn test_tx_command_latency_distribution() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -259,6 +260,7 @@ fn test_tx_command_latency_distribution() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -337,6 +339,7 @@ fn test_metrics_accuracy() {
     });
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -346,6 +349,7 @@ fn test_metrics_accuracy() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -399,6 +403,7 @@ fn test_realtime_overwrite_accuracy() {
     // 测试场景：验证 Overwrite 次数与实际触发次数一致
 
     let is_running = Arc::new(AtomicBool::new(true));
+    let ctx = Arc::new(PiperContext::new());
     let metrics = Arc::new(PiperMetrics::new());
 
     // 创建慢速 TX 适配器（模拟瓶颈）
@@ -436,6 +441,7 @@ fn test_realtime_overwrite_accuracy() {
     // 实际的 overwrite 逻辑在 send_realtime 中实现
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -445,6 +451,7 @@ fn test_realtime_overwrite_accuracy() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 

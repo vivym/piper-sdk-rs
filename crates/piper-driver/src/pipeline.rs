@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, trace, warn};
 
+// 使用 spin_sleep 提供微秒级延迟精度（相比 std::thread::sleep 的 1-2ms）
+use spin_sleep;
+
 /// Pipeline 配置
 ///
 /// 控制 IO 线程的行为，包括接收超时和帧组超时设置。
@@ -459,7 +462,16 @@ pub fn rx_loop(
         metrics.rx_frames_valid.fetch_add(1, Ordering::Relaxed);
 
         // ============================================================
-        // 2. 根据 CAN ID 解析帧并更新状态
+        // 2. 触发 RX 回调（v1.2.1: 非阻塞，<1μs）
+        // ============================================================
+        // 使用 try_read 避免阻塞，如果锁被持有则跳过本次触发
+        if let Ok(hooks) = ctx.hooks.try_read() {
+            hooks.trigger_all(&frame);
+            // ^^^v 所有回调必须使用 try_send，<1μs，非阻塞
+        }
+
+        // ============================================================
+        // 3. 根据 CAN ID 解析帧并更新状态
         // ============================================================
         // 复用 io_loop 中的解析逻辑（通过调用辅助函数）
         parse_and_update_state(&frame, &ctx, &config, &mut state);
@@ -479,12 +491,14 @@ pub fn rx_loop(
 /// - `reliable_rx`: 可靠命令队列接收端（容量 10）
 /// - `is_running`: 运行标志（用于生命周期联动）
 /// - `metrics`: 性能指标
+/// - `ctx`: 共享状态上下文（用于触发 TX 回调，v1.2.1）
 pub fn tx_loop_mailbox(
     mut tx: impl TxAdapter,
     realtime_slot: Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
     reliable_rx: Receiver<PiperFrame>,
     is_running: Arc<AtomicBool>,
     metrics: Arc<PiperMetrics>,
+    ctx: Arc<PiperContext>,
 ) {
     // 饿死保护：连续处理 N 个 Realtime 包后，强制检查一次普通队列
     const REALTIME_BURST_LIMIT: usize = 100;
@@ -523,6 +537,12 @@ pub fn tx_loop_mailbox(
                 match tx.send(frame) {
                     Ok(_) => {
                         sent_count += 1;
+                        // 🆕 v1.2.1: 触发 TX 回调（仅在发送成功后）
+                        // 使用 try_read 避免阻塞
+                        if let Ok(hooks) = ctx.hooks.try_read() {
+                            hooks.trigger_all_sent(&frame);
+                            // ^^^v 非阻塞，<1μs
+                        }
                     },
                     Err(e) => {
                         error!(
@@ -579,6 +599,12 @@ pub fn tx_loop_mailbox(
         if let Ok(frame) = reliable_rx.try_recv() {
             match tx.send(frame) {
                 Ok(_) => {
+                    // 🆕 v1.2.1: 触发 TX 回调（仅在发送成功后）
+                    // 使用 try_read 避免阻塞
+                    if let Ok(hooks) = ctx.hooks.try_read() {
+                        hooks.trigger_all_sent(&frame);
+                        // ^^^v 非阻塞，<1μs
+                    }
                     // 注意：不在这里更新 tx_frames_total，因为 send_reliable() 已经更新了
                 },
                 Err(e) => {
@@ -603,7 +629,8 @@ pub fn tx_loop_mailbox(
         // 都没有数据，避免忙等待
         // 使用短暂的 sleep（50μs）降低 CPU 占用
         // 注意：这里的延迟不会影响控制循环，因为控制循环在另一个线程
-        std::thread::sleep(Duration::from_micros(50));
+        // 使用 spin_sleep 而非 thread::sleep 以获得微秒级精度（相比 thread::sleep 的 1-2ms）
+        spin_sleep::sleep(Duration::from_micros(50));
     }
 
     trace!("TX thread: loop exited");
@@ -620,6 +647,7 @@ pub fn tx_loop_mailbox(
 /// - `reliable_rx`: 可靠命令队列接收端（容量 10）
 /// - `is_running`: 运行标志（用于生命周期联动）
 /// - `metrics`: 性能指标
+/// - `ctx`: 共享状态上下文（用于触发 TX 回调，v1.2.1）
 #[allow(dead_code)]
 pub fn tx_loop(
     mut tx: impl TxAdapter,
@@ -627,6 +655,7 @@ pub fn tx_loop(
     reliable_rx: Receiver<PiperFrame>,
     is_running: Arc<AtomicBool>,
     metrics: Arc<PiperMetrics>,
+    ctx: Arc<PiperContext>,
 ) {
     loop {
         // 检查运行标志
@@ -667,6 +696,12 @@ pub fn tx_loop(
         // 发送帧
         match tx.send(frame) {
             Ok(_) => {
+                // 🆕 v1.2.1: 触发 TX 回调（仅在发送成功后）
+                // 使用 try_read 避免阻塞
+                if let Ok(hooks) = ctx.hooks.try_read() {
+                    hooks.trigger_all_sent(&frame);
+                    // ^^^v 非阻塞，<1μs
+                }
                 metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
             },
             Err(e) => {

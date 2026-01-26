@@ -1,0 +1,37 @@
+{
+  "name": "简单移动序列",
+  "description": "演示脚本系统：回零 -> 移动 -> 等待 -> 查询位置",
+  "commands": [
+    {
+      "type": "Home"
+    },
+    {
+      "type": "Wait",
+      "duration_ms": 500
+    },
+    {
+      "type": "Move",
+      "joints": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+      "force": false
+    },
+    {
+      "type": "Wait",
+      "duration_ms": 1000
+    },
+    {
+      "type": "Position"
+    },
+    {
+      "type": "Move",
+      "joints": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "force": false
+    },
+    {
+      "type": "Wait",
+      "duration_ms": 1000
+    },
+    {
+      "type": "Position"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "name": "测试序列",
+  "description": "完整的测试流程，包括所有命令类型",
+  "commands": [
+    {
+      "type": "Home"
+    },
+    {
+      "type": "Wait",
+      "duration_ms": 1000
+    },
+    {
+      "type": "Position"
+    },
+    {
+      "type": "Move",
+      "joints": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+      "force": false
+    },
+    {
+      "type": "Wait",
+      "duration_ms": 500
+    },
+    {
+      "type": "Move",
+      "joints": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+      "force": false
+    },
+    {
+      "type": "Wait",
+      "duration_ms": 500
+    },
+    {
+      "type": "Move",
+      "joints": [0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+      "force": false
+    },
+    {
+      "type": "Wait",
+      "duration_ms": 1000
+    },
+    {
+      "type": "Position"
+    }
+  ]
+}

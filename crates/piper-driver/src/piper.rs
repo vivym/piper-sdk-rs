@@ -208,6 +208,7 @@ impl Piper {
         });
 
         // 克隆用于 TX 线程
+        let ctx_tx = ctx.clone();
         let is_running_tx = is_running.clone();
         let metrics_tx = metrics.clone();
         let realtime_slot_tx = realtime_slot.clone();
@@ -220,6 +221,7 @@ impl Piper {
                 reliable_rx,
                 is_running_tx,
                 metrics_tx,
+                ctx_tx, // 🆕 v1.2.1: 传入 ctx 用于触发 TX 回调
             );
         });
 

@@ -101,6 +101,7 @@ fn test_priority_scheduling() {
     });
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -110,6 +111,7 @@ fn test_priority_scheduling() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -174,7 +176,7 @@ fn test_priority_scheduling() {
 fn test_reliable_command_not_dropped() {
     // 测试场景：验证可靠命令不会被丢弃（即使队列满）
 
-    let _ctx = Arc::new(PiperContext::new());
+    let ctx = Arc::new(PiperContext::new());
     let _config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
@@ -210,6 +212,7 @@ fn test_reliable_command_not_dropped() {
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -219,6 +222,7 @@ fn test_reliable_command_not_dropped() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 
@@ -282,7 +286,7 @@ fn test_reliable_command_not_dropped() {
 fn test_realtime_overwrite_strategy() {
     // 测试场景：验证实时命令支持覆盖（Overwrite 策略）
 
-    let _ctx = Arc::new(PiperContext::new());
+    let ctx = Arc::new(PiperContext::new());
     let _config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
@@ -318,6 +322,7 @@ fn test_realtime_overwrite_strategy() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
 
     // 启动 TX 线程
+    let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
     let tx_handle = thread::spawn(move || {
@@ -327,6 +332,7 @@ fn test_realtime_overwrite_strategy() {
             reliable_rx,
             is_running_tx,
             metrics_tx,
+            ctx_tx,
         );
     });
 

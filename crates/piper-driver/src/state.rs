@@ -871,6 +871,40 @@ impl MasterSlaveGripperControlState {
     }
 }
 
+/// 钩子管理器（v1.2.1）
+///
+/// 专门管理运行时回调列表。
+///
+/// # 设计理由
+///
+/// - **Config vs Context 分离**:
+///   - `PipelineConfig` 应该是 POD（Plain Old Data），用于序列化
+///   - `PiperContext` 管理运行时状态和动态组件（如回调）
+///
+/// # 线程安全
+///
+/// 使用 `RwLock<HookManager>` 确保回调列表的线程安全。
+///
+/// # 使用示例
+///
+/// ```rust
+/// use piper_driver::hooks::HookManager;
+/// use piper_driver::hooks::FrameCallback;
+/// use piper_driver::recording::AsyncRecordingHook;
+/// use piper_driver::state::PiperContext;
+/// use std::sync::Arc;
+///
+/// // 添加录制钩子
+/// let context = PiperContext::new();
+/// let (hook, _rx) = AsyncRecordingHook::new();
+/// let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+///
+/// if let Ok(mut hooks) = context.hooks.write() {
+///     hooks.add_callback(callback);
+/// }
+/// ```
+use crate::hooks::HookManager;
+
 /// Piper 上下文（所有状态的聚合）
 pub struct PiperContext {
     // === 热数据（500Hz，高频运动数据）===
@@ -936,6 +970,37 @@ pub struct PiperContext {
     ///
     /// 使用 App Start Relative Time 模式，确保时间单调性。
     pub connection_monitor: crate::heartbeat::ConnectionMonitor,
+
+    // === 钩子管理（v1.2.1）===
+    /// 钩子管理器（用于运行时回调注册）
+    ///
+    /// 使用 `RwLock` 支持动态添加/移除回调，同时保证线程安全。
+    ///
+    /// # 设计理由（v1.2.1）
+    ///
+    /// - **Config vs Context 分离**: `PipelineConfig` 保持为 POD（Plain Old Data），
+    ///   `PiperContext` 管理运行时状态和动态组件（如回调）
+    /// - **动态注册**: 运行时可以添加/移除回调，无需重新配置 pipeline
+    /// - **线程安全**: 使用 `RwLock` 保证并发访问安全
+    ///
+    /// # 示例
+    ///
+    /// ```rust
+    /// use piper_driver::recording::AsyncRecordingHook;
+    /// use piper_driver::hooks::FrameCallback;
+    /// use piper_driver::state::PiperContext;
+    /// use std::sync::Arc;
+    ///
+    /// // 创建上下文和录制钩子
+    /// let context = PiperContext::new();
+    /// let (hook, _rx) = AsyncRecordingHook::new();
+    ///
+    /// // 注册为回调
+    /// if let Ok(mut hooks) = context.hooks.write() {
+    ///     hooks.add_callback(Arc::new(hook) as Arc<dyn FrameCallback>);
+    /// }
+    /// ```
+    pub hooks: Arc<RwLock<HookManager>>,
 }
 
 impl PiperContext {
@@ -997,6 +1062,9 @@ impl PiperContext {
             connection_monitor: crate::heartbeat::ConnectionMonitor::new(
                 std::time::Duration::from_secs(1),
             ),
+
+            // 钩子管理器（v1.2.1）
+            hooks: Arc::new(RwLock::new(HookManager::new())),
         }
     }
 
