@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/piper-sdk/badge.svg)](https://docs.rs/piper-sdk)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**High-performance, cross-platform (Linux/Windows/macOS), zero-abstraction-overhead** Rust SDK for AgileX Piper Robot Arm with support for high-frequency force control (500Hz).
+**High-performance, cross-platform (Linux/Windows/macOS), zero-abstraction-overhead** Rust SDK for AgileX Piper Robot Arm with support for high-frequency force control (500Hz) and async CAN frame recording.
 
 [中文版 README](README.zh-CN.md)
 
@@ -17,6 +17,12 @@
 - 🌍 **Cross-Platform Support (Linux/Windows/macOS)**:
   - **Linux**: Supports both SocketCAN (kernel-level performance) and GS-USB (userspace via libusb)
   - **Windows/macOS**: GS-USB driver implementation using `rusb` (driver-free/universal)
+- 🎬 **Async CAN Frame Recording**:
+  - **Non-blocking hooks**: <1μs overhead per frame using `try_send`
+  - **Bounded queues**: 10,000 frame capacity prevents OOM at 1kHz
+  - **Hardware timestamps**: Direct use of kernel/driver interrupt timestamps
+  - **TX safety**: Only records frames after successful `send()`
+  - **Drop monitoring**: Built-in `dropped_frames` counter for loss tracking
 - 📊 **Advanced Health Monitoring** (gs_usb_daemon):
   - **CAN Bus Off Detection**: Detects CAN Bus Off events (critical system failure) with debounce mechanism
   - **Error Passive Monitoring**: Monitors Error Passive state (pre-Bus Off warning) for early detection
@@ -33,10 +39,12 @@ piper-sdk-rs/
 ├── crates/
 │   ├── piper-protocol/    # Protocol layer (bit-level CAN protocol)
 │   ├── piper-can/         # CAN abstraction (SocketCAN/GS-USB)
-│   ├── piper-driver/      # Driver layer (I/O threads, state sync)
+│   ├── piper-driver/      # Driver layer (I/O threads, state sync, hooks)
 │   ├── piper-client/      # Client layer (type-safe user API)
+│   ├── piper-tools/       # Recording and analysis tools
 │   └── piper-sdk/         # Compatibility layer (re-exports all)
 └── apps/
+    ├── cli/               # Command-line interface
     └── daemon/            # GS-USB daemon binary
 ```
 
@@ -46,9 +54,10 @@ piper-sdk-rs/
 |-------|-------|---------|---------------|
 | Protocol | `piper-protocol` | Type-safe CAN protocol encoding/decoding | 214 tests ✅ |
 | CAN | `piper-can` | Hardware abstraction for CAN adapters | 97 tests ✅ |
-| Driver | `piper-driver` | I/O management, state synchronization | 127 tests ✅ |
+| Driver | `piper-driver` | I/O management, state sync, hooks | 149 tests ✅ |
 | Client | `piper-client` | High-level type-safe API | 105 tests ✅ |
-| SDK | `piper-sdk` | Compatibility layer (re-exports) | 543 tests ✅ |
+| Tools | `piper-tools` | Recording, statistics, safety | 23 tests ✅ |
+| SDK | `piper-sdk` | Compatibility layer (re-exports) | 588 tests ✅ |
 
 **Benefits**:
 - ✅ **Faster compilation**: Only recompile modified layers (up to 88% faster)
@@ -68,6 +77,7 @@ See [Workspace Migration Guide](docs/v0/workspace/USER_MIGRATION_GUIDE.md) for d
 | Protocol Parsing | `bilge` | Bit operations, unaligned data processing, alternative to serde |
 | Concurrency Model | `crossbeam-channel` | High-performance MPSC channel for sending control commands |
 | State Sharing | `arc-swap` | RCU mechanism for lock-free reading of latest state |
+| Frame Hooks | `hooks` + `recording` | Non-blocking async recording with bounded queues |
 | Error Handling | `thiserror` | Precise error enumeration within SDK |
 | Logging | `tracing` | Structured logging |
 
@@ -156,6 +166,10 @@ piper-client = "0.1"
 # Use only the driver layer (for advanced users)
 [dependencies]
 piper-driver = "0.1"
+
+# Use only tools (for recording/analysis)
+[dependencies]
+piper-tools = "0.1"
 ```
 
 **Note**: When using specific layers, update your imports:
@@ -195,6 +209,66 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### CAN Frame Recording
+
+Record CAN frames asynchronously with non-blocking hooks:
+
+```rust
+use piper_driver::recording::AsyncRecordingHook;
+use piper_driver::hooks::FrameCallback;
+use piper_sdk::prelude::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create recording hook
+    let (hook, rx) = AsyncRecordingHook::new();
+    let dropped_counter = hook.dropped_frames().clone();
+
+    // Register as callback
+    let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+
+    // Connect robot
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .build()?;
+
+    // Register hook in driver layer
+    // (Note: This is advanced usage - see driver API docs)
+    robot.context.hooks.write()?.add_callback(callback);
+
+    // Spawn recording thread
+    let handle = thread::spawn(move || {
+        let mut file = std::fs::File::create("recording.bin")?;
+        while let Ok(frame) = rx.recv() {
+            // Process frame: write to file, analyze, etc.
+            println!("Received frame: ID=0x{:03X}, timestamp={}us",
+                     frame.id, frame.timestamp_us);
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    });
+
+    // Run for 5 seconds
+    thread::sleep(Duration::from_secs(5));
+
+    // Check dropped frames
+    let dropped = dropped_counter.load(Ordering::Relaxed);
+    println!("Dropped frames: {}", dropped);
+
+    handle.join().ok();
+    Ok(())
+}
+```
+
+**Key Features**:
+- ✅ **Non-blocking**: `<1μs` overhead per frame
+- ✅ **OOM-safe**: Bounded queue (10,000 frames @ 1kHz = 10s buffer)
+- ✅ **Hardware timestamps**: Microsecond precision from kernel/driver
+- ✅ **TX safe**: Only records successfully sent frames
+- ✅ **Loss tracking**: Built-in `dropped_frames` counter
 
 ### Advanced Usage (Driver API)
 
@@ -251,37 +325,55 @@ The SDK uses a layered architecture from low-level to high-level:
 - **CAN Layer** (`can`): CAN hardware abstraction, supports SocketCAN and GS-USB
 - **Protocol Layer** (`protocol`): Type-safe protocol encoding/decoding
 - **Driver Layer** (`driver`): IO thread management, state synchronization, frame parsing
+  - **Hooks System**: Runtime callback registration for frame recording
+  - **Recording Module**: Async non-blocking recording with bounded queues
 - **Client Layer** (`client`): Type-safe, user-friendly control interface
+- **Tools Layer** (`tools`): Recording formats, statistics, safety validation
 
 ### Core Components
 
 ```
-piper-rs/
-├── src/
-│   ├── lib.rs              # Library entry, Facade Pattern exports
-│   ├── prelude.rs          # Convenient imports for common types
-│   ├── can/                # CAN communication adapter layer
-│   │   ├── mod.rs          # CAN adapter Trait and common types
-│   │   └── gs_usb/         # [Win/Mac] GS-USB protocol implementation
-│   ├── protocol/           # Protocol definitions (business-agnostic, pure data)
-│   │   ├── ids.rs          # CAN ID constants/enums
-│   │   ├── feedback.rs     # Robot arm feedback frames (bilge)
-│   │   ├── control.rs      # Control command frames (bilge)
-│   │   └── config.rs       # Configuration frames (bilge)
-│   ├── driver/             # Driver layer (IO management, state sync)
-│   │   ├── mod.rs          # Driver module entry
-│   │   ├── piper.rs        # Driver-level Piper object (API)
-│   │   ├── pipeline.rs     # IO Loop, ArcSwap update logic
-│   │   ├── state.rs        # State structure definitions (hot/cold data splitting)
-│   │   ├── builder.rs      # PiperBuilder (fluent construction)
-│   │   └── error.rs        # DriverError (error types)
-│   └── client/             # Client layer (type-safe, user-friendly API)
-│       ├── mod.rs          # Client module entry
-│       ├── observer.rs      # Observer (read-only state access)
-│       ├── state/           # Type State Pattern state machine
-│       │   └── machine.rs   # Piper state machine (command methods)
-│       ├── control/         # Controllers and trajectory planning
-│       └── types/           # Type system (units, joints, errors)
+piper-sdk-rs/
+├── crates/
+│   ├── piper-protocol/
+│   │   └── src/
+│   │       ├── lib.rs          # Protocol module entry
+│   │       ├── ids.rs          # CAN ID constants/enums
+│   │       ├── feedback.rs     # Robot arm feedback frames (bilge)
+│   │       ├── control.rs      # Control command frames (bilge)
+│   │       └── config.rs       # Configuration frames (bilge)
+│   ├── piper-can/
+│   │   └── src/
+│   │       ├── lib.rs          # CAN module entry
+│   │       ├── socketcan/      # [Linux] SocketCAN implementation
+│   │       └── gs_usb/         # [Win/Mac/Linux] GS-USB protocol
+│   ├── piper-driver/
+│   │   └── src/
+│   │       ├── mod.rs          # Driver module entry
+│   │       ├── piper.rs        # Driver-level Piper object (API)
+│   │       ├── pipeline.rs     # IO Loop, ArcSwap update logic
+│   │       ├── state.rs        # State structure definitions
+│   │       ├── hooks.rs        # Hook system for frame callbacks
+│   │       ├── recording.rs    # Async recording with bounded queues
+│   │       ├── builder.rs      # PiperBuilder (fluent construction)
+│   │       └── metrics.rs      # Performance metrics
+│   ├── piper-client/
+│   │   └── src/
+│   │       ├── mod.rs          # Client module entry
+│   │       ├── observer.rs      # Observer (read-only state access)
+│   │       ├── state/           # Type State Pattern state machine
+│   │       ├── motion.rs       # Piper command interface
+│   │       └── types/           # Type system (units, joints, errors)
+│   └── piper-tools/
+│       └── src/
+│           ├── recording.rs    # Recording formats and tools
+│           ├── statistics.rs    # CAN statistics analysis
+│           └── safety.rs        # Safety validation
+└── apps/
+    └── cli/
+        └── src/
+            ├── commands/       # CLI commands
+            └── modes/          # CLI modes (repl, oneshot)
 ```
 
 ### Concurrency Model
@@ -291,6 +383,7 @@ Adopts **asynchronous IO concepts but implemented with synchronous threads** (en
 1. **IO Thread**: Responsible for CAN frame transmission/reception and state updates
 2. **Control Thread**: Lock-free reading of latest state via `ArcSwap`, sending commands via `crossbeam-channel`
 3. **Frame Commit Mechanism**: Ensures the state read by control threads is a consistent snapshot at a specific time point
+4. **Hook System**: Non-blocking callbacks triggered on RX/TX frames for recording
 
 ## 📚 Examples
 
@@ -307,6 +400,7 @@ Available examples:
 Planned examples:
 - `torque_control.rs` - Force control demonstration
 - `configure_can.rs` - CAN baud rate configuration tool
+- `can_recording.rs` - CAN frame recording example
 
 ## 🤝 Contributing
 
@@ -325,6 +419,8 @@ For detailed design documentation, see:
 - [Real-time Optimization Guide](docs/v0/realtime_optimization.md)
 - [Migration Guide](docs/v0/MIGRATION_GUIDE.md) - Guide for migrating from v0.1.x to v0.2.0+
 - [Position Control & MOVE Mode User Guide](docs/v0/position_control_user_guide.md) - Complete guide for position control and motion types
+- **[Hooks System Code Review](docs/architecture/code-review-v1.2.1-hooks-system.md)** - Deep dive into the recording system design
+- **[Full Repository Code Review](docs/architecture/code-review-full-repo-v1.2.1.md)** - Comprehensive codebase analysis
 
 ## 🔗 Related Links
 
