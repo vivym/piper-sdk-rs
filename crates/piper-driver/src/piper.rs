@@ -85,6 +85,12 @@ pub struct Piper {
     is_running: Arc<AtomicBool>,
     /// 性能指标（原子计数器）
     metrics: Arc<PiperMetrics>,
+    /// CAN 接口名称（用于录制元数据）
+    interface: String,
+    /// CAN 总线速度（bps）（用于录制元数据）
+    bus_speed: u32,
+    /// Driver 工作模式（用于回放模式控制）
+    driver_mode: crate::mode::AtomicDriverMode,
 }
 
 impl Piper {
@@ -110,6 +116,13 @@ impl Piper {
     /// # }
     /// ```
     pub const MAX_REALTIME_PACKAGE_SIZE: usize = 10;
+
+    /// 设置元数据（内部方法，由 Builder 调用）
+    pub(crate) fn with_metadata(mut self, interface: String, bus_speed: u32) -> Self {
+        self.interface = interface;
+        self.bus_speed = bus_speed;
+        self
+    }
 
     /// 创建新的 Piper 实例
     ///
@@ -147,6 +160,9 @@ impl Piper {
             tx_thread: None,                             // 单线程模式
             is_running: Arc::new(AtomicBool::new(true)), // 默认运行中
             metrics: Arc::new(PiperMetrics::new()),      // 初始化指标
+            interface: "unknown".to_string(),            // 未通过 builder 构建
+            bus_speed: 1_000_000,                        // 默认 1Mbps
+            driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
         })
     }
 
@@ -239,6 +255,9 @@ impl Piper {
             tx_thread: Some(tx_thread),
             is_running,
             metrics,
+            interface: "unknown".to_string(), // 未通过 builder 构建
+            bus_speed: 1_000_000,             // 默认 1Mbps
+            driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
         })
     }
 
@@ -728,6 +747,142 @@ impl Piper {
             crossbeam_channel::TrySendError::Full(_) => DriverError::ChannelFull,
             crossbeam_channel::TrySendError::Disconnected(_) => DriverError::ChannelClosed,
         })
+    }
+
+    /// 获取钩子管理器的引用（用于高级诊断）
+    ///
+    /// # 设计理念
+    ///
+    /// 这是一个**逃生舱（Escape Hatch）**，用于高级诊断场景：
+    /// - 注册自定义 CAN 帧回调
+    /// - 实现录制功能
+    /// - 性能分析和调试
+    ///
+    /// # 使用场景
+    ///
+    /// - 自定义诊断工具
+    /// - 高级抓包和调试
+    /// - 性能分析和优化
+    /// - 后台监控线程
+    ///
+    /// # 示例
+    ///
+    /// ```rust,no_run
+    /// # use piper_driver::Piper;
+    /// # use piper_driver::hooks::FrameCallback;
+    /// # use piper_driver::recording::AsyncRecordingHook;
+    /// # use std::sync::Arc;
+    /// # fn example(robot: &Piper) {
+    /// // 获取 hooks 访问
+    /// let hooks = robot.hooks();
+    ///
+    /// // 创建录制钩子
+    /// let (hook, _rx) = AsyncRecordingHook::new();
+    /// let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+    ///
+    /// // 注册回调（忽略错误以简化示例）
+    /// if let Ok(mut hooks_guard) = hooks.write() {
+    ///     hooks_guard.add_callback(callback);
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// # 安全注意事项
+    ///
+    /// - **性能要求**：回调必须在 <1μs 内完成
+    /// - **线程安全**：返回 `Arc<RwLock<HookManager>>`，需手动加锁
+    /// - **不要阻塞**：禁止在回调中使用 Mutex、I/O、分配等阻塞操作
+    ///
+    /// # 返回值
+    ///
+    /// `Arc<RwLock<HookManager>>`: 钩子管理器的共享引用
+    ///
+    /// # 参考
+    ///
+    /// - [`HookManager`](crate::hooks::HookManager) - 钩子管理器
+    /// - [`FrameCallback`](crate::hooks::FrameCallback) - 回调 trait
+    /// - [架构分析报告](../../../docs/architecture/piper-driver-client-mixing-analysis.md) - 方案 B 设计
+    pub fn hooks(&self) -> Arc<std::sync::RwLock<crate::hooks::HookManager>> {
+        Arc::clone(&self.ctx.hooks)
+    }
+
+    /// 获取 CAN 接口名称
+    ///
+    /// # 返回值
+    ///
+    /// CAN 接口名称，例如 "can0", "vcan0" 等
+    pub fn interface(&self) -> String {
+        self.interface.clone()
+    }
+
+    /// 获取 CAN 总线速度
+    ///
+    /// # 返回值
+    ///
+    /// CAN 总线速度（bps），例如 1000000 (1Mbps)
+    pub fn bus_speed(&self) -> u32 {
+        self.bus_speed
+    }
+
+    /// 获取当前 Driver 模式
+    ///
+    /// # 返回值
+    ///
+    /// 当前 Driver 模式（Normal 或 Replay）
+    ///
+    /// # 示例
+    ///
+    /// ```rust,no_run
+    /// # use piper_driver::Piper;
+    /// # fn example(robot: &Piper) {
+    /// let mode = robot.mode();
+    /// println!("Current mode: {:?}", mode);
+    /// # }
+    /// ```
+    pub fn mode(&self) -> crate::mode::DriverMode {
+        self.driver_mode.get(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 设置 Driver 模式
+    ///
+    /// # 参数
+    ///
+    /// - `mode`: 新的 Driver 模式
+    ///
+    /// # 模式说明
+    ///
+    /// - **Normal**: 正常模式，TX 线程按周期发送控制指令
+    /// - **Replay**: 回放模式，TX 线程暂停周期性发送
+    ///
+    /// # 使用场景
+    ///
+    /// Replay 模式用于安全地回放预先录制的 CAN 帧：
+    /// - 暂停 TX 线程的周期性发送
+    /// - 避免双控制流冲突
+    /// - 允许精确控制帧发送时机
+    ///
+    /// # ⚠️ 安全警告
+    ///
+    /// - 切换到 Replay 模式前，应确保机器人处于 Standby 状态
+    /// - 在 Replay 模式下发送控制指令时，应遵守安全速度限制
+    ///
+    /// # 示例
+    ///
+    /// ```rust,no_run
+    /// # use piper_driver::{Piper, mode::DriverMode};
+    /// # fn example(robot: &Piper) {
+    /// // 切换到回放模式
+    /// robot.set_mode(DriverMode::Replay);
+    ///
+    /// // ... 执行回放 ...
+    ///
+    /// // 恢复正常模式
+    /// robot.set_mode(DriverMode::Normal);
+    /// # }
+    /// ```
+    pub fn set_mode(&self, mode: crate::mode::DriverMode) {
+        self.driver_mode.set(mode, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("Driver mode set to: {:?}", mode);
     }
 
     /// 发送控制帧（阻塞，带超时）

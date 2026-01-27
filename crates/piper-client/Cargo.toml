@@ -11,7 +11,9 @@ serde = ["dep:serde", "piper-protocol/serde"]
 piper-driver = { workspace = true }
 piper-can = { workspace = true }
 piper-protocol = { workspace = true }
+piper-tools = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 spin_sleep = { workspace = true }
+crossbeam-channel = { workspace = true }
 serde = { workspace = true, optional = true }

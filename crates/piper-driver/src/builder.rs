@@ -267,7 +267,11 @@ impl PiperBuilder {
             .map_err(DriverError::Can)?;
 
         // 使用双线程模式（默认）
-        Piper::new_dual_thread(can, self.pipeline_config.clone()).map_err(DriverError::Can)
+        let interface = interface.to_string();
+        let bus_speed = self.baud_rate.unwrap_or(1_000_000);
+        Piper::new_dual_thread(can, self.pipeline_config.clone())
+            .map(|p| p.with_metadata(interface, bus_speed))
+            .map_err(DriverError::Can)
     }
 
     /// 构建 GS-USB 直连适配器
@@ -317,7 +321,14 @@ impl PiperBuilder {
         can.set_receive_timeout(std::time::Duration::from_millis(config.receive_timeout_ms));
 
         // 使用双线程模式（默认）
-        Piper::new_dual_thread(can, self.pipeline_config.clone()).map_err(DriverError::Can)
+        let interface = self.interface.clone().unwrap_or_else(|| {
+            // Try to get the actual device serial
+            "unknown".to_string()
+        });
+        let bus_speed = bitrate;
+        Piper::new_dual_thread(can, self.pipeline_config.clone())
+            .map(|p| p.with_metadata(interface, bus_speed))
+            .map_err(DriverError::Can)
     }
 
     /// 构建 GS-USB 守护进程适配器
@@ -347,7 +358,11 @@ impl PiperBuilder {
 
         // 注意：GsUsbUdpAdapter 不支持 SplittableAdapter，因此使用单线程模式
         // TODO: 实现双线程模式
-        Piper::new(can, self.pipeline_config.clone()).map_err(DriverError::Can)
+        let interface = daemon_addr.clone();
+        let bus_speed = self.baud_rate.unwrap_or(1_000_000);
+        Piper::new(can, self.pipeline_config.clone())
+            .map(|p| p.with_metadata(interface, bus_speed))
+            .map_err(DriverError::Can)
     }
 }
 

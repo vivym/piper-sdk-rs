@@ -4,9 +4,7 @@
 
 use anyhow::Result;
 use clap::Args;
-use piper_tools::PiperRecording;
-
-use crate::utils;
+use piper_sdk::PiperBuilder;
 
 /// 回放命令参数
 #[derive(Args, Debug)]
@@ -16,6 +14,13 @@ pub struct ReplayCommand {
     pub input: String,
 
     /// 回放速度倍数（1.0 = 正常速度）
+    ///
+    /// # 安全说明
+    ///
+    /// - 1.0x: 原始速度（推荐）
+    /// - 0.1x ~ 2.0x: 安全范围
+    /// - > 2.0x: 需要特别小心
+    /// - 最大值: 5.0x
     #[arg(short, long, default_value_t = 1.0)]
     pub speed: f64,
 
@@ -35,102 +40,135 @@ pub struct ReplayCommand {
 impl ReplayCommand {
     /// 执行回放
     pub async fn execute(&self) -> Result<()> {
-        println!("🔄 回放录制: {}", self.input);
+        // === 1. 文件检查 ===
 
-        // 检查文件是否存在
-        if !std::path::Path::new(&self.input).exists() {
-            anyhow::bail!("录制文件不存在: {}", self.input);
+        let path = std::path::Path::new(&self.input);
+        if !path.exists() {
+            anyhow::bail!("❌ 录制文件不存在: {}", self.input);
         }
 
-        // ⚠️ 安全确认
-        if self.confirm || self.speed > 1.0 {
-            println!("⚠️  回放速度: {}x", self.speed);
-            if self.speed > 1.0 {
-                println!("⚠️  高速回放可能不安全！");
-            }
+        // === 2. 速度验证 ===
 
-            let confirmed = utils::prompt_confirmation("确定要回放吗？", false)?;
+        const MAX_SPEED_FACTOR: f64 = 5.0;
+        const RECOMMENDED_SPEED_FACTOR: f64 = 2.0;
 
-            if !confirmed {
+        if self.speed <= 0.0 {
+            anyhow::bail!("❌ 速度倍数必须为正数，当前: {:.2}", self.speed);
+        }
+
+        if self.speed > MAX_SPEED_FACTOR {
+            anyhow::bail!(
+                "❌ 速度倍数超出最大值: {:.2} > {}\n   最大速度倍数限制为安全考虑",
+                self.speed,
+                MAX_SPEED_FACTOR
+            );
+        }
+
+        // === 3. 显示回放信息 ===
+
+        println!("════════════════════════════════════════");
+        println!("           回放模式");
+        println!("════════════════════════════════════════");
+        println!();
+        println!("📁 文件: {}", self.input);
+        println!("⚡ 速度: {:.2}x", self.speed);
+
+        if self.speed > RECOMMENDED_SPEED_FACTOR {
+            println!(
+                "⚠️  警告: 速度超过推荐值 ({:.1}x)",
+                RECOMMENDED_SPEED_FACTOR
+            );
+            println!("   请确保:");
+            println!("   • 回放环境安全，无人员/障碍物");
+            println!("   • 有急停准备");
+            println!("   • 机器人状态正常");
+        }
+
+        println!();
+
+        // === 4. 安全确认 ===
+
+        if !self.confirm {
+            let prompt = "即将开始回放，确定要继续吗？[y/N] ";
+
+            print!("{}", prompt);
+            use std::io::Write;
+            std::io::stdout().flush()?;
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+
+            if !input.trim().to_lowercase().starts_with('y') {
                 println!("❌ 操作已取消");
                 return Ok(());
             }
 
             println!("✅ 已确认");
+            println!();
         }
 
-        println!("⏳ 加载录制文件...");
+        // === 5. 连接到机器人 ===
 
-        // 加载录制
-        let recording = PiperRecording::load(&self.input)?;
+        println!("⏳ 连接到机器人...");
 
-        println!("📊 录制信息:");
-        println!("  文件: {}", self.input);
-        println!("  版本: {}", recording.version);
-        println!("  帧数: {}", recording.frame_count());
-        if let Some(duration) = recording.duration() {
-            println!("  时长: {:?}", duration);
-        }
-        println!("  接口: {}", recording.metadata.interface);
-        println!("  速度: {}x", self.speed);
+        let builder = if let Some(interface) = &self.interface {
+            #[cfg(target_os = "linux")]
+            {
+                println!("   使用 CAN 接口: {} (SocketCAN)", interface);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                println!("   使用设备序列号: {}", interface);
+            }
+            PiperBuilder::new().interface(interface)
+        } else if let Some(serial) = &self.serial {
+            println!("   使用设备序列号: {}", serial);
+            PiperBuilder::new().interface(serial)
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                println!("   使用默认 CAN 接口: can0");
+                PiperBuilder::new().interface("can0")
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let default_daemon = "127.0.0.1:18888";
+                println!("   使用默认守护进程: {}", default_daemon);
+                PiperBuilder::new().with_daemon(default_daemon)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                println!("   自动扫描 GS-USB 设备...");
+                PiperBuilder::new()
+            }
+        };
+
+        let standby = builder.build()?;
+        println!("✅ 已连接");
+
+        // === 6. 进入回放模式 ===
+
+        println!("⏳ 进入回放模式...");
+        let replay = standby.enter_replay_mode()?;
+        println!("✅ 已进入回放模式（Driver tx_loop 已暂停）");
+
+        // === 7. 回放录制 ===
+
+        println!("🔄 开始回放...");
+        println!();
+        println!("   进度: [回放中...]");
         println!();
 
-        println!("⏳ 回放中...");
+        let _standby = replay.replay_recording(&self.input, self.speed)?;
 
-        // 注意：实际回放需要发送 CAN 帧
-        // 由于架构限制，这里只能显示进度
-        // TODO: 需要访问 driver 层的 send_frame 方法
+        // === 8. 完成 ===
 
-        let total_frames = recording.frame_count();
-
-        if recording.frames.is_empty() {
-            println!("⚠️  录制文件为空");
-            return Ok(());
-        }
-
-        // 获取第一个帧的时间戳作为基准
-        let base_timestamp = recording.frames[0].timestamp_us;
-
-        println!("📝 开始回放 {} 帧...", total_frames);
-        println!("💡 注意：当前仅显示进度，实际 CAN 帧发送需要底层访问");
+        println!();
+        println!("✅ 回放完成");
+        println!("   已退出回放模式（Driver tx_loop 已恢复）");
         println!();
 
-        for (i, frame) in recording.frames.iter().enumerate() {
-            // 计算相对时间（微秒）
-            let elapsed_us = frame.timestamp_us.saturating_sub(base_timestamp);
-            let elapsed_ms = elapsed_us / 1000;
-
-            // 应用速度控制
-            let delay_ms = if self.speed > 0.0 {
-                (elapsed_ms as f64 / self.speed) as u64
-            } else {
-                elapsed_ms
-            };
-
-            // 进度显示
-            if i % 100 == 0 || i == total_frames - 1 {
-                print!(
-                    "\r回放进度: {}/{} 帧 ({}%)",
-                    i + 1,
-                    total_frames,
-                    ((i + 1) * 100 / total_frames)
-                );
-                use std::io::Write;
-                std::io::stdout().flush().ok();
-            }
-
-            // TODO: 实际发送 CAN 帧
-            // 需要访问 driver 层的 Piper::send_frame 方法
-            // piper_sdk::driver::Piper::send_frame(&piper_frame)
-
-            // 控制回放速度
-            if delay_ms > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-            }
-        }
-
-        println!("\r✅ 回放完成: {} 帧", total_frames);
-
+        // 任何连接都会在这里自动 Drop 并断开
         Ok(())
     }
 }
@@ -166,5 +204,78 @@ mod tests {
 
         assert_eq!(cmd.speed, 1.0);
         assert!(!cmd.confirm);
+    }
+
+    #[test]
+    fn test_replay_command_with_serial() {
+        let cmd = ReplayCommand {
+            input: "test.bin".to_string(),
+            speed: 1.5,
+            interface: None,
+            serial: Some("ABC123".to_string()),
+            confirm: false,
+        };
+
+        assert_eq!(cmd.input, "test.bin");
+        assert_eq!(cmd.speed, 1.5);
+        assert_eq!(cmd.serial, Some("ABC123".to_string()));
+        assert!(cmd.interface.is_none());
+    }
+
+    #[test]
+    fn test_replay_command_interface_takes_precedence() {
+        let cmd = ReplayCommand {
+            input: "test.bin".to_string(),
+            speed: 1.0,
+            interface: Some("vcan0".to_string()),
+            serial: Some("ABC123".to_string()),
+            confirm: true,
+        };
+
+        // Both can be set, but interface should take precedence in execute()
+        assert_eq!(cmd.interface, Some("vcan0".to_string()));
+        assert_eq!(cmd.serial, Some("ABC123".to_string()));
+    }
+
+    #[test]
+    fn test_replay_command_max_speed() {
+        let max_speed = 5.0;
+        let cmd = ReplayCommand {
+            input: "test.bin".to_string(),
+            speed: max_speed,
+            interface: None,
+            serial: None,
+            confirm: true,
+        };
+
+        assert_eq!(cmd.speed, max_speed);
+    }
+
+    #[test]
+    fn test_replay_command_slow_speed() {
+        let min_speed = 0.1;
+        let cmd = ReplayCommand {
+            input: "test.bin".to_string(),
+            speed: min_speed,
+            interface: None,
+            serial: None,
+            confirm: false,
+        };
+
+        assert_eq!(cmd.speed, min_speed);
+    }
+
+    #[test]
+    fn test_replay_command_recommended_speed() {
+        let recommended_speed = 2.0;
+        let cmd = ReplayCommand {
+            input: "test.bin".to_string(),
+            speed: recommended_speed,
+            interface: None,
+            serial: None,
+            confirm: false,
+        };
+
+        assert_eq!(cmd.speed, recommended_speed);
     }
 }

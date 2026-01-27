@@ -8,6 +8,13 @@
 
 [中文版 README](README.zh-CN.md)
 
+> **⚠️ IMPORTANT NOTICE**
+> **This project is under active development. APIs may change. Please test carefully before using in production.**
+>
+> **Version Status**: The current version is **pre-0.1.0** (alpha quality). The SDK has **NOT been fully tested on real robotic arms** and may not work correctly or safely.
+>
+> **⚠️ SAFETY WARNING**: Do NOT use this SDK in production or with real robotic arms without comprehensive testing. The software may send incorrect commands that could damage the robot or cause safety hazards.
+
 ## ✨ Core Features
 
 - 🚀 **Zero Abstraction Overhead**: Compile-time polymorphism, no virtual function table (vtable) overhead at runtime
@@ -270,6 +277,229 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - ✅ **TX safe**: Only records successfully sent frames
 - ✅ **Loss tracking**: Built-in `dropped_frames` counter
 
+## 🎬 Recording and Replay
+
+Piper SDK provides three complementary APIs for CAN frame recording and replay:
+
+| API | Use Case | Complexity | Safety |
+|-----|----------|------------|--------|
+| **Standard Recording** | Simple record-and-save workflows | ⭐ Low | ✅ Type-safe |
+| **Custom Diagnostics** | Real-time frame analysis & custom processing | ⭐⭐ Medium | ✅ Thread-safe |
+| **ReplayMode** | Safe replay of recorded sessions | ⭐⭐ Medium | ✅ Type-safe + Driver-level protection |
+
+### 1. Standard Recording API
+
+The simplest way to record CAN frames to a file:
+
+```rust
+use piper_client::{PiperBuilder, recording::{RecordingConfig, RecordingMetadata, StopCondition}};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Connect to robot
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .build()?;
+
+    // Start recording with metadata
+    let (robot, handle) = robot.start_recording(RecordingConfig {
+        output_path: "demo_recording.bin".into(),
+        stop_condition: StopCondition::Duration(10), // Record for 10 seconds
+        metadata: RecordingMetadata {
+            notes: "Standard recording example".to_string(),
+            operator: "DemoUser".to_string(),
+        },
+    })?;
+
+    // Perform operations (all CAN frames are recorded)
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Stop recording and get statistics
+    let (robot, stats) = robot.stop_recording(handle)?;
+
+    println!("Recorded {} frames in {:.2}s", stats.frame_count, stats.duration.as_secs_f64());
+    println!("Dropped frames: {}", stats.dropped_frames);
+
+    Ok(())
+}
+```
+
+**Features**:
+- ✅ **Automatic stop conditions**: Duration, frame count, or manual
+- ✅ **Rich metadata**: Record operator, notes, timestamps
+- ✅ **Statistics**: Frame count, duration, dropped frames
+- ✅ **Type-safe**: Recording handle prevents misuse
+
+See [examples/standard_recording.rs](examples/standard_recording.rs) for full example.
+
+### 2. Custom Diagnostics API
+
+Advanced users can register custom frame callbacks for real-time analysis:
+
+```rust
+use piper_client::PiperBuilder;
+use piper_driver::recording::AsyncRecordingHook;
+use std::sync::Arc;
+use std::thread;
+
+fn main() -> anyhow::Result<()> {
+    // Connect and enable robot
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .build()?;
+    let active = robot.enable_position_mode(Default::default())?;
+
+    // Get diagnostics interface
+    let diag = active.diagnostics();
+
+    // Create custom recording hook
+    let (hook, rx) = AsyncRecordingHook::new();
+    let dropped_counter = hook.dropped_frames().clone();
+
+    // Register hook
+    let callback = Arc::new(hook) as Arc<dyn piper_driver::FrameCallback>;
+    diag.register_callback(callback)?;
+
+    // Process frames in background thread
+    thread::spawn(move || {
+        let mut frame_count = 0;
+        while let Ok(frame) = rx.recv() {
+            frame_count += 1;
+
+            // Custom analysis: e.g., CAN ID distribution, timing analysis
+            if frame_count % 1000 == 0 {
+                println!("Received frame: ID=0x{:03X}", frame.id);
+            }
+        }
+
+        println!("Total frames: {}", frame_count);
+        println!("Dropped: {}", dropped_counter.load(std::sync::atomic::Ordering::Relaxed));
+    });
+
+    // Run operations...
+    thread::sleep(std::time::Duration::from_secs(5));
+
+    // Shutdown
+    let _standby = active.shutdown()?;
+
+    Ok(())
+}
+```
+
+**Features**:
+- ✅ **Real-time processing**: Analyze frames as they arrive
+- ✅ **Custom logic**: Implement any analysis algorithm
+- ✅ **Background threading**: Non-blocking main thread
+- ✅ **Loss tracking**: Monitor dropped frames
+
+See [examples/custom_diagnostics.rs](examples/custom_diagnostics.rs) for full example.
+
+### 3. ReplayMode API
+
+Safely replay previously recorded sessions with driver-level protection:
+
+```rust
+use piper_client::PiperBuilder;
+
+fn main() -> anyhow::Result<()> {
+    // Connect to robot
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .build()?;
+
+    // Enter ReplayMode (Driver TX thread pauses automatically)
+    let replay = robot.enter_replay_mode()?;
+
+    // Replay recording at 2.0x speed
+    let robot = replay.replay_recording("demo_recording.bin", 2.0)?;
+
+    // Automatically exits ReplayMode (TX thread resumes)
+    println!("Replay completed!");
+
+    Ok(())
+}
+```
+
+**Safety Features**:
+- ✅ **Driver-level protection**: TX thread pauses during replay (no dual control flow)
+- ✅ **Speed limits**: Maximum 5.0x, recommended ≤ 2.0x with warnings
+- ✅ **Type-safe transitions**: Cannot call enable/disable in ReplayMode
+- ✅ **Automatic cleanup**: Always returns to Standby state
+
+**Speed Guidelines**:
+- **1.0x**: Original speed (recommended for most use cases)
+- **0.1x ~ 2.0x**: Safe range for testing/debugging
+- **> 2.0x**: Use with caution - ensure safe environment
+- **Maximum**: 5.0x (hard limit for safety)
+
+See [examples/replay_mode.rs](examples/replay_mode.rs) for full example with speed validation.
+
+### CLI Usage
+
+The `piper-cli` tool provides convenient commands for recording and replay:
+
+```bash
+# Record CAN frames
+piper-cli record -o demo.bin --duration 10
+
+# Replay recording (normal speed)
+piper-cli replay -i demo.bin
+
+# Replay at 2.0x speed
+piper-cli replay -i demo.bin --speed 2.0
+
+# Replay without confirmation prompt
+piper-cli replay -i demo.bin --confirm
+```
+
+### Complete Workflow Example
+
+```bash
+# Step 1: Record a session
+cargo run --example standard_recording
+
+# Step 2: Analyze the recording
+cargo run --example custom_diagnostics
+
+# Step 3: Replay the recording safely
+cargo run --example replay_mode
+```
+
+### Architecture Highlights
+
+#### Why Three APIs?
+
+Each API serves a distinct purpose:
+
+1. **Standard Recording**: For users who want "just record this" without complexity
+2. **Custom Diagnostics**: For researchers developing custom analysis tools
+3. **ReplayMode**: For test engineers reproducing bugs or testing sequences
+
+#### Type Safety Through Type States
+
+The ReplayMode API uses Rust's type system for compile-time safety:
+
+```rust
+// ✅ Compile-time error: cannot enable in ReplayMode
+let replay = robot.enter_replay_mode()?;
+let active = replay.enable_position_mode(...);  // ERROR!
+
+// ✅ Must exit ReplayMode first
+let robot = replay.replay_recording(...)?;
+let active = robot.enable_position_mode(...);  // OK!
+```
+
+#### Driver-Level Protection
+
+ReplayMode switches the driver to `DriverMode::Replay`, which:
+
+- **Pauses periodic TX**: Driver stops sending automatic control commands
+- **Allows explicit frames**: Only replay frames are sent to CAN bus
+- **Prevents conflicts**: No dual control flow (Driver vs Replay)
+
+This design is documented in [architecture analysis](docs/architecture/piper-driver-client-mixing-analysis.md).
+
 ### Advanced Usage (Driver API)
 
 For direct CAN frame control or maximum performance, use the driver API:
@@ -396,11 +626,13 @@ Available examples:
 - `realtime_control_demo.rs` - Real-time control with dual-threaded architecture
 - `robot_monitor.rs` - Robot state monitoring
 - `timestamp_verification.rs` - Timestamp synchronization verification
+- `standard_recording.rs` - 📼 Standard recording API usage (record CAN frames to file)
+- `custom_diagnostics.rs` - 🔧 Custom diagnostics interface (real-time frame analysis)
+- `replay_mode.rs` - 🔄 ReplayMode API (safe CAN frame replay)
 
 Planned examples:
 - `torque_control.rs` - Force control demonstration
 - `configure_can.rs` - CAN baud rate configuration tool
-- `can_recording.rs` - CAN frame recording example
 
 ## 🤝 Contributing
 
@@ -427,7 +659,3 @@ For detailed design documentation, see:
 - [AgileX Robotics](https://www.agilex.ai/)
 - [bilge](https://docs.rs/bilge/)
 - [rusb](https://docs.rs/rusb/)
-
----
-
-**Note**: This project is under active development. APIs may change. Please test carefully before using in production.

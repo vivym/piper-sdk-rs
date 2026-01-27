@@ -68,5 +68,6 @@ pub use machine::{
     Piper,
     PositionMode,
     PositionModeConfig,
+    ReplayMode,
     Standby,
 };

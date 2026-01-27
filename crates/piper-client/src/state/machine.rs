@@ -55,6 +55,56 @@ impl PositionMode {
 /// 在此状态下，不允许发送任何运动控制命令。
 pub struct ErrorState;
 
+/// 回放模式状态
+///
+/// 用于安全地回放预先录制的 CAN 帧。
+///
+/// # 设计目的
+///
+/// - 暂停 TX 线程的周期性发送
+/// - 避免双控制流冲突
+/// - 允许精确控制帧发送时机
+///
+/// # 转换规则
+///
+/// - **进入**: 从 `Standby` 通过 `enter_replay_mode()` 进入
+/// - **退出**: 通过 `stop_replay()` 返回到 `Standby`
+///
+/// # 安全特性
+///
+/// - 在 ReplayMode 下，无法调用 `enable_*()` 方法
+/// - 所有周期性发送的控制指令都会被暂停
+/// - 只能通过 `replay_recording()` 发送预先录制的帧
+///
+/// # 使用场景
+///
+/// - 回放预先录制的运动轨迹
+/// - 测试和验证录制的 CAN 帧序列
+/// - 调试和分析工具
+///
+/// # 示例
+///
+/// ```rust,ignore
+/// # use piper_client::{PiperBuilder};
+/// # fn main() -> anyhow::Result<()> {
+/// let robot = PiperBuilder::new()
+///     .interface("can0")
+///     .build()?;
+///
+/// let standby = robot.connect()?;
+///
+/// // 进入回放模式
+/// let replay = standby.enter_replay_mode()?;
+///
+/// // 回放录制（1.0x 速度，原始速度）
+/// let standby = replay.replay_recording("recording.bin", 1.0)?;
+///
+/// // 回放完成后自动返回 Standby 状态
+/// # Ok(())
+/// # }
+/// ```
+pub struct ReplayMode;
+
 // ==================== 运动类型 ====================
 
 /// 运动类型
@@ -696,6 +746,141 @@ impl Piper<Standby> {
             std::thread::sleep(sleep_duration);
         }
     }
+
+    /// 启动录制（Standby 状态）
+    ///
+    /// # 参数
+    ///
+    /// - `config`: 录制配置
+    ///
+    /// # 返回
+    ///
+    /// 返回 `(Piper<Standby>, RecordingHandle)`
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::{PiperBuilder, recording::{RecordingConfig, StopCondition}};
+    /// # fn example() -> Result<()> {
+    /// let robot = PiperBuilder::new()
+    ///     .interface("can0")
+    ///     .build()?;
+    ///
+    /// let standby = robot.connect()?;
+    ///
+    /// // 启动录制
+    /// let (standby, handle) = standby.start_recording(RecordingConfig {
+    ///     output_path: "demo.bin".into(),
+    ///     stop_condition: StopCondition::Duration(10),
+    ///     metadata: RecordingMetadata {
+    ///         notes: "Test recording".to_string(),
+    ///         operator: "Alice".to_string(),
+    ///     },
+    /// })?;
+    ///
+    /// // 执行操作（会被录制）
+    /// // ...
+    ///
+    /// // 停止录制并保存
+    /// let _standby = standby.stop_recording(handle)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start_recording(
+        self,
+        config: crate::recording::RecordingConfig,
+    ) -> Result<(Self, crate::recording::RecordingHandle)> {
+        use crate::recording::RecordingHandle;
+
+        // 创建录制钩子
+        let (hook, rx) = piper_driver::recording::AsyncRecordingHook::new();
+        let dropped = hook.dropped_frames().clone();
+
+        // 注册钩子
+        let callback = std::sync::Arc::new(hook) as std::sync::Arc<dyn piper_driver::FrameCallback>;
+        self.driver
+            .hooks()
+            .write()
+            .map_err(|_e| {
+                crate::RobotError::Infrastructure(piper_driver::DriverError::PoisonedLock)
+            })?
+            .add_callback(callback);
+
+        let handle = RecordingHandle::new(
+            rx,
+            dropped,
+            config.output_path.clone(),
+            std::time::Instant::now(),
+        );
+
+        tracing::info!("Recording started: {:?}", config.output_path);
+
+        Ok((self, handle))
+    }
+
+    /// 进入回放模式
+    ///
+    /// # 功能
+    ///
+    /// 将 Driver 切换到 Replay 模式，暂停 TX 线程的周期性发送，
+    /// 准备回放预先录制的 CAN 帧。
+    ///
+    /// # 安全保证
+    ///
+    /// - Driver 进入 Replay 模式后，TX 线程暂停周期性发送
+    /// - 避免双控制流冲突
+    /// - 只能通过 `replay_recording()` 发送预先录制的帧
+    ///
+    /// # ⚠️ 安全警告
+    ///
+    /// - 进入 Replay 模式前，应确保机器人处于 Standby 状态
+    /// - 回放时应遵守安全速度限制（建议 ≤ 2.0x）
+    /// - 回放过程中应有人工急停准备
+    ///
+    /// # 返回
+    ///
+    /// 返回 `Piper<ReplayMode>` 实例
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> anyhow::Result<()> {
+    /// let robot = PiperBuilder::new()
+    ///     .interface("can0")
+    ///     .build()?;
+    ///
+    /// let standby = robot.connect()?;
+    ///
+    /// // 进入回放模式
+    /// let replay = standby.enter_replay_mode()?;
+    ///
+    /// // 回放录制（1.0x 速度，原始速度）
+    /// let standby = replay.replay_recording("recording.bin", 1.0)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn enter_replay_mode(self) -> Result<Piper<ReplayMode>> {
+        use piper_driver::mode::DriverMode;
+
+        // 切换 Driver 到 Replay 模式
+        self.driver.set_mode(DriverMode::Replay);
+
+        tracing::info!("Entered ReplayMode - TX thread periodic sending paused");
+
+        // 状态转换：Standby -> ReplayMode
+        let this = std::mem::ManuallyDrop::new(self);
+
+        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
+        let driver = unsafe { std::ptr::read(&this.driver) };
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
+        Ok(Piper {
+            driver,
+            observer,
+            _state: ReplayMode,
+        })
+    }
 }
 
 // ==================== 所有状态共享的辅助方法 ====================
@@ -903,6 +1088,218 @@ impl<M> Piper<Active<M>> {
             observer,
             _state: Standby,
         })
+    }
+
+    /// 获取诊断接口（逃生舱）
+    ///
+    /// # 返回值
+    ///
+    /// 返回的 `PiperDiagnostics` 持有 `Arc<piper_driver::Piper>`：
+    /// - ✅ 独立于当前 `Piper` 实例的生命周期
+    /// - ✅ 可以安全地移动到其他线程
+    /// - ✅ 可以在后台线程中长期持有
+    ///
+    /// # 使用场景
+    ///
+    /// - 自定义诊断工具
+    /// - 高级抓包和调试
+    /// - 性能分析和优化
+    /// - 后台监控线程
+    ///
+    /// # 示例
+    ///
+    /// ```rust,no_run
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let robot = PiperBuilder::new()
+    ///     .interface("can0")
+    ///     .build()?;
+    ///
+    /// let active = robot.enable_position_mode(Default::default())?;
+    ///
+    /// // 获取诊断接口
+    /// let diag = active.diagnostics();
+    ///
+    /// // diag 可以安全地移动到其他线程
+    /// std::thread::spawn(move || {
+    ///     // 在这里使用 diag...
+    /// });
+    ///
+    /// // active 仍然可以正常使用
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # 安全注意事项
+    ///
+    /// 诊断接口提供了底层访问能力，使用时需注意：
+    /// 1. **不要在 Active 状态下发送控制指令帧**（会导致双控制流冲突）
+    /// 2. **确保回调执行时间 <1μs**（否则会影响实时性能）
+    /// 3. **注意生命周期**：即使持有 `Arc`，也要确保关联的 `Piper` 实例未被销毁
+    ///
+    /// # 参考
+    ///
+    /// - [`PiperDiagnostics`](crate::PiperDiagnostics) - 诊断接口文档
+    /// - [架构分析报告](../../../docs/architecture/piper-driver-client-mixing-analysis.md) - 方案 B 设计
+    pub fn diagnostics(&self) -> crate::PiperDiagnostics {
+        crate::PiperDiagnostics::new(self)
+    }
+
+    /// 启动录制（Active 状态）
+    ///
+    /// # 参数
+    ///
+    /// - `config`: 录制配置
+    ///
+    /// # 返回
+    ///
+    /// 返回 `(Piper<Active<M>>, RecordingHandle)`
+    ///
+    /// # 注意
+    ///
+    /// Active 状态下的录制会包含控制指令帧（0x1A1-0x1FF）。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::{PiperBuilder, recording::{RecordingConfig, StopCondition}};
+    /// # fn example() -> Result<()> {
+    /// let robot = PiperBuilder::new()
+    ///     .interface("can0")
+    ///     .build()?;
+    ///
+    /// let standby = robot.connect()?;
+    /// let active = standby.enable_mit_mode(Default::default())?;
+    ///
+    /// // 启动录制（Active 状态）
+    /// let (active, handle) = active.start_recording(RecordingConfig {
+    ///     output_path: "demo.bin".into(),
+    ///     stop_condition: StopCondition::Duration(10),
+    ///     metadata: RecordingMetadata {
+    ///         notes: "Test recording".to_string(),
+    ///         operator: "Alice".to_string(),
+    ///     },
+    /// })?;
+    ///
+    /// // 执行操作（会被录制，包含控制指令帧）
+    /// active.command_torques(...)?;
+    ///
+    /// // 停止录制并保存
+    /// let (active, _stats) = active.stop_recording(handle)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start_recording(
+        self,
+        config: crate::recording::RecordingConfig,
+    ) -> Result<(Self, crate::recording::RecordingHandle)> {
+        use crate::recording::RecordingHandle;
+
+        // 创建录制钩子
+        let (hook, rx) = piper_driver::recording::AsyncRecordingHook::new();
+        let dropped = hook.dropped_frames().clone();
+
+        // 注册钩子
+        let callback = std::sync::Arc::new(hook) as std::sync::Arc<dyn piper_driver::FrameCallback>;
+        self.driver
+            .hooks()
+            .write()
+            .map_err(|_e| {
+                crate::RobotError::Infrastructure(piper_driver::DriverError::PoisonedLock)
+            })?
+            .add_callback(callback);
+
+        let handle = RecordingHandle::new(
+            rx,
+            dropped,
+            config.output_path.clone(),
+            std::time::Instant::now(),
+        );
+
+        tracing::info!("Recording started (Active): {:?}", config.output_path);
+
+        Ok((self, handle))
+    }
+
+    /// 停止录制并保存文件
+    ///
+    /// # 参数
+    ///
+    /// - `handle`: 录制句柄
+    ///
+    /// # 返回
+    ///
+    /// 返回 `(Piper<Active<M>>, 录制统计)`
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> anyhow::Result<()> {
+    /// let robot = PiperBuilder::new()
+    ///     .interface("can0")
+    ///     .build()?;
+    ///
+    /// let standby = robot.connect()?;
+    /// let active = standby.enable_mit_mode(Default::default())?;
+    ///
+    /// let (active, handle) = active.start_recording(config)?;
+    ///
+    /// // ... 执行操作 ...
+    ///
+    /// // 停止录制并保存
+    /// let (active, stats) = active.stop_recording(handle)?;
+    ///
+    /// println!("录制完成: {} 帧", stats.frame_count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn stop_recording(
+        self,
+        handle: crate::recording::RecordingHandle,
+    ) -> Result<(Self, crate::recording::RecordingStats)> {
+        use piper_tools::{PiperRecording, TimestampSource, TimestampedFrame};
+
+        // 创建录制对象
+        let mut recording = PiperRecording::new(piper_tools::RecordingMetadata::new(
+            self.driver.interface(),
+            self.driver.bus_speed(),
+        ));
+
+        // 收集所有帧（转换为 piper_tools 格式）
+        let mut frame_count = 0;
+        while let Ok(driver_frame) = handle.receiver().try_recv() {
+            // 转换 piper_driver::TimestampedFrame -> piper_tools::TimestampedFrame
+            let tools_frame = TimestampedFrame::new(
+                driver_frame.timestamp_us,
+                driver_frame.id,
+                driver_frame.data,
+                TimestampSource::Hardware, // 使用硬件时间戳
+            );
+            recording.add_frame(tools_frame);
+            frame_count += 1;
+        }
+
+        // 保存文件
+        recording.save(handle.output_path()).map_err(|e| {
+            crate::RobotError::Infrastructure(piper_driver::DriverError::IoThread(e.to_string()))
+        })?;
+
+        let stats = crate::recording::RecordingStats {
+            frame_count,
+            duration: handle.elapsed(),
+            dropped_frames: handle.dropped_count(),
+            output_path: handle.output_path().clone(),
+        };
+
+        tracing::info!(
+            "Recording saved: {} frames, {:.2}s, {} dropped",
+            stats.frame_count,
+            stats.duration.as_secs_f64(),
+            stats.dropped_frames
+        );
+
+        Ok((self, stats))
     }
 }
 
@@ -1336,6 +1733,240 @@ impl Piper<Active<PositionMode>> {
         // the inner `self` is NOT dropped, preventing double-disable
 
         // Construct new state (no Arc ref count increase!)
+        Ok(Piper {
+            driver,
+            observer,
+            _state: Standby,
+        })
+    }
+}
+
+// ==================== ReplayMode 状态 ====================
+
+impl Piper<ReplayMode> {
+    /// 回放预先录制的 CAN 帧
+    ///
+    /// # 参数
+    ///
+    /// - `recording_path`: 录制文件路径
+    /// - `speed_factor`: 速度倍数（1.0 = 原始速度，建议范围 0.1 ~ 2.0）
+    ///
+    /// # 功能
+    ///
+    /// 从录制文件中读取 CAN 帧序列，并按照原始时间间隔发送。
+    /// 支持变速回放，但建议速度 ≤ 2.0x 以确保安全。
+    ///
+    /// # 安全保证
+    ///
+    /// - Driver 处于 Replay 模式，TX 线程暂停周期性发送
+    /// - 按照录制的时间戳顺序发送帧
+    /// - 速度限制：建议 ≤ 2.0x，最大值 5.0x
+    ///
+    /// # ⚠️ 安全警告
+    ///
+    /// - **速度限制**: 建议使用 1.0x（原始速度），最高不超过 2.0x
+    /// - **人工监控**: 回放过程中应有人工急停准备
+    /// - **环境确认**: 确保回放环境安全，无人员/障碍物
+    /// - **文件验证**: 只回放可信来源的录制文件
+    ///
+    /// # 返回
+    ///
+    /// 返回 `Piper<Standby>`，自动退出 Replay 模式
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> anyhow::Result<()> {
+    /// let robot = PiperBuilder::new()
+    ///     .interface("can0")
+    ///     .build()?;
+    ///
+    /// let standby = robot.connect()?;
+    /// let replay = standby.enter_replay_mode()?;
+    ///
+    /// // 回放录制（1.0x 速度，原始速度）
+    /// let standby = replay.replay_recording("recording.bin", 1.0)?;
+    ///
+    /// // 回放完成后自动返回 Standby 状态
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn replay_recording(
+        self,
+        recording_path: impl AsRef<std::path::Path>,
+        speed_factor: f64,
+    ) -> Result<Piper<Standby>> {
+        use piper_driver::mode::DriverMode;
+        use piper_tools::PiperRecording;
+        use std::thread;
+        use std::time::Duration;
+
+        // === 安全检查 ===
+
+        // 速度限制验证
+        const MAX_SPEED_FACTOR: f64 = 5.0;
+        const RECOMMENDED_SPEED_FACTOR: f64 = 2.0;
+
+        if speed_factor <= 0.0 {
+            return Err(crate::RobotError::InvalidParameter {
+                param: "speed_factor".to_string(),
+                reason: "must be positive".to_string(),
+            });
+        }
+
+        if speed_factor > MAX_SPEED_FACTOR {
+            return Err(crate::RobotError::InvalidParameter {
+                param: "speed_factor".to_string(),
+                reason: format!("exceeds maximum {}", MAX_SPEED_FACTOR),
+            });
+        }
+
+        if speed_factor > RECOMMENDED_SPEED_FACTOR {
+            tracing::warn!(
+                "Speed factor {} exceeds recommended limit {}. \
+                 Ensure safe environment and emergency stop ready.",
+                speed_factor,
+                RECOMMENDED_SPEED_FACTOR
+            );
+        }
+
+        tracing::info!(
+            "Starting replay: file={:?}, speed={:.2}x",
+            recording_path.as_ref(),
+            speed_factor
+        );
+
+        // === 加载录制文件 ===
+
+        let recording = PiperRecording::load(recording_path.as_ref()).map_err(|e| {
+            crate::RobotError::Infrastructure(piper_driver::DriverError::IoThread(e.to_string()))
+        })?;
+
+        if recording.frames.is_empty() {
+            tracing::warn!("Recording file is empty");
+            // 即使是空录制，也要正常退出 Replay 模式
+        } else {
+            tracing::info!(
+                "Loaded {} frames, duration: {:.2}s",
+                recording.frames.len(),
+                recording.duration().map(|d| d.as_secs_f64()).unwrap_or(0.0)
+            );
+        }
+
+        // === 回放帧序列 ===
+
+        let mut first_frame = true;
+        let mut last_timestamp_us = 0u64;
+
+        for frame in recording.frames {
+            // 计算时间间隔（考虑速度因子）
+            let delay_us = if first_frame {
+                first_frame = false;
+                0 // 第一帧立即发送
+            } else {
+                let elapsed_us = frame.timestamp_us.saturating_sub(last_timestamp_us);
+                // 应用速度因子：速度越快，延迟越短
+                (elapsed_us as f64 / speed_factor) as u64
+            };
+
+            last_timestamp_us = frame.timestamp_us;
+
+            // 等待适当的延迟
+            if delay_us > 0 {
+                let delay = Duration::from_micros(delay_us);
+                thread::sleep(delay);
+            }
+
+            // 发送帧
+            let piper_frame = piper_can::PiperFrame {
+                id: frame.can_id,
+                data: {
+                    let mut data = [0u8; 8];
+                    data.copy_from_slice(&frame.data);
+                    data
+                },
+                len: frame.data.len() as u8,
+                is_extended: frame.can_id > 0x7FF,
+                timestamp_us: frame.timestamp_us,
+            };
+
+            self.driver.send_frame(piper_frame).map_err(|e| {
+                crate::RobotError::Infrastructure(piper_driver::DriverError::IoThread(
+                    e.to_string(),
+                ))
+            })?;
+
+            // 跟踪进度（每 1000 帧打印一次）
+            if frame.timestamp_us % 1_000_000 < 1000 {
+                trace!(
+                    "Replayed frame at {:.3}s",
+                    frame.timestamp_us as f64 / 1_000_000.0
+                );
+            }
+        }
+
+        tracing::info!("Replay completed successfully");
+
+        // === 退出 Replay 模式 ===
+
+        // 恢复 Driver 到 Normal 模式
+        self.driver.set_mode(DriverMode::Normal);
+
+        tracing::info!("Exited ReplayMode - TX thread normal operation resumed");
+
+        // 状态转换：ReplayMode -> Standby
+        let this = std::mem::ManuallyDrop::new(self);
+
+        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
+        let driver = unsafe { std::ptr::read(&this.driver) };
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
+        Ok(Piper {
+            driver,
+            observer,
+            _state: Standby,
+        })
+    }
+
+    /// 退出回放模式（返回 Standby）
+    ///
+    /// # 功能
+    ///
+    /// 提前终止回放，恢复 Driver 到 Normal 模式。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> anyhow::Result<()> {
+    /// let robot = PiperBuilder::new()
+    ///     .interface("can0")
+    ///     .build()?;
+    ///
+    /// let standby = robot.connect()?;
+    /// let replay = standby.enter_replay_mode()?;
+    ///
+    /// // 提前退出回放模式
+    /// let standby = replay.stop_replay()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn stop_replay(self) -> Result<Piper<Standby>> {
+        use piper_driver::mode::DriverMode;
+
+        tracing::info!("Stopping replay - exiting ReplayMode");
+
+        // 恢复 Driver 到 Normal 模式
+        self.driver.set_mode(DriverMode::Normal);
+
+        // 状态转换：ReplayMode -> Standby
+        let this = std::mem::ManuallyDrop::new(self);
+
+        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
+        let driver = unsafe { std::ptr::read(&this.driver) };
+        let observer = unsafe { std::ptr::read(&this.observer) };
+
         Ok(Piper {
             driver,
             observer,

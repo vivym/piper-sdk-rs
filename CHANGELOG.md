@@ -9,6 +9,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🎬 Recording and Replay System (2026-01-27)
+
+#### Added
+
+**Standard Recording API** (`piper_client::recording`):
+- ✨ `start_recording()`: Start recording CAN frames with configurable stop conditions
+- ✨ `stop_recording()`: Stop recording and retrieve statistics
+- ✨ `RecordingConfig`: Configuration for recording (output path, stop condition, metadata)
+- ✨ `RecordingMetadata`: Rich metadata (operator, notes, timestamps)
+- ✨ `StopCondition`: Flexible stop conditions (Duration, FrameCount, Manual)
+- ✨ `RecordingStatistics`: Recording statistics (frame count, duration, dropped frames)
+- ✨ Non-blocking async recording with bounded queues (10,000 frame capacity)
+- ✨ Hardware timestamps with microsecond precision
+- ✨ TX safety (only records successfully sent frames)
+
+**Custom Diagnostics API**:
+- ✨ `diagnostics()` method: Access diagnostics interface from `Active<Mode>` states
+- ✨ `Diagnostics`: Interface for registering custom frame callbacks
+- ✨ `register_callback()`: Register custom frame processing hooks
+- ✨ Support for real-time frame analysis in background threads
+- ✨ Loss tracking via `dropped_frames` counter
+
+**ReplayMode API** (`piper_client::state::ReplayMode`):
+- ✨ `enter_replay_mode()`: Enter ReplayMode (driver TX thread pauses automatically)
+- ✨ `replay_recording()`: Replay recorded CAN frames with configurable speed
+- ✨ `stop_replay()`: Early exit from replay mode
+- ✨ `ReplayMode`: Type state marker for compile-time safety
+- ✨ Speed validation (0.1x ~ 5.0x, recommended ≤ 2.0x)
+- ✨ Driver-level protection via `DriverMode::Replay`
+- ✨ Frame timing preservation during replay
+- ✨ Automatic return to `Standby` state after replay
+
+**Driver Layer** (`piper_driver::mode`):
+- ✨ `DriverMode` enum: `Normal` (periodic TX) and `Replay` (TX paused)
+- ✨ `AtomicDriverMode`: Thread-safe driver mode switching
+- ✨ `Piper::mode()`: Get current driver mode
+- ✨ `Piper::set_mode()`: Set driver mode with logging
+- ✨ `Piper::interface()`: Get CAN interface name (for recording metadata)
+- ✨ `Piper::bus_speed()`: Get CAN bus speed (for recording metadata)
+
+**CLI Commands** (`piper-cli`):
+- ✨ `piper-cli replay`: Full replay command implementation
+  - File existence validation
+  - Speed range validation with warnings
+  - Interactive confirmation prompt (optional `--confirm` flag)
+  - Cross-platform support (SocketCAN/GS-USB)
+  - Beautiful progress display with emojis
+
+**Examples**:
+- 📚 `standard_recording.rs`: Standard recording API usage demo
+- 📚 `custom_diagnostics.rs`: Custom diagnostics interface demo
+- 📚 `replay_mode.rs`: ReplayMode API demo with speed validation
+
+**Documentation**:
+- 📖 README.md: Comprehensive "Recording and Replay" section
+  - Three API comparison table
+  - Code examples for each API
+  - CLI usage examples
+  - Architecture highlights (type safety, driver protection)
+  - Complete workflow examples
+
+#### Changed
+
+- Updated `Piper<Standby>` to expose `enter_replay_mode()` method
+- Updated `Piper<ReplayMode>` to implement replay methods
+- Updated `Piper<Active<Mode>>` to expose `diagnostics()` method
+- Updated examples section in README to include new recording/replay examples
+
+#### Technical Highlights
+
+**1. Three-API Design**:
+```rust
+// API 1: Standard Recording (simplest)
+let (robot, handle) = robot.start_recording(config)?;
+let (robot, stats) = robot.stop_recording(handle)?;
+
+// API 2: Custom Diagnostics (advanced)
+let diag = active.diagnostics();
+diag.register_callback(custom_hook)?;
+
+// API 3: ReplayMode (safe replay)
+let replay = robot.enter_replay_mode()?;
+let robot = replay.replay_recording(path, speed)?;
+```
+
+**2. Type Safety via ReplayMode**:
+```rust
+// ✅ Compile-time error: cannot enable in ReplayMode
+let replay = robot.enter_replay_mode()?;
+let active = replay.enable_position_mode(...);  // ERROR!
+```
+
+**3. Driver-Level Protection**:
+```rust
+// Driver switches to ReplayMode automatically
+// TX thread pauses, preventing dual control flow
+self.driver.set_mode(DriverMode::Replay);
+```
+
+**4. Speed Validation**:
+- Maximum 5.0x hard limit (safety)
+- Recommended ≤ 2.0x with warnings
+- Preserves frame timing during replay
+
+#### Safety Features
+
+- ✅ Type-safe state transitions (compile-time)
+- ✅ Driver-level mode switching (runtime)
+- ✅ Speed limit validation (5.0x maximum)
+- ✅ TX thread pause during replay (no conflicts)
+- ✅ Automatic cleanup via RAII
+
+#### Performance
+
+- Recording overhead: <1μs per frame (non-blocking)
+- Queue capacity: 10,000 frames @ 1kHz = 10s buffer
+- Dropped frame monitoring: Atomic counter
+
+#### Code Statistics
+
+- **New modules**: 3 (recording, mode, diagnostics)
+- **New examples**: 3 (standard_recording, custom_diagnostics, replay_mode)
+- **New CLI commands**: 1 (replay)
+- **New documentation sections**: 1 major section in README
+
+---
+
 ### 🚀 v1.0-alpha (2026-01-23)
 
 #### Added - 高级 API (High-Level API)

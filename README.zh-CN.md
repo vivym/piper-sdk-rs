@@ -8,6 +8,13 @@
 
 [English README](README.md)
 
+> **⚠️ 重要提示**
+> **本项目正在积极开发中。API 可能会发生变化。请在生产环境中使用前仔细测试。**
+>
+> **版本状态**：当前版本为 **0.1.0 之前**（alpha 质量阶段）。SDK **尚未在真实机械臂上进行全面测试**，可能无法正确或安全地工作。
+>
+> **⚠️ 安全警告**：未经全面测试，请勿在生产环境或真实机械臂上使用此 SDK。软件可能发送错误的指令，导致机械臂损坏或造成安全危险。
+
 ## ✨ 核心特性
 
 - 🚀 **零抽象开销**：编译期多态，运行时无虚函数表（vtable）开销
@@ -270,6 +277,229 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - ✅ **TX 安全**：仅录制成功发送的帧
 - ✅ **丢失跟踪**：内置 `dropped_frames` 计数器
 
+## 🎬 录制与回放
+
+Piper SDK 提供三个互补的 API 用于 CAN 帧录制和回放：
+
+| API | 使用场景 | 复杂度 | 安全性 |
+|-----|----------|------------|--------|
+| **标准录制** | 简单的录制保存工作流 | ⭐ 低 | ✅ 类型安全 |
+| **自定义诊断** | 实时帧分析和自定义处理 | ⭐⭐ 中 | ✅ 线程安全 |
+| **回放模式** | 安全回放预先录制的会话 | ⭐⭐ 中 | ✅ 类型安全 + 驱动层保护 |
+
+### 1. 标准录制 API
+
+将 CAN 帧录制到文件的最简单方式：
+
+```rust
+use piper_client::{PiperBuilder, recording::{RecordingConfig, RecordingMetadata, StopCondition}};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 连接到机器人
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .build()?;
+
+    // 启动录制（带元数据）
+    let (robot, handle) = robot.start_recording(RecordingConfig {
+        output_path: "demo_recording.bin".into(),
+        stop_condition: StopCondition::Duration(10), // 录制 10 秒
+        metadata: RecordingMetadata {
+            notes: "标准录制示例".to_string(),
+            operator: "DemoUser".to_string(),
+        },
+    })?;
+
+    // 执行操作（所有 CAN 帧都会被录制）
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // 停止录制并获取统计信息
+    let (robot, stats) = robot.stop_recording(handle)?;
+
+    println!("录制了 {} 帧，耗时 {:.2} 秒", stats.frame_count, stats.duration.as_secs_f64());
+    println!("丢帧数: {}", stats.dropped_frames);
+
+    Ok(())
+}
+```
+
+**核心特性**：
+- ✅ **自动停止条件**：时长、帧数或手动停止
+- ✅ **丰富的元数据**：记录操作员、备注、时间戳
+- ✅ **统计信息**：帧数、时长、丢帧数
+- ✅ **类型安全**：录制句柄防止误用
+
+完整示例参见 [examples/standard_recording.rs](examples/standard_recording.rs)
+
+### 2. 自定义诊断 API
+
+高级用户可以注册自定义帧回调进行实时分析：
+
+```rust
+use piper_client::PiperBuilder;
+use piper_driver::recording::AsyncRecordingHook;
+use std::sync::Arc;
+use std::thread;
+
+fn main() -> anyhow::Result<()> {
+    // 连接并使能机器人
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .build()?;
+    let active = robot.enable_position_mode(Default::default())?;
+
+    // 获取诊断接口
+    let diag = active.diagnostics();
+
+    // 创建自定义录制钩子
+    let (hook, rx) = AsyncRecordingHook::new();
+    let dropped_counter = hook.dropped_frames().clone();
+
+    // 注册钩子
+    let callback = Arc::new(hook) as Arc<dyn piper_driver::FrameCallback>;
+    diag.register_callback(callback)?;
+
+    // 在后台线程处理帧
+    thread::spawn(move || {
+        let mut frame_count = 0;
+        while let Ok(frame) = rx.recv() {
+            frame_count += 1;
+
+            // 自定义分析：例如 CAN ID 分布、时序分析
+            if frame_count % 1000 == 0 {
+                println!("收到帧: ID=0x{:03X}", frame.id);
+            }
+        }
+
+        println!("总帧数: {}", frame_count);
+        println!("丢帧: {}", dropped_counter.load(std::sync::atomic::Ordering::Relaxed));
+    });
+
+    // 执行操作...
+    thread::sleep(std::time::Duration::from_secs(5));
+
+    // 关闭
+    let _standby = active.shutdown()?;
+
+    Ok(())
+}
+```
+
+**核心特性**：
+- ✅ **实时处理**：帧到达时即时分析
+- ✅ **自定义逻辑**：实现任何分析算法
+- ✅ **后台线程**：主线程不阻塞
+- ✅ **丢失跟踪**：监控丢帧数
+
+完整示例参见 [examples/custom_diagnostics.rs](examples/custom_diagnostics.rs)
+
+### 3. 回放模式 API
+
+使用驱动层保护安全地回放预先录制的会话：
+
+```rust
+use piper_client::PiperBuilder;
+
+fn main() -> anyhow::Result<()> {
+    // 连接到机器人
+    let robot = PiperBuilder::new()
+        .interface("can0")
+        .build()?;
+
+    // 进入回放模式（驱动 TX 线程自动暂停）
+    let replay = robot.enter_replay_mode()?;
+
+    // 以 2.0x 速度回放录制
+    let robot = replay.replay_recording("demo_recording.bin", 2.0)?;
+
+    // 自动退出回放模式（TX 线程恢复）
+    println!("回放完成！");
+
+    Ok(())
+}
+```
+
+**安全特性**：
+- ✅ **驱动层保护**：回放期间 TX 线程暂停（无双控制流）
+- ✅ **速度限制**：最大 5.0x，推荐 ≤ 2.0x 并有警告
+- ✅ **类型安全转换**：在回放模式下无法调用使能/失能
+- ✅ **自动清理**：总是返回到待机状态
+
+**速度指南**：
+- **1.0x**：原始速度（推荐大多数使用场景）
+- **0.1x ~ 2.0x**：测试/调试的安全范围
+- **> 2.0x**：谨慎使用 - 确保安全环境
+- **最大值**：5.0x（安全硬限制）
+
+完整示例参见 [examples/replay_mode.rs](examples/replay_mode.rs)
+
+### CLI 使用
+
+`piper-cli` 工具提供了录制和回放的便捷命令：
+
+```bash
+# 录制 CAN 帧
+piper-cli record -o demo.bin --duration 10
+
+# 回放录制（正常速度）
+piper-cli replay -i demo.bin
+
+# 以 2.0x 速度回放
+piper-cli replay -i demo.bin --speed 2.0
+
+# 回放时跳过确认提示
+piper-cli replay -i demo.bin --confirm
+```
+
+### 完整工作流示例
+
+```bash
+# 步骤 1: 录制会话
+cargo run --example standard_recording
+
+# 步骤 2: 分析录制
+cargo run --example custom_diagnostics
+
+# 步骤 3: 安全回放录制
+cargo run --example replay_mode
+```
+
+### 架构亮点
+
+#### 为什么是三个 API？
+
+每个 API 服务于不同的目的：
+
+1. **标准录制**：适合想要"直接录制"的用户，无需复杂配置
+2. **自定义诊断**：适合研究人员开发自定义分析工具
+3. **回放模式**：适合测试工程师重现 bug 或测试序列
+
+#### 通过类型状态实现类型安全
+
+ReplayMode API 使用 Rust 类型系统实现编译期安全：
+
+```rust
+// ✅ 编译期错误：在回放模式下无法使能
+let replay = robot.enter_replay_mode()?;
+let active = replay.enable_position_mode(...);  // 错误！
+
+// ✅ 必须先退出回放模式
+let robot = replay.replay_recording(...)?;
+let active = robot.enable_position_mode(...);  // OK!
+```
+
+#### 驱动层保护
+
+ReplayMode 将驱动切换到 `DriverMode::Replay`，从而：
+
+- **暂停周期性 TX**：驱动停止发送自动控制命令
+- **允许显式帧**：只有回放帧被发送到 CAN 总线
+- **防止冲突**：无双控制流（驱动 vs 回放）
+
+此设计记录在[架构分析](docs/architecture/piper-driver-client-mixing-analysis.md)中。
+
 ### 高级使用（驱动层 API）
 
 需要直接控制 CAN 帧或追求最高性能时，使用驱动层 API：
@@ -396,11 +626,13 @@ piper-sdk-rs/
 - `realtime_control_demo.rs` - 实时控制演示（双线程架构）
 - `robot_monitor.rs` - 机器人状态监控
 - `timestamp_verification.rs` - 时间戳同步验证
+- `standard_recording.rs` - 📼 标准录制 API 使用（录制 CAN 帧到文件）
+- `custom_diagnostics.rs` - 🔧 自定义诊断接口（实时帧分析）
+- `replay_mode.rs` - 🔄 回放模式 API（安全 CAN 帧回放）
 
 计划中的示例：
 - `torque_control.rs` - 力控演示
 - `configure_can.rs` - CAN 波特率配置工具
-- `can_recording.rs` - CAN 帧录制示例
 
 ## 🤝 贡献
 
@@ -427,7 +659,3 @@ piper-sdk-rs/
 - [松灵机器人](https://www.agilex.ai/)
 - [bilge](https://docs.rs/bilge/)
 - [rusb](https://docs.rs/rusb/)
-
----
-
-**注意**：本项目正在积极开发中，API 可能会有变更。建议在生产环境使用前仔细测试。

@@ -4,8 +4,6 @@
 
 use anyhow::Result;
 use clap::Args;
-use piper_tools::{PiperRecording, RecordingMetadata, TimestampSource, TimestampedFrame};
-use std::time::SystemTime;
 
 /// 录制命令参数
 #[derive(Args, Debug)]
@@ -33,98 +31,28 @@ pub struct RecordCommand {
 
 impl RecordCommand {
     /// 执行录制
-    pub async fn execute(&self, config: &crate::modes::oneshot::OneShotConfig) -> Result<()> {
-        use piper_sdk::driver::PiperBuilder;
-        use std::time::Duration;
-
-        println!("⏳ 连接到机器人...");
-
-        let interface_str =
-            self.interface.as_deref().or(config.interface.as_deref()).unwrap_or("can0");
-
-        // 创建录制
-        let metadata = RecordingMetadata::new(interface_str.to_string(), 1_000_000);
-        let mut recording = PiperRecording::new(metadata);
-
-        // 模拟录制（实际应该从 CAN 总线读取）
-        let start_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-
-        let duration = self.duration;
-        let max_frames = if duration > 0 {
-            duration * 1000 // 假设 1000Hz
-        } else {
-            1000 // 默认录制 1000 帧
-        };
-
-        let mut frame_count = 0;
-
-        // 连接到机器人读取状态
-        let robot = PiperBuilder::new().interface(interface_str).build()?;
-
-        println!("✅ 已连接，开始录制...");
-
-        let start = std::time::Instant::now();
-        let stop_id = self.stop_on_id;
-
-        loop {
-            // 检查时长限制
-            if duration > 0 && start.elapsed() >= Duration::from_secs(duration) {
-                println!("\n⏱️  达到时长限制");
-                break;
-            }
-
-            // 读取状态（触发 CAN 接收）
-            let _position = robot.get_joint_position();
-            let _end_pose = robot.get_end_pose();
-
-            // 模拟录制 CAN 帧
-            // TODO: 实际实现需要访问 driver 层的 CAN 帧
-            let can_id: u32 = (0x2A5 + (frame_count % 6)).try_into().unwrap();
-            let frame = TimestampedFrame::new(
-                start_time * 1_000_000 + frame_count * 1000,
-                can_id,
-                vec![frame_count as u8; 8],
-                TimestampSource::Hardware,
-            );
-
-            recording.add_frame(frame);
-            frame_count += 1;
-
-            // 进度显示
-            if frame_count % 100 == 0 {
-                print!(
-                    "\r录制中: {} 帧 (时长: {:.1}s)",
-                    frame_count,
-                    start.elapsed().as_secs_f64()
-                );
-                use std::io::Write;
-                std::io::stdout().flush().ok();
-            }
-
-            // 检查帧数限制
-            if frame_count >= max_frames {
-                println!("\n✅ 达到帧数限制");
-                break;
-            }
-
-            // 检查停止条件
-            if matches!(stop_id, Some(id) if can_id == id) {
-                println!("\n✅ 接收到停止 ID 0x{:03X}", stop_id.unwrap());
-                break;
-            }
-
-            // 小延迟，避免 100% CPU
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-
-        println!("\n✅ 录制完成: {} 帧", recording.frame_count());
-
-        // 保存录制
-        println!("💾 保存到: {}", self.output);
-        recording.save(&self.output)?;
-        println!("✅ 保存完成");
-
-        Ok(())
+    pub async fn execute(&self, _config: &crate::modes::oneshot::OneShotConfig) -> Result<()> {
+        // ⚠️ 架构限制：当前录制功能暂未实现
+        //
+        // 详细分析和实施计划请参见：
+        // docs/architecture/piper-driver-client-mixing-analysis.md
+        anyhow::bail!(
+            "❌ 录制功能暂未实现\n\
+             \n\
+             原因：piper_client 当前未暴露底层 CAN 帧访问接口。\n\
+             直接混用 piper_driver 会导致 SocketCAN/GS-USB 接口独占冲突。\n\
+             \n\
+             计划实施（2026 Q1）:\n\
+             • 方案 A: 标准录制 API（易于使用）\n\
+             • 方案 B: 高级诊断接口（灵活定制）\n\
+             • 方案 C: ReplayMode（回放专用状态）\n\
+             \n\
+             参考文档:\n\
+             • docs/architecture/piper-driver-client-mixing-analysis.md\n\
+             \n\
+             临时方案：如需紧急使用 CAN 录制，请参考 piper_driver 层的\n\
+             AsyncRecordingHook（需手动管理生命周期）。"
+        );
     }
 }
 
