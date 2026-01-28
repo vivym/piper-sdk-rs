@@ -45,7 +45,7 @@ use crate::hooks::FrameCallback;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use piper_protocol::PiperFrame;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 带时间戳的帧
 ///
@@ -81,14 +81,15 @@ impl From<&PiperFrame> for TimestampedFrame {
 /// # 内存安全（v1.2.1 关键修正）
 ///
 /// 使用 **有界通道**（Bounded Channel）防止 OOM：
-/// - 容量: 10,000 帧（约 10 秒 @ 1kHz）
+/// - 容量: 100,000 帧（约 3.3 分钟 @ 500Hz）
 /// - 队列满时丢帧，而不是无限增长导致 OOM
-/// - 可通过 `dropped_frames` 计数器监控
+/// - 可通过 `dropped_frames` 和 `frame_counter` 计数器监控
 ///
 /// # 设计理由
 ///
 /// ❌ **v1.1 错误设计**: `unbounded()` 可能导致 OOM
 /// ✅ **v1.2.1 正确设计**: `bounded(10000)` 优雅降级
+/// ✅ **v1.3.0 最新设计**: `bounded(100000)` 更长录制时长（约 3.3 分钟）
 ///
 /// # 示例
 ///
@@ -100,16 +101,17 @@ impl From<&PiperFrame> for TimestampedFrame {
 /// // 创建录制钩子
 /// let (hook, rx) = AsyncRecordingHook::new();
 ///
-/// // 直接持有 dropped_frames 的 Arc 引用
-/// // 📊 v1.2.1: 避免 downcast，直接持有引用
+/// // 直接持有计数器的 Arc 引用
 /// let dropped_counter = hook.dropped_frames().clone();
+/// let frame_counter = hook.frame_counter().clone();
 ///
 /// // 注册为回调
 /// let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
 ///
-/// // 监控丢帧
-/// let count = dropped_counter.load(std::sync::atomic::Ordering::Relaxed);
-/// println!("丢了 {} 帧", count);
+/// // 监控丢帧和帧数
+/// let dropped = dropped_counter.load(std::sync::atomic::Ordering::Relaxed);
+/// let frames = frame_counter.load(std::sync::atomic::Ordering::Relaxed);
+/// println!("已录制 {} 帧，丢了 {} 帧", frames, dropped);
 /// ```
 pub struct AsyncRecordingHook {
     /// 发送端（用于 Channel）
@@ -117,6 +119,15 @@ pub struct AsyncRecordingHook {
 
     /// 丢帧计数器（用于监控）
     dropped_frames: Arc<AtomicU64>,
+
+    /// 帧计数器（每次成功发送时递增）
+    frame_counter: Arc<AtomicU64>,
+
+    /// 停止条件：当收到此 CAN ID 时停止录制（None 表示不启用）
+    stop_on_id: Option<u32>,
+
+    /// 停止请求标志（原子操作，用于跨线程通信）
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl AsyncRecordingHook {
@@ -124,11 +135,15 @@ impl AsyncRecordingHook {
     ///
     /// # 队列容量
     ///
-    /// - 容量: 10,000 帧（约 10 秒 @ 1kHz）
-    /// - 500Hz CAN 总线: 20 秒缓存
-    /// - 1kHz CAN 总线: 10 秒缓存
+    /// - 容量: 100,000 帧（约 3.3 分钟 @ 500Hz）
+    /// - 500Hz CAN 总线: 约 3.3 分钟缓存
+    /// - 1kHz CAN 总线: 约 1.6 分钟缓存
+    /// - 内存占用: 约 2.4MB（100k × 24 bytes/frame）
     ///
-    /// **设计理由**: 足够吸收短暂的磁盘 I/O 延迟，同时防止 OOM。
+    /// **设计理由**:
+    /// - 足够吸收短暂的磁盘 I/O 延迟，同时防止 OOM
+    /// - 支持中等时长的录制（3 分钟左右）
+    /// - 超过此时长会导致丢帧（Channel 满）
     ///
     /// # 返回
     ///
@@ -143,15 +158,67 @@ impl AsyncRecordingHook {
     /// ```
     #[must_use]
     pub fn new() -> (Self, Receiver<TimestampedFrame>) {
-        // 🛡️ v1.2.1: 使用有界通道防止 OOM
-        let (tx, rx) = bounded(10_000);
+        // ⚠️ 缓冲区大小：100,000 帧（约 3-4 分钟 @ 500Hz）
+        // 内存占用：约 2.4MB（100k × 24 bytes/frame）
+        // 风险提示：超过此时长会导致丢帧
+        let (tx, rx) = bounded(100_000);
 
         let hook = Self {
             tx,
             dropped_frames: Arc::new(AtomicU64::new(0)),
+            frame_counter: Arc::new(AtomicU64::new(0)),
+            stop_on_id: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
         };
 
         (hook, rx)
+    }
+
+    /// 创建新的录制钩子（带停止条件）
+    ///
+    /// # 参数
+    ///
+    /// - `stop_on_id`: 当收到此 CAN ID 时停止录制（None 表示不启用）
+    ///
+    /// # 返回
+    ///
+    /// - `(hook, rx)`: 钩子实例和接收端
+    ///
+    /// # 示例
+    ///
+    /// ```rust
+    /// use piper_driver::recording::AsyncRecordingHook;
+    ///
+    /// // 当收到 0x2A4 时停止录制（末端位姿帧）
+    /// let (hook, rx) = AsyncRecordingHook::with_stop_condition(Some(0x2A4));
+    /// ```
+    #[must_use]
+    pub fn with_stop_condition(stop_on_id: Option<u32>) -> (Self, Receiver<TimestampedFrame>) {
+        let (tx, rx) = bounded(100_000);
+
+        let hook = Self {
+            tx,
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            frame_counter: Arc::new(AtomicU64::new(0)),
+            stop_on_id,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+        };
+
+        (hook, rx)
+    }
+
+    /// 获取停止请求标志（新增：v1.4）
+    ///
+    /// 用于检查是否应该停止录制
+    pub fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Relaxed)
+    }
+
+    /// 获取停止请求标志的 Arc 引用（新增：v1.4）
+    ///
+    /// 用于跨线程共享停止标志
+    pub fn stop_requested(&self) -> &Arc<AtomicBool> {
+        &self.stop_requested
     }
 
     /// 获取发送端（用于自定义场景）
@@ -200,6 +267,41 @@ impl AsyncRecordingHook {
     pub fn dropped_count(&self) -> u64 {
         self.dropped_frames.load(Ordering::Relaxed)
     }
+
+    /// 获取帧计数器（新增：v1.3.0）
+    ///
+    /// # 使用建议
+    ///
+    /// ✅ **推荐**: 在创建钩子时直接持有 `Arc` 引用
+    ///
+    /// ```rust
+    /// use piper_driver::recording::AsyncRecordingHook;
+    /// use std::sync::atomic::Ordering;
+    ///
+    /// let (hook, _rx) = AsyncRecordingHook::new();
+    /// let frame_counter = hook.frame_counter().clone();  // 在此持有
+    ///
+    /// // 直接读取，无需从 Context downcast
+    /// let count = frame_counter.load(Ordering::Relaxed);
+    /// ```
+    ///
+    /// # 返回
+    ///
+    /// `Arc<AtomicU64>`: 帧计数器的引用（不可变，只读）
+    #[must_use]
+    pub fn frame_counter(&self) -> &Arc<AtomicU64> {
+        &self.frame_counter
+    }
+
+    /// 获取当前已录制的帧数（新增：v1.3.0）
+    ///
+    /// # 返回
+    ///
+    /// 当前已成功录制的帧数
+    #[must_use]
+    pub fn frame_count(&self) -> u64 {
+        self.frame_counter.load(Ordering::Relaxed)
+    }
 }
 
 impl FrameCallback for AsyncRecordingHook {
@@ -230,17 +332,28 @@ impl FrameCallback for AsyncRecordingHook {
     /// // let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
     /// ```
     #[inline]
+    #[allow(clippy::collapsible_if)] // 嵌套 if 结构更清晰：先检查 Option，再比较 ID
     fn on_frame_received(&self, frame: &PiperFrame) {
-        // ⏱️ 直接透传硬件时间戳
-        let ts_frame = TimestampedFrame::from(frame);
+        // ⚠️ 关键：这里运行在 CAN 接收线程中，必须极快
+        // ✅ 性能优化：先记录所有帧（包括触发帧），再检查停止条件（v1.4 修正）
 
-        // 🛡️ 非阻塞发送：队列满时丢帧
+        // 1. 先记录帧（无论是否为触发帧）
+        let ts_frame = TimestampedFrame::from(frame);
         if self.tx.try_send(ts_frame).is_err() {
-            // 记录丢帧
+            // ⚠️ 缓冲区满时，丢弃"新"帧，保留"旧"帧
             self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-            // 注意: 丢帧优于 OOM 崩溃，也优于阻塞控制线程
+        } else {
+            self.frame_counter.fetch_add(1, Ordering::Relaxed);
         }
-        // ^^^^ <1μs，非阻塞
+
+        // 2. 再检查停止条件（原子操作，极快）
+        if let Some(stop_id) = self.stop_on_id {
+            if frame.id() == stop_id {
+                // ✅ 原子存储，不会阻塞
+                self.stop_requested.store(true, Ordering::SeqCst);
+                // ✅ 注意：不使用 return，因为已经记录了触发帧
+            }
+        }
     }
 
     /// 当发送 CAN 帧成功后调用（可选）

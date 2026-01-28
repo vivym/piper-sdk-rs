@@ -28,15 +28,54 @@ pub use control::*;
 pub use feedback::*;
 pub use ids::*;
 
-/// 临时的 CAN 帧定义（用于迁移期间，仅支持 CAN 2.0）
+/// CAN 2.0 标准帧的统一抽象
 ///
-/// TODO: 移除这个定义，让协议层只返回字节数据，
-/// 转换为 PiperFrame 的逻辑应该在 can 层或更高层实现。
+/// # 设计目的
 ///
-/// 设计要点：
-/// - Copy trait：零成本复制，适合高频场景
-/// - 固定 8 字节数据：避免堆分配
-/// - 无生命周期：简化 API
+/// `PiperFrame` 是协议层和硬件层之间的中间抽象，提供：
+/// - **层次解耦**：协议层不依赖底层 CAN 实现（SocketCAN/GS-USB）
+/// - **统一接口**：上层通过 `CanAdapter` trait 使用统一的帧类型
+/// - **类型安全**：编译时保证帧格式正确，避免原始字节操作错误
+///
+/// # 在架构中的位置
+///
+/// ```text
+/// Protocol Layer (piper-protocol)
+///     ↓ TryFrom<PiperFrame> 解析 / new_standard() 构建
+/// PiperFrame (此类型)
+///     ↓ 转换逻辑在 CAN 层实现
+/// CAN Layer (piper-can)
+///     ↓ SocketCAN/GS-USB 适配器
+/// Hardware
+/// ```
+///
+/// # 设计特性
+///
+/// - **Copy trait**：零成本复制，适合高频 CAN 场景（~1kHz 帧率）
+/// - **固定 8 字节**：避免堆分配，减少内存碎片
+/// - **无生命周期**：自包含数据结构，简化 API
+/// - **时间戳支持**：`timestamp_us` 字段支持录制/回放功能
+///
+/// # 限制
+///
+/// - **仅支持 CAN 2.0**：固定 8 字节数据
+/// - **不支持 CAN FD**：最长 64 字节的帧需要使用 `PiperFrameFd`（未来扩展）
+///
+/// # 转换示例
+///
+/// ```rust
+/// use piper_protocol::PiperFrame;
+///
+/// // 创建标准帧
+/// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+///
+/// // 创建扩展帧
+/// let frame_ext = PiperFrame::new_extended(0x12345678, &[5, 6, 7, 8]);
+///
+/// // 访问数据
+/// assert_eq!(frame.id(), 0x123);
+/// assert_eq!(frame.data_slice(), &[1, 2, 3, 4]);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PiperFrame {

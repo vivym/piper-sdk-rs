@@ -46,27 +46,40 @@ impl TimestampSource {
     }
 }
 
-/// 从 CAN 帧中提取时间戳
+/// 从 CAN 帧数据中提取时间戳（预留接口，暂未使用）
 ///
-/// 根据平台和 CAN 接口类型自动检测时间戳来源
+/// **注意**: 此函数是预留接口，当前未被代码库使用。
+///
+/// **实际时间戳提取**:
+/// - 录制和回放功能使用 `piper-can` 层的 `extract_timestamp_from_cmsg()` 方法
+/// - 该方法从 SocketCAN 的控制消息（CMSG）中提取硬件/软件时间戳
+/// - 参见: `crates/piper-can/src/socketcan/mod.rs` 或 `split.rs`
+///
+/// **此函数的预期用途**:
+/// - 未来可能用于从已保存的 CAN 帧数据中解析时间戳
+/// - 或用于特殊场景下需要从帧数据本身提取时间戳的情况
+///
+/// **当前实现**:
+/// - 使用当前系统时间作为占位符
+/// - 如果需要实现，请根据实际 CAN 帧格式解析时间戳字段
+#[deprecated(
+    since = "0.1.0",
+    note = "This function is a stub and not used in production. Timestamp extraction is handled by piper-can layer."
+)]
 pub fn extract_timestamp(
-    can_frame: &[u8],
+    _can_frame: &[u8],
     platform_hint: Option<TimestampSource>,
 ) -> (u64, TimestampSource) {
-    // ⚠️ 注意：实际实现需要根据具体的 CAN 帧格式提取时间戳
-    // 这里提供一个简化的实现框架
-
     // 如果提供了平台提示，使用它
     if let Some(source) = platform_hint {
-        // 实际时间戳应该从 CAN 帧的某个字段提取
-        // 这里使用当前时间作为占位符
+        // ⚠️ 当前实现：使用系统时间作为占位符
+        // 实际应该从 can_frame 中解析时间戳字段（如果帧数据包含时间戳）
         let timestamp = current_time_us();
         return (timestamp, source);
     }
 
-    // 否则，自动检测
-    // 注意：这需要查看实际的 CAN 帧格式
-    let source = detect_timestamp_source_from_frame(can_frame);
+    // 否则，自动检测平台并使用当前时间
+    let source = detect_timestamp_source();
     let timestamp = current_time_us();
 
     (timestamp, source)
@@ -87,22 +100,6 @@ pub fn detect_timestamp_source() -> TimestampSource {
     #[cfg(not(target_os = "linux"))]
     {
         // 其他平台（GS-USB）通常是用户空间时间戳
-        TimestampSource::Userspace
-    }
-}
-
-/// 从 CAN 帧检测时间戳来源
-fn detect_timestamp_source_from_frame(_frame: &[u8]) -> TimestampSource {
-    // ⚠️ 实际实现需要检查 CAN 帧的格式
-    // 例如：某些 CAN 帧可能包含硬件时间戳字段
-
-    #[cfg(target_os = "linux")]
-    {
-        TimestampSource::Hardware
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
         TimestampSource::Userspace
     }
 }

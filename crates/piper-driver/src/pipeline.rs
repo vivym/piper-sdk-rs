@@ -11,11 +11,39 @@ use piper_protocol::feedback::*;
 use piper_protocol::ids::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{error, trace, warn};
 
 // 使用 spin_sleep 提供微秒级延迟精度（相比 std::thread::sleep 的 1-2ms）
 use spin_sleep;
+
+/// 安全获取系统时间戳（微秒）
+///
+/// 此函数处理时钟回跳情况，避免 panic。
+/// 返回的时间戳仅用于记录（"For Info Only"），不参与控制计算。
+///
+/// # 时钟回跳处理
+///
+/// - 如果时钟回跳，返回 0（表示时间戳无效）
+/// - 记录警告日志
+/// - 不会导致 panic
+///
+/// # 注意
+///
+/// 此函数为内部实现细节，用于 CAN 帧处理线程中安全获取系统时间戳。
+/// 时钟回跳时返回 0 而非 panic，确保 IO 线程稳定运行。
+#[inline]
+fn safe_system_timestamp_us() -> u64 {
+    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros() as u64,
+        Err(_) => {
+            // 时钟回跳：返回 0 表示无效时间戳
+            // 这仅用于记录，不影响控制计算
+            warn!("System clock went backwards, using invalid timestamp (0)");
+            0
+        },
+    }
+}
 
 /// Pipeline 配置
 ///
@@ -783,10 +811,7 @@ fn parse_and_update_state(
                 state.joint_pos_frame_mask |= 1 << 2; // Bit 2 = 0x2A7
 
                 // 计算系统时间戳（微秒）
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 // 提交新的 JointPositionState（独立于 end_pose）
                 let new_joint_pos_state = JointPositionState {
@@ -838,10 +863,7 @@ fn parse_and_update_state(
                 state.end_pose_frame_mask |= 1 << 2; // Bit 2 = 0x2A4
 
                 // 计算系统时间戳（微秒）
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 // 提交新的 EndPoseState（独立于 joint_pos）
                 let new_end_pose_state = EndPoseState {
@@ -930,10 +952,7 @@ fn parse_and_update_state(
         ID_ROBOT_STATUS => {
             // RobotStatusFeedback (0x2A1) - 更新 RobotControlState
             if let Ok(feedback) = RobotStatusFeedback::try_from(*frame) {
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 // 构建故障码位掩码
                 let fault_angle_limit_mask = feedback.fault_code_angle_limit.joint1_limit() as u8
@@ -983,10 +1002,7 @@ fn parse_and_update_state(
         ID_GRIPPER_FEEDBACK => {
             // GripperFeedback (0x2A8) - 更新 GripperState
             if let Ok(feedback) = GripperFeedback::try_from(*frame) {
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 let current = ctx.gripper.load();
                 let last_travel = current.last_travel;
@@ -1026,10 +1042,8 @@ fn parse_and_update_state(
             if let Ok(feedback) = JointDriverLowSpeedFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
-                    let system_timestamp_us = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros() as u64;
+                    // ✅ 使用安全的时间戳函数，防止系统时钟错误导致 panic
+                    let system_timestamp_us = safe_system_timestamp_us();
 
                     ctx.joint_driver_low_speed.rcu(|old| {
                         let mut new = (**old).clone();
@@ -1103,10 +1117,7 @@ fn parse_and_update_state(
         ID_COLLISION_PROTECTION_LEVEL_FEEDBACK => {
             // CollisionProtectionLevelFeedback (0x47B)
             if let Ok(feedback) = CollisionProtectionLevelFeedback::try_from(*frame) {
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 // Use try_write to avoid blocking in IO loop (returns immediately if lock is held)
                 if let Ok(mut collision) = ctx.collision_protection.try_write() {
@@ -1136,10 +1147,8 @@ fn parse_and_update_state(
             if let Ok(feedback) = MotorLimitFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
-                    let system_timestamp_us = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros() as u64;
+                    // ✅ 使用安全的时间戳函数，防止系统时钟错误导致 panic
+                    let system_timestamp_us = safe_system_timestamp_us();
 
                     if let Ok(mut joint_limit) = ctx.joint_limit_config.write() {
                         joint_limit.joint_limits_max[joint_idx] = feedback.max_angle().to_radians();
@@ -1172,10 +1181,8 @@ fn parse_and_update_state(
             if let Ok(feedback) = MotorMaxAccelFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
-                    let system_timestamp_us = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros() as u64;
+                    // ✅ 使用安全的时间戳函数，防止系统时钟错误导致 panic
+                    let system_timestamp_us = safe_system_timestamp_us();
 
                     if let Ok(mut joint_accel) = ctx.joint_accel_config.write() {
                         joint_accel.max_acc_limits[joint_idx] = feedback.max_accel();
@@ -1203,10 +1210,7 @@ fn parse_and_update_state(
         ID_END_VELOCITY_ACCEL_FEEDBACK => {
             // EndVelocityAccelFeedback (0x478)
             if let Ok(feedback) = EndVelocityAccelFeedback::try_from(*frame) {
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 if let Ok(mut end_limit) = ctx.end_limit_config.write() {
                     end_limit.max_end_linear_velocity = feedback.max_linear_velocity();
@@ -1234,10 +1238,7 @@ fn parse_and_update_state(
         ID_FIRMWARE_READ => {
             // FirmwareReadFeedback (0x4AF)
             if let Ok(feedback) = FirmwareReadFeedback::try_from(*frame) {
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 if let Ok(mut firmware_state) = ctx.firmware_version.write() {
                     firmware_state.firmware_data.extend_from_slice(feedback.firmware_data());
@@ -1257,10 +1258,7 @@ fn parse_and_update_state(
         ID_CONTROL_MODE => {
             // ControlModeCommandFeedback (0x151)
             if let Ok(feedback) = ControlModeCommandFeedback::try_from(*frame) {
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 let new_state = MasterSlaveControlModeState {
                     hardware_timestamp_us: frame.timestamp_us,
@@ -1308,10 +1306,7 @@ fn parse_and_update_state(
                 state.pending_joint_target_deg[5] = feedback.j6_deg;
                 state.joint_control_frame_mask |= 1 << 2; // Bit 2 = 0x157
 
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 let new_state = MasterSlaveJointControlState {
                     hardware_timestamp_us: frame.timestamp_us,
@@ -1337,10 +1332,7 @@ fn parse_and_update_state(
         ID_GRIPPER_CONTROL => {
             // GripperControlFeedback (0x159) - 主从模式夹爪控制指令反馈
             if let Ok(feedback) = GripperControlFeedback::try_from(*frame) {
-                let system_timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64;
+                let system_timestamp_us = safe_system_timestamp_us();
 
                 let new_state = MasterSlaveGripperControlState {
                     hardware_timestamp_us: frame.timestamp_us,

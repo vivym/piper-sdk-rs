@@ -377,12 +377,13 @@ mod tests {
             TimestampSource::Userspace,
         ));
 
-        // 保存到临时文件
-        let temp_file = "/tmp/test_recording.bin";
-        recording.save(temp_file).unwrap();
+        // ✅ 保存到临时文件（RAII 自动清理）
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path();
+        recording.save(temp_path).unwrap();
 
         // 加载文件
-        let loaded = PiperRecording::load(temp_file).unwrap();
+        let loaded = PiperRecording::load(temp_path).unwrap();
 
         // 验证数据
         assert_eq!(loaded.version, 1);
@@ -394,7 +395,6 @@ mod tests {
         assert_eq!(loaded.frames[1].can_id, 0x200);
         assert_eq!(loaded.frames[1].data, vec![5, 6, 7, 8]);
 
-        // 清理
-        std::fs::remove_file(temp_file).ok();
+        // ✅ temp_file 在 drop 时自动删除，无需手动清理
     }
 }

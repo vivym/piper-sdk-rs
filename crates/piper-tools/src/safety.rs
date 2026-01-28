@@ -4,7 +4,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
 use std::path::Path;
 
 /// 安全配置
@@ -13,12 +12,15 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyConfig {
     /// 安全限制
+    #[serde(rename = "limits")]
     pub limits: SafetyLimits,
 
     /// 确认设置
+    #[serde(rename = "confirmation")]
     pub confirmation: ConfirmationSettings,
 
     /// E-Stop 设置
+    #[serde(rename = "estop")]
     pub estop: EStopSettings,
 }
 
@@ -37,29 +39,50 @@ impl SafetyConfig {
     /// 配置文件路径：
     /// - Linux/macOS: `~/.config/piper/safety.toml`
     /// - Windows: `%APPDATA%\piper\safety.toml`
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
-        let _content = fs::read_to_string(path)?;
+    ///
+    /// # 示例
+    ///
+    /// ```toml
+    /// [limits]
+    /// max_velocity = 3.0
+    /// max_acceleration = 10.0
+    /// joints_min = [-3.14, -1.57, -1.57, -1.57, -1.57, -3.14]
+    /// joints_max = [3.14, 1.57, 1.57, 1.57, 1.57, 3.14]
+    /// max_step_angle = 30.0
+    ///
+    /// [confirmation]
+    /// threshold_degrees = 10.0
+    /// enabled = true
+    ///
+    /// [estop]
+    /// enabled = true
+    /// timeout_ms = 50
+    /// ```
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("无法读取配置文件: {}", e))?;
 
-        // ⚠️ 简化实现：实际应该使用 TOML 解析
-        // 这里提供一个框架，需要添加 toml 依赖
-        // let config: SafetyConfig = toml::from_str(&content)?;
+        let config: SafetyConfig =
+            toml::from_str(&content).map_err(|e| anyhow::anyhow!("解析 TOML 失败: {}", e))?;
 
-        // 暂时返回默认配置
-        Ok(Self::default_config())
+        Ok(config)
     }
 
     /// 保存配置到文件
-    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), io::Error> {
-        // ⚠️ 简化实现：实际应该序列化为 TOML
-        let content = format!(
-            r#"[safety]
-max_velocity = {}
-max_acceleration = {}
-"#,
-            self.limits.max_velocity, self.limits.max_acceleration
-        );
+    ///
+    /// 自动创建父目录（如果不存在）
+    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), anyhow::Error> {
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| anyhow::anyhow!("序列化为 TOML 失败: {}", e))?;
 
-        fs::write(path, content)
+        // 确保父目录存在
+        if let Some(parent) = path.as_ref().parent() {
+            fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("创建目录失败: {}", e))?;
+        }
+
+        fs::write(path, content).map_err(|e| anyhow::anyhow!("写入配置文件失败: {}", e))?;
+
+        Ok(())
     }
 
     /// 检查速度是否在限制内

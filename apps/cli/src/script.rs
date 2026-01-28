@@ -9,6 +9,11 @@ use piper_client::types::{JointArray, Rad};
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+/// 急停错误（用于中断脚本执行）
+#[derive(Debug, thiserror::Error)]
+#[error("紧急停止")]
+pub struct EmergencyStop;
+
 /// 脚本命令序列
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Script {
@@ -154,6 +159,14 @@ impl ScriptExecutor {
                 },
 
                 Err(err) => {
+                    // ✅ 检查是否是急停错误
+                    if err.is::<EmergencyStop>() {
+                        println!();
+                        println!("🛑 脚本执行已紧急停止");
+                        // 急停被视为成功停止，而非失败
+                        break;
+                    }
+
                     println!("  ❌ 失败: {}", err);
                     result.failed.push((i, err.to_string()));
 
@@ -258,15 +271,12 @@ impl ScriptExecutor {
             },
 
             ScriptCommand::Stop => {
-                println!("  急停");
+                println!("  🛑 急停");
 
-                // 注意：这里不能直接 disable，因为我们在 Active 状态
-                // 应该发送失能命令，但这会转换状态
-                // 简化实现：仅提示
-                println!("    ⚠️  脚本中的急停不会立即生效");
-                println!("    💡 建议：使用 Ctrl+C 或单独的 stop 命令");
-
-                Ok(())
+                // ✅ 返回特殊错误以中断脚本执行
+                // robot 会在 execute() 函数返回时被 drop，
+                // Drop 实现会自动发送 disable_all() 命令
+                Err(EmergencyStop.into())
             },
         }
     }

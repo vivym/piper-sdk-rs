@@ -65,6 +65,47 @@ The SDK is organized in four layers (from low-level to high-level):
 
 ## Key Architectural Concepts
 
+### PiperFrame (Universal CAN Frame Abstraction)
+
+`PiperFrame` is the **central data structure** that flows through all layers of the SDK:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Client Layer                              │
+│     Uses PiperFrame via CanAdapter trait interface          │
+├─────────────────────────────────────────────────────────────┤
+│                   Driver Layer                              │
+│        Passes PiperFrame through channels (RX/TX)           │
+├─────────────────────────────────────────────────────────────┤
+│                   Protocol Layer                            │
+│   Parses (TryFrom) / Builds (new_standard) PiperFrame       │
+├─────────────────────────────────────────────────────────────┤
+│                    CAN Layer                                │
+│    Converts: PiperFrame ← → SocketCAN/GsUsbFrame           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Properties**:
+- **Layer Decoupling**: Protocol layer doesn't depend on CAN implementations
+- **Zero-Cost**: `Copy` trait, fixed 8-byte array, no heap allocation
+- **Type Safety**: Compile-time checks for frame format
+- **Timestamp Support**: `timestamp_us` field for recording/playback
+
+**Usage**:
+```rust
+// Create frame (Protocol Layer)
+let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+
+// Send via CAN Layer
+adapter.send(frame)?;
+
+// Receive and parse (Protocol Layer)
+let frame = adapter.receive()?;
+let feedback = RobotStatusFeedback::try_from(frame)?;
+```
+
+**Note**: `PiperFrame` only supports CAN 2.0 (8 bytes). CAN FD support (64 bytes) is planned for future versions.
+
 ### Type State Pattern (Client Layer)
 
 The client API uses zero-sized type markers for compile-time state safety:

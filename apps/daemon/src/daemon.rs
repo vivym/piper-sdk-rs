@@ -14,6 +14,27 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// 获取临时 socket 路径（XDG 合规）
+///
+/// 使用 `dirs` crate 确保跨平台兼容性和 XDG 规范合规性：
+/// - Linux: $XDG_RUNTIME_DIR 或 /tmp
+/// - macOS: $TMPDIR 或 /tmp
+/// - Windows: %TEMP%
+fn get_temp_socket_path(socket_name: &str) -> String {
+    // ✅ 优先使用 XDG_RUNTIME_DIR（Linux/macOS，符合 XDG 规范）
+    if let Some(runtime_dir) = dirs::runtime_dir() {
+        let path = runtime_dir.join(socket_name);
+        if let Some(parent) = path.parent()
+            && (parent.exists() || std::fs::create_dir_all(parent).is_ok())
+        {
+            return path.to_string_lossy().to_string();
+        }
+    }
+
+    // ✅ 其次使用系统临时目录（跨平台）
+    std::env::temp_dir().join(socket_name).to_string_lossy().to_string()
+}
+
 /// 设备状态机
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceState {
@@ -1314,12 +1335,14 @@ impl Daemon {
                             eprintln!(
                                 "Warning: Client path contains invalid UTF-8, using fallback"
                             );
-                            "/tmp/gs_usb_client_auto.sock".to_string()
+                            // ✅ 使用 XDG 合规路径
+                            get_temp_socket_path("gs_usb_client_auto.sock")
                         },
                     },
                     None => {
                         eprintln!("Warning: Client address is abstract, using fallback path");
-                        "/tmp/gs_usb_client_auto.sock".to_string()
+                        // ✅ 使用 XDG 合规路径
+                        get_temp_socket_path("gs_usb_client_auto.sock")
                     },
                 };
 
@@ -1437,9 +1460,9 @@ impl Daemon {
                 let addr_str = match client_addr.as_pathname() {
                     Some(path) => match path.to_str() {
                         Some(s) => s.to_string(),
-                        None => "/tmp/gs_usb_client.sock".to_string(),
+                        None => get_temp_socket_path("gs_usb_client.sock"), // ✅ XDG 合规
                     },
-                    None => "/tmp/gs_usb_client.sock".to_string(),
+                    None => get_temp_socket_path("gs_usb_client.sock"), // ✅ XDG 合规
                 };
 
                 let clients_guard = clients.read().unwrap();
@@ -1490,7 +1513,8 @@ impl Daemon {
                 }
             },
             _ => {
-                // 其他消息类型暂未实现
+                // ✅ 未知消息类型必须记录（用于调试）
+                eprintln!("⚠️  [Unix] Received unsupported message type: {:?}", msg);
             },
         }
     }
@@ -1671,7 +1695,8 @@ impl Daemon {
                 }
             },
             _ => {
-                // 其他消息类型暂未实现
+                // ✅ 未知消息类型必须记录（用于调试）
+                eprintln!("⚠️  [UDP] Received unsupported message type: {:?}", msg);
             },
         }
     }
@@ -1696,57 +1721,35 @@ impl Daemon {
     /// CPU 监控循环（低优先级线程）
     ///
     /// 定期监控 CPU 使用率，用于健康度评分
+    ///
+    /// ✅ 使用 `sysinfo` crate 实现跨平台 CPU 使用率监控
     fn cpu_monitor_loop(stats: Arc<RwLock<DaemonStats>>) {
+        use sysinfo::{CpuRefreshKind, RefreshKind, System};
+
         // 设置低优先级
-        // 注意：在非 macOS 平台上这是空操作，可以安全调用
         crate::macos_qos::set_low_priority();
 
-        #[cfg(target_os = "macos")]
-        {
-            // macOS: 使用系统调用获取 CPU 使用率
-            // 简化实现：使用进程 CPU 时间计算
-            let mut last_timestamp = Instant::now();
+        // ✅ 初始化系统信息（仅 CPU）
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+        );
 
-            loop {
-                thread::sleep(Duration::from_secs(1));
+        loop {
+            thread::sleep(Duration::from_secs(1));
 
-                // 获取当前进程的 CPU 时间（简化实现）
-                // 注意：macOS 上获取 CPU 使用率比较复杂，这里使用简化版本
-                let current_timestamp = Instant::now();
-                let elapsed = current_timestamp.duration_since(last_timestamp).as_secs_f64();
+            // ✅ 刷新 CPU 使用率
+            sys.refresh_cpu_all();
+            let cpu_usage = sys.global_cpu_usage(); // f64 (0-100)
 
-                if elapsed > 0.0 {
-                    // 简化：假设 CPU 使用率与 RX/TX FPS 相关
-                    // 实际应该使用系统调用获取真实的 CPU 时间
-                    let stats_guard = stats.read().unwrap();
-                    let rx_fps = stats_guard.get_rx_fps();
-                    let tx_fps = stats_guard.get_tx_fps();
-
-                    // 经验公式：1kHz = 约 10% CPU
-                    let estimated_cpu = ((rx_fps + tx_fps) / 1000.0 * 10.0).min(100.0) as u32;
-
-                    stats_guard
-                        .detailed
-                        .read()
-                        .unwrap()
-                        .cpu_usage_percent
-                        .store(estimated_cpu, Ordering::Relaxed);
-                }
-
-                last_timestamp = current_timestamp;
-            }
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            // 参数在非 macOS 下暂未使用，显式忽略避免告警
-            let _ = &stats;
-
-            // 其他平台：简化实现
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                // 暂时不实现
-            }
+            // 存储到统计中
+            stats
+                .read()
+                .unwrap()
+                .detailed
+                .read()
+                .unwrap()
+                .cpu_usage_percent
+                .store(cpu_usage as u32, Ordering::Relaxed);
         }
     }
 

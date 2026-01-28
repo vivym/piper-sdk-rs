@@ -25,44 +25,37 @@ fn config_file() -> Result<PathBuf> {
 
 /// CLI 配置
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct CliConfig {
+pub struct CliConfig {
     /// 默认 CAN 接口
-    interface: Option<String>,
+    pub interface: Option<String>,
 
     /// 设备序列号（GS-USB）
-    serial: Option<String>,
+    pub serial: Option<String>,
 }
 
 impl CliConfig {
     /// 加载配置
-    fn load() -> Result<Self> {
+    pub fn load() -> Result<Self> {
         let path = config_file()?;
 
         if !path.exists() {
             return Ok(Self::default());
         }
 
-        let _content = fs::read_to_string(&path).context("读取配置文件失败")?;
+        let content = fs::read_to_string(&path).context("读取配置文件失败")?;
 
-        // ⚠️ 简化实现：实际应该使用 TOML 解析
-        // 这里暂时返回默认配置
-        Ok(Self::default())
+        // ✅ 使用 TOML 解析
+        let config: CliConfig = toml::from_str(&content).context("解析 TOML 配置失败")?;
+
+        Ok(config)
     }
 
     /// 保存配置
     fn save(&self) -> Result<()> {
         let path = config_file()?;
 
-        // ⚠️ 简化实现：实际应该序列化为 TOML
-        let content = format!(
-            r#"# Piper CLI Configuration
-
-[default]
-interface = {:?}
-serial = {:?}
-"#,
-            self.interface, self.serial
-        );
+        // ✅ 使用 TOML 序列化
+        let content = toml::to_string_pretty(self).context("序列化配置为 TOML 失败")?;
 
         fs::write(&path, content).context("写入配置文件失败")?;
 

@@ -42,7 +42,7 @@
 use piper_driver::recording::TimestampedFrame;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// 录制句柄（用于控制和监控）
@@ -65,6 +65,12 @@ pub struct RecordingHandle {
     /// 丢帧计数器
     dropped_frames: Arc<AtomicU64>,
 
+    /// 帧计数器（从 Driver 层传递）
+    frame_counter: Arc<AtomicU64>,
+
+    /// 停止请求标记（用于 Manual 停止）
+    stop_requested: Arc<AtomicBool>,
+
     /// 输出文件路径
     output_path: PathBuf,
 
@@ -74,23 +80,52 @@ pub struct RecordingHandle {
 
 impl RecordingHandle {
     /// 创建新的录制句柄（内部使用）
+    ///
+    /// # 参数
+    ///
+    /// - `stop_requested`: 可选的外部停止标志（用于 Driver 层的 `OnCanId` 停止条件）
+    ///   - `None`: 创建新的内部停止标志（用于 `Manual` 停止条件）
+    ///   - `Some(external)`: 使用 Driver 层提供的停止标志（用于 `OnCanId` 停止条件）
     pub(super) fn new(
         rx: crossbeam_channel::Receiver<TimestampedFrame>,
         dropped_frames: Arc<AtomicU64>,
+        frame_counter: Arc<AtomicU64>,
         output_path: PathBuf,
         start_time: Instant,
+        stop_requested: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
             rx,
             dropped_frames,
+            frame_counter,
+            stop_requested: stop_requested.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             output_path,
             start_time,
         }
     }
 
+    /// 获取当前已录制的帧数（线程安全，无阻塞）
+    ///
+    /// # 返回
+    ///
+    /// 当前已成功录制的帧数
+    pub fn frame_count(&self) -> u64 {
+        self.frame_counter.load(Ordering::Relaxed)
+    }
+
     /// 获取当前丢帧数量
     pub fn dropped_count(&self) -> u64 {
         self.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    /// 检查是否已请求停止（用于循环条件判断）
+    pub fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Relaxed)
+    }
+
+    /// 手动停止录制（请求停止）
+    pub fn stop(&self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
     }
 
     /// 获取录制时长

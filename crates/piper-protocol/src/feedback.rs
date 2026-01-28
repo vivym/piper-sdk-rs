@@ -675,10 +675,15 @@ impl TryFrom<PiperFrame> for EndPoseFeedback3 {
 /// 注意：关节索引从 CAN ID 推导（0x251 -> 1, 0x252 -> 2, ..., 0x256 -> 6）
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JointDriverHighSpeedFeedback {
-    pub joint_index: u8,   // 从 ID 推导：0x251 -> 1, 0x252 -> 2, ...
-    pub speed_rad_s: i16,  // Byte 0-1: 速度，单位 0.001rad/s
-    pub current_a: i16,    // Byte 2-3: 电流，单位 0.001A（有符号 i16，支持负值表示反向电流）
-    pub position_rad: i32, // Byte 4-7: 位置，单位 rad (TODO: 需要确认真实单位)
+    pub joint_index: u8,  // 从 ID 推导：0x251 -> 1, 0x252 -> 2, ...
+    pub speed_rad_s: i16, // Byte 0-1: 速度，单位 0.001rad/s
+    pub current_a: i16,   // Byte 2-3: 电流，单位 0.001A（有符号 i16，支持负值表示反向电流）
+    pub position_rad: i32, // Byte 4-7: 位置（未使用）
+                          //
+                          // ⚠️ 此字段单位未确认（可能是 rad、mrad、0.01° 或编码器 ticks）
+                          // ⚠️ 生产代码不使用此字段（实际位置来自 0x2A5-0x2A7 帧的 millidegrees）
+                          // 💡 如需位置数据，请使用 JointFeedback12/34/56 的 j1_rad() 等方法
+                          // 📖 详见：docs/v0/position_unit_analysis_report.md
 }
 
 impl JointDriverHighSpeedFeedback {
@@ -722,13 +727,28 @@ impl JointDriverHighSpeedFeedback {
     }
 
     /// 获取位置（rad）
+    ///
+    /// # ⚠️ 弃用警告 (Deprecated)
+    ///
+    /// **此方法的返回值单位未确认**，可能导致不正确的位置值。
+    ///
+    /// **已知问题**:
+    /// - 字段标注为 `rad`，但测试数据存在矛盾（3141592 对应 π？）
+    /// - 可能的单位：rad、mrad（0.001rad）、0.01°、编码器 ticks
+    /// - 当前**没有生产代码使用此方法**
+    ///
+    /// **替代方案**:
+    /// - 高层 API: `piper.observer().get_joint_position(joint)` - 推荐，单位已确认为弧度
+    /// - 协议层: `JointFeedback12::j1_rad()`, `j2_rad()` 等 - 单位明确 (从 0.001° 转换)
+    /// - 原始值: `self.position_raw()` - 获取未转换的 i32 原始值
+    ///
+    /// **背景**: 详见 `docs/v0/position_unit_analysis_report.md`
+    #[deprecated(
+        since = "0.1.0",
+        note = "Field unit unverified (rad vs mrad). Prefer `Observer::get_joint_position()` for verified position data, or use `position_raw()` for raw access."
+    )]
     pub fn position(&self) -> f64 {
         self.position_rad as f64
-    }
-
-    /// 获取位置（度）
-    pub fn position_deg(&self) -> f64 {
-        self.position() * 180.0 / std::f64::consts::PI
     }
 
     /// 计算力矩（N·m）
@@ -1787,8 +1807,8 @@ mod tests {
         assert_eq!(feedback.position_raw(), 1000000);
         assert!((feedback.speed() - 1.5).abs() < 0.0001);
         assert!((feedback.current() - 2.5).abs() < 0.0001);
-        // 位置单位：根据协议是 rad，但 i32 是整数，实际精度需要根据硬件确认
-        assert_eq!(feedback.position(), 1000000.0);
+        // 位置单位已弃用：position() 方法单位未确认（rad vs mrad）
+        // 应该使用 Observer::get_joint_position() 或 JointFeedback12::j1_rad() 获取已验证的位置
     }
 
     #[test]
@@ -1819,8 +1839,9 @@ mod tests {
 
         assert!((feedback.speed() - std::f64::consts::PI).abs() < 0.001);
         assert!((feedback.current() - 5.0).abs() < 0.001);
-        // 位置：根据协议单位是 rad，直接返回 i32 转 f64
-        assert_eq!(feedback.position(), position_val as f64);
+        // 位置单位已弃用：position() 方法单位未确认（rad vs mrad）
+        // 原始值可以正确获取
+        assert_eq!(feedback.position_raw(), position_val);
     }
 
     #[test]

@@ -75,12 +75,14 @@ struct Args {
 ///
 /// 优先使用用户可写的目录，避免权限问题：
 /// 1. XDG_RUNTIME_DIR（Linux，通常为 /run/user/{uid}）
-/// 2. /tmp（所有 Unix 系统）
+/// 2. 系统临时目录（跨平台）
 /// 3. 用户主目录下的 .cache/piper 目录（最后备选）
+///
+/// 使用 `dirs` crate 确保跨平台兼容性和 XDG 规范合规性
 fn get_default_lock_file() -> String {
-    // 优先使用 XDG_RUNTIME_DIR（符合 XDG 规范）
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let path = std::path::Path::new(&runtime_dir).join("gs_usb_daemon.lock");
+    // ✅ 优先使用 XDG_RUNTIME_DIR（Linux/macOS，符合 XDG 规范）
+    if let Some(runtime_dir) = dirs::runtime_dir() {
+        let path = runtime_dir.join("gs_usb_daemon.lock");
         // 确保目录存在且可写
         if let Some(parent) = path.parent()
             && (parent.exists() || std::fs::create_dir_all(parent).is_ok())
@@ -89,23 +91,29 @@ fn get_default_lock_file() -> String {
         }
     }
 
-    // 其次使用 /tmp（所有用户都有写权限）
-    let tmp_path = std::path::Path::new("/tmp").join("gs_usb_daemon.lock");
-    if tmp_path.parent().map(|p| p.exists()).unwrap_or(false) {
-        return tmp_path.to_string_lossy().to_string();
+    // ✅ 其次使用系统临时目录（跨平台）
+    // - Linux/macOS: /tmp 或 $TMPDIR
+    // - Windows: %TEMP%
+    let temp_dir = std::env::temp_dir();
+    let temp_path = temp_dir.join("gs_usb_daemon.lock");
+    if temp_path.parent().map(|p| p.exists()).unwrap_or(false) {
+        return temp_path.to_string_lossy().to_string();
     }
 
-    // 最后备选：用户主目录下的 .cache/piper
-    if let Ok(home) = std::env::var("HOME") {
-        let cache_dir = std::path::Path::new(&home).join(".cache").join("piper");
-        if std::fs::create_dir_all(&cache_dir).is_ok() {
-            let path = cache_dir.join("gs_usb_daemon.lock");
+    // ✅ 最后备选：用户缓存目录（跨平台）
+    // - Linux: ~/.cache/
+    // - macOS: ~/Library/Caches/
+    // - Windows: %LOCALAPPDATA%
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let piper_cache = cache_dir.join("piper");
+        if std::fs::create_dir_all(&piper_cache).is_ok() {
+            let path = piper_cache.join("gs_usb_daemon.lock");
             return path.to_string_lossy().to_string();
         }
     }
 
-    // 如果都不行，仍然返回 /tmp 路径（虽然可能也会失败）
-    "/tmp/gs_usb_daemon.lock".to_string()
+    // ❌ 最后回退：使用系统临时目录（可能失败，但至少给出一个路径）
+    std::env::temp_dir().join("gs_usb_daemon.lock").to_string_lossy().to_string()
 }
 
 fn main() {

@@ -69,5 +69,10 @@ pub use client::{
                   // 类型系统通过 types 模块导出
 };
 
+// 导出 recording 模块的常用类型
+pub use client::recording::{
+    RecordingConfig, RecordingHandle, RecordingMetadata, RecordingStats, StopCondition,
+};
+
 // 类型别名：为驱动层提供清晰的别名
 pub type Driver = driver::Piper; // 高级用户可以使用这个别名

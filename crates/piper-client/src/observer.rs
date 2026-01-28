@@ -167,7 +167,30 @@ impl Observer {
     /// 检查指定关节是否使能
     pub fn is_joint_enabled(&self, joint_index: usize) -> bool {
         let driver_state = self.driver.get_joint_driver_low_speed();
-        (driver_state.driver_enabled_mask >> joint_index) & 1 == 1
+        (driver_state.driver_enabled_mask & (1 << joint_index)) != 0
+    }
+
+    /// 获取末端位姿（独立读取，可能与其他状态有时间偏斜）
+    ///
+    /// # 返回值
+    ///
+    /// 返回 `EndPoseState`，包含：
+    /// - `end_pose`: [X, Y, Z, Rx, Ry, Rz]
+    ///   - X, Y, Z: 位置（米）
+    ///   - Rx, Ry, Rz: 姿态角（弧度）
+    ///
+    /// # 示例
+    ///
+    /// ```rust,no_run
+    /// # use piper_client::observer::Observer;
+    /// # fn example(observer: Observer) {
+    /// let end_pose = observer.end_pose();
+    /// println!("Position: X={:.4}, Y={:.4}, Z={:.4}",
+    ///     end_pose.end_pose[0], end_pose.end_pose[1], end_pose.end_pose[2]);
+    /// # }
+    /// ```
+    pub fn end_pose(&self) -> piper_driver::state::EndPoseState {
+        self.driver.get_end_pose()
     }
 
     /// 检查是否全部使能

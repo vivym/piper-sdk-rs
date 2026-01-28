@@ -42,4 +42,5 @@ pub mod safety;
 // 重新导出常用类型
 pub use recording::{PiperRecording, RecordingMetadata, TimestampedFrame};
 pub use safety::{SafetyConfig, SafetyLimits};
-pub use timestamp::{TimestampSource, detect_timestamp_source, extract_timestamp};
+pub use timestamp::{TimestampSource, detect_timestamp_source};
+// extract_timestamp 已弃用，不导出（由 piper-can 层处理实际时间戳提取）

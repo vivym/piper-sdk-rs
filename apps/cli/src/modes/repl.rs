@@ -92,56 +92,66 @@ impl ReplSession {
 
     /// 使能电机
     pub fn enable(&mut self) -> Result<()> {
-        match std::mem::replace(&mut self.state, ReplState::Disconnected) {
-            ReplState::Standby(robot) => {
-                println!("⏳ 使能电机...");
-                let config = PositionModeConfig::default();
-                let robot = robot.enable_position_mode(config)?;
-                self.state = ReplState::ActivePosition(robot);
-                println!("✅ 已使能 Position Mode");
-                Ok(())
-            },
-            ReplState::Disconnected => {
-                self.state = ReplState::Disconnected;
-                anyhow::bail!("未连接，请先使用 connect 命令");
-            },
+        match &self.state {
             ReplState::ActivePosition(_) => {
+                // ✅ 已经使能，直接返回（不需要恢复状态）
                 println!("⚠️  已经使能");
-                // 恢复状态
-                self.state = ReplState::ActivePosition(
-                    std::mem::replace(&mut self.state, ReplState::Disconnected)
-                        .into_active_position()
-                        .unwrap(),
-                );
                 Ok(())
+            },
+            _ => {
+                // ✅ 使用 take() 避免状态恢复问题
+                let old_state = std::mem::replace(&mut self.state, ReplState::Disconnected);
+                match old_state {
+                    ReplState::Standby(robot) => {
+                        println!("⏳ 使能电机...");
+                        let config = PositionModeConfig::default();
+                        let robot = robot.enable_position_mode(config)?;
+                        self.state = ReplState::ActivePosition(robot);
+                        println!("✅ 已使能 Position Mode");
+                        Ok(())
+                    },
+                    ReplState::Disconnected => {
+                        self.state = ReplState::Disconnected;
+                        anyhow::bail!("未连接，请先使用 connect 命令");
+                    },
+                    ReplState::ActivePosition(_) => {
+                        // 不可能：已经在第一个分支处理了
+                        unreachable!()
+                    },
+                }
             },
         }
     }
 
     /// 去使能电机
     pub fn disable(&mut self) -> Result<()> {
-        match std::mem::replace(&mut self.state, ReplState::Disconnected) {
-            ReplState::ActivePosition(robot) => {
-                println!("⏳ 去使能电机...");
-                let config = DisableConfig::default();
-                let robot = robot.disable(config)?;
-                self.state = ReplState::Standby(robot);
-                println!("✅ 已去使能");
-                Ok(())
-            },
-            ReplState::Disconnected => {
-                self.state = ReplState::Disconnected;
-                anyhow::bail!("未连接");
-            },
+        match &self.state {
             ReplState::Standby(_) => {
+                // ✅ 已经是 Standby 状态，直接返回
                 println!("⚠️  未使能");
-                // 恢复状态
-                self.state = ReplState::Standby(
-                    std::mem::replace(&mut self.state, ReplState::Disconnected)
-                        .into_standby()
-                        .unwrap(),
-                );
                 Ok(())
+            },
+            _ => {
+                // ✅ 使用 take() 避免状态恢复问题
+                let old_state = std::mem::replace(&mut self.state, ReplState::Disconnected);
+                match old_state {
+                    ReplState::ActivePosition(robot) => {
+                        println!("⏳ 去使能电机...");
+                        let config = DisableConfig::default();
+                        let robot = robot.disable(config)?;
+                        self.state = ReplState::Standby(robot);
+                        println!("✅ 已去使能");
+                        Ok(())
+                    },
+                    ReplState::Disconnected => {
+                        self.state = ReplState::Disconnected;
+                        anyhow::bail!("未连接");
+                    },
+                    ReplState::Standby(_) => {
+                        // 不可能：已经在第一个分支处理了
+                        unreachable!()
+                    },
+                }
             },
         }
     }
@@ -195,22 +205,15 @@ impl ReplSession {
             },
         }
     }
-}
 
-// 辅助函数用于状态转换
-impl ReplState {
-    fn into_standby(self) -> Option<Piper<Standby>> {
-        match self {
-            ReplState::Standby(robot) => Some(robot),
-            _ => None,
-        }
+    /// 检查是否已使能
+    pub fn is_enabled(&self) -> bool {
+        self.state.is_enabled()
     }
 
-    fn into_active_position(self) -> Option<Piper<Active<PositionMode>>> {
-        match self {
-            ReplState::ActivePosition(robot) => Some(robot),
-            _ => None,
-        }
+    /// 检查是否已连接
+    pub fn is_connected(&self) -> bool {
+        self.state.is_connected()
     }
 }
 
@@ -313,14 +316,8 @@ pub async fn run_repl() -> Result<()> {
 
     println!();
     println!("💡 提示: 使用 'connect' 连接到机器人，然后 'enable' 使能电机");
+    println!("💡 提示: 按 Ctrl+C 执行急停并退出");
     println!();
-
-    // ⭐ 后台任务：Ctrl+C 急停处理
-    tokio::spawn(async {
-        tokio::signal::ctrl_c().await.expect("failed to install CTRL+C handler");
-        eprintln!("\n🛑 收到 Ctrl+C，执行急停...");
-        // TODO: 发送急停命令到 session
-    });
 
     loop {
         tokio::select! {
@@ -367,7 +364,22 @@ pub async fn run_repl() -> Result<()> {
             // ⭐ 优先级2：Ctrl+C 急停
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\n🛑 Emergency stop activated!");
-                // TODO: 发送急停命令到 session
+
+                // ✅ 实现急停逻辑：如果已使能，先失能
+                if session.is_enabled() {
+                    eprintln!("⏳ 正在停止电机...");
+                    if let Err(err) = session.disable() {
+                        eprintln!("⚠️  失能失败: {}", err);
+                    } else {
+                        eprintln!("✅ 电机已停止");
+                    }
+                }
+
+                // 断开连接
+                if session.is_connected() {
+                    let _ = session.disconnect();
+                }
+
                 break;
             }
         }

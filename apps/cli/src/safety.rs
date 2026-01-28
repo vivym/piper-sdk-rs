@@ -44,18 +44,21 @@ impl SafetyChecker {
 
     /// 显示确认提示
     #[allow(dead_code)]
-    pub fn show_confirmation_prompt(&self, positions: &[f64]) -> Result<()> {
+    pub fn show_confirmation_prompt(&self, positions: &[f64]) -> Result<bool> {
         let max_delta = positions.iter().map(|&p| p.abs()).fold(0.0_f64, f64::max);
 
         let max_delta_degrees = max_delta * 180.0 / std::f64::consts::PI;
 
         println!("⚠️  大幅移动检测");
         println!("  最大角度: {:.1}°", max_delta_degrees);
-        println!("  确定要继续吗？[y/N]: ");
 
-        // TODO: 实际需要从 stdin 读取确认
-        // 这里暂时返回 true 表示已确认
-        Ok(())
+        // ✅ 使用 inquire 提供更好的交互体验
+        let confirmed = inquire::Confirm::new("确定要继续吗？")
+            .with_default(false)  // 默认为 No（安全优先）
+            .prompt()
+            .map_err(|e| anyhow::anyhow!("用户交互失败: {}", e))?;
+
+        Ok(confirmed)
     }
 }
 

@@ -49,9 +49,27 @@ impl PositionCommand {
             println!("  J{}: {:.3} rad ({:.1}°)", i + 1, pos.0, deg.0);
         }
 
-        // TODO: 末端位姿需要使用 driver 层 API
-        // 目前简化实现，只显示关节位置
-        println!("\n💡 提示: 末端位姿查看请使用 monitor 命令");
+        // ✅ 读取并显示末端位姿
+        println!("\n📍 末端位姿:");
+        let end_pose = observer.end_pose();
+
+        println!("  位置 (m):");
+        println!("    X: {:.4}", end_pose.end_pose[0]);
+        println!("    Y: {:.4}", end_pose.end_pose[1]);
+        println!("    Z: {:.4}", end_pose.end_pose[2]);
+
+        println!("  姿态 (rad):");
+        println!("    Rx: {:.4}", end_pose.end_pose[3]);
+        println!("    Ry: {:.4}", end_pose.end_pose[4]);
+        println!("    Rz: {:.4}", end_pose.end_pose[5]);
+
+        // ✅ 检查数据有效性
+        if end_pose.frame_valid_mask != 0b111 {
+            println!(
+                "\n⚠️  警告: 末端位姿数据不完整（帧组掩码: {:#03b}）",
+                end_pose.frame_valid_mask
+            );
+        }
 
         Ok(())
     }

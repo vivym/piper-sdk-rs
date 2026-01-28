@@ -30,11 +30,48 @@ use socketcan::{
     EmbeddedFrame, ExtendedId, Frame, Socket, SocketOptions, StandardId,
 };
 use std::io::IoSliceMut;
+use std::mem;
 use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::time::Duration;
 use tracing::{error, trace, warn};
+
+/// 检查 socket 是否启用了 SO_TIMESTAMPING
+///
+/// 通过 getsockopt 查询 SO_TIMESTAMPING 选项的值，验证时间戳功能是否已启用。
+/// 这是一个运行时检查，确保 dup() 后的 socket 确实继承了时间戳设置。
+fn check_timestamping_enabled(socket: &CanSocket) -> bool {
+    unsafe {
+        let mut flags: u32 = 0;
+        let mut len = mem::size_of::<u32>() as libc::socklen_t;
+
+        let ret = libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPING,
+            &mut flags as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+
+        if ret < 0 {
+            // getsockopt 失败，说明可能未启用或系统不支持
+            warn!(
+                "Failed to query SO_TIMESTAMPING on dup'd socket: {}",
+                std::io::Error::last_os_error()
+            );
+            return false;
+        }
+
+        // 检查是否有任何时间戳标志被设置
+        let expected_flags = libc::SOF_TIMESTAMPING_RX_HARDWARE
+            | libc::SOF_TIMESTAMPING_RAW_HARDWARE
+            | libc::SOF_TIMESTAMPING_RX_SOFTWARE
+            | libc::SOF_TIMESTAMPING_SOFTWARE;
+
+        flags & expected_flags != 0
+    }
+}
 
 /// 使用 dup() 复制底层 FD，生成新的 `CanSocket`
 fn dup_socket(socket: &CanSocket) -> Result<CanSocket, CanError> {
@@ -94,12 +131,17 @@ impl SocketCanRxAdapter {
         // 但需要确保 feedback_ids 列表包含所有需要的 CAN ID
         // Self::configure_hardware_filters(&rx_socket)?;
 
-        // 检查时间戳是否已启用（从原始 socket 继承）
-        // 注意：SocketCanAdapter 在初始化时已启用 SO_TIMESTAMPING
-        // 由于 dup() 共享 socket 选项，这里假设已启用
-        // 实际检查需要查询 socket 选项，但为了简化，我们假设已启用
-        // 如果时间戳不可用，提取时会返回 0
-        let timestamping_enabled = true; // 假设已启用（SocketCanAdapter 默认启用）
+        // ✅ 检查时间戳是否已启用（从原始 socket 继承）
+        // SocketCanAdapter 在初始化时已启用 SO_TIMESTAMPING
+        // 由于 dup() 共享 socket 选项，这里需要实际查询验证
+        let timestamping_enabled = check_timestamping_enabled(&rx_socket);
+
+        if timestamping_enabled {
+            trace!("SocketCanRxAdapter: SO_TIMESTAMPING verified on dup'd socket");
+        } else {
+            warn!("SocketCanRxAdapter: SO_TIMESTAMPING not available on dup'd socket");
+        }
+
         let hw_timestamp_available = false; // 运行时检测
 
         Ok(Self {

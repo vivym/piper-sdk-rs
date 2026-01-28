@@ -18,3 +18,7 @@ clap = { workspace = true }
 ctrlc = { workspace = true }
 fs4 = { workspace = true }
 libc = { workspace = true }
+# ✅ XDG Base Directory 规范（跨平台临时目录）
+dirs = "6.0"
+# ✅ 系统信息（CPU 使用率监控）
+sysinfo = "0.38"

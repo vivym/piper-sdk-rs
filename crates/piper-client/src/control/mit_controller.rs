@@ -103,6 +103,10 @@ impl Default for MitControllerConfig {
 /// 控制错误
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
+    /// Controller was already parked
+    #[error("Controller was already parked, cannot execute commands")]
+    AlreadyParked,
+
     /// 连续错误超过阈值
     #[error("Consecutive CAN failures: {count}, last error: {last_error}")]
     ConsecutiveFailures {
@@ -225,7 +229,7 @@ impl MitController {
         let mut next_tick = Instant::now();
 
         // 提取 piper 引用（避免每次都解 Option）
-        let _piper = self.piper.as_ref().expect("Piper should exist");
+        let _piper = self.piper.as_ref().ok_or(ControlError::AlreadyParked)?;
 
         while start.elapsed() < timeout {
             // 1. 设定下一个锚点（绝对时间）
@@ -319,7 +323,16 @@ impl MitController {
         };
 
         // 直接传递 kp/kd 增益到底层，让固件进行 PD 计算
-        let piper = self.piper.as_ref().expect("Piper should exist");
+        let piper =
+            self.piper.as_ref().ok_or(ControlError::AlreadyParked).map_err(|e| match e {
+                ControlError::AlreadyParked => crate::RobotError::InvalidTransition {
+                    from: "Active<MitMode>".to_string(),
+                    to: "Standby".to_string(),
+                },
+                _ => crate::RobotError::StatePoisoned {
+                    reason: format!("Controller error: {:?}", e),
+                },
+            })?;
         piper.command_torques(&target, &velocities, &kp, &kd, &torques)
     }
 
@@ -398,7 +411,15 @@ impl MitController {
     /// ```
     pub fn park(mut self, config: DisableConfig) -> crate::types::Result<Piper<Standby>> {
         // 安全提取 piper（Option 变为 None）
-        let piper = self.piper.take().expect("Piper should exist");
+        let piper = self.piper.take().ok_or(ControlError::AlreadyParked).map_err(|e| match e {
+            ControlError::AlreadyParked => crate::RobotError::InvalidTransition {
+                from: "Active<MitMode>".to_string(),
+                to: "Standby".to_string(),
+            },
+            _ => crate::RobotError::StatePoisoned {
+                reason: format!("Controller error: {:?}", e),
+            },
+        })?;
 
         // 失能并返回到 Standby 状态
         piper.disable(config)

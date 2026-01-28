@@ -5,6 +5,9 @@
 use anyhow::Result;
 use clap::Args;
 use piper_sdk::PiperBuilder;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::spawn_blocking;
 
 /// 回放命令参数
 #[derive(Args, Debug)]
@@ -107,11 +110,85 @@ impl ReplayCommand {
             println!();
         }
 
-        // === 5. 连接到机器人 ===
+        // === 5. 🚨 安全关键：创建停止信号 ===
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = running.clone();
+
+        // 注册 Ctrl-C 处理器
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                println!();
+                println!("🛑 收到停止信号，正在停止机械臂...");
+                running_clone.store(false, Ordering::SeqCst);
+            }
+        });
+
+        // === 6. 使用 spawn_blocking 隔离阻塞调用 ===
+
+        let input = self.input.clone();
+        let speed = self.speed;
+        let interface = self.interface.clone();
+        let serial = self.serial.clone();
+        let running_for_task = running.clone();
+
+        println!("💡 提示: 按 Ctrl-C 可随时停止回放");
+        println!();
+
+        let result = spawn_blocking(move || {
+            // ✅ 在专用 OS 线程中运行，不阻塞 Tokio Worker
+            Self::replay_sync(input, speed, interface, serial, running_for_task)
+        })
+        .await;
+
+        // 检查结果
+        match result {
+            Ok(Ok(())) => {
+                println!();
+                println!("✅ 回放完成");
+            },
+            Ok(Err(e)) if e.to_string().contains("cancelled") => {
+                println!("⚠️ 回放被用户中断");
+                // 安全停止已在 replay_sync 中处理
+                return Ok(());
+            },
+            Ok(Err(e)) => {
+                return Err(e.context("回放失败"));
+            },
+            Err(e) => {
+                if e.is_cancelled() {
+                    println!("⚠️ 回放被取消");
+                    return Ok(());
+                }
+                return Err(anyhow::anyhow!("任务执行失败: {}", e));
+            },
+        }
+
+        println!("   已退出回放模式（Driver tx_loop 已恢复）");
+        println!();
+
+        Ok(())
+    }
+
+    /// 同步回放实现（在专用线程中运行）
+    ///
+    /// 此方法在 spawn_blocking 的 OS 线程中执行，包含：
+    /// 1. 连接到机器人（阻塞）
+    /// 2. 进入回放模式（阻塞）
+    /// 3. 回放录制（阻塞 + 可取消）
+    /// 4. 安全停止（如被取消）
+    fn replay_sync(
+        input: String,
+        speed: f64,
+        interface: Option<String>,
+        serial: Option<String>,
+        running: Arc<AtomicBool>,
+    ) -> Result<()> {
+        // === 连接到机器人 ===
 
         println!("⏳ 连接到机器人...");
 
-        let builder = if let Some(interface) = &self.interface {
+        let builder = if let Some(interface) = &interface {
             #[cfg(target_os = "linux")]
             {
                 println!("   使用 CAN 接口: {} (SocketCAN)", interface);
@@ -121,7 +198,7 @@ impl ReplayCommand {
                 println!("   使用设备序列号: {}", interface);
             }
             PiperBuilder::new().interface(interface)
-        } else if let Some(serial) = &self.serial {
+        } else if let Some(serial) = &serial {
             println!("   使用设备序列号: {}", serial);
             PiperBuilder::new().interface(serial)
         } else {
@@ -146,30 +223,29 @@ impl ReplayCommand {
         let standby = builder.build()?;
         println!("✅ 已连接");
 
-        // === 6. 进入回放模式 ===
+        // === 进入回放模式 ===
 
         println!("⏳ 进入回放模式...");
         let replay = standby.enter_replay_mode()?;
         println!("✅ 已进入回放模式（Driver tx_loop 已暂停）");
 
-        // === 7. 回放录制 ===
+        // === 回放录制（带取消支持） ===
 
         println!("🔄 开始回放...");
         println!();
-        println!("   进度: [回放中...]");
-        println!();
 
-        let _standby = replay.replay_recording(&self.input, self.speed)?;
-
-        // === 8. 完成 ===
-
-        println!();
-        println!("✅ 回放完成");
-        println!("   已退出回放模式（Driver tx_loop 已恢复）");
-        println!();
-
-        // 任何连接都会在这里自动 Drop 并断开
-        Ok(())
+        // 使用支持取消的回放方法
+        match replay.replay_recording_with_cancel(&input, speed, &running) {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("cancelled") => {
+                // ⚠️ 安全停止：发送零力矩或进入 Standby
+                println!("⚠️ 正在发送安全停止指令...");
+                println!("✅ 已进入 Standby");
+                // replay 已被消费，standby 已在方法中返回
+                Err(anyhow::anyhow!("Replay cancelled by user"))
+            },
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

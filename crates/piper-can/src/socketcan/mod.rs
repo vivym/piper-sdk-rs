@@ -811,13 +811,57 @@ impl CanAdapter for SocketCanAdapter {
     /// 带超时的发送
     fn send_timeout(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
         // SocketCAN 支持发送超时（通过 SO_SNDTIMEO）
+        // ✅ 保存原始超时设置
+        let original_timeout = unsafe {
+            let mut tv: libc::timeval = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+
+            let ret = libc::getsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDTIMEO,
+                &mut tv as *mut _ as *mut libc::c_void,
+                &mut len,
+            );
+
+            if ret < 0 {
+                // 查询失败，假设无超时
+                None
+            } else {
+                // 转换为 Duration（None 表示无超时）
+                if tv.tv_sec < 0 || tv.tv_usec < 0 {
+                    None
+                } else {
+                    Some(
+                        Duration::from_secs(tv.tv_sec as u64)
+                            + Duration::from_micros(tv.tv_usec as u64),
+                    )
+                }
+            }
+        };
+
         // 临时设置发送超时
         self.socket.set_write_timeout(timeout).map_err(CanError::Io)?;
 
         let result = self.send(frame);
 
-        // 恢复默认发送超时（5ms，与 SocketCanTxAdapter 一致）
-        let _ = self.socket.set_write_timeout(Duration::from_millis(5));
+        // ✅ 恢复原始超时设置
+        let restore_result = match original_timeout {
+            Some(timeout) => self.socket.set_write_timeout(timeout).map_err(CanError::Io),
+            None => self.socket.set_write_timeout(None).map_err(CanError::Io),
+        };
+
+        if let Err(e) = restore_result {
+            // 恢复失败不影响发送结果，但记录警告
+            warn!(
+                "Failed to restore original write timeout after send_timeout: {:?}. \
+                 Socket may have incorrect timeout setting.",
+                e
+            );
+        }
 
         result
     }

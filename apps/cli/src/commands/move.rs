@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use clap::Args;
 use piper_client::PiperBuilder;
 use piper_client::state::PositionModeConfig;
-use piper_client::types::JointArray;
 use piper_tools::SafetyConfig;
 
 /// 移动命令参数
@@ -111,19 +110,42 @@ impl MoveCommand {
         println!("⚡ 使能 Position Mode...");
         let robot = robot.enable_position_mode(config_mode)?;
 
+        // ✅ 获取当前关节位置（用于部分关节移动）
+        let observer = robot.observer();
+        let current_positions = observer.snapshot().position;
+
         // 转换为 JointArray<Rad>
         use piper_client::types::Rad;
-        let mut joint_array = JointArray::from([Rad(0.0); 6]);
+        let mut joint_array = current_positions; // ✅ 从当前位置开始
+
+        // ✅ 合并用户指定位置
         for (i, &pos) in positions.iter().enumerate() {
             if i < 6 {
                 joint_array[i] = Rad(pos);
             }
         }
 
-        // 如果少于 6 个关节，只发送部分
+        // ✅ 显示部分关节移动信息
         if positions.len() < 6 {
-            // TODO: 支持部分关节移动
-            println!("⚠️  注意: 当前版本会移动所有 6 个关节");
+            println!("\nℹ️  部分关节移动:");
+            for i in 0..6 {
+                if i < positions.len() {
+                    println!(
+                        "  J{}: {:.3} rad ({:.1}°) [用户指定]",
+                        i + 1,
+                        positions[i],
+                        positions[i] * 180.0 / std::f64::consts::PI
+                    );
+                } else {
+                    println!(
+                        "  J{}: {:.3} rad ({:.1}°) [保持当前]",
+                        i + 1,
+                        joint_array[i].0,
+                        joint_array[i].0 * 180.0 / std::f64::consts::PI
+                    );
+                }
+            }
+            println!();
         }
 
         // 发送位置命令

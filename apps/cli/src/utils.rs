@@ -27,6 +27,7 @@ use std::io::{self, Write};
 ///     println!("用户取消");
 /// }
 /// ```
+#[allow(dead_code)]
 pub fn prompt_confirmation(prompt: &str, default: bool) -> Result<bool> {
     let default_text = if default { "[Y/n]" } else { "[y/N]" };
 
