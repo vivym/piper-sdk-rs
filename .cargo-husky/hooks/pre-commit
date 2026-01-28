@@ -1,10 +1,23 @@
 #!/bin/sh
 
+# 检查暂存区中是否有 Rust 源文件
+RS_FILES=$(git diff --cached --name-only | grep -E '\.rs$' || true)
+
+if [ -z "$RS_FILES" ]; then
+  echo "ℹ️  No Rust files changed, skipping pre-commit checks."
+  exit 0
+fi
+
+echo "🦀 Rust files changed in this commit:"
+echo "$RS_FILES"
+echo ""
+
 # 1. 确保代码格式化正确 (如果格式不对，这里会报错)
 echo "Running cargo fmt..."
 cargo fmt --all -- --check
 if [ $? -ne 0 ]; then
   echo "❌ Cargo fmt failed."
+  echo "💡 Run 'cargo fmt --all' to fix formatting."
   exit 1
 fi
 
@@ -17,7 +30,7 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-# 3. 运行测试 (可选，如果测试太慢可以注释掉)
+# 3. 运行测试 (仅当有 Rust 文件变更时)
 echo "Running cargo test..."
 cargo test
 if [ $? -ne 0 ]; then
