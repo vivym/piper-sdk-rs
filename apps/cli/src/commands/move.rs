@@ -52,13 +52,17 @@ impl MoveCommand {
             anyhow::bail!("最多支持 6 个关节");
         }
 
-        // 使用验证器验证关节位置
+        // 🔴 P0 安全修复：必须验证关节位置
         let validator = JointValidator::default_range();
 
-        // 验证每个关节（支持少于 6 个）
-        for (i, &pos) in positions.iter().enumerate() {
-            validator.validate_joint(i, pos)?;
+        // ✅ 如果少于 6 个，补齐到 6 个（使用 0.0）
+        let mut full_positions = positions.clone();
+        while full_positions.len() < 6 {
+            full_positions.push(0.0);
         }
+
+        // ✅ 完整验证（包括 NaN 检查、数量检查）
+        validator.validate_joints(&full_positions).context("关节位置安全检查失败")?;
 
         Ok(positions)
     }

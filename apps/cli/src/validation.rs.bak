@@ -190,6 +190,40 @@ impl Default for PathValidator {
     }
 }
 
+/// CAN ID 验证器
+#[allow(dead_code)]
+pub struct CanIdValidator;
+
+#[allow(dead_code)]
+impl CanIdValidator {
+    /// 验证标准 CAN ID (11-bit)
+    pub fn validate_standard(id: u32) -> Result<()> {
+        if id > 0x7FF {
+            anyhow::bail!("标准 CAN ID 必须小于 0x7FF，得到: 0x{:03X}", id);
+        }
+        Ok(())
+    }
+
+    /// 验证扩展 CAN ID (29-bit)
+    pub fn validate_extended(id: u32) -> Result<()> {
+        if id > 0x1FFFFFFF {
+            anyhow::bail!("扩展 CAN ID 必须小于 0x1FFFFFFF，得到: 0x{:08X}", id);
+        }
+        Ok(())
+    }
+
+    /// 验证 CAN ID（自动检测标准或扩展）
+    pub fn validate(id: u32) -> Result<()> {
+        if id <= 0x7FF {
+            Self::validate_standard(id)
+        } else if id <= 0x1FFFFFFF {
+            Self::validate_extended(id)
+        } else {
+            anyhow::bail!("CAN ID 无效: 0x{:08X}", id)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +263,12 @@ mod tests {
         assert!(validator.validate_path("/nonexistent/file.txt").is_err());
         // 测试当前目录（应该存在）
         assert!(validator.validate_path(".").is_ok());
+    }
+
+    #[test]
+    fn test_can_id_validator() {
+        assert!(CanIdValidator::validate(0x123).is_ok()); // 标准 ID
+        assert!(CanIdValidator::validate(0x12345678).is_ok()); // 扩展 ID
+        assert!(CanIdValidator::validate(0x2FFFFFFF).is_err()); // 无效 ID
     }
 }

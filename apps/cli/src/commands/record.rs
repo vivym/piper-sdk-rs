@@ -2,7 +2,7 @@
 //!
 //! 录制 CAN 总线数据到文件
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use piper_sdk::{PiperBuilder, RecordingConfig, RecordingMetadata, StopCondition};
 use std::io::Write;
@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::spawn_blocking;
+
+use crate::validation::PathValidator;
 
 /// 录制命令参数
 #[derive(Args, Debug)]
@@ -46,6 +48,12 @@ impl RecordCommand {
         // === 1. 参数验证 ===
 
         let output_path = PathBuf::from(&self.output);
+
+        // 🔴 P0 安全修复：验证输出路径
+        let validator = PathValidator::new();
+        validator
+            .validate_output_path(&self.output)
+            .context("输出路径验证失败，请确保父目录存在")?;
 
         // 检查文件是否已存在
         if output_path.exists() && !self.force {

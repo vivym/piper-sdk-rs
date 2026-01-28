@@ -46,8 +46,12 @@ pub struct Client {
     pub send_frequency_level: AtomicU32,
 
     /// 客户端创建时间（便于调试和追踪）
-    /// 可通过 client_age() 方法访问，用于监控和调试
-    #[allow(dead_code)]
+    ///
+    /// 用途：
+    /// - 调试：追踪客户端连接时长
+    /// - 监控：通过 client_age() 方法查看存活时间
+    /// - 故障排查：识别长时间未活动的客户端
+    #[allow(dead_code)] // 调试字段，生产环境只写不读
     pub created_at: Instant,
 }
 
@@ -67,7 +71,7 @@ impl Client {
     ///
     /// # 返回
     /// 客户端的存活时长，用于调试和追踪
-    #[allow(dead_code)]
+    #[cfg(test)] // 仅在测试中使用，生产环境不需要
     pub fn client_age(&self) -> Duration {
         self.created_at.elapsed()
     }

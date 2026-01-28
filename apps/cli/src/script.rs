@@ -108,7 +108,34 @@ impl ScriptExecutor {
         Ok(script)
     }
 
-    /// 保存脚本文件
+    /// 保存脚本到文件（预留功能）
+    ///
+    /// 将脚本对象序列化为 JSON 格式并写入指定路径。
+    ///
+    /// # 当前状态
+    ///
+    /// 此方法当前未使用，但保留以备未来需要。
+    ///
+    /// # 未来用途
+    ///
+    /// 可能用于以下场景：
+    /// 1. **脚本创建工具**：提供 `piper script create` 命令，引导用户创建新脚本
+    /// 2. **脚本录制**：录制用户的操作并自动生成脚本文件
+    /// 3. **脚本模板**：从预定义模板生成脚本文件
+    ///
+    /// # 使用示例
+    ///
+    /// ```ignore
+    /// use piper_cli::script::{ScriptExecutor, Script, ScriptCommand};
+    ///
+    /// let script = Script {
+    ///     name: "测试脚本".to_string(),
+    ///     description: "自动生成的测试脚本".to_string(),
+    ///     commands: vec![ScriptCommand::Home],
+    /// };
+    ///
+    /// ScriptExecutor::save_script("test_script.json", &script)?;
+    /// ```
     #[allow(dead_code)]
     pub fn save_script<P: AsRef<std::path::Path>>(path: P, script: &Script) -> Result<()> {
         let content = serde_json::to_string_pretty(script).context("序列化脚本失败")?;
@@ -126,9 +153,11 @@ impl ScriptExecutor {
 
         // 连接到机器人
         println!("🔌 连接到机器人...");
+        // 🟡 P1-2 修复：优先使用 serial（如果提供），其次使用 interface
         let mut builder = PiperBuilder::new();
-        if let Some(interface) = &self.config.interface {
-            builder = builder.interface(interface);
+        let connection_target = self.config.serial.clone().or(self.config.interface.clone());
+        if let Some(target) = connection_target {
+            builder = builder.interface(&target);
         }
 
         let robot = builder.build()?;
@@ -291,7 +320,14 @@ impl Default for ScriptExecutor {
 /// 脚本执行结果
 #[derive(Debug)]
 pub struct ScriptResult {
-    /// 脚本名称
+    /// 脚本名称（预留用于结果报告）
+    ///
+    /// **当前状态**：此字段当前未在结果打印中使用。
+    ///
+    /// **未来用途**：可能用于：
+    /// 1. 在结果报告中显示脚本名称
+    /// 2. 生成结构化的执行报告（JSON/YAML）
+    /// 3. 多脚本批处理时标识不同脚本的结果
     #[allow(dead_code)]
     pub script_name: String,
 

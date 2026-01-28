@@ -282,6 +282,70 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
+    /// 发送带序号的位姿指令（用于圆弧运动/轨迹记录）
+    ///
+    /// **注意**：此方法已废弃，请使用 `send_circular_motion` 方法。
+    /// 此方法保留仅用于向后兼容或特殊场景。
+    ///
+    /// **原子性发送**：`[0x152, 0x153, 0x154] + [0x158]`
+    ///
+    /// **关键设计**：利用 CAN 总线优先级机制（ID 越小优先级越高）保证顺序。
+    /// - 位姿指令 ID：`0x152`, `0x153`, `0x154`（较小）
+    /// - 序号指令 ID：`0x158`（较大）
+    ///
+    /// 只要将这 4 帧数据作为一个 Batch 一次性写入 CAN 控制器，
+    /// CAN 控制器和总线仲裁机制会保证：**位姿数据一定先于序号指令被处理**。
+    ///
+    /// **警告**：由于 `send_realtime_package` 使用邮箱模式（覆盖策略），
+    /// 连续两次调用此方法会导致第一次被覆盖。对于圆弧运动，请使用 `send_circular_motion`。
+    ///
+    /// **优势**：
+    /// - ✅ 保证顺序：利用硬件机制，无需等待 ACK
+    /// - ✅ 高性能：非阻塞，避免 `send_reliable` 的通信延迟
+    /// - ✅ 原子性：一次调用完成所有相关帧的发送
+    ///
+    /// # 参数
+    ///
+    /// - `position`: 末端位置（米）
+    /// - `orientation`: 末端姿态（欧拉角，度）
+    /// - `index`: 圆弧序号（0x01=起点, 0x02=中点, 0x03=终点）
+    #[allow(dead_code)] // 保留用于向后兼容或特殊场景
+    pub(crate) fn send_pose_with_index(
+        &self,
+        position: Position3D,
+        orientation: EulerAngles,
+        index: u8,
+    ) -> Result<()> {
+        use piper_protocol::control::{ArcPointCommand, ArcPointIndex};
+
+        // 构建位姿帧
+        let pose_frames = Self::build_end_pose_frames(&position, &orientation);
+
+        // 构建序号帧
+        // index: 0x01=起点, 0x02=中点, 0x03=终点
+        let arc_index = match index {
+            0x01 => ArcPointIndex::Start,
+            0x02 => ArcPointIndex::Middle,
+            0x03 => ArcPointIndex::End,
+            _ => ArcPointIndex::Invalid,
+        };
+        let index_frame = ArcPointCommand::new(arc_index).to_frame(); // 0x158
+
+        // ✅ 构建 4 帧的 Package，原子性发送
+        let package = [
+            pose_frames[0], // 0x152
+            pose_frames[1], // 0x153
+            pose_frames[2], // 0x154
+            index_frame,    // 0x158
+        ];
+
+        // ✅ 使用实时通道一次性发送，保证顺序且无阻塞
+        // CAN 总线仲裁机制确保 0x152 < 0x153 < 0x154 < 0x158 的顺序
+        self.driver.send_realtime_package(package)?;
+
+        Ok(())
+    }
+
     /// 发送圆弧运动命令（原子性发送所有点）
     ///
     /// **关键设计**：将所有点打包到一个 Frame Package 里，一次性发送。
@@ -309,9 +373,9 @@ impl<'a> RawCommander<'a> {
     /// **为什么需要打包发送？**
     ///
     /// `send_realtime_package` 使用邮箱模式（Mailbox），采用覆盖策略（Last Write Wins）。
-    /// 如果分两次发送位姿数据：
-    /// - 第一次发送：中间点（4帧）放入邮箱
-    /// - 第二次发送：终点（4帧）**覆盖**邮箱中的中间点
+    /// 如果分两次调用 `send_pose_with_index`：
+    /// - 第一次调用：中间点（4帧）放入邮箱
+    /// - 第二次调用：终点（4帧）**覆盖**邮箱中的中间点
     /// - 结果：中间点丢失，只有终点被发送
     ///
     /// **解决方案**：

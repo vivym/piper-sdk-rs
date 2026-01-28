@@ -330,10 +330,8 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let send_times = tx_adapter.send_times.clone();
 
     // 创建命令通道
-    let (realtime_tx, _realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
+    let (realtime_tx, realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     // 启动 RX 线程
     let ctx_rx = ctx.clone();
@@ -350,7 +348,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_rx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
@@ -515,10 +513,8 @@ fn test_command_priority_performance() {
     let tx_adapter = SimpleTxAdapter::new(Duration::from_micros(100));
 
     // 创建命令通道
-    let (realtime_tx, _realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
+    let (realtime_tx, realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     // 启动 TX 线程
     let ctx_tx = ctx.clone();
@@ -527,7 +523,7 @@ fn test_command_priority_performance() {
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_rx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
@@ -563,10 +559,8 @@ fn test_command_priority_performance() {
     let is_running2 = Arc::new(AtomicBool::new(true));
     let metrics2 = Arc::new(PiperMetrics::new());
     let tx_adapter2 = SimpleTxAdapter::new(Duration::from_micros(100));
-    let (realtime_tx2, _realtime_rx2) = crossbeam_channel::bounded::<PiperFrame>(1);
+    let (realtime_tx2, realtime_rx2) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx2, reliable_rx2) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot2: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     let ctx_tx2 = ctx.clone();
     let is_running_tx2 = is_running2.clone();
@@ -574,7 +568,7 @@ fn test_command_priority_performance() {
     let tx_handle2 = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter2,
-            realtime_slot2,
+            realtime_rx2,
             reliable_rx2,
             is_running_tx2,
             metrics_tx2,

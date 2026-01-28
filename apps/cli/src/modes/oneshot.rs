@@ -116,16 +116,19 @@ impl OneShotMode {
     /// 回零位
     pub async fn home(&mut self) -> Result<()> {
         // ✅ 实际连接并执行回零
-        let builder = if let Some(interface) = &self.config.interface {
+        // 🟡 P1-2 修复：优先使用 serial（如果提供），其次使用 interface
+        let connection_target = self.config.serial.clone().or(self.config.interface.clone());
+
+        let builder = if let Some(target) = connection_target {
             #[cfg(target_os = "linux")]
             {
-                println!("使用 CAN 接口: {} (SocketCAN)", interface);
+                println!("使用 CAN 接口: {} (SocketCAN)", target);
             }
             #[cfg(not(target_os = "linux"))]
             {
-                println!("使用设备序列号: {}", interface);
+                println!("使用设备序列号: {}", target);
             }
-            ClientPiperBuilder::new().interface(interface)
+            ClientPiperBuilder::new().interface(target)
         } else {
             #[cfg(target_os = "linux")]
             {
@@ -177,16 +180,19 @@ impl OneShotMode {
         println!("⏳ 连接到机器人...");
 
         // 创建 Piper 实例（使用 driver 层 API 以支持 FPS 统计）
-        let builder = if let Some(interface) = &self.config.interface {
+        // 🟡 P1-2 修复：优先使用 serial（如果提供），其次使用 interface
+        let connection_target = self.config.serial.clone().or(self.config.interface.clone());
+
+        let builder = if let Some(target) = connection_target {
             #[cfg(target_os = "linux")]
             {
-                println!("使用 CAN 接口: {} (SocketCAN)", interface);
+                println!("使用 CAN 接口: {} (SocketCAN)", target);
             }
             #[cfg(not(target_os = "linux"))]
             {
-                println!("使用设备序列号: {}", interface);
+                println!("使用设备序列号: {}", target);
             }
-            DriverPiperBuilder::new().interface(interface)
+            DriverPiperBuilder::new().interface(target)
         } else {
             #[cfg(target_os = "linux")]
             {

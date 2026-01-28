@@ -131,9 +131,8 @@ fn test_rx_unaffected_by_tx_timeout() {
     let tx_adapter = MockTxAdapter::new(Duration::from_millis(1));
 
     // 创建命令通道
+    let (_realtime_tx, realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     // 启动 RX 线程
     let ctx_rx = ctx.clone();
@@ -150,7 +149,7 @@ fn test_rx_unaffected_by_tx_timeout() {
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_rx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
@@ -225,9 +224,8 @@ fn test_tx_detects_rx_failure() {
     let tx_adapter = MockTxAdapter::new(Duration::from_millis(1));
 
     // 创建命令通道
+    let (_realtime_tx, realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     // 启动 RX 线程
     let ctx_rx = ctx.clone();
@@ -244,7 +242,7 @@ fn test_tx_detects_rx_failure() {
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_rx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
@@ -319,9 +317,8 @@ fn test_thread_lifecycle_linkage() {
     let tx_adapter = MockTxAdapter::new(Duration::from_millis(1));
 
     // 创建命令通道
+    let (_realtime_tx, realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     // 启动 RX 线程
     let ctx_rx = ctx.clone();
@@ -338,7 +335,7 @@ fn test_thread_lifecycle_linkage() {
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_rx,
             reliable_rx,
             is_running_tx,
             metrics_tx,

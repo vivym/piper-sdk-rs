@@ -14,14 +14,16 @@ mod imp {
     type qos_class_t = c_int;
 
     // macOS QoS 级别定义
-    const QOS_CLASS_USER_INTERACTIVE: qos_class_t = 0x21; // 最高实时性优先级
+    const QOS_CLASS_USER_INTERACTIVE: qos_class_t = 0x21; // 最高实时性优先级（用于 USB Rx/Tx 线程）
+
+    // 备用 QoS 级别，当前未使用但保留以备将来需要
     #[allow(dead_code)]
-    const QOS_CLASS_USER_INITIATED: qos_class_t = 0x19;
+    const QOS_CLASS_USER_INITIATED: qos_class_t = 0x19; // 用户发起的任务（中等优先级）
     #[allow(dead_code)]
-    const QOS_CLASS_DEFAULT: qos_class_t = 0x15;
-    const QOS_CLASS_UTILITY: qos_class_t = 0x11;
+    const QOS_CLASS_DEFAULT: qos_class_t = 0x15; // 默认优先级
+    const QOS_CLASS_UTILITY: qos_class_t = 0x11; // 低优先级（用于设备管理线程）
     #[allow(dead_code)]
-    const QOS_CLASS_BACKGROUND: qos_class_t = 0x09;
+    const QOS_CLASS_BACKGROUND: qos_class_t = 0x09; // 后台任务（最低优先级）
 
     unsafe extern "C" {
         fn pthread_self() -> pthread_t;

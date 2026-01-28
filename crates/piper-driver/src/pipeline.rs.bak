@@ -565,7 +565,6 @@ pub fn tx_loop_mailbox(
                 match tx.send(frame) {
                     Ok(_) => {
                         sent_count += 1;
-                        metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
                         // 🆕 v1.2.1: 触发 TX 回调（仅在发送成功后）
                         // 使用 try_read 避免阻塞
                         if let Ok(hooks) = ctx.hooks.try_read() {
@@ -628,15 +627,13 @@ pub fn tx_loop_mailbox(
         if let Ok(frame) = reliable_rx.try_recv() {
             match tx.send(frame) {
                 Ok(_) => {
-                    // 更新 metrics（可靠命令发送）
-                    metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
-
                     // 🆕 v1.2.1: 触发 TX 回调（仅在发送成功后）
                     // 使用 try_read 避免阻塞
                     if let Ok(hooks) = ctx.hooks.try_read() {
                         hooks.trigger_all_sent(&frame);
                         // ^^^v 非阻塞，<1μs
                     }
+                    // 注意：不在这里更新 tx_frames_total，因为 send_reliable() 已经更新了
                 },
                 Err(e) => {
                     error!("TX thread: Failed to send reliable frame: {}", e);
@@ -662,6 +659,97 @@ pub fn tx_loop_mailbox(
         // 注意：这里的延迟不会影响控制循环，因为控制循环在另一个线程
         // 使用 spin_sleep 而非 thread::sleep 以获得微秒级精度（相比 thread::sleep 的 1-2ms）
         spin_sleep::sleep(Duration::from_micros(50));
+    }
+
+    trace!("TX thread: loop exited");
+}
+
+/// TX 线程主循环（旧版，保留用于兼容性）
+///
+/// 专门负责从命令队列取命令并发送。
+/// 支持优先级队列：实时命令优先于可靠命令。
+///
+/// # 参数
+/// - `tx`: TX 适配器（只写）
+/// - `realtime_rx`: 实时命令队列接收端（容量 1）
+/// - `reliable_rx`: 可靠命令队列接收端（容量 10）
+/// - `is_running`: 运行标志（用于生命周期联动）
+/// - `metrics`: 性能指标
+/// - `ctx`: 共享状态上下文（用于触发 TX 回调，v1.2.1）
+#[allow(dead_code)]
+pub fn tx_loop(
+    mut tx: impl TxAdapter,
+    realtime_rx: Receiver<PiperFrame>,
+    reliable_rx: Receiver<PiperFrame>,
+    is_running: Arc<AtomicBool>,
+    metrics: Arc<PiperMetrics>,
+    ctx: Arc<PiperContext>,
+) {
+    loop {
+        // 检查运行标志
+        // Acquire: If we see false, we must see all cleanup writes from other threads
+        if !is_running.load(Ordering::Acquire) {
+            trace!("TX thread: is_running flag is false, exiting");
+            break;
+        }
+
+        // 优先级调度：优先处理实时命令
+        // 使用 try_recv 确保严格优先级（crossbeam::select! 是公平的）
+        let frame = if let Ok(f) = realtime_rx.try_recv() {
+            // 实时命令
+            f
+        } else if let Ok(f) = reliable_rx.try_recv() {
+            // 可靠命令
+            f
+        } else {
+            // 两个队列都为空，使用带超时的 recv 等待任意一个
+            // 使用较短的超时（1ms），避免长时间阻塞
+            match crossbeam_channel::select! {
+                recv(realtime_rx) -> msg => msg,
+                recv(reliable_rx) -> msg => msg,
+                default(Duration::from_millis(1)) => {
+                    // 超时，继续循环检查 is_running
+                    continue;
+                },
+            } {
+                Ok(f) => f,
+                Err(_) => {
+                    // 通道断开
+                    trace!("TX thread: command channel disconnected");
+                    break;
+                },
+            }
+        };
+
+        // 发送帧
+        match tx.send(frame) {
+            Ok(_) => {
+                // 🆕 v1.2.1: 触发 TX 回调（仅在发送成功后）
+                // 使用 try_read 避免阻塞
+                if let Ok(hooks) = ctx.hooks.try_read() {
+                    hooks.trigger_all_sent(&frame);
+                    // ^^^v 非阻塞，<1μs
+                }
+                metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
+            },
+            Err(e) => {
+                error!("TX thread: Failed to send frame: {}", e);
+                metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+
+                // 检测致命错误
+                let is_fatal = matches!(e, CanError::Device(_) | CanError::BufferOverflow);
+
+                if is_fatal {
+                    error!("TX thread: Fatal error detected, setting is_running = false");
+                    // Release: All writes before this are visible to threads that see the false value
+                    is_running.store(false, Ordering::Release);
+                    break;
+                }
+
+                // 非致命错误，继续循环尝试恢复
+            },
+        }
     }
 
     trace!("TX thread: loop exited");

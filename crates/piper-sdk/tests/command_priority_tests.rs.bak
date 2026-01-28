@@ -89,10 +89,8 @@ fn test_priority_scheduling() {
     let sent_frames = tx_adapter.sent_frames.clone();
 
     // 创建命令通道
+    let (realtime_tx, realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let realtime_slot_clone = realtime_slot.clone();
 
     // 启动 RX 线程
     let ctx_rx = ctx.clone();
@@ -109,7 +107,7 @@ fn test_priority_scheduling() {
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_rx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
@@ -127,10 +125,8 @@ fn test_priority_scheduling() {
     reliable_tx.send(reliable_frame1).unwrap();
     reliable_tx.send(reliable_frame2).unwrap();
 
-    // 立即发送实时命令（写入 mailbox slot）
-    *realtime_slot_clone.lock().unwrap() = Some(
-        piper_sdk::driver::command::RealtimeCommand::single(realtime_frame),
-    );
+    // 立即发送实时命令
+    realtime_tx.send(realtime_frame).unwrap();
 
     // 等待处理完成
     thread::sleep(Duration::from_millis(150));
@@ -212,9 +208,8 @@ fn test_reliable_command_not_dropped() {
     let sent_count = tx_adapter.sent_count.clone();
 
     // 创建命令通道（可靠队列容量 10）
+    let (_realtime_tx, realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     // 启动 TX 线程
     let ctx_tx = ctx.clone();
@@ -223,7 +218,7 @@ fn test_reliable_command_not_dropped() {
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_rx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
@@ -323,10 +318,8 @@ fn test_realtime_overwrite_strategy() {
     let sent_frames = tx_adapter.sent_frames.clone();
 
     // 创建命令通道（实时队列容量 1）
+    let (realtime_tx, realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let realtime_slot_clone = realtime_slot.clone();
 
     // 启动 TX 线程
     let ctx_tx = ctx.clone();
@@ -335,7 +328,7 @@ fn test_realtime_overwrite_strategy() {
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_rx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
@@ -349,9 +342,20 @@ fn test_realtime_overwrite_strategy() {
         .collect();
 
     for frame in realtime_commands.iter() {
-        // 写入 realtime slot（会覆盖之前的值）
-        *realtime_slot_clone.lock().unwrap() =
-            Some(piper_sdk::driver::command::RealtimeCommand::single(*frame));
+        // 使用 try_send，如果队列满则等待
+        match realtime_tx.try_send(*frame) {
+            Ok(_) => {},
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                // 队列满，等待一小段时间后重试（最多重试 3 次）
+                for _ in 0..3 {
+                    thread::sleep(Duration::from_millis(5));
+                    if realtime_tx.try_send(*frame).is_ok() {
+                        break;
+                    }
+                }
+            },
+            Err(_) => break,
+        }
         thread::sleep(Duration::from_millis(2));
     }
 

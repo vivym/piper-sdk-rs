@@ -6,12 +6,11 @@ use anyhow::{Result, bail};
 use piper_tools::SafetyConfig;
 
 /// 安全检查器
-#[allow(dead_code)]
 pub struct SafetyChecker {
+    #[allow(dead_code)] // 安全基础设施，保留以备未来使用
     config: SafetyConfig,
 }
 
-#[allow(dead_code)]
 impl SafetyChecker {
     /// 创建新的安全检查器
     pub fn new() -> Self {
@@ -21,6 +20,7 @@ impl SafetyChecker {
     }
 
     /// 检查关节位置是否在限制内
+    #[allow(dead_code)] // 安全基础设施，保留以备未来使用
     pub fn check_joint_positions(&self, positions: &[f64]) -> Result<()> {
         for (i, &pos) in positions.iter().enumerate() {
             if !self.config.check_joint_position(i, pos) {
@@ -32,6 +32,7 @@ impl SafetyChecker {
     }
 
     /// 检查是否需要用户确认
+    #[allow(dead_code)] // 安全基础设施，保留以备未来使用
     pub fn requires_confirmation(&self, positions: &[f64]) -> bool {
         // 计算最大角度变化
         let max_delta = positions.iter().map(|&p| p.abs()).fold(0.0_f64, f64::max);
@@ -43,7 +44,6 @@ impl SafetyChecker {
     }
 
     /// 显示确认提示
-    #[allow(dead_code)]
     pub fn show_confirmation_prompt(&self, positions: &[f64]) -> Result<bool> {
         let max_delta = positions.iter().map(|&p| p.abs()).fold(0.0_f64, f64::max);
 
