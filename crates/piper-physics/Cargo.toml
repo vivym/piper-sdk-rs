@@ -11,8 +11,7 @@ piper-sdk = { path = "../piper-sdk" }
 
 # 必选依赖（通过 re-export 模式）
 nalgebra = { version = "0.32", features = ["std"] }
-k = { version = "0.32", optional = true }  # 用于运动学（FK/IK）
-mujoco-rs = { version = "2.3", optional = true }  # 用于动力学（重力补偿）
+mujoco-rs = "2.3"  # MuJoCo physics engine for gravity compensation
 
 # 错误处理
 thiserror = "1.0"
@@ -20,24 +19,23 @@ thiserror = "1.0"
 # 日志
 log = "0.4"
 
-[features]
-# ⚠️  IMPORTANT: MuJoCo is NOT enabled by default!
-#
-# MuJoCo requires native library installation (libmujoco.so/dylib/dll).
-# If you enable this feature, you must:
-# 1. Install MuJoCo: brew install mujoco (macOS) or apt-get install libmujoco-dev (Linux)
-# 2. Set environment variables: MUJOCO_DIR, LD_LIBRARY_PATH
-#
-# To use piper-physics WITHOUT MuJoCo, use features = ["kinematics"]
-#
-# See: https://github.com/google-deepmind/mujoco/blob/main/BUILD.md
-default = []  # No default features - user must explicitly choose
-kinematics = ["dep:k"]  # k crate for kinematics (pure Rust, no external deps)
-dynamics = ["dep:mujoco-rs"]  # MuJoCo for dynamics (requires native library)
-mujoco = ["dep:mujoco-rs"]  # Alias for dynamics
+[build-dependencies]
+# HTTP下载
+ureq = "2.9"
+
+# 文件压缩
+flate2 = "1.0"
+tar = "0.4"
+zip = "0.6"
+
+# 目录处理
+dirs = "5.0"
 
 [dev-dependencies]
 # 用于测试
 piper-sdk = { path = "../piper-sdk" }
 env_logger = "0.10"
 approx = "0.5"
+
+# 用于真实机械臂控制的example
+ctrlc = "3.4"

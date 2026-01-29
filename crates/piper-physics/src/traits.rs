@@ -141,11 +141,9 @@ pub trait GravityCompensation: Send + Sync {
     /// # Migration Guide
     ///
     /// ```rust,no_run
-    /// # #[cfg(feature = "mujoco")]
-    /// # {
     /// # use piper_physics::{MujocoGravityCompensation, GravityCompensation};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let mut gc = MujocoGravityCompensation::from_standard_path()?;
+    /// # let mut gc = MujocoGravityCompensation::from_embedded()?;
     /// # let q = piper_physics::JointState::from_iterator([0.0; 6]);
     /// // Old (deprecated):
     /// let torques = gc.compute_gravity_torques(&q, None)?;
@@ -153,7 +151,6 @@ pub trait GravityCompensation: Send + Sync {
     /// // New (recommended):
     /// let torques = gc.compute_gravity_compensation(&q)?;
     /// # Ok(())
-    /// # }
     /// # }
     /// ```
     #[deprecated(since = "0.0.4", note = "Use compute_gravity_compensation instead")]

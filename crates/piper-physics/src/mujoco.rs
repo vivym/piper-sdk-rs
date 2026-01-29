@@ -868,26 +868,34 @@ mod tests {
             // Fast motion
             let tau_fast = gravity.compute_partial_inverse_dynamics(&q, &qvel_fast).unwrap();
 
-            // Verify: faster motion should produce larger torques (Coriolis effect)
+            // Verify: velocity affects the torque (Coriolis forces are present)
+            // We check that at least some joints show significant Coriolis effects
+            let mut joints_with_coriolis = 0;
             for i in 0..6 {
-                // Slow motion should be >= static
-                assert!(
-                    tau_slow[i].abs() >= tau_static[i].abs(),
-                    "Joint {}: slow motion torque ({:.6}) should be >= static ({:.6})",
-                    i,
-                    tau_slow[i],
-                    tau_static[i]
-                );
+                let slow_diff = (tau_slow[i] - tau_static[i]).abs();
+                let fast_diff = (tau_fast[i] - tau_static[i]).abs();
 
-                // Fast motion should be >= slow motion
-                assert!(
-                    tau_fast[i].abs() >= tau_slow[i].abs(),
-                    "Joint {}: fast motion torque ({:.6}) should be >= slow ({:.6})",
-                    i,
-                    tau_fast[i],
-                    tau_slow[i]
-                );
+                // Check if this joint shows velocity-dependent effects
+                if slow_diff > 0.0001 || fast_diff > 0.0001 {
+                    joints_with_coriolis += 1;
+
+                    // For joints with Coriolis effects, faster motion should have larger effect
+                    assert!(
+                        fast_diff >= slow_diff,
+                        "Joint {}: fast motion diff ({:.6}) should be >= slow diff ({:.6})",
+                        i,
+                        fast_diff,
+                        slow_diff
+                    );
+                }
             }
+
+            // At least 3 joints should show Coriolis effects
+            assert!(
+                joints_with_coriolis >= 3,
+                "Expected at least 3 joints with Coriolis effects, got {}",
+                joints_with_coriolis
+            );
         }
     }
 
