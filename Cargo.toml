@@ -7,6 +7,7 @@ members = [
     "crates/piper-client",
     "crates/piper-sdk",
     "crates/piper-tools",
+    "crates/piper-physics",
     "apps/daemon",
     "apps/cli",
 ]
@@ -29,6 +30,7 @@ piper-driver = { path = "crates/piper-driver" }
 piper-client = { path = "crates/piper-client" }
 piper-sdk = { path = "crates/piper-sdk" }
 piper-tools = { path = "crates/piper-tools" }
+piper-physics = { path = "crates/piper-physics" }
 
 # 协议层外部依赖
 bilge = "0.3.0"

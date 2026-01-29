@@ -1,0 +1,105 @@
+<?xml version="1.0" ?>
+<mujoco model="piper">
+  <compiler angle="radian" />
+  <size njmax="500" nconmax="100" />
+
+  <worldbody>
+    <body name="dummy_link" pos="0 0 0">
+      <body name="base_link" pos="0.0 0.0 0.0">
+        <!-- Precise inertial properties from verified model -->
+        <inertial pos="-0.00473641164191482 2.56829134630247e-05 0.041451518036016"
+                  mass="1.02"
+                  diaginertia="0.00267433 0.00282612 0.00089624" />
+        <!-- Simplified geometry for visualization (no mesh dependency) -->
+        <geom type="cylinder" size="0.05 0.1" pos="0 0 0.05"
+              rgba="0.792156862745098 0.819607843137255 0.933333333333333 1"
+              contype="0"/>
+
+        <body name="link1" pos="0.0 0.0 0.123">
+          <!-- Precise inertial from verified model -->
+          <inertial pos="0.000121504734057468 0.000104632162460536 -0.00438597309559853"
+                    mass="0.71"
+                    diaginertia="0.00048916 0.00040472 0.00043982" />
+          <joint name="joint1" pos="0 0 0" axis="0.0 0.0 1.0" limited="true"
+                 range="-2.618 2.168" damping="5" />
+          <geom type="cylinder" size="0.04 0.08" pos="0 0 0.04"
+                rgba="0.792156862745098 0.819607843137255 0.933333333333333 1"
+                contype="0"/>
+
+          <body name="link2" pos="0.0 0.0 0.0" quat="0.048008436658572406 -0.04801344301314855 -0.7054761009125181 -0.7054738622662738">
+            <!-- Precise inertial from verified model -->
+            <inertial pos="0.198666145229743 -0.010926924140076 0.00142121714502687"
+                      mass="1.17"
+                      diaginertia="0.00116918 0.06785384 0.06774489" />
+            <joint name="joint2" pos="0 0 0" axis="0.0 0.0 1.0" limited="true"
+                   range="0.0 3.14" damping="5" />
+            <geom type="box" size="0.03 0.03 0.1" pos="0 0 0.05"
+                  rgba="0.792156862745098 0.819607843137255 0.933333333333333 1"
+                  contype="0"/>
+
+            <body name="link3" pos="0.28503 0.0 0.0" quat="0.6239962203797329 0.0 0.0 -0.7814273587172437">
+              <!-- Precise inertial from verified model -->
+              <inertial pos="-0.0202737662122021 -0.133914995944595 -0.000458682652737356"
+                        mass="0.5"
+                        diaginertia="0.01361711 0.00045024 0.01380322" />
+              <joint name="joint3" pos="0 0 0" axis="0.0 0.0 1.0" limited="true"
+                     range="-2.967 0.0" damping="5" />
+              <!-- NOTE: No contype in verified model - allows collision -->
+              <geom type="box" size="0.025 0.025 0.08" pos="0 0 0.04"
+                    rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+
+              <body name="link4" pos="-0.021984 -0.25075 0.0" quat="0.7071054825112363 0.7071080798594735 0.0 0.0">
+                <!-- Precise inertial from verified model -->
+                <inertial pos="-9.66635791618542e-05 0.000876064475651083 -0.00496880904640868"
+                          mass="0.38"
+                          diaginertia="0.00018501 0.00018965 0.00015484" />
+                <joint name="joint4" pos="0 0 0" axis="0.0 0.0 1.0" limited="true"
+                       range="-1.745 1.745" damping="5" />
+                <!-- NOTE: No contype in verified model - allows collision -->
+                <geom type="cylinder" size="0.02 0.03" pos="0 0 0.015"
+                      rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+
+                <body name="link5" pos="0.0 0.0 0.0" quat="0.7071054825112363 -0.7071080798594735 0.0 0.0">
+                  <!-- Precise inertial from verified model -->
+                  <inertial pos="-4.10554118924211e-05 -0.0566486692356075 -0.0037205791677906"
+                            mass="0.383"
+                            diaginertia="0.00166169 0.0001851 0.00164321" />
+                  <joint name="joint5" pos="0 0 0" axis="0.0 0.0 1.0" limited="true"
+                         range="-1.22 1.22" damping="5" />
+                  <!-- NOTE: No contype in verified model - allows collision -->
+                  <geom type="cylinder" size="0.015 0.025" pos="0 0 0.0125"
+                        rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+
+                  <body name="link6" pos="8.8259e-05 -0.091 0.0" quat="0.7071054825112363 0.7071080798594735 0.0 0.0">
+                    <!-- Precise inertial from verified model -->
+                    <inertial pos="-8.82590762930069e-05 9.0598378529832e-06 -0.002"
+                              mass="0.007"
+                              diaginertia="5.73015540542155e-07 5.73015540542155e-07 1.06738869138926e-06" />
+                    <joint name="joint6" pos="0 0 0" axis="0.0 0.0 1.0" limited="true"
+                           range="-2.0944 2.0944" damping="5" />
+                    <!-- NOTE: No contype in verified model - allows collision -->
+                    <geom type="cylinder" size="0.01 0.02" pos="0 0 0.01"
+                          rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+
+                    <!-- End effector site -->
+                    <site name="end_effector" pos="0 0 0.02" size="0.01" rgba="1 0 0 1"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Precise actuator limits from verified model -->
+    <motor name="joint1" joint="joint1" ctrlrange="-90.0 90.0" />
+    <motor name="joint2" joint="joint2" ctrlrange="-20.0 20.0" />
+    <motor name="joint3" joint="joint3" ctrlrange="-20.0 20.0" />
+    <motor name="joint4" joint="joint4" ctrlrange="-10.0 10.0" />
+    <motor name="joint5" joint="joint5" ctrlrange="-10.0 10.0" />
+    <motor name="joint6" joint="joint6" ctrlrange="-10.0 10.0" />
+  </actuator>
+</mujoco>
