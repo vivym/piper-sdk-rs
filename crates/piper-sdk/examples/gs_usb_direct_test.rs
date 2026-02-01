@@ -272,7 +272,10 @@ fn read_frame(
     Ok(frame)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     println!("{}", "=".repeat(60));
     println!("GS USB 直接测试（直连调试）");
     println!("{}", "=".repeat(60));

@@ -17,6 +17,9 @@ use piper_sdk::client::types::{Joint, JointArray, Rad};
 use std::time::{Duration, Instant};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     println!("📈 Piper SDK - Trajectory Planner Demo");
     println!("======================================\n");
 

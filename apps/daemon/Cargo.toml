@@ -14,6 +14,8 @@ piper-protocol = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# ✅ 非阻塞日志持久化（文件输出 + 每日轮转）
+tracing-appender = "0.2"
 clap = { workspace = true }
 ctrlc = { workspace = true }
 fs4 = { workspace = true }

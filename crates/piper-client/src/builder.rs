@@ -8,6 +8,7 @@ use crate::types::Result;
 use piper_driver::PiperBuilder as DriverBuilder;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, info};
 
 /// Client 层 Piper Builder
 ///
@@ -102,39 +103,51 @@ impl PiperBuilder {
     /// - 当启用 Daemon 模式时，`interface` 参数会被忽略（Daemon 模式优先级最高）
     /// - Interface 为 `None` 时，Linux 平台默认使用 "can0"，其他平台自动选择第一个 GS-USB 设备
     pub fn build(self) -> Result<Piper<Standby>> {
+        debug!("Building Piper client connection");
+
         // 构造 Driver Builder
         let mut driver_builder = DriverBuilder::new();
 
         // 处理 interface：保持 Option<String> 语义
-        if let Some(interface) = self.interface {
+        if let Some(ref interface) = self.interface {
+            debug!("Configuring interface: {}", interface);
             driver_builder = driver_builder.interface(interface);
         } else {
             // 使用平台默认值
             #[cfg(target_os = "linux")]
             {
+                debug!("Using default Linux interface: can0");
                 driver_builder = driver_builder.interface("can0");
             }
-            // macOS/Windows: 不设置 interface，让 Driver 层自动选择
+            #[cfg(not(target_os = "linux"))]
+            {
+                debug!("Auto-selecting first available GS-USB device");
+            }
         }
 
         // 设置波特率（如果有）
         if let Some(baud) = self.baud_rate {
+            debug!("Configuring baud rate: {} bps", baud);
             driver_builder = driver_builder.baud_rate(baud);
         }
 
         // 设置守护进程（如果有，优先级最高）
-        if let Some(daemon) = self.daemon_addr {
+        if let Some(ref daemon) = self.daemon_addr {
+            info!("Using daemon mode: {}", daemon);
             driver_builder = driver_builder.with_daemon(daemon);
         }
 
         // 构建 Driver 实例
         // 注意：DriverError 通过 #[from] 自动转换为 RobotError::Infrastructure
         let driver = Arc::new(driver_builder.build()?);
+        debug!("Driver connection established");
 
         // 等待反馈
         let timeout = self.timeout.unwrap_or(Duration::from_secs(5));
+        debug!("Waiting for robot feedback (timeout: {:?})", timeout);
         // 注意：DriverError 通过 #[from] 自动转换为 RobotError::Infrastructure
         driver.wait_for_feedback(timeout)?;
+        info!("Robot ready - Standby mode");
 
         // 创建 Observer
         let observer = Observer::new(driver.clone());

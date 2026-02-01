@@ -12,6 +12,10 @@ piper-client = { workspace = true }
 piper-driver = { workspace = true }
 piper-can = { workspace = true }
 piper-protocol = { workspace = true }
+# ✅ 日志初始化宏支持
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
 
 [dev-dependencies]
 crossbeam-channel = { workspace = true }

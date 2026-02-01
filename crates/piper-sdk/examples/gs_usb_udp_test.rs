@@ -85,7 +85,7 @@ fn test_send(
     adapter: &mut GsUsbUdpAdapter,
     count: u32,
     interval: Duration,
-) -> Result<(), CanError> {
+) -> std::result::Result<(), CanError> {
     println!("开始发送测试（发送 {} 帧）...", count);
 
     for i in 0..count {
@@ -123,7 +123,10 @@ fn test_send(
 }
 
 /// 测试接收功能
-fn test_receive(adapter: &mut GsUsbUdpAdapter, timeout: Duration) -> Result<(), CanError> {
+fn test_receive(
+    adapter: &mut GsUsbUdpAdapter,
+    timeout: Duration,
+) -> std::result::Result<(), CanError> {
     println!("开始接收测试（超时: {:?}）...", timeout);
     println!("等待接收 CAN 帧...");
 
@@ -167,7 +170,7 @@ fn test_loopback(
     count: u32,
     interval: Duration,
     running: Arc<AtomicBool>,
-) -> Result<(), CanError> {
+) -> std::result::Result<(), CanError> {
     println!("开始回环测试（发送 {} 帧并尝试接收）...", count);
     println!("注意：此测试需要设备支持 loopback 模式或连接到实际的 CAN 总线");
 
@@ -255,7 +258,7 @@ fn test_loopback(
 fn interactive_mode(
     adapter: &mut GsUsbUdpAdapter,
     running: Arc<AtomicBool>,
-) -> Result<(), CanError> {
+) -> std::result::Result<(), CanError> {
     println!("进入交互模式");
     println!("可用命令:");
     println!("  send <id> <data...>  - 发送标准帧（例如: send 0x123 01 02 03）");
@@ -371,7 +374,10 @@ fn interactive_mode(
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     let args = Args::parse();
 
     // 设置 Ctrl+C 处理

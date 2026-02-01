@@ -561,7 +561,7 @@ impl CanAdapter for GsUsbCanAdapter {
             },
         }
 
-        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
+        // Hot path: removed trace! call (TX can be high frequency)
         Ok(())
     }
 
@@ -581,11 +581,7 @@ impl CanAdapter for GsUsbCanAdapter {
 
         // 1. 优先从队列中取（如果有上次读剩下的）
         if let Some(frame) = self.rx_queue.pop_front() {
-            // 调试信息：验证 rx_queue 正在工作
-            trace!(
-                "Returning frame from queue (queue size: {})",
-                self.rx_queue.len()
-            );
+            // Hot path: removed trace! call (queue return is 200Hz+)
             return Ok(frame);
         }
 
@@ -661,7 +657,7 @@ impl CanAdapter for GsUsbCanAdapter {
                         is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
                         timestamp_us: gs_frame.timestamp_us as u64, // GS-USB 使用 u32，转换为 u64
                     };
-                    trace!("Received CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
+                    // Hot path: removed trace! call (200Hz+)
                     return Ok(frame);
                 }
                 // 如果是 Echo 且非 Loopback，继续循环读取下一个包
@@ -673,7 +669,7 @@ impl CanAdapter for GsUsbCanAdapter {
                 // 3.1 过滤 TX Echo（静默丢弃）
                 // 注意：在 Loopback 模式下，Echo 是测试的一部分，不应该被过滤
                 if !is_loopback && gs_frame.is_tx_echo() {
-                    trace!("Received TX echo (ignored)");
+                    // TX echo filtering - removed trace! call (high frequency)
                     continue;
                 }
 
@@ -702,12 +698,7 @@ impl CanAdapter for GsUsbCanAdapter {
             // 4. 如果队列里有东西了，返回第一个；否则继续循环读 USB
             // 注意：如果这批数据都被过滤掉了（例如全是 Echo 且非 Loopback），循环继续
             if let Some(frame) = self.rx_queue.pop_front() {
-                trace!(
-                    "Received CAN frame: ID=0x{:X}, len={} (queue size: {})",
-                    frame.id,
-                    frame.len,
-                    self.rx_queue.len()
-                );
+                // Hot path: removed trace! call (200Hz+)
                 return Ok(frame);
             }
             // 如果这批数据都被过滤掉了，继续读下一个 USB 包

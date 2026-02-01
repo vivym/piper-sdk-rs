@@ -76,3 +76,55 @@ pub use client::recording::{
 
 // 类型别名：为驱动层提供清晰的别名
 pub type Driver = driver::Piper; // 高级用户可以使用这个别名
+
+// ============================================================
+// 日志初始化宏
+// ============================================================
+
+/// 初始化日志系统（便捷宏）
+///
+/// ## 功能
+///
+/// - 兼容 `log` crate（通过 `tracing-log::LogTracer`）
+/// - 从 `RUST_LOG` 环境变量读取日志级别
+/// - 默认级别：`piper_sdk=info`
+/// - 格式：compact，隐藏 target（易读）
+///
+/// ## 使用示例
+///
+/// ```rust,no_run
+/// use piper_sdk::prelude::*;
+///
+/// fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+///     // 在 main 函数开头初始化日志
+///     piper_sdk::init_logger!();
+///
+///     // 连接机器人
+///     let driver = PiperBuilder::new().interface("can0").build()?;
+///
+///     // 现在可以使用 tracing::info!, tracing::warn! 等宏
+///     tracing::info!("Connected to robot");
+///
+///     Ok(())
+/// }
+/// ```
+#[macro_export]
+macro_rules! init_logger {
+    () => {
+        // ✅ 兼容旧 log crate 的宏（如 log::info!）
+        let _ = ::tracing_log::LogTracer::init();
+
+        // 使用默认配置，支持 RUST_LOG 环境变量
+        if ::std::env::var("RUST_LOG").is_ok() {
+            // 用户设置了 RUST_LOG，使用他们的配置
+            ::tracing_subscriber::fmt().with_target(false).compact().init();
+        } else {
+            // 使用默认级别 info
+            ::tracing_subscriber::fmt()
+                .with_max_level(::tracing::Level::INFO)
+                .with_target(false)
+                .compact()
+                .init();
+        }
+    };
+}

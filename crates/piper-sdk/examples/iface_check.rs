@@ -14,11 +14,17 @@
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     eprintln!("该示例仅支持 Linux（SocketCAN）。");
 }
 
 #[cfg(target_os = "linux")]
 fn main() {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     use piper_sdk::can::SocketCanAdapter;
     use std::env;
     use std::time::Duration;

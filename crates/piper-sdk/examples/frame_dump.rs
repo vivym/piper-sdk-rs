@@ -9,7 +9,10 @@
 //! - 帧回放功能
 //! - 网络传输帧数据
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     println!("🎯 Piper Frame Dump Example\n");
 
     // 只有启用 serde feature 时才能运行此演示

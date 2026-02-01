@@ -5,9 +5,9 @@
 //! 正确的做法是使用 Arc<Mutex<Piper>> 来共享机器人实例。
 
 use clap::Parser;
-use piper_sdk::PiperBuilder;
-use piper_sdk::client::state::*;
-use piper_sdk::client::types::*;
+use piper_sdk::client::state::MitModeConfig;
+use piper_sdk::client::types::{JointArray, NewtonMeter, Rad};
+use piper_sdk::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +35,9 @@ struct Args {
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     let args = Args::parse();
 
     println!("🤖 Piper SDK - 多线程控制演示");

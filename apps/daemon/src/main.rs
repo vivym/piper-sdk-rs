@@ -12,6 +12,8 @@ use daemon::{Daemon, DaemonConfig};
 use singleton::SingletonLock;
 use std::process;
 use std::time::Duration;
+use tracing::{error, info, warn};
+use tracing_subscriber::prelude::*;
 
 /// GS-USB 守护进程
 ///
@@ -116,7 +118,88 @@ fn get_default_lock_file() -> String {
     std::env::temp_dir().join("gs_usb_daemon.lock").to_string_lossy().to_string()
 }
 
+/// 初始化日志系统
+///
+/// ## 配置说明
+///
+/// - **终端输出**: compact 格式，隐藏 target，仅显示重要日志
+/// - **文件输出**: JSON 格式，每日轮转，保留 7 天
+/// - **默认级别**: info（可通过 RUST_LOG 环境变量覆盖）
+///
+/// ## 日志级别策略
+///
+/// - `gs_usb_daemon=info`: 守护进程自身的日志
+/// - `piper_driver=warn`: 驱动层仅警告和错误
+/// - `piper_can=warn`: CAN 层仅警告和错误
+/// - `piper_protocol=warn`: 协议层仅警告和错误
+///
+/// ## 使用示例
+///
+/// ```bash
+/// # 默认级别
+/// cargo run --bin gs_usb_daemon
+///
+/// # 启用详细调试日志
+/// RUST_LOG=debug cargo run --bin gs_usb_daemon
+///
+/// # 仅启用特定模块的 trace 日志
+/// RUST_LOG=gs_usb_daemon=trace,piper_driver=info cargo run --bin gs_usb_daemon
+/// ```
+fn init_logging() {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    // 确定日志目录（优先使用 XDG_CACHE_DIR 或系统临时目录）
+    let log_dir = if let Some(cache_dir) = dirs::cache_dir() {
+        cache_dir.join("piper").join("logs")
+    } else {
+        std::env::temp_dir().join("piper").join("logs")
+    };
+
+    // 创建日志目录（如果不存在）
+    if let Some(parent) = log_dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // 非阻塞文件日志（每日轮转，保留 7 天）
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "gs_usb_daemon.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // 从环境变量读取日志级别，默认为 info
+    let env_filter = EnvFilter::from_default_env()
+        .add_directive("gs_usb_daemon=info".parse().unwrap())
+        .add_directive("piper_driver=warn".parse().unwrap())
+        .add_directive("piper_can=warn".parse().unwrap())
+        .add_directive("piper_protocol=warn".parse().unwrap());
+
+    // 组合多个 subscriber layer
+    tracing_subscriber::registry()
+        .with(env_filter)
+        // 终端输出：compact 格式，无 target，易读
+        .with(
+            fmt::layer()
+                .with_target(false)
+                .compact()
+        )
+        // 文件输出：完整格式，用于调试和审计
+        .with(
+            fmt::layer()
+                .with_writer(non_blocking)
+                .with_target(true)
+                .with_thread_ids(true)
+        )
+        .init();
+
+    // 日志初始化信息（延迟打印，避免被 tracing 初始化前的输出干扰）
+    // 注意：此时尚未连接到设备，仅打印日志路径信息
+    // 实际的启动信息在 main() 中打印
+}
+
 fn main() {
+    // ============================================================
+    // 初始化日志（必须在所有其他操作之前）
+    // ============================================================
+    init_logging();
+
     // 解析命令行参数
     let mut args = Args::parse();
 
@@ -127,9 +210,9 @@ fn main() {
     let _lock = match SingletonLock::try_lock(&lock_file) {
         Ok(lock) => lock,
         Err(e) => {
-            eprintln!("Failed to acquire singleton lock: {}", e);
-            eprintln!("Another instance of gs_usb_daemon may be running.");
-            eprintln!("Lock file: {}", lock_file);
+            error!("Failed to acquire singleton lock: {}", e);
+            error!("Another instance of gs_usb_daemon may be running.");
+            error!("Lock file: {}", lock_file);
             process::exit(1);
         },
     };
@@ -137,16 +220,13 @@ fn main() {
     // 2. 设置信号处理（Ctrl+C 优雅退出）
     let uds_path_for_cleanup = args.uds.clone();
     ctrlc::set_handler(move || {
-        eprintln!("\nReceived interrupt signal. Shutting down...");
+        warn!("Received interrupt signal. Shutting down...");
         // 清理 UDS socket 文件（如果使用了 UDS）
         if let Some(ref uds_path) = uds_path_for_cleanup
             && std::path::Path::new(uds_path).exists()
             && let Err(e) = std::fs::remove_file(uds_path)
         {
-            eprintln!(
-                "Warning: Failed to remove UDS socket file {}: {}",
-                uds_path, e
-            );
+            warn!("Failed to remove UDS socket file {}: {}", uds_path, e);
         }
         process::exit(0);
     })
@@ -164,30 +244,30 @@ fn main() {
     };
 
     // 打印启动信息
-    eprintln!("GS-USB Daemon starting...");
-    eprintln!("  UDP: {} (default)", args.udp);
+    info!("GS-USB Daemon starting...");
+    info!("UDP: {} (default)", args.udp);
     if let Some(ref uds) = args.uds {
-        eprintln!("  UDS: {} (optional)", uds);
+        info!("UDS: {} (optional)", uds);
     }
-    eprintln!("  Bitrate: {} bps", args.bitrate);
+    info!("Bitrate: {} bps", args.bitrate);
     if let Some(ref serial) = args.serial {
-        eprintln!("  Serial: {}", serial);
+        info!("Serial: {}", serial);
     }
-    eprintln!("  Lock file: {}", lock_file);
+    info!("Lock file: {}", lock_file);
 
     // 4. 创建守护进程实例
     let mut daemon = match Daemon::new(config) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Failed to create daemon: {}", e);
+            error!("Failed to create daemon: {}", e);
             process::exit(1);
         },
     };
 
     // 5. 启动守护进程（阻塞直到退出）
-    eprintln!("GS-USB Daemon started. Press Ctrl+C to stop.");
+    info!("GS-USB Daemon started. Press Ctrl+C to stop.");
     if let Err(e) = daemon.run() {
-        eprintln!("Daemon error: {}", e);
+        error!("Daemon error: {}", e);
         process::exit(1);
     }
 }

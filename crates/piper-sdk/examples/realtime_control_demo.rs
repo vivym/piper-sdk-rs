@@ -13,9 +13,9 @@ use piper_sdk::can::PiperFrame;
 use piper_sdk::driver::{PiperBuilder, PiperCommand};
 use std::time::{Duration, Instant};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging (optional, requires tracing-subscriber dependency)
-    // tracing_subscriber::fmt::init();
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
 
     println!("=== Real-time Control Demo ===\n");
 

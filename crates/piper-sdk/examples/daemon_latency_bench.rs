@@ -69,7 +69,7 @@ impl LatencyStats {
 }
 
 /// 测试场景 2: 发送延迟（仅测试发送路径）
-fn test_send_latency() -> Result<(), Box<dyn std::error::Error>> {
+fn test_send_latency() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 测试场景 2: 发送延迟（仅发送路径）===");
 
     #[cfg(unix)]
@@ -123,7 +123,7 @@ fn test_send_latency() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 测试场景 3: 接收延迟（仅测试接收路径）
-fn test_receive_latency() -> Result<(), Box<dyn std::error::Error>> {
+fn test_receive_latency() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 测试场景 3: 接收延迟（仅接收路径）===");
     println!("注意：此测试需要 daemon 持续发送数据");
     println!("如果没有数据源，此测试会超时");
@@ -183,7 +183,7 @@ fn test_receive_latency() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 测试场景 4: 吞吐量测试
-fn test_throughput() -> Result<(), Box<dyn std::error::Error>> {
+fn test_throughput() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 测试场景 4: 吞吐量测试 ===");
 
     #[cfg(unix)]
@@ -229,7 +229,7 @@ fn test_throughput() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 测试场景 5: 客户端阻塞处理（模拟故障客户端）
-fn test_client_blocking_handling() -> Result<(), Box<dyn std::error::Error>> {
+fn test_client_blocking_handling() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 测试场景 5: 客户端阻塞处理 ===");
     println!("此测试需要手动验证：");
     println!("1. 启动 daemon");
@@ -248,7 +248,10 @@ fn test_client_blocking_handling() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     println!("GS-USB Daemon 性能基准测试");
     println!("============================\n");
 

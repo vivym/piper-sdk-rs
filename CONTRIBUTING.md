@@ -248,24 +248,156 @@ pub fn get_state(&self) -> RobotState {
 
 ## 🐛 调试
 
-### 使用日志
+### 日志使用指南
 
-我们使用 `tracing` 进行日志记录。开发时可以启用：
+我们使用 `tracing` 生态系统进行结构化日志记录。
+
+#### 初始化日志
+
+**示例和二进制程序**：必须在 `main()` 函数开头初始化日志：
 
 ```rust
-use tracing::{debug, info, warn, error};
+use piper_sdk::prelude::*;
 
-debug!("调试信息");
-info!("一般信息");
-warn!("警告");
-error!("错误");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ✅ 第一步：初始化日志
+    init_logger!();
+
+    // 然后才能看到日志输出
+    let driver = PiperBuilder::new().interface("can0").build()?;
+
+    Ok(())
+}
 ```
 
-运行时设置日志级别：
+#### 日志级别策略
+
+| 级别 | 用途 | 性能开销 | 示例 |
+|------|------|----------|------|
+| `error` | 错误，影响功能 | 极低 | CAN 连接失败、设备无响应 |
+| `warn` | 警告，不影响功能 | 极低 | 重连成功、使用默认值 |
+| `info` | 重要状态变化 | 低 | 连接成功、模式切换、配置加载 |
+| `debug` | 调试信息（单次） | 低 | 解析成功、命令发送、函数入口 |
+| `trace` | 高频循环（200Hz） | **高** | 单帧接收、单帧发送 |
+
+**关键原则**：
+- ❌ **禁止**在 200Hz 循环中使用 `trace!`（性能杀手）
+- ✅ 使用 `debug!` 记录单次事件（如函数入口）
+- ✅ 使用 `info!` 记录重要状态变化
+
+#### 性能敏感场景
+
+**驱动层 200Hz RX/TX 线程**：默认级别应为 `warn`，避免日志开销：
+
+```rust
+// ❌ 错误：高频循环中的 trace
+fn rx_thread(&self) {
+    loop {
+        let frame = self.rx.recv()?;
+        tracing::trace!("Received frame: {:?}", frame); // 每秒 200 次日志！
+    }
+}
+
+// ✅ 正确：仅在警告级别记录异常情况
+fn rx_thread(&self) {
+    loop {
+        match self.rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(frame) => {
+                // 不记录日志（性能敏感）
+                self.process_frame(frame);
+            },
+            Err(Timeout) => {
+                // 超时是正常情况，仅在调试时启用
+                tracing::debug!("RX timeout (normal)");
+            },
+            Err(e) => {
+                // 真正的错误才记录
+                tracing::warn!("RX error: {}", e);
+            },
+        }
+    }
+}
+```
+
+#### 结构化日志（字段）
+
+优先使用结构化字段而非字符串拼接：
+
+```rust
+// ❌ 避免：字符串拼接
+tracing::info!("Connected to can0 with bitrate 1000000");
+
+// ✅ 推荐：结构化字段
+tracing::info!(
+    interface = "can0",
+    bitrate = 1_000_000,
+    "Connected to CAN interface"
+);
+```
+
+#### 使用 `#[instrument]`
+
+**适用场景**：
+- ✅ 短生命周期函数（如单次命令）
+- ✅ 异步函数
+- ✅ 需要追踪参数和返回值的函数
+
+**⚠️ 危险陷阱**：不要在长生命周期循环上使用 `#[instrument]`：
+
+```rust
+// ❌ 危险：长生命周期循环
+#[instrument(skip(self, rx))]
+fn run_rx_thread(&self, rx: Receiver<Frame>) {
+    loop { /* 永远运行 */ }
+}
+
+// ✅ 正确：在短生命周期函数上使用
+fn run_rx_thread(&self, rx: Receiver<Frame>) {
+    loop {
+        let frame = rx.recv()?;
+        self.process_single_frame(frame);  // ← 在这里用 #[instrument]
+    }
+}
+
+#[instrument(skip(self), fields(frame_id = frame.id))]
+fn process_single_frame(&self, frame: Frame) {
+    // 短生命周期函数，适合用 #[instrument]
+}
+```
+
+#### 运行时日志级别
 
 ```bash
-RUST_LOG=piper_sdk=debug cargo run --example your_example
+# 默认级别
+cargo run --example your_example
+
+# 启用调试日志
+RUST_LOG=debug cargo run --example your_example
+
+# 启用特定模块的 trace 日志（谨慎使用！）
+RUST_LOG=piper_sdk=trace cargo run --example your_example
+
+# 多模块组合
+RUST_LOG=piper_sdk=debug,piper_driver=warn cargo run --example your_example
 ```
+
+#### 兼容旧 `log` crate
+
+`init_logger!()` 宏会自动初始化 `tracing-log::LogTracer`，因此旧的 `log::info!` 等宏会自动桥接到 `tracing`：
+
+```rust
+// ✅ 旧代码仍然工作
+use log::info;  // 仍然支持
+
+fn main() {
+    init_logger!();  // 自动启用 LogTracer
+    info!("Hello from old log crate");  // 会正常输出
+}
+```
+
+#### 高级用法（自定义配置）
+
+如需文件输出、日志轮转等高级功能，请参考 `apps/daemon/src/main.rs` 的 `init_logging()` 函数实现。
 
 ## ❓ 问题？
 

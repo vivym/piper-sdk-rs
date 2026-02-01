@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::types::*;
 use crate::{observer::Observer, raw_commander::RawCommander};
 use piper_protocol::control::InstallPosition;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 // ==================== 状态类型（零大小类型）====================
 
@@ -474,11 +474,14 @@ impl Piper<Standby> {
         use piper_protocol::control::*;
         use piper_protocol::feedback::MoveMode;
 
+        debug!("Enabling MIT mode (speed_percent={})", config.speed_percent);
+
         // === PHASE 1: All operations that can panic ===
 
         // 1. 发送使能指令
         let enable_cmd = MotorEnableCommand::enable_all();
         self.driver.send_reliable(enable_cmd.to_frame())?;
+        debug!("Motor enable command sent");
 
         // 2. 等待使能完成（带 Debounce）
         self.wait_for_enabled(
@@ -486,6 +489,7 @@ impl Piper<Standby> {
             config.debounce_threshold,
             config.poll_interval,
         )?;
+        debug!("All motors enabled (debounced)");
 
         // 3. 设置 MIT 模式
         // ✅ 关键修正：MoveMode 必须设为 MoveM (0x04)
@@ -499,6 +503,7 @@ impl Piper<Standby> {
             InstallPosition::Invalid,
         );
         self.driver.send_reliable(control_cmd.to_frame())?;
+        info!("Robot enabled - Active<MitMode>");
 
         // === PHASE 2: No-panic zone - must not panic after this point ===
 
@@ -541,11 +546,17 @@ impl Piper<Standby> {
         use piper_protocol::control::*;
         use piper_protocol::feedback::MoveMode;
 
+        debug!(
+            "Enabling Position mode (motion_type={:?}, speed_percent={})",
+            config.motion_type, config.speed_percent
+        );
+
         // === PHASE 1: All operations that can panic ===
 
         // 1. 发送使能指令
         let enable_cmd = MotorEnableCommand::enable_all();
         self.driver.send_reliable(enable_cmd.to_frame())?;
+        debug!("Motor enable command sent");
 
         // 2. 等待使能完成（带 Debounce）
         self.wait_for_enabled(
@@ -553,6 +564,7 @@ impl Piper<Standby> {
             config.debounce_threshold,
             config.poll_interval,
         )?;
+        debug!("All motors enabled (debounced)");
 
         // 3. 设置位置模式
         // ✅ 修改：使用配置的 motion_type
@@ -567,6 +579,7 @@ impl Piper<Standby> {
             config.install_position,
         );
         self.driver.send_reliable(control_cmd.to_frame())?;
+        info!("Robot enabled - Active<PositionMode>");
 
         // === PHASE 2: No-panic zone - must not panic after this point ===
 
@@ -1543,11 +1556,14 @@ impl Piper<Active<MitMode>> {
     pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby>> {
         use piper_protocol::control::*;
 
+        debug!("Disabling robot");
+
         // === PHASE 1: All operations that can panic ===
 
         // 1. 失能机械臂
         let disable_cmd = MotorEnableCommand::disable_all();
         self.driver.send_reliable(disable_cmd.to_frame())?;
+        debug!("Motor disable command sent");
 
         // 2. 等待失能完成（带 Debounce）
         self.wait_for_disabled(
@@ -1555,6 +1571,7 @@ impl Piper<Active<MitMode>> {
             config.debounce_threshold,
             config.poll_interval,
         )?;
+        info!("Robot disabled - Standby mode");
 
         // === PHASE 2: No-panic zone - must not panic after this point ===
 
@@ -1816,11 +1833,14 @@ impl Piper<Active<PositionMode>> {
     pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby>> {
         use piper_protocol::control::*;
 
+        debug!("Disabling robot");
+
         // === PHASE 1: All operations that can panic ===
 
         // 1. 失能机械臂
         let disable_cmd = MotorEnableCommand::disable_all();
         self.driver.send_reliable(disable_cmd.to_frame())?;
+        debug!("Motor disable command sent");
 
         // 2. 等待失能完成（带 Debounce）
         self.wait_for_disabled(
@@ -1828,6 +1848,7 @@ impl Piper<Active<PositionMode>> {
             config.debounce_threshold,
             config.poll_interval,
         )?;
+        info!("Robot disabled - Standby mode");
 
         // === PHASE 2: No-panic zone - must not panic after this point ===
 

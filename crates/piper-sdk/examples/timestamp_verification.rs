@@ -14,6 +14,9 @@
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     eprintln!("该示例仅支持 Linux（SocketCAN）。");
 }
 
@@ -29,7 +32,10 @@ use std::mem;
 use std::os::unix::io::AsRawFd;
 
 #[cfg(target_os = "linux")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     println!("SocketCAN 硬件时间戳验证程序");
     println!("正在打开 vcan0 接口...");
 

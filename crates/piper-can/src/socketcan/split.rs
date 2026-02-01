@@ -355,10 +355,7 @@ impl RxAdapter for SocketCanRxAdapter {
             timestamp_us, // ✅ 使用提取的时间戳
         };
 
-        trace!(
-            "RX: Received CAN frame: ID=0x{:X}, len={}, timestamp_us={}",
-            piper_frame.id, piper_frame.len, piper_frame.timestamp_us
-        );
+        // Hot path: removed trace! call (200Hz+)
 
         Ok(piper_frame)
     }
@@ -625,7 +622,7 @@ impl TxAdapter for SocketCanTxAdapter {
             )))
         })?;
 
-        trace!("TX: Sent CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
+        // Hot path: removed trace! call (TX can be high frequency)
         Ok(())
     }
 }

@@ -12,7 +12,10 @@
 //! cargo run --example high_level_gripper_control
 //! ```
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     println!("🤏 Piper SDK - 夹爪控制示例");
     println!("================================\n");
 

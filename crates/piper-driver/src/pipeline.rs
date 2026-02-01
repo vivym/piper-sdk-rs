@@ -12,7 +12,7 @@ use piper_protocol::ids::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 // 使用 spin_sleep 提供微秒级延迟精度（相比 std::thread::sleep 的 1-2ms）
 use spin_sleep;
@@ -737,10 +737,7 @@ fn parse_and_update_state(
                     .load()
                     .joint_position_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!(
-                    "JointPositionState committed: mask={:03b}",
-                    state.joint_pos_frame_mask
-                );
+                // Hot path: removed trace! call (200Hz)
 
                 // 重置帧组掩码和标志
                 state.joint_pos_frame_mask = 0;
@@ -789,10 +786,7 @@ fn parse_and_update_state(
                     .load()
                     .end_pose_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!(
-                    "EndPoseState committed: mask={:03b}",
-                    state.end_pose_frame_mask
-                );
+                // Hot path: removed trace! call (200Hz)
 
                 // 重置帧组掩码和标志
                 state.end_pose_frame_mask = 0;
@@ -853,9 +847,8 @@ fn parse_and_update_state(
                             "Velocity frame commit timeout: mask={:06b}, incomplete data",
                             state.vel_update_mask
                         );
-                    } else {
-                        trace!("Joint dynamic committed: 6 joints velocity/current updated");
                     }
+                    // Hot path: removed trace! call for successful commit (200Hz)
                 }
             }
         },
@@ -904,10 +897,7 @@ fn parse_and_update_state(
                     .load()
                     .robot_control_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!(
-                    "RobotControlState committed: mode={}, status={}",
-                    feedback.control_mode as u8, feedback.robot_status as u8
-                );
+                // Hot path: removed trace! call (200Hz)
             }
         },
 
@@ -938,11 +928,7 @@ fn parse_and_update_state(
                     .load()
                     .gripper_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!(
-                    "GripperState committed: travel={:.3}mm, torque={:.3}N·m",
-                    feedback.travel(),
-                    feedback.torque()
-                );
+                // Hot path: removed trace! call (gripper update, 200Hz)
             }
         },
 
@@ -1017,11 +1003,7 @@ fn parse_and_update_state(
                         .load()
                         .joint_driver_low_speed_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    trace!(
-                        "JointDriverLowSpeedState updated: joint={}, temp={:.1}°C",
-                        joint_idx + 1,
-                        feedback.motor_temp()
-                    );
+                    // Hot path: removed trace! call (diagnostic update)
                 }
             }
         },
@@ -1036,20 +1018,14 @@ fn parse_and_update_state(
                     collision.hardware_timestamp_us = frame.timestamp_us;
                     collision.system_timestamp_us = system_timestamp_us;
                     collision.protection_levels = feedback.levels;
-                } else {
-                    trace!(
-                        "Failed to acquire collision_protection write lock (lock is held), skipping update"
-                    );
                 }
+                // Failed lock is expected behavior when client is reading, skip logging
 
                 ctx.fps_stats
                     .load()
                     .collision_protection_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!(
-                    "CollisionProtectionState updated: levels={:?}",
-                    feedback.levels
-                );
+                // Hot path: removed trace! call (config update)
             }
         },
 
@@ -1078,12 +1054,7 @@ fn parse_and_update_state(
                         .load()
                         .joint_limit_config_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    trace!(
-                        "JointLimitConfigState updated: joint={}, max={:.2}°, min={:.2}°",
-                        joint_idx + 1,
-                        feedback.max_angle(),
-                        feedback.min_angle()
-                    );
+                    // Config update: removed trace! call
                 }
             }
         },
@@ -1110,11 +1081,7 @@ fn parse_and_update_state(
                         .load()
                         .joint_accel_config_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    trace!(
-                        "JointAccelConfigState updated: joint={}, max_accel={:.2} rad/s²",
-                        joint_idx + 1,
-                        feedback.max_accel()
-                    );
+                    // Config update: removed trace! call
                 }
             }
         },
@@ -1138,11 +1105,7 @@ fn parse_and_update_state(
                     .load()
                     .end_limit_config_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!(
-                    "EndLimitConfigState updated: linear_vel={:.3} m/s, angular_vel={:.3} rad/s",
-                    feedback.max_linear_velocity(),
-                    feedback.max_angular_velocity()
-                );
+                // Config update: removed trace! call
             }
         },
 
@@ -1163,7 +1126,7 @@ fn parse_and_update_state(
                     .load()
                     .firmware_version_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!("FirmwareVersionState updated");
+                // Config update: removed trace! call
             }
         },
 
@@ -1189,7 +1152,7 @@ fn parse_and_update_state(
                     .load()
                     .master_slave_control_mode_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!("MasterSlaveControlModeState updated");
+                // Config update: removed trace! call
             }
         },
 
@@ -1232,10 +1195,7 @@ fn parse_and_update_state(
                     .load()
                     .master_slave_joint_control_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!(
-                    "MasterSlaveJointControlState committed: mask={:03b}",
-                    state.joint_control_frame_mask
-                );
+                // Config update: removed trace! call
 
                 state.joint_control_frame_mask = 0;
             }
@@ -1261,13 +1221,14 @@ fn parse_and_update_state(
                     .load()
                     .master_slave_gripper_control_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                trace!("MasterSlaveGripperControlState updated");
+                // Config update: removed trace! call
             }
         },
 
         // 未识别的帧 ID，记录日志但不报错
         _ => {
-            trace!("RX thread: Received unhandled frame ID=0x{:X}", frame.id);
+            // Unexpected frame - changed to debug! for troubleshooting
+            debug!("RX thread: Received unhandled frame ID=0x{:X}", frame.id);
         },
     }
 }

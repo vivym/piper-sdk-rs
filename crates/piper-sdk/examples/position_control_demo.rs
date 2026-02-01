@@ -20,9 +20,8 @@
 //! ```
 
 use clap::Parser;
-use piper_sdk::PiperBuilder;
 use piper_sdk::client::state::*;
-use piper_sdk::client::types::*;
+use piper_sdk::prelude::*;
 use std::time::{Duration, Instant};
 
 /// 命令行参数
@@ -43,6 +42,9 @@ struct Args {
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    piper_sdk::init_logger!();
+
     let args = Args::parse();
 
     println!("🤖 Piper SDK - 位置控制演示");
