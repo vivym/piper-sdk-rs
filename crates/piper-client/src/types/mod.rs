@@ -5,9 +5,11 @@
 pub mod cartesian;
 pub mod error;
 pub mod joint;
+pub mod quirks;
 pub mod units;
 
 pub use cartesian::*;
 pub use error::*;
 pub use joint::*;
+pub use quirks::*;
 pub use units::*;

@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use crate::types::*;
 use crate::{observer::Observer, raw_commander::RawCommander};
 use piper_protocol::control::InstallPosition;
-use tracing::{debug, info, trace};
+use semver::Version;
+use tracing::{debug, info, trace, warn};
 
 // ==================== 状态类型（零大小类型）====================
 
@@ -159,6 +160,18 @@ impl From<MotionType> for piper_protocol::feedback::MoveMode {
             MotionType::ContinuousPositionVelocity => MoveMode::MoveCpv,
         }
     }
+}
+
+// ==================== 辅助函数 ====================
+
+/// 解析固件版本字符串
+///
+/// 将 "S-V1.6-3" 格式的字符串解析为 semver::Version
+fn parse_firmware_version(version_str: &str) -> Option<Version> {
+    let version_str = version_str.trim();
+    let version_part = version_str.strip_prefix("S-V")?;
+    let normalized = version_part.replace('-', ".");
+    Version::parse(&normalized).ok()
 }
 
 // ==================== 连接配置 ====================
@@ -353,6 +366,7 @@ impl Default for DisableConfig {
 pub struct Piper<State = Disconnected> {
     pub(crate) driver: Arc<piper_driver::Piper>,
     pub(crate) observer: Observer,
+    pub(crate) quirks: DeviceQuirks,
     pub(crate) _state: State, // 改为直接存储状态（不再使用 PhantomData）
 }
 
@@ -384,12 +398,32 @@ impl Piper<Disconnected> {
         // 等待接收到第一个有效反馈
         driver.wait_for_feedback(config.timeout)?;
 
+        // 查询固件版本（用于 DeviceQuirks）
+        let _ = driver.query_firmware_version();
+
+        // 创建 DeviceQuirks
+        let quirks = if let Some(version_str) = driver.get_firmware_version() {
+            match parse_firmware_version(&version_str) {
+                Some(version) => DeviceQuirks::from_firmware_version(version),
+                None => {
+                    warn!(
+                        "Failed to parse firmware version '{}'. Using default quirks.",
+                        version_str
+                    );
+                    DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
+                },
+            }
+        } else {
+            DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
+        };
+
         // 创建 Observer（View 模式）
         let observer = Observer::new(driver.clone());
 
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Standby,
         })
     }
@@ -436,14 +470,32 @@ impl Piper<Disconnected> {
         // 2. 等待反馈
         driver.wait_for_feedback(config.timeout)?;
 
-        // 3. 创建 observer
+        // 3. 查询固件版本并创建 DeviceQuirks
+        let _ = driver.query_firmware_version();
+        let quirks = if let Some(version_str) = driver.get_firmware_version() {
+            match parse_firmware_version(&version_str) {
+                Some(version) => DeviceQuirks::from_firmware_version(version),
+                None => {
+                    warn!(
+                        "Failed to parse firmware version '{}'. Using default quirks.",
+                        version_str
+                    );
+                    DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
+                },
+            }
+        } else {
+            DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
+        };
+
+        // 4. 创建 observer
         let observer = Observer::new(driver.clone());
 
-        // 4. 返回到 Standby 状态
+        // 5. 返回到 Standby 状态
         info!("Reconnection successful");
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Standby,
         })
     }
@@ -522,6 +574,9 @@ impl Piper<Standby> {
         // Same safety reasoning as driver above.
         let observer = unsafe { std::ptr::read(&this.observer) };
 
+        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
+        let quirks = this.quirks.clone();
+
         // `this` is dropped here, but since it's ManuallyDrop,
         // the inner `self` is NOT dropped, preventing double-disable
 
@@ -529,6 +584,7 @@ impl Piper<Standby> {
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Active(MitMode),
         })
     }
@@ -598,6 +654,9 @@ impl Piper<Standby> {
         // Same safety reasoning as driver above.
         let observer = unsafe { std::ptr::read(&this.observer) };
 
+        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
+        let quirks = this.quirks.clone();
+
         // `this` is dropped here, but since it's ManuallyDrop,
         // the inner `self` is NOT dropped, preventing double-disable
 
@@ -606,6 +665,7 @@ impl Piper<Standby> {
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Active(position_mode),
         })
     }
@@ -985,18 +1045,122 @@ impl Piper<Standby> {
         // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
         let driver = unsafe { std::ptr::read(&this.driver) };
         let observer = unsafe { std::ptr::read(&this.observer) };
+        let quirks = this.quirks.clone();
 
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: ReplayMode,
         })
+    }
+
+    /// 设置碰撞保护级别
+    ///
+    /// 设置6个关节的碰撞防护等级（0~8，等级0代表不检测碰撞）。
+    ///
+    /// # 参数
+    ///
+    /// - `levels`: 6个关节的碰撞防护等级数组，每个值范围 0~8
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let standby = PiperBuilder::new().interface("can0").build()?;
+    ///
+    /// // 所有关节设置为等级 5（中等保护）
+    /// standby.set_collision_protection([5, 5, 5, 5, 5, 5])?;
+    ///
+    /// // 为不同关节设置不同等级
+    /// // J1-J3 基座关节使用较高保护，J4-J6 末端关节使用较低保护
+    /// standby.set_collision_protection([6, 6, 6, 4, 4, 4])?;
+    ///
+    /// // 禁用碰撞保护（谨慎使用）
+    /// standby.set_collision_protection([0, 0, 0, 0, 0, 0])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_collision_protection(&self, levels: [u8; 6]) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        raw.set_collision_protection(levels)
+    }
+
+    /// 设置关节零位
+    ///
+    /// 设置指定关节的当前位置为零点。
+    ///
+    /// **⚠️ 安全警告**：
+    /// - 设置零位前，确保关节已移动到预期的零点位置
+    /// - 建议在机械臂安装或重新校准时使用
+    /// - 设置后应验证关节位置是否正确
+    ///
+    /// # 参数
+    ///
+    /// - `joints`: 要设置零位的关节数组（0-based，0-5 对应 J1-J6）
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let standby = PiperBuilder::new().interface("can0").build()?;
+    ///
+    /// // 设置 J1 的当前位置为零点
+    /// // 注意：确保 J1 已移动到预期的零点位置
+    /// standby.set_joint_zero_positions(&[0])?;
+    ///
+    /// // 设置多个关节的零位
+    /// standby.set_joint_zero_positions(&[0, 1, 2])?;
+    ///
+    /// // 设置所有关节的零位
+    /// standby.set_joint_zero_positions(&[0, 1, 2, 3, 4, 5])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_joint_zero_positions(&self, joints: &[usize]) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        raw.set_joint_zero_positions(joints)
     }
 }
 
 // ==================== 所有状态共享的辅助方法 ====================
 
 impl<State> Piper<State> {
+    /// 获取固件特性（DeviceQuirks）
+    ///
+    /// # 返回
+    ///
+    /// 返回当前机械臂的固件特性，包括：
+    /// - `firmware_version`: 固件版本号
+    /// - `joint_flip_map`: 关节 flip 标志
+    /// - `torque_scaling`: 力矩缩放因子
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let robot = PiperBuilder::new().interface("can0").build()?;
+    ///
+    /// // 获取固件特性
+    /// let quirks = robot.quirks();
+    /// println!("Firmware version: {}", quirks.firmware_version);
+    ///
+    /// // 在控制循环中使用 quirks
+    /// for joint in [Joint::J1, Joint::J2, Joint::J3, Joint::J4, Joint::J5, Joint::J6] {
+    ///     let needs_flip = quirks.needs_flip(joint);
+    ///     let scaling = quirks.torque_scaling_factor(joint);
+    ///     println!("Joint {:?}: flip={}, scaling={}", joint, needs_flip, scaling);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quirks(&self) -> DeviceQuirks {
+        self.quirks.clone()
+    }
+
     /// 急停：发送急停指令，并转换到 ErrorState（之后不允许继续 command_*）
     ///
     /// # 设计说明
@@ -1047,6 +1211,9 @@ impl<State> Piper<State> {
         // Same safety reasoning as driver above.
         let observer = unsafe { std::ptr::read(&this.observer) };
 
+        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
+        let quirks = this.quirks.clone();
+
         // `this` is dropped here, but since it's ManuallyDrop,
         // the inner `self` is NOT dropped, preventing double-disable
 
@@ -1054,6 +1221,7 @@ impl<State> Piper<State> {
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: ErrorState,
         })
     }
@@ -1194,9 +1362,13 @@ impl<M> Piper<Active<M>> {
         // Same safety reasoning as driver above.
         let observer = unsafe { std::ptr::read(&this.observer) };
 
+        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
+        let quirks = this.quirks.clone();
+
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Standby,
         })
     }
@@ -1431,6 +1603,37 @@ impl<M> Piper<Active<M>> {
 
         Ok((self, stats))
     }
+
+    /// 设置碰撞保护级别
+    ///
+    /// 设置6个关节的碰撞防护等级（0~8，等级0代表不检测碰撞）。
+    ///
+    /// **注意**：此方法在 Active 状态下也可调用，允许运行时调整碰撞保护级别。
+    ///
+    /// # 参数
+    ///
+    /// - `levels`: 6个关节的碰撞防护等级数组，每个值范围 0~8
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::PiperBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let standby = PiperBuilder::new().interface("can0").build()?;
+    /// let active = standby.enable_position_mode(Default::default())?;
+    ///
+    /// // 运行时提高碰撞保护级别（例如进入精密操作区域）
+    /// active.set_collision_protection([7, 7, 7, 7, 7, 7])?;
+    ///
+    /// // 运行时降低碰撞保护级别（例如需要更大的力矩）
+    /// active.set_collision_protection([3, 3, 3, 3, 3, 3])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_collision_protection(&self, levels: [u8; 6]) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        raw.set_collision_protection(levels)
+    }
 }
 
 // ==================== Active<MitMode> 状态 ====================
@@ -1590,6 +1793,9 @@ impl Piper<Active<MitMode>> {
         // Same safety reasoning as driver above.
         let observer = unsafe { std::ptr::read(&this.observer) };
 
+        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
+        let quirks = this.quirks.clone();
+
         // `this` is dropped here, but since it's ManuallyDrop,
         // the inner `self` is NOT dropped, preventing double-disable
 
@@ -1597,6 +1803,7 @@ impl Piper<Active<MitMode>> {
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Standby,
         })
     }
@@ -1867,6 +2074,9 @@ impl Piper<Active<PositionMode>> {
         // Same safety reasoning as driver above.
         let observer = unsafe { std::ptr::read(&this.observer) };
 
+        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
+        let quirks = this.quirks.clone();
+
         // `this` is dropped here, but since it's ManuallyDrop,
         // the inner `self` is NOT dropped, preventing double-disable
 
@@ -1874,6 +2084,7 @@ impl Piper<Active<PositionMode>> {
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Standby,
         })
     }
@@ -2058,10 +2269,12 @@ impl Piper<ReplayMode> {
         // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
         let driver = unsafe { std::ptr::read(&this.driver) };
         let observer = unsafe { std::ptr::read(&this.observer) };
+        let quirks = this.quirks.clone();
 
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Standby,
         })
     }
@@ -2268,10 +2481,12 @@ impl Piper<ReplayMode> {
         // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
         let driver = unsafe { std::ptr::read(&this.driver) };
         let observer = unsafe { std::ptr::read(&this.observer) };
+        let quirks = this.quirks.clone();
 
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Standby,
         })
     }
@@ -2312,10 +2527,12 @@ impl Piper<ReplayMode> {
         // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
         let driver = unsafe { std::ptr::read(&this.driver) };
         let observer = unsafe { std::ptr::read(&this.observer) };
+        let quirks = this.quirks.clone();
 
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: Standby,
         })
     }

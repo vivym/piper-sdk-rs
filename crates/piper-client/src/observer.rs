@@ -275,6 +275,35 @@ impl Observer {
     pub fn connection_age(&self) -> std::time::Duration {
         self.driver.connection_age()
     }
+
+    /// 获取碰撞保护级别
+    ///
+    /// 返回6个关节的当前碰撞防护等级（0~8，等级0代表不检测碰撞）。
+    ///
+    /// # 返回
+    ///
+    /// 返回 `[J1, J2, J3, J4, J5, J6]` 的碰撞防护等级
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// # use piper_client::Observer;
+    /// # fn example(observer: Observer) {
+    /// let levels = observer.collision_protection_levels();
+    /// println!("J1-J6 碰撞保护级别: {:?}", levels);
+    ///
+    /// // 检查某个关节的保护等级
+    /// if levels[0] == 0 {
+    ///     println!("J1 未启用碰撞保护");
+    /// }
+    /// # }
+    /// ```
+    pub fn collision_protection_levels(&self) -> [u8; 6] {
+        self.driver
+            .get_collision_protection()
+            .map(|state| state.protection_levels)
+            .unwrap_or([0; 6]) // 如果读取失败，返回默认值
+    }
 }
 
 /// 夹爪状态

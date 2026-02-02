@@ -4,11 +4,12 @@
 
 use crate::observer::Observer;
 use crate::state::*;
-use crate::types::Result;
+use crate::types::{DeviceQuirks, Result};
 use piper_driver::PiperBuilder as DriverBuilder;
+use semver::Version;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Client 层 Piper Builder
 ///
@@ -48,6 +49,31 @@ pub struct PiperBuilder {
     baud_rate: Option<u32>,
     timeout: Option<Duration>,
     daemon_addr: Option<String>,
+}
+
+/// 解析固件版本字符串
+///
+/// 将 "S-V1.6-3" 格式的字符串解析为 semver::Version
+///
+/// # 参数
+///
+/// - `version_str`: 固件版本字符串（例如 "S-V1.6-3"）
+///
+/// # 返回
+///
+/// 解析后的 semver::Version（例如 "1.6.3"）
+fn parse_firmware_version(version_str: &str) -> Option<Version> {
+    // 格式: "S-V1.6-3" -> "1.6.3"
+    let version_str = version_str.trim();
+
+    // 移除 "S-V" 前缀
+    let version_part = version_str.strip_prefix("S-V")?;
+
+    // 替换连字符为点号: "1.6-3" -> "1.6.3"
+    let normalized = version_part.replace('-', ".");
+
+    // 解析为 semver::Version
+    Version::parse(&normalized).ok()
 }
 
 impl PiperBuilder {
@@ -149,12 +175,46 @@ impl PiperBuilder {
         driver.wait_for_feedback(timeout)?;
         info!("Robot ready - Standby mode");
 
+        // 查询固件版本（用于 DeviceQuirks）
+        info!("Querying firmware version for DeviceQuirks initialization");
+        if let Err(e) = driver.query_firmware_version() {
+            warn!(
+                "Failed to query firmware version: {:?}. Using default quirks (latest firmware behavior).",
+                e
+            );
+        }
+
+        // 获取固件版本并创建 DeviceQuirks
+        let quirks = if let Some(version_str) = driver.get_firmware_version() {
+            debug!("Raw firmware version string: {}", version_str);
+            match parse_firmware_version(&version_str) {
+                Some(version) => {
+                    info!("Parsed firmware version: {}", version);
+                    DeviceQuirks::from_firmware_version(version)
+                },
+                None => {
+                    warn!(
+                        "Failed to parse firmware version '{}'. Using default quirks (latest firmware behavior).",
+                        version_str
+                    );
+                    DeviceQuirks::from_firmware_version(Version::new(1, 9, 0)) // 默认使用最新版本行为
+                },
+            }
+        } else {
+            // 如果查询失败，使用最新版本行为（所有 quirks 都为 false/1.0）
+            info!(
+                "No firmware version available. Using default quirks (latest firmware behavior)."
+            );
+            DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
+        };
+
         // 创建 Observer
         let observer = Observer::new(driver.clone());
 
         Ok(Piper {
             driver,
             observer,
+            quirks,
             _state: machine::Standby,
         })
     }

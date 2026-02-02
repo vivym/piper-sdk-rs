@@ -382,6 +382,80 @@ impl<'a> RawCommander<'a> {
 
         Ok(())
     }
+
+    /// 设置碰撞保护级别
+    ///
+    /// 设置6个关节的碰撞防护等级（0~8，等级0代表不检测碰撞）。
+    ///
+    /// # 参数
+    ///
+    /// - `levels`: 6个关节的碰撞防护等级数组，每个值范围 0~8
+    ///
+    /// # 示例
+    ///
+    /// ```ignore
+    /// // 所有关节设置为等级 5
+    /// raw_commander.set_collision_protection([5, 5, 5, 5, 5, 5])?;
+    ///
+    /// // 为不同关节设置不同等级
+    /// raw_commander.set_collision_protection([3, 4, 5, 5, 4, 3])?;
+    /// ```
+    pub(crate) fn set_collision_protection(&self, levels: [u8; 6]) -> Result<()> {
+        use piper_protocol::config::CollisionProtectionLevelCommand;
+
+        // 验证等级范围
+        for &level in &levels {
+            if level > 8 {
+                return Err(RobotError::ConfigError(format!(
+                    "碰撞防护等级必须在0~8之间，收到: {}",
+                    level
+                )));
+            }
+        }
+
+        let cmd = CollisionProtectionLevelCommand::new(levels);
+        self.driver.send_reliable(cmd.to_frame())?;
+        Ok(())
+    }
+
+    /// 设置关节零位
+    ///
+    /// 设置指定关节的当前位置为零点。
+    ///
+    /// # 参数
+    ///
+    /// - `joints`: 要设置零位的关节索引数组（0-based，0-5 对应 J1-J6）
+    ///
+    /// # 示例
+    ///
+    /// ```ignore
+    /// // 设置 J1 的当前位置为零点
+    /// raw_commander.set_joint_zero_positions(&[0])?;
+    ///
+    /// // 设置多个关节的零位
+    /// raw_commander.set_joint_zero_positions(&[0, 1, 2])?;
+    ///
+    /// // 设置所有关节的零位
+    /// raw_commander.set_joint_zero_positions(&[0, 1, 2, 3, 4, 5])?;
+    /// ```
+    pub(crate) fn set_joint_zero_positions(&self, joints: &[usize]) -> Result<()> {
+        use piper_protocol::config::JointSettingCommand;
+
+        for &joint_index in joints {
+            if joint_index > 5 {
+                return Err(RobotError::ConfigError(format!(
+                    "关节索引必须在0-5之间，收到: {}",
+                    joint_index
+                )));
+            }
+
+            // joint_index 是 0-based，需要转换为 1-based（J1=0 -> 1）
+            let cmd = JointSettingCommand::set_zero_point((joint_index + 1) as u8);
+            self.driver.send_reliable(cmd.to_frame())?;
+        }
+
+        Ok(())
+    }
 }
 
 // 确保 Send + Sync
