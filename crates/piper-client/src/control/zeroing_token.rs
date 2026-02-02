@@ -228,6 +228,7 @@ mod tests {
     #[test]
     fn test_confirm_from_env_success() {
         unsafe {
+            env::remove_var(ENV_VAR); // 先清理，避免测试间干扰
             env::set_var(ENV_VAR, ENV_VALUE);
         }
         let token = ZeroingConfirmToken::confirm_from_env();
@@ -249,6 +250,7 @@ mod tests {
     #[test]
     fn test_confirm_from_env_wrong_value() {
         unsafe {
+            env::remove_var(ENV_VAR); // 先清理，避免测试间干扰
             env::set_var(ENV_VAR, "wrong_value");
         }
         let token = ZeroingConfirmToken::confirm_from_env();

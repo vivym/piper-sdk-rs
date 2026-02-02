@@ -18,8 +18,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
 
       - name: Cache cargo registry
         uses: actions/cache@v3
@@ -47,6 +45,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -84,33 +95,46 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, beta]
-        exclude:
-          # 只在 stable 上测试所有操作系统
-          - os: ubuntu-latest
-            rust: beta
-          - os: macos-latest
-            rust: beta
-          - os: windows-latest
-            rust: beta
+        rust: [stable]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
 
-      - name: Setup vcan0 for Linux
+      # ✅ 安装 just 命令运行器
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # ✅ 缓存 MuJoCo 安装（路径与 justfile 严格一致）
+      - name: Cache MuJoCo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.local/lib/mujoco                    # Linux
+            ~/Library/Frameworks/mujoco.framework   # macOS
+            ~\AppData\Local\mujoco                 # Windows
+          key: mujoco-${{ runner.os }}-3.3.7
+
+      # ✅ 设置 MuJoCo 环境（复用 justfile 逻辑）
+      # 将 _mujoco_download 的输出写入 $GITHUB_ENV
+      - name: Setup MuJoCo Environment
+        shell: bash
+        run: |
+          # _mujoco_download 输出: export MUJOCO_DYNAMIC_LINK_DIR=...
+          # 写入 $GITHUB_ENV 使后续 step 可以读取环境变量
+          just _mujoco_download >> $GITHUB_ENV
+
+      - name: Setup vcan0 (Linux only)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          # 尝试加载 vcan 模块（如果不存在则忽略错误）
           sudo modprobe vcan || echo "Warning: vcan module not available, tests will be skipped"
-          # 尝试创建 vcan0 接口（如果失败则忽略，测试会自动跳过）
           sudo ip link add dev vcan0 type vcan || echo "Warning: Failed to create vcan0, tests will be skipped"
           sudo ip link set up vcan0 || echo "Warning: Failed to bring up vcan0, tests will be skipped"
-          # 验证接口（如果不存在也不会失败，因为测试会自动跳过）
-          ip link show vcan0 || echo "Note: vcan0 not available, SocketCAN tests will be skipped"
 
       - name: Cache cargo registry
         uses: actions/cache@v3
@@ -121,12 +145,13 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+            ${{ runner.os }}-cargo-
 
+      # ✅ 运行测试（环境变量已通过 $GITHUB_ENV 传递）
       - name: Run unit tests
-        run: cargo test --lib
+        run: just test
 
       - name: Run doctests
         run: cargo test --doc

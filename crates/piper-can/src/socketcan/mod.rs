@@ -49,7 +49,7 @@ pub use split::{SocketCanRxAdapter, SocketCanTxAdapter};
 /// # 示例
 ///
 /// ```no_run
-/// use piper_sdk::can::{SocketCanAdapter, CanAdapter, PiperFrame};
+/// use piper_can::{SocketCanAdapter, CanAdapter, PiperFrame};
 ///
 /// // 打开 CAN 接口
 /// let mut adapter = SocketCanAdapter::new("can0").unwrap();
@@ -96,7 +96,7 @@ impl SocketCanAdapter {
     /// # 示例
     ///
     /// ```no_run
-    /// use piper_sdk::can::SocketCanAdapter;
+    /// use piper_can::SocketCanAdapter;
     ///
     /// let adapter = SocketCanAdapter::new("can0").unwrap();
     /// ```

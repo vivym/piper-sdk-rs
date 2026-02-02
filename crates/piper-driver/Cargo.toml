@@ -7,6 +7,8 @@ edition.workspace = true
 default = []
 # Real-time thread priority support (Linux/macOS/Windows)
 realtime = ["dep:thread-priority"]
+# Mock mode for testing without hardware
+mock = ["piper-can/mock"]
 
 [dependencies]
 piper-protocol = { workspace = true }

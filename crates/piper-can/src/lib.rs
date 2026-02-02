@@ -2,31 +2,82 @@
 //!
 //! CAN 硬件抽象层，提供统一的 CAN 接口抽象。
 
+// 跨平台 feature 检查：在非 Linux 平台启用 socketcan feature 会编译失败
+#[cfg(all(feature = "socketcan", not(target_os = "linux")))]
+compile_error!(
+    "The 'socketcan' feature is only supported on Linux.\n\
+     Please use the default features or 'gs_usb' feature on this platform."
+);
+
 use std::time::Duration;
 use thiserror::Error;
 
 // 重新导出 piper-protocol 中的 PiperFrame
 pub use piper_protocol::PiperFrame;
 
-#[cfg(target_os = "linux")]
+// SocketCAN (Linux only)
+// 优先级：mock 优先级最高，然后是显式 feature，最后是 auto-backend
+#[cfg(all(
+    not(feature = "mock"),                          // ⚠️ 确保 mock 模式下彻底禁用硬件
+    any(
+        feature = "socketcan",                      // 显式启用
+        all(feature = "auto-backend", target_os = "linux")  // 自动推导
+    )
+))]
 pub mod socketcan;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    not(feature = "mock"),
+    any(
+        feature = "socketcan",
+        all(feature = "auto-backend", target_os = "linux")
+    )
+))]
 pub use socketcan::SocketCanAdapter;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    not(feature = "mock"),
+    any(
+        feature = "socketcan",
+        all(feature = "auto-backend", target_os = "linux")
+    )
+))]
 pub use socketcan::split::{SocketCanRxAdapter, SocketCanTxAdapter};
 
+// GS-USB (所有平台)
+// 优先级：mock 优先级最高，然后是显式 feature，最后是 auto-backend
+#[cfg(all(
+    not(feature = "mock"),                          // mock 模式下禁用
+    any(
+        feature = "gs_usb",                         // 显式启用
+        feature = "auto-backend"                    // 自动推导
+    )
+))]
 pub mod gs_usb;
 
-// Re-export gs_usb 类型
+#[cfg(all(
+    not(feature = "mock"),
+    any(feature = "gs_usb", feature = "auto-backend")
+))]
 pub use gs_usb::GsUsbCanAdapter;
 
 // GS-UDP 守护进程客户端库（UDS/UDP）
+// 不受 mock 模式影响（因为它是网络层，不直接访问硬件）
 pub mod gs_usb_udp;
 
 // 导出 split 相关的类型（如果可用）
+#[cfg(all(
+    not(feature = "mock"),
+    any(feature = "gs_usb", feature = "auto-backend")
+))]
 pub use gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
+
+// Mock Adapter (用于测试)
+#[cfg(feature = "mock")]
+pub mod mock;
+
+#[cfg(feature = "mock")]
+pub use mock::MockCanAdapter;
 
 /// CAN 适配层统一错误类型
 #[derive(Error, Debug)]

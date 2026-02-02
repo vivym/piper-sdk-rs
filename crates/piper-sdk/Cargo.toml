@@ -21,7 +21,11 @@ tracing-log = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
-rusb = { workspace = true }
 proptest = { workspace = true }
 ctrlc = { workspace = true }
 rand = { workspace = true }
+# For examples and tests
+nix = { workspace = true }
+libc = { workspace = true }
+socketcan = { workspace = true }
+rusb = { workspace = true }

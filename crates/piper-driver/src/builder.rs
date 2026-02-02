@@ -5,10 +5,17 @@
 use crate::error::DriverError;
 use crate::pipeline::PipelineConfig;
 use crate::piper::Piper;
-#[cfg(target_os = "linux")]
+
+#[cfg(all(not(feature = "mock"), target_os = "linux"))]
 use piper_can::SocketCanAdapter;
+
+#[cfg(not(feature = "mock"))]
 use piper_can::gs_usb::GsUsbCanAdapter;
+
+#[cfg(not(feature = "mock"))]
 use piper_can::gs_usb_udp::GsUsbUdpAdapter;
+
+#[cfg(not(feature = "mock"))]
 use piper_can::{CanDeviceError, CanDeviceErrorKind, CanError};
 
 /// 驱动类型选择
@@ -200,60 +207,77 @@ impl PiperBuilder {
     /// ```
     pub fn build(self) -> Result<Piper, DriverError> {
         // 1. 守护进程模式（所有平台，优先级最高）
+        #[cfg(not(feature = "mock"))]
         if let Some(ref daemon_addr) = self.daemon_addr {
             return self.build_gs_usb_daemon(daemon_addr.clone());
         }
 
         // 2. 根据 driver_type 和 interface 自动选择后端
-        match self.driver_type {
-            DriverType::Auto => {
-                // Linux: Smart Default 逻辑
-                #[cfg(target_os = "linux")]
-                {
-                    if let Some(ref interface) = self.interface {
-                        // 如果接口名是 "can0", "can1" 等，尝试 SocketCAN
-                        if interface.starts_with("can") && interface.len() <= 5 {
-                            // 尝试 SocketCAN（可能失败，例如接口不存在）
-                            if let Ok(piper) = self.build_socketcan(interface.as_str()) {
-                                return Ok(piper);
+        #[cfg(not(feature = "mock"))]
+        {
+            match self.driver_type {
+                DriverType::Auto => {
+                    // Linux: Smart Default 逻辑
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Some(ref interface) = self.interface {
+                            // 如果接口名是 "can0", "can1" 等，尝试 SocketCAN
+                            if interface.starts_with("can") && interface.len() <= 5 {
+                                // 尝试 SocketCAN（可能失败，例如接口不存在）
+                                if let Ok(piper) = self.build_socketcan(interface.as_str()) {
+                                    return Ok(piper);
+                                }
+                                // 如果 SocketCAN 失败，fallback 到 GS-USB
+                                tracing::info!(
+                                    "SocketCAN interface '{}' not available, falling back to GS-USB",
+                                    interface
+                                );
                             }
-                            // 如果 SocketCAN 失败，fallback 到 GS-USB
-                            tracing::info!(
-                                "SocketCAN interface '{}' not available, falling back to GS-USB",
-                                interface
-                            );
                         }
+                        // 其他情况（未指定接口、USB 总线号等）：使用 GS-USB
+                        self.build_gs_usb_direct()
                     }
-                    // 其他情况（未指定接口、USB 总线号等）：使用 GS-USB
-                    self.build_gs_usb_direct()
-                }
 
-                // 其他平台：默认使用 GS-USB
-                #[cfg(not(target_os = "linux"))]
-                {
-                    self.build_gs_usb_direct()
-                }
-            },
-            DriverType::SocketCan => {
-                #[cfg(target_os = "linux")]
-                {
-                    let interface = self.interface.as_deref().unwrap_or("can0");
-                    self.build_socketcan(interface)
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Err(DriverError::Can(CanError::Device(CanDeviceError::new(
-                        CanDeviceErrorKind::UnsupportedConfig,
-                        "SocketCAN is only available on Linux",
-                    ))))
-                }
-            },
-            DriverType::GsUsb => self.build_gs_usb_direct(),
+                    // 其他平台：默认使用 GS-USB
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        self.build_gs_usb_direct()
+                    }
+                },
+                DriverType::SocketCan => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let interface = self.interface.as_deref().unwrap_or("can0");
+                        self.build_socketcan(interface)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                            CanDeviceErrorKind::UnsupportedConfig,
+                            "SocketCAN is only available on Linux",
+                        ))))
+                    }
+                },
+                DriverType::GsUsb => self.build_gs_usb_direct(),
+            }
+        }
+
+        // Mock 模式：使用 MockCanAdapter
+        #[cfg(feature = "mock")]
+        {
+            use piper_can::MockCanAdapter;
+            let can = MockCanAdapter::new();
+
+            let interface = self.interface.unwrap_or_else(|| "mock".to_string());
+            let bus_speed = self.baud_rate.unwrap_or(1_000_000);
+            Piper::new(can, self.pipeline_config)
+                .map(|p| p.with_metadata(interface, bus_speed))
+                .map_err(DriverError::Can)
         }
     }
 
     /// 构建 SocketCAN 适配器（Linux only）
-    #[cfg(target_os = "linux")]
+    #[cfg(all(not(feature = "mock"), target_os = "linux"))]
     fn build_socketcan(&self, interface: &str) -> Result<Piper, DriverError> {
         let mut can = SocketCanAdapter::new(interface).map_err(DriverError::Can)?;
 
@@ -275,6 +299,7 @@ impl PiperBuilder {
     }
 
     /// 构建 GS-USB 直连适配器
+    #[cfg(not(feature = "mock"))]
     fn build_gs_usb_direct(&self) -> Result<Piper, DriverError> {
         // interface 可能是：
         // - 设备序列号（如 "ABC123456"）
@@ -334,6 +359,7 @@ impl PiperBuilder {
     /// 构建 GS-USB 守护进程适配器
     ///
     /// 注意：GsUsbUdpAdapter 不支持 SplittableAdapter，因此使用单线程模式。
+    #[cfg(not(feature = "mock"))]
     fn build_gs_usb_daemon(&self, daemon_addr: String) -> Result<Piper, DriverError> {
         let mut can = if daemon_addr.starts_with('/') || daemon_addr.starts_with("unix:") {
             // UDS 模式

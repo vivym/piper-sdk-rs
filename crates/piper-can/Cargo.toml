@@ -4,12 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["auto-backend"]  # 默认启用自动后端选择
 
-# CAN 后端选择（互斥，通常通过目标平台自动选择）
-socketcan = []  # Linux: 由 target cfg 自动包含
-gs_usb = []     # macOS/Windows: 由 target cfg 自动包含
-mock = []       # 测试: 完全移除硬件依赖
+# 自动后端选择（通过 target_cfg + 显式 features）
+auto-backend = ["socketcan", "gs_usb"]  # 显式启用平台依赖
+
+# 显式后端选择（可选，增量式设计，允许共存）
+socketcan = ["dep:socketcan", "dep:nix"]
+gs_usb = ["dep:rusb"]
+
+# Mock 模式（无硬件依赖，优先级最高）
+mock = []
 
 # Serde 序列化支持
 serde = ["dep:serde", "piper-protocol/serde"]
@@ -21,12 +26,20 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true, optional = true }
 
-# 平台特定依赖（不标记为 optional，由 target cfg 自动包含）
+# ⚠️ 重要：平台特定依赖必须标记为 optional = true
+# 这样才能被 features 正确控制
+# 同时也保留 target_cfg 的平台过滤作用
 [target.'cfg(target_os = "linux")'.dependencies]
-socketcan = { workspace = true }
-nix = { workspace = true }
+socketcan = { workspace = true, optional = true }
+nix = { workspace = true, optional = true }
 libc = { workspace = true }
+rusb = { workspace = true, optional = true, features = ["vendored"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-rusb = { workspace = true, features = ["vendored"] }
+rusb = { workspace = true, optional = true, features = ["vendored"] }
 libc = { workspace = true }
+
+# docs.rs 配置：生成所有平台的文档
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

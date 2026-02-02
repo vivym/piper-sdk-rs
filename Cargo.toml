@@ -69,7 +69,7 @@ fs4 = { version = "0.13", features = ["sync"] }
 
 # 平台特定依赖（所有平台都声明，具体 crate 按需选择）
 libc = "0.2"
-nix = "0.30"
+nix = { version = "0.30", features = ["poll", "socket", "uio"] }
 socketcan = "3.5"
 rusb = { version = "0.9.4", features = ["vendored"] }
 thread-priority = "1.0"
