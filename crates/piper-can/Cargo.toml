@@ -2,6 +2,10 @@
 name = "piper-can"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CAN bus adapter abstraction layer supporting SocketCAN and GS-USB"
 
 [features]
 default = ["auto-backend"]  # 默认启用自动后端选择

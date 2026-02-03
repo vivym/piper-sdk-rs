@@ -2,6 +2,10 @@
 name = "piper-driver"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "IO management and state synchronization driver for Piper robot arms"
 
 [features]
 default = []

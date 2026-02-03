@@ -2,11 +2,11 @@
 name = "piper-cli"
 version.workspace = true
 edition.workspace = true
-authors = ["Piper SDK Team"]
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Command-line interface for Piper robot arm control"
-repository = "https://github.com/yourusername/piper-sdk-rs"
-readme = "README.md"
+publish = false
 
 [[bin]]
 name = "piper-cli"

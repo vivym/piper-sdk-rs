@@ -2,6 +2,10 @@
 name = "piper-client"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-level type-safe API with type state pattern for Piper robot control"
 
 [features]
 default = []

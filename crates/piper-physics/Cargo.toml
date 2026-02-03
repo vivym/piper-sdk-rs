@@ -1,10 +1,12 @@
 [package]
 name = "piper-physics"
-version = "0.0.3"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Physics calculations for Piper robot including gravity compensation"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/your-org/piper-sdk-rs"
+publish = false
 
 [dependencies]
 piper-sdk = { path = "../piper-sdk" }

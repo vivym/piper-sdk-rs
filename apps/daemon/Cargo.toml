@@ -2,6 +2,11 @@
 name = "gs_usb_daemon"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Background daemon for GS-USB CAN adapter management"
+publish = false
 
 [[bin]]
 name = "gs_usb_daemon"

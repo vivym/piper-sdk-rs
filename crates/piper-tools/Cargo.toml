@@ -2,11 +2,10 @@
 name = "piper-tools"
 version.workspace = true
 edition.workspace = true
-authors = ["Piper SDK Team"]
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Shared data structures and utilities for Piper applications"
-repository = "https://github.com/yourusername/piper-sdk-rs"
-readme = "README.md"
 
 [features]
 default = []

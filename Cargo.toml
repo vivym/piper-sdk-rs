@@ -89,9 +89,6 @@ tag-name = "v{{version}}"
 # 将所有 crate 的提交合并为一个（原子操作）
 consolidate-commits = true
 
-# 将所有 crate 的推送合并为一个
-consolidate-pushes = true
-
 # 发布前先运行所有测试
 pre-release-hook = ["cargo", "test", "--workspace"]
 

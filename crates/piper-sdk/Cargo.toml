@@ -2,6 +2,10 @@
 name = "piper-sdk"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified SDK for Piper robot arm control with real-time performance"
 
 [features]
 default = []
