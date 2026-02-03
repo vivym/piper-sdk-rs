@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 /// - Linux: $XDG_RUNTIME_DIR 或 /tmp
 /// - macOS: $TMPDIR 或 /tmp
 /// - Windows: %TEMP%
+#[cfg(unix)]
 fn get_temp_socket_path(socket_name: &str) -> String {
     // ✅ 优先使用 XDG_RUNTIME_DIR（Linux/macOS，符合 XDG 规范）
     if let Some(runtime_dir) = dirs::runtime_dir() {

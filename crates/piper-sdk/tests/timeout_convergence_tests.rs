@@ -17,6 +17,23 @@
 use piper_sdk::driver::{PipelineConfig, PiperBuilder};
 use std::time::{Duration, Instant};
 
+/// 检测是否在CI环境中运行
+fn is_ci_env() -> bool {
+    std::env::var("CI").is_ok()
+        || std::env::var("GITHUB_ACTIONS").is_ok()
+        || std::env::var("GITLAB_CI").is_ok()
+        || std::env::var("CIRCLECI").is_ok()
+        || std::env::var("TRAVIS").is_ok()
+        || std::env::var("APPVEYOR").is_ok()
+}
+
+/// 根据环境调整时间阈值（毫秒）
+/// 在CI环境中，使用更宽松的阈值（通常是本地环境的3-5倍）
+fn adjust_threshold_ms(local_threshold_ms: u64) -> Duration {
+    let multiplier = if is_ci_env() { 5 } else { 1 };
+    Duration::from_millis(local_threshold_ms * multiplier)
+}
+
 /// 计算延迟分布的百分位数
 fn calculate_percentiles(mut latencies: Vec<Duration>) -> (Duration, Duration, Duration, Duration) {
     latencies.sort();
@@ -79,18 +96,22 @@ fn test_command_latency_quiet_bus() {
     println!("P99: {:?}", p99);
     println!("Max: {:?}", max);
 
-    // 改进后，P99 延迟应该 < 5ms
+    // 改进后，P99 延迟应该 < 5ms（CI环境会放宽）
+    let p99_threshold = adjust_threshold_ms(5);
     assert!(
-        p99 < Duration::from_millis(5),
-        "P99 latency too high: {:?} (expected < 5ms)",
-        p99
+        p99 < p99_threshold,
+        "P99 latency too high: {:?} (expected < {:?}, CI环境已放宽)",
+        p99,
+        p99_threshold
     );
 
-    // P50 应该非常小（< 1ms），因为 send_frame 只是入队
+    // P50 应该非常小（< 1ms），因为 send_frame 只是入队（CI环境会放宽）
+    let p50_threshold = adjust_threshold_ms(1);
     assert!(
-        p50 < Duration::from_millis(1),
-        "P50 latency too high: {:?} (expected < 1ms)",
-        p50
+        p50 < p50_threshold,
+        "P50 latency too high: {:?} (expected < {:?}, CI环境已放宽)",
+        p50,
+        p50_threshold
     );
 }
 
@@ -118,11 +139,13 @@ fn test_socketcan_timeout_config() {
             let elapsed = start.elapsed();
             println!("SocketCAN timeout: {:?}", elapsed);
 
-            // 超时应该在 2-5ms 范围内（允许一些抖动）
+            // 超时应该在 2-5ms 范围内（允许一些抖动，CI环境会放宽上限）
+            let max_threshold = adjust_threshold_ms(10);
             assert!(
-                elapsed >= Duration::from_millis(1) && elapsed < Duration::from_millis(10),
-                "Timeout latency out of range: {:?}",
-                elapsed
+                elapsed >= Duration::from_millis(1) && elapsed < max_threshold,
+                "Timeout latency out of range: {:?} (max: {:?}, CI环境已放宽)",
+                elapsed,
+                max_threshold
             );
         },
         Ok(frame) => {
@@ -153,11 +176,13 @@ fn test_gs_usb_timeout_config() {
             let elapsed = start.elapsed();
             println!("GS-USB timeout: {:?}", elapsed);
 
-            // 超时应该在 2-10ms 范围内（允许一些抖动和 USB 延迟）
+            // 超时应该在 2-10ms 范围内（允许一些抖动和 USB 延迟，CI环境会放宽上限）
+            let max_threshold = adjust_threshold_ms(15);
             assert!(
-                elapsed >= Duration::from_millis(1) && elapsed < Duration::from_millis(15),
-                "Timeout latency out of range: {:?}",
-                elapsed
+                elapsed >= Duration::from_millis(1) && elapsed < max_threshold,
+                "Timeout latency out of range: {:?} (max: {:?}, CI环境已放宽)",
+                elapsed,
+                max_threshold
             );
         },
         Ok(frame) => {

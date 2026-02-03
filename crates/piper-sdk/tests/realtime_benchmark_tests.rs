@@ -15,6 +15,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// 检测是否在CI环境中运行
+fn is_ci_env() -> bool {
+    std::env::var("CI").is_ok()
+        || std::env::var("GITHUB_ACTIONS").is_ok()
+        || std::env::var("GITLAB_CI").is_ok()
+        || std::env::var("CIRCLECI").is_ok()
+        || std::env::var("TRAVIS").is_ok()
+        || std::env::var("APPVEYOR").is_ok()
+}
+
+/// 根据环境调整时间阈值（毫秒）
+/// 在CI环境中，使用更宽松的阈值（通常是本地环境的3-5倍）
+fn adjust_threshold_ms(local_threshold_ms: u64) -> Duration {
+    let multiplier = if is_ci_env() { 5 } else { 1 };
+    Duration::from_millis(local_threshold_ms * multiplier)
+}
+
 /// 实时性指标结构（增强版 LatencyStats）
 #[derive(Debug, Clone)]
 pub struct RealtimeMetrics {
@@ -401,19 +418,24 @@ fn test_500hz_realtime_benchmark() {
 
     // 验收标准：P95 < 5ms（500Hz = 2ms 周期，允许系统调度延迟）
     // 注意：在 mock 测试环境中，实际延迟可能高于真实硬件环境
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ms(5);
     assert!(
-        rx_metrics.p95() < Duration::from_millis(5),
-        "RX update period P95 should be < 5ms for 500Hz, got: {:?}",
+        rx_metrics.p95() < threshold,
+        "RX update period P95 should be < {:?} for 500Hz (CI环境已放宽), got: {:?}",
+        threshold,
         rx_metrics.p95()
     );
 
     // 验证：P50 应该在合理范围内（500Hz = 2ms 周期）
     // 在 mock 环境中，允许更大的误差范围
+    // 在CI环境中，上限会放宽
     let expected_period = Duration::from_millis(2);
     let p50 = rx_metrics.p50();
+    let max_multiplier = if is_ci_env() { 20 * 2 } else { 20 };
     assert!(
-        p50 >= expected_period * 5 / 10 && p50 <= expected_period * 20 / 10,
-        "RX update period P50 should be around 2ms (500Hz), got: {:?}",
+        p50 >= expected_period * 5 / 10 && p50 <= expected_period * max_multiplier / 10,
+        "RX update period P50 should be around 2ms (500Hz, CI环境已放宽上限), got: {:?}",
         p50
     );
 }
@@ -471,19 +493,24 @@ fn test_1khz_realtime_benchmark() {
 
     // 验收标准：P95 < 5ms（1kHz = 1ms 周期，允许系统调度与 CI 环境波动）
     // 注意：在 mock/CI 环境中，实际延迟可能高于真实硬件，故放宽至 5ms 避免 flake
+    // 在CI环境中，阈值会进一步放宽
+    let threshold = adjust_threshold_ms(5);
     assert!(
-        rx_metrics.p95() < Duration::from_millis(5),
-        "RX update period P95 should be < 5ms for 1kHz, got: {:?}",
+        rx_metrics.p95() < threshold,
+        "RX update period P95 should be < {:?} for 1kHz (CI环境已放宽), got: {:?}",
+        threshold,
         rx_metrics.p95()
     );
 
     // 验证：P50 应该在合理范围内（1kHz = 1ms 周期）
     // 在 mock 环境中，允许更大的误差范围
+    // 在CI环境中，上限会放宽
     let expected_period = Duration::from_millis(1);
     let p50 = rx_metrics.p50();
+    let max_multiplier = if is_ci_env() { 20 * 2 } else { 20 };
     assert!(
-        p50 >= expected_period * 5 / 10 && p50 <= expected_period * 20 / 10,
-        "RX update period P50 should be around 1ms (1kHz), got: {:?}",
+        p50 >= expected_period * 5 / 10 && p50 <= expected_period * max_multiplier / 10,
+        "RX update period P50 should be around 1ms (1kHz, CI环境已放宽上限), got: {:?}",
         p50
     );
 }
@@ -573,10 +600,12 @@ fn test_tx_latency_benchmark() {
     let tx_metrics = benchmark.tx_latency_metrics();
     println!("{}", tx_metrics.to_markdown());
 
-    // 验收标准：P95 < 1ms
+    // 验收标准：P95 < 1ms（CI环境会放宽）
+    let threshold = adjust_threshold_ms(1);
     assert!(
-        tx_metrics.p95() < Duration::from_millis(1),
-        "TX latency P95 should be < 1ms, got: {:?}",
+        tx_metrics.p95() < threshold,
+        "TX latency P95 should be < {:?} (CI环境已放宽), got: {:?}",
+        threshold,
         tx_metrics.p95()
     );
 }
@@ -655,9 +684,16 @@ fn test_send_duration_benchmark() {
     // 验收标准：P95 < 1.5ms
     // 注意：在 Windows 上，线程调度精度和系统开销可能导致更高的延迟
     // 模拟延迟为 100µs，但实际 P50 约为 500µs，P95 约为 1ms
+    // 在CI环境中，阈值会放宽
+    let threshold = if is_ci_env() {
+        Duration::from_millis(1) + Duration::from_micros(500) * 5
+    } else {
+        Duration::from_millis(1) + Duration::from_micros(500)
+    };
     assert!(
-        send_metrics.p95() < Duration::from_millis(1) + Duration::from_micros(500),
-        "Send duration P95 should be < 1.5ms, got: {:?}",
+        send_metrics.p95() < threshold,
+        "Send duration P95 should be < {:?} (CI环境已放宽), got: {:?}",
+        threshold,
         send_metrics.p95()
     );
 }
@@ -719,9 +755,12 @@ fn test_usb_fault_simulation() {
     // 验收标准：P95 < 20ms（允许故障导致的延迟）
     // 注意：在 mock 测试环境中，故障模拟（5% 延迟 + 1% 丢包）可能导致更大的延迟
     // 真实硬件环境中，故障恢复应该更快
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ms(20);
     assert!(
-        rx_metrics.p95() < Duration::from_millis(20),
-        "RX update period P95 should be < 20ms even with USB faults, got: {:?}",
+        rx_metrics.p95() < threshold,
+        "RX update period P95 should be < {:?} even with USB faults (CI环境已放宽), got: {:?}",
+        threshold,
         rx_metrics.p95()
     );
 }

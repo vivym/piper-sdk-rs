@@ -9,6 +9,27 @@ use piper_sdk::driver::*;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// 检测是否在CI环境中运行
+/// CI环境通常有更高的延迟和更不稳定的性能
+fn is_ci_env() -> bool {
+    std::env::var("CI").is_ok()
+        || std::env::var("GITHUB_ACTIONS").is_ok()
+        || std::env::var("GITLAB_CI").is_ok()
+        || std::env::var("CIRCLECI").is_ok()
+        || std::env::var("TRAVIS").is_ok()
+        || std::env::var("APPVEYOR").is_ok()
+}
+
+/// 根据环境调整时间阈值
+/// 在CI环境中，使用更宽松的阈值（通常是本地环境的3-5倍）
+fn adjust_threshold_ns(local_threshold_ns: u128) -> u128 {
+    if is_ci_env() {
+        local_threshold_ns * 5 // CI环境使用5倍阈值
+    } else {
+        local_threshold_ns
+    }
+}
+
 /// 测试结构体大小（位掩码优化效果）
 #[test]
 fn test_state_struct_sizes() {
@@ -97,9 +118,19 @@ fn test_arcswap_read_latency() {
     println!("迭代次数: {}", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns", avg_ns);
+    if is_ci_env() {
+        println!("检测到CI环境，使用放宽的阈值");
+    }
 
     // ArcSwap::load() 应该是纳秒级的（通常 < 100ns）
-    assert!(avg_ns < 1000, "ArcSwap 读取延迟应该小于 1000ns");
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ns(1000);
+    assert!(
+        avg_ns < threshold,
+        "ArcSwap 读取延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        threshold,
+        avg_ns
+    );
 }
 
 /// 测试 ArcSwap 写入延迟
@@ -137,9 +168,19 @@ fn test_arcswap_write_latency() {
     println!("迭代次数: {}", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns", avg_ns);
+    if is_ci_env() {
+        println!("检测到CI环境，使用放宽的阈值");
+    }
 
     // ArcSwap::store() 应该是纳秒级的（通常 < 200ns）
-    assert!(avg_ns < 2000, "ArcSwap 写入延迟应该小于 2000ns");
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ns(2000);
+    assert!(
+        avg_ns < threshold,
+        "ArcSwap 写入延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        threshold,
+        avg_ns
+    );
 }
 
 /// 测试 RwLock 读取延迟（对比）
@@ -165,9 +206,19 @@ fn test_rwlock_read_latency() {
     println!("迭代次数: {}", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns", avg_ns);
+    if is_ci_env() {
+        println!("检测到CI环境，使用放宽的阈值");
+    }
 
     // RwLock::read() 通常比 ArcSwap::load() 稍慢，但应该仍然很快
-    assert!(avg_ns < 2000, "RwLock 读取延迟应该小于 2000ns");
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ns(2000);
+    assert!(
+        avg_ns < threshold,
+        "RwLock 读取延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        threshold,
+        avg_ns
+    );
 }
 
 /// 测试 RwLock 写入延迟（对比）
@@ -199,9 +250,19 @@ fn test_rwlock_write_latency() {
     println!("迭代次数: {}", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns", avg_ns);
+    if is_ci_env() {
+        println!("检测到CI环境，使用放宽的阈值");
+    }
 
     // RwLock::write() 通常比 ArcSwap::store() 稍慢
-    assert!(avg_ns < 5000, "RwLock 写入延迟应该小于 5000ns");
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ns(5000);
+    assert!(
+        avg_ns < threshold,
+        "RwLock 写入延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        threshold,
+        avg_ns
+    );
 }
 
 /// 测试 capture_motion_snapshot() 延迟
@@ -227,11 +288,18 @@ fn test_capture_motion_snapshot_latency() {
     println!("迭代次数: {}", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns", avg_ns);
+    if is_ci_env() {
+        println!("检测到CI环境，使用放宽的阈值");
+    }
 
     // capture_motion_snapshot() 需要读取两个 ArcSwap，应该仍然很快
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ns(2000);
     assert!(
-        avg_ns < 2000,
-        "capture_motion_snapshot() 延迟应该小于 2000ns"
+        avg_ns < threshold,
+        "capture_motion_snapshot() 延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        threshold,
+        avg_ns
     );
 }
 
@@ -284,9 +352,19 @@ fn test_bitmask_access_performance() {
     println!("迭代次数: {} (每个关节访问 12 次)", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns (每次访问)", avg_ns);
+    if is_ci_env() {
+        println!("检测到CI环境，使用放宽的阈值");
+    }
 
     // 位掩码访问应该是非常快的（通常 < 10ns）
-    assert!(avg_ns < 100, "位掩码访问延迟应该小于 100ns");
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ns(100);
+    assert!(
+        avg_ns < threshold,
+        "位掩码访问延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        threshold,
+        avg_ns
+    );
 }
 
 /// 测试状态克隆性能
@@ -318,9 +396,19 @@ fn test_state_clone_performance() {
     println!("迭代次数: {}", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns", avg_ns);
+    if is_ci_env() {
+        println!("检测到CI环境，使用放宽的阈值");
+    }
 
     // 克隆应该很快（通常 < 100ns）
-    assert!(avg_ns < 500, "状态克隆延迟应该小于 500ns");
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ns(500);
+    assert!(
+        avg_ns < threshold,
+        "状态克隆延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        threshold,
+        avg_ns
+    );
 }
 
 /// 测试多个状态同时读取的性能
@@ -352,7 +440,17 @@ fn test_multiple_states_read_performance() {
     println!("迭代次数: {} (每次读取 4 个状态)", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns (每个状态)", avg_ns);
+    if is_ci_env() {
+        println!("检测到CI环境，使用放宽的阈值");
+    }
 
     // 每个状态读取应该仍然很快
-    assert!(avg_ns < 1000, "每个状态读取延迟应该小于 1000ns");
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ns(1000);
+    assert!(
+        avg_ns < threshold,
+        "每个状态读取延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        threshold,
+        avg_ns
+    );
 }

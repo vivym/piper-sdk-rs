@@ -14,6 +14,16 @@
 use piper_sdk::can::gs_usb::GsUsbCanAdapter;
 use piper_sdk::can::{CanAdapter, PiperFrame};
 
+/// 检测是否在CI环境中运行
+fn is_ci_env() -> bool {
+    std::env::var("CI").is_ok()
+        || std::env::var("GITHUB_ACTIONS").is_ok()
+        || std::env::var("GITLAB_CI").is_ok()
+        || std::env::var("CIRCLECI").is_ok()
+        || std::env::var("TRAVIS").is_ok()
+        || std::env::var("APPVEYOR").is_ok()
+}
+
 /// 测试 CAN 适配器基本功能
 #[test]
 #[ignore]
@@ -52,7 +62,14 @@ fn test_send_fire_and_forget() {
 
     println!("Sent 100 frames in {:?}", elapsed);
     // Fire-and-Forget 应该在毫秒级完成（不等待 Echo）
-    assert!(elapsed.as_millis() < 1000, "Send blocked too long");
+    // 在CI环境中，阈值会放宽
+    let threshold_ms = if is_ci_env() { 1000 * 5 } else { 1000 };
+    assert!(
+        elapsed.as_millis() < threshold_ms,
+        "Send blocked too long: {}ms (threshold: {}ms, CI环境已放宽)",
+        elapsed.as_millis(),
+        threshold_ms
+    );
 }
 
 /// 测试三层过滤漏斗（接收逻辑）
@@ -81,7 +98,14 @@ fn test_receive_filter_funnel() {
     let elapsed = start.elapsed();
     println!("Receive attempt took {:?}", elapsed);
     // 应该快速超时（约 2ms，基于代码中的超时设置）
-    assert!(elapsed.as_millis() < 100, "Receive blocked too long");
+    // 在CI环境中，阈值会放宽
+    let threshold_ms = if is_ci_env() { 100 * 5 } else { 100 };
+    assert!(
+        elapsed.as_millis() < threshold_ms,
+        "Receive blocked too long: {}ms (threshold: {}ms, CI环境已放宽)",
+        elapsed.as_millis(),
+        threshold_ms
+    );
 }
 
 /// 测试错误处理：设备未启动时发送

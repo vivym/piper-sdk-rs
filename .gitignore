@@ -1,6 +1,7 @@
 /tmp
 /.mujoco
 .DS_Store
+*.dll
 
 # Created by https://www.toptal.com/developers/gitignore/api/rust,rust-analyzer,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=rust,rust-analyzer,visualstudiocode

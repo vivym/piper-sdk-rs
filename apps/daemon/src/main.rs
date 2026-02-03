@@ -146,7 +146,7 @@ fn get_default_lock_file() -> String {
 /// RUST_LOG=gs_usb_daemon=trace,piper_driver=info cargo run --bin gs_usb_daemon
 /// ```
 fn init_logging() {
-    use tracing_subscriber::{EnvFilter, fmt};
+    use tracing_subscriber::fmt;
 
     // 确定日志目录（优先使用 XDG_CACHE_DIR 或系统临时目录）
     let log_dir = if let Some(cache_dir) = dirs::cache_dir() {
@@ -165,7 +165,7 @@ fn init_logging() {
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     // 从环境变量读取日志级别，默认为 info
-    let env_filter = EnvFilter::from_default_env()
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("gs_usb_daemon=info".parse().unwrap())
         .add_directive("piper_driver=warn".parse().unwrap())
         .add_directive("piper_can=warn".parse().unwrap())

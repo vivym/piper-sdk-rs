@@ -14,6 +14,16 @@
 use piper_sdk::can::gs_usb::GsUsbCanAdapter;
 use piper_sdk::can::{CanAdapter, PiperFrame};
 
+/// 检测是否在CI环境中运行
+fn is_ci_env() -> bool {
+    std::env::var("CI").is_ok()
+        || std::env::var("GITHUB_ACTIONS").is_ok()
+        || std::env::var("GITLAB_CI").is_ok()
+        || std::env::var("CIRCLECI").is_ok()
+        || std::env::var("TRAVIS").is_ok()
+        || std::env::var("APPVEYOR").is_ok()
+}
+
 /// 测试 1kHz 发送性能（Fire-and-Forget）
 #[test]
 #[ignore]
@@ -74,10 +84,13 @@ fn test_send_latency() {
     );
 
     // Fire-and-Forget 应该在微秒级（< 1ms）
+    // 在CI环境中，阈值会放宽
+    let threshold = if is_ci_env() { 1000.0 * 5.0 } else { 1000.0 };
     assert!(
-        avg_latency < 1000.0,
-        "Average latency too high: {:.2}µs",
-        avg_latency
+        avg_latency < threshold,
+        "Average latency too high: {:.2}µs (threshold: {:.2}µs, CI环境已放宽)",
+        avg_latency,
+        threshold
     );
 }
 

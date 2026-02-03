@@ -232,13 +232,10 @@ impl OneShotMode {
             }
             #[cfg(windows)]
             {
-                match signal::windows::ctrl_c() {
-                    Ok(mut sig) => {
-                        sig.recv().await;
-                        r.store(false, Ordering::SeqCst);
-                        println!("\n收到退出信号，正在关闭...");
-                    },
-                    Err(_) => {},
+                if let Ok(mut sig) = signal::windows::ctrl_c() {
+                    sig.recv().await;
+                    r.store(false, Ordering::SeqCst);
+                    println!("\n收到退出信号，正在关闭...");
                 }
             }
         });

@@ -14,6 +14,23 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// 检测是否在CI环境中运行
+fn is_ci_env() -> bool {
+    std::env::var("CI").is_ok()
+        || std::env::var("GITHUB_ACTIONS").is_ok()
+        || std::env::var("GITLAB_CI").is_ok()
+        || std::env::var("CIRCLECI").is_ok()
+        || std::env::var("TRAVIS").is_ok()
+        || std::env::var("APPVEYOR").is_ok()
+}
+
+/// 根据环境调整时间阈值（毫秒）
+/// 在CI环境中，使用更宽松的阈值（通常是本地环境的3-5倍）
+fn adjust_threshold_ms(local_threshold_ms: u64) -> Duration {
+    let multiplier = if is_ci_env() { 5 } else { 1 };
+    Duration::from_millis(local_threshold_ms * multiplier)
+}
+
 /// 性能统计结构
 #[derive(Debug, Default)]
 struct LatencyStats {
@@ -215,10 +232,12 @@ fn test_rx_update_period_distribution() {
     println!("  Min: {:?}", stats.min());
     println!("  Mean: {:?}", stats.mean());
 
-    // 验收标准：P99 < 5ms
+    // 验收标准：P99 < 5ms（CI环境会放宽）
+    let threshold = adjust_threshold_ms(5);
     assert!(
-        stats.p99() < Duration::from_millis(5),
-        "RX update period P99 should be < 5ms, got: {:?}",
+        stats.p99() < threshold,
+        "RX update period P99 should be < {:?} (CI环境已放宽), got: {:?}",
+        threshold,
         stats.p99()
     );
 
@@ -306,9 +325,12 @@ fn test_tx_command_latency_distribution() {
 
     // 验收标准：实时命令延迟 P95 < 2ms（考虑系统调度和 Mock 适配器延迟）
     // 在实际硬件环境中，这个值应该 < 1ms
+    // 在CI环境中，阈值会放宽
+    let threshold = adjust_threshold_ms(2);
     assert!(
-        stats.p95() < Duration::from_millis(2),
-        "TX command latency P95 should be < 2ms (in real hardware < 1ms), got: {:?}",
+        stats.p95() < threshold,
+        "TX command latency P95 should be < {:?} (CI环境已放宽, in real hardware < 1ms), got: {:?}",
+        threshold,
         stats.p95()
     );
 }

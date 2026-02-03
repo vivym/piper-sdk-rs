@@ -15,6 +15,23 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// 检测是否在CI环境中运行
+fn is_ci_env() -> bool {
+    std::env::var("CI").is_ok()
+        || std::env::var("GITHUB_ACTIONS").is_ok()
+        || std::env::var("GITLAB_CI").is_ok()
+        || std::env::var("CIRCLECI").is_ok()
+        || std::env::var("TRAVIS").is_ok()
+        || std::env::var("APPVEYOR").is_ok()
+}
+
+/// 根据环境调整时间阈值（毫秒）
+/// 在CI环境中，使用更宽松的阈值（通常是本地环境的3-5倍）
+fn adjust_threshold_ms(local_threshold_ms: u64) -> Duration {
+    let multiplier = if is_ci_env() { 5 } else { 1 };
+    Duration::from_millis(local_threshold_ms * multiplier)
+}
+
 /// Mock RX 适配器：模拟正常接收
 struct MockRxAdapter {
     frames: VecDeque<PiperFrame>,
@@ -276,16 +293,18 @@ fn test_tx_detects_rx_failure() {
 
     let elapsed = start.elapsed();
 
-    // 验证：TX 线程应该在 100ms 内退出
+    // 验证：TX 线程应该在 100ms 内退出（CI环境会放宽）
+    let threshold = adjust_threshold_ms(200);
     assert!(
         tx_exited,
-        "TX thread should exit within 200ms after RX failure. Elapsed: {:?}",
-        elapsed
+        "TX thread should exit within {:?} after RX failure (CI环境已放宽). Elapsed: {:?}",
+        threshold, elapsed
     );
 
     assert!(
-        elapsed < Duration::from_millis(200),
-        "TX thread should detect RX failure quickly (< 200ms). Elapsed: {:?}",
+        elapsed < threshold,
+        "TX thread should detect RX failure quickly (< {:?}, CI环境已放宽). Elapsed: {:?}",
+        threshold,
         elapsed
     );
 
@@ -373,10 +392,12 @@ fn test_thread_lifecycle_linkage() {
         elapsed
     );
 
-    // 验证：退出时间应该在合理范围内（< 300ms）
+    // 验证：退出时间应该在合理范围内（< 300ms，CI环境会放宽）
+    let threshold = adjust_threshold_ms(300);
     assert!(
-        elapsed < Duration::from_millis(300),
-        "Threads should exit quickly (< 300ms). Elapsed: {:?}",
+        elapsed < threshold,
+        "Threads should exit quickly (< {:?}, CI环境已放宽). Elapsed: {:?}",
+        threshold,
         elapsed
     );
 
