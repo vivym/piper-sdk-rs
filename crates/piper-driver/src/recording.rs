@@ -327,10 +327,9 @@ impl FrameCallback for AsyncRecordingHook {
     ///
     /// ❌ **禁止软件生成时间戳**:
     ///
-    /// ```rust
     /// // ❌ 错误：回调执行时间已晚于帧到达时间（仅说明概念）
     /// // let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
-    /// ```
+    ///
     #[inline]
     #[allow(clippy::collapsible_if)] // 嵌套 if 结构更清晰：先检查 Option，再比较 ID
     fn on_frame_received(&self, frame: &PiperFrame) {

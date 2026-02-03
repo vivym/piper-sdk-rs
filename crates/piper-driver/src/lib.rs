@@ -10,7 +10,7 @@
 //! # 使用场景
 //!
 //! 适用于需要直接控制 CAN 帧、需要高性能状态读取的场景。
-//! 大多数用户应该使用 [`client`](crate::client) 模块提供的更高级接口。
+//! 大多数用户应该使用 piper_sdk 的 client 模块提供的更高级接口。
 
 mod builder;
 pub mod command;

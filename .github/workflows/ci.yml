@@ -19,6 +19,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
       - name: Cache cargo registry
         uses: actions/cache@v3
         with:
@@ -32,8 +37,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Cache MuJoCo for check (includes piper-physics)
+      - name: Cache MuJoCo
+        uses: actions/cache@v3
+        with:
+          path: ~/.local/lib/mujoco
+          key: mujoco-${{ runner.os }}-3.3.7
+
+      # Setup MuJoCo environment for check
+      - name: Setup MuJoCo Environment
+        shell: bash
+        run: |
+          # Export MuJoCo environment variables to subsequent steps
+          just _mujoco_download >> $GITHUB_ENV
+
       - name: Check code
-        run: cargo check --all-targets
+        run: just check
 
   fmt:
     name: Format
@@ -191,6 +210,11 @@ jobs:
         with:
           components: rust-docs
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
       - name: Cache cargo registry
         uses: actions/cache@v3
         with:
@@ -204,8 +228,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Cache MuJoCo for docs (includes piper-physics)
+      - name: Cache MuJoCo
+        uses: actions/cache@v3
+        with:
+          path: ~/.local/lib/mujoco
+          key: mujoco-${{ runner.os }}-3.3.7
+
+      # Setup MuJoCo environment for docs
+      - name: Setup MuJoCo Environment
+        shell: bash
+        run: |
+          # Export MuJoCo environment variables to subsequent steps
+          just _mujoco_download >> $GITHUB_ENV
+
       - name: Build documentation
-        run: cargo doc --no-deps --document-private-items
+        run: just doc
 
       - name: Check documentation links
-        run: cargo doc --no-deps --document-private-items 2>&1 | grep -i "warning\|error" && exit 1 || exit 0
+        run: just doc-check

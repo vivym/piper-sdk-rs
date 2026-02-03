@@ -180,6 +180,40 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
+# Build documentation
+doc:
+    #!/usr/bin/env bash
+    eval "$(just _mujoco_download)"
+    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
+        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
+        case "$(uname -s)" in
+            Linux*)
+                >&2 echo "✓ RPATH embedded for Linux"
+                ;;
+            Darwin*)
+                >&2 echo "✓ Framework linked for macOS"
+                ;;
+        esac
+    fi
+    cargo doc --no-deps --document-private-items
+
+# Check documentation links
+doc-check:
+    #!/usr/bin/env bash
+    eval "$(just _mujoco_download)"
+    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
+        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
+        case "$(uname -s)" in
+            Linux*)
+                >&2 echo "✓ RPATH embedded for Linux"
+                ;;
+            Darwin*)
+                >&2 echo "✓ Framework linked for macOS"
+                ;;
+        esac
+    fi
+    cargo doc --no-deps --document-private-items 2>&1 | grep -i "warning\|error" && exit 1 || exit 0
+
 # Show MuJoCo installation location
 mujoco-info:
     @echo "=== MuJoCo Installation Info ==="
@@ -205,11 +239,15 @@ mujoco-shell:
     @echo ""
     exec bash
 
-# Private helper: Parse MuJoCo version from Cargo.lock
+# Private helper: Parse MuJoCo version from cargo metadata
+# Uses cargo metadata instead of Cargo.lock to support library projects
+# that don't commit Cargo.lock to version control
 _mujoco_parse_version:
     #!/usr/bin/env bash
-    grep -A 1 '^name = "mujoco-rs"' "${PWD}/Cargo.lock" | \
-      grep '^version' | \
+    # Use cargo metadata to get the resolved mujoco-rs version
+    # Format: "2.3.0+mj-3.3.7" -> extract "3.3.7"
+    cargo metadata --format-version 1 2>/dev/null | \
+      python3 -c 'import sys, json; data = json.load(sys.stdin); pkgs = {p["name"]: p for p in data["packages"]}; print(pkgs.get("mujoco-rs", {}).get("version", "NOT_FOUND"))' | \
       sed -E 's/.*\+mj-([0-9.]+).*/\1/'
 
 # Private helper: Download/setup MuJoCo (cross-platform with manual download)

@@ -200,8 +200,8 @@ impl PiperDiagnostics {
     ///
     /// # 禁止的使用场景
     ///
-    /// - ❌ Active<MIT>：发送 0x1A1-0x1A6（位置/速度/力矩指令）
-    /// - ❌ Active<Position>: 发送 0x1A1-0x1A6
+    /// - ❌ `Active<MIT>`：发送 0x1A1-0x1A6（位置/速度/力矩指令）
+    /// - ❌ `Active<Position>`: 发送 0x1A1-0x1A6
     ///
     /// # 示例
     ///

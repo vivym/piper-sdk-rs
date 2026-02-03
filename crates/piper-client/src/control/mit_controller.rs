@@ -388,7 +388,7 @@ impl MitController {
     /// - 不会触发 Piper 的 Drop
     ///
     /// **忘记调用 park()**（安全网）：
-    /// - MitController 被 drop 时，Piper<Active>::drop() 自动触发
+    /// - MitController 被 drop 时，`Piper<Active>::drop()` 自动触发
     /// - 发送 disable 命令（不等待确认）
     /// - 电机被安全失能
     ///
