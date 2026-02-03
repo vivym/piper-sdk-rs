@@ -92,8 +92,39 @@ release:
     fi
     cargo build --workspace --release
 
-# Publish crates to crates.io (with MuJoCo env for testing)
+# Publish all crates to crates.io (calls batch1 then batch2 to handle rate limits)
 publish:
+    @echo "📦 Publishing batch 1/2: base layer (5 crates)..."
+    just publish-batch1
+    @echo ""
+    @echo "⏳ Waiting 30 seconds for crates.io to update..."
+    sleep 30
+    @echo ""
+    @echo "📦 Publishing batch 2/2: top layer (2 crates)..."
+    just publish-batch2
+    @echo ""
+    @echo "✅ All crates published successfully!"
+
+# Publish crates to crates.io - batch 1: base layer (5 crates)
+publish-batch1:
+    #!/usr/bin/env bash
+    eval "$(just _mujoco_download)"
+    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
+        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
+    fi
+    cargo release -p piper-protocol -p piper-can -p piper-driver -p piper-tools -p piper-client --execute
+
+# Publish crates to crates.io - batch 2: top layer (2 crates)
+publish-batch2:
+    #!/usr/bin/env bash
+    eval "$(just _mujoco_download)"
+    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
+        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
+    fi
+    cargo release -p piper-sdk -p piper-physics --execute
+
+# Dry-run publish to verify all crates are ready (without actually uploading)
+publish-dry:
     #!/usr/bin/env bash
     eval "$(just _mujoco_download)"
     if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
