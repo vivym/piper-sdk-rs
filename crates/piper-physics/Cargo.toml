@@ -6,7 +6,6 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Physics calculations for Piper robot including gravity compensation"
-publish = false
 
 [dependencies]
 piper-sdk = { path = "../piper-sdk" }
