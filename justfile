@@ -372,7 +372,13 @@ _mujoco_download:
             fi
 
             curl -L -o "$zip_path" "$download_url"
-            unzip -q "$zip_path" -d "$install_dir"
+            # Use -UU to handle Unicode paths and ignore backslash warnings
+            unzip -q -UU "$zip_path" -d "$install_dir" 2>/dev/null || true
+            # If unzip fails, try using PowerShell as fallback
+            if [ ! -d "$version_dir" ]; then
+                >&2 echo "unzip failed, trying PowerShell Expand-Archive..."
+                powershell -Command "Expand-Archive -Path '$zip_path' -DestinationPath '$install_dir' -Force" 2>/dev/null || true
+            fi
             rm -f "$zip_path"
 
             # Copy DLL to target directories

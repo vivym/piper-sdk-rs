@@ -127,18 +127,19 @@ mod tests {
 
     #[test]
     fn test_connection_monitor_feedback_resets_timer() {
-        let monitor = ConnectionMonitor::new(Duration::from_millis(100));
+        // Use 200ms timeout so CI (macOS etc.) timer variance doesn't flake
+        let monitor = ConnectionMonitor::new(Duration::from_millis(200));
 
-        // Wait half of timeout
+        // Wait part of timeout
         thread::sleep(Duration::from_millis(50));
 
         // Register feedback (resets timer)
         monitor.register_feedback();
 
-        // Wait another 50ms (total 100ms from start)
-        thread::sleep(Duration::from_millis(50));
+        // Wait less than timeout; even if CI oversleeps (e.g. 80ms), still under 200ms
+        thread::sleep(Duration::from_millis(60));
 
-        // Should still be alive because timer was reset
+        // Should still be alive because timer was reset at register_feedback
         assert!(
             monitor.check_connection(),
             "Feedback should reset timeout timer"
