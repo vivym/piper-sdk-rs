@@ -121,7 +121,7 @@ publish-batch2:
     if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
         >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
     fi
-    cargo release -p piper-sdk -p piper-physics --execute
+    cargo release -p piper-sdk -p piper-physics --no-tag --execute
 
 # Dry-run publish to verify all crates are ready (without actually uploading)
 publish-dry:
