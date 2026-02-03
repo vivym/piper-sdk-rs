@@ -24,13 +24,13 @@ categories = ["hardware-support"]
 
 [workspace.dependencies]
 # 内部 crates
-piper-protocol = { path = "crates/piper-protocol" }
-piper-can = { path = "crates/piper-can" }
-piper-driver = { path = "crates/piper-driver" }
-piper-client = { path = "crates/piper-client" }
-piper-sdk = { path = "crates/piper-sdk" }
-piper-tools = { path = "crates/piper-tools" }
-piper-physics = { path = "crates/piper-physics" }
+piper-protocol = { version = "0.0.3", path = "crates/piper-protocol" }
+piper-can = { version = "0.0.3", path = "crates/piper-can" }
+piper-driver = { version = "0.0.3", path = "crates/piper-driver" }
+piper-client = { version = "0.0.3", path = "crates/piper-client" }
+piper-sdk = { version = "0.0.3", path = "crates/piper-sdk" }
+piper-tools = { version = "0.0.3", path = "crates/piper-tools" }
+piper-physics = { version = "0.0.3", path = "crates/piper-physics" }
 
 # 协议层外部依赖
 bilge = "0.3.0"
