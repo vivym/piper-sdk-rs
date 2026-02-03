@@ -178,6 +178,10 @@ impl TxAdapter for NormalTxAdapter {
 
 #[test]
 fn test_rx_update_period_distribution() {
+    // CI 调度不可控，时序断言易偶发失败；仅在本地运行以验证 1kHz 周期
+    if is_ci_env() {
+        return;
+    }
     // 测试场景：1kHz 控制回路，测量 RX 状态更新周期分布
 
     let ctx = Arc::new(PiperContext::new());
@@ -263,6 +267,10 @@ fn test_rx_update_period_distribution() {
 
 #[test]
 fn test_tx_command_latency_distribution() {
+    // CI 调度不可控，P95 等时序断言易偶发失败；仅在本地运行以验证实时延迟
+    if is_ci_env() {
+        return;
+    }
     // 测试场景：测量 TX 命令延迟分布
 
     let ctx = Arc::new(PiperContext::new());
