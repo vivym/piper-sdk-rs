@@ -6,11 +6,15 @@ edition.workspace = true
 [features]
 default = ["auto-backend"]  # 默认启用自动后端选择
 
-# 自动后端选择（通过 target_cfg + 显式 features）
-auto-backend = ["socketcan", "gs_usb"]  # 显式启用平台依赖
+# 自动后端选择（平台相关）
+# Linux: socketcan + gs_usb, 其他平台: gs_usb
+# 注意：socketcan 在 Linux 上由 target_cfg 自动提供，不需要 feature 启用
+auto-backend = ["dep:rusb"]
 
-# 显式后端选择（可选，增量式设计，允许共存）
-socketcan = ["dep:socketcan", "dep:nix"]
+# 显式后端选择（可选，用于测试）
+# socketcan: 仅作为标记，实际依赖由 target_cfg 控制
+# gs_usb: 显式启用
+socketcan = []
 gs_usb = ["dep:rusb"]
 
 # Mock 模式（无硬件依赖，优先级最高）
@@ -26,12 +30,13 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true, optional = true }
 
-# ⚠️ 重要：平台特定依赖必须标记为 optional = true
-# 这样才能被 features 正确控制
-# 同时也保留 target_cfg 的平台过滤作用
+# ⚠️ 重要：平台特定依赖
+# Linux: socketcan 和 nix 始终可用（非 optional），由 cfg 控制是否编译模块
+#      这样可以避免 feature 在跨平台时的依赖解析问题
+# 其他平台: socketcan 和 nix 不存在
 [target.'cfg(target_os = "linux")'.dependencies]
-socketcan = { workspace = true, optional = true }
-nix = { workspace = true, optional = true }
+socketcan = "3.5"
+nix = { version = "0.30", features = ["poll", "socket", "uio"] }
 libc = { workspace = true }
 rusb = { workspace = true, optional = true, features = ["vendored"] }
 

@@ -24,8 +24,11 @@ clap = { workspace = true }
 proptest = { workspace = true }
 ctrlc = { workspace = true }
 rand = { workspace = true }
-# For examples and tests
-nix = { workspace = true }
+# For examples and tests (platform-specific)
 libc = { workspace = true }
-socketcan = { workspace = true }
 rusb = { workspace = true }
+
+# Linux-only dev dependencies
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { version = "0.30", features = ["poll", "socket", "uio"] }
+socketcan = "3.5"

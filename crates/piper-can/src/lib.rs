@@ -2,13 +2,6 @@
 //!
 //! CAN 硬件抽象层，提供统一的 CAN 接口抽象。
 
-// 跨平台 feature 检查：在非 Linux 平台启用 socketcan feature 会编译失败
-#[cfg(all(feature = "socketcan", not(target_os = "linux")))]
-compile_error!(
-    "The 'socketcan' feature is only supported on Linux.\n\
-     Please use the default features or 'gs_usb' feature on this platform."
-);
-
 use std::time::Duration;
 use thiserror::Error;
 

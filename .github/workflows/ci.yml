@@ -73,6 +73,11 @@ jobs:
         with:
           components: clippy
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
       - name: Cache cargo registry
         uses: actions/cache@v3
         with:
@@ -86,8 +91,27 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Clippy check
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      # Cache MuJoCo for clippy-all (includes piper-physics)
+      - name: Cache MuJoCo
+        uses: actions/cache@v3
+        with:
+          path: ~/.local/lib/mujoco
+          key: mujoco-${{ runner.os }}-3.3.7
+
+      # Setup MuJoCo environment for clippy-all
+      - name: Setup MuJoCo Environment
+        shell: bash
+        run: |
+          # Export MuJoCo environment variables to subsequent steps
+          just _mujoco_download >> $GITHUB_ENV
+
+      # Run clippy with hardware backends and full features (including piper-physics)
+      - name: Clippy check (hardware mode)
+        run: just clippy-all
+
+      # Run clippy with mock mode (library code only, no hardware)
+      - name: Clippy check (mock mode)
+        run: just clippy-mock
 
   test:
     name: Test (Unit)

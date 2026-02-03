@@ -113,8 +113,12 @@ check:
     fi
     cargo check --all-targets
 
-# Run linter (default features + MuJoCo)
+# Run linter (default, no MuJoCo needed)
 clippy:
+    cargo clippy --workspace --exclude piper-physics --all-targets --features "piper-driver/realtime" -- -D warnings
+
+# Run linter with all features (excluding mock due to conflicts, requires MuJoCo)
+clippy-all:
     #!/usr/bin/env bash
     eval "$(just _mujoco_download)"
     if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
@@ -128,13 +132,24 @@ clippy:
                 ;;
         esac
     fi
-    cargo clippy --workspace --all-targets --features "piper-driver/realtime" -- -D warnings
+    cargo clippy --workspace --all-targets --features "piper-driver/realtime,piper-sdk/serde,piper-tools/full" -- -D warnings
 
-# Run linter with all features (excluding mock due to conflicts)
-clippy-all:
+# Run linter on piper-physics only (requires MuJoCo)
+clippy-physics:
     #!/usr/bin/env bash
     eval "$(just _mujoco_download)"
-    cargo clippy --workspace --all-targets --features "piper-driver/realtime,piper-sdk/serde,piper-tools/full" -- -D warnings
+    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
+        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
+        case "$(uname -s)" in
+            Linux*)
+                >&2 echo "✓ RPATH embedded for Linux"
+                ;;
+            Darwin*)
+                >&2 echo "✓ Framework linked for macOS"
+                ;;
+        esac
+    fi
+    cargo clippy -p piper-physics --all-targets -- -D warnings
 
 # Run linter with mock mode (library code only, no tests/examples/bins)
 clippy-mock:
@@ -218,7 +233,7 @@ _mujoco_download:
             install_dir="$HOME/Library/Frameworks"
             framework_path="$install_dir/mujoco.framework"
             version_dir="$framework_path/Versions/A"
-            download_url="${base_url}/${mujoco_version}/mujoco-${mujoco_version}-macos-universal.dmg"
+            download_url="${base_url}/${mujoco_version}/mujoco-${mujoco_version}-macos-universal2.dmg"
             ;;
         MINGW*|MSYS*|CYGWIN*|Windows_NT*)
             install_dir="$LOCALAPPDATA/mujoco"
@@ -300,6 +315,9 @@ _mujoco_download:
 
             # Remove quarantine from framework
             xattr -r -d com.apple.quarantine "$framework_path" 2>/dev/null || true
+
+            # Create symlink for mujoco-rs build script (expects libmujoco.dylib at root)
+            ln -sf "$version_dir/libmujoco.3.3.7.dylib" "$version_dir/libmujoco.dylib"
 
             # Clean up DMG
             rm -f "$dmg_path"
