@@ -223,9 +223,11 @@ pub enum ZeroingTokenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::env;
 
     #[test]
+    #[serial]
     fn test_confirm_from_env_success() {
         unsafe {
             env::remove_var(ENV_VAR); // 先清理，避免测试间干扰
@@ -239,6 +241,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_confirm_from_env_not_set() {
         unsafe {
             env::remove_var(ENV_VAR);
@@ -248,6 +251,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_confirm_from_env_wrong_value() {
         unsafe {
             env::remove_var(ENV_VAR); // 先清理，避免测试间干扰
