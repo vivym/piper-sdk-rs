@@ -247,7 +247,7 @@ _mujoco_parse_version:
     # Use cargo metadata to get the resolved mujoco-rs version
     # Format: "2.3.0+mj-3.3.7" -> extract "3.3.7"
     cargo metadata --format-version 1 2>/dev/null | \
-      python -c 'import sys, json; data = json.load(sys.stdin); pkgs = {p["name"]: p for p in data["packages"]}; print(pkgs.get("mujoco-rs", {}).get("version", "NOT_FOUND"))' | \
+      python3 -c 'import sys, json; data = json.load(sys.stdin); pkgs = {p["name"]: p for p in data["packages"]}; print(pkgs.get("mujoco-rs", {}).get("version", "NOT_FOUND"))' | \
       sed -E 's/.*\+mj-([0-9.]+).*/\1/'
 
 # Private helper: Download/setup MuJoCo (cross-platform with manual download)
@@ -368,15 +368,15 @@ _mujoco_download:
             temp_extract_dir="$install_dir/temp_extract_$$"
 
             curl -L -o "$zip_path" "$download_url"
-            
+
             # Extract to temporary directory first
             mkdir -p "$temp_extract_dir"
-            
+
             # Try unzip first
             if command -v unzip &>/dev/null; then
                 unzip -q -UU "$zip_path" -d "$temp_extract_dir" 2>/dev/null || true
             fi
-            
+
             # If unzip failed or not available, try PowerShell
             # Convert paths to Windows format for PowerShell
             zip_path_win=$(echo "$zip_path" | sed 's|/|\\|g')
@@ -385,9 +385,9 @@ _mujoco_download:
                 >&2 echo "unzip failed, trying PowerShell Expand-Archive..."
                 powershell -Command "Expand-Archive -Path '$zip_path_win' -DestinationPath '$temp_extract_dir_win' -Force" 2>/dev/null || true
             fi
-            
+
             rm -f "$zip_path"
-            
+
             # Check if ZIP contains version directory or direct contents
             if [ -d "$temp_extract_dir/mujoco-${mujoco_version}" ]; then
                 # ZIP contains version directory, move it to install_dir
@@ -407,7 +407,7 @@ _mujoco_download:
                 rm -rf "$temp_extract_dir"
                 exit 1
             fi
-            
+
             # Clean up temporary directory
             rmdir "$temp_extract_dir" 2>/dev/null || rm -rf "$temp_extract_dir" 2>/dev/null || true
 

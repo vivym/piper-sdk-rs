@@ -258,8 +258,17 @@ fn test_reliable_command_not_dropped() {
 
     println!("Sent {} reliable commands successfully", sent_successfully);
 
-    // 等待处理完成
-    thread::sleep(Duration::from_millis(500));
+    // 等待处理完成。SlowTxAdapter 每帧 20ms，CI 环境调度可能较慢，预留充足时间。
+    // 最少等待 (帧数 * 单帧延迟 * 3) 或 800ms，确保 macOS CI 等慢环境能处理完。
+    let min_wait_ms = (sent_successfully as u64).saturating_mul(20 * 3).max(800);
+    let deadline = std::time::Instant::now() + Duration::from_millis(min_wait_ms);
+    while std::time::Instant::now() < deadline {
+        let processed = sent_count.load(Ordering::Relaxed);
+        if processed >= sent_successfully as u64 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 
     // 停止线程
     is_running.store(false, Ordering::Relaxed);
@@ -273,9 +282,9 @@ fn test_reliable_command_not_dropped() {
         sent_successfully, final_sent_count
     );
 
-    // 验证：处理的数量应该等于或接近发送的数量（允许一些误差）
+    // 验证：处理的数量应等于发送的数量（已通过轮询等待足够时间）
     assert!(
-        final_sent_count >= sent_successfully.saturating_sub(2) as u64,
+        final_sent_count >= sent_successfully as u64,
         "All successfully sent reliable commands should be processed. Sent: {}, Processed: {}",
         sent_successfully,
         final_sent_count
