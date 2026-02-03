@@ -258,9 +258,9 @@ fn test_reliable_command_not_dropped() {
 
     println!("Sent {} reliable commands successfully", sent_successfully);
 
-    // 等待处理完成。SlowTxAdapter 每帧 20ms，CI 环境调度可能较慢，预留充足时间。
-    // 最少等待 (帧数 * 单帧延迟 * 3) 或 800ms，确保 macOS CI 等慢环境能处理完。
-    let min_wait_ms = (sent_successfully as u64).saturating_mul(20 * 3).max(800);
+    // 等待处理完成。SlowTxAdapter 每帧 20ms，CI 环境（尤其 macOS）调度可能很慢，预留充足时间。
+    // 按 15 倍单帧延迟估算 + 至少 2.5s，避免超时后 is_running=false 导致 channel 未排空即退出。
+    let min_wait_ms = (sent_successfully as u64).saturating_mul(20 * 15).max(2500);
     let deadline = std::time::Instant::now() + Duration::from_millis(min_wait_ms);
     while std::time::Instant::now() < deadline {
         let processed = sent_count.load(Ordering::Relaxed);
