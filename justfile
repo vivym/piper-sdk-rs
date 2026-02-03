@@ -92,6 +92,15 @@ release:
     fi
     cargo build --workspace --release
 
+# Publish crates to crates.io (with MuJoCo env for testing)
+publish:
+    #!/usr/bin/env bash
+    eval "$(just _mujoco_download)"
+    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
+        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
+    fi
+    cargo release
+
 # Clean build artifacts
 clean:
     cargo clean
