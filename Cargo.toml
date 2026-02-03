@@ -89,8 +89,8 @@ tag-name = "v{{version}}"
 # 将所有 crate 的提交合并为一个（原子操作）
 consolidate-commits = true
 
-# 发布前先运行所有测试
-pre-release-hook = ["cargo", "test", "--workspace"]
+# 发布前先运行测试（排除不发布的 crate）
+pre-release-hook = ["cargo", "test", "--workspace", "--exclude", "piper-physics", "--exclude", "gs_usb_daemon", "--exclude", "piper-cli"]
 
 # 推送 tag 到远程
 push = true
