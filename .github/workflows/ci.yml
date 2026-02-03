@@ -192,12 +192,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # ✅ 运行测试（环境变量已通过 $GITHUB_ENV 传递）
-      - name: Run unit tests
+      # ✅ 运行测试（just test 已包含 unit/integration/doctest）
+      - name: Run tests
         run: just test
-
-      - name: Run doctests
-        run: cargo test --doc
 
   docs:
     name: Documentation
