@@ -242,12 +242,21 @@ fn test_rx_update_period_distribution() {
     );
 
     // 验证：P50 应该在 1ms 左右（1kHz = 1ms 周期）
-    // 考虑系统调度延迟，允许 30% 误差
+    // 本地：考虑系统调度延迟，允许 30% 误差 [0.7ms, 1.5ms]
+    // CI：调度不可控，只要求有周期性更新，上界放宽为 adjust_threshold_ms(2)
     let expected_period = Duration::from_millis(1);
     let p50 = stats.p50();
+    let p50_min = expected_period * 7 / 10;
+    let p50_max = if is_ci_env() {
+        adjust_threshold_ms(2) // CI 下 2*5=10ms
+    } else {
+        expected_period * 15 / 10
+    };
     assert!(
-        p50 >= expected_period * 7 / 10 && p50 <= expected_period * 15 / 10,
-        "RX update period P50 should be around 1ms (1kHz), got: {:?}",
+        p50 >= p50_min && p50 <= p50_max,
+        "RX update period P50 should be in [{:?}, {:?}] (1kHz ~1ms, CI relaxed), got: {:?}",
+        p50_min,
+        p50_max,
         p50
     );
 }

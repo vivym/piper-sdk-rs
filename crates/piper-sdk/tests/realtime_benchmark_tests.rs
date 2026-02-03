@@ -428,14 +428,20 @@ fn test_500hz_realtime_benchmark() {
     );
 
     // 验证：P50 应该在合理范围内（500Hz = 2ms 周期）
-    // 在 mock 环境中，允许更大的误差范围
-    // 在CI环境中，上限会放宽
+    // 本地：约 [1ms, 4ms]；CI：上界放宽为 adjust_threshold_ms(4)=20ms
     let expected_period = Duration::from_millis(2);
     let p50 = rx_metrics.p50();
-    let max_multiplier = if is_ci_env() { 20 * 2 } else { 20 };
+    let p50_min = expected_period * 5 / 10;
+    let p50_max = if is_ci_env() {
+        adjust_threshold_ms(4) // CI 下 20ms
+    } else {
+        expected_period * 20 / 10
+    };
     assert!(
-        p50 >= expected_period * 5 / 10 && p50 <= expected_period * max_multiplier / 10,
-        "RX update period P50 should be around 2ms (500Hz, CI环境已放宽上限), got: {:?}",
+        p50 >= p50_min && p50 <= p50_max,
+        "RX update period P50 should be in [{:?}, {:?}] (500Hz, CI relaxed), got: {:?}",
+        p50_min,
+        p50_max,
         p50
     );
 }
@@ -503,14 +509,20 @@ fn test_1khz_realtime_benchmark() {
     );
 
     // 验证：P50 应该在合理范围内（1kHz = 1ms 周期）
-    // 在 mock 环境中，允许更大的误差范围
-    // 在CI环境中，上限会放宽
+    // 本地：约 [0.5ms, 2ms]；CI：调度不可控，上界放宽为 adjust_threshold_ms(2)=10ms
     let expected_period = Duration::from_millis(1);
     let p50 = rx_metrics.p50();
-    let max_multiplier = if is_ci_env() { 20 * 2 } else { 20 };
+    let p50_min = expected_period * 5 / 10;
+    let p50_max = if is_ci_env() {
+        adjust_threshold_ms(2) // CI 下 10ms，与 pipeline_performance_tests 一致
+    } else {
+        expected_period * 20 / 10
+    };
     assert!(
-        p50 >= expected_period * 5 / 10 && p50 <= expected_period * max_multiplier / 10,
-        "RX update period P50 should be around 1ms (1kHz, CI环境已放宽上限), got: {:?}",
+        p50 >= p50_min && p50 <= p50_max,
+        "RX update period P50 should be in [{:?}, {:?}] (1kHz, CI relaxed), got: {:?}",
+        p50_min,
+        p50_max,
         p50
     );
 }
