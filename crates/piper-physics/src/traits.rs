@@ -1,6 +1,6 @@
 //! Core traits for gravity compensation and inverse dynamics
 
-use crate::{types::JointState, types::JointTorques, PhysicsError};
+use crate::{PhysicsError, types::JointState, types::JointTorques};
 
 /// Gravity compensation and inverse dynamics trait
 ///

@@ -844,7 +844,9 @@ mod tests {
                 assert!(
                     diff < 1e-10,
                     "Joint {}: gravity compensation ({}) should match partial inverse dynamics ({}) at zero velocity",
-                    i, tau_gravity[i], tau_partial[i]
+                    i,
+                    tau_gravity[i],
+                    tau_partial[i]
                 );
             }
         }
@@ -932,7 +934,9 @@ mod tests {
                 assert!(
                     tau_full_large[i].abs() >= tau_full_small[i].abs(),
                     "Joint {}: full ID (large acc) should be >= full ID (small acc) ({:.6} >= {:.6})",
-                    i, tau_full_large[i], tau_full_small[i]
+                    i,
+                    tau_full_large[i],
+                    tau_full_small[i]
                 );
             }
         }

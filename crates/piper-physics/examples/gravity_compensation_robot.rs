@@ -41,11 +41,11 @@
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     use piper_physics::{GravityCompensation, JointState, MujocoGravityCompensation};
+    use piper_sdk::PiperBuilder;
     use piper_sdk::client::state::*;
     use piper_sdk::client::types::*;
-    use piper_sdk::PiperBuilder;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use std::{array, thread};
 
