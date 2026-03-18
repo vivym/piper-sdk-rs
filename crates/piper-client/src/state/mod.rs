@@ -26,27 +26,24 @@
 //! # 使用示例
 //!
 //! ```rust,ignore
-//! # use piper_client::state::Piper;
-//! # use piper_client::types::*;
+//! # use piper_client::{PiperBuilder, state::MitModeConfig, types::*};
 //! # fn example() -> Result<()> {
 //! // 连接
-//! let robot = Piper::connect("can0")?;        // Piper<Standby>
+//! let robot = PiperBuilder::new().socketcan("can0").build()?; // Piper<Standby>
 //!
 //! // 使能 MIT 模式
-//! let robot = robot.enable_mit_mode()?;       // Piper<Active<MitMode>>
+//! let robot = robot.enable_mit_mode(MitModeConfig::default())?; // Piper<Active<MitMode>>
 //!
 //! // 发送命令
-//! robot.command_torques(
-//!     Joint::J1,
-//!     Rad(1.0),
-//!     0.5,
-//!     10.0,
-//!     2.0,
-//!     NewtonMeter(5.0),
-//! )?;
+//! let positions = JointArray::splat(Rad(1.0));
+//! let velocities = JointArray::splat(RadPerSecond(0.0));
+//! let kp = JointArray::splat(10.0);
+//! let kd = JointArray::splat(2.0);
+//! let torques = JointArray::splat(NewtonMeter(5.0));
+//! robot.command_torques(&positions, &velocities, &kp, &kd, &torques)?;
 //!
 //! // 失能
-//! let robot = robot.disable()?;                // Piper<Standby>
+//! let _robot = robot.disable()?; // Piper<Standby>
 //!
 //! // Drop 自动失能
 //! # Ok(())

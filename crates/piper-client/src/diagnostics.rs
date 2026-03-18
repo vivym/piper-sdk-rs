@@ -52,7 +52,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let robot = PiperBuilder::new()
-//!     .interface("can0")
+//!     .socketcan("can0")
 //!     .build()?;
 //!
 //! let active = robot.enable_position_mode(Default::default())?;
@@ -84,7 +84,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let robot = PiperBuilder::new()
-//!     .interface("can0")
+//!     .socketcan("can0")
 //!     .build()?;
 //!
 //! let active = robot.enable_position_mode(Default::default())?;
@@ -163,7 +163,7 @@ impl PiperDiagnostics {
     /// # use std::sync::Arc;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let robot = PiperBuilder::new()
-    ///     .interface("can0")
+    ///     .socketcan("can0")
     ///     .build()?;
     ///
     /// let active = robot.enable_position_mode(Default::default())?;
@@ -210,7 +210,7 @@ impl PiperDiagnostics {
     /// # use piper_can::PiperFrame;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let robot = PiperBuilder::new()
-    ///     .interface("can0")
+    ///     .socketcan("can0")
     ///     .build()?;
     ///
     /// let active = robot.enable_position_mode(Default::default())?;
@@ -260,7 +260,7 @@ impl PiperDiagnostics {
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let robot = PiperBuilder::new()
-    ///     .interface("can0")
+    ///     .socketcan("can0")
     ///     .build()?;
     ///
     /// let active = robot.enable_position_mode(Default::default())?;

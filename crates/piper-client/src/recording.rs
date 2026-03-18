@@ -15,7 +15,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let robot = PiperBuilder::new()
-//!     .interface("can0")
+//!     .socketcan("can0")
 //!     .build()?;
 //!
 //! let active = robot.enable_position_mode(Default::default())?;

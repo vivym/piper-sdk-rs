@@ -264,7 +264,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logger!();
 
     // 然后才能看到日志输出
-    let driver = PiperBuilder::new().interface("can0").build()?;
+    let driver = PiperBuilder::new().socketcan("can0").build()?;
 
     Ok(())
 }
@@ -408,4 +408,3 @@ fn main() {
 3. 联系项目维护者
 
 感谢你的贡献！🎉
-

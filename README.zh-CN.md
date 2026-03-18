@@ -195,9 +195,10 @@ piper-tools = "0.1"
 use piper_sdk::prelude::*;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // 使用 Builder API 连接（自动处理平台差异）
+    // 在 Linux 上显式使用 SocketCAN 连接。
+    // macOS/Windows 请改用 `.gs_usb_auto()` 或 `.gs_usb_serial(...)`。
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .baud_rate(1_000_000)
         .build()?;
     let robot = robot.enable_position_mode(PositionModeConfig::default())?;
@@ -240,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 连接机器人
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .build()?;
 
     // 在驱动层注册钩子
@@ -299,7 +300,7 @@ use std::time::Duration;
 async fn main() -> anyhow::Result<()> {
     // 连接到机器人
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .build()?;
 
     // 启动录制（带元数据）
@@ -346,7 +347,7 @@ use std::thread;
 fn main() -> anyhow::Result<()> {
     // 连接并使能机器人
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .build()?;
     let active = robot.enable_position_mode(Default::default())?;
 
@@ -405,7 +406,7 @@ use piper_client::PiperBuilder;
 fn main() -> anyhow::Result<()> {
     // 连接到机器人
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .build()?;
 
     // 进入回放模式（驱动 TX 线程自动暂停）
@@ -510,8 +511,8 @@ use piper_sdk::driver::PiperBuilder;
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 创建驱动实例
     let robot = PiperBuilder::new()
-        .interface("can0")?  // Linux: SocketCAN 接口名（或 GS-USB 设备序列号）
-        .baud_rate(1_000_000)?  // CAN 波特率
+        .socketcan("can0")  // Linux: 显式指定 SocketCAN 目标
+        .baud_rate(1_000_000)  // CAN 波特率
         .build()?;
 
     // 获取当前状态（无锁，纳秒级返回）

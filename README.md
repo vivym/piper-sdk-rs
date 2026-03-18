@@ -195,9 +195,10 @@ Most users should use the high-level client API for type-safe, easy-to-use contr
 use piper_sdk::prelude::*;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Connect using Builder API (automatically handles platform differences)
+    // Connect using an explicit SocketCAN target on Linux.
+    // On macOS/Windows, use `.gs_usb_auto()` or `.gs_usb_serial(...)`.
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .baud_rate(1_000_000)
         .build()?;
     let robot = robot.enable_position_mode(PositionModeConfig::default())?;
@@ -240,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect robot
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .build()?;
 
     // Register hook in driver layer
@@ -299,7 +300,7 @@ use std::time::Duration;
 async fn main() -> anyhow::Result<()> {
     // Connect to robot
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .build()?;
 
     // Start recording with metadata
@@ -346,7 +347,7 @@ use std::thread;
 fn main() -> anyhow::Result<()> {
     // Connect and enable robot
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .build()?;
     let active = robot.enable_position_mode(Default::default())?;
 
@@ -405,7 +406,7 @@ use piper_client::PiperBuilder;
 fn main() -> anyhow::Result<()> {
     // Connect to robot
     let robot = PiperBuilder::new()
-        .interface("can0")
+        .socketcan("can0")
         .build()?;
 
     // Enter ReplayMode (Driver TX thread pauses automatically)
@@ -510,8 +511,8 @@ use piper_sdk::driver::PiperBuilder;
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create driver instance
     let robot = PiperBuilder::new()
-        .interface("can0")?  // Linux: SocketCAN interface name (or GS-USB device serial)
-        .baud_rate(1_000_000)?  // CAN baud rate
+        .socketcan("can0")  // Linux: explicit SocketCAN target
+        .baud_rate(1_000_000)  // CAN baud rate
         .build()?;
 
     // Get current state (lock-free, nanosecond-level response)
