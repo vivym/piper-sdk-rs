@@ -558,13 +558,15 @@ pub fn tx_loop_mailbox(
             }
         };
 
-        if let Some(command) = realtime_command {
+        if let Some(mut command) = realtime_command {
             // 处理实时命令（统一使用 FrameBuffer，不需要 match 分支）
             // 单个帧只是 len=1 的特殊情况，循环只执行一次，开销极低
+            let ack = command.take_ack();
             let frames = command.into_frames();
             let total_frames = frames.len();
             let mut sent_count = 0;
             let mut should_break = false;
+            let mut send_error = None;
 
             for frame in frames {
                 match tx.send(frame) {
@@ -598,9 +600,22 @@ pub fn tx_loop_mailbox(
 
                         // 停止发送后续帧（部分原子性）
                         // 注意：CAN 总线特性决定了已发送的帧无法回滚
+                        send_error = Some(e);
                         break;
                     },
                 }
+            }
+
+            if let Some(ack) = ack {
+                let result = match send_error {
+                    Some(source) => Err(crate::DriverError::RealtimeDeliveryFailed {
+                        sent: sent_count,
+                        total: total_frames,
+                        source,
+                    }),
+                    None => Ok(()),
+                };
+                let _ = ack.send(result);
             }
 
             // 记录包发送统计
@@ -673,6 +688,11 @@ pub fn tx_loop_mailbox(
 
     if is_running.load(Ordering::Acquire) {
         record_fault(&last_fault, RuntimeFaultKind::TxExited);
+    }
+    if let Ok(mut slot) = realtime_slot.lock()
+        && let Some(command) = slot.take()
+    {
+        command.complete(Err(crate::DriverError::ChannelClosed));
     }
     trace!("TX thread: loop exited");
 }

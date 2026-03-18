@@ -8,7 +8,10 @@
 
 // 客户端层（推荐使用）
 pub use crate::client::Piper;
-pub use crate::client::{ControlReadPolicy, ControlSnapshot, Observer, PiperBuilder};
+pub use crate::client::{
+    ControlReadPolicy, ControlSnapshot, Observer, PiperBuilder, RuntimeFaultKind,
+    RuntimeHealthSnapshot,
+};
 // 类型系统（通过 types 模块导出）
 pub use crate::client::types::*;
 

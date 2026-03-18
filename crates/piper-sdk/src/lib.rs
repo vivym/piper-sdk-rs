@@ -71,7 +71,9 @@ pub use client::Piper; // Type State Pattern 的状态机
 pub use client::{
     Observer,
     PiperBuilder, // Client 层 Builder（推荐使用）
-                  // 类型系统通过 types 模块导出
+    RuntimeFaultKind,
+    RuntimeHealthSnapshot,
+    // 类型系统通过 types 模块导出
 };
 
 // 导出 recording 模块的常用类型

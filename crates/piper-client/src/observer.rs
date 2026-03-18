@@ -41,7 +41,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::types::*;
-use piper_driver::{AlignmentResult, DriverError, Piper as RobotPiper};
+use piper_driver::{
+    AlignmentResult, DriverError, HealthStatus, Piper as RobotPiper, RuntimeFaultKind,
+};
 use piper_protocol::constants::*;
 
 /// 状态观察器（只读接口，View 模式）
@@ -118,6 +120,33 @@ pub struct ControlSnapshot {
     pub skew_us: i64,
 }
 
+/// Driver 运行时健康状态快照
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeHealthSnapshot {
+    /// 是否仍在接收任意反馈
+    pub connected: bool,
+    /// 最近一次任意反馈距离现在的年龄
+    pub last_feedback_age: Duration,
+    /// RX 线程是否存活
+    pub rx_alive: bool,
+    /// TX 线程是否存活
+    pub tx_alive: bool,
+    /// 最近一次运行时故障
+    pub fault: Option<RuntimeFaultKind>,
+}
+
+impl From<HealthStatus> for RuntimeHealthSnapshot {
+    fn from(value: HealthStatus) -> Self {
+        Self {
+            connected: value.connected,
+            last_feedback_age: value.last_feedback_age,
+            rx_alive: value.rx_alive,
+            tx_alive: value.tx_alive,
+            fault: value.fault,
+        }
+    }
+}
+
 impl Observer {
     /// 创建新的 Observer
     ///
@@ -139,6 +168,13 @@ impl Observer {
     pub fn control_snapshot(&self, policy: ControlReadPolicy) -> Result<ControlSnapshot> {
         match self.driver.get_aligned_motion(policy.max_state_skew_us) {
             AlignmentResult::Ok(state) => {
+                if !state.is_complete() {
+                    return Err(RobotError::control_state_incomplete(
+                        state.position_frame_valid_mask,
+                        state.dynamic_valid_mask,
+                    ));
+                }
+
                 let age = control_feedback_age(
                     state.position_system_timestamp_us,
                     state.dynamic_system_timestamp_us,
@@ -162,6 +198,13 @@ impl Observer {
                 })
             },
             AlignmentResult::Misaligned { state, .. } => {
+                if !state.is_complete() {
+                    return Err(RobotError::control_state_incomplete(
+                        state.position_frame_valid_mask,
+                        state.dynamic_valid_mask,
+                    ));
+                }
+
                 let age = control_feedback_age(
                     state.position_system_timestamp_us,
                     state.dynamic_system_timestamp_us,
@@ -183,6 +226,7 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
+    /// 该接口可能返回部分帧组提交后的状态，只适合监控/诊断。
     pub fn joint_positions(&self) -> JointArray<Rad> {
         let raw_pos = self.driver.get_joint_position();
         JointArray::new(raw_pos.joint_pos.map(Rad))
@@ -193,6 +237,7 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
+    /// 该接口可能返回 timeout 提交的部分动态组，只适合监控/诊断。
     ///
     /// # 返回值
     ///
@@ -208,6 +253,7 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
+    /// 该接口可能返回 timeout 提交的部分动态组，只适合监控/诊断。
     pub fn joint_torques(&self) -> JointArray<NewtonMeter> {
         let dyn_state = self.driver.get_joint_dynamic();
         JointArray::new(dyn_state.get_all_torques().map(NewtonMeter))
@@ -354,6 +400,11 @@ impl Observer {
     /// ```
     pub fn connection_age(&self) -> std::time::Duration {
         self.driver.connection_age()
+    }
+
+    /// 获取 driver 运行时健康快照。
+    pub fn runtime_health(&self) -> RuntimeHealthSnapshot {
+        self.driver.health().into()
     }
 
     /// 获取当前缓存的碰撞保护快照
@@ -670,8 +721,24 @@ mod tests {
 
     #[test]
     fn test_control_snapshot_rejects_stale_feedback() {
-        let (driver, observer) = start_observer_with_frames(Vec::new());
-        let _keep_driver_alive = driver;
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 1000, timestamp_us),
+            joint_dynamic_frame(2, 0, 1000, timestamp_us),
+            joint_dynamic_frame(3, 0, 1000, timestamp_us),
+            joint_dynamic_frame(4, 0, 1000, timestamp_us),
+            joint_dynamic_frame(5, 0, 1000, timestamp_us),
+            joint_dynamic_frame(6, 0, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(30));
 
         let error = observer
             .control_snapshot(ControlReadPolicy {
@@ -681,6 +748,96 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, RobotError::FeedbackStale { .. }));
+    }
+
+    #[test]
+    fn test_control_snapshot_rejects_incomplete_position_group() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 1000, timestamp_us),
+            joint_dynamic_frame(2, 0, 1000, timestamp_us),
+            joint_dynamic_frame(3, 0, 1000, timestamp_us),
+            joint_dynamic_frame(4, 0, 1000, timestamp_us),
+            joint_dynamic_frame(5, 0, 1000, timestamp_us),
+            joint_dynamic_frame(6, 0, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let error = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 500,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RobotError::ControlStateIncomplete {
+                position_frame_valid_mask: 0b101,
+                dynamic_valid_mask: 0b111111,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_control_snapshot_rejects_incomplete_dynamic_group() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 1000, timestamp_us),
+            joint_dynamic_frame(2, 0, 1000, timestamp_us),
+            joint_dynamic_frame(3, 0, 1000, timestamp_us),
+            joint_dynamic_frame(4, 0, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let error = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 500,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RobotError::ControlStateIncomplete {
+                position_frame_valid_mask: 0b111,
+                dynamic_valid_mask: 0b001111,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_control_snapshot_prioritizes_incomplete_over_stale_and_misaligned() {
+        let error = Observer::new(Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                ScriptedRxAdapter::new(Vec::new()),
+                IdleTxAdapter,
+                None,
+            )
+            .expect("driver should start"),
+        ))
+        .control_snapshot(ControlReadPolicy {
+            max_state_skew_us: 0,
+            max_feedback_age: Duration::from_millis(1),
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, RobotError::ControlStateIncomplete { .. }));
     }
 
     #[test]
@@ -806,5 +963,6 @@ mod tests {
         assert_send_sync::<GripperState>();
         assert_send_sync::<ControlReadPolicy>();
         assert_send_sync::<ControlSnapshot>();
+        assert_send_sync::<RuntimeHealthSnapshot>();
     }
 }

@@ -29,6 +29,7 @@
 //! ```
 
 use super::joint::Joint;
+use piper_driver::RuntimeFaultKind;
 use piper_protocol::{MitControlField, ProtocolError};
 use std::time::Duration;
 use thiserror::Error;
@@ -95,6 +96,28 @@ pub enum RobotError {
         skew_us: i64,
         /// 允许的最大绝对偏差
         max_skew_us: u64,
+    },
+
+    /// 控制闭环读取到的不完整运动状态
+    #[error(
+        "Control state incomplete: position mask {position_frame_valid_mask:03b}, dynamic mask {dynamic_valid_mask:06b}"
+    )]
+    ControlStateIncomplete {
+        /// 位置反馈帧组有效性掩码（0x2A5-0x2A7）
+        position_frame_valid_mask: u8,
+        /// 动态反馈组有效性掩码（J1-J6）
+        dynamic_valid_mask: u8,
+    },
+
+    /// 运行时健康状态异常
+    #[error("Runtime health unhealthy: rx_alive={rx_alive}, tx_alive={tx_alive}, fault={fault:?}")]
+    RuntimeHealthUnhealthy {
+        /// RX 线程是否存活
+        rx_alive: bool,
+        /// TX 线程是否存活
+        tx_alive: bool,
+        /// 最近一次运行时故障
+        fault: Option<RuntimeFaultKind>,
     },
 
     /// 关节限位超出
@@ -241,6 +264,7 @@ impl RobotError {
                 | Self::StatePoisoned { .. }
                 | Self::EmergencyStop
                 | Self::CanBusFatal(_)
+                | Self::RuntimeHealthUnhealthy { .. }
         )
     }
 
@@ -255,6 +279,7 @@ impl RobotError {
                 | Self::Protocol(_)
                 | Self::FeedbackStale { .. }
                 | Self::StateMisaligned { .. }
+                | Self::ControlStateIncomplete { .. }
         )
     }
 
@@ -325,6 +350,27 @@ impl RobotError {
         Self::StateMisaligned {
             skew_us,
             max_skew_us,
+        }
+    }
+
+    /// 创建控制状态不完整错误
+    pub fn control_state_incomplete(position_frame_valid_mask: u8, dynamic_valid_mask: u8) -> Self {
+        Self::ControlStateIncomplete {
+            position_frame_valid_mask,
+            dynamic_valid_mask,
+        }
+    }
+
+    /// 创建运行时健康异常错误
+    pub fn runtime_health_unhealthy(
+        rx_alive: bool,
+        tx_alive: bool,
+        fault: Option<RuntimeFaultKind>,
+    ) -> Self {
+        Self::RuntimeHealthUnhealthy {
+            rx_alive,
+            tx_alive,
+            fault,
         }
     }
 

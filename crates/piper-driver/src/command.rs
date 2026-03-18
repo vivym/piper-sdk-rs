@@ -2,6 +2,8 @@
 //!
 //! 提供命令优先级和类型区分机制，优化丢弃策略。
 
+use crate::DriverError;
+use crossbeam_channel::Sender;
 use piper_can::PiperFrame;
 use smallvec::SmallVec;
 
@@ -45,9 +47,12 @@ pub type FrameBuffer = SmallVec<[PiperFrame; 6]>;
 /// - Single 只是 len=1 的 FrameBuffer
 /// - 简化 TX 线程逻辑（不需要 match 分支）
 /// - 消除 CPU 分支预测压力
-#[derive(Debug, Clone)]
+pub type RealtimeAck = Sender<Result<(), DriverError>>;
+
+#[derive(Debug)]
 pub struct RealtimeCommand {
     frames: FrameBuffer,
+    ack: Option<RealtimeAck>,
 }
 
 impl RealtimeCommand {
@@ -58,7 +63,10 @@ impl RealtimeCommand {
     pub fn single(frame: PiperFrame) -> Self {
         let mut buffer = FrameBuffer::new();
         buffer.push(frame); // 不会分配堆内存（len=1 < 6）
-        RealtimeCommand { frames: buffer }
+        RealtimeCommand {
+            frames: buffer,
+            ack: None,
+        }
     }
 
     /// 创建帧包命令
@@ -71,7 +79,20 @@ impl RealtimeCommand {
     #[inline]
     pub fn package(frames: impl IntoIterator<Item = PiperFrame>) -> Self {
         let buffer: FrameBuffer = frames.into_iter().collect();
-        RealtimeCommand { frames: buffer }
+        RealtimeCommand {
+            frames: buffer,
+            ack: None,
+        }
+    }
+
+    /// 创建带确认通道的帧包命令。
+    #[inline]
+    pub fn confirmed(frames: impl IntoIterator<Item = PiperFrame>, ack: RealtimeAck) -> Self {
+        let buffer: FrameBuffer = frames.into_iter().collect();
+        RealtimeCommand {
+            frames: buffer,
+            ack: Some(ack),
+        }
     }
 
     /// 获取帧数量
@@ -96,6 +117,20 @@ impl RealtimeCommand {
     #[inline]
     pub fn into_frames(self) -> FrameBuffer {
         self.frames
+    }
+
+    /// 取出确认通道。
+    #[inline]
+    pub fn take_ack(&mut self) -> Option<RealtimeAck> {
+        self.ack.take()
+    }
+
+    /// 完成确认通道。
+    #[inline]
+    pub fn complete(mut self, result: Result<(), DriverError>) {
+        if let Some(ack) = self.ack.take() {
+            let _ = ack.send(result);
+        }
     }
 }
 

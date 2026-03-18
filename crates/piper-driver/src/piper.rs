@@ -570,6 +570,8 @@ impl Piper {
             dynamic_timestamp_us: joint_dynamic.group_timestamp_us,
             position_system_timestamp_us: snapshot.joint_position.system_timestamp_us,
             dynamic_system_timestamp_us: joint_dynamic.group_system_timestamp_us,
+            position_frame_valid_mask: snapshot.joint_position.frame_valid_mask,
+            dynamic_valid_mask: joint_dynamic.valid_mask,
             skew_us: (joint_dynamic.group_timestamp_us as i64)
                 - (snapshot.joint_position.hardware_timestamp_us as i64),
         };
@@ -958,24 +960,70 @@ impl Piper {
         self.send_realtime_command(RealtimeCommand::package(buffer))
     }
 
+    /// 发送实时帧包并等待 TX 线程确认实际发送结果。
+    pub fn send_realtime_package_confirmed(
+        &self,
+        frames: impl IntoIterator<Item = PiperFrame>,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        use crate::command::FrameBuffer;
+
+        if !self.tx_thread_alive() || !self.is_running.load(Ordering::Acquire) {
+            return Err(DriverError::ChannelClosed);
+        }
+
+        let buffer: FrameBuffer = frames.into_iter().collect();
+
+        if buffer.is_empty() {
+            return Err(DriverError::InvalidInput(
+                "Frame package cannot be empty".to_string(),
+            ));
+        }
+
+        if buffer.len() > Self::MAX_REALTIME_PACKAGE_SIZE {
+            return Err(DriverError::InvalidInput(format!(
+                "Frame package too large: {} (max: {})",
+                buffer.len(),
+                Self::MAX_REALTIME_PACKAGE_SIZE
+            )));
+        }
+
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.send_realtime_command(RealtimeCommand::confirmed(buffer, ack_tx))?;
+
+        match ack_rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(DriverError::RealtimeDeliveryTimeout)
+            },
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(DriverError::ChannelClosed)
+            },
+        }
+    }
+
     /// 内部方法：发送实时命令（统一处理单个帧和帧包）
     fn send_realtime_command(&self, command: RealtimeCommand) -> Result<(), DriverError> {
         match self.realtime_slot.lock() {
             Ok(mut slot) => {
                 // 检测是否发生覆盖（如果插槽已有数据）
-                let is_overwrite = slot.is_some();
+                let previous = slot.replace(command);
+                let is_overwrite = previous.is_some();
 
                 // 计算帧数量（在覆盖前，避免双重计算）
-                let frame_count = command.len();
+                let frame_count = slot.as_ref().map(RealtimeCommand::len).unwrap_or_default();
 
                 // 直接覆盖（邮箱模式：Last Write Wins）
                 // 注意：如果旧命令是 Package，Drop 操作会释放 SmallVec
                 // 但如果数据在栈上（len ≤ 4），Drop 只是栈指针移动，几乎零开销
-                *slot = Some(command);
 
                 // 更新指标（在锁外更新，减少锁持有时间）
                 // 注意：先释放锁，再更新指标，避免在锁内进行原子操作
                 drop(slot); // 显式释放锁
+
+                if let Some(previous) = previous {
+                    previous.complete(Err(DriverError::RealtimeDeliveryOverwritten));
+                }
 
                 // 更新指标（在锁外更新，减少锁持有时间）
                 let total =
@@ -1105,6 +1153,12 @@ impl Drop for Piper {
             ManuallyDrop::drop(&mut self.cmd_tx);
         }
 
+        if let Ok(mut slot) = self.realtime_slot.lock()
+            && let Some(command) = slot.take()
+        {
+            command.complete(Err(DriverError::ChannelClosed));
+        }
+
         let join_timeout = Duration::from_secs(2);
 
         if let Some(handle) = self.workers.rx_thread.take()
@@ -1132,6 +1186,8 @@ mod tests {
     use super::*;
     use piper_can::{CanAdapter, PiperFrame, SplittableAdapter};
     use std::collections::VecDeque;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, mpsc};
 
     struct MockCanAdapter;
 
@@ -1158,6 +1214,50 @@ mod tests {
 
     impl piper_can::TxAdapter for MockTxAdapter {
         fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    }
+
+    impl piper_can::TxAdapter for RecordingTxAdapter {
+        fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
+    struct FailOnNthTxAdapter {
+        fail_on: usize,
+        sends: usize,
+    }
+
+    impl piper_can::TxAdapter for FailOnNthTxAdapter {
+        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+            self.sends += 1;
+            if self.sends == self.fail_on {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+    }
+
+    struct CoordinatedFailTxAdapter {
+        started_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
+        first_send: bool,
+    }
+
+    impl piper_can::TxAdapter for CoordinatedFailTxAdapter {
+        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+            if !self.first_send {
+                self.first_send = true;
+                let _ = self.started_tx.send(());
+                let _ = self.release_rx.recv();
+                return Err(CanError::BufferOverflow);
+            }
             Ok(())
         }
     }
@@ -1274,6 +1374,8 @@ mod tests {
             AlignmentResult::Ok(state) => {
                 assert_eq!(state.position_timestamp_us, 0);
                 assert_eq!(state.dynamic_timestamp_us, 0);
+                assert_eq!(state.position_frame_valid_mask, 0);
+                assert_eq!(state.dynamic_valid_mask, 0);
                 assert_eq!(state.skew_us, 0);
             },
             AlignmentResult::Misaligned { .. } => {
@@ -1461,6 +1563,164 @@ mod tests {
                 assert_eq!(state.skew_us, 0);
             },
         }
+    }
+
+    #[test]
+    fn test_get_aligned_motion_carries_completeness_masks() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+
+        piper.ctx.publish_joint_position(JointPositionState {
+            hardware_timestamp_us: 1_000,
+            system_timestamp_us: 2_000,
+            joint_pos: [0.0; 6],
+            frame_valid_mask: 0b101,
+        });
+        piper.ctx.joint_dynamic.store(Arc::new(JointDynamicState {
+            group_timestamp_us: 1_000,
+            group_system_timestamp_us: 2_000,
+            joint_vel: [0.0; 6],
+            joint_current: [0.0; 6],
+            timestamps: [1_000; 6],
+            valid_mask: 0b001111,
+        }));
+
+        let result = piper.get_aligned_motion(0);
+        let state = match result {
+            AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
+        };
+
+        assert_eq!(state.position_frame_valid_mask, 0b101);
+        assert_eq!(state.dynamic_valid_mask, 0b001111);
+        assert!(!state.is_complete());
+    }
+
+    #[test]
+    fn test_send_realtime_package_confirmed_success() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts(
+            MockRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, &[0x01]),
+            PiperFrame::new_standard(0x156, &[0x02]),
+        ];
+
+        piper
+            .send_realtime_package_confirmed(frames, Duration::from_millis(200))
+            .expect("confirmed send should succeed");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn test_send_realtime_command_confirms_overwrite_immediately() {
+        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
+        piper.is_running.store(false, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(5));
+        let (ack1_tx, ack1_rx) = crossbeam_channel::bounded(1);
+
+        piper
+            .send_realtime_command(RealtimeCommand::confirmed(
+                [PiperFrame::new_standard(0x155, &[0x01])],
+                ack1_tx,
+            ))
+            .expect("first queue should succeed");
+        piper
+            .send_realtime_command(RealtimeCommand::package([PiperFrame::new_standard(
+                0x156,
+                &[0x02],
+            )]))
+            .expect("overwrite queue should succeed");
+
+        let result = ack1_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("overwrite ack should arrive");
+        assert!(matches!(
+            result,
+            Err(DriverError::RealtimeDeliveryOverwritten)
+        ));
+    }
+
+    #[test]
+    fn test_send_realtime_package_confirmed_reports_partial_failure() {
+        let piper = Piper::new_dual_thread_parts(
+            MockRxAdapter,
+            FailOnNthTxAdapter {
+                fail_on: 2,
+                sends: 0,
+            },
+            None,
+        )
+        .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, &[0x01]),
+            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x157, &[0x03]),
+        ];
+
+        let error = piper
+            .send_realtime_package_confirmed(frames, Duration::from_millis(200))
+            .expect_err("partial send should fail");
+
+        assert!(matches!(
+            error,
+            DriverError::RealtimeDeliveryFailed {
+                sent: 1,
+                total: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_pending_confirmed_send_is_failed_when_tx_thread_exits() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts(
+                MockRxAdapter,
+                CoordinatedFailTxAdapter {
+                    started_tx,
+                    release_rx,
+                    first_send: false,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let first = [PiperFrame::new_standard(0x155, &[0x01])];
+        let second = [PiperFrame::new_standard(0x156, &[0x02])];
+
+        piper.send_realtime_package(first).expect("first realtime package should queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("tx thread should start sending first frame");
+
+        let pending_result = Arc::new(Mutex::new(None));
+        let pending_result_clone = pending_result.clone();
+        let piper_clone = piper.clone();
+        let handle = std::thread::spawn(move || {
+            let result =
+                piper_clone.send_realtime_package_confirmed(second, Duration::from_millis(500));
+            *pending_result_clone.lock().expect("pending result lock") = Some(result);
+        });
+
+        let _ = release_tx.send(());
+        handle.join().expect("confirmed send thread should finish");
+
+        let result = pending_result
+            .lock()
+            .expect("pending result lock")
+            .take()
+            .expect("confirmed send result should be captured");
+        assert!(matches!(result, Err(DriverError::ChannelClosed)));
     }
 
     #[test]

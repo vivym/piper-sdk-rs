@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::connection::initialize_connected_driver;
 use crate::types::*;
 use crate::{
-    observer::{CollisionProtectionSnapshot, Observer},
+    observer::{CollisionProtectionSnapshot, Observer, RuntimeHealthSnapshot},
     raw_commander::RawCommander,
 };
 use piper_protocol::control::{InstallPosition, MitControlCommand};
@@ -1168,6 +1168,11 @@ impl<State> Piper<State> {
             .map_err(Into::into)
     }
 
+    /// 获取 driver 运行时健康快照。
+    pub fn runtime_health(&self) -> RuntimeHealthSnapshot {
+        self.observer.runtime_health()
+    }
+
     fn build_validated_mit_command_batch(
         &self,
         positions: &JointArray<Rad>,
@@ -1772,6 +1777,22 @@ impl Piper<Active<MitMode>> {
         let commands =
             self.build_validated_mit_command_batch(positions, velocities, kp, kd, torques)?;
         raw.send_validated_mit_command_batch(commands)
+    }
+
+    /// 发送 MIT 模式控制指令，并等待 TX 线程确认实际发送结果。
+    pub fn command_torques_confirmed(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        let commands =
+            self.build_validated_mit_command_batch(positions, velocities, kp, kd, torques)?;
+        raw.send_validated_mit_command_batch_confirmed(commands, timeout)
     }
 
     /// 控制夹爪
@@ -2848,6 +2869,94 @@ mod tests {
         assert!(
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "no frames should be sent when the batch fails validation"
+        );
+    }
+
+    #[test]
+    fn command_torques_confirmed_applies_firmware_quirks_before_encoding() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let robot = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 7, 2)),
+            sent_frames.clone(),
+        );
+
+        let positions =
+            JointArray::from([Rad(1.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)]);
+        let velocities = JointArray::splat(0.0);
+        let kp = JointArray::splat(0.0);
+        let kd = JointArray::splat(0.0);
+        let torques = JointArray::from([
+            NewtonMeter(4.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+        ]);
+
+        robot
+            .command_torques_confirmed(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(200),
+            )
+            .expect("command_torques_confirmed should succeed");
+
+        let frames = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(frames.len(), 6);
+
+        let expected = MitControlCommand::try_new(1, -1.0, 0.0, 0.0, 0.0, -1.0)
+            .expect("expected command should be valid")
+            .to_frame();
+        assert_eq!(frames[0].id, expected.id);
+        assert_eq!(frames[0].data, expected.data);
+    }
+
+    #[test]
+    fn command_torques_confirmed_is_atomic_when_any_joint_is_invalid() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let robot = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames.clone(),
+        );
+
+        let positions = JointArray::splat(Rad(0.0));
+        let velocities = JointArray::splat(0.0);
+        let kp = JointArray::splat(0.0);
+        let kd = JointArray::splat(0.0);
+        let torques = JointArray::from([
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(9.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+        ]);
+
+        let error = robot
+            .command_torques_confirmed(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(200),
+            )
+            .expect_err("invalid joint torque should fail the whole confirmed batch");
+
+        assert!(matches!(
+            error,
+            RobotError::TorqueLimitExceeded {
+                joint: Joint::J3,
+                ..
+            }
+        ));
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "no frames should be sent when confirmed batch validation fails"
         );
     }
 

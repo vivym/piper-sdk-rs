@@ -37,7 +37,11 @@ mod recording_tests;
 // 重新导出常用类型
 pub use builder::PiperBuilder;
 pub use diagnostics::PiperDiagnostics;
-pub use observer::{CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, Observer};
+pub use observer::{
+    CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, Observer,
+    RuntimeHealthSnapshot,
+};
+pub use piper_driver::RuntimeFaultKind;
 pub use recording::{
     RecordingConfig, RecordingHandle, RecordingMetadata, RecordingStats, StopCondition,
 };

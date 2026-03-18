@@ -48,6 +48,26 @@ pub enum DriverError {
     /// 无效输入（如空帧包）
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// 已确认的实时命令在进入 TX 线程前被新命令覆盖
+    #[error("Realtime delivery was overwritten before transmission")]
+    RealtimeDeliveryOverwritten,
+
+    /// 已确认的实时命令在 TX 线程中发送失败
+    #[error("Realtime delivery failed after sending {sent}/{total} frames: {source}")]
+    RealtimeDeliveryFailed {
+        /// 已成功发送的帧数
+        sent: usize,
+        /// 计划发送的总帧数
+        total: usize,
+        /// 底层 CAN 发送错误
+        #[source]
+        source: CanError,
+    },
+
+    /// 已确认的实时命令等待 TX 线程确认超时
+    #[error("Realtime delivery confirmation timed out")]
+    RealtimeDeliveryTimeout,
 }
 
 #[cfg(test)]
@@ -111,6 +131,22 @@ mod tests {
         let driver_error = DriverError::Timeout;
         let msg = format!("{}", driver_error);
         assert_eq!(msg, "Operation timeout");
+
+        let driver_error = DriverError::RealtimeDeliveryOverwritten;
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("overwritten"));
+
+        let driver_error = DriverError::RealtimeDeliveryFailed {
+            sent: 1,
+            total: 6,
+            source: CanError::Timeout,
+        };
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("1/6"));
+
+        let driver_error = DriverError::RealtimeDeliveryTimeout;
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("timed out"));
     }
 
     /// 测试 From<CanError> 转换

@@ -1147,7 +1147,26 @@ pub struct AlignedMotionState {
     pub dynamic_timestamp_us: u64,
     pub position_system_timestamp_us: u64,
     pub dynamic_system_timestamp_us: u64,
+    pub position_frame_valid_mask: u8,
+    pub dynamic_valid_mask: u8,
     pub skew_us: i64,
+}
+
+impl AlignedMotionState {
+    /// 位置反馈帧组是否完整（0x2A5-0x2A7 都已到达）。
+    pub fn position_complete(&self) -> bool {
+        self.position_frame_valid_mask == 0b0000_0111
+    }
+
+    /// 动态反馈组是否完整（J1-J6 都已到达）。
+    pub fn dynamic_complete(&self) -> bool {
+        self.dynamic_valid_mask == 0b0011_1111
+    }
+
+    /// 位置和动态反馈是否都完整。
+    pub fn is_complete(&self) -> bool {
+        self.position_complete() && self.dynamic_complete()
+    }
 }
 
 /// 时间对齐结果
@@ -1358,6 +1377,8 @@ mod tests {
             dynamic_timestamp_us: 1500,
             position_system_timestamp_us: 2000,
             dynamic_system_timestamp_us: 2500,
+            position_frame_valid_mask: 0b111,
+            dynamic_valid_mask: 0b111111,
             skew_us: 500,
         };
         let debug_str = format!("{:?}", state);
@@ -1375,6 +1396,8 @@ mod tests {
             dynamic_timestamp_us: 1500,
             position_system_timestamp_us: 2000,
             dynamic_system_timestamp_us: 2500,
+            position_frame_valid_mask: 0b111,
+            dynamic_valid_mask: 0b111111,
             skew_us: 500,
         };
         let result_ok = AlignmentResult::Ok(state);
@@ -1390,6 +1413,8 @@ mod tests {
             dynamic_timestamp_us: 1500,
             position_system_timestamp_us: 2000,
             dynamic_system_timestamp_us: 2500,
+            position_frame_valid_mask: 0b111,
+            dynamic_valid_mask: 0b111111,
             skew_us: 500,
         };
         let result_mis = AlignmentResult::Misaligned {
@@ -1398,6 +1423,35 @@ mod tests {
         };
         let debug_str2 = format!("{:?}", result_mis);
         assert!(debug_str2.contains("Misaligned") || debug_str2.contains("AlignmentResult"));
+    }
+
+    #[test]
+    fn test_aligned_motion_state_completeness_helpers() {
+        let state = AlignedMotionState {
+            joint_pos: [0.0; 6],
+            joint_vel: [0.0; 6],
+            joint_current: [0.0; 6],
+            end_pose: [0.0; 6],
+            position_timestamp_us: 0,
+            dynamic_timestamp_us: 0,
+            position_system_timestamp_us: 0,
+            dynamic_system_timestamp_us: 0,
+            position_frame_valid_mask: 0b111,
+            dynamic_valid_mask: 0b111111,
+            skew_us: 0,
+        };
+        assert!(state.position_complete());
+        assert!(state.dynamic_complete());
+        assert!(state.is_complete());
+
+        let incomplete = AlignedMotionState {
+            position_frame_valid_mask: 0b011,
+            dynamic_valid_mask: 0b011111,
+            ..state
+        };
+        assert!(!incomplete.position_complete());
+        assert!(!incomplete.dynamic_complete());
+        assert!(!incomplete.is_complete());
     }
 
     // ============================================================

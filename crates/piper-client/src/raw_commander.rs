@@ -13,6 +13,7 @@ use piper_can::PiperFrame;
 use piper_driver::Piper as RobotPiper;
 use piper_protocol::constants::*;
 use piper_protocol::control::*;
+use std::time::Duration;
 
 /// 原始命令发送器（简化版，移除 StateTracker 依赖）
 ///
@@ -48,6 +49,17 @@ impl<'a> RawCommander<'a> {
     ) -> Result<()> {
         let frames_array = commands.map(MitControlCommand::to_frame);
         self.driver.send_realtime_package(frames_array)?;
+        Ok(())
+    }
+
+    /// 发送已规范化、已校验的 MIT 批命令，并等待 TX 线程确认实际发送结果。
+    pub(crate) fn send_validated_mit_command_batch_confirmed(
+        &self,
+        commands: [MitControlCommand; 6],
+        timeout: Duration,
+    ) -> Result<()> {
+        let frames_array = commands.map(MitControlCommand::to_frame);
+        self.driver.send_realtime_package_confirmed(frames_array, timeout)?;
         Ok(())
     }
 
