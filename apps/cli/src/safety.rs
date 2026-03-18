@@ -1,100 +1,65 @@
-//! 安全检查模块
-//!
-//! 提供命令执行前的安全验证
+//! CLI 安全确认辅助
 
-use anyhow::{Result, bail};
-use piper_tools::SafetyConfig;
+use anyhow::Result;
+use piper_control::PreparedMove;
 
-/// 安全检查器
-pub struct SafetyChecker {
-    #[allow(dead_code)] // 安全基础设施，保留以备未来使用
-    config: SafetyConfig,
+pub fn confirm_prepared_move(prepared: &PreparedMove) -> Result<bool> {
+    println!("⚠️  大幅移动检测");
+    println!("  最大位移: {:.1}°", prepared.max_delta_deg);
+    println!("  当前: {}", format_joint_values(&prepared.current));
+    println!(
+        "  目标: {}",
+        format_joint_values(&prepared.effective_target)
+    );
+
+    inquire::Confirm::new("确定要继续吗？")
+        .with_default(false)
+        .prompt()
+        .map_err(|error| anyhow::anyhow!("用户交互失败: {error}"))
 }
 
-impl SafetyChecker {
-    /// 创建新的安全检查器
-    pub fn new() -> Self {
-        Self {
-            config: SafetyConfig::default_config(),
-        }
-    }
+pub fn confirm_zero_setting(joints: &[usize]) -> Result<bool> {
+    let description = if joints.len() == 6 {
+        "全部关节".to_string()
+    } else {
+        joints
+            .iter()
+            .map(|joint| format!("J{}", joint + 1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
-    /// 检查关节位置是否在限制内
-    #[allow(dead_code)] // 安全基础设施，保留以备未来使用
-    pub fn check_joint_positions(&self, positions: &[f64]) -> Result<()> {
-        for (i, &pos) in positions.iter().enumerate() {
-            if !self.config.check_joint_position(i, pos) {
-                bail!("关节 J{} 位置超出限制: {:.3} rad", i + 1, pos);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// 检查是否需要用户确认
-    #[allow(dead_code)] // 安全基础设施，保留以备未来使用
-    pub fn requires_confirmation(&self, positions: &[f64]) -> bool {
-        // 计算最大角度变化
-        let max_delta = positions.iter().map(|&p| p.abs()).fold(0.0_f64, f64::max);
-
-        // 转换为角度
-        let max_delta_degrees = max_delta * 180.0 / std::f64::consts::PI;
-
-        self.config.requires_confirmation(max_delta_degrees)
-    }
-
-    /// 显示确认提示
-    pub fn show_confirmation_prompt(&self, positions: &[f64]) -> Result<bool> {
-        let max_delta = positions.iter().map(|&p| p.abs()).fold(0.0_f64, f64::max);
-
-        let max_delta_degrees = max_delta * 180.0 / std::f64::consts::PI;
-
-        println!("⚠️  大幅移动检测");
-        println!("  最大角度: {:.1}°", max_delta_degrees);
-
-        // ✅ 使用 inquire 提供更好的交互体验
-        let confirmed = inquire::Confirm::new("确定要继续吗？")
-            .with_default(false)  // 默认为 No（安全优先）
-            .prompt()
-            .map_err(|e| anyhow::anyhow!("用户交互失败: {}", e))?;
-
-        Ok(confirmed)
-    }
+    println!("⚠️  即将把 {} 当前位置写入零点标定", description);
+    inquire::Confirm::new("确定要继续吗？")
+        .with_default(false)
+        .prompt()
+        .map_err(|error| anyhow::anyhow!("用户交互失败: {error}"))
 }
 
-impl Default for SafetyChecker {
-    fn default() -> Self {
-        Self::new()
-    }
+fn format_joint_values(values: &[f64; 6]) -> String {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("J{}={:.3}", index + 1, value))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use piper_control::PreparedMove;
 
     #[test]
-    fn test_check_joint_positions() {
-        let checker = SafetyChecker::new();
+    fn prepared_move_reports_delta_not_absolute_target() {
+        let prepared = PreparedMove {
+            current: [2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            effective_target: [0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+            max_delta_rad: 2.4,
+            max_delta_deg: 2.4_f64.to_degrees(),
+            requires_confirmation: true,
+        };
 
-        // 正常范围内的位置
-        let positions = vec![0.1, 0.2, 0.3];
-        assert!(checker.check_joint_positions(&positions).is_ok());
-
-        // 超出限制的位置
-        let positions = vec![10.0]; // 远超 3.14 rad 限制
-        assert!(checker.check_joint_positions(&positions).is_err());
-    }
-
-    #[test]
-    fn test_requires_confirmation() {
-        let checker = SafetyChecker::new();
-
-        // 小幅度移动，无需确认
-        let positions = vec![0.05]; // < 10度
-        assert!(!checker.requires_confirmation(&positions));
-
-        // 大幅度移动，需要确认
-        let positions = vec![0.5]; // > 10度
-        assert!(checker.requires_confirmation(&positions));
+        assert!(prepared.requires_confirmation);
+        assert!(prepared.max_delta_deg > 100.0);
     }
 }

@@ -7,9 +7,14 @@ use std::time::{Duration, Instant};
 
 use crate::connection::initialize_connected_driver;
 use crate::types::*;
-use crate::{observer::Observer, raw_commander::RawCommander};
+use crate::{
+    observer::{CollisionProtectionSnapshot, Observer},
+    raw_commander::RawCommander,
+};
 use piper_protocol::control::InstallPosition;
 use tracing::{debug, info, trace};
+
+const COLLISION_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 // ==================== 状态类型（零大小类型）====================
 
@@ -672,7 +677,7 @@ impl Piper<Standby> {
     /// # 返回
     ///
     /// 返回 `()`，因为失能后仍然保持 Standby 状态。
-    pub fn disable_all(self) -> Result<()> {
+    pub fn disable_all(&self) -> Result<()> {
         use piper_protocol::control::MotorEnableCommand;
 
         self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
@@ -1033,6 +1038,17 @@ impl Piper<Standby> {
         raw.set_collision_protection(levels)
     }
 
+    /// 主动查询当前碰撞保护等级并等待设备反馈。
+    pub fn query_collision_protection(&self, timeout: Duration) -> Result<[u8; 6]> {
+        self.query_collision_protection_with_poll(timeout, COLLISION_QUERY_POLL_INTERVAL)
+            .map(|snapshot| snapshot.levels)
+    }
+
+    /// 读取 driver 当前缓存的碰撞保护快照，不触发设备 query。
+    pub fn collision_protection_cached(&self) -> Result<CollisionProtectionSnapshot> {
+        self.collision_protection_cached_inner()
+    }
+
     /// 设置关节零位
     ///
     /// 设置指定关节的当前位置为零点。
@@ -1074,6 +1090,65 @@ impl Piper<Standby> {
 // ==================== 所有状态共享的辅助方法 ====================
 
 impl<State> Piper<State> {
+    fn into_state<NextState>(self, next_state: NextState) -> Piper<NextState> {
+        let this = std::mem::ManuallyDrop::new(self);
+        let driver = unsafe { std::ptr::read(&this.driver) };
+        let observer = unsafe { std::ptr::read(&this.observer) };
+        let quirks = this.quirks.clone();
+
+        Piper {
+            driver,
+            observer,
+            quirks,
+            _state: next_state,
+        }
+    }
+
+    fn query_collision_protection_with_poll(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<CollisionProtectionSnapshot> {
+        let baseline = self.collision_protection_cached_inner().ok();
+        let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
+        let baseline_sys = baseline.as_ref().map_or(0, |state| state.system_timestamp_us);
+
+        let raw = RawCommander::new(&self.driver);
+        raw.query_collision_protection()?;
+
+        let start = Instant::now();
+        loop {
+            let state = self.collision_protection_cached_inner()?;
+            let updated = state.is_newer_than(baseline_hw, baseline_sys);
+            if updated {
+                return Ok(state);
+            }
+
+            if start.elapsed() > timeout {
+                return Err(RobotError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+
+            let remaining = timeout.saturating_sub(start.elapsed());
+            let sleep_duration = poll_interval.min(remaining);
+            if sleep_duration.is_zero() {
+                return Err(RobotError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+
+            std::thread::sleep(sleep_duration);
+        }
+    }
+
+    fn collision_protection_cached_inner(&self) -> Result<CollisionProtectionSnapshot> {
+        self.driver
+            .get_collision_protection()
+            .map(CollisionProtectionSnapshot::from)
+            .map_err(Into::into)
+    }
+
     /// 获取固件特性（DeviceQuirks）
     ///
     /// # 返回
@@ -1233,6 +1308,17 @@ impl<State> Piper<State> {
 // ==================== Active<Mode> 状态（通用方法） ====================
 
 impl<M> Piper<Active<M>> {
+    /// 立即失能全部关节并返回 Standby。
+    ///
+    /// 这是急停/人工接管路径，发送 `disable_all()` 后立即转换回 Standby，
+    /// 不等待 debounce 或关闭序列完成。
+    pub fn disable_all(self) -> Result<Piper<Standby>> {
+        use piper_protocol::control::MotorEnableCommand;
+
+        self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
+        Ok(self.into_state(Standby))
+    }
+
     /// 优雅关闭机械臂
     ///
     /// 执行完整的关闭序列：
@@ -1577,6 +1663,17 @@ impl<M> Piper<Active<M>> {
     pub fn set_collision_protection(&self, levels: [u8; 6]) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
         raw.set_collision_protection(levels)
+    }
+
+    /// 主动查询当前碰撞保护等级并等待设备反馈。
+    pub fn query_collision_protection(&self, timeout: Duration) -> Result<[u8; 6]> {
+        self.query_collision_protection_with_poll(timeout, COLLISION_QUERY_POLL_INTERVAL)
+            .map(|snapshot| snapshot.levels)
+    }
+
+    /// 读取 driver 当前缓存的碰撞保护快照，不触发设备 query。
+    pub fn collision_protection_cached(&self) -> Result<CollisionProtectionSnapshot> {
+        self.collision_protection_cached_inner()
     }
 }
 

@@ -1,43 +1,27 @@
 //! 急停命令
-//!
-//! 软件急停功能，用于紧急情况下的快速停止
 
-use crate::connection::client_builder;
 use anyhow::Result;
 use clap::Args;
 
-/// 急停命令参数
-#[derive(Args, Debug)]
-pub struct StopCommand {
-    /// CAN 接口（覆盖配置）
-    #[arg(short, long)]
-    pub interface: Option<String>,
+use crate::commands::config::CliConfig;
+use crate::connection::{TargetArgs, client_builder};
 
-    /// 设备序列号（GS-USB）
-    #[arg(short, long)]
-    pub serial: Option<String>,
+#[derive(Args, Debug, Clone)]
+pub struct StopCommand {
+    #[command(flatten)]
+    pub target: TargetArgs,
 }
 
 impl StopCommand {
-    /// 执行急停
-    pub async fn execute(&self, config: &crate::modes::oneshot::OneShotConfig) -> Result<()> {
-        // 确定接口（命令行参数优先）
-        let interface = self.interface.as_deref().or(config.interface.as_deref());
-        let serial = self.serial.as_deref().or(config.serial.as_deref());
-
-        // 创建 Piper 实例
-        let builder = client_builder(interface, serial, None);
+    pub async fn execute(&self, config: &CliConfig) -> Result<()> {
+        let profile = config.control_profile(self.target.target.as_ref());
+        let builder = client_builder(&profile.target);
 
         println!("🔌 连接到机器人...");
         let robot = builder.build()?;
-
         println!("🛑 发送急停命令（失能所有关节）...");
-
-        // 使用 client 层的 disable_all 方法
         robot.disable_all()?;
-
         println!("✅ 急停完成");
-
         Ok(())
     }
 }
@@ -45,26 +29,32 @@ impl StopCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_control::TargetSpec;
 
     #[test]
-    fn test_stop_command_creation() {
+    fn stop_command_can_override_target() {
         let cmd = StopCommand {
-            interface: Some("can0".to_string()),
-            serial: Some("ABC123".to_string()),
+            target: TargetArgs {
+                target: Some(TargetSpec::SocketCan {
+                    iface: "can0".to_string(),
+                }),
+            },
         };
 
-        assert_eq!(cmd.interface, Some("can0".to_string()));
-        assert_eq!(cmd.serial, Some("ABC123".to_string()));
+        assert_eq!(
+            cmd.target.target,
+            Some(TargetSpec::SocketCan {
+                iface: "can0".to_string()
+            })
+        );
     }
 
     #[test]
-    fn test_stop_command_defaults() {
+    fn stop_command_defaults_to_config_target() {
         let cmd = StopCommand {
-            interface: None,
-            serial: None,
+            target: TargetArgs::default(),
         };
 
-        assert!(cmd.interface.is_none());
-        assert!(cmd.serial.is_none());
+        assert!(cmd.target.target.is_none());
     }
 }

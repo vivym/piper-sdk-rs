@@ -2,9 +2,12 @@
 //!
 //! 回放录制的数据
 
-use crate::connection::client_builder;
+use crate::commands::config::CliConfig;
+use crate::connection::{TargetArgs, client_builder, resolved_target_spec};
 use anyhow::Result;
 use clap::Args;
+use piper_control::TargetSpec;
+use piper_sdk::driver::ConnectionTarget;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::spawn_blocking;
@@ -27,13 +30,8 @@ pub struct ReplayCommand {
     #[arg(short, long, default_value_t = 1.0)]
     pub speed: f64,
 
-    /// CAN 接口（覆盖配置）
-    #[arg(short, long)]
-    pub interface: Option<String>,
-
-    /// 设备序列号（GS-USB）
-    #[arg(short, long)]
-    pub serial: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
 
     /// 回放前确认
     #[arg(long)]
@@ -126,18 +124,20 @@ impl ReplayCommand {
 
         // === 6. 使用 spawn_blocking 隔离阻塞调用 ===
 
+        let config = CliConfig::load()?;
+        let target_spec = resolved_target_spec(&config, self.target.target.as_ref());
         let input = self.input.clone();
         let speed = self.speed;
-        let interface = self.interface.clone();
-        let serial = self.serial.clone();
+        let target = target_spec.clone().into_connection_target();
         let running_for_task = running.clone();
 
         println!("💡 提示: 按 Ctrl-C 可随时停止回放");
+        println!("🎯 target: {}", target_spec);
         println!();
 
         let result = spawn_blocking(move || {
             // ✅ 在专用 OS 线程中运行，不阻塞 Tokio Worker
-            Self::replay_sync(input, speed, interface, serial, running_for_task)
+            Self::replay_sync(input, speed, target, target_spec, running_for_task)
         })
         .await;
 
@@ -180,42 +180,16 @@ impl ReplayCommand {
     fn replay_sync(
         input: String,
         speed: f64,
-        interface: Option<String>,
-        serial: Option<String>,
+        target: ConnectionTarget,
+        target_spec: TargetSpec,
         running: Arc<AtomicBool>,
     ) -> Result<()> {
         // === 连接到机器人 ===
 
         println!("⏳ 连接到机器人...");
+        println!("   target: {}", target_spec);
 
-        if let Some(interface) = &interface {
-            #[cfg(target_os = "linux")]
-            {
-                println!("   使用 CAN 接口: {} (SocketCAN)", interface);
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                println!("   使用设备序列号: {}", interface);
-            }
-        } else if let Some(serial) = &serial {
-            println!("   使用设备序列号: {}", serial);
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                println!("   使用默认 CAN 接口: can0");
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let default_daemon = "127.0.0.1:18888";
-                println!("   使用默认守护进程: {}", default_daemon);
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                println!("   自动扫描 GS-USB 设备...");
-            }
-        }
-
-        let builder = client_builder(interface.as_deref(), serial.as_deref(), None);
+        let builder = client_builder(&target);
 
         let standby = builder.build()?;
         println!("✅ 已连接");
@@ -255,8 +229,11 @@ mod tests {
         let cmd = ReplayCommand {
             input: "recording.bin".to_string(),
             speed: 2.0,
-            interface: Some("can0".to_string()),
-            serial: None,
+            target: TargetArgs {
+                target: Some(TargetSpec::SocketCan {
+                    iface: "can0".to_string(),
+                }),
+            },
             confirm: true,
         };
 
@@ -270,8 +247,7 @@ mod tests {
         let cmd = ReplayCommand {
             input: "recording.bin".to_string(),
             speed: 1.0,
-            interface: None,
-            serial: None,
+            target: TargetArgs::default(),
             confirm: false,
         };
 
@@ -284,30 +260,39 @@ mod tests {
         let cmd = ReplayCommand {
             input: "test.bin".to_string(),
             speed: 1.5,
-            interface: None,
-            serial: Some("ABC123".to_string()),
+            target: TargetArgs {
+                target: Some(TargetSpec::GsUsbSerial {
+                    serial: "ABC123".to_string(),
+                }),
+            },
             confirm: false,
         };
 
         assert_eq!(cmd.input, "test.bin");
         assert_eq!(cmd.speed, 1.5);
-        assert_eq!(cmd.serial, Some("ABC123".to_string()));
-        assert!(cmd.interface.is_none());
+        assert!(matches!(
+            cmd.target.target,
+            Some(TargetSpec::GsUsbSerial { .. })
+        ));
     }
 
     #[test]
-    fn test_replay_command_interface_takes_precedence() {
+    fn test_replay_command_accepts_target_override() {
         let cmd = ReplayCommand {
             input: "test.bin".to_string(),
             speed: 1.0,
-            interface: Some("vcan0".to_string()),
-            serial: Some("ABC123".to_string()),
+            target: TargetArgs {
+                target: Some(TargetSpec::SocketCan {
+                    iface: "vcan0".to_string(),
+                }),
+            },
             confirm: true,
         };
 
-        // Both can be set, but interface should take precedence in execute()
-        assert_eq!(cmd.interface, Some("vcan0".to_string()));
-        assert_eq!(cmd.serial, Some("ABC123".to_string()));
+        assert!(matches!(
+            cmd.target.target,
+            Some(TargetSpec::SocketCan { .. })
+        ));
     }
 
     #[test]
@@ -316,8 +301,7 @@ mod tests {
         let cmd = ReplayCommand {
             input: "test.bin".to_string(),
             speed: max_speed,
-            interface: None,
-            serial: None,
+            target: TargetArgs::default(),
             confirm: true,
         };
 
@@ -330,8 +314,7 @@ mod tests {
         let cmd = ReplayCommand {
             input: "test.bin".to_string(),
             speed: min_speed,
-            interface: None,
-            serial: None,
+            target: TargetArgs::default(),
             confirm: false,
         };
 
@@ -344,8 +327,7 @@ mod tests {
         let cmd = ReplayCommand {
             input: "test.bin".to_string(),
             speed: recommended_speed,
-            interface: None,
-            serial: None,
+            target: TargetArgs::default(),
             confirm: false,
         };
 

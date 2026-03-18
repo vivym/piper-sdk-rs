@@ -16,6 +16,7 @@ path = "src/main.rs"
 # ✅ Piper SDK
 piper-sdk = { workspace = true }
 piper-client = { workspace = true }
+piper-control = { workspace = true }
 piper-tools = { workspace = true, features = ["full"] }  # CLI 需要统计功能
 
 # ✅ 命令行解析

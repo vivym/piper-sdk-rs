@@ -5,6 +5,7 @@ members = [
     "crates/piper-can",
     "crates/piper-driver",
     "crates/piper-client",
+    "crates/piper-control",
     "crates/piper-sdk",
     "crates/piper-tools",
     "apps/daemon",
@@ -28,6 +29,7 @@ piper-protocol = { version = "0.0.3", path = "crates/piper-protocol" }
 piper-can = { version = "0.0.3", path = "crates/piper-can" }
 piper-driver = { version = "0.0.3", path = "crates/piper-driver" }
 piper-client = { version = "0.0.3", path = "crates/piper-client" }
+piper-control = { version = "0.0.3", path = "crates/piper-control" }
 piper-sdk = { version = "0.0.3", path = "crates/piper-sdk" }
 piper-tools = { version = "0.0.3", path = "crates/piper-tools" }
 

@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::types::*;
-use piper_driver::Piper as RobotPiper;
+use piper_driver::{DriverError, Piper as RobotPiper};
 use piper_protocol::constants::*;
 
 /// 状态观察器（只读接口，View 模式）
@@ -51,6 +51,35 @@ use piper_protocol::constants::*;
 pub struct Observer {
     /// Driver 实例（直接持有，零拷贝）
     driver: Arc<RobotPiper>,
+}
+
+/// 碰撞保护配置快照
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollisionProtectionSnapshot {
+    /// 设备硬件时间戳（微秒）
+    pub hardware_timestamp_us: u64,
+    /// 主机接收时间戳（微秒）
+    pub system_timestamp_us: u64,
+    /// `[J1, J2, J3, J4, J5, J6]` 的碰撞防护等级
+    pub levels: [u8; 6],
+}
+
+impl CollisionProtectionSnapshot {
+    /// 判断快照是否严格晚于给定时间基线。
+    pub fn is_newer_than(self, hardware_timestamp_us: u64, system_timestamp_us: u64) -> bool {
+        self.hardware_timestamp_us > hardware_timestamp_us
+            || self.system_timestamp_us > system_timestamp_us
+    }
+}
+
+impl From<piper_driver::CollisionProtectionState> for CollisionProtectionSnapshot {
+    fn from(value: piper_driver::CollisionProtectionState) -> Self {
+        Self {
+            hardware_timestamp_us: value.hardware_timestamp_us,
+            system_timestamp_us: value.system_timestamp_us,
+            levels: value.protection_levels,
+        }
+    }
 }
 
 impl Observer {
@@ -276,33 +305,32 @@ impl Observer {
         self.driver.connection_age()
     }
 
-    /// 获取碰撞保护级别
+    /// 获取当前缓存的碰撞保护快照
     ///
-    /// 返回6个关节的当前碰撞防护等级（0~8，等级0代表不检测碰撞）。
+    /// 返回 driver 中最近一次收到的碰撞保护状态快照。
     ///
     /// # 返回
     ///
-    /// 返回 `[J1, J2, J3, J4, J5, J6]` 的碰撞防护等级
+    /// 返回碰撞保护等级及其时间戳；如果底层状态不可读，则返回错误。
     ///
     /// # 示例
     ///
     /// ```rust,ignore
     /// # use piper_client::Observer;
     /// # fn example(observer: Observer) {
-    /// let levels = observer.collision_protection_levels();
-    /// println!("J1-J6 碰撞保护级别: {:?}", levels);
+    /// let snapshot = observer.collision_protection_snapshot().unwrap();
+    /// println!("J1-J6 碰撞保护级别: {:?}", snapshot.levels);
     ///
     /// // 检查某个关节的保护等级
-    /// if levels[0] == 0 {
+    /// if snapshot.levels[0] == 0 {
     ///     println!("J1 未启用碰撞保护");
     /// }
     /// # }
     /// ```
-    pub fn collision_protection_levels(&self) -> [u8; 6] {
-        self.driver
-            .get_collision_protection()
-            .map(|state| state.protection_levels)
-            .unwrap_or([0; 6]) // 如果读取失败，返回默认值
+    pub fn collision_protection_snapshot(
+        &self,
+    ) -> std::result::Result<CollisionProtectionSnapshot, DriverError> {
+        self.driver.get_collision_protection().map(CollisionProtectionSnapshot::from)
     }
 }
 

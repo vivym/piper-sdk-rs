@@ -1,86 +1,35 @@
+use clap::Args;
 use piper_client::PiperBuilder as ClientPiperBuilder;
-use piper_sdk::driver::PiperBuilder as DriverPiperBuilder;
+use piper_control::{TargetSpec, client_builder_for_target, driver_builder_for_target};
+use piper_sdk::driver::{ConnectionTarget, PiperBuilder as DriverPiperBuilder};
 
-pub fn client_builder(
-    interface: Option<&str>,
-    serial: Option<&str>,
-    daemon_addr: Option<&str>,
-) -> ClientPiperBuilder {
-    if let Some(addr) = daemon_addr {
-        return if addr.starts_with('/') {
-            ClientPiperBuilder::new().daemon_uds(addr)
-        } else {
-            ClientPiperBuilder::new().daemon_udp(addr)
-        };
-    }
+use crate::commands::config::CliConfig;
 
-    if let Some(serial) = serial {
-        return ClientPiperBuilder::new().gs_usb_serial(serial);
-    }
-
-    if let Some(interface) = interface {
-        #[cfg(target_os = "linux")]
-        {
-            return ClientPiperBuilder::new().socketcan(interface);
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            return ClientPiperBuilder::new().gs_usb_serial(interface);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        ClientPiperBuilder::new().socketcan("can0")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        ClientPiperBuilder::new().daemon_udp("127.0.0.1:18888")
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        ClientPiperBuilder::new()
-    }
+#[derive(Args, Debug, Clone, Default)]
+pub struct TargetArgs {
+    /// 连接目标，示例: auto / socketcan:can0 / gs-usb-serial:ABC123 / gs-usb-bus-address:1:8 / daemon-udp:127.0.0.1:18888 / daemon-uds:/tmp/gs_usb.sock
+    #[arg(long, value_name = "SPEC")]
+    pub target: Option<TargetSpec>,
 }
 
-pub fn driver_builder(
-    interface: Option<&str>,
-    serial: Option<&str>,
-    daemon_addr: Option<&str>,
-) -> DriverPiperBuilder {
-    if let Some(addr) = daemon_addr {
-        return if addr.starts_with('/') {
-            DriverPiperBuilder::new().daemon_uds(addr)
-        } else {
-            DriverPiperBuilder::new().daemon_udp(addr)
-        };
-    }
+pub fn resolved_target_spec(
+    config: &CliConfig,
+    override_target: Option<&TargetSpec>,
+) -> TargetSpec {
+    config.resolved_target_spec(override_target)
+}
 
-    if let Some(serial) = serial {
-        return DriverPiperBuilder::new().gs_usb_serial(serial);
-    }
+pub fn resolved_target(
+    config: &CliConfig,
+    override_target: Option<&TargetSpec>,
+) -> ConnectionTarget {
+    resolved_target_spec(config, override_target).into_connection_target()
+}
 
-    if let Some(interface) = interface {
-        #[cfg(target_os = "linux")]
-        {
-            return DriverPiperBuilder::new().socketcan(interface);
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            return DriverPiperBuilder::new().gs_usb_serial(interface);
-        }
-    }
+pub fn client_builder(target: &ConnectionTarget) -> ClientPiperBuilder {
+    client_builder_for_target(target)
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        DriverPiperBuilder::new().socketcan("can0")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        DriverPiperBuilder::new().daemon_udp("127.0.0.1:18888")
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        DriverPiperBuilder::new()
-    }
+pub fn driver_builder(target: &ConnectionTarget) -> DriverPiperBuilder {
+    driver_builder_for_target(target)
 }

@@ -1,0 +1,18 @@
+[package]
+name = "piper-control"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-level control workflows for Piper robots"
+
+[dependencies]
+piper-client = { workspace = true }
+piper-driver = { workspace = true }
+piper-tools = { workspace = true }
+piper-protocol = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = "1.0"

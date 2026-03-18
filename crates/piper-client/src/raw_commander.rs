@@ -418,6 +418,17 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
+    /// 查询当前碰撞保护级别。
+    pub(crate) fn query_collision_protection(&self) -> Result<()> {
+        use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
+
+        let frame = ParameterQuerySetCommand::query(ParameterQueryType::CollisionProtectionLevel)
+            .to_frame()
+            .map_err(RobotError::Protocol)?;
+        self.driver.send_reliable(frame)?;
+        Ok(())
+    }
+
     /// 设置关节零位
     ///
     /// 设置指定关节的当前位置为零点。
@@ -573,5 +584,27 @@ mod tests {
             5000,
             "effort=1.0 should map to 5.0 N·m full scale"
         );
+    }
+
+    #[test]
+    fn test_query_collision_protection_sends_parameter_query_frame() {
+        use piper_protocol::ids::ID_PARAMETER_QUERY_SET;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+
+        commander
+            .query_collision_protection()
+            .expect("collision protection query should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 1);
+        let frame = &frames[0];
+        assert_eq!(frame.id, ID_PARAMETER_QUERY_SET);
+        assert_eq!(
+            frame.data[0], 0x02,
+            "query type must be collision protection"
+        );
+        assert_eq!(frame.data[1], 0x00, "set type must remain unset");
     }
 }

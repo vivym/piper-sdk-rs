@@ -7,8 +7,8 @@
 //! ### One-shot 模式（推荐用于 CI/脚本）
 //!
 //! ```bash
-//! # 配置默认接口
-//! piper-cli config set --interface can0
+//! # 配置默认连接目标
+//! piper-cli config set-target socketcan:can0
 //!
 //! # 执行操作（内部：连接 -> 移动 -> 断开）
 //! piper-cli move --joints 0.1,0.2,0.3,0.4,0.5,0.6
@@ -18,7 +18,7 @@
 //!
 //! ```bash
 //! $ piper-cli shell
-//! piper> connect can0
+//! piper> connect socketcan:can0
 //! piper> enable
 //! piper> move --joints 0.1,0.2,0.3,0.4,0.5,0.6
 //! piper> stop
@@ -31,15 +31,18 @@ use clap::{Parser, Subcommand};
 mod commands;
 mod connection;
 mod modes;
+mod parsing;
 mod safety;
 mod script;
 mod utils;
 mod validation;
 
+use commands::config::CliConfig;
 use commands::{
-    ConfigCommand, MoveCommand, PositionCommand, RecordCommand, ReplayCommand, RunCommand,
-    StopCommand,
+    CollisionProtectionCommand, ConfigCommand, HomeCommand, MoveCommand, ParkCommand,
+    PositionCommand, RecordCommand, ReplayCommand, RunCommand, SetZeroCommand, StopCommand,
 };
+use connection::TargetArgs;
 use modes::oneshot::OneShotMode;
 use modes::repl::run_repl;
 
@@ -81,13 +84,37 @@ enum Commands {
     Shell,
 
     /// 回到零位
-    Home,
+    Home {
+        #[command(flatten)]
+        args: HomeCommand,
+    },
+
+    /// 前往安全停靠位
+    Park {
+        #[command(flatten)]
+        args: ParkCommand,
+    },
+
+    /// 将当前位置写入关节零点
+    SetZero {
+        #[command(flatten)]
+        args: SetZeroCommand,
+    },
+
+    /// 读取或设置碰撞保护等级
+    CollisionProtection {
+        #[command(flatten)]
+        args: CollisionProtectionCommand,
+    },
 
     /// 监控机器人状态
     Monitor {
         /// 更新频率（Hz）
         #[arg(short, long, default_value_t = 10)]
         frequency: u32,
+
+        #[command(flatten)]
+        target: TargetArgs,
     },
 
     /// 录制 CAN 总线数据
@@ -133,46 +160,47 @@ async fn main() -> Result<()> {
         },
 
         Commands::Move { args } => {
-            // One-shot 模式：移动命令
-            let mut mode = OneShotMode::new().await?;
-            mode.move_to(args).await?;
-            Ok(())
+            let config = CliConfig::load()?;
+            args.execute(&config).await
         },
 
         Commands::Position { args } => {
-            // One-shot 模式：位置查询
-            let mut mode = OneShotMode::new().await?;
-            mode.get_position(args).await?;
-            Ok(())
+            let config = CliConfig::load()?;
+            args.execute(&config).await
         },
 
         Commands::Stop { args } => {
-            // One-shot 模式：急停
+            let config = CliConfig::load()?;
+            args.execute(&config).await
+        },
+
+        Commands::Home { args } => {
+            let config = CliConfig::load()?;
+            args.execute(&config).await
+        },
+
+        Commands::Park { args } => {
+            let config = CliConfig::load()?;
+            args.execute(&config).await
+        },
+
+        Commands::SetZero { args } => {
+            let config = CliConfig::load()?;
+            args.execute(&config).await
+        },
+
+        Commands::CollisionProtection { args } => {
+            let config = CliConfig::load()?;
+            args.execute(&config).await
+        },
+
+        Commands::Monitor { frequency, target } => {
             let mut mode = OneShotMode::new().await?;
-            mode.stop(args).await?;
+            mode.monitor(frequency, target.target.as_ref()).await?;
             Ok(())
         },
 
-        Commands::Home => {
-            // One-shot 模式：回零位
-            let mut mode = OneShotMode::new().await?;
-            mode.home().await?;
-            Ok(())
-        },
-
-        Commands::Monitor { frequency } => {
-            // One-shot 模式：监控
-            let mut mode = OneShotMode::new().await?;
-            mode.monitor(frequency).await?;
-            Ok(())
-        },
-
-        Commands::Record { args } => {
-            // One-shot 模式：录制
-            let mut mode = OneShotMode::new().await?;
-            mode.record(args).await?;
-            Ok(())
-        },
+        Commands::Record { args } => args.execute().await,
 
         Commands::Run { args } => {
             // One-shot 模式：执行脚本

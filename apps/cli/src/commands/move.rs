@@ -1,37 +1,28 @@
 //! 移动命令
-//!
-//! 移动机器人到目标位置，包含安全检查和确认机制
 
-use crate::connection::client_builder;
-use crate::validation::JointValidator;
 use anyhow::{Context, Result};
 use clap::Args;
-use piper_client::state::PositionModeConfig;
-use piper_tools::SafetyConfig;
+use piper_control::{move_to_joint_target_blocking, prepare_move};
 
-/// 移动命令参数
-#[derive(Args, Debug)]
+use crate::commands::config::CliConfig;
+use crate::connection::{TargetArgs, client_builder};
+use crate::safety::confirm_prepared_move;
+
+#[derive(Args, Debug, Clone)]
 pub struct MoveCommand {
-    /// 目标关节位置（弧度），逗号分隔
-    /// 例如：0.1,0.2,0.3,0.4,0.5,0.6
+    /// 目标关节位置（弧度），逗号分隔；1~6 个值会依次映射到 J1..Jn，剩余关节保持当前位置
     #[arg(short, long)]
     pub joints: Option<String>,
 
-    /// 跳过确认提示
+    /// 跳过大幅移动确认
     #[arg(long)]
     pub force: bool,
 
-    /// CAN 接口（覆盖配置）
-    #[arg(short, long)]
-    pub interface: Option<String>,
-
-    /// 设备序列号（GS-USB）
-    #[arg(short, long)]
-    pub serial: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
 }
 
 impl MoveCommand {
-    /// 解析关节位置
     pub fn parse_joints(&self) -> Result<Vec<f64>> {
         let joints_str = self
             .joints
@@ -40,126 +31,54 @@ impl MoveCommand {
 
         let positions: Vec<f64> = joints_str
             .split(',')
-            .map(|s| s.trim().parse::<f64>())
+            .map(|value| value.trim().parse::<f64>())
             .collect::<Result<Vec<_>, _>>()
             .context("解析关节位置失败")?;
 
         if positions.is_empty() {
             anyhow::bail!("关节位置不能为空");
         }
-
         if positions.len() > 6 {
             anyhow::bail!("最多支持 6 个关节");
         }
 
-        // 🔴 P0 安全修复：必须验证关节位置
-        let validator = JointValidator::default_range();
-
-        // ✅ 如果少于 6 个，补齐到 6 个（使用 0.0）
-        let mut full_positions = positions.clone();
-        while full_positions.len() < 6 {
-            full_positions.push(0.0);
-        }
-
-        // ✅ 完整验证（包括 NaN 检查、数量检查）
-        validator.validate_joints(&full_positions).context("关节位置安全检查失败")?;
-
         Ok(positions)
     }
 
-    /// 检查是否需要确认
-    pub fn requires_confirmation(&self, positions: &[f64], safety_config: &SafetyConfig) -> bool {
-        if self.force {
-            return false;
+    pub async fn execute(&self, config: &CliConfig) -> Result<()> {
+        let requested_positions = self.parse_joints()?;
+        let profile = config.control_profile(self.target.target.as_ref());
+        let builder = client_builder(&profile.target);
+
+        println!("🔌 连接到机器人...");
+        let standby = builder.build()?;
+
+        let current = std::array::from_fn(|index| standby.observer().snapshot().position[index].0);
+        let prepared = prepare_move(current, &requested_positions, &profile.safety, self.force)?;
+
+        if prepared.requires_confirmation && !confirm_prepared_move(&prepared)? {
+            println!("❌ 操作已取消");
+            return Ok(());
         }
 
-        // 计算最大角度变化
-        let max_delta = positions.iter().map(|&p| p.abs()).fold(0.0_f64, f64::max);
-
-        // 转换为角度
-        let max_delta_degrees = max_delta * 180.0 / std::f64::consts::PI;
-
-        // 检查是否超过阈值
-        safety_config.requires_confirmation(max_delta_degrees)
-    }
-
-    /// 执行移动
-    pub async fn execute(&self, config: &crate::modes::oneshot::OneShotConfig) -> Result<()> {
-        let positions = self.parse_joints()?;
-
         println!("⏳ 正在移动到目标位置...");
-        for (i, &pos) in positions.iter().enumerate() {
+        for (index, value) in prepared.effective_target.iter().enumerate() {
+            let source = if index < requested_positions.len() {
+                "用户指定"
+            } else {
+                "保持当前"
+            };
             println!(
-                "  J{}: {:.3} rad ({:.1}°)",
-                i + 1,
-                pos,
-                pos * 180.0 / std::f64::consts::PI
+                "  J{}: {:.3} rad ({:.1}°) [{}]",
+                index + 1,
+                value,
+                value.to_degrees(),
+                source
             );
         }
 
-        // 确定接口和序列号（命令行参数优先）
-        let interface = self.interface.as_deref().or(config.interface.as_deref());
-        let serial = self.serial.as_deref().or(config.serial.as_deref());
-
-        // 创建 Piper 实例
-        let builder = client_builder(interface, serial, None);
-
-        println!("🔌 连接到机器人...");
-        let robot = builder.build()?;
-
-        // 使能 Position Mode
-        let config_mode = PositionModeConfig::default();
-        println!("⚡ 使能 Position Mode...");
-        let robot = robot.enable_position_mode(config_mode)?;
-
-        // ✅ 获取当前关节位置（用于部分关节移动）
-        let observer = robot.observer();
-        let current_positions = observer.snapshot().position;
-
-        // 转换为 JointArray<Rad>
-        use piper_client::types::Rad;
-        let mut joint_array = current_positions; // ✅ 从当前位置开始
-
-        // ✅ 合并用户指定位置
-        for (i, &pos) in positions.iter().enumerate() {
-            if i < 6 {
-                joint_array[i] = Rad(pos);
-            }
-        }
-
-        // ✅ 显示部分关节移动信息
-        if positions.len() < 6 {
-            println!("\nℹ️  部分关节移动:");
-            for i in 0..6 {
-                if i < positions.len() {
-                    println!(
-                        "  J{}: {:.3} rad ({:.1}°) [用户指定]",
-                        i + 1,
-                        positions[i],
-                        positions[i] * 180.0 / std::f64::consts::PI
-                    );
-                } else {
-                    println!(
-                        "  J{}: {:.3} rad ({:.1}°) [保持当前]",
-                        i + 1,
-                        joint_array[i].0,
-                        joint_array[i].0 * 180.0 / std::f64::consts::PI
-                    );
-                }
-            }
-            println!();
-        }
-
-        // 发送位置命令
-        println!("📡 发送位置命令...");
-        robot.send_position_command(&joint_array)?;
-
-        // 等待一段时间让机器人完成移动
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        // robot 在这里 drop，自动 disable
+        let _standby = move_to_joint_target_blocking(standby, &profile, prepared.effective_target)?;
         println!("✅ 移动完成");
-
         Ok(())
     }
 }
@@ -167,29 +86,62 @@ impl MoveCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_control::{TargetSpec, prepare_move};
+    use piper_tools::SafetyConfig;
 
     #[test]
-    fn test_parse_joints() {
+    fn parse_joints_allows_partial_targets() {
         let cmd = MoveCommand {
             joints: Some("0.1,0.2,0.3".to_string()),
             force: false,
-            interface: None,
-            serial: None,
+            target: TargetArgs::default(),
         };
 
-        let positions = cmd.parse_joints().unwrap();
-        assert_eq!(positions, vec![0.1, 0.2, 0.3]);
+        assert_eq!(cmd.parse_joints().unwrap(), vec![0.1, 0.2, 0.3]);
     }
 
     #[test]
-    fn test_parse_joints_invalid() {
+    fn parse_joints_rejects_invalid_numbers() {
         let cmd = MoveCommand {
             joints: Some("0.1,invalid,0.3".to_string()),
             force: false,
-            interface: None,
-            serial: None,
+            target: TargetArgs::default(),
         };
 
         assert!(cmd.parse_joints().is_err());
+    }
+
+    #[test]
+    fn prepare_move_requires_confirmation_for_large_rollback() {
+        let prepared = prepare_move(
+            [2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &[0.1],
+            &SafetyConfig::default_config(),
+            false,
+        )
+        .unwrap();
+
+        assert!(prepared.requires_confirmation);
+        assert!(prepared.max_delta_deg > 100.0);
+    }
+
+    #[test]
+    fn target_override_is_carried_by_args() {
+        let cmd = MoveCommand {
+            joints: Some("0.1".to_string()),
+            force: true,
+            target: TargetArgs {
+                target: Some(TargetSpec::SocketCan {
+                    iface: "vcan0".to_string(),
+                }),
+            },
+        };
+
+        assert_eq!(
+            cmd.target.target,
+            Some(TargetSpec::SocketCan {
+                iface: "vcan0".to_string()
+            })
+        );
     }
 }

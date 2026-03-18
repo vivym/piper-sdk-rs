@@ -2,9 +2,12 @@
 //!
 //! 录制 CAN 总线数据到文件
 
-use crate::connection::client_builder;
+use crate::commands::config::CliConfig;
+use crate::connection::{TargetArgs, client_builder, resolved_target_spec};
 use anyhow::{Context, Result};
 use clap::Args;
+use piper_control::TargetSpec;
+use piper_sdk::driver::ConnectionTarget;
 use piper_sdk::{RecordingConfig, RecordingMetadata, StopCondition};
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,13 +25,8 @@ pub struct RecordCommand {
     #[arg(short, long)]
     pub output: String,
 
-    /// CAN 接口（覆盖配置）
-    #[arg(short, long)]
-    pub interface: Option<String>,
-
-    /// 设备序列号（GS-USB）
-    #[arg(short, long)]
-    pub serial: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
 
     /// 录制时长（秒），0 表示无限
     #[arg(short, long, default_value_t = 0)]
@@ -92,16 +90,9 @@ impl RecordCommand {
         if let Some(stop_id) = self.stop_on_id {
             println!("🛑 停止条件: CAN ID 0x{:X}", stop_id);
         }
-        if let Some(interface) = &self.interface {
-            println!("💾 接口: {}", interface);
-        } else if let Some(serial) = &self.serial {
-            println!("🔧 序列号: {}", serial);
-        } else {
-            #[cfg(target_os = "linux")]
-            println!("💾 接口: can0 (默认)");
-            #[cfg(target_os = "macos")]
-            println!("🔧 守护进程: 127.0.0.1:18888 (默认)");
-        }
+        let config = CliConfig::load()?;
+        let target_spec = resolved_target_spec(&config, self.target.target.as_ref());
+        println!("🎯 target: {}", target_spec);
         println!();
 
         // === 3. 安全确认 ===
@@ -144,8 +135,7 @@ impl RecordCommand {
         // 在专用线程中运行录制逻辑
         let output_path = self.output.clone();
         let duration = self.duration;
-        let interface = self.interface.clone();
-        let serial = self.serial.clone();
+        let target = target_spec.clone().into_connection_target();
         let stop_on_id = self.stop_on_id;
         let running_for_task = running.clone();
 
@@ -157,8 +147,8 @@ impl RecordCommand {
             Self::record_sync(
                 output_path,
                 duration,
-                interface,
-                serial,
+                target,
+                target_spec,
                 stop_on_id,
                 running_for_task,
             )
@@ -205,8 +195,8 @@ impl RecordCommand {
     fn record_sync(
         output_path: String,
         duration: u64,
-        interface: Option<String>,
-        serial: Option<String>,
+        target: ConnectionTarget,
+        target_spec: TargetSpec,
         stop_on_id: Option<u32>,
         running: Arc<AtomicBool>,
     ) -> Result<piper_sdk::RecordingStats> {
@@ -214,34 +204,9 @@ impl RecordCommand {
 
         println!("⏳ 连接到机器人...");
 
-        if let Some(interface) = &interface {
-            #[cfg(target_os = "linux")]
-            {
-                println!("   使用 CAN 接口: {} (SocketCAN)", interface);
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                println!("   使用设备序列号: {}", interface);
-            }
-        } else if let Some(serial) = &serial {
-            println!("   使用设备序列号: {}", serial);
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                println!("   使用默认 CAN 接口: can0");
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let default_daemon = "127.0.0.1:18888";
-                println!("   使用默认守护进程: {}", default_daemon);
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                println!("   自动扫描 GS-USB 设备...");
-            }
-        }
+        println!("   target: {}", target_spec);
 
-        let builder = client_builder(interface.as_deref(), serial.as_deref(), None);
+        let builder = client_builder(&target);
 
         let standby = builder.build()?;
         println!("✅ 已连接");
@@ -378,8 +343,11 @@ mod tests {
     fn test_record_command_creation() {
         let cmd = RecordCommand {
             output: "test.bin".to_string(),
-            interface: Some("can0".to_string()),
-            serial: None,
+            target: TargetArgs {
+                target: Some(TargetSpec::SocketCan {
+                    iface: "can0".to_string(),
+                }),
+            },
             duration: 10,
             stop_on_id: Some(0x2A5),
             force: false,
@@ -395,8 +363,7 @@ mod tests {
     fn test_record_command_defaults() {
         let cmd = RecordCommand {
             output: "recording.bin".to_string(),
-            interface: None,
-            serial: None,
+            target: TargetArgs::default(),
             duration: 0,
             stop_on_id: None,
             force: false,
@@ -411,8 +378,11 @@ mod tests {
     fn test_record_command_with_serial() {
         let cmd = RecordCommand {
             output: "test.bin".to_string(),
-            interface: None,
-            serial: Some("ABC123".to_string()),
+            target: TargetArgs {
+                target: Some(TargetSpec::GsUsbSerial {
+                    serial: "ABC123".to_string(),
+                }),
+            },
             duration: 30,
             stop_on_id: None,
             force: true,
@@ -420,8 +390,10 @@ mod tests {
 
         assert_eq!(cmd.output, "test.bin");
         assert_eq!(cmd.duration, 30);
-        assert_eq!(cmd.serial, Some("ABC123".to_string()));
-        assert!(cmd.interface.is_none());
+        assert!(matches!(
+            cmd.target.target,
+            Some(TargetSpec::GsUsbSerial { .. })
+        ));
         assert!(cmd.force);
     }
 }
