@@ -78,11 +78,16 @@
 pub use nalgebra;
 
 mod error;
+mod runner;
 mod traits;
 mod types;
 
 // Re-export common types
-pub use error::PhysicsError;
+pub use error::{GravityCompensationRunnerError, PhysicsError};
+pub use runner::{
+    GravityCompensationRobot, GravityCompensationRunFailure, GravityCompensationRunStats,
+    GravityCompensationRunner, GravityCompensationRunnerConfig,
+};
 pub use traits::GravityCompensation;
 pub use types::*;
 

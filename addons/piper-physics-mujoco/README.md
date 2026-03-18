@@ -222,6 +222,11 @@ cargo run --example gravity_compensation_mujoco
 cargo run --example gravity_compensation_robot -- can0
 ```
 
+Real-robot gravity compensation now uses a reusable runner with two distinct layers of torque handling:
+
+- `torque_safety_scale` is an algorithm-side safety reduction applied to MuJoCo output.
+- Firmware flip and torque-scaling quirks are handled automatically inside `piper-sdk` MIT command encoding and should not be duplicated in addon code.
+
 ---
 
 ## Technical Details
