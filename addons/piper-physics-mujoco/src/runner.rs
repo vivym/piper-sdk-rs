@@ -5,7 +5,7 @@ use crate::{
 };
 use piper_sdk::client::state::{Active, MitMode};
 use piper_sdk::client::types::{JointArray, NewtonMeter, Rad, Result as RobotResult};
-use piper_sdk::client::{ControlReadPolicy, ControlSnapshot, Piper};
+use piper_sdk::client::{ControlReadPolicy, ControlSnapshot, Piper, RuntimeHealthSnapshot};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -15,14 +15,18 @@ pub trait GravityCompensationRobot: Send + Sync {
     /// Read a control-safe aligned snapshot
     fn control_snapshot(&self, policy: ControlReadPolicy) -> RobotResult<ControlSnapshot>;
 
-    /// Send MIT torque command
-    fn command_torques(
+    /// Read current runtime health snapshot
+    fn runtime_health(&self) -> RuntimeHealthSnapshot;
+
+    /// Send MIT torque command and wait for TX thread confirmation
+    fn command_torques_confirmed(
         &self,
         positions: &JointArray<Rad>,
         velocities: &JointArray<f64>,
         kp: &JointArray<f64>,
         kd: &JointArray<f64>,
         torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
     ) -> RobotResult<()>;
 }
 
@@ -31,15 +35,22 @@ impl GravityCompensationRobot for Piper<Active<MitMode>> {
         self.observer().control_snapshot(policy)
     }
 
-    fn command_torques(
+    fn runtime_health(&self) -> RuntimeHealthSnapshot {
+        Piper::<Active<MitMode>>::runtime_health(self)
+    }
+
+    fn command_torques_confirmed(
         &self,
         positions: &JointArray<Rad>,
         velocities: &JointArray<f64>,
         kp: &JointArray<f64>,
         kd: &JointArray<f64>,
         torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
     ) -> RobotResult<()> {
-        Piper::<Active<MitMode>>::command_torques(self, positions, velocities, kp, kd, torques)
+        Piper::<Active<MitMode>>::command_torques_confirmed(
+            self, positions, velocities, kp, kd, torques, timeout,
+        )
     }
 }
 
@@ -48,6 +59,8 @@ impl GravityCompensationRobot for Piper<Active<MitMode>> {
 pub struct GravityCompensationRunnerConfig {
     /// Main control loop period
     pub loop_period: Duration,
+    /// Maximum time allowed for TX thread delivery confirmation
+    pub command_delivery_timeout: Duration,
     /// Safe aligned read policy for control snapshots
     pub read_policy: ControlReadPolicy,
     /// Safety scaling applied to model torques before sending
@@ -62,6 +75,7 @@ impl Default for GravityCompensationRunnerConfig {
     fn default() -> Self {
         Self {
             loop_period: Duration::from_millis(5),
+            command_delivery_timeout: Duration::from_millis(10),
             read_policy: ControlReadPolicy::default(),
             torque_safety_scale: [0.25, 0.25, 0.25, 1.25, 1.25, 1.25],
             shutdown_kd: [0.4; 6],
@@ -166,6 +180,7 @@ where
     }
 
     fn run_cycle(&mut self) -> Result<(), GravityCompensationRunnerError> {
+        ensure_runtime_healthy(self.robot.runtime_health())?;
         let snapshot = self.robot.control_snapshot(self.config.read_policy)?;
         let q = joint_state_from_snapshot(snapshot);
         let raw_torques = self.gravity.compute_gravity_compensation(&q)?;
@@ -173,12 +188,13 @@ where
         let zero_gains = JointArray::splat(0.0);
         let velocities = snapshot.velocity.map(|velocity| velocity.0);
 
-        self.robot.command_torques(
+        self.robot.command_torques_confirmed(
             &snapshot.position,
             &velocities,
             &zero_gains,
             &zero_gains,
             &commanded_torques,
+            self.config.command_delivery_timeout,
         )?;
 
         Ok(())
@@ -197,6 +213,14 @@ where
 
         while shutdown_start.elapsed() < self.config.shutdown_duration {
             let cycle_start = Instant::now();
+            let health = self.robot.runtime_health();
+            if let Err(error) = ensure_runtime_healthy(health) {
+                log::warn!(
+                    "Gravity compensation shutdown aborted: runtime health unhealthy: {}",
+                    error
+                );
+                break;
+            }
             let snapshot = match self.robot.control_snapshot(self.config.read_policy) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -207,12 +231,13 @@ where
                     break;
                 },
             };
-            if let Err(error) = self.robot.command_torques(
+            if let Err(error) = self.robot.command_torques_confirmed(
                 &snapshot.position,
                 &zero_velocities,
                 &zero_kp,
                 &shutdown_kd,
                 &zero_torques,
+                self.config.command_delivery_timeout,
             ) {
                 log::warn!(
                     "Gravity compensation shutdown aborted: failed to send damping command: {}",
@@ -249,13 +274,27 @@ fn sleep_remainder(started_at: Instant, period: Duration) {
     }
 }
 
+fn ensure_runtime_healthy(health: RuntimeHealthSnapshot) -> RobotResult<()> {
+    if health.rx_alive && health.tx_alive && health.fault.is_none() {
+        return Ok(());
+    }
+
+    Err(piper_sdk::client::types::RobotError::runtime_health_unhealthy(
+        health.rx_alive,
+        health.tx_alive,
+        health.fault,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use piper_sdk::client::types::RadPerSecond;
     use piper_sdk::client::types::RobotError;
+    use piper_sdk::client::RuntimeFaultKind;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::PhysicsError;
 
@@ -268,6 +307,7 @@ mod tests {
 
     struct FakeRobot {
         snapshots: Mutex<VecDeque<RobotResult<ControlSnapshot>>>,
+        healths: Mutex<VecDeque<RuntimeHealthSnapshot>>,
         command_results: Mutex<VecDeque<RobotResult<()>>>,
         commands: Mutex<Vec<RecordedCommand>>,
     }
@@ -275,10 +315,12 @@ mod tests {
     impl FakeRobot {
         fn new(
             snapshots: impl Into<VecDeque<RobotResult<ControlSnapshot>>>,
+            healths: impl Into<VecDeque<RuntimeHealthSnapshot>>,
             command_results: impl Into<VecDeque<RobotResult<()>>>,
         ) -> Self {
             Self {
                 snapshots: Mutex::new(snapshots.into()),
+                healths: Mutex::new(healths.into()),
                 command_results: Mutex::new(command_results.into()),
                 commands: Mutex::new(Vec::new()),
             }
@@ -299,13 +341,22 @@ mod tests {
             })
         }
 
-        fn command_torques(
+        fn runtime_health(&self) -> RuntimeHealthSnapshot {
+            self.healths
+                .lock()
+                .expect("healths lock")
+                .pop_front()
+                .unwrap_or_else(healthy_runtime)
+        }
+
+        fn command_torques_confirmed(
             &self,
             _positions: &JointArray<Rad>,
             velocities: &JointArray<f64>,
             _kp: &JointArray<f64>,
             kd: &JointArray<f64>,
             torques: &JointArray<NewtonMeter>,
+            _timeout: Duration,
         ) -> RobotResult<()> {
             self.commands.lock().expect("commands lock").push(RecordedCommand {
                 velocities: velocities.into_array(),
@@ -323,13 +374,19 @@ mod tests {
 
     struct FakeGravity {
         results: VecDeque<Result<JointTorques, PhysicsError>>,
+        calls: AtomicUsize,
     }
 
     impl FakeGravity {
         fn new(results: impl Into<VecDeque<Result<JointTorques, PhysicsError>>>) -> Self {
             Self {
                 results: results.into(),
+                calls: AtomicUsize::new(0),
             }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
         }
     }
 
@@ -338,6 +395,7 @@ mod tests {
             &mut self,
             _q: &JointState,
         ) -> Result<JointTorques, PhysicsError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             self.results.pop_front().unwrap_or_else(|| Ok(JointState::repeat(0.0)))
         }
 
@@ -378,10 +436,21 @@ mod tests {
         }
     }
 
+    fn healthy_runtime() -> RuntimeHealthSnapshot {
+        RuntimeHealthSnapshot {
+            connected: true,
+            last_feedback_age: Duration::from_millis(1),
+            rx_alive: true,
+            tx_alive: true,
+            fault: None,
+        }
+    }
+
     #[test]
     fn runner_stops_cleanly_when_cancelled() {
         let robot = FakeRobot::new(
             vec![Ok(snapshot_with_velocity(0.0)), Ok(snapshot_with_velocity(0.0))],
+            vec![healthy_runtime()],
             Vec::<RobotResult<()>>::new(),
         );
         let mut gravity = FakeGravity::new(vec![Ok(JointState::repeat(1.0))]);
@@ -414,6 +483,7 @@ mod tests {
                 Duration::from_millis(80),
                 Duration::from_millis(50),
             ))],
+            vec![healthy_runtime()],
             Vec::<RobotResult<()>>::new(),
         );
         let mut gravity = FakeGravity::new(Vec::<Result<JointTorques, PhysicsError>>::new());
@@ -441,6 +511,7 @@ mod tests {
     fn runner_reports_misaligned_feedback() {
         let robot = FakeRobot::new(
             vec![Err(RobotError::state_misaligned(9_000, 5_000))],
+            vec![healthy_runtime()],
             Vec::<RobotResult<()>>::new(),
         );
         let mut gravity = FakeGravity::new(Vec::<Result<JointTorques, PhysicsError>>::new());
@@ -467,6 +538,7 @@ mod tests {
     fn runner_reports_solver_error() {
         let robot = FakeRobot::new(
             vec![Ok(snapshot_with_velocity(0.0))],
+            vec![healthy_runtime()],
             Vec::<RobotResult<()>>::new(),
         );
         let mut gravity = FakeGravity::new(vec![Err(PhysicsError::CalculationFailed(
@@ -495,6 +567,7 @@ mod tests {
     fn runner_reports_send_error() {
         let robot = FakeRobot::new(
             vec![Ok(snapshot_with_velocity(0.0))],
+            vec![healthy_runtime()],
             vec![Err(RobotError::CanIoError("send failed".to_string()))],
         );
         let mut gravity = FakeGravity::new(vec![Ok(JointState::repeat(1.0))]);
@@ -524,6 +597,7 @@ mod tests {
                 Ok(snapshot_with_velocity(0.0)),
                 Ok(snapshot_with_velocity(1.5)),
             ],
+            vec![healthy_runtime(), healthy_runtime()],
             Vec::<RobotResult<()>>::new(),
         );
         let mut gravity = FakeGravity::new(vec![Ok(JointState::repeat(2.0))]);
@@ -549,5 +623,75 @@ mod tests {
         assert_eq!(commands[1].torques, [0.0; 6]);
         assert_eq!(commands[1].velocities, [0.0; 6]);
         assert_eq!(commands[1].kd, config.shutdown_kd);
+    }
+
+    #[test]
+    fn runner_stops_before_solver_when_runtime_health_is_unhealthy() {
+        let robot = FakeRobot::new(
+            vec![Ok(snapshot_with_velocity(0.0))],
+            vec![RuntimeHealthSnapshot {
+                connected: true,
+                last_feedback_age: Duration::from_millis(1),
+                rx_alive: true,
+                tx_alive: false,
+                fault: Some(RuntimeFaultKind::TxExited),
+            }],
+            Vec::<RobotResult<()>>::new(),
+        );
+        let mut gravity = FakeGravity::new(vec![Ok(JointState::repeat(1.0))]);
+        let mut runner = GravityCompensationRunner::new(
+            &robot,
+            &mut gravity,
+            GravityCompensationRunnerConfig {
+                shutdown_duration: Duration::ZERO,
+                ..Default::default()
+            },
+        );
+
+        let error = runner
+            .run_until_stopped(|| true)
+            .expect_err("unhealthy runtime should stop the runner");
+
+        assert!(matches!(
+            error.error,
+            GravityCompensationRunnerError::Robot(RobotError::RuntimeHealthUnhealthy { .. })
+        ));
+        assert_eq!(gravity.call_count(), 0);
+        assert!(robot.commands().is_empty());
+    }
+
+    #[test]
+    fn runner_stops_shutdown_when_confirmed_send_fails() {
+        let robot = FakeRobot::new(
+            vec![
+                Ok(snapshot_with_velocity(0.0)),
+                Ok(snapshot_with_velocity(1.5)),
+                Ok(snapshot_with_velocity(1.5)),
+            ],
+            vec![healthy_runtime(), healthy_runtime(), healthy_runtime()],
+            vec![Ok(()), Err(RobotError::CanIoError("shutdown failed".to_string()))],
+        );
+        let mut gravity = FakeGravity::new(vec![Ok(JointState::repeat(2.0))]);
+        let mut runner = GravityCompensationRunner::new(
+            &robot,
+            &mut gravity,
+            GravityCompensationRunnerConfig {
+                loop_period: Duration::ZERO,
+                shutdown_duration: Duration::from_millis(10),
+                ..Default::default()
+            },
+        );
+        let mut polls = 0;
+
+        let _stats = runner
+            .run_until_stopped(|| {
+                polls += 1;
+                polls <= 1
+            })
+            .expect("runner should stop cleanly");
+
+        let commands = robot.commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1].torques, [0.0; 6]);
     }
 }
