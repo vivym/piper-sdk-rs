@@ -1,6 +1,7 @@
 //! 脚本系统
 
 use anyhow::{Context, Result};
+use piper_client::ControlReadPolicy;
 use piper_client::state::Piper;
 use piper_client::state::Standby;
 use piper_control::{
@@ -175,8 +176,11 @@ impl ScriptExecutor {
         match command {
             ScriptCommand::Move { joints, force } => {
                 println!("  移动: joints = {:?}", joints);
-                let current =
-                    std::array::from_fn(|index| standby.observer().snapshot().position[index].0);
+                let snapshot = standby
+                    .observer()
+                    .control_snapshot(ControlReadPolicy::default())
+                    .map_err(CommandFailure::lost_standby)?;
+                let current = std::array::from_fn(|index| snapshot.position[index].0);
                 let prepared =
                     match prepare_move(current, joints, &self.config.profile.safety, *force) {
                         Ok(prepared) => prepared,
@@ -203,7 +207,10 @@ impl ScriptExecutor {
             },
             ScriptCommand::Position => {
                 println!("  查询位置");
-                let snapshot = standby.observer().snapshot();
+                let snapshot = standby
+                    .observer()
+                    .control_snapshot(ControlReadPolicy::default())
+                    .map_err(CommandFailure::lost_standby)?;
                 for (index, position) in snapshot.position.iter().enumerate() {
                     println!(
                         "    J{}: {:.3} rad ({:.1}°)",

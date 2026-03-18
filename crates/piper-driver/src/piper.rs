@@ -566,8 +566,11 @@ impl Piper {
             joint_vel: joint_dynamic.joint_vel,
             joint_current: joint_dynamic.joint_current,
             end_pose: snapshot.end_pose.end_pose,
-            timestamp: snapshot.joint_position.hardware_timestamp_us, // 使用位置数据的时间戳作为基准
-            time_diff_us: (joint_dynamic.group_timestamp_us as i64)
+            position_timestamp_us: snapshot.joint_position.hardware_timestamp_us,
+            dynamic_timestamp_us: joint_dynamic.group_timestamp_us,
+            position_system_timestamp_us: snapshot.joint_position.system_timestamp_us,
+            dynamic_system_timestamp_us: joint_dynamic.group_system_timestamp_us,
+            skew_us: (joint_dynamic.group_timestamp_us as i64)
                 - (snapshot.joint_position.hardware_timestamp_us as i64),
         };
 
@@ -1269,8 +1272,9 @@ mod tests {
         let result = piper.get_aligned_motion(5000);
         match result {
             AlignmentResult::Ok(state) => {
-                assert_eq!(state.timestamp, 0);
-                assert_eq!(state.time_diff_us, 0);
+                assert_eq!(state.position_timestamp_us, 0);
+                assert_eq!(state.dynamic_timestamp_us, 0);
+                assert_eq!(state.skew_us, 0);
             },
             AlignmentResult::Misaligned { .. } => {
                 // 如果时间戳都为 0，不应该是不对齐的
@@ -1445,16 +1449,16 @@ mod tests {
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // 测试对齐阈值边界情况
-        // 时间戳都为 0 时，time_diff_us 应该是 0
+        // 时间戳都为 0 时，skew_us 应该是 0
         let result = piper.get_aligned_motion(0);
         match result {
             AlignmentResult::Ok(state) => {
-                assert_eq!(state.time_diff_us, 0);
+                assert_eq!(state.skew_us, 0);
             },
             AlignmentResult::Misaligned { state, diff_us } => {
                 // 如果时间戳都为 0，diff_us 应该也是 0
                 assert_eq!(diff_us, 0);
-                assert_eq!(state.time_diff_us, 0);
+                assert_eq!(state.skew_us, 0);
             },
         }
     }

@@ -36,77 +36,18 @@ impl<'a> RawCommander<'a> {
     pub(crate) fn new(driver: &'a RobotPiper) -> Self {
         RawCommander { driver }
     }
-    /// 批量发送 MIT 控制指令（一次性发送所有 6 个关节）
+    /// 发送已规范化、已校验的 MIT 批命令
     ///
-    /// **关键修复**：此方法一次性发送所有 6 个关节，避免覆盖问题。
-    ///
-    /// **问题说明**：
-    /// - 如果循环调用 `send_mit_command` 6 次，由于邮箱模式（覆盖策略），
-    ///   后面的会覆盖前面的，导致只有最后一个关节生效。
-    ///
-    /// **正确实现**：
-    /// - 一次性准备所有 6 个关节的帧
-    /// - 打包成一个 Package，一次性发送
-    ///
-    /// # 参数
-    ///
-    /// - `positions`: 各关节目标位置
-    /// - `velocities`: 各关节目标速度
-    /// - `kp`: 位置增益（每个关节独立）
-    /// - `kd`: 速度增益（每个关节独立）
-    /// - `torques`: 各关节前馈力矩
-    pub(crate) fn send_mit_command_batch(
+    /// 调用方必须在进入此方法前完成：
+    /// - 固件 quirk 修正
+    /// - 协议范围校验
+    /// - 整批原子性决策
+    pub(crate) fn send_validated_mit_command_batch(
         &self,
-        positions: &JointArray<Rad>,
-        velocities: &JointArray<f64>,
-        kp: &JointArray<f64>,
-        kd: &JointArray<f64>,
-        torques: &JointArray<NewtonMeter>,
+        commands: [MitControlCommand; 6],
     ) -> Result<()> {
-        use piper_protocol::control::MitControlCommand;
-
-        // 准备所有 6 个关节的帧
-        // 注意：使用数组（栈分配）而不是 Vec，因为 FrameBuffer 的栈缓冲区是 6
-        // 这样可以确保完全在栈上，零堆分配，满足高频控制的实时性要求
-        let mut frames_array: [PiperFrame; 6] = [
-            PiperFrame::new_standard(0, &[0; 8]),
-            PiperFrame::new_standard(0, &[0; 8]),
-            PiperFrame::new_standard(0, &[0; 8]),
-            PiperFrame::new_standard(0, &[0; 8]),
-            PiperFrame::new_standard(0, &[0; 8]),
-            PiperFrame::new_standard(0, &[0; 8]),
-        ];
-
-        for (index, joint) in [
-            Joint::J1,
-            Joint::J2,
-            Joint::J3,
-            Joint::J4,
-            Joint::J5,
-            Joint::J6,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let joint_index = joint.index() as u8 + 1;
-            let pos_ref = positions[joint].0 as f32;
-            let vel_ref = velocities[joint] as f32;
-            let kp_f32 = kp[joint] as f32; // 每个关节独立的 kp 增益
-            let kd_f32 = kd[joint] as f32; // 每个关节独立的 kd 增益
-            let t_ref = torques[joint].0 as f32;
-
-            // ✅ v2.1 重构：简化为两行，自动计算 CRC
-            // encode_to_bytes 内部已处理完整的 8 字节编码（包括 T_ref 的高低位）
-            // to_frame 只负责计算并填入 CRC
-            let cmd = MitControlCommand::new(joint_index, pos_ref, vel_ref, kp_f32, kd_f32, t_ref);
-            frames_array[index] = cmd.to_frame(); // 内部自动计算 CRC
-        }
-
-        // ✅ 一次性打包发送所有 6 帧
-        // 注意：由于 FrameBuffer 的栈缓冲区是 6，这 6 帧完全在栈上，零堆分配
-        // 这对于高频控制（500Hz-1kHz）至关重要，确保实时性能
+        let frames_array = commands.map(MitControlCommand::to_frame);
         self.driver.send_realtime_package(frames_array)?;
-
         Ok(())
     }
 
@@ -424,7 +365,7 @@ impl<'a> RawCommander<'a> {
 
         let frame = ParameterQuerySetCommand::query(ParameterQueryType::CollisionProtectionLevel)
             .to_frame()
-            .map_err(RobotError::Protocol)?;
+            .map_err(RobotError::from)?;
         self.driver.send_reliable(frame)?;
         Ok(())
     }
@@ -550,15 +491,13 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = build_driver(sent_frames.clone());
         let commander = RawCommander::new(&driver);
-
-        let positions = JointArray::splat(Rad(0.0));
-        let velocities = JointArray::splat(0.0);
-        let kp = JointArray::splat(10.0);
-        let kd = JointArray::splat(0.8);
-        let torques = JointArray::splat(NewtonMeter(0.0));
+        let commands = std::array::from_fn(|index| {
+            MitControlCommand::try_new(index as u8 + 1, 0.0, 0.0, 10.0, 0.8, 0.0)
+                .expect("command should be valid")
+        });
 
         commander
-            .send_mit_command_batch(&positions, &velocities, &kp, &kd, &torques)
+            .send_validated_mit_command_batch(commands)
             .expect("MIT batch send should succeed");
 
         let frames = wait_for_sent_frames(&sent_frames, 6);

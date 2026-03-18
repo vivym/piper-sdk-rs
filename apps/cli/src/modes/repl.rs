@@ -4,6 +4,7 @@ use crate::commands::config::CliConfig;
 use crate::connection::client_builder;
 use crate::parsing::{parse_collision_levels, parse_joint_indices_arg};
 use anyhow::{Result, bail};
+use piper_client::ControlReadPolicy;
 use piper_client::Piper;
 use piper_client::state::{Active, DisableConfig, Piper as StatePiper, PositionMode, Standby};
 use piper_control::{
@@ -181,12 +182,18 @@ impl ReplSession {
 
     fn observer_positions(&self) -> Result<[f64; 6]> {
         match &self.state {
-            ReplState::Standby(robot) => Ok(std::array::from_fn(|index| {
-                robot.observer().snapshot().position[index].0
-            })),
-            ReplState::ActivePosition(robot) => Ok(std::array::from_fn(|index| {
-                robot.observer().snapshot().position[index].0
-            })),
+            ReplState::Standby(robot) => {
+                let snapshot = robot
+                    .observer()
+                    .control_snapshot(ControlReadPolicy::default())?;
+                Ok(std::array::from_fn(|index| snapshot.position[index].0))
+            },
+            ReplState::ActivePosition(robot) => {
+                let snapshot = robot
+                    .observer()
+                    .control_snapshot(ControlReadPolicy::default())?;
+                Ok(std::array::from_fn(|index| snapshot.position[index].0))
+            },
             ReplState::Disconnected => {
                 #[cfg(test)]
                 if let Some(positions) = self.test_observer_positions {

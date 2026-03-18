@@ -115,6 +115,8 @@ pub struct JointDynamicState {
     /// **注意**：存储的是硬件时间戳（来自 `PiperFrame.timestamp_us`），不是 UNIX 时间戳。
     /// 硬件时间戳是设备相对时间，用于帧间时间差计算，不能直接与系统时间戳比较。
     pub group_timestamp_us: u64,
+    /// 整个组在主机侧提交时的系统时间戳（微秒）
+    pub group_system_timestamp_us: u64,
 
     // === 关节速度/电流（来自 0x251-0x256，独立帧） ===
     /// 关节速度（rad/s）[J1, J2, J3, J4, J5, J6]
@@ -1141,8 +1143,11 @@ pub struct AlignedMotionState {
     pub joint_vel: [f64; 6],
     pub joint_current: [f64; 6],
     pub end_pose: [f64; 6],
-    pub timestamp: u64,    // 基准时间戳（来自位置数据）
-    pub time_diff_us: i64, // 速度数据与位置数据的时间差（用于调试）
+    pub position_timestamp_us: u64,
+    pub dynamic_timestamp_us: u64,
+    pub position_system_timestamp_us: u64,
+    pub dynamic_system_timestamp_us: u64,
+    pub skew_us: i64,
 }
 
 /// 时间对齐结果
@@ -1275,6 +1280,7 @@ mod tests {
     fn test_joint_dynamic_state_default() {
         let state = JointDynamicState::default();
         assert_eq!(state.group_timestamp_us, 0);
+        assert_eq!(state.group_system_timestamp_us, 0);
         assert_eq!(state.joint_vel, [0.0; 6]);
         assert_eq!(state.joint_current, [0.0; 6]);
         assert_eq!(state.timestamps, [0; 6]);
@@ -1302,6 +1308,7 @@ mod tests {
 
         let joint_dynamic = ctx.joint_dynamic.load();
         assert_eq!(joint_dynamic.group_timestamp_us, 0);
+        assert_eq!(joint_dynamic.group_system_timestamp_us, 0);
 
         let robot_control = ctx.robot_control.load();
         assert_eq!(robot_control.hardware_timestamp_us, 0);
@@ -1317,6 +1324,7 @@ mod tests {
     fn test_joint_dynamic_state_clone() {
         let state = JointDynamicState {
             group_timestamp_us: 1000,
+            group_system_timestamp_us: 2000,
             joint_vel: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             joint_current: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
             timestamps: [100, 200, 300, 400, 500, 600],
@@ -1324,6 +1332,10 @@ mod tests {
         };
         let cloned = state.clone();
         assert_eq!(state.group_timestamp_us, cloned.group_timestamp_us);
+        assert_eq!(
+            state.group_system_timestamp_us,
+            cloned.group_system_timestamp_us
+        );
         assert_eq!(state.joint_vel, cloned.joint_vel);
         assert_eq!(state.joint_current, cloned.joint_current);
         assert_eq!(state.timestamps, cloned.timestamps);
@@ -1342,8 +1354,11 @@ mod tests {
             joint_vel: [2.0; 6],
             joint_current: [3.0; 6],
             end_pose: [4.0; 6],
-            timestamp: 1000,
-            time_diff_us: 500,
+            position_timestamp_us: 1000,
+            dynamic_timestamp_us: 1500,
+            position_system_timestamp_us: 2000,
+            dynamic_system_timestamp_us: 2500,
+            skew_us: 500,
         };
         let debug_str = format!("{:?}", state);
         assert!(debug_str.contains("AlignedMotionState"));
@@ -1356,8 +1371,11 @@ mod tests {
             joint_vel: [2.0; 6],
             joint_current: [3.0; 6],
             end_pose: [4.0; 6],
-            timestamp: 1000,
-            time_diff_us: 500,
+            position_timestamp_us: 1000,
+            dynamic_timestamp_us: 1500,
+            position_system_timestamp_us: 2000,
+            dynamic_system_timestamp_us: 2500,
+            skew_us: 500,
         };
         let result_ok = AlignmentResult::Ok(state);
         let debug_str = format!("{:?}", result_ok);
@@ -1368,8 +1386,11 @@ mod tests {
             joint_vel: [2.0; 6],
             joint_current: [3.0; 6],
             end_pose: [4.0; 6],
-            timestamp: 1000,
-            time_diff_us: 500,
+            position_timestamp_us: 1000,
+            dynamic_timestamp_us: 1500,
+            position_system_timestamp_us: 2000,
+            dynamic_system_timestamp_us: 2500,
+            skew_us: 500,
         };
         let result_mis = AlignmentResult::Misaligned {
             state: state2,

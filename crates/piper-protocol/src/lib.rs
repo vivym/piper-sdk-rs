@@ -152,6 +152,20 @@ pub enum ProtocolError {
     #[error("Invalid CAN ID: 0x{id:X}")]
     InvalidCanId { id: u32 },
 
+    #[error("Invalid MIT joint index: expected 1..=6, got {joint_index}")]
+    InvalidJointIndex { joint_index: u8 },
+
+    #[error(
+        "MIT input out of range for joint J{joint_index} field {field}: {value} not in [{min}, {max}]"
+    )]
+    MitInputOutOfRange {
+        joint_index: u8,
+        field: crate::control::MitControlField,
+        value: f32,
+        min: f32,
+        max: f32,
+    },
+
     #[error("Parse error: {0}")]
     ParseError(String),
 

@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::Args;
+use piper_sdk::client::ControlReadPolicy;
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -26,7 +27,7 @@ impl PositionCommand {
         println!("🔌 连接到机器人...");
         let robot = builder.build()?;
         let observer = robot.observer();
-        let snapshot = observer.snapshot();
+        let snapshot = observer.control_snapshot(ControlReadPolicy::default())?;
 
         println!("📊 关节位置:");
         for (index, pos) in snapshot.position.iter().enumerate() {

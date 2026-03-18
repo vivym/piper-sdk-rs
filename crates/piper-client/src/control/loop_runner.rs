@@ -19,6 +19,7 @@
 //! let config = LoopConfig {
 //!     frequency_hz: 100.0,              // 100Hz 控制频率
 //!     dt_clamp_multiplier: 2.0,         // dt 最大为 2x 标称值
+//!     read_policy: ControlReadPolicy::default(),
 //!     max_iterations: Some(1000),       // 运行 1000 次后停止
 //! };
 //!
@@ -29,6 +30,7 @@
 
 use super::controller::Controller;
 use crate::Piper;
+use crate::observer::ControlReadPolicy;
 use crate::state::{Active, MitMode};
 use crate::types::RobotError;
 use std::time::{Duration, Instant};
@@ -48,6 +50,9 @@ pub struct LoopConfig {
     /// 例如：2.0 表示 dt 最大为 2 * (1 / frequency_hz)
     pub dt_clamp_multiplier: f64,
 
+    /// 高频控制读取策略
+    pub read_policy: ControlReadPolicy,
+
     /// 最大迭代次数（None 表示无限循环）
     ///
     /// 用于测试或定时运行。
@@ -59,7 +64,8 @@ impl Default for LoopConfig {
         LoopConfig {
             frequency_hz: 100.0,      // 默认 100Hz
             dt_clamp_multiplier: 2.0, // 默认 2x
-            max_iterations: None,     // 默认无限循环
+            read_policy: ControlReadPolicy::default(),
+            max_iterations: None, // 默认无限循环
         }
     }
 }
@@ -101,6 +107,7 @@ impl Default for LoopConfig {
 /// let config = LoopConfig {
 ///     frequency_hz: 200.0,  // 200Hz 高频控制
 ///     dt_clamp_multiplier: 1.5,
+///     read_policy: ControlReadPolicy::default(),
 ///     max_iterations: Some(2000),  // 运行 10 秒后停止
 /// };
 ///
@@ -167,7 +174,7 @@ where
         }
 
         // 3. 读取当前状态
-        let current = piper.observer().joint_positions();
+        let current = piper.observer().control_snapshot(config.read_policy)?.position;
 
         // 4. 调用控制器（只返回力矩）
         let torques = controller.tick(&current, dt).map_err(RobotError::from)?;
@@ -253,7 +260,7 @@ where
             dt = max_dt;
         }
 
-        let current = piper.observer().joint_positions();
+        let current = piper.observer().control_snapshot(config.read_policy)?.position;
         let torques = controller.tick(&current, dt).map_err(RobotError::from)?;
 
         let zero_positions = crate::types::JointArray::from([crate::types::Rad(0.0); 6]);
@@ -292,10 +299,12 @@ mod tests {
         let config = LoopConfig {
             frequency_hz: 200.0,
             dt_clamp_multiplier: 1.5,
+            read_policy: ControlReadPolicy::default(),
             max_iterations: Some(1000),
         };
         assert_eq!(config.frequency_hz, 200.0);
         assert_eq!(config.dt_clamp_multiplier, 1.5);
+        assert_eq!(config.read_policy, ControlReadPolicy::default());
         assert_eq!(config.max_iterations, Some(1000));
     }
 

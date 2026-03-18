@@ -35,6 +35,7 @@
 //!     kd_gains: [0.8; 6],  // Nm/(rad/s)
 //!     rest_position: None,
 //!     control_rate: 200.0,
+//!     read_policy: ControlReadPolicy::default(),
 //! };
 //! # // let mut controller = MitController::new(piper, config);
 //!
@@ -58,7 +59,7 @@
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
-use crate::observer::Observer;
+use crate::observer::{ControlReadPolicy, Observer};
 use crate::state::machine::{Active, DisableConfig, MitMode, Piper, Standby};
 use crate::types::*;
 
@@ -87,6 +88,9 @@ pub struct MitControllerConfig {
     /// 使用绝对时间锚点机制，实际频率将精确锁定在此值。
     /// 推荐值：200.0 Hz（与固件更新频率一致）
     pub control_rate: f64,
+
+    /// 控制闭环读取策略
+    pub read_policy: ControlReadPolicy,
 }
 
 impl Default for MitControllerConfig {
@@ -96,6 +100,7 @@ impl Default for MitControllerConfig {
             kd_gains: [0.8; 6],
             rest_position: None,
             control_rate: 200.0,
+            read_policy: ControlReadPolicy::default(),
         }
     }
 }
@@ -263,7 +268,7 @@ impl MitController {
             }
 
             // 3. 检查是否到达
-            let current = self.observer.joint_positions();
+            let current = self.observer.control_snapshot(self.config.read_policy)?.position;
             let reached =
                 current.iter().zip(target.iter()).all(|(c, t)| (*c - *t).abs() < threshold);
 
@@ -442,5 +447,6 @@ mod tests {
         assert_eq!(config.kd_gains[0], 0.8);
         assert!(config.rest_position.is_none());
         assert_eq!(config.control_rate, 200.0);
+        assert_eq!(config.read_policy, ControlReadPolicy::default());
     }
 }

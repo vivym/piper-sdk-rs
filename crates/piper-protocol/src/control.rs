@@ -6,6 +6,7 @@
 use crate::can::PiperFrame;
 use crate::{ProtocolError, i16_to_bytes_be, i32_to_bytes_be, ids::*};
 use bilge::prelude::*;
+use std::fmt;
 
 // ============================================================================
 // 控制模式指令相关枚举
@@ -1394,23 +1395,65 @@ mod arc_point_tests {
 /// - CRC 属于衍生属性，不在结构体中存储
 /// - 在 `to_frame` 时即时计算，确保数据一致性
 /// - 避免了 "Stale CRC" 问题（修改字段后 CRC 过期）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MitControlField {
+    PositionReference,
+    VelocityReference,
+    Kp,
+    Kd,
+    TorqueReference,
+}
+
+impl fmt::Display for MitControlField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::PositionReference => "pos_ref",
+            Self::VelocityReference => "vel_ref",
+            Self::Kp => "kp",
+            Self::Kd => "kd",
+            Self::TorqueReference => "t_ref",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MitControlCommand {
-    pub joint_index: u8, // 从 ID 推导：0x15A -> 1, 0x15B -> 2, ...
-    pub pos_ref: f32,    // 位置参考值
-    pub vel_ref: f32,    // 速度参考值
-    pub kp: f32,         // 比例增益（参考值：10）
-    pub kd: f32,         // 微分增益（参考值：0.8）
-    pub t_ref: f32,      // 力矩参考值
+    joint_index: u8, // 从 ID 推导：0x15A -> 1, 0x15B -> 2, ...
+    pos_ref: f32,    // 位置参考值
+    vel_ref: f32,    // 速度参考值
+    kp: f32,         // 比例增益（参考值：10）
+    kd: f32,         // 微分增益（参考值：0.8）
+    t_ref: f32,      // 力矩参考值
 }
 
 impl MitControlCommand {
-    fn assert_valid_joint_index(joint_index: u8) {
-        assert!(
-            (1..=6).contains(&joint_index),
-            "MIT joint_index must be in [1, 6], got {}",
-            joint_index
-        );
+    fn validate_joint_index(joint_index: u8) -> Result<(), ProtocolError> {
+        if (1..=6).contains(&joint_index) {
+            Ok(())
+        } else {
+            Err(ProtocolError::InvalidJointIndex { joint_index })
+        }
+    }
+
+    fn validate_range(
+        joint_index: u8,
+        field: MitControlField,
+        value: f32,
+        min: f32,
+        max: f32,
+    ) -> Result<(), ProtocolError> {
+        if (min..=max).contains(&value) {
+            Ok(())
+        } else {
+            Err(ProtocolError::MitInputOutOfRange {
+                joint_index,
+                field,
+                value,
+                min,
+                max,
+            })
+        }
     }
 
     // ✅ 常量定义：消除魔法数字
@@ -1506,16 +1549,59 @@ impl MitControlCommand {
     ///
     /// **v2.1**：移除了 `crc` 参数，CRC 在 `to_frame` 时即时计算。
     /// 这样可以避免"Stale CRC"问题（修改字段后 CRC 过期）。
-    pub fn new(joint_index: u8, pos_ref: f32, vel_ref: f32, kp: f32, kd: f32, t_ref: f32) -> Self {
-        Self::assert_valid_joint_index(joint_index);
-        Self {
+    pub fn try_new(
+        joint_index: u8,
+        pos_ref: f32,
+        vel_ref: f32,
+        kp: f32,
+        kd: f32,
+        t_ref: f32,
+    ) -> Result<Self, ProtocolError> {
+        Self::validate_joint_index(joint_index)?;
+        Self::validate_range(
+            joint_index,
+            MitControlField::PositionReference,
+            pos_ref,
+            Self::P_MIN,
+            Self::P_MAX,
+        )?;
+        Self::validate_range(
+            joint_index,
+            MitControlField::VelocityReference,
+            vel_ref,
+            Self::V_MIN,
+            Self::V_MAX,
+        )?;
+        Self::validate_range(
+            joint_index,
+            MitControlField::Kp,
+            kp,
+            Self::KP_MIN,
+            Self::KP_MAX,
+        )?;
+        Self::validate_range(
+            joint_index,
+            MitControlField::Kd,
+            kd,
+            Self::KD_MIN,
+            Self::KD_MAX,
+        )?;
+        Self::validate_range(
+            joint_index,
+            MitControlField::TorqueReference,
+            t_ref,
+            Self::T_MIN,
+            Self::T_MAX,
+        )?;
+
+        Ok(Self {
             joint_index,
             pos_ref,
             vel_ref,
             kp,
             kd,
             t_ref,
-        }
+        })
     }
 
     /// 核心编码逻辑：将控制参数编码为完整的 8 字节（CRC 位预留为 0）
@@ -1609,8 +1695,6 @@ impl MitControlCommand {
     /// - 将 CRC 填入第 8 字节的低 4 位
     /// - 避免 `T_ref` 的双重计算，性能优化
     pub fn to_frame(self) -> PiperFrame {
-        Self::assert_valid_joint_index(self.joint_index);
-
         // 1. 获取完整数据（CRC 位目前是 0）
         let mut data = self.encode_to_bytes();
 
@@ -1640,8 +1724,6 @@ impl MitControlCommand {
     /// **v2.1**：复用 `encode_to_bytes`，只需修改 CRC 位。
     #[cfg(test)]
     pub fn to_frame_with_custom_crc(self, custom_crc: u8) -> PiperFrame {
-        Self::assert_valid_joint_index(self.joint_index);
-
         // 复用 encode_to_bytes，只需修改 CRC 位
         let mut data = self.encode_to_bytes();
 
@@ -1692,9 +1774,10 @@ mod mit_control_tests {
     }
 
     #[test]
-    fn test_mit_control_command_new() {
+    fn test_mit_control_command_try_new() {
         // v2.1: 移除了 crc 参数，CRC 在 to_frame 时自动计算
-        let cmd = MitControlCommand::new(1, 1.0, 2.0, 10.0, 0.8, 5.0);
+        let cmd = MitControlCommand::try_new(1, 1.0, 2.0, 10.0, 0.8, 5.0)
+            .expect("valid MIT command should build");
         assert_eq!(cmd.joint_index, 1);
         assert_eq!(cmd.pos_ref, 1.0);
         assert_eq!(cmd.vel_ref, 2.0);
@@ -1704,9 +1787,77 @@ mod mit_control_tests {
     }
 
     #[test]
-    #[should_panic(expected = "MIT joint_index must be in [1, 6]")]
     fn test_mit_control_command_rejects_zero_based_joint_index() {
-        let _ = MitControlCommand::new(0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let error = MitControlCommand::try_new(0, 0.0, 0.0, 0.0, 0.0, 0.0).unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidJointIndex { joint_index: 0 }
+        ));
+    }
+
+    #[test]
+    fn test_mit_control_command_rejects_out_of_range_position() {
+        let error = MitControlCommand::try_new(1, 20.0, 0.0, 0.0, 0.0, 0.0).unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolError::MitInputOutOfRange {
+                joint_index: 1,
+                field: MitControlField::PositionReference,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_mit_control_command_rejects_out_of_range_velocity() {
+        let error = MitControlCommand::try_new(1, 0.0, 50.0, 0.0, 0.0, 0.0).unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolError::MitInputOutOfRange {
+                joint_index: 1,
+                field: MitControlField::VelocityReference,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_mit_control_command_rejects_out_of_range_kp() {
+        let error = MitControlCommand::try_new(1, 0.0, 0.0, 600.0, 0.0, 0.0).unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolError::MitInputOutOfRange {
+                joint_index: 1,
+                field: MitControlField::Kp,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_mit_control_command_rejects_out_of_range_kd() {
+        let error = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 10.0, 0.0).unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolError::MitInputOutOfRange {
+                joint_index: 1,
+                field: MitControlField::Kd,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_mit_control_command_rejects_out_of_range_torque() {
+        let error = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 9.0).unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolError::MitInputOutOfRange {
+                joint_index: 1,
+                field: MitControlField::TorqueReference,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1716,14 +1867,14 @@ mod mit_control_tests {
         // 测试用例 1：所有输入都为 0（包括 kp 和 kd）
         // 注意：由于编码时的位操作，即使输入全 0，
         // 编码后的字节可能不全为 0，因此 CRC 可能不为 0
-        let cmd = MitControlCommand::new(1, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let cmd = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.0).unwrap();
         let frame = cmd.to_frame();
         // 只验证 CRC 在有效范围内（0-15）
         let crc = frame.data[7] & 0x0F;
         assert!(crc <= 0x0F, "CRC 应该在 0-15 范围内");
 
         // 测试用例 2：有输入值（kp=10.0, kd=0.8）
-        let cmd2 = MitControlCommand::new(1, 0.0, 0.0, 10.0, 0.8, 0.0);
+        let cmd2 = MitControlCommand::try_new(1, 0.0, 0.0, 10.0, 0.8, 0.0).unwrap();
         let frame2 = cmd2.to_frame();
         let crc2 = frame2.data[7] & 0x0F;
         assert!(crc2 <= 0x0F, "CRC 应该在 0-15 范围内");
@@ -1747,7 +1898,9 @@ mod mit_control_tests {
     #[test]
     fn test_mit_control_command_joint_ids_cover_full_range() {
         for joint_index in 1..=6 {
-            let frame = MitControlCommand::new(joint_index, 0.0, 0.0, 0.0, 0.0, 0.0).to_frame();
+            let frame = MitControlCommand::try_new(joint_index, 0.0, 0.0, 0.0, 0.0, 0.0)
+                .unwrap()
+                .to_frame();
             assert_eq!(frame.id, ID_MIT_CONTROL_BASE + (joint_index - 1) as u32);
         }
     }

@@ -13,6 +13,7 @@
 use piper_sdk::client::state::*;
 // 注意：不导入 types::* 以避免 Result 类型别名冲突
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
+use piper_sdk::client::ControlReadPolicy;
 use piper_sdk::client::types::{Joint, NewtonMeter, Rad};
 use piper_sdk::prelude::JointArray;
 use std::collections::VecDeque;
@@ -232,7 +233,7 @@ fn test_observer() {
         let _positions = observer.joint_positions();
         let _velocities = observer.joint_velocities();
         let _torques = observer.joint_torques();
-        let _snapshot = observer.snapshot();
+        let _snapshot = observer.control_snapshot(ControlReadPolicy::default());
         let _gripper = observer.gripper_state();
         let _enabled = observer.is_arm_enabled();
 

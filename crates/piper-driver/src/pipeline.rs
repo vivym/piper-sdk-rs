@@ -810,10 +810,12 @@ fn parse_and_update_state(
             let joint_index = (id - ID_JOINT_DRIVER_HIGH_SPEED_BASE) as usize;
 
             if let Ok(feedback) = JointDriverHighSpeedFeedback::try_from(*frame) {
+                let system_timestamp_us = safe_system_timestamp_us();
                 // 1. 更新缓冲区（而不是立即提交）
                 state.pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                 state.pending_joint_dynamic.joint_current[joint_index] = feedback.current();
                 state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us;
+                state.pending_joint_dynamic.group_system_timestamp_us = system_timestamp_us;
 
                 // 2. 标记该关节已更新
                 let now = Instant::now();

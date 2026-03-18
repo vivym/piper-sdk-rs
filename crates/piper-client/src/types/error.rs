@@ -29,6 +29,8 @@
 //! ```
 
 use super::joint::Joint;
+use piper_protocol::{MitControlField, ProtocolError};
+use std::time::Duration;
 use thiserror::Error;
 
 /// 机器人错误类型
@@ -73,6 +75,28 @@ pub enum RobotError {
         to: String,
     },
 
+    /// 控制闭环读取到的反馈已过期
+    #[error("Control feedback is stale: age {age_ms}ms exceeds allowed {max_age_ms}ms")]
+    FeedbackStale {
+        /// 反馈年龄
+        age: Duration,
+        /// 允许的最大反馈年龄
+        max_age: Duration,
+        /// 便于日志直接打印的毫秒值
+        age_ms: u128,
+        /// 便于日志直接打印的毫秒值
+        max_age_ms: u128,
+    },
+
+    /// 控制闭环读取到的位置/动态状态时间未对齐
+    #[error("Control state misaligned: skew {skew_us}us exceeds allowed {max_skew_us}us")]
+    StateMisaligned {
+        /// 有符号时间偏差（dynamic - position）
+        skew_us: i64,
+        /// 允许的最大绝对偏差
+        max_skew_us: u64,
+    },
+
     /// 关节限位超出
     #[error("Joint {joint} limit exceeded: {value:.3} (limit: {limit:.3})")]
     JointLimitExceeded {
@@ -95,15 +119,57 @@ pub enum RobotError {
         limit: f64,
     },
 
+    /// MIT 位置参考超范围
+    #[error(
+        "MIT position reference out of range for joint {joint}: {value:.3} not in [{min:.3}, {max:.3}]"
+    )]
+    PositionReferenceOutOfRange {
+        joint: Joint,
+        value: f64,
+        min: f64,
+        max: f64,
+    },
+
+    /// MIT 速度参考超范围
+    #[error(
+        "MIT velocity reference out of range for joint {joint}: {value:.3} not in [{min:.3}, {max:.3}]"
+    )]
+    VelocityReferenceOutOfRange {
+        joint: Joint,
+        value: f64,
+        min: f64,
+        max: f64,
+    },
+
+    /// MIT Kp 超范围
+    #[error("MIT Kp out of range for joint {joint}: {value:.3} not in [{min:.3}, {max:.3}]")]
+    KpGainOutOfRange {
+        joint: Joint,
+        value: f64,
+        min: f64,
+        max: f64,
+    },
+
+    /// MIT Kd 超范围
+    #[error("MIT Kd out of range for joint {joint}: {value:.3} not in [{min:.3}, {max:.3}]")]
+    KdGainOutOfRange {
+        joint: Joint,
+        value: f64,
+        min: f64,
+        max: f64,
+    },
+
     /// 力矩限制超出
-    #[error("Torque limit exceeded for joint {joint}: {value:.3} (limit: {limit:.3})")]
+    #[error("Torque limit exceeded for joint {joint}: {value:.3} not in [{min:.3}, {max:.3}]")]
     TorqueLimitExceeded {
         /// 关节索引
         joint: Joint,
         /// 实际力矩
         value: f64,
-        /// 限矩
-        limit: f64,
+        /// 最小允许值
+        min: f64,
+        /// 最大允许值
+        max: f64,
     },
 
     // ==================== I/O Errors ====================
@@ -116,9 +182,9 @@ pub enum RobotError {
     SerializationError(String),
 
     // ==================== Protocol Errors ====================
-    /// 协议错误（自动转换自 protocol::ProtocolError）
+    /// 协议错误
     #[error("Protocol encoding error: {0}")]
-    Protocol(#[from] piper_protocol::ProtocolError),
+    Protocol(ProtocolError),
 
     /// 驱动层错误（自动转换自 driver::DriverError）
     #[error("Driver infrastructure error: {0}")]
@@ -184,7 +250,11 @@ impl RobotError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::Timeout { .. } | Self::CanIoError(_) | Self::Protocol(_)
+            Self::Timeout { .. }
+                | Self::CanIoError(_)
+                | Self::Protocol(_)
+                | Self::FeedbackStale { .. }
+                | Self::StateMisaligned { .. }
         )
     }
 
@@ -199,6 +269,10 @@ impl RobotError {
             self,
             Self::JointLimitExceeded { .. }
                 | Self::VelocityLimitExceeded { .. }
+                | Self::PositionReferenceOutOfRange { .. }
+                | Self::VelocityReferenceOutOfRange { .. }
+                | Self::KpGainOutOfRange { .. }
+                | Self::KdGainOutOfRange { .. }
                 | Self::TorqueLimitExceeded { .. }
         )
     }
@@ -236,6 +310,24 @@ impl RobotError {
         }
     }
 
+    /// 创建反馈过期错误
+    pub fn feedback_stale(age: Duration, max_age: Duration) -> Self {
+        Self::FeedbackStale {
+            age,
+            max_age,
+            age_ms: age.as_millis(),
+            max_age_ms: max_age.as_millis(),
+        }
+    }
+
+    /// 创建控制状态未对齐错误
+    pub fn state_misaligned(skew_us: i64, max_skew_us: u64) -> Self {
+        Self::StateMisaligned {
+            skew_us,
+            max_skew_us,
+        }
+    }
+
     /// 创建关节限位错误
     pub fn joint_limit(joint: Joint, value: f64, limit: f64) -> Self {
         Self::JointLimitExceeded {
@@ -255,11 +347,64 @@ impl RobotError {
     }
 
     /// 创建力矩限制错误
-    pub fn torque_limit(joint: Joint, value: f64, limit: f64) -> Self {
+    pub fn torque_limit(joint: Joint, value: f64, min: f64, max: f64) -> Self {
         Self::TorqueLimitExceeded {
             joint,
             value,
-            limit,
+            min,
+            max,
+        }
+    }
+}
+
+impl From<ProtocolError> for RobotError {
+    fn from(value: ProtocolError) -> Self {
+        match value {
+            ProtocolError::MitInputOutOfRange {
+                joint_index,
+                field,
+                value,
+                min,
+                max,
+            } => {
+                let joint = match Joint::from_index((joint_index.saturating_sub(1)) as usize) {
+                    Some(joint) => joint,
+                    None => {
+                        return Self::Protocol(ProtocolError::InvalidJointIndex { joint_index });
+                    },
+                };
+
+                match field {
+                    MitControlField::PositionReference => Self::PositionReferenceOutOfRange {
+                        joint,
+                        value: value as f64,
+                        min: min as f64,
+                        max: max as f64,
+                    },
+                    MitControlField::VelocityReference => Self::VelocityReferenceOutOfRange {
+                        joint,
+                        value: value as f64,
+                        min: min as f64,
+                        max: max as f64,
+                    },
+                    MitControlField::Kp => Self::KpGainOutOfRange {
+                        joint,
+                        value: value as f64,
+                        min: min as f64,
+                        max: max as f64,
+                    },
+                    MitControlField::Kd => Self::KdGainOutOfRange {
+                        joint,
+                        value: value as f64,
+                        min: min as f64,
+                        max: max as f64,
+                    },
+                    MitControlField::TorqueReference => {
+                        Self::torque_limit(joint, value as f64, min as f64, max as f64)
+                    },
+                }
+            },
+            other => Self::Protocol(other),
         }
     }
 }
@@ -292,6 +437,11 @@ mod tests {
         let can_io = RobotError::CanIoError("temporary failure".to_string());
         assert!(!can_io.is_fatal());
         assert!(can_io.is_retryable());
+
+        let stale =
+            RobotError::feedback_stale(Duration::from_millis(60), Duration::from_millis(50));
+        assert!(!stale.is_fatal());
+        assert!(stale.is_retryable());
     }
 
     #[test]
@@ -303,8 +453,16 @@ mod tests {
         let velocity_limit = RobotError::velocity_limit(Joint::J2, 10.0, 5.0);
         assert!(velocity_limit.is_limit_error());
 
-        let torque_limit = RobotError::torque_limit(Joint::J3, 15.0, 10.0);
+        let torque_limit = RobotError::torque_limit(Joint::J3, 15.0, -8.0, 8.0);
         assert!(torque_limit.is_limit_error());
+
+        let kp_limit = RobotError::KpGainOutOfRange {
+            joint: Joint::J4,
+            value: 600.0,
+            min: 0.0,
+            max: 500.0,
+        };
+        assert!(kp_limit.is_limit_error());
     }
 
     #[test]
@@ -349,6 +507,30 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("Standby"));
         assert!(msg.contains("Active"));
+    }
+
+    #[test]
+    fn test_protocol_mit_range_mapping() {
+        let err: RobotError = ProtocolError::MitInputOutOfRange {
+            joint_index: 3,
+            field: MitControlField::TorqueReference,
+            value: 9.0,
+            min: -8.0,
+            max: 8.0,
+        }
+        .into();
+
+        assert!(matches!(
+            err,
+            RobotError::TorqueLimitExceeded {
+                joint: Joint::J3,
+                value,
+                min,
+                max,
+            } if (value - 9.0).abs() < f64::EPSILON
+                && (min + 8.0).abs() < f64::EPSILON
+                && (max - 8.0).abs() < f64::EPSILON
+        ));
     }
 
     #[test]

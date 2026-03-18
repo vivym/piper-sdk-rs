@@ -1,7 +1,7 @@
 use crate::{ControlProfile, MotionWaitConfig};
 use anyhow::{Result, bail};
 use piper_client::Observer;
-use piper_client::observer::CollisionProtectionSnapshot;
+use piper_client::observer::{CollisionProtectionSnapshot, ControlReadPolicy};
 use piper_client::state::{Active, DisableConfig, Piper, PositionMode, Standby};
 use piper_client::types::RobotError;
 use piper_client::types::{JointArray, Rad};
@@ -93,7 +93,7 @@ where
     blocking_motion_loop_with_cancel(
         target,
         wait,
-        || Ok(observer_positions(robot.observer())),
+        || observer_positions(robot.observer()).map_err(Into::into),
         || robot.send_position_command(&target_positions).map_err(Into::into),
         should_cancel,
     )
@@ -161,9 +161,9 @@ pub fn set_collision_protection_verified(
     )
 }
 
-fn observer_positions(observer: &Observer) -> [f64; 6] {
-    let snapshot = observer.snapshot();
-    std::array::from_fn(|index| snapshot.position[index].0)
+fn observer_positions(observer: &Observer) -> std::result::Result<[f64; 6], RobotError> {
+    let snapshot = observer.control_snapshot(ControlReadPolicy::default())?;
+    Ok(std::array::from_fn(|index| snapshot.position[index].0))
 }
 
 fn joint_array_from_f64(values: [f64; 6]) -> JointArray<Rad> {

@@ -8,27 +8,28 @@
 //! - **零延迟**: 直接从 `driver::Piper` 读取，无缓存层
 //! - **零拷贝**: 使用 ArcSwap 的 wait-free 读取
 //! - **类型安全**: 返回强类型单位（Rad, RadPerSecond, NewtonMeter）
-//! - **逻辑一致性**: 提供 `snapshot()` 方法保证时间一致性
+//! - **控制安全**: 提供 `control_snapshot()`，只返回对齐且新鲜的控制状态
 //!
 //! # 使用示例
 //!
 //! ```rust,no_run
 //! # use piper_client::observer::Observer;
+//! # use piper_client::observer::ControlReadPolicy;
 //! # use piper_client::types::*;
 //! # fn example(observer: Observer) -> Result<()> {
 //! // 读取关节位置
 //! let positions = observer.joint_positions();
 //! println!("J1 position: {}", positions[Joint::J1].to_deg());
 //!
-//! // 使用 snapshot 获取时间一致的数据（推荐用于控制算法）
-//! let snapshot = observer.snapshot();
+//! // 使用 control_snapshot 获取可直接用于闭环控制的数据
+//! let snapshot = observer.control_snapshot(ControlReadPolicy::default())?;
 //! println!("Position: {:?}, Velocity: {:?}", snapshot.position, snapshot.velocity);
 //!
 //! // 克隆 Observer 用于另一个线程
 //! let observer2 = observer.clone();
 //! std::thread::spawn(move || {
 //!     loop {
-//!         let snapshot = observer2.snapshot();
+//!         let snapshot = observer2.control_snapshot(ControlReadPolicy::default());
 //!         // ... 监控状态 ...
 //!     }
 //! });
@@ -37,10 +38,10 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::types::*;
-use piper_driver::{DriverError, Piper as RobotPiper};
+use piper_driver::{AlignmentResult, DriverError, Piper as RobotPiper};
 use piper_protocol::constants::*;
 
 /// 状态观察器（只读接口，View 模式）
@@ -82,6 +83,41 @@ impl From<piper_driver::CollisionProtectionState> for CollisionProtectionSnapsho
     }
 }
 
+/// 高频控制读取策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlReadPolicy {
+    /// 允许的位置/动态状态最大时间偏差（微秒）
+    pub max_state_skew_us: u64,
+    /// 允许的最大反馈年龄
+    pub max_feedback_age: Duration,
+}
+
+impl Default for ControlReadPolicy {
+    fn default() -> Self {
+        Self {
+            max_state_skew_us: 5_000,
+            max_feedback_age: Duration::from_millis(50),
+        }
+    }
+}
+
+/// 可直接用于控制闭环的对齐快照
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ControlSnapshot {
+    /// 关节位置
+    pub position: JointArray<Rad>,
+    /// 关节速度
+    pub velocity: JointArray<RadPerSecond>,
+    /// 关节力矩
+    pub torque: JointArray<NewtonMeter>,
+    /// 位置反馈硬件时间戳
+    pub position_timestamp_us: u64,
+    /// 动态反馈硬件时间戳
+    pub dynamic_timestamp_us: u64,
+    /// 有符号时间偏差（dynamic - position）
+    pub skew_us: i64,
+}
+
 impl Observer {
     /// 创建新的 Observer
     ///
@@ -93,54 +129,70 @@ impl Observer {
         Observer { driver }
     }
 
-    /// 获取运动快照（推荐用于控制算法）
+    /// 获取可直接用于控制闭环的对齐状态
     ///
-    /// 此方法尽可能快地连续读取多个相关状态，减少时间偏斜。
-    /// 即使底层是分帧更新的，此方法也能提供逻辑上最一致的数据。
+    /// 与监控/诊断接口不同，此方法会严格检查：
+    /// - 最近反馈是否仍然新鲜
+    /// - 位置状态和动态状态是否在允许的时间偏差内
     ///
-    /// # 性能
-    ///
-    /// - 延迟：~20ns（连续调用 3 次 ArcSwap::load）
-    /// - 无锁竞争（ArcSwap 是 Wait-Free 的）
-    ///
-    /// # 推荐使用场景
-    ///
-    /// - 高频控制算法（>100Hz）
-    /// - 阻抗控制、力矩控制等需要时间一致性的算法
-    pub fn snapshot(&self) -> MotionSnapshot {
-        // 在读取之前记录时间戳，更准确地反映"读取动作发生"的时刻
-        let timestamp = Instant::now();
+    /// 任一条件不满足都会返回错误，不会返回“半可用”数据。
+    pub fn control_snapshot(&self, policy: ControlReadPolicy) -> Result<ControlSnapshot> {
+        match self.driver.get_aligned_motion(policy.max_state_skew_us) {
+            AlignmentResult::Ok(state) => {
+                let age = control_feedback_age(
+                    state.position_system_timestamp_us,
+                    state.dynamic_system_timestamp_us,
+                );
+                if age > policy.max_feedback_age {
+                    return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
+                }
 
-        // 连续读取，减少中间被抢占的概率
-        let pos = self.driver.get_joint_position();
-        let dyn_state = self.driver.get_joint_dynamic();
+                Ok(ControlSnapshot {
+                    position: JointArray::new(state.joint_pos.map(Rad)),
+                    velocity: JointArray::new(state.joint_vel.map(RadPerSecond)),
+                    torque: JointArray::new(std::array::from_fn(|index| {
+                        NewtonMeter(piper_driver::JointDynamicState::calculate_torque(
+                            index,
+                            state.joint_current[index],
+                        ))
+                    })),
+                    position_timestamp_us: state.position_timestamp_us,
+                    dynamic_timestamp_us: state.dynamic_timestamp_us,
+                    skew_us: state.skew_us,
+                })
+            },
+            AlignmentResult::Misaligned { state, .. } => {
+                let age = control_feedback_age(
+                    state.position_system_timestamp_us,
+                    state.dynamic_system_timestamp_us,
+                );
+                if age > policy.max_feedback_age {
+                    return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
+                }
 
-        MotionSnapshot {
-            position: JointArray::new(pos.joint_pos.map(Rad)),
-            // ✅ 使用类型安全的单位
-            velocity: JointArray::new(dyn_state.joint_vel.map(RadPerSecond)),
-            torque: JointArray::new(dyn_state.get_all_torques().map(NewtonMeter)),
-            timestamp, // 使用读取前的时间戳
+                Err(RobotError::state_misaligned(
+                    state.skew_us,
+                    policy.max_state_skew_us,
+                ))
+            },
         }
     }
 
-    /// 获取关节位置（独立读取，可能与其他状态有时间偏斜）
+    /// 获取关节位置（监控/诊断接口）
     ///
     /// # 注意
     ///
-    /// 如果需要与其他状态（如速度、力矩）保持时间一致性，
-    /// 请使用 `snapshot()` 方法。
+    /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
     pub fn joint_positions(&self) -> JointArray<Rad> {
         let raw_pos = self.driver.get_joint_position();
         JointArray::new(raw_pos.joint_pos.map(Rad))
     }
 
-    /// 获取关节速度（独立读取，可能与其他状态有时间偏斜）
+    /// 获取关节速度（监控/诊断接口）
     ///
     /// # 注意
     ///
-    /// 如果需要与其他状态（如位置、力矩）保持时间一致性，
-    /// 请使用 `snapshot()` 方法。
+    /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
     ///
     /// # 返回值
     ///
@@ -151,12 +203,11 @@ impl Observer {
         JointArray::new(dyn_state.joint_vel.map(RadPerSecond))
     }
 
-    /// 获取关节力矩（独立读取，可能与其他状态有时间偏斜）
+    /// 获取关节力矩（监控/诊断接口）
     ///
     /// # 注意
     ///
-    /// 如果需要与其他状态（如位置、速度）保持时间一致性，
-    /// 请使用 `snapshot()` 方法。
+    /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
     pub fn joint_torques(&self) -> JointArray<NewtonMeter> {
         let dyn_state = self.driver.get_joint_dynamic();
         JointArray::new(dyn_state.get_all_torques().map(NewtonMeter))
@@ -249,7 +300,7 @@ impl Observer {
     ///
     /// 返回 (position, velocity, torque) 元组。
     /// **注意**：此方法独立读取，可能与其他状态有时间偏斜。
-    /// 如需时间一致性，请使用 `snapshot()` 方法。
+    /// 如需控制闭环使用，请改用 `control_snapshot()`。
     pub fn joint_state(&self, joint: Joint) -> (Rad, RadPerSecond, NewtonMeter) {
         let pos = self.driver.get_joint_position();
         let dyn_state = self.driver.get_joint_dynamic();
@@ -334,6 +385,32 @@ impl Observer {
     }
 }
 
+fn control_feedback_age(
+    position_system_timestamp_us: u64,
+    dynamic_system_timestamp_us: u64,
+) -> Duration {
+    let position_age = system_timestamp_age(position_system_timestamp_us);
+    let dynamic_age = system_timestamp_age(dynamic_system_timestamp_us);
+    position_age.max(dynamic_age)
+}
+
+fn system_timestamp_age(timestamp_us: u64) -> Duration {
+    if timestamp_us == 0 {
+        return Duration::MAX;
+    }
+
+    let now_us = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros() as u64,
+        Err(_) => return Duration::MAX,
+    };
+
+    if now_us < timestamp_us {
+        return Duration::MAX;
+    }
+
+    Duration::from_micros(now_us - timestamp_us)
+}
+
 /// 夹爪状态
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GripperState {
@@ -355,24 +432,6 @@ impl Default for GripperState {
     }
 }
 
-/// 运动快照（逻辑原子性）
-///
-/// **设计说明：**
-/// - 使用 `#[non_exhaustive]` 允许未来非破坏性地添加字段
-/// - 例如：加速度、数据有效性标志等衍生数据
-#[derive(Debug, Clone)]
-#[non_exhaustive] // ✅ 允许未来非破坏性地添加字段
-pub struct MotionSnapshot {
-    /// 关节位置
-    pub position: JointArray<Rad>,
-    /// 关节速度（✅ 使用类型安全的单位）
-    pub velocity: JointArray<RadPerSecond>,
-    /// 关节力矩
-    pub torque: JointArray<NewtonMeter>,
-    /// 读取时间戳（用于调试）
-    pub timestamp: Instant,
-}
-
 // 确保 Send + Sync
 unsafe impl Send for Observer {}
 unsafe impl Sync for Observer {}
@@ -381,8 +440,12 @@ unsafe impl Sync for Observer {}
 mod tests {
     use super::*;
     use piper_can::{CanError, PiperFrame, RxAdapter, TxAdapter};
-    use piper_protocol::ids::ID_GRIPPER_FEEDBACK;
+    use piper_protocol::ids::{
+        ID_GRIPPER_FEEDBACK, ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12,
+        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
+    };
     use std::collections::VecDeque;
+    use std::thread;
     use std::time::Duration;
 
     struct ScriptedRxAdapter {
@@ -403,6 +466,37 @@ mod tests {
         }
     }
 
+    struct TimedFrame {
+        delay: Duration,
+        frame: PiperFrame,
+    }
+
+    struct PacedRxAdapter {
+        frames: VecDeque<TimedFrame>,
+    }
+
+    impl PacedRxAdapter {
+        fn new(frames: Vec<TimedFrame>) -> Self {
+            Self {
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl RxAdapter for PacedRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            match self.frames.pop_front() {
+                Some(timed) => {
+                    if !timed.delay.is_zero() {
+                        thread::sleep(timed.delay);
+                    }
+                    Ok(timed.frame)
+                },
+                None => Err(CanError::Timeout),
+            }
+        }
+    }
+
     struct IdleTxAdapter;
 
     impl TxAdapter for IdleTxAdapter {
@@ -418,19 +512,82 @@ mod tests {
     // 这里只测试类型系统和基本逻辑
 
     #[test]
-    fn test_motion_snapshot_structure() {
-        // 测试 MotionSnapshot 结构
-        let snapshot = MotionSnapshot {
+    fn test_control_snapshot_structure() {
+        let snapshot = ControlSnapshot {
             position: JointArray::splat(Rad(0.0)),
             velocity: JointArray::splat(RadPerSecond(0.0)),
             torque: JointArray::splat(NewtonMeter(0.0)),
-            timestamp: Instant::now(),
+            position_timestamp_us: 100,
+            dynamic_timestamp_us: 100,
+            skew_us: 0,
         };
 
-        // ✅ 验证速度单位类型正确
         let _: RadPerSecond = snapshot.velocity[Joint::J1];
         let _: JointArray<Rad> = snapshot.position;
         let _: JointArray<NewtonMeter> = snapshot.torque;
+    }
+
+    fn joint_feedback_frame(
+        can_id: u16,
+        first_deg_milli: i32,
+        second_deg_milli: i32,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
+        data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(can_id, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn joint_dynamic_frame(
+        joint_index: u8,
+        speed_millirad_per_sec: i16,
+        current_milliamp: i16,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&speed_millirad_per_sec.to_be_bytes());
+        data[2..4].copy_from_slice(&current_milliamp.to_be_bytes());
+        data[4..8].copy_from_slice(&0i32.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(
+            (ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1)) as u16,
+            &data,
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn gripper_feedback_frame(timestamp_us: u64) -> PiperFrame {
+        let travel_raw = 50_000i32.to_be_bytes();
+        let torque_raw = 1_000i16.to_be_bytes();
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&travel_raw);
+        data[4..6].copy_from_slice(&torque_raw);
+        data[6] = 0b0100_0000;
+
+        let mut frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn start_observer_with_frames(frames: Vec<PiperFrame>) -> (Arc<RobotPiper>, Observer) {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(ScriptedRxAdapter::new(frames), IdleTxAdapter, None)
+                .expect("driver should start"),
+        );
+        let observer = Observer::new(driver.clone());
+        (driver, observer)
+    }
+
+    fn start_observer_with_timed_frames(frames: Vec<TimedFrame>) -> (Arc<RobotPiper>, Observer) {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(PacedRxAdapter::new(frames), IdleTxAdapter, None)
+                .expect("driver should start"),
+        );
+        let observer = Observer::new(driver.clone());
+        (driver, observer)
     }
 
     #[test]
@@ -477,10 +634,177 @@ mod tests {
     }
 
     #[test]
+    fn test_control_snapshot_returns_aligned_state() {
+        let position_timestamp_us = 1_000;
+        let dynamic_timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, position_timestamp_us),
+            joint_dynamic_frame(1, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(2, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(3, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(4, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(5, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(6, 1000, 1000, dynamic_timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let snapshot = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 500,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .expect("aligned snapshot should succeed");
+
+        assert_eq!(snapshot.position_timestamp_us, position_timestamp_us);
+        assert_eq!(snapshot.dynamic_timestamp_us, dynamic_timestamp_us);
+        assert_eq!(snapshot.skew_us, 0);
+        assert_eq!(snapshot.velocity[Joint::J1], RadPerSecond(1.0));
+    }
+
+    #[test]
+    fn test_control_snapshot_rejects_stale_feedback() {
+        let (driver, observer) = start_observer_with_frames(Vec::new());
+        let _keep_driver_alive = driver;
+
+        let error = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 500,
+                max_feedback_age: Duration::from_millis(10),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, RobotError::FeedbackStale { .. }));
+    }
+
+    #[test]
+    fn test_control_snapshot_rejects_stale_motion_even_if_other_feedback_is_fresh() {
+        let position_timestamp_us = 1_000;
+        let dynamic_timestamp_us = 1_000;
+        let frames = vec![
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(
+                    ID_JOINT_FEEDBACK_12 as u16,
+                    0,
+                    0,
+                    position_timestamp_us,
+                ),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(
+                    ID_JOINT_FEEDBACK_34 as u16,
+                    0,
+                    0,
+                    position_timestamp_us,
+                ),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(
+                    ID_JOINT_FEEDBACK_56 as u16,
+                    0,
+                    0,
+                    position_timestamp_us,
+                ),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(1, 1000, 1000, dynamic_timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(2, 1000, 1000, dynamic_timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(3, 1000, 1000, dynamic_timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(4, 1000, 1000, dynamic_timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(5, 1000, 1000, dynamic_timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(6, 1000, 1000, dynamic_timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::from_millis(40),
+                frame: gripper_feedback_frame(2_000),
+            },
+        ];
+        let (driver, observer) = start_observer_with_timed_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(60));
+
+        let error = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 500,
+                max_feedback_age: Duration::from_millis(30),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, RobotError::FeedbackStale { .. }));
+    }
+
+    #[test]
+    fn test_control_snapshot_rejects_misaligned_state() {
+        let position_timestamp_us = 1_000;
+        let dynamic_timestamp_us = 9_500;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, position_timestamp_us),
+            joint_dynamic_frame(1, 0, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(2, 0, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(3, 0, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(4, 0, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(5, 0, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(6, 0, 1000, dynamic_timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let error = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 1_000,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RobotError::StateMisaligned {
+                skew_us: 8_500,
+                max_skew_us: 1_000,
+            }
+        ));
+    }
+
+    #[test]
     fn test_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Observer>();
         assert_send_sync::<GripperState>();
-        assert_send_sync::<MotionSnapshot>();
+        assert_send_sync::<ControlReadPolicy>();
+        assert_send_sync::<ControlSnapshot>();
     }
 }
