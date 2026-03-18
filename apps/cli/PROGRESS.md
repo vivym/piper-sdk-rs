@@ -1,3 +1,5 @@
+> Historical note: 这是阶段性进度文档，不代表当前 CLI 的真实实现。请优先参考 `apps/cli/README.md` 和 `apps/cli/REPL_IMPLEMENTATION.md`。
+
 # Piper CLI - 开发进度
 
 **最后更新**: 2026-01-27

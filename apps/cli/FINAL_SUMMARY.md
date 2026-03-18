@@ -1,3 +1,5 @@
+> Historical note: 这是阶段性总结文档，不代表当前 CLI 的真实实现。请优先参考 `apps/cli/README.md` 和 `apps/cli/REPL_IMPLEMENTATION.md`。
+
 # Piper CLI - 项目完成总结
 
 **项目**: Piper CLI - 机器人臂命令行工具

@@ -1,3 +1,5 @@
+> Historical note: 这是阶段性进度文档，不代表当前 CLI 的真实实现。请优先参考 `apps/cli/README.md` 和 `apps/cli/REPL_IMPLEMENTATION.md`。
+
 # Piper CLI - Phase 2 实际功能实现
 
 **日期**: 2026-01-26

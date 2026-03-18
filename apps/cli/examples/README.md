@@ -25,8 +25,8 @@ piper-cli run --script examples/move_sequence.json
 # 失败时继续执行
 piper-cli run --script examples/move_sequence.json --continue-on-error
 
-# 指定接口
-piper-cli run --script examples/move_sequence.json --interface can0
+# 指定连接目标
+piper-cli run --script examples/move_sequence.json --target socketcan:can0
 ```
 
 ### 2. 创建自定义脚本
@@ -151,7 +151,7 @@ piper-cli replay --input my_recording.bin --speed 1.0
 检查 JSON 格式是否正确，可以使用在线 JSON 验证工具。
 
 ### 连接失败
-确保 CAN 接口配置正确：
+确保 target 配置正确：
 ```bash
 piper-cli config check
 ```
