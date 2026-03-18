@@ -77,6 +77,9 @@ REPL 现在使用“前台输入 + 后台命令 worker”模型：
 - 运行期间主线程仍能处理 `stop` 和 `Ctrl+C`
 - 当前运动会被取消，然后统一执行 `disable_all()`
 - 连接会保留在 `Standby`
+- shell 中不做交互式确认；需要确认的 `move` / `set-zero` 必须显式加 `--force`
+- 若需要交互确认，请使用 one-shot CLI
+- `Ctrl+D` 会直接退出 shell；若当前命令仍在运行，会先请求急停并在命令收尾后退出
 
 ## 配置文件
 
@@ -116,6 +119,7 @@ timeout_ms = 5000
 - 未指定的关节保持当前位姿
 - 大幅移动确认基于“当前位姿 -> 有效目标”的实际位移，而不是目标绝对值
 - one-shot / REPL / script 共享同一套 workflow
+- REPL 中若触发大幅移动保护，必须显式加 `--force`
 
 ### `home`
 
@@ -132,6 +136,7 @@ timeout_ms = 5000
 
 - 只允许在 `Standby` 状态执行
 - 作用是“把当前位置写成零点”，不会先移动
+- REPL 中必须显式加 `--force`；若需要交互确认，请使用 one-shot CLI
 
 ### `collision-protection get`
 

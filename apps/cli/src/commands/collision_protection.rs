@@ -41,9 +41,9 @@ impl CollisionProtectionCommand {
                 let profile = config.control_profile(target.target.as_ref());
                 let builder = client_builder(&profile.target);
                 let standby = builder.build()?;
-                let levels = query_collision_protection_blocking(&standby, &profile.wait)?;
-                println!("collision protection levels: {:?}", levels);
-                Ok(())
+                print_collision_protection_levels(|| {
+                    query_collision_protection_blocking(&standby, &profile.wait)
+                })
             },
             CollisionProtectionAction::Set {
                 level,
@@ -62,9 +62,19 @@ impl CollisionProtectionCommand {
     }
 }
 
+fn print_collision_protection_levels<Query>(query: Query) -> Result<()>
+where
+    Query: FnOnce() -> Result<[u8; 6]>,
+{
+    let levels = query()?;
+    println!("collision protection levels: {:?}", levels);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_client::RobotError;
 
     #[test]
     fn parse_levels_accepts_single_level() {
@@ -83,5 +93,18 @@ mod tests {
     fn parse_levels_rejects_invalid_mixes() {
         assert!(parse_collision_levels(Some(3), Some("1,2,3,4,5,6")).is_err());
         assert!(parse_collision_levels(None, None).is_err());
+    }
+
+    #[test]
+    fn get_propagates_query_timeout_instead_of_faking_defaults() {
+        let error = print_collision_protection_levels(|| {
+            Err::<[u8; 6], _>(RobotError::Timeout { timeout_ms: 25 }.into())
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<RobotError>(),
+            Some(RobotError::Timeout { timeout_ms: 25 })
+        ));
     }
 }

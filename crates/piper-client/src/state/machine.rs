@@ -363,6 +363,47 @@ pub struct Piper<State = Disconnected> {
     pub(crate) _state: State, // 改为直接存储状态（不再使用 PhantomData）
 }
 
+fn wait_for_fresh_collision_protection_update<SendQuery, ReadCached>(
+    timeout: Duration,
+    poll_interval: Duration,
+    baseline: Option<CollisionProtectionSnapshot>,
+    mut send_query: SendQuery,
+    mut read_cached: ReadCached,
+) -> Result<CollisionProtectionSnapshot>
+where
+    SendQuery: FnMut() -> Result<()>,
+    ReadCached: FnMut() -> Result<CollisionProtectionSnapshot>,
+{
+    let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
+    let baseline_sys = baseline.as_ref().map_or(0, |state| state.system_timestamp_us);
+
+    send_query()?;
+
+    let start = Instant::now();
+    loop {
+        let state = read_cached()?;
+        if state.is_newer_than(baseline_hw, baseline_sys) {
+            return Ok(state);
+        }
+
+        if start.elapsed() > timeout {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let sleep_duration = poll_interval.min(remaining);
+        if sleep_duration.is_zero() {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        std::thread::sleep(sleep_duration);
+    }
+}
+
 // ==================== Disconnected 状态 ====================
 
 impl Piper<Disconnected> {
@@ -1110,36 +1151,14 @@ impl<State> Piper<State> {
         poll_interval: Duration,
     ) -> Result<CollisionProtectionSnapshot> {
         let baseline = self.collision_protection_cached_inner().ok();
-        let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
-        let baseline_sys = baseline.as_ref().map_or(0, |state| state.system_timestamp_us);
-
         let raw = RawCommander::new(&self.driver);
-        raw.query_collision_protection()?;
-
-        let start = Instant::now();
-        loop {
-            let state = self.collision_protection_cached_inner()?;
-            let updated = state.is_newer_than(baseline_hw, baseline_sys);
-            if updated {
-                return Ok(state);
-            }
-
-            if start.elapsed() > timeout {
-                return Err(RobotError::Timeout {
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-
-            let remaining = timeout.saturating_sub(start.elapsed());
-            let sleep_duration = poll_interval.min(remaining);
-            if sleep_duration.is_zero() {
-                return Err(RobotError::Timeout {
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-
-            std::thread::sleep(sleep_duration);
-        }
+        wait_for_fresh_collision_protection_update(
+            timeout,
+            poll_interval,
+            baseline,
+            || raw.query_collision_protection(),
+            || self.collision_protection_cached_inner(),
+        )
     }
 
     fn collision_protection_cached_inner(&self) -> Result<CollisionProtectionSnapshot> {
@@ -2616,6 +2635,8 @@ impl<State> Drop for Piper<State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observer::CollisionProtectionSnapshot;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_state_type_sizes() {
@@ -2666,6 +2687,93 @@ mod tests {
     #[test]
     fn test_motion_type_default() {
         assert_eq!(MotionType::default(), MotionType::Joint);
+    }
+
+    #[test]
+    fn fresh_collision_query_rejects_stale_cached_snapshot() {
+        let baseline = CollisionProtectionSnapshot {
+            hardware_timestamp_us: 10,
+            system_timestamp_us: 10,
+            levels: [4; 6],
+        };
+        let reads = AtomicUsize::new(0);
+
+        let error = wait_for_fresh_collision_protection_update(
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            Some(baseline),
+            || Ok(()),
+            || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(baseline)
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
+        assert!(reads.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn fresh_collision_query_accepts_newer_snapshot_after_query() {
+        let baseline = CollisionProtectionSnapshot {
+            hardware_timestamp_us: 10,
+            system_timestamp_us: 10,
+            levels: [1; 6],
+        };
+        let reads = AtomicUsize::new(0);
+        let sent = AtomicUsize::new(0);
+
+        let snapshot = wait_for_fresh_collision_protection_update(
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            Some(baseline),
+            || {
+                sent.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            || {
+                let read = reads.fetch_add(1, Ordering::SeqCst);
+                if read == 0 {
+                    Ok(baseline)
+                } else {
+                    Ok(CollisionProtectionSnapshot {
+                        hardware_timestamp_us: 11,
+                        system_timestamp_us: 11,
+                        levels: [5; 6],
+                    })
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshot.levels, [5; 6]);
+        assert!(snapshot.is_newer_than(10, 10));
+    }
+
+    #[test]
+    fn fresh_collision_query_times_out_without_new_feedback() {
+        let error = wait_for_fresh_collision_protection_update(
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            Some(CollisionProtectionSnapshot {
+                hardware_timestamp_us: 7,
+                system_timestamp_us: 7,
+                levels: [2; 6],
+            }),
+            || Ok(()),
+            || {
+                Ok(CollisionProtectionSnapshot {
+                    hardware_timestamp_us: 7,
+                    system_timestamp_us: 7,
+                    levels: [9; 6],
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
     }
 
     // 注意：集成测试位于 tests/ 目录

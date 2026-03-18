@@ -4,7 +4,7 @@
 
 REPL 采用“前台输入 + 后台命令 worker”模型：
 
-- 输入线程只负责 readline、历史记录和把命令转发到主循环
+- 输入线程只负责 readline、历史记录和把命令通过长期存在的 Tokio channel 转发到主循环
 - 主循环只负责：
   - 读取输入
   - 提交命令到后台 worker
@@ -39,6 +39,14 @@ REPL 的急停语义固定为：
 - 保持连接
 - 最终状态为 `Standby`
 
+## Confirmation Policy
+
+REPL 不支持后台交互式确认。
+
+- `move` 若触发大幅移动保护，必须显式加 `--force`
+- `set-zero` 必须显式加 `--force`
+- 若需要交互确认，使用 one-shot CLI
+
 ## Busy Policy
 
 命令执行期间：
@@ -47,6 +55,11 @@ REPL 的急停语义固定为：
 - 拒绝：其他普通命令
 
 这样可以避免在一个未完成的 type-state 迁移过程中再叠加第二个命令。
+
+输入线程关闭（例如 `Ctrl+D` / EOF）时：
+
+- 空闲状态：shell 立即退出
+- 忙碌状态：先请求急停或排队 stop，待当前命令收尾后退出
 
 ## Motion Workflow
 

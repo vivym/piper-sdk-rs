@@ -3,15 +3,13 @@
 use crate::commands::config::CliConfig;
 use crate::connection::client_builder;
 use crate::parsing::{parse_collision_levels, parse_joint_indices_arg};
-use crate::safety::{confirm_prepared_move, confirm_zero_setting};
 use anyhow::{Result, bail};
-use crossbeam_channel::{Receiver, bounded};
 use piper_client::Piper;
 use piper_client::state::{Active, DisableConfig, Piper as StatePiper, PositionMode, Standby};
 use piper_control::{
-    ControlProfile, MotionExecutionOutcome, TargetSpec, active_move_to_joint_target_with_cancel,
-    prepare_move, query_collision_protection_blocking, set_collision_protection_verified,
-    set_joint_zero_blocking,
+    ControlProfile, MotionExecutionOutcome, PreparedMove, TargetSpec,
+    active_move_to_joint_target_with_cancel, prepare_move, query_collision_protection_blocking,
+    set_collision_protection_verified, set_joint_zero_blocking,
 };
 use rustyline::Editor;
 use std::panic;
@@ -19,7 +17,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -48,6 +46,8 @@ pub struct ReplSession {
     state: ReplState,
     config: CliConfig,
     profile: ControlProfile,
+    #[cfg(test)]
+    test_observer_positions: Option<[f64; 6]>,
 }
 
 impl ReplSession {
@@ -57,7 +57,14 @@ impl ReplSession {
             state: ReplState::Disconnected,
             config,
             profile,
+            #[cfg(test)]
+            test_observer_positions: None,
         }
+    }
+
+    #[cfg(test)]
+    fn set_test_observer_positions(&mut self, positions: [f64; 6]) {
+        self.test_observer_positions = Some(positions);
     }
 
     pub fn connect(&mut self, target: Option<TargetSpec>) -> Result<()> {
@@ -180,19 +187,25 @@ impl ReplSession {
             ReplState::ActivePosition(robot) => Ok(std::array::from_fn(|index| {
                 robot.observer().snapshot().position[index].0
             })),
-            ReplState::Disconnected => bail!("未连接"),
+            ReplState::Disconnected => {
+                #[cfg(test)]
+                if let Some(positions) = self.test_observer_positions {
+                    return Ok(positions);
+                }
+                bail!("未连接")
+            },
         }
     }
 }
 
 pub struct ReplInput {
-    command_rx: Receiver<String>,
+    command_rx: mpsc::Receiver<String>,
     _input_thread: thread::JoinHandle<Result<()>>,
 }
 
 impl ReplInput {
     pub fn new() -> Self {
-        let (command_tx, command_rx) = bounded::<String>(10);
+        let (command_tx, command_rx) = mpsc::channel::<String>(10);
 
         let input_thread = thread::spawn(move || {
             use rustyline::history::DefaultHistory;
@@ -216,17 +229,17 @@ impl ReplInput {
                         }
                         if line == "exit" || line == "quit" {
                             rl.save_history(history_path).ok();
-                            let _ = command_tx.send(line);
+                            let _ = command_tx.blocking_send(line);
                             break;
                         }
                         let _ = rl.add_history_entry(line.clone());
-                        if command_tx.send(line).is_err() {
+                        if command_tx.blocking_send(line).is_err() {
                             break;
                         }
                     },
                     Err(rustyline::error::ReadlineError::Interrupted) => {
                         println!("^C");
-                        let _ = command_tx.send("SIGINT".to_string());
+                        let _ = command_tx.blocking_send("SIGINT".to_string());
                     },
                     Err(rustyline::error::ReadlineError::Eof) => {
                         rl.save_history(history_path).ok();
@@ -248,12 +261,8 @@ impl ReplInput {
         }
     }
 
-    pub async fn recv_command(&self) -> Option<String> {
-        let rx = self.command_rx.clone();
-        tokio::task::spawn_blocking(move || rx.recv())
-            .await
-            .ok()
-            .and_then(|result| result.ok())
+    pub async fn recv_command(&mut self) -> Option<String> {
+        self.command_rx.recv().await
     }
 }
 
@@ -502,7 +511,7 @@ fn run_command_worker(
 pub async fn run_repl() -> Result<()> {
     let config = CliConfig::load()?;
     let mut executor = ReplExecutor::new(config);
-    let input = ReplInput::new();
+    let mut input = ReplInput::new();
     let mut exit_after_completion = false;
 
     println!();
@@ -510,15 +519,26 @@ pub async fn run_repl() -> Result<()> {
     println!("💡 提示: 连接目标使用和 CLI 一样的 target spec，例如 socketcan:can0");
     println!("💡 提示: `stop` 或 Ctrl+C 会发送 disable_all()，但保持连接在 Standby");
     println!("💡 提示: 命令执行期间只接受 `stop` / Ctrl+C / exit");
+    println!("💡 提示: shell 不做交互式确认；高风险 move / set-zero 请显式加 --force");
     println!();
 
     loop {
         if executor.is_busy() {
             tokio::select! {
-                Some(line) = input.recv_command() => {
-                    if handle_line_while_busy(&mut executor, &line, &mut exit_after_completion)? {
-                        println!("👋 再见！");
-                        break;
+                line = input.recv_command() => {
+                    match line {
+                        Some(line) => {
+                            if handle_line_while_busy(&mut executor, &line, &mut exit_after_completion)? {
+                                println!("👋 再见！");
+                                break;
+                            }
+                        },
+                        None => {
+                            if handle_input_closed_while_busy(&mut executor, &mut exit_after_completion)? {
+                                println!("👋 再见！");
+                                break;
+                            }
+                        },
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -536,10 +556,20 @@ pub async fn run_repl() -> Result<()> {
         }
 
         tokio::select! {
-            Some(line) = input.recv_command() => {
-                if handle_line_when_idle(&mut executor, &line)? {
-                    println!("👋 再见！");
-                    break;
+            line = input.recv_command() => {
+                match line {
+                    Some(line) => {
+                        if handle_line_when_idle(&mut executor, &line)? {
+                            println!("👋 再见！");
+                            break;
+                        }
+                    },
+                    None => {
+                        if handle_input_closed_when_idle() {
+                            println!("👋 再见！");
+                            break;
+                        }
+                    },
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -594,6 +624,19 @@ fn handle_line_while_busy(
     }
 
     println!("⚠️  当前命令仍在执行；请等待完成或先使用 `stop` / Ctrl+C");
+    Ok(false)
+}
+
+fn handle_input_closed_when_idle() -> bool {
+    true
+}
+
+fn handle_input_closed_while_busy(
+    executor: &mut ReplExecutor,
+    exit_after_completion: &mut bool,
+) -> Result<bool> {
+    *exit_after_completion = true;
+    announce_stop_request(executor.request_emergency_stop()?);
     Ok(false)
 }
 
@@ -678,10 +721,7 @@ fn handle_move(
         &session.profile.safety,
         force,
     )?;
-    if prepared.requires_confirmation && !confirm_prepared_move(&prepared)? {
-        println!("❌ 操作已取消");
-        return Ok(CommandExecutionOutcome::Completed);
-    }
+    require_repl_move_force(&prepared, force)?;
 
     let _motion_guard = control.motion_scope();
     let robot = session.active_robot()?;
@@ -753,14 +793,28 @@ fn handle_park(
 fn handle_set_zero(session: &ReplSession, parts: &[&str]) -> Result<()> {
     let joints = parse_joint_indices_arg(option_value(parts, "--joints"))?;
     let force = parts.contains(&"--force");
-    if !force && !confirm_zero_setting(&joints)? {
-        println!("❌ 操作已取消");
-        return Ok(());
-    }
+    require_repl_set_zero_force(force)?;
 
     let robot = session.standby_robot()?;
     set_joint_zero_blocking(robot, &joints)?;
     println!("✅ 零点标定命令已发送");
+    Ok(())
+}
+
+fn require_repl_move_force(prepared: &PreparedMove, force: bool) -> Result<()> {
+    if prepared.requires_confirmation && !force {
+        bail!(
+            "REPL 中大幅移动必须显式加 --force（最大位移 {:.1}°）；若需要交互确认，请使用 one-shot CLI",
+            prepared.max_delta_deg
+        );
+    }
+    Ok(())
+}
+
+fn require_repl_set_zero_force(force: bool) -> Result<()> {
+    if !force {
+        bail!("REPL 中 set-zero 必须显式加 --force；若需要交互确认，请使用 one-shot CLI");
+    }
     Ok(())
 }
 
@@ -821,15 +875,19 @@ fn print_help() {
     println!("  help                                  显示帮助");
     println!("  exit / quit                           退出");
     println!("  Ctrl+C                                急停（disable_all，保持连接）");
+    println!("  Ctrl+D                                退出 shell");
     println!("  忙碌时                                仅接受 stop / Ctrl+C / exit");
+    println!("  需要确认的操作                        shell 中必须显式加 --force");
     println!();
 }
 
 fn print_help_hint(command: &str) {
     if command.starts_with("move") {
-        eprintln!("💡 提示: 使用 'move --joints 0.1,0.2,0.3'，未指定的关节保持当前位姿");
+        eprintln!("💡 提示: 使用 'move --joints 0.1,0.2,0.3 --force'；未指定的关节保持当前位姿");
     } else if command.starts_with("connect") {
         eprintln!("💡 提示: 使用 'connect' 或 'connect socketcan:can0'");
+    } else if command.starts_with("set-zero") {
+        eprintln!("💡 提示: 使用 'set-zero --force' 或 'set-zero --joints 1,2,3 --force'");
     } else {
         eprintln!("💡 提示: 输入 'help' 查看所有命令");
     }
@@ -894,6 +952,75 @@ mod tests {
     }
 
     #[test]
+    fn handle_input_closed_when_idle_exits_shell() {
+        assert!(handle_input_closed_when_idle());
+    }
+
+    #[tokio::test]
+    async fn handle_input_closed_while_busy_requests_stop_and_defers_exit() {
+        let mut executor = ReplExecutor::new(CliConfig::default());
+        let mut exit_after_completion = false;
+
+        executor.start_command("__test-motion".to_string()).unwrap();
+        for _ in 0..20 {
+            if executor.handle.motion_in_progress.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        assert!(
+            !handle_input_closed_while_busy(&mut executor, &mut exit_after_completion).unwrap()
+        );
+        assert!(exit_after_completion);
+        assert!(executor.handle.cancel_requested.load(Ordering::SeqCst));
+
+        let completion = executor.wait_for_completion().await.unwrap();
+        executor.finish_completion(completion);
+    }
+
+    #[test]
+    fn repl_move_requires_force_for_large_motion() {
+        let prepared = PreparedMove {
+            current: [2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            effective_target: [0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+            max_delta_rad: 2.4,
+            max_delta_deg: 2.4_f64.to_degrees(),
+            requires_confirmation: true,
+        };
+
+        let error = require_repl_move_force(&prepared, false).unwrap_err();
+        assert!(error.to_string().contains("REPL 中大幅移动必须显式加 --force"));
+        require_repl_move_force(&prepared, true).unwrap();
+    }
+
+    #[test]
+    fn repl_set_zero_requires_force() {
+        let error = require_repl_set_zero_force(false).unwrap_err();
+        assert!(error.to_string().contains("REPL 中 set-zero 必须显式加 --force"));
+        require_repl_set_zero_force(true).unwrap();
+    }
+
+    #[test]
+    fn handle_command_move_requires_force_before_motion_path() {
+        let mut session = ReplSession::new(CliConfig::default());
+        session.set_test_observer_positions([2.5, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let control = CommandExecutionControl::new(&ReplHandle::default());
+
+        let error = handle_command("move --joints 0.1", &mut session, &control).unwrap_err();
+        assert!(error.to_string().contains("REPL 中大幅移动必须显式加 --force"));
+    }
+
+    #[test]
+    fn handle_command_set_zero_requires_force_before_write_path() {
+        let mut session = ReplSession::new(CliConfig::default());
+        let control = CommandExecutionControl::new(&ReplHandle::default());
+
+        let error = handle_command("set-zero", &mut session, &control).unwrap_err();
+        assert!(error.to_string().contains("REPL 中 set-zero 必须显式加 --force"));
+    }
+
+    #[test]
     fn repl_handle_requests_motion_cancellation() {
         let handle = ReplHandle::default();
         handle.motion_in_progress.store(true, Ordering::SeqCst);
@@ -946,7 +1073,57 @@ mod tests {
         assert!(completion.post_command_stop.as_ref().is_some_and(Result::is_ok));
         executor.finish_completion(completion);
 
-        assert_eq!(TEST_MOTION_COUNT.load(Ordering::SeqCst), before + 1);
+        assert!(TEST_MOTION_COUNT.load(Ordering::SeqCst) > before);
+    }
+
+    #[tokio::test]
+    async fn handle_line_while_busy_rejects_regular_commands() {
+        let mut executor = ReplExecutor::new(CliConfig::default());
+        let mut exit_after_completion = false;
+
+        executor.start_command("__test-motion".to_string()).unwrap();
+        for _ in 0..20 {
+            if executor.handle.motion_in_progress.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        assert!(
+            !handle_line_while_busy(&mut executor, "position", &mut exit_after_completion).unwrap()
+        );
+        assert!(!exit_after_completion);
+        assert!(executor.is_busy());
+        assert_eq!(
+            executor.request_emergency_stop().unwrap(),
+            EmergencyStopOutcome::CancellingMotion
+        );
+
+        let completion = executor.wait_for_completion().await.unwrap();
+        executor.finish_completion(completion);
+    }
+
+    #[tokio::test]
+    async fn handle_line_while_busy_exit_queues_stop_and_exit() {
+        let mut executor = ReplExecutor::new(CliConfig::default());
+        let mut exit_after_completion = false;
+
+        executor.start_command("__test-motion".to_string()).unwrap();
+        for _ in 0..20 {
+            if executor.handle.motion_in_progress.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        assert!(
+            !handle_line_while_busy(&mut executor, "exit", &mut exit_after_completion).unwrap()
+        );
+        assert!(exit_after_completion);
+        assert!(executor.handle.cancel_requested.load(Ordering::SeqCst));
+
+        let completion = executor.wait_for_completion().await.unwrap();
+        executor.finish_completion(completion);
     }
 
     #[tokio::test]
@@ -968,6 +1145,6 @@ mod tests {
         assert!(completion.post_command_stop.as_ref().is_some_and(Result::is_ok));
         executor.finish_completion(completion);
 
-        assert_eq!(TEST_BUSY_COUNT.load(Ordering::SeqCst), before + 1);
+        assert!(TEST_BUSY_COUNT.load(Ordering::SeqCst) > before);
     }
 }
