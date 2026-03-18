@@ -1,12 +1,12 @@
 //! 移动命令
 
+use crate::commands::config::CliConfig;
+use crate::connection::{TargetArgs, client_builder};
+use crate::safety::confirm_prepared_move;
 use anyhow::{Context, Result};
 use clap::Args;
 use piper_control::{move_to_joint_target_blocking, prepare_move};
 use piper_sdk::client::ControlReadPolicy;
-use crate::commands::config::CliConfig;
-use crate::connection::{TargetArgs, client_builder};
-use crate::safety::confirm_prepared_move;
 
 #[derive(Args, Debug, Clone)]
 pub struct MoveCommand {
@@ -53,9 +53,7 @@ impl MoveCommand {
         println!("🔌 连接到机器人...");
         let standby = builder.build()?;
 
-        let snapshot = standby
-            .observer()
-            .control_snapshot(ControlReadPolicy::default())?;
+        let snapshot = standby.observer().control_snapshot(ControlReadPolicy::default())?;
         let current = std::array::from_fn(|index| snapshot.position[index].0);
         let prepared = prepare_move(current, &requested_positions, &profile.safety, self.force)?;
 

@@ -183,15 +183,11 @@ impl ReplSession {
     fn observer_positions(&self) -> Result<[f64; 6]> {
         match &self.state {
             ReplState::Standby(robot) => {
-                let snapshot = robot
-                    .observer()
-                    .control_snapshot(ControlReadPolicy::default())?;
+                let snapshot = robot.observer().control_snapshot(ControlReadPolicy::default())?;
                 Ok(std::array::from_fn(|index| snapshot.position[index].0))
             },
             ReplState::ActivePosition(robot) => {
-                let snapshot = robot
-                    .observer()
-                    .control_snapshot(ControlReadPolicy::default())?;
+                let snapshot = robot.observer().control_snapshot(ControlReadPolicy::default())?;
                 Ok(std::array::from_fn(|index| snapshot.position[index].0))
             },
             ReplState::Disconnected => {
