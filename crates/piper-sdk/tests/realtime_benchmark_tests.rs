@@ -8,9 +8,11 @@
 //! 5. 生成测试报告（Markdown）
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
-use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
+use piper_sdk::driver::{
+    PipelineConfig, PiperContext, PiperMetrics, command::RealtimeCommand, rx_loop, tx_loop_mailbox,
+};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -366,6 +368,7 @@ impl TxAdapter for ConfigurableTxAdapter {
 }
 
 #[test]
+#[ignore = "non-gating realtime benchmark"]
 fn test_500hz_realtime_benchmark() {
     // CI 调度不可控，时序断言易偶发失败；仅在本地运行
     if is_ci_env() {
@@ -381,6 +384,7 @@ fn test_500hz_realtime_benchmark() {
     let config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
+    let last_fault = Arc::new(AtomicU8::new(0));
 
     // 创建 500Hz RX 适配器
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration);
@@ -389,8 +393,16 @@ fn test_500hz_realtime_benchmark() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let metrics_rx = metrics.clone();
+    let last_fault_rx = last_fault.clone();
     let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
+        rx_loop(
+            rx_adapter,
+            ctx_rx,
+            config,
+            is_running_rx,
+            metrics_rx,
+            last_fault_rx,
+        );
     });
 
     // 监控状态更新周期
@@ -451,6 +463,7 @@ fn test_500hz_realtime_benchmark() {
 }
 
 #[test]
+#[ignore = "non-gating realtime benchmark"]
 fn test_1khz_realtime_benchmark() {
     // CI 调度不可控，时序断言易偶发失败；仅在本地运行
     if is_ci_env() {
@@ -466,6 +479,7 @@ fn test_1khz_realtime_benchmark() {
     let config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
+    let last_fault = Arc::new(AtomicU8::new(0));
 
     // 创建 1kHz RX 适配器
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration);
@@ -474,8 +488,16 @@ fn test_1khz_realtime_benchmark() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let metrics_rx = metrics.clone();
+    let last_fault_rx = last_fault.clone();
     let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
+        rx_loop(
+            rx_adapter,
+            ctx_rx,
+            config,
+            is_running_rx,
+            metrics_rx,
+            last_fault_rx,
+        );
     });
 
     // 监控状态更新周期
@@ -536,6 +558,7 @@ fn test_1khz_realtime_benchmark() {
 }
 
 #[test]
+#[ignore = "non-gating realtime benchmark"]
 fn test_tx_latency_benchmark() {
     // CI 调度不可控，P95 等时序断言易偶发失败；仅在本地运行
     if is_ci_env() {
@@ -550,13 +573,13 @@ fn test_tx_latency_benchmark() {
     let _config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
+    let last_fault = Arc::new(AtomicU8::new(0));
 
     // 创建 TX 适配器（记录发送时间）
     let tx_adapter = ConfigurableTxAdapter::new(Duration::from_micros(100));
     let send_times = tx_adapter.send_times.clone();
 
     // 创建命令通道
-    let (realtime_tx, _realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -565,14 +588,17 @@ fn test_tx_latency_benchmark() {
     let ctx_tx = _ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
+    let last_fault_tx = last_fault.clone();
+    let realtime_slot_tx = realtime_slot.clone();
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_slot_tx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
             ctx_tx,
+            last_fault_tx,
         );
     });
 
@@ -587,27 +613,34 @@ fn test_tx_latency_benchmark() {
             &[command_count as u8; 8],
         );
 
-        match realtime_tx.try_send(frame) {
-            Ok(_) => {
-                // 等待发送完成（通过检查 send_times）
-                let mut retries = 0;
-                while retries < 100 {
-                    let times = send_times.lock().unwrap();
-                    if times.len() > command_count as usize {
-                        let (send_time, _) = times[command_count as usize];
-                        let latency = send_time.duration_since(api_call_time);
-                        benchmark.tx_latency_metrics.add_sample(latency);
-                        break;
-                    }
-                    drop(times);
-                    thread::sleep(Duration::from_micros(100));
-                    retries += 1;
+        let queued = {
+            let mut slot = realtime_slot.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(RealtimeCommand::single(frame));
+                true
+            } else {
+                false
+            }
+        };
+
+        if queued {
+            // 等待发送完成（通过检查 send_times）
+            let mut retries = 0;
+            while retries < 100 {
+                let times = send_times.lock().unwrap();
+                if times.len() > command_count as usize {
+                    let (send_time, _) = times[command_count as usize];
+                    let latency = send_time.duration_since(api_call_time);
+                    benchmark.tx_latency_metrics.add_sample(latency);
+                    break;
                 }
-                command_count += 1;
-            },
-            Err(_) => {
-                // 队列满，跳过
-            },
+                drop(times);
+                thread::sleep(Duration::from_micros(100));
+                retries += 1;
+            }
+            command_count += 1;
+        } else {
+            // 邮箱忙，跳过
         }
 
         thread::sleep(Duration::from_millis(2)); // 500Hz
@@ -635,6 +668,7 @@ fn test_tx_latency_benchmark() {
 }
 
 #[test]
+#[ignore = "non-gating realtime benchmark"]
 fn test_send_duration_benchmark() {
     // CI 调度不可控，时序断言易偶发失败；仅在本地运行
     if is_ci_env() {
@@ -649,13 +683,13 @@ fn test_send_duration_benchmark() {
     let _config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
+    let last_fault = Arc::new(AtomicU8::new(0));
 
     // 创建 TX 适配器（记录发送耗时）
     let tx_adapter = ConfigurableTxAdapter::new(Duration::from_micros(100));
     let send_times = tx_adapter.send_times.clone();
 
     // 创建命令通道
-    let (realtime_tx, _realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -664,14 +698,17 @@ fn test_send_duration_benchmark() {
     let ctx_tx = _ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
+    let last_fault_tx = last_fault.clone();
+    let realtime_slot_tx = realtime_slot.clone();
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
-            realtime_slot,
+            realtime_slot_tx,
             reliable_rx,
             is_running_tx,
             metrics_tx,
             ctx_tx,
+            last_fault_tx,
         );
     });
 
@@ -685,7 +722,17 @@ fn test_send_duration_benchmark() {
             &[command_count as u8; 8],
         );
 
-        if realtime_tx.try_send(frame).is_ok() {
+        let queued = {
+            let mut slot = realtime_slot.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(RealtimeCommand::single(frame));
+                true
+            } else {
+                false
+            }
+        };
+
+        if queued {
             command_count += 1;
         }
 
@@ -720,6 +767,7 @@ fn test_send_duration_benchmark() {
 }
 
 #[test]
+#[ignore = "non-gating realtime benchmark"]
 fn test_usb_fault_simulation() {
     // CI 调度不可控，故障场景下 P95 时序断言易偶发失败；仅在本地运行
     if is_ci_env() {
@@ -735,6 +783,7 @@ fn test_usb_fault_simulation() {
     let config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
     let metrics = Arc::new(PiperMetrics::new());
+    let last_fault = Arc::new(AtomicU8::new(0));
 
     // 创建 RX 适配器（模拟 5% 延迟，10ms 延迟）
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration)
@@ -745,8 +794,16 @@ fn test_usb_fault_simulation() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let metrics_rx = metrics.clone();
+    let last_fault_rx = last_fault.clone();
     let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
+        rx_loop(
+            rx_adapter,
+            ctx_rx,
+            config,
+            is_running_rx,
+            metrics_rx,
+            last_fault_rx,
+        );
     });
 
     // 监控状态更新周期

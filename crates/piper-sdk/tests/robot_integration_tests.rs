@@ -2,7 +2,7 @@
 //!
 //! 使用 MockCanAdapter 模拟 CAN 帧输入，验证完整的状态更新流程。
 
-use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
+use piper_sdk::can::{CanAdapter, CanError, PiperFrame, SplittableAdapter};
 use piper_sdk::driver::DriverError;
 use piper_sdk::driver::*;
 use piper_sdk::protocol::ids::*;
@@ -69,6 +69,43 @@ impl CanAdapter for MockCanAdapter {
     }
 }
 
+pub struct MockRxAdapter {
+    receive_queue: Arc<Mutex<VecDeque<PiperFrame>>>,
+}
+
+impl piper_sdk::can::RxAdapter for MockRxAdapter {
+    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        self.receive_queue.lock().unwrap().pop_front().ok_or(CanError::Timeout)
+    }
+}
+
+pub struct MockTxAdapter {
+    sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+}
+
+impl piper_sdk::can::TxAdapter for MockTxAdapter {
+    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        self.sent_frames.lock().unwrap().push(frame);
+        Ok(())
+    }
+}
+
+impl SplittableAdapter for MockCanAdapter {
+    type RxAdapter = MockRxAdapter;
+    type TxAdapter = MockTxAdapter;
+
+    fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+        Ok((
+            MockRxAdapter {
+                receive_queue: Arc::clone(&self.receive_queue),
+            },
+            MockTxAdapter {
+                sent_frames: Arc::clone(&self.sent_frames),
+            },
+        ))
+    }
+}
+
 // 辅助函数：创建关节位置反馈帧
 fn create_joint_feedback_frame(id: u32, j1_deg: f64, j2_deg: f64, timestamp: u32) -> PiperFrame {
     let j1_raw = (j1_deg * 1000.0) as i32;
@@ -117,7 +154,7 @@ fn test_piper_end_to_end_joint_pos_update() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建完整的关节位置帧组（0x2A5, 0x2A6, 0x2A7）
     // J1=10°, J2=20°, J3=30°, J4=40°, J5=50°, J6=60°
@@ -174,7 +211,7 @@ fn test_piper_end_to_end_robot_status_update() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建 RobotStatusFeedback 帧
     let status_frame = create_robot_status_frame();
@@ -202,7 +239,7 @@ fn test_piper_end_to_end_command_send() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 发送命令帧
     let cmd_frame = PiperFrame::new_standard(0x150, &[0x01, 0x02, 0x03]);
@@ -225,7 +262,7 @@ fn test_piper_end_to_end_full_state_read() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 测试所有状态读取方法都不会崩溃
     let _joint_pos = piper.get_joint_position();
@@ -285,7 +322,7 @@ fn test_piper_end_to_end_complete_frame_groups() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建完整的关节位置帧组（0x2A5, 0x2A6, 0x2A7）
     let frames = vec![
@@ -327,7 +364,7 @@ fn test_piper_end_to_end_velocity_buffer_all_received() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建 6 个关节的速度帧（0x251-0x256）
     // J1=1.0 rad/s, J2=2.0 rad/s, ..., J6=6.0 rad/s
@@ -368,7 +405,7 @@ fn test_piper_end_to_end_mixed_state_updates() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 1. 发送关节位置帧组
     let joint_pos_frames = vec![
@@ -412,7 +449,7 @@ fn test_piper_stress_velocity_partial_loss() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 只发送 3 个关节的速度帧（模拟部分丢失）
     // 正常情况下需要 6 个帧，但这里只发送 J1, J2, J3
@@ -449,7 +486,7 @@ fn test_piper_stress_incomplete_joint_pos_frame_group() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 只发送 2 个关节位置帧（0x2A5, 0x2A6），缺少 0x2A7
     // 这样帧组不完整，不应该触发 Frame Commit
@@ -483,7 +520,7 @@ fn test_piper_stress_command_channel_full() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 快速发送多个命令帧（尝试填满通道）
     // 通道容量为 10，发送 15 个帧应该会导致部分返回 ChannelFull
@@ -518,7 +555,7 @@ fn test_piper_stress_mixed_frame_sequence() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建大量混合帧序列：关节位置 + 速度 + 状态帧
     let mut frames = Vec::new();

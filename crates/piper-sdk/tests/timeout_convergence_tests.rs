@@ -159,8 +159,8 @@ fn test_socketcan_timeout_config() {
 #[test]
 #[ignore]
 fn test_gs_usb_timeout_config() {
+    use piper_can::gs_usb::GsUsbCanAdapter;
     use piper_sdk::can::CanAdapter;
-    use piper_sdk::can::gs_usb::GsUsbCanAdapter;
     use std::time::Duration;
 
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create GS-USB adapter");

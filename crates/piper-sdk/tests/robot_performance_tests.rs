@@ -2,7 +2,7 @@
 //!
 //! 测试高频读取性能（500Hz 控制循环）
 
-use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
+use piper_sdk::can::{CanAdapter, CanError, PiperFrame, SplittableAdapter};
 use piper_sdk::driver::*;
 use std::time::Instant;
 
@@ -29,13 +29,38 @@ impl CanAdapter for MockCanAdapter {
     }
 }
 
+struct MockRxAdapter;
+
+impl piper_sdk::can::RxAdapter for MockRxAdapter {
+    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        Err(CanError::Timeout)
+    }
+}
+
+struct MockTxAdapter;
+
+impl piper_sdk::can::TxAdapter for MockTxAdapter {
+    fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+        Ok(())
+    }
+}
+
+impl SplittableAdapter for MockCanAdapter {
+    type RxAdapter = MockRxAdapter;
+    type TxAdapter = MockTxAdapter;
+
+    fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+        Ok((MockRxAdapter, MockTxAdapter))
+    }
+}
+
 /// 测试高频读取性能（500Hz）
 ///
 /// 验证能够达到至少 450 Hz（允许 10% 误差）
 #[test]
 fn test_high_frequency_read_performance() {
     let mock_can = MockCanAdapter;
-    let piper = Piper::new(mock_can, None).unwrap();
+    let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
     let start = Instant::now();
     let mut count = 0;
@@ -73,7 +98,7 @@ fn test_high_frequency_read_performance() {
 #[test]
 fn test_lock_free_read_performance() {
     let mock_can = MockCanAdapter;
-    let piper = Piper::new(mock_can, None).unwrap();
+    let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
     let start = Instant::now();
     let mut count = 0;

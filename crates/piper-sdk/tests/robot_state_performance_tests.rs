@@ -292,7 +292,7 @@ fn test_capture_motion_snapshot_latency() {
         println!("检测到CI环境，使用放宽的阈值");
     }
 
-    // capture_motion_snapshot() 需要读取两个 ArcSwap，应该仍然很快
+    // capture_motion_snapshot() 现在只读取一个已发布的 MotionSnapshot，应该仍然很快
     // 在CI环境中，阈值会放宽
     let threshold = adjust_threshold_ns(2000);
     assert!(

@@ -11,7 +11,7 @@ use piper_sdk::can::{
 use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -138,6 +138,7 @@ fn test_rx_unaffected_by_tx_timeout() {
     let ctx = Arc::new(PiperContext::new());
     let config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
+    let last_fault = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
 
     // 创建 RX 适配器：每 2ms 接收一帧
@@ -156,14 +157,23 @@ fn test_rx_unaffected_by_tx_timeout() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let metrics_rx = metrics.clone();
+    let last_fault_rx = last_fault.clone();
     let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
+        rx_loop(
+            rx_adapter,
+            ctx_rx,
+            config,
+            is_running_rx,
+            metrics_rx,
+            last_fault_rx,
+        );
     });
 
     // 启动 TX 线程
     let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
+    let last_fault_tx = last_fault.clone();
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
@@ -172,6 +182,7 @@ fn test_rx_unaffected_by_tx_timeout() {
             is_running_tx,
             metrics_tx,
             ctx_tx,
+            last_fault_tx,
         );
     });
 
@@ -231,6 +242,7 @@ fn test_tx_detects_rx_failure() {
     let ctx = Arc::new(PiperContext::new());
     let config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
+    let last_fault = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
 
     // 创建 RX 适配器：初始正常，稍后模拟故障
@@ -250,14 +262,23 @@ fn test_tx_detects_rx_failure() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let metrics_rx = metrics.clone();
+    let last_fault_rx = last_fault.clone();
     let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
+        rx_loop(
+            rx_adapter,
+            ctx_rx,
+            config,
+            is_running_rx,
+            metrics_rx,
+            last_fault_rx,
+        );
     });
 
     // 启动 TX 线程
     let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
+    let last_fault_tx = last_fault.clone();
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
@@ -266,6 +287,7 @@ fn test_tx_detects_rx_failure() {
             is_running_tx,
             metrics_tx,
             ctx_tx,
+            last_fault_tx,
         );
     });
 
@@ -327,6 +349,7 @@ fn test_thread_lifecycle_linkage() {
     let ctx = Arc::new(PiperContext::new());
     let config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
+    let last_fault = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
 
     // 创建 RX 适配器
@@ -346,14 +369,23 @@ fn test_thread_lifecycle_linkage() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let metrics_rx = metrics.clone();
+    let last_fault_rx = last_fault.clone();
     let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
+        rx_loop(
+            rx_adapter,
+            ctx_rx,
+            config,
+            is_running_rx,
+            metrics_rx,
+            last_fault_rx,
+        );
     });
 
     // 启动 TX 线程
     let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
+    let last_fault_tx = last_fault.clone();
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
@@ -362,6 +394,7 @@ fn test_thread_lifecycle_linkage() {
             is_running_tx,
             metrics_tx,
             ctx_tx,
+            last_fault_tx,
         );
     });
 

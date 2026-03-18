@@ -3,6 +3,7 @@
 //! 测试新状态结构在多线程环境下的并发安全性，特别是 `ArcSwap` 的 Wait-Free 特性。
 
 use piper_sdk::driver::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -257,32 +258,43 @@ fn test_gripper_state_concurrent_read() {
 
 /// 测试 `capture_motion_snapshot()` 的并发调用
 ///
-/// 验证多个线程同时调用 `capture_motion_snapshot()` 不会出现问题。
+/// 验证多个线程同时调用 `capture_motion_snapshot()` 只会读到已发布的逻辑原子快照。
 #[test]
 fn test_capture_motion_snapshot_concurrent() {
     let ctx = Arc::new(PiperContext::new());
     let num_threads = 10;
     let calls_per_thread = 1000;
+    let mut valid_snapshots = HashSet::new();
+    valid_snapshots.insert((0u64, 0u64));
+
+    for i in 0..calls_per_thread {
+        let joint_timestamp = i as u64 * 1000 + 1;
+        let end_timestamp = i as u64 * 1000 + 2;
+        let previous_end_timestamp = if i == 0 { 0 } else { (i as u64 - 1) * 1000 + 2 };
+        valid_snapshots.insert((joint_timestamp, previous_end_timestamp));
+        valid_snapshots.insert((joint_timestamp, end_timestamp));
+    }
+    let valid_snapshots = Arc::new(valid_snapshots);
 
     // 更新状态
     let ctx_writer = ctx.clone();
     let writer_handle = thread::spawn(move || {
         for i in 0..calls_per_thread {
             let new_joint_pos = JointPositionState {
-                hardware_timestamp_us: i as u64 * 1000,
+                hardware_timestamp_us: i as u64 * 1000 + 1,
                 system_timestamp_us: i as u64 * 2000,
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer.joint_position.store(Arc::new(new_joint_pos));
+            ctx_writer.publish_joint_position(new_joint_pos);
 
             let new_end_pose = EndPoseState {
-                hardware_timestamp_us: i as u64 * 1000,
+                hardware_timestamp_us: i as u64 * 1000 + 2,
                 system_timestamp_us: i as u64 * 2000,
-                end_pose: [i as f64; 6],
+                end_pose: [10_000.0 + i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer.end_pose.store(Arc::new(new_end_pose));
+            ctx_writer.publish_end_pose(new_end_pose);
             thread::yield_now();
         }
     });
@@ -291,12 +303,19 @@ fn test_capture_motion_snapshot_concurrent() {
     let mut reader_handles = Vec::new();
     for _ in 0..num_threads {
         let ctx_reader = ctx.clone();
+        let valid_snapshots_reader = valid_snapshots.clone();
         let handle = thread::spawn(move || {
             for _ in 0..calls_per_thread {
                 let snapshot = ctx_reader.capture_motion_snapshot();
-                // 验证快照完整性
-                assert!(snapshot.joint_position.joint_pos.len() == 6);
-                assert!(snapshot.end_pose.end_pose.len() == 6);
+                let signature = (
+                    snapshot.joint_position.hardware_timestamp_us,
+                    snapshot.end_pose.hardware_timestamp_us,
+                );
+                assert!(
+                    valid_snapshots_reader.contains(&signature),
+                    "snapshot should match a published motion snapshot: {:?}",
+                    signature
+                );
                 thread::yield_now();
             }
         });

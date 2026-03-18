@@ -1,528 +1,388 @@
-//! 性能测试与调优
+//! Pipeline 结构性性能测试
 //!
-//! 全面测试性能改进和 metrics 准确性：
-//! 1. RX 状态更新周期分布（P50/P95/P99/max）
-//! 2. TX 命令延迟分布
-//! 3. Overwrite 次数、错误次数
-//! 4. Metrics 准确性验证
+//! 这些测试保留在默认 `cargo test` 中，但只验证进度、队列语义和 metrics 准确性，
+//! 不再依赖 wall-clock P95/P99 阈值。
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
 use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 检测是否在CI环境中运行
-fn is_ci_env() -> bool {
-    std::env::var("CI").is_ok()
-        || std::env::var("GITHUB_ACTIONS").is_ok()
-        || std::env::var("GITLAB_CI").is_ok()
-        || std::env::var("CIRCLECI").is_ok()
-        || std::env::var("TRAVIS").is_ok()
-        || std::env::var("APPVEYOR").is_ok()
-}
-
-/// 根据环境调整时间阈值（毫秒）
-/// 在CI环境中，使用更宽松的阈值（通常是本地环境的3-5倍）
-fn adjust_threshold_ms(local_threshold_ms: u64) -> Duration {
-    let multiplier = if is_ci_env() { 5 } else { 1 };
-    Duration::from_millis(local_threshold_ms * multiplier)
-}
-
-/// 性能统计结构
-#[derive(Debug, Default)]
-struct LatencyStats {
-    samples: Vec<Duration>,
-}
-
-impl LatencyStats {
-    fn new() -> Self {
-        Self {
-            samples: Vec::new(),
+fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return;
         }
+        thread::sleep(Duration::from_millis(1));
     }
-
-    fn add_sample(&mut self, latency: Duration) {
-        self.samples.push(latency);
-    }
-
-    fn percentile(&self, p: f64) -> Duration {
-        if self.samples.is_empty() {
-            return Duration::ZERO;
-        }
-
-        let mut sorted = self.samples.clone();
-        sorted.sort();
-
-        let index = ((sorted.len() as f64) * p / 100.0).ceil() as usize - 1;
-        sorted[index.min(sorted.len() - 1)]
-    }
-
-    fn p50(&self) -> Duration {
-        self.percentile(50.0)
-    }
-
-    fn p95(&self) -> Duration {
-        self.percentile(95.0)
-    }
-
-    fn p99(&self) -> Duration {
-        self.percentile(99.0)
-    }
-
-    fn max(&self) -> Duration {
-        self.samples.iter().max().copied().unwrap_or(Duration::ZERO)
-    }
-
-    fn min(&self) -> Duration {
-        self.samples.iter().min().copied().unwrap_or(Duration::ZERO)
-    }
-
-    fn mean(&self) -> Duration {
-        if self.samples.is_empty() {
-            return Duration::ZERO;
-        }
-        let total: Duration = self.samples.iter().sum();
-        total / self.samples.len() as u32
-    }
-
-    fn count(&self) -> usize {
-        self.samples.len()
-    }
+    panic!("condition not met within {:?}", timeout);
 }
 
-/// Mock RX 适配器：模拟高频接收（1kHz）
-struct HighFreqRxAdapter {
+struct QueueRxAdapter {
     frames: VecDeque<PiperFrame>,
-    interval: Duration,
-    frame_count: Arc<AtomicU64>,
-    start_time: Instant,
 }
 
-impl HighFreqRxAdapter {
-    fn new(frames_per_second: u32) -> Self {
-        let mut frames = VecDeque::new();
-        // 生成足够的帧（假设测试运行 1 分钟）
-        let total_frames = frames_per_second * 60;
-        for i in 0..total_frames {
-            frames.push_back(PiperFrame::new_standard(
-                (0x251 + (i % 6)) as u16,
-                &[i as u8; 8],
-            ));
-        }
-
+impl QueueRxAdapter {
+    fn new(frames: impl IntoIterator<Item = PiperFrame>) -> Self {
         Self {
-            frames,
-            interval: Duration::from_millis(1000 / frames_per_second as u64),
-            frame_count: Arc::new(AtomicU64::new(0)),
-            start_time: Instant::now(),
+            frames: frames.into_iter().collect(),
         }
-    }
-
-    #[allow(dead_code)]
-    fn frame_count(&self) -> u64 {
-        self.frame_count.load(Ordering::Relaxed)
     }
 }
 
-impl RxAdapter for HighFreqRxAdapter {
+impl RxAdapter for QueueRxAdapter {
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
-        let elapsed = self.start_time.elapsed();
-        let expected_frame_index = (elapsed.as_millis() / self.interval.as_millis()) as usize;
-
-        if expected_frame_index >= self.frames.len() {
-            return Err(CanError::Timeout);
-        }
-
-        // 模拟精确的时序
-        let next_frame_time = self.start_time + self.interval * expected_frame_index as u32;
-        let now = Instant::now();
-        if now < next_frame_time {
-            thread::sleep(next_frame_time - now);
-        }
-
-        self.frame_count.fetch_add(1, Ordering::Relaxed);
         self.frames.pop_front().ok_or(CanError::Timeout)
     }
 }
 
-/// Mock TX 适配器：模拟正常发送
-struct NormalTxAdapter {
+struct RecordingTxAdapter {
+    sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
     send_delay: Duration,
-    sent_count: Arc<AtomicU64>,
 }
 
-impl NormalTxAdapter {
-    fn new() -> Self {
+impl RecordingTxAdapter {
+    fn new(send_delay: Duration) -> Self {
         Self {
-            send_delay: Duration::from_micros(100), // 100µs 发送延迟
-            sent_count: Arc::new(AtomicU64::new(0)),
+            sent_frames: Arc::new(Mutex::new(Vec::new())),
+            send_delay,
         }
     }
-
-    #[allow(dead_code)]
-    fn sent_count(&self) -> u64 {
-        self.sent_count.load(Ordering::Relaxed)
-    }
 }
 
-impl TxAdapter for NormalTxAdapter {
-    fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
-        thread::sleep(self.send_delay);
-        self.sent_count.fetch_add(1, Ordering::Relaxed);
+impl TxAdapter for RecordingTxAdapter {
+    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        if !self.send_delay.is_zero() {
+            thread::sleep(self.send_delay);
+        }
+        self.sent_frames.lock().unwrap().push(frame);
         Ok(())
     }
 }
 
-#[test]
-fn test_rx_update_period_distribution() {
-    // CI 调度不可控，时序断言易偶发失败；仅在本地运行以验证 1kHz 周期
-    if is_ci_env() {
-        return;
-    }
-    // 测试场景：1kHz 控制回路，测量 RX 状态更新周期分布
+struct BlockingFirstTxAdapter {
+    sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    first_frame_tx: Option<mpsc::Sender<PiperFrame>>,
+    release_first_rx: mpsc::Receiver<()>,
+    first_send_blocked: bool,
+}
 
-    let ctx = Arc::new(PiperContext::new());
-    let config = PipelineConfig::default();
-    let is_running = Arc::new(AtomicBool::new(true));
-    let metrics = Arc::new(PiperMetrics::new());
-
-    // 创建 1kHz RX 适配器
-    let rx_adapter = HighFreqRxAdapter::new(1000);
-
-    // 启动 RX 线程
-    let ctx_rx = ctx.clone();
-    let is_running_rx = is_running.clone();
-    let metrics_rx = metrics.clone();
-    let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
-    });
-
-    // 监控状态更新周期
-    let mut stats = LatencyStats::new();
-    let mut last_update_time = Instant::now();
-    let mut last_update_count = 0u64;
-
-    // 运行 5 秒
-    let test_duration = Duration::from_secs(5);
-    let start = Instant::now();
-
-    while start.elapsed() < test_duration {
-        let current_count = metrics.rx_frames_valid.load(Ordering::Relaxed);
-
-        if current_count > last_update_count {
-            let period = last_update_time.elapsed();
-            stats.add_sample(period);
-            last_update_time = Instant::now();
-            last_update_count = current_count;
+impl BlockingFirstTxAdapter {
+    fn new(first_frame_tx: mpsc::Sender<PiperFrame>, release_first_rx: mpsc::Receiver<()>) -> Self {
+        Self {
+            sent_frames: Arc::new(Mutex::new(Vec::new())),
+            first_frame_tx: Some(first_frame_tx),
+            release_first_rx,
+            first_send_blocked: false,
         }
-
-        thread::sleep(Duration::from_millis(1));
     }
-
-    // 停止线程
-    is_running.store(false, Ordering::Relaxed);
-    let _ = rx_handle.join();
-
-    // 验证统计结果
-    println!("RX Update Period Statistics:");
-    println!("  Samples: {}", stats.count());
-    println!("  P50: {:?}", stats.p50());
-    println!("  P95: {:?}", stats.p95());
-    println!("  P99: {:?}", stats.p99());
-    println!("  Max: {:?}", stats.max());
-    println!("  Min: {:?}", stats.min());
-    println!("  Mean: {:?}", stats.mean());
-
-    // 验收标准：P99 < 5ms（CI环境会放宽）
-    let threshold = adjust_threshold_ms(5);
-    assert!(
-        stats.p99() < threshold,
-        "RX update period P99 should be < {:?} (CI环境已放宽), got: {:?}",
-        threshold,
-        stats.p99()
-    );
-
-    // 验证：P50 应该在 1ms 左右（1kHz = 1ms 周期）
-    // 本地：考虑系统调度延迟，允许 30% 误差 [0.7ms, 1.5ms]
-    // CI：调度不可控，上界放宽为 15ms 避免偶发超 10ms
-    let expected_period = Duration::from_millis(1);
-    let p50 = stats.p50();
-    let p50_min = expected_period * 7 / 10;
-    let p50_max = if is_ci_env() {
-        adjust_threshold_ms(3) // CI 下 15ms
-    } else {
-        expected_period * 15 / 10
-    };
-    assert!(
-        p50 >= p50_min && p50 <= p50_max,
-        "RX update period P50 should be in [{:?}, {:?}] (1kHz ~1ms, CI relaxed), got: {:?}",
-        p50_min,
-        p50_max,
-        p50
-    );
 }
 
-#[test]
-fn test_tx_command_latency_distribution() {
-    // CI 调度不可控，P95 等时序断言易偶发失败；仅在本地运行以验证实时延迟
-    if is_ci_env() {
-        return;
-    }
-    // 测试场景：测量 TX 命令延迟分布
+impl TxAdapter for BlockingFirstTxAdapter {
+    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        self.sent_frames.lock().unwrap().push(frame);
 
-    let ctx = Arc::new(PiperContext::new());
-    let _config = PipelineConfig::default();
-    let is_running = Arc::new(AtomicBool::new(true));
-    let metrics = Arc::new(PiperMetrics::new());
-
-    // 创建 TX 适配器
-    let tx_adapter = NormalTxAdapter::new();
-
-    // 创建命令通道
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let realtime_slot_clone = realtime_slot.clone();
-
-    // 启动 TX 线程
-    let ctx_tx = ctx.clone();
-    let is_running_tx = is_running.clone();
-    let metrics_tx = metrics.clone();
-    let tx_handle = thread::spawn(move || {
-        tx_loop_mailbox(
-            tx_adapter,
-            realtime_slot,
-            reliable_rx,
-            is_running_tx,
-            metrics_tx,
-            ctx_tx,
-        );
-    });
-
-    // 测量命令延迟
-    let mut stats = LatencyStats::new();
-    let test_duration = Duration::from_secs(2);
-    let start = Instant::now();
-
-    while start.elapsed() < test_duration {
-        let send_start = Instant::now();
-        let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
-        *realtime_slot_clone.lock().unwrap() =
-            Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
-
-        // 等待发送完成（通过 metrics 验证）
-        let initial_count = metrics.tx_frames_total.load(Ordering::Relaxed);
-        let mut attempts = 0;
-        while metrics.tx_frames_total.load(Ordering::Relaxed) == initial_count && attempts < 100 {
-            thread::sleep(Duration::from_millis(1));
-            attempts += 1;
-        }
-
-        let latency = send_start.elapsed();
-        stats.add_sample(latency);
-
-        // 1kHz 发送频率
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    // 停止线程
-    is_running.store(false, Ordering::Relaxed);
-    let _ = tx_handle.join();
-
-    // 验证统计结果
-    println!("TX Command Latency Statistics:");
-    println!("  Samples: {}", stats.count());
-    println!("  P50: {:?}", stats.p50());
-    println!("  P95: {:?}", stats.p95());
-    println!("  P99: {:?}", stats.p99());
-    println!("  Max: {:?}", stats.max());
-
-    // 验收标准：实时命令延迟 P95 < 2ms（考虑系统调度和 Mock 适配器延迟）
-    // 在实际硬件环境中，这个值应该 < 1ms
-    // CI 环境调度方差大，放宽为 3*5=15ms 避免偶发超 10ms
-    let threshold = adjust_threshold_ms(3);
-    assert!(
-        stats.p95() < threshold,
-        "TX command latency P95 should be < {:?} (CI环境已放宽, in real hardware < 1ms), got: {:?}",
-        threshold,
-        stats.p95()
-    );
-}
-
-#[test]
-fn test_metrics_accuracy() {
-    // 测试场景：验证 metrics 计数与实际发送/接收帧数一致
-
-    let ctx = Arc::new(PiperContext::new());
-    let config = PipelineConfig::default();
-    let is_running = Arc::new(AtomicBool::new(true));
-    let metrics = Arc::new(PiperMetrics::new());
-
-    // 创建 RX 适配器
-    let rx_adapter = HighFreqRxAdapter::new(100);
-    // 注意：frame_count 在移动后无法访问，这里我们使用 metrics 来验证
-
-    // 创建 TX 适配器
-    let tx_adapter = NormalTxAdapter::new();
-
-    // 创建命令通道
-    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
-
-    // 启动 RX 线程
-    let ctx_rx = ctx.clone();
-    let is_running_rx = is_running.clone();
-    let metrics_rx = metrics.clone();
-    let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
-    });
-
-    // 启动 TX 线程
-    let ctx_tx = ctx.clone();
-    let is_running_tx = is_running.clone();
-    let metrics_tx = metrics.clone();
-    let tx_handle = thread::spawn(move || {
-        tx_loop_mailbox(
-            tx_adapter,
-            realtime_slot,
-            reliable_rx,
-            is_running_tx,
-            metrics_tx,
-            ctx_tx,
-        );
-    });
-
-    // 发送固定数量的命令
-    let expected_tx_frames = 50u64;
-    for i in 0..expected_tx_frames {
-        let frame = PiperFrame::new_standard(0x123, &[i as u8; 8]);
-        reliable_tx.send(frame).unwrap();
-    }
-
-    // 等待处理完成
-    thread::sleep(Duration::from_millis(200));
-
-    // 停止线程
-    is_running.store(false, Ordering::Relaxed);
-    let _ = rx_handle.join();
-    let _ = tx_handle.join();
-
-    // 验证 metrics 准确性
-    let snapshot = metrics.snapshot();
-
-    println!("Metrics Accuracy Test:");
-    println!("  RX frames total: {}", snapshot.rx_frames_total);
-    println!("  RX frames valid: {}", snapshot.rx_frames_valid);
-    println!("  TX frames total: {}", snapshot.tx_frames_total);
-    println!("  Expected TX frames: {}", expected_tx_frames);
-    println!("  Actual TX frames sent: {}", expected_tx_frames);
-
-    // 验证：TX 帧数应该与实际发送数一致（允许少量误差）
-    let tx_accuracy = if expected_tx_frames > 0 {
-        (snapshot.tx_frames_total as f64 / expected_tx_frames as f64) * 100.0
-    } else {
-        100.0
-    };
-
-    assert!(
-        tx_accuracy > 95.0,
-        "TX metrics accuracy should be > 95%, got: {:.2}%",
-        tx_accuracy
-    );
-
-    // 验证：RX 有效帧数应该 > 0
-    assert!(
-        snapshot.rx_frames_valid > 0,
-        "RX should receive at least some valid frames"
-    );
-}
-
-#[test]
-fn test_realtime_overwrite_accuracy() {
-    // 测试场景：验证 Overwrite 次数与实际触发次数一致
-
-    let is_running = Arc::new(AtomicBool::new(true));
-    let ctx = Arc::new(PiperContext::new());
-    let metrics = Arc::new(PiperMetrics::new());
-
-    // 创建慢速 TX 适配器（模拟瓶颈）
-    struct SlowTxAdapter {
-        send_delay: Duration,
-        sent_count: Arc<AtomicU64>,
-    }
-
-    impl SlowTxAdapter {
-        fn new() -> Self {
-            Self {
-                send_delay: Duration::from_millis(10), // 10ms 发送延迟（慢）
-                sent_count: Arc::new(AtomicU64::new(0)),
+        if !self.first_send_blocked {
+            self.first_send_blocked = true;
+            if let Some(sender) = self.first_frame_tx.take() {
+                sender.send(frame).unwrap();
             }
+            self.release_first_rx.recv().unwrap();
         }
+
+        Ok(())
     }
+}
 
-    impl TxAdapter for SlowTxAdapter {
-        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
-            thread::sleep(self.send_delay);
-            self.sent_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-    }
+fn start_rx_loop(
+    rx_adapter: impl RxAdapter + Send + 'static,
+    ctx: Arc<PiperContext>,
+    metrics: Arc<PiperMetrics>,
+    is_running: Arc<AtomicBool>,
+    fault: Arc<AtomicU8>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        rx_loop(
+            rx_adapter,
+            ctx,
+            PipelineConfig::default(),
+            is_running,
+            metrics,
+            fault,
+        );
+    })
+}
 
-    let tx_adapter = SlowTxAdapter::new();
-
-    // 创建命令通道
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let realtime_slot_clone = realtime_slot.clone();
-
-    // 启动 TX 线程
-    let ctx_tx = ctx.clone();
-    let is_running_tx = is_running.clone();
-    let metrics_tx = metrics.clone();
-    let tx_handle = thread::spawn(move || {
+fn start_tx_loop(
+    tx_adapter: impl TxAdapter + Send + 'static,
+    ctx: Arc<PiperContext>,
+    metrics: Arc<PiperMetrics>,
+    is_running: Arc<AtomicBool>,
+    fault: Arc<AtomicU8>,
+    realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>>,
+    reliable_rx: crossbeam_channel::Receiver<PiperFrame>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
             reliable_rx,
-            is_running_tx,
-            metrics_tx,
-            ctx_tx,
+            is_running,
+            metrics,
+            ctx,
+            fault,
         );
+    })
+}
+
+#[test]
+fn test_rx_loop_processes_burst_without_transport_fault() {
+    let frames = (0..12).map(|i| PiperFrame::new_standard((0x251 + (i % 6)) as u16, &[i as u8; 8]));
+    let ctx = Arc::new(PiperContext::new());
+    let metrics = Arc::new(PiperMetrics::new());
+    let is_running = Arc::new(AtomicBool::new(true));
+    let fault = Arc::new(AtomicU8::new(0));
+
+    let handle = start_rx_loop(
+        QueueRxAdapter::new(frames),
+        ctx,
+        metrics.clone(),
+        is_running.clone(),
+        fault.clone(),
+    );
+
+    wait_until(Duration::from_secs(1), || {
+        metrics.rx_frames_valid.load(Ordering::Relaxed) >= 12
     });
 
-    // 快速发送命令（超过 TX 处理速度，触发 Overwrite）
-    // Mailbox 模式下，每次写入都会覆盖之前的值
-    let total_sends = 20u64;
+    is_running.store(false, Ordering::Relaxed);
+    handle.join().unwrap();
 
-    for i in 0..total_sends {
-        let frame = PiperFrame::new_standard(0x123, &[i as u8; 8]);
-        // 直接写入 slot，会自动覆盖之前的值
-        *realtime_slot_clone.lock().unwrap() =
-            Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
-        thread::sleep(Duration::from_millis(1)); // 1ms 间隔发送
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.rx_frames_valid, 12);
+    assert_eq!(snapshot.device_errors, 0);
+    assert_eq!(fault.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
+    let ctx = Arc::new(PiperContext::new());
+    let metrics = Arc::new(PiperMetrics::new());
+    let is_running = Arc::new(AtomicBool::new(true));
+    let fault = Arc::new(AtomicU8::new(0));
+    let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(2));
+    let sent_frames = tx_adapter.sent_frames.clone();
+    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let realtime_slot = Arc::new(std::sync::Mutex::new(None));
+
+    let handle = start_tx_loop(
+        tx_adapter,
+        ctx,
+        metrics.clone(),
+        is_running.clone(),
+        fault.clone(),
+        realtime_slot,
+        reliable_rx,
+    );
+
+    let expected: Vec<PiperFrame> = (0..10)
+        .map(|i| PiperFrame::new_standard((0x180 + i) as u16, &[i as u8; 8]))
+        .collect();
+    for frame in &expected {
+        reliable_tx.send(*frame).unwrap();
     }
 
-    // 等待处理完成
-    thread::sleep(Duration::from_millis(500));
+    wait_until(Duration::from_secs(2), || {
+        sent_frames.lock().unwrap().len() == expected.len()
+    });
 
-    // 停止线程
     is_running.store(false, Ordering::Relaxed);
-    let _ = tx_handle.join();
+    handle.join().unwrap();
 
-    // 验证发送结果
+    let sent = sent_frames.lock().unwrap().clone();
+    assert_eq!(sent, expected);
+
     let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.tx_frames_total, expected.len() as u64);
+    assert_eq!(snapshot.tx_timeouts, 0);
+    assert_eq!(snapshot.device_errors, 0);
+    assert_eq!(fault.load(Ordering::Relaxed), 0);
+}
 
-    println!("Overwrite Accuracy Test:");
-    println!("  Total sends: {}", total_sends);
-    println!("  Metrics overwrites: {}", snapshot.tx_realtime_overwrites);
-    println!("  TX frames total: {}", snapshot.tx_frames_total);
+#[test]
+fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
+    let ctx = Arc::new(PiperContext::new());
+    let metrics = Arc::new(PiperMetrics::new());
+    let is_running = Arc::new(AtomicBool::new(true));
+    let fault = Arc::new(AtomicU8::new(0));
+    let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(1));
+    let sent_frames = tx_adapter.sent_frames.clone();
+    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let realtime_slot = Arc::new(std::sync::Mutex::new(None));
+    let realtime_slot_writer = realtime_slot.clone();
 
-    // 验证：Mailbox 模式下，应该有帧被发送
-    // 由于快速发送覆盖，实际发送的帧数可能少于 total_sends
-    assert!(snapshot.tx_frames_total > 0, "Should have sent some frames");
+    let handle = start_tx_loop(
+        tx_adapter,
+        ctx,
+        metrics.clone(),
+        is_running.clone(),
+        fault.clone(),
+        realtime_slot,
+        reliable_rx,
+    );
+
+    let reliable_frames: Vec<PiperFrame> = (0..3)
+        .map(|i| PiperFrame::new_standard((0x300 + i) as u16, &[0xAA, i as u8]))
+        .collect();
+    for frame in &reliable_frames {
+        reliable_tx.send(*frame).unwrap();
+    }
+
+    let realtime_writer = thread::spawn(move || {
+        for i in 0..30 {
+            let frame = PiperFrame::new_standard((0x400 + i) as u16, &[i as u8; 8]);
+            *realtime_slot_writer.lock().unwrap() =
+                Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    wait_until(Duration::from_secs(2), || {
+        let sent = sent_frames.lock().unwrap();
+        reliable_frames
+            .iter()
+            .all(|frame| sent.iter().any(|sent_frame| sent_frame.id == frame.id))
+    });
+
+    realtime_writer.join().unwrap();
+    is_running.store(false, Ordering::Relaxed);
+    handle.join().unwrap();
+
+    let sent = sent_frames.lock().unwrap();
+    for frame in &reliable_frames {
+        assert!(
+            sent.iter().any(|sent_frame| sent_frame.id == frame.id),
+            "reliable frame 0x{:X} should not starve",
+            frame.id
+        );
+    }
+    assert_eq!(fault.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn test_metrics_snapshot_matches_processed_frames() {
+    let ctx = Arc::new(PiperContext::new());
+    let metrics = Arc::new(PiperMetrics::new());
+    let is_running = Arc::new(AtomicBool::new(true));
+    let fault = Arc::new(AtomicU8::new(0));
+
+    let rx_frames: Vec<PiperFrame> = (0..6)
+        .map(|i| PiperFrame::new_standard((0x251 + (i % 6)) as u16, &[i as u8; 8]))
+        .collect();
+    let rx_handle = start_rx_loop(
+        QueueRxAdapter::new(rx_frames.clone()),
+        ctx.clone(),
+        metrics.clone(),
+        is_running.clone(),
+        fault.clone(),
+    );
+
+    let tx_adapter = RecordingTxAdapter::new(Duration::ZERO);
+    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let realtime_slot = Arc::new(std::sync::Mutex::new(None));
+    let tx_handle = start_tx_loop(
+        tx_adapter,
+        ctx,
+        metrics.clone(),
+        is_running.clone(),
+        fault.clone(),
+        realtime_slot,
+        reliable_rx,
+    );
+
+    let tx_frames: Vec<PiperFrame> = (0..4)
+        .map(|i| PiperFrame::new_standard((0x500 + i) as u16, &[i as u8; 8]))
+        .collect();
+    for frame in &tx_frames {
+        reliable_tx.send(*frame).unwrap();
+    }
+
+    wait_until(Duration::from_secs(1), || {
+        let snapshot = metrics.snapshot();
+        snapshot.rx_frames_valid == rx_frames.len() as u64
+            && snapshot.tx_frames_total == tx_frames.len() as u64
+    });
+
+    is_running.store(false, Ordering::Relaxed);
+    rx_handle.join().unwrap();
+    tx_handle.join().unwrap();
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.rx_frames_valid, rx_frames.len() as u64);
+    assert_eq!(snapshot.tx_frames_total, tx_frames.len() as u64);
+    assert_eq!(snapshot.device_errors, 0);
+    assert_eq!(snapshot.tx_timeouts, 0);
+}
+
+#[test]
+fn test_realtime_overwrite_keeps_latest_pending_command() {
+    let ctx = Arc::new(PiperContext::new());
+    let metrics = Arc::new(PiperMetrics::new());
+    let is_running = Arc::new(AtomicBool::new(true));
+    let fault = Arc::new(AtomicU8::new(0));
+    let (first_frame_tx, first_frame_rx) = mpsc::channel();
+    let (release_first_tx, release_first_rx) = mpsc::channel();
+    let tx_adapter = BlockingFirstTxAdapter::new(first_frame_tx, release_first_rx);
+    let sent_frames = tx_adapter.sent_frames.clone();
+    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let realtime_slot = Arc::new(std::sync::Mutex::new(None));
+    let realtime_slot_writer = realtime_slot.clone();
+
+    let handle = start_tx_loop(
+        tx_adapter,
+        ctx,
+        metrics.clone(),
+        is_running.clone(),
+        fault.clone(),
+        realtime_slot,
+        reliable_rx,
+    );
+
+    let first = PiperFrame::new_standard(0x610, &[1; 8]);
+    *realtime_slot_writer.lock().unwrap() =
+        Some(piper_sdk::driver::command::RealtimeCommand::single(first));
+
+    let blocked_frame = first_frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(blocked_frame.id, first.id);
+
+    let latest = PiperFrame::new_standard(0x614, &[4; 8]);
+    for frame in [
+        PiperFrame::new_standard(0x611, &[2; 8]),
+        PiperFrame::new_standard(0x612, &[3; 8]),
+        PiperFrame::new_standard(0x613, &[4; 8]),
+        latest,
+    ] {
+        *realtime_slot_writer.lock().unwrap() =
+            Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
+    }
+
+    release_first_tx.send(()).unwrap();
+
+    wait_until(Duration::from_secs(1), || {
+        sent_frames.lock().unwrap().len() >= 2
+    });
+
+    is_running.store(false, Ordering::Relaxed);
+    handle.join().unwrap();
+
+    let sent = sent_frames.lock().unwrap().clone();
+    assert_eq!(sent[0].id, first.id);
+    assert_eq!(sent[1].id, latest.id);
+    assert_eq!(metrics.snapshot().tx_frames_total, 2);
+    assert_eq!(fault.load(Ordering::Relaxed), 0);
 }

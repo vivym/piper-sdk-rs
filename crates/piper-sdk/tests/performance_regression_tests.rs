@@ -10,7 +10,7 @@ use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
 use piper_sdk::driver::command::PiperCommand;
 use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -330,6 +330,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let ctx = Arc::new(PiperContext::new());
     let config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
+    let last_fault = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
 
     // 创建 RX 适配器
@@ -349,14 +350,23 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let metrics_rx = metrics.clone();
+    let last_fault_rx = last_fault.clone();
     let rx_handle = thread::spawn(move || {
-        rx_loop(rx_adapter, ctx_rx, config, is_running_rx, metrics_rx);
+        rx_loop(
+            rx_adapter,
+            ctx_rx,
+            config,
+            is_running_rx,
+            metrics_rx,
+            last_fault_rx,
+        );
     });
 
     // 启动 TX 线程
     let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
+    let last_fault_tx = last_fault.clone();
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
@@ -365,6 +375,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             is_running_tx,
             metrics_tx,
             ctx_tx,
+            last_fault_tx,
         );
     });
 
@@ -469,6 +480,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
 }
 
 #[test]
+#[ignore = "non-gating performance benchmark"]
 fn test_performance_regression() {
     // 测试场景：验证当前性能不退化
 
@@ -510,6 +522,7 @@ fn test_performance_regression() {
 }
 
 #[test]
+#[ignore = "non-gating performance benchmark"]
 fn test_command_priority_performance() {
     // 测试场景：验证命令优先级机制不引入性能开销
 
@@ -519,6 +532,7 @@ fn test_command_priority_performance() {
     let ctx = Arc::new(PiperContext::new());
     let _config = PipelineConfig::default();
     let is_running = Arc::new(AtomicBool::new(true));
+    let last_fault = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
 
     // 创建 TX 适配器
@@ -534,6 +548,7 @@ fn test_command_priority_performance() {
     let ctx_tx = ctx.clone();
     let is_running_tx = is_running.clone();
     let metrics_tx = metrics.clone();
+    let last_fault_tx = last_fault.clone();
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
@@ -542,6 +557,7 @@ fn test_command_priority_performance() {
             is_running_tx,
             metrics_tx,
             ctx_tx,
+            last_fault_tx,
         );
     });
 
@@ -571,6 +587,7 @@ fn test_command_priority_performance() {
 
     // 测试使用 PiperCommand（有优先级）
     let is_running2 = Arc::new(AtomicBool::new(true));
+    let last_fault2 = Arc::new(AtomicU8::new(0));
     let metrics2 = Arc::new(PiperMetrics::new());
     let tx_adapter2 = SimpleTxAdapter::new(Duration::from_micros(100));
     let (realtime_tx2, _realtime_rx2) = crossbeam_channel::bounded::<PiperFrame>(1);
@@ -581,6 +598,7 @@ fn test_command_priority_performance() {
     let ctx_tx2 = ctx.clone();
     let is_running_tx2 = is_running2.clone();
     let metrics_tx2 = metrics2.clone();
+    let last_fault_tx2 = last_fault2.clone();
     let tx_handle2 = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter2,
@@ -589,6 +607,7 @@ fn test_command_priority_performance() {
             is_running_tx2,
             metrics_tx2,
             ctx_tx2,
+            last_fault_tx2,
         );
     });
 

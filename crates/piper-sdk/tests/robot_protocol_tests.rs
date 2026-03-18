@@ -2,7 +2,7 @@
 //!
 //! 测试各种协议反馈帧的解析和状态更新。
 
-use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
+use piper_sdk::can::{CanAdapter, CanError, PiperFrame, SplittableAdapter};
 use piper_sdk::driver::*;
 use piper_sdk::protocol::ids::*;
 use std::collections::VecDeque;
@@ -38,6 +38,43 @@ impl CanAdapter for MockCanAdapter {
     }
 }
 
+struct MockRxAdapter {
+    receive_queue: Arc<Mutex<VecDeque<PiperFrame>>>,
+}
+
+impl piper_sdk::can::RxAdapter for MockRxAdapter {
+    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        self.receive_queue.lock().unwrap().pop_front().ok_or(CanError::Timeout)
+    }
+}
+
+struct MockTxAdapter {
+    sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+}
+
+impl piper_sdk::can::TxAdapter for MockTxAdapter {
+    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        self.sent_frames.lock().unwrap().push(frame);
+        Ok(())
+    }
+}
+
+impl SplittableAdapter for MockCanAdapter {
+    type RxAdapter = MockRxAdapter;
+    type TxAdapter = MockTxAdapter;
+
+    fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+        Ok((
+            MockRxAdapter {
+                receive_queue: Arc::clone(&self.receive_queue),
+            },
+            MockTxAdapter {
+                sent_frames: Arc::clone(&self.sent_frames),
+            },
+        ))
+    }
+}
+
 /// 测试 RobotStatusFeedback (0x2A1) 更新 RobotControlState
 #[test]
 fn test_robot_status_feedback_update() {
@@ -48,7 +85,7 @@ fn test_robot_status_feedback_update() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建 RobotStatusFeedback 帧 (0x2A1)
     let status_frame = PiperFrame::new_standard(
@@ -87,7 +124,7 @@ fn test_gripper_feedback_update() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建 GripperFeedback 帧 (0x2A8)
     // travel_mm: 100mm = 100000 (0.001mm 单位) -> i32
@@ -124,7 +161,7 @@ fn test_command_channel_send() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 发送命令帧
     let cmd_frame = PiperFrame::new_standard(0x150, &[0x01, 0x02, 0x03]);
@@ -174,7 +211,7 @@ fn test_joint_driver_low_speed_feedback_update() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建 6 个关节的低速反馈帧 (0x261-0x266)
     for joint_index in 1..=6 {
@@ -213,7 +250,7 @@ fn test_collision_protection_level_feedback_update() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建 CollisionProtectionLevelFeedback 帧 (0x47B)
     // Byte 0-5: 6 个关节的保护等级 (0-8)
@@ -249,7 +286,7 @@ fn test_motor_limit_feedback_accumulation() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 发送 6 个 0x473 帧，每个关节一次
     for joint_index in 1..=6 {
@@ -287,7 +324,7 @@ fn test_motor_max_accel_feedback_accumulation() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 发送 6 个 0x47C 帧，每个关节一次
     for joint_index in 1..=6 {
@@ -322,7 +359,7 @@ fn test_end_velocity_accel_feedback_update() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建 EndVelocityAccelFeedback 帧 (0x478)
     // 最大线速度: 0.5 m/s = 500 (0.001m/s 单位)
@@ -360,7 +397,7 @@ fn test_can_receive_error_timeout() {
         receive_queue: Arc::new(Mutex::new(VecDeque::new())),
         sent_frames: Arc::new(Mutex::new(Vec::new())),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 不发送任何帧，MockCanAdapter 会返回 Timeout
     // 等待 IO 线程处理超时
@@ -383,7 +420,7 @@ fn test_can_send_error_handling() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 发送命令帧（应该成功）
     let cmd_frame = PiperFrame::new_standard(0x150, &[0x01]);
@@ -400,7 +437,7 @@ fn test_frame_parse_error_invalid_frame() {
         receive_queue: mock_can_clone.receive_queue.clone(),
         sent_frames: mock_can_clone.sent_frames.clone(),
     };
-    let piper = Piper::new(can_adapter, None).unwrap();
+    let piper = Piper::new_dual_thread(can_adapter, None).unwrap();
 
     // 创建一个无效的 CAN 帧（错误的 ID 或数据长度）
     // 例如：使用正确 ID 但数据长度不足

@@ -26,7 +26,7 @@
 //! - ✅ 标准帧和扩展帧支持
 
 // GS-USB 模块在所有平台可用
-use piper_sdk::can::gs_usb::GsUsbCanAdapter;
+use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_sdk::can::{CanAdapter, PiperFrame};
 
 /// 测试 Loopback 模式端到端流程

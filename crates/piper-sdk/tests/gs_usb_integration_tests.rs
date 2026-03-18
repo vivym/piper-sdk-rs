@@ -11,7 +11,7 @@
 //! ```
 
 // GS-USB 模块只在非 Linux 系统上可用
-use piper_sdk::can::gs_usb::GsUsbCanAdapter;
+use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_sdk::can::{CanAdapter, PiperFrame};
 
 /// 检测是否在CI环境中运行
