@@ -7,10 +7,10 @@ members = [
     "crates/piper-client",
     "crates/piper-sdk",
     "crates/piper-tools",
-    "crates/piper-physics",
     "apps/daemon",
     "apps/cli",
 ]
+exclude = ["addons/piper-physics-mujoco"]
 
 [workspace.package]
 version = "0.0.3"
@@ -30,7 +30,6 @@ piper-driver = { version = "0.0.3", path = "crates/piper-driver" }
 piper-client = { version = "0.0.3", path = "crates/piper-client" }
 piper-sdk = { version = "0.0.3", path = "crates/piper-sdk" }
 piper-tools = { version = "0.0.3", path = "crates/piper-tools" }
-piper-physics = { version = "0.0.3", path = "crates/piper-physics" }
 
 # 协议层外部依赖
 bilge = "0.3.0"

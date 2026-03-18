@@ -1,14 +1,14 @@
 [package]
 name = "piper-physics"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.0.3"
+edition = "2024"
+authors = ["Ming Yang"]
+license = "MIT"
+repository = "https://github.com/vivym/piper-sdk-rs"
 description = "Physics calculations for Piper robot including gravity compensation"
 
 [dependencies]
-piper-sdk = { version = "0.0.3", path = "../piper-sdk" }
+piper-sdk = { version = "0.0.3", path = "../../crates/piper-sdk" }
 
 # 必选依赖（通过 re-export 模式）
 nalgebra = { version = "0.32", features = ["std"] }
@@ -25,9 +25,11 @@ log = "0.4"
 
 [dev-dependencies]
 # 用于测试
-piper-sdk = { version = "0.0.3", path = "../piper-sdk" }
+piper-sdk = { version = "0.0.3", path = "../../crates/piper-sdk" }
 env_logger = "0.10"
 approx = "0.5"
 
 # 用于真实机械臂控制的example
 ctrlc = "3.4"
+
+[workspace]

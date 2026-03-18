@@ -19,11 +19,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
       - name: Cache cargo registry
         uses: actions/cache@v3
         with:
@@ -37,22 +32,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Cache MuJoCo for check (includes piper-physics)
-      - name: Cache MuJoCo
-        uses: actions/cache@v3
-        with:
-          path: ~/.local/lib/mujoco
-          key: mujoco-${{ runner.os }}-3.3.7
-
-      # Setup MuJoCo environment for check
-      - name: Setup MuJoCo Environment
-        shell: bash
-        run: |
-          # Export MuJoCo environment variables to subsequent steps
-          just _mujoco_download >> $GITHUB_ENV
-
       - name: Check code
-        run: just check
+        run: cargo check --workspace --all-targets
 
   fmt:
     name: Format
@@ -92,11 +73,6 @@ jobs:
         with:
           components: clippy
 
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
       - name: Cache cargo registry
         uses: actions/cache@v3
         with:
@@ -110,27 +86,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Cache MuJoCo for clippy-all (includes piper-physics)
-      - name: Cache MuJoCo
-        uses: actions/cache@v3
-        with:
-          path: ~/.local/lib/mujoco
-          key: mujoco-${{ runner.os }}-3.3.7
-
-      # Setup MuJoCo environment for clippy-all
-      - name: Setup MuJoCo Environment
-        shell: bash
-        run: |
-          # Export MuJoCo environment variables to subsequent steps
-          just _mujoco_download >> $GITHUB_ENV
-
-      # Run clippy with hardware backends and full features (including piper-physics)
-      - name: Clippy check (hardware mode)
-        run: just clippy-all
-
-      # Run clippy with mock mode (library code only, no hardware)
-      - name: Clippy check (mock mode)
-        run: just clippy-mock
+      - name: Clippy check
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test (Unit)
@@ -146,31 +103,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
-
-      # ✅ 安装 just 命令运行器
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
-      # ✅ 缓存 MuJoCo 安装（路径与 justfile 严格一致）
-      - name: Cache MuJoCo
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.local/lib/mujoco                    # Linux
-            ~/Library/Frameworks/mujoco.framework   # macOS
-            ~\AppData\Local\mujoco                 # Windows
-          key: mujoco-${{ runner.os }}-3.3.7
-
-      # ✅ 设置 MuJoCo 环境（复用 justfile 逻辑）
-      # 将 _mujoco_download 的输出写入 $GITHUB_ENV
-      - name: Setup MuJoCo Environment
-        shell: bash
-        run: |
-          # _mujoco_download 输出: export MUJOCO_DYNAMIC_LINK_DIR=...
-          # 写入 $GITHUB_ENV 使后续 step 可以读取环境变量
-          just _mujoco_download >> $GITHUB_ENV
 
       - name: Setup vcan0 (Linux only)
         if: matrix.os == 'ubuntu-latest'
@@ -192,9 +124,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # ✅ 运行测试（just test 已包含 unit/integration/doctest）
       - name: Run tests
-        run: just test
+        run: cargo test --workspace --all-targets
 
   docs:
     name: Documentation
@@ -206,6 +137,36 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-docs
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --document-private-items
+
+      - name: Check documentation links
+        run: cargo doc --workspace --no-deps --document-private-items 2>&1 | grep -i "warning\\|error" && exit 1 || exit 0
+
+  physics-addon:
+    name: Physics Addon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Install just
         uses: taiki-e/install-action@v2
@@ -225,22 +186,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Cache MuJoCo for docs (includes piper-physics)
       - name: Cache MuJoCo
         uses: actions/cache@v3
         with:
           path: ~/.local/lib/mujoco
           key: mujoco-${{ runner.os }}-3.3.7
 
-      # Setup MuJoCo environment for docs
-      - name: Setup MuJoCo Environment
-        shell: bash
-        run: |
-          # Export MuJoCo environment variables to subsequent steps
-          just _mujoco_download >> $GITHUB_ENV
+      - name: Check addon
+        run: just check-physics
 
-      - name: Build documentation
-        run: just doc
+      - name: Test addon
+        run: just test-physics
 
-      - name: Check documentation links
-        run: just doc-check
+      - name: Clippy addon
+        run: just clippy-physics

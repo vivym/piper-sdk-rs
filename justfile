@@ -9,87 +9,33 @@ default:
 
 # Build the entire workspace
 build:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
     cargo build --workspace
 
 # Build specific package
 build-pkg package:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
     cargo build -p {{package}}
+
+# Build the MuJoCo addon explicitly
+build-physics:
+    #!/usr/bin/env bash
+    eval "$(just _mujoco_download addons/piper-physics-mujoco/Cargo.toml)"
+    cargo build --manifest-path addons/piper-physics-mujoco/Cargo.toml
 
 # Run all tests
 test:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
-    cargo test --workspace
+    cargo test --workspace --all-targets
 
 # Run tests for specific package (with optional extra arguments)
 test-pkg package *args:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
     cargo test -p {{package}} {{args}}
+
+test-physics *args:
+    #!/usr/bin/env bash
+    eval "$(just _mujoco_download addons/piper-physics-mujoco/Cargo.toml)"
+    cargo test --manifest-path addons/piper-physics-mujoco/Cargo.toml {{args}}
 
 # Run release build
 release:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
     cargo build --workspace --release
 
 # Publish all crates to crates.io (calls batch1 then batch2 to handle rate limits)
@@ -107,29 +53,19 @@ publish:
 
 # Publish crates to crates.io - batch 1: base layer (5 crates)
 publish-batch1:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-    fi
     cargo release -p piper-protocol -p piper-can -p piper-driver -p piper-tools -p piper-client --execute
 
 # Publish crates to crates.io - batch 2: top layer (2 crates)
 publish-batch2:
+    cargo release -p piper-sdk --no-tag --execute
+
+publish-physics:
     #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-    fi
-    cargo release -p piper-sdk -p piper-physics --no-tag --execute
+    eval "$(just _mujoco_download addons/piper-physics-mujoco/Cargo.toml)"
+    cargo release --manifest-path addons/piper-physics-mujoco/Cargo.toml --no-tag --execute
 
 # Dry-run publish to verify all crates are ready (without actually uploading)
 publish-dry:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-    fi
     cargo release
 
 # Clean build artifacts
@@ -138,74 +74,29 @@ clean:
 
 # Check code
 check:
+    cargo check --workspace --all-targets
+
+check-physics:
     #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
-    cargo check --all-targets
+    eval "$(just _mujoco_download addons/piper-physics-mujoco/Cargo.toml)"
+    cargo check --manifest-path addons/piper-physics-mujoco/Cargo.toml --all-targets
 
 # Run linter (default, no MuJoCo needed)
 clippy:
-    cargo clippy --workspace --exclude piper-physics --all-targets --features "piper-driver/realtime" -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Run linter with all features (excluding mock due to conflicts, requires MuJoCo)
+# Run linter with all features
 clippy-all:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
-    cargo clippy --workspace --all-targets --features "piper-driver/realtime,piper-sdk/serde,piper-tools/full" -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Run linter on piper-physics only (requires MuJoCo)
 clippy-physics:
     #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
-    cargo clippy -p piper-physics --all-targets -- -D warnings
+    eval "$(just _mujoco_download addons/piper-physics-mujoco/Cargo.toml)"
+    cargo clippy --manifest-path addons/piper-physics-mujoco/Cargo.toml --all-targets -- -D warnings
 
 # Run linter with mock mode (library code only, no tests/examples/bins)
 clippy-mock:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
     # Note: tests, examples, and bins require hardware backends (GsUsb, SocketCAN)
     # We use --lib to check only library source code with mock feature
     # Dynamically list library crates to avoid manual maintenance
@@ -222,37 +113,16 @@ fmt-check:
 
 # Build documentation
 doc:
-    #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
-    cargo doc --no-deps --document-private-items
+    cargo doc --workspace --no-deps --document-private-items
 
 # Check documentation links
 doc-check:
+    cargo doc --workspace --no-deps --document-private-items 2>&1 | grep -i "warning\|error" && exit 1 || exit 0
+
+doc-physics:
     #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
-    if [ -n "${MUJOCO_DYNAMIC_LINK_DIR:-}" ]; then
-        >&2 echo "✓ Using MuJoCo from: $MUJOCO_DYNAMIC_LINK_DIR"
-        case "$(uname -s)" in
-            Linux*)
-                >&2 echo "✓ RPATH embedded for Linux"
-                ;;
-            Darwin*)
-                >&2 echo "✓ Framework linked for macOS"
-                ;;
-        esac
-    fi
-    cargo doc --no-deps --document-private-items 2>&1 | grep -i "warning\|error" && exit 1 || exit 0
+    eval "$(just _mujoco_download addons/piper-physics-mujoco/Cargo.toml)"
+    cargo doc --manifest-path addons/piper-physics-mujoco/Cargo.toml --no-deps --document-private-items
 
 # Show MuJoCo installation location
 mujoco-info:
@@ -273,7 +143,7 @@ mujoco-clean:
 # Open shell with MuJoCo environment
 mujoco-shell:
     #!/usr/bin/env bash
-    eval "$(just _mujoco_download)"
+    eval "$(just _mujoco_download addons/piper-physics-mujoco/Cargo.toml)"
     @echo "=== MuJoCo Environment Shell ==="
     @echo "Type 'exit' to leave the shell"
     @echo ""
@@ -282,21 +152,30 @@ mujoco-shell:
 # Private helper: Parse MuJoCo version from cargo metadata
 # Uses cargo metadata instead of Cargo.lock to support library projects
 # that don't commit Cargo.lock to version control
-_mujoco_parse_version:
+_mujoco_parse_version manifest='addons/piper-physics-mujoco/Cargo.toml':
     #!/usr/bin/env bash
+    set -euo pipefail
     # Use cargo metadata to get the resolved mujoco-rs version
     # Format: "2.3.0+mj-3.3.7" -> extract "3.3.7"
-    cargo metadata --format-version 1 2>/dev/null | \
-      python3 -c 'import sys, json; data = json.load(sys.stdin); pkgs = {p["name"]: p for p in data["packages"]}; print(pkgs.get("mujoco-rs", {}).get("version", "NOT_FOUND"))' | \
-      sed -E 's/.*\+mj-([0-9.]+).*/\1/'
+    version=$(
+      cargo metadata --manifest-path {{manifest}} --format-version 1 2>/dev/null | \
+        python3 -c 'import sys, json; data = json.load(sys.stdin); pkgs = {p["name"]: p for p in data["packages"]}; print(pkgs.get("mujoco-rs", {}).get("version", "NOT_FOUND"))' 2>/dev/null | \
+        sed -E 's/.*\+mj-([0-9.]+).*/\1/' || true
+    )
+
+    if [ -z "$version" ] || [ "$version" = "NOT_FOUND" ]; then
+        version="3.3.7"
+    fi
+
+    echo "$version"
 
 # Private helper: Download/setup MuJoCo (cross-platform with manual download)
-_mujoco_download:
+_mujoco_download manifest='addons/piper-physics-mujoco/Cargo.toml':
     #!/usr/bin/env bash
     set -euo pipefail
 
     # Get MuJoCo version from Cargo.lock
-    mujoco_version=$(just _mujoco_parse_version)
+    mujoco_version=$(just _mujoco_parse_version {{manifest}})
     base_url="https://github.com/google-deepmind/mujoco/releases/download"
 
     # Detect platform and set directories

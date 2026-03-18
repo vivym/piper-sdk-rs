@@ -72,18 +72,24 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("🔌 Connecting to robot...");
 
     // Get CAN interface from command line args, or use default
-    let can_interface = std::env::args().nth(1).unwrap_or_else(|| {
-        #[cfg(target_os = "linux")]
-        {
-            "can0".to_string()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            "auto".to_string()
-        }
-    });
+    let connection_target = std::env::args().nth(1);
 
-    let driver = PiperBuilder::new().interface(&can_interface).build()?;
+    let builder = match connection_target.as_deref() {
+        #[cfg(target_os = "linux")]
+        Some("auto") => PiperBuilder::new(),
+        #[cfg(not(target_os = "linux"))]
+        Some("auto") => PiperBuilder::new().gs_usb_auto(),
+        #[cfg(target_os = "linux")]
+        Some(target) => PiperBuilder::new().socketcan(target),
+        #[cfg(not(target_os = "linux"))]
+        Some(target) => PiperBuilder::new().gs_usb_serial(target),
+        #[cfg(target_os = "linux")]
+        None => PiperBuilder::new().socketcan("can0"),
+        #[cfg(not(target_os = "linux"))]
+        None => PiperBuilder::new().gs_usb_auto(),
+    };
+
+    let driver = builder.build()?;
 
     println!("✓ Connected to CAN interface\n");
 

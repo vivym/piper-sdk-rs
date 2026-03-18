@@ -1,4 +1,4 @@
-# Piper SDK - MuJoCo 快速开始
+# Piper SDK - 快速开始
 
 ## ⚡ 快速开始（3 步）
 
@@ -6,7 +6,7 @@
 # 1. 安装 just 命令运行器
 cargo install just
 
-# 2. 构建项目（首次会自动下载 MuJoCo）
+# 2. 构建主 workspace
 just build
 
 # 3. 运行测试
@@ -15,7 +15,7 @@ just test
 
 ## 构建
 
-本项目使用 MuJoCo 物理引擎进行重力补偿计算。首次构建时会自动下载 MuJoCo 库到系统缓存目录。
+主 workspace 默认不再依赖 MuJoCo。MuJoCo 物理能力已拆分到独立 addon `addons/piper-physics-mujoco/`，只有在显式构建 addon 时才需要下载和配置 MuJoCo。
 
 ### 推荐方式（使用 `just` 命令运行器）
 
@@ -32,8 +32,9 @@ just build
 # 运行所有测试
 just test
 
-# 运行特定包的测试
-just test-pkg piper-physics
+# 运行 MuJoCo addon
+just build-physics
+just test-physics
 
 # 发布构建
 just release
@@ -134,7 +135,8 @@ just                    # 列出所有命令
 # === 构建与测试 ===
 just build              # 构建整个项目
 just test               # 运行所有测试
-just test-pkg piper-physics  # 运行特定包的测试
+just build-physics      # 构建 MuJoCo addon
+just test-physics       # 运行 MuJoCo addon 测试
 just check              # 快速检查（编译但不运行）
 just release            # 发布构建
 just clean              # 清理构建产物
@@ -142,9 +144,10 @@ just clean              # 清理构建产物
 # === 代码质量检查 ===
 just fmt                # 格式化代码
 just fmt-check          # 验证格式（不修改文件）
-just clippy             # 日常开发检查（default + realtime）
-just clippy-all         # 完整功能检查（+serde +statistics）
+just clippy             # 主 workspace 全量 clippy
+just clippy-all         # 与 just clippy 等价，保留兼容入口
 just clippy-mock        # Mock 模式检查（无硬件环境）
+just clippy-physics     # MuJoCo addon clippy
 
 # === MuJoCo 管理 ===
 just mujoco-info        # MuJoCo 缓存信息
@@ -173,8 +176,8 @@ just fmt-check && just clippy-all
 
 | 命令 | Features | 执行时间 | 适用场景 |
 |------|----------|---------|----------|
-| `just clippy` | default + realtime | ~0.2s | 日常开发 |
-| `just clippy-all` | default + realtime + serde + statistics | ~0.2s | **Pre-commit、PR 检查** |
+| `just clippy` | workspace + all-features | ~0.2s | 日常开发 |
+| `just clippy-all` | workspace + all-features | ~0.2s | **Pre-commit、PR 检查** |
 | `just clippy-mock` | mock（排他） | ~0.07s | Mock 模式开发 |
 
 **推荐工作流**：
@@ -213,9 +216,10 @@ just fmt-check && just clippy-all
 ### Q: 测试失败了怎么办？
 
 **A**:
-1. 确保运行 `just test`（包含 MuJoCo 设置）
-2. 单独运行失败的测试：`cargo test test_name`
-3. 查看测试文档：`docs/v0/test_env_var_race_condition_fix.md`
+1. 先运行 `just test`
+2. 如果是物理 addon，再运行 `just test-physics`
+3. 单独运行失败的测试：`cargo test test_name`
+4. 查看测试文档：`docs/v0/test_env_var_race_condition_fix.md`
 
 ## 获取帮助
 
