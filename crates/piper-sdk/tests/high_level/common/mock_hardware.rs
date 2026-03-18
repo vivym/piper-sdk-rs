@@ -354,10 +354,10 @@ mod tests {
     fn test_gripper_state_update() {
         let bus = MockCanBus::new();
 
-        bus.set_gripper_state(0.05, 10.0, true);
+        bus.set_gripper_state(0.05, 5.0, true);
         let state = bus.get_hardware_state();
         assert_eq!(state.gripper_position, 0.05);
-        assert_eq!(state.gripper_effort, 10.0);
+        assert_eq!(state.gripper_effort, 5.0);
         assert!(state.gripper_enabled);
     }
 }

@@ -88,7 +88,7 @@ impl<'a> RawCommander<'a> {
         .into_iter()
         .enumerate()
         {
-            let joint_index = joint.index() as u8;
+            let joint_index = joint.index() as u8 + 1;
             let pos_ref = positions[joint].0 as f32;
             let vel_ref = velocities[joint] as f32;
             let kp_f32 = kp[joint] as f32; // 每个关节独立的 kp 增益
@@ -464,15 +464,114 @@ unsafe impl<'a> Sync for RawCommander<'a> {}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use piper_can::{CanError, RxAdapter, TxAdapter};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct IdleRxAdapter;
+
+    impl RxAdapter for IdleRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            Err(CanError::Timeout)
+        }
+    }
+
+    struct RecordingTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    }
+
+    impl RecordingTxAdapter {
+        fn new(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> Self {
+            Self { sent_frames }
+        }
+    }
+
+    impl TxAdapter for RecordingTxAdapter {
+        fn send(&mut self, frame: PiperFrame) -> std::result::Result<(), CanError> {
+            self.sent_frames.lock().unwrap().push(frame);
+            Ok(())
+        }
+    }
+
+    fn build_driver(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> RobotPiper {
+        RobotPiper::new_dual_thread_parts(IdleRxAdapter, RecordingTxAdapter::new(sent_frames), None)
+            .expect("driver should start")
+    }
+
+    fn wait_for_sent_frames(
+        sent_frames: &Arc<Mutex<Vec<PiperFrame>>>,
+        expected: usize,
+    ) -> Vec<PiperFrame> {
+        let start = Instant::now();
+        loop {
+            let frames = sent_frames.lock().unwrap().clone();
+            if frames.len() >= expected {
+                return frames;
+            }
+
+            assert!(
+                start.elapsed() < Duration::from_millis(200),
+                "timed out waiting for {} sent frames, got {}",
+                expected,
+                frames.len()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn test_raw_commander_creation() {
-        // 测试 RawCommander 可以创建（需要真实的 robot 实例）
-        // 这个测试应该在集成测试中完成
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames);
+        let _commander = RawCommander::new(&driver);
     }
 
     #[test]
     fn test_send_sync() {
         // 注意：RawCommander 现在有生命周期参数，需要特殊处理
         // 在实际使用中，它会被包含在有生命周期的上下文中
+    }
+
+    #[test]
+    fn test_send_mit_command_batch_uses_all_six_joint_ids() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+
+        let positions = JointArray::splat(Rad(0.0));
+        let velocities = JointArray::splat(0.0);
+        let kp = JointArray::splat(10.0);
+        let kd = JointArray::splat(0.8);
+        let torques = JointArray::splat(NewtonMeter(0.0));
+
+        commander
+            .send_mit_command_batch(&positions, &velocities, &kp, &kd, &torques)
+            .expect("MIT batch send should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 6);
+        let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
+        assert_eq!(ids, vec![0x15A, 0x15B, 0x15C, 0x15D, 0x15E, 0x15F]);
+    }
+
+    #[test]
+    fn test_send_gripper_command_full_effort_maps_to_protocol_full_scale() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+
+        commander
+            .send_gripper_command(1.0, 1.0)
+            .expect("gripper command should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 1);
+        let frame = &frames[0];
+        assert_eq!(frame.id, ID_GRIPPER_CONTROL);
+        assert_eq!(
+            i16::from_be_bytes([frame.data[4], frame.data[5]]),
+            5000,
+            "effort=1.0 should map to 5.0 N·m full scale"
+        );
     }
 }

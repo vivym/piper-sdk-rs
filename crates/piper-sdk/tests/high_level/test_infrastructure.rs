@@ -70,11 +70,11 @@ fn test_joint_position_control() {
 fn test_gripper_control() {
     let bus = MockCanBus::new();
 
-    bus.set_gripper_state(0.05, 10.0, true);
+    bus.set_gripper_state(0.05, 5.0, true);
 
     let state = bus.get_hardware_state();
     assert_eq!(state.gripper_position, 0.05);
-    assert_eq!(state.gripper_effort, 10.0);
+    assert_eq!(state.gripper_effort, 5.0);
     assert!(state.gripper_enabled);
 }
 
@@ -84,7 +84,7 @@ fn test_feedback_frame_generation() {
 
     // 设置状态
     bus.set_joint_position(0, 1.5);
-    bus.set_gripper_state(0.05, 10.0, true);
+    bus.set_gripper_state(0.05, 5.0, true);
 
     // 生成反馈帧
     bus.generate_feedback_frame();
@@ -205,4 +205,3 @@ fn test_latency_simulation() {
     // 应该至少有 1ms 的延迟
     assert!(elapsed >= Duration::from_micros(1000));
 }
-

@@ -10,7 +10,7 @@ pub const GRIPPER_POSITION_SCALE: f64 = 100.0;
 /// Gripper 力度归一化比例尺
 ///
 /// 将硬件值（N·m）转换为归一化值（0.0-1.0）
-pub const GRIPPER_FORCE_SCALE: f64 = 10.0;
+pub const GRIPPER_FORCE_SCALE: f64 = 5.0;
 
 // 重新导出 CAN ID 常量（从 ids.rs）
 pub use crate::ids::{
@@ -26,7 +26,7 @@ mod tests {
     fn test_gripper_normalization() {
         // 验证归一化常量的正确性
         assert_eq!(GRIPPER_POSITION_SCALE, 100.0);
-        assert_eq!(GRIPPER_FORCE_SCALE, 10.0);
+        assert_eq!(GRIPPER_FORCE_SCALE, 5.0);
 
         // 测试归一化
         let travel_mm = 50.0;
@@ -35,7 +35,7 @@ mod tests {
 
         let torque_nm = 5.0;
         let normalized = torque_nm / GRIPPER_FORCE_SCALE;
-        assert_eq!(normalized, 0.5);
+        assert_eq!(normalized, 1.0);
     }
 
     #[test]

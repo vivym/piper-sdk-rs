@@ -352,6 +352,36 @@ unsafe impl Sync for Observer {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+    use piper_protocol::ids::ID_GRIPPER_FEEDBACK;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    struct ScriptedRxAdapter {
+        frames: VecDeque<PiperFrame>,
+    }
+
+    impl ScriptedRxAdapter {
+        fn new(frames: Vec<PiperFrame>) -> Self {
+            Self {
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl RxAdapter for ScriptedRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            self.frames.pop_front().ok_or(CanError::Timeout)
+        }
+    }
+
+    struct IdleTxAdapter;
+
+    impl TxAdapter for IdleTxAdapter {
+        fn send(&mut self, _frame: PiperFrame) -> std::result::Result<(), CanError> {
+            Ok(())
+        }
+    }
 
     // 注意：单元测试中创建真实的 robot 实例需要真实的 CAN 适配器
     // 这里只测试类型和基本逻辑，集成测试会测试完整功能
@@ -386,6 +416,36 @@ mod tests {
         // 验证归一化范围
         assert!(gripper.position >= 0.0 && gripper.position <= 1.0);
         assert!(gripper.effort >= 0.0 && gripper.effort <= 1.0);
+    }
+
+    #[test]
+    fn test_gripper_effort_full_scale_matches_five_nm_feedback() {
+        let travel_raw = 50_000i32.to_be_bytes();
+        let torque_raw = 5_000i16.to_be_bytes();
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&travel_raw);
+        data[4..6].copy_from_slice(&torque_raw);
+        data[6] = 0b0100_0000; // enabled = true
+
+        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                ScriptedRxAdapter::new(vec![frame]),
+                IdleTxAdapter,
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let observer = Observer::new(driver.clone());
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("gripper feedback should arrive");
+
+        let gripper = observer.gripper_state();
+        assert_eq!(gripper.position, 0.5);
+        assert_eq!(gripper.effort, 1.0);
+        assert!(gripper.enabled);
     }
 
     #[test]

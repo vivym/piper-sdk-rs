@@ -203,6 +203,8 @@ mod tests {
         assert_eq!(FrameType::from_id(0x999), FrameType::Unknown);
         assert_eq!(FrameType::from_id(0x121), FrameType::Unknown); // 灯光控制，辅助功能
         assert_eq!(FrameType::from_id(0x422), FrameType::Unknown); // 固件升级，辅助功能
+        assert_eq!(FrameType::from_id(0x16A), FrameType::Unknown); // shifted control IDs 未实现
+        assert_eq!(FrameType::from_id(0x2B1), FrameType::Unknown); // shifted feedback IDs 未实现
     }
 
     #[test]

@@ -93,6 +93,7 @@ impl TryFrom<u8> for ControlIdOffset {
 /// 随动主从模式设置指令 (0x470)
 ///
 /// 用于设置机械臂为示教输入臂或运动输出臂，并配置 ID 偏移值。
+/// 当前 SDK 与官方 Python SDK 保持一致：这里只透传 offset 配置，不会据此改写本地收发分派。
 /// 协议长度：4 字节，但 CAN 帧为 8 字节（后 4 字节保留）。
 #[derive(Debug, Clone, Copy)]
 pub struct MasterSlaveModeCommand {
@@ -216,6 +217,7 @@ mod tests {
         assert_eq!(frame.data[1], 0x00); // None
         assert_eq!(frame.data[2], 0x00); // None
         assert_eq!(frame.data[3], 0x00); // None
+        assert_eq!(frame.data[4..], [0, 0, 0, 0]); // 8-byte zero padding
     }
 }
 

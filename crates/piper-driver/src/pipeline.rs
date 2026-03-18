@@ -1105,7 +1105,9 @@ fn parse_and_update_state(
                 let system_timestamp_us = safe_system_timestamp_us();
 
                 if let Ok(mut firmware_state) = ctx.firmware_version.write() {
-                    firmware_state.firmware_data.extend_from_slice(feedback.firmware_data());
+                    firmware_state
+                        .firmware_data
+                        .extend_from_slice(&feedback.firmware_data()[..frame.len as usize]);
                     firmware_state.hardware_timestamp_us = frame.timestamp_us;
                     firmware_state.system_timestamp_us = system_timestamp_us;
                     firmware_state.parse_version();

@@ -1405,6 +1405,14 @@ pub struct MitControlCommand {
 }
 
 impl MitControlCommand {
+    fn assert_valid_joint_index(joint_index: u8) {
+        assert!(
+            (1..=6).contains(&joint_index),
+            "MIT joint_index must be in [1, 6], got {}",
+            joint_index
+        );
+    }
+
     // ✅ 常量定义：消除魔法数字
     /// 位置参考范围（弧度）
     const P_MIN: f32 = -12.5;
@@ -1419,8 +1427,10 @@ impl MitControlCommand {
     const KD_MIN: f32 = -5.0;
     const KD_MAX: f32 = 5.0;
     /// 力矩参考范围（牛顿·米）
-    const T_MIN: f32 = -18.0;
-    const T_MAX: f32 = 18.0;
+    ///
+    /// 以官方 SDK 的实际编码逻辑为准：运行时代码固定按 [-8.0, 8.0] 编码。
+    const T_MIN: f32 = -8.0;
+    const T_MAX: f32 = 8.0;
 
     /// 辅助函数：将浮点数转换为无符号整数（根据协议公式）
     ///
@@ -1481,7 +1491,7 @@ impl MitControlCommand {
     /// - vel_ref: -45.0 ~ 45.0 rad/s
     /// - kp: 0.0 ~ 500.0
     /// - kd: -5.0 ~ 5.0
-    /// - t_ref: -18.0 ~ 18.0 N·m
+    /// - t_ref: -8.0 ~ 8.0 N·m（以官方 SDK 运行时代码为准）
     ///
     /// # Arguments
     ///
@@ -1497,6 +1507,7 @@ impl MitControlCommand {
     /// **v2.1**：移除了 `crc` 参数，CRC 在 `to_frame` 时即时计算。
     /// 这样可以避免"Stale CRC"问题（修改字段后 CRC 过期）。
     pub fn new(joint_index: u8, pos_ref: f32, vel_ref: f32, kp: f32, kd: f32, t_ref: f32) -> Self {
+        Self::assert_valid_joint_index(joint_index);
         Self {
             joint_index,
             pos_ref,
@@ -1588,7 +1599,7 @@ impl MitControlCommand {
     /// - Vel_ref: -45.0 ~ 45.0 rad/s (12位)
     /// - Kp: 0.0 ~ 500.0 (12位)
     /// - Kd: -5.0 ~ 5.0 (12位)
-    /// - T_ref: -18.0 ~ 18.0 N·m (8位)
+    /// - T_ref: -8.0 ~ 8.0 N·m (8位，按官方 SDK 实际编码实现)
     ///
     /// **版本变更**
     ///
@@ -1598,6 +1609,8 @@ impl MitControlCommand {
     /// - 将 CRC 填入第 8 字节的低 4 位
     /// - 避免 `T_ref` 的双重计算，性能优化
     pub fn to_frame(self) -> PiperFrame {
+        Self::assert_valid_joint_index(self.joint_index);
+
         // 1. 获取完整数据（CRC 位目前是 0）
         let mut data = self.encode_to_bytes();
 
@@ -1627,6 +1640,8 @@ impl MitControlCommand {
     /// **v2.1**：复用 `encode_to_bytes`，只需修改 CRC 位。
     #[cfg(test)]
     pub fn to_frame_with_custom_crc(self, custom_crc: u8) -> PiperFrame {
+        Self::assert_valid_joint_index(self.joint_index);
+
         // 复用 encode_to_bytes，只需修改 CRC 位
         let mut data = self.encode_to_bytes();
 
@@ -1689,6 +1704,12 @@ mod mit_control_tests {
     }
 
     #[test]
+    #[should_panic(expected = "MIT joint_index must be in [1, 6]")]
+    fn test_mit_control_command_rejects_zero_based_joint_index() {
+        let _ = MitControlCommand::new(0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    #[test]
     fn test_mit_control_command_calculate_crc() {
         // 测试 CRC 计算逻辑（私有方法，通过 to_frame 间接测试）
 
@@ -1721,6 +1742,40 @@ mod mit_control_tests {
 
         // 由于精度损失，允许一定误差
         assert!((float_val - original).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_mit_control_command_joint_ids_cover_full_range() {
+        for joint_index in 1..=6 {
+            let frame = MitControlCommand::new(joint_index, 0.0, 0.0, 0.0, 0.0, 0.0).to_frame();
+            assert_eq!(frame.id, ID_MIT_CONTROL_BASE + (joint_index - 1) as u32);
+        }
+    }
+
+    #[test]
+    fn test_mit_torque_range_matches_official_runtime() {
+        let min = MitControlCommand::float_to_uint(
+            MitControlCommand::T_MIN,
+            MitControlCommand::T_MIN,
+            MitControlCommand::T_MAX,
+            8,
+        );
+        let mid = MitControlCommand::float_to_uint(
+            0.0,
+            MitControlCommand::T_MIN,
+            MitControlCommand::T_MAX,
+            8,
+        );
+        let max = MitControlCommand::float_to_uint(
+            MitControlCommand::T_MAX,
+            MitControlCommand::T_MIN,
+            MitControlCommand::T_MAX,
+            8,
+        );
+
+        assert_eq!(min, 0);
+        assert!((127..=128).contains(&mid));
+        assert_eq!(max, 255);
     }
 }
 

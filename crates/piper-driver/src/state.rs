@@ -727,10 +727,14 @@ impl FirmwareVersionState {
     pub fn parse_version(&mut self) -> Option<String> {
         // 导入 FirmwareReadFeedback 的 parse_version_string 方法
         use piper_protocol::feedback::FirmwareReadFeedback;
+        if !self.check_completeness() {
+            self.version_string = None;
+            return None;
+        }
+
         if let Some(version) = FirmwareReadFeedback::parse_version_string(&self.firmware_data) {
             self.version_string = Some(version.clone());
-            // 同时更新完整性状态
-            self.check_completeness();
+            self.is_complete = true;
             Some(version)
         } else {
             self.version_string = None;
@@ -741,7 +745,7 @@ impl FirmwareVersionState {
 
     /// 获取版本字符串（如果已解析）
     pub fn version_string(&self) -> Option<&String> {
-        self.version_string.as_ref()
+        self.version_string.as_ref().filter(|_| self.is_complete)
     }
 }
 
@@ -2405,6 +2409,19 @@ mod tests {
 
         // 测试：未找到版本
         state.firmware_data = b"Some data without version".to_vec();
+        let version = state.parse_version();
+        assert_eq!(version, None);
+        assert!(state.version_string.is_none());
+        assert!(!state.is_complete);
+    }
+
+    #[test]
+    fn test_firmware_version_state_parse_version_requires_complete_payload() {
+        let mut state = FirmwareVersionState {
+            firmware_data: b"S-V1.6".to_vec(),
+            ..Default::default()
+        };
+
         let version = state.parse_version();
         assert_eq!(version, None);
         assert!(state.version_string.is_none());

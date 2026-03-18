@@ -1397,6 +1397,25 @@ mod tests {
     }
 
     #[test]
+    fn test_read_firmware_version_waits_for_complete_split_payload() {
+        let frame_1 =
+            PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"S-V1.6");
+        let frame_2 = PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"-3");
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![frame_1, frame_2], Duration::from_millis(20)),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        let version = piper
+            .read_firmware_version(Duration::from_millis(200))
+            .expect("firmware version should wait for all 8 bytes");
+        assert_eq!(version, "S-V1.6-3");
+        assert_eq!(piper.firmware_version_cached().as_deref(), Some("S-V1.6-3"));
+    }
+
+    #[test]
     fn test_send_frame_blocking_timeout() {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
