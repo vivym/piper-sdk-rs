@@ -20,6 +20,7 @@
 //! 对于常规录制场景，参见 [`recording`] 模块。
 
 pub mod builder; // Client 层 Builder
+mod connection;
 pub mod control;
 pub mod diagnostics;
 pub mod heartbeat;

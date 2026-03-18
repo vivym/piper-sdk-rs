@@ -11,6 +11,7 @@ readme = "../../README.md"
 [features]
 default = []
 serde = ["piper-client/serde", "piper-can/serde", "piper-protocol/serde"]
+mock = ["piper-can/mock"]
 
 [dependencies]
 piper-client = { workspace = true }

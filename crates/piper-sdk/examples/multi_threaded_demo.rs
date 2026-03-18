@@ -46,10 +46,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // ==================== 步骤 1: 连接并使能机械臂 ====================
     println!("📡 步骤 1: 连接并使能机械臂...");
 
-    let robot = PiperBuilder::new()
-        .interface(&args.interface)
-        .baud_rate(args.baud_rate)
-        .build()?;
+    let robot = {
+        #[cfg(target_os = "linux")]
+        {
+            PiperBuilder::new()
+                .socketcan(&args.interface)
+                .baud_rate(args.baud_rate)
+                .build()?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            PiperBuilder::new()
+                .gs_usb_serial(&args.interface)
+                .baud_rate(args.baud_rate)
+                .build()?
+        }
+    };
     let robot = robot.enable_mit_mode(MitModeConfig::default())?;
     println!("   ✅ 使能成功\n");
 

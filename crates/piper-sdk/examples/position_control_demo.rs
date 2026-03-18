@@ -54,10 +54,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("📡 步骤 1: 连接机械臂...");
 
     // 使用新的 Builder API 连接（自动处理平台差异）
-    let robot = PiperBuilder::new()
-        .interface(&args.interface)
-        .baud_rate(args.baud_rate)
-        .build()?;
+    let robot = {
+        #[cfg(target_os = "linux")]
+        {
+            PiperBuilder::new()
+                .socketcan(&args.interface)
+                .baud_rate(args.baud_rate)
+                .build()?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            PiperBuilder::new()
+                .gs_usb_serial(&args.interface)
+                .baud_rate(args.baud_rate)
+                .build()?
+        }
+    };
     println!("   ✅ 连接成功\n");
 
     // ==================== 步骤 2: 使能机械臂 ====================

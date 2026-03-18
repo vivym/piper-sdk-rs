@@ -259,42 +259,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. 在 macOS 平台下，默认使用 UDP 守护进程模式（127.0.0.1:18888）
     // 5. 在其他平台下，自动扫描 GS-USB 设备
     let builder = if let Some(daemon_addr) = &args.uds {
-        // 守护进程模式（UDS/UDP）- 所有平台支持
-        // 代码会自动识别是 UDS 路径还是 UDP 地址
         println!("使用守护进程模式: {}", daemon_addr);
-        PiperBuilder::new().with_daemon(daemon_addr)
+        if daemon_addr.starts_with('/') {
+            PiperBuilder::new().daemon_uds(daemon_addr)
+        } else {
+            PiperBuilder::new().daemon_udp(daemon_addr)
+        }
     } else if let Some(interface) = &args.interface {
-        // 指定接口/设备序列号（所有平台）
         #[cfg(target_os = "linux")]
         {
-            println!(
-                "使用 CAN 接口: {} (将尝试 SocketCAN，失败时自动切换到 GS-USB)",
-                interface
-            );
+            println!("使用 CAN 接口: {} (SocketCAN)", interface);
+            PiperBuilder::new().socketcan(interface)
         }
         #[cfg(not(target_os = "linux"))]
         {
             println!("使用设备序列号: {}", interface);
+            PiperBuilder::new().gs_usb_serial(interface)
         }
-        PiperBuilder::new().interface(interface)
     } else {
-        // 未指定任何参数，使用平台默认值
         #[cfg(target_os = "linux")]
         {
-            // Linux 平台：默认使用 can0（SocketCAN）
             println!("使用默认 CAN 接口: can0 (SocketCAN)");
-            PiperBuilder::new().interface("can0")
+            PiperBuilder::new().socketcan("can0")
         }
         #[cfg(target_os = "macos")]
         {
-            // macOS 平台：默认使用 UDP 守护进程模式
             let default_daemon = "127.0.0.1:18888";
             println!("使用默认守护进程模式: {} (UDP)", default_daemon);
-            PiperBuilder::new().with_daemon(default_daemon)
+            PiperBuilder::new().daemon_udp(default_daemon)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // 其他平台：自动扫描 GS-USB 设备
             println!("自动扫描 GS-USB 设备...");
             PiperBuilder::new()
         }

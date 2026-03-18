@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 注意：此示例需要实际的 CAN 适配器
     // 对于测试，可以使用 MockCanAdapter
     let robot = PiperBuilder::new()
-        .interface("can0")  // Linux: SocketCAN 接口名
+        .socketcan("can0")  // Linux: SocketCAN 接口名
         .baud_rate(1_000_000)  // CAN 波特率
         .build()?;
 

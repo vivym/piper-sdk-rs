@@ -9,10 +9,10 @@ use crate::metrics::{MetricsSnapshot, PiperMetrics};
 use crate::pipeline::*;
 use crate::state::*;
 use crossbeam_channel::Sender;
-use piper_can::{CanAdapter, CanError, PiperFrame, SplittableAdapter};
+use piper_can::{CanError, PiperFrame, RxAdapter, SplittableAdapter, TxAdapter};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{JoinHandle, spawn};
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -58,33 +58,58 @@ impl<T: std::marker::Send + 'static> JoinTimeout for JoinHandle<T> {
     }
 }
 
+#[derive(Debug)]
+struct RuntimeWorkers {
+    rx_thread: Option<JoinHandle<()>>,
+    tx_thread: Option<JoinHandle<()>>,
+}
+
+/// 运行时健康故障类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RuntimeFaultKind {
+    RxExited = 1,
+    TxExited = 2,
+    TransportError = 3,
+}
+
+impl RuntimeFaultKind {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::RxExited),
+            2 => Some(Self::TxExited),
+            3 => Some(Self::TransportError),
+            _ => None,
+        }
+    }
+}
+
+/// 运行时健康状态快照。
+#[derive(Debug, Clone)]
+pub struct HealthStatus {
+    pub connected: bool,
+    pub last_feedback_age: Duration,
+    pub rx_alive: bool,
+    pub tx_alive: bool,
+    pub fault: Option<RuntimeFaultKind>,
+}
+
 /// Piper 机械臂驱动（对外 API）
-///
-/// 支持单线程和双线程两种模式
-/// - 单线程模式：使用 `io_thread`（向后兼容）
-/// - 双线程模式：使用 `rx_thread` 和 `tx_thread`（物理隔离）
 pub struct Piper {
-    /// 命令发送通道（向 IO 线程发送控制帧，单线程模式）
-    ///
-    /// 需要在 Drop 时 **提前关闭通道**（在 join IO 线程之前），
-    /// 否则 `io_loop` 可能永远收不到 `Disconnected` 而导致退出卡住。
+    /// 可靠命令发送通道。
     cmd_tx: ManuallyDrop<Sender<PiperFrame>>,
-    /// 实时命令插槽（双线程模式，邮箱模式，Overwrite）
-    realtime_slot: Option<Arc<std::sync::Mutex<Option<RealtimeCommand>>>>,
-    /// 可靠命令队列发送端（双线程模式，容量 10，FIFO）
-    reliable_tx: Option<Sender<PiperFrame>>,
+    /// 实时命令插槽（邮箱模式，Overwrite）
+    realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>>,
     /// 共享状态上下文
     ctx: Arc<PiperContext>,
-    /// IO 线程句柄（单线程模式，Drop 时 join）
-    io_thread: Option<JoinHandle<()>>,
-    /// RX 线程句柄（双线程模式）
-    rx_thread: Option<JoinHandle<()>>,
-    /// TX 线程句柄（双线程模式）
-    tx_thread: Option<JoinHandle<()>>,
+    /// 统一管理的 worker 句柄。
+    workers: RuntimeWorkers,
     /// 运行标志（用于线程生命周期联动）
     is_running: Arc<AtomicBool>,
     /// 性能指标（原子计数器）
     metrics: Arc<PiperMetrics>,
+    /// 最近一次运行时故障。
+    runtime_fault: Arc<AtomicU8>,
     /// CAN 接口名称（用于录制元数据）
     interface: String,
     /// CAN 总线速度（bps）（用于录制元数据）
@@ -124,46 +149,20 @@ impl Piper {
         self
     }
 
-    /// 创建新的 Piper 实例
-    ///
-    /// # 参数
-    /// - `can`: CAN 适配器（会被移动到 IO 线程）
-    /// - `config`: Pipeline 配置（可选）
-    ///
-    /// # 错误
-    /// - `CanError`: CAN 设备初始化失败（注意：这里返回 CanError，因为 DriverError 尚未完全实现 `From<CanError>`）
-    pub fn new(
-        can: impl CanAdapter + Send + 'static,
-        config: Option<PipelineConfig>,
-    ) -> Result<Self, CanError> {
-        // 创建命令通道（有界队列，容量 10）
-        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(10);
+    fn rx_thread_alive(&self) -> bool {
+        self.workers
+            .rx_thread
+            .as_ref()
+            .map(|handle| !handle.is_finished())
+            .unwrap_or(false)
+    }
 
-        // 创建共享状态上下文
-        let ctx = Arc::new(PiperContext::new());
-
-        // 克隆上下文用于 IO 线程
-        let ctx_clone = ctx.clone();
-
-        // 启动 IO 线程
-        let io_thread = spawn(move || {
-            io_loop(can, cmd_rx, ctx_clone, config.unwrap_or_default());
-        });
-
-        Ok(Self {
-            cmd_tx: ManuallyDrop::new(cmd_tx),
-            realtime_slot: None, // 单线程模式
-            reliable_tx: None,   // 单线程模式
-            ctx,
-            io_thread: Some(io_thread),
-            rx_thread: None,                             // 单线程模式
-            tx_thread: None,                             // 单线程模式
-            is_running: Arc::new(AtomicBool::new(true)), // 默认运行中
-            metrics: Arc::new(PiperMetrics::new()),      // 初始化指标
-            interface: "unknown".to_string(),            // 未通过 builder 构建
-            bus_speed: 1_000_000,                        // 默认 1Mbps
-            driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
-        })
+    fn tx_thread_alive(&self) -> bool {
+        self.workers
+            .tx_thread
+            .as_ref()
+            .map(|handle| !handle.is_finished())
+            .unwrap_or(false)
     }
 
     /// 创建双线程模式的 Piper 实例
@@ -192,27 +191,29 @@ impl Piper {
         C::RxAdapter: Send + 'static,
         C::TxAdapter: Send + 'static,
     {
-        // 分离适配器
         let (rx_adapter, tx_adapter) = can.split()?;
+        Self::new_dual_thread_parts(rx_adapter, tx_adapter, config)
+    }
 
-        // 创建命令通道（邮箱模式 + 可靠队列容量 10）
+    /// 使用已拆分的 RX/TX 适配器创建双线程 runtime。
+    pub fn new_dual_thread_parts(
+        rx_adapter: impl RxAdapter + Send + 'static,
+        tx_adapter: impl TxAdapter + Send + 'static,
+        config: Option<PipelineConfig>,
+    ) -> Result<Self, CanError> {
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
-
-        // 创建共享状态上下文
         let ctx = Arc::new(PiperContext::new());
-
-        // 创建运行标志和指标
         let is_running = Arc::new(AtomicBool::new(true));
         let metrics = Arc::new(PiperMetrics::new());
+        let runtime_fault = Arc::new(AtomicU8::new(0));
 
-        // 克隆用于线程
         let ctx_clone = ctx.clone();
         let is_running_clone = is_running.clone();
         let metrics_clone = metrics.clone();
+        let runtime_fault_rx = runtime_fault.clone();
         let config_clone = config.clone().unwrap_or_default();
 
-        // 启动 RX 线程
         let rx_thread = spawn(move || {
             crate::pipeline::rx_loop(
                 rx_adapter,
@@ -220,16 +221,16 @@ impl Piper {
                 config_clone,
                 is_running_clone,
                 metrics_clone,
+                runtime_fault_rx,
             );
         });
 
-        // 克隆用于 TX 线程
         let ctx_tx = ctx.clone();
         let is_running_tx = is_running.clone();
         let metrics_tx = metrics.clone();
         let realtime_slot_tx = realtime_slot.clone();
+        let runtime_fault_tx = runtime_fault.clone();
 
-        // 启动 TX 线程（邮箱模式）
         let tx_thread = spawn(move || {
             crate::pipeline::tx_loop_mailbox(
                 tx_adapter,
@@ -237,50 +238,52 @@ impl Piper {
                 reliable_rx,
                 is_running_tx,
                 metrics_tx,
-                ctx_tx, // 🆕 v1.2.1: 传入 ctx 用于触发 TX 回调
+                ctx_tx,
+                runtime_fault_tx,
             );
         });
 
-        // 给 RX 线程一些启动时间，确保它已经开始接收数据
-        // 这对于 wait_for_feedback 很重要，因为如果 RX 线程还没启动，就无法收到反馈
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         Ok(Self {
-            cmd_tx: ManuallyDrop::new(reliable_tx.clone()), // 向后兼容：单线程模式使用
-            realtime_slot: Some(realtime_slot),             // 实时命令邮箱
-            reliable_tx: Some(reliable_tx),                 // 可靠队列
+            cmd_tx: ManuallyDrop::new(reliable_tx),
+            realtime_slot,
             ctx,
-            io_thread: None, // 双线程模式不使用 io_thread
-            rx_thread: Some(rx_thread),
-            tx_thread: Some(tx_thread),
+            workers: RuntimeWorkers {
+                rx_thread: Some(rx_thread),
+                tx_thread: Some(tx_thread),
+            },
             is_running,
             metrics,
-            interface: "unknown".to_string(), // 未通过 builder 构建
-            bus_speed: 1_000_000,             // 默认 1Mbps
+            runtime_fault,
+            interface: "unknown".to_string(),
+            bus_speed: 1_000_000,
             driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
         })
     }
 
-    /// 检查线程健康状态
-    ///
-    /// 返回 RX 和 TX 线程的存活状态。
-    ///
-    /// # 返回
-    /// - `(rx_alive, tx_alive)`: 两个布尔值，表示线程是否还在运行
-    pub fn check_health(&self) -> (bool, bool) {
-        let rx_alive = self.rx_thread.as_ref().map(|h| !h.is_finished()).unwrap_or(true); // 单线程模式下，认为健康
+    /// 获取运行时健康状态。
+    pub fn health(&self) -> HealthStatus {
+        let rx_alive = self.rx_thread_alive();
+        let tx_alive = self.tx_thread_alive();
+        let connected = self.is_connected();
+        let last_feedback_age = self.connection_age();
 
-        let tx_alive = self.tx_thread.as_ref().map(|h| !h.is_finished()).unwrap_or(true); // 单线程模式下，认为健康
+        let fault = if !rx_alive {
+            Some(RuntimeFaultKind::RxExited)
+        } else if !tx_alive {
+            Some(RuntimeFaultKind::TxExited)
+        } else {
+            RuntimeFaultKind::from_raw(self.runtime_fault.load(Ordering::Acquire))
+        };
 
-        (rx_alive, tx_alive)
-    }
-
-    /// 检查是否健康
-    ///
-    /// 如果所有线程都存活，返回 `true`。
-    pub fn is_healthy(&self) -> bool {
-        let (rx_alive, tx_alive) = self.check_health();
-        rx_alive && tx_alive
+        HealthStatus {
+            connected,
+            last_feedback_age,
+            rx_alive,
+            tx_alive,
+            fault,
+        }
     }
 
     /// 获取性能指标快照
@@ -338,7 +341,7 @@ impl Piper {
     /// 虽然这两个状态在硬件上不是同时更新的，但此方法保证逻辑上的原子性。
     ///
     /// # 性能
-    /// - 无锁读取（两次 ArcSwap::load）
+    /// - 无锁读取（单次 ArcSwap::load）
     /// - 返回快照副本
     /// - 适合需要同时使用关节位置和末端位姿的场景
     ///
@@ -389,85 +392,46 @@ impl Piper {
         self.ctx.joint_driver_low_speed.load().as_ref().clone()
     }
 
-    /// 获取固件版本字符串
-    ///
-    /// 从累积的固件数据中解析版本字符串。
-    /// 如果固件数据未完整或未找到版本字符串，返回 `None`。
-    ///
-    /// # 性能
-    /// - 需要获取 RwLock 读锁
-    /// - 如果已解析，直接返回缓存的版本字符串
-    /// - 如果未解析，尝试从累积数据中解析
-    pub fn get_firmware_version(&self) -> Option<String> {
+    /// 返回已缓存的固件版本。
+    pub fn firmware_version_cached(&self) -> Option<String> {
         if let Ok(mut firmware_state) = self.ctx.firmware_version.write() {
-            // 如果已经解析过，直接返回
             if let Some(version) = firmware_state.version_string() {
                 return Some(version.clone());
             }
-            // 否则尝试解析
             firmware_state.parse_version()
         } else {
             None
         }
     }
 
-    /// 查询固件版本
-    ///
-    /// 发送固件版本查询指令到机械臂，并清空之前的固件数据缓存。
-    /// 查询和反馈使用相同的 CAN ID (0x4AF)。
-    ///
-    /// **注意**：
-    /// - 发送查询命令后会自动清空固件数据缓存（与 Python SDK 一致）
-    /// - 需要等待一段时间（推荐 30-50ms）让机械臂返回反馈数据
-    /// - 之后可以调用 `get_firmware_version()` 获取解析后的版本字符串
-    ///
-    /// # 错误
-    /// - `DriverError::ChannelFull`: 命令通道已满（单线程模式）
-    /// - `DriverError::ChannelClosed`: 命令通道已关闭
-    /// - `DriverError::NotDualThread`: 双线程模式下使用错误的方法
-    ///
-    /// # 示例
-    ///
-    /// ```no_run
-    /// # use piper_driver::Piper;
-    /// # use piper_protocol::FirmwareVersionQueryCommand;
-    /// # // 注意：此示例需要实际的 CAN 适配器，仅供参考
-    /// # // let piper = Piper::new(/* ... */).unwrap();
-    /// # // 发送查询命令
-    /// # // piper.query_firmware_version().unwrap();
-    /// # // 等待反馈数据累积
-    /// # // std::thread::sleep(std::time::Duration::from_millis(50));
-    /// # // 获取版本字符串
-    /// # // if let Some(version) = piper.get_firmware_version() {
-    /// # //     println!("Firmware version: {}", version);
-    /// # // }
-    /// ```
-    pub fn query_firmware_version(&self) -> Result<(), DriverError> {
+    /// 发送查询并阻塞等待固件版本。
+    pub fn read_firmware_version(&self, timeout: Duration) -> Result<String, DriverError> {
         use piper_protocol::FirmwareVersionQueryCommand;
 
-        // 创建查询命令
-        let cmd = FirmwareVersionQueryCommand::new();
-        let frame = cmd.to_frame();
-
-        // 发送命令（使用可靠命令模式，确保命令被发送）
-        // 注意：固件版本查询不是高频实时命令，使用可靠命令模式更合适
-        if let Some(reliable_tx) = &self.reliable_tx {
-            // 双线程模式：使用可靠命令队列
-            reliable_tx.try_send(frame).map_err(|e| match e {
-                crossbeam_channel::TrySendError::Full(_) => DriverError::ChannelFull,
-                crossbeam_channel::TrySendError::Disconnected(_) => DriverError::ChannelClosed,
-            })?;
-        } else {
-            // 单线程模式：使用普通命令通道
-            self.send_frame(frame)?;
-        }
-
-        // 清空固件数据缓存
         if let Ok(mut firmware_state) = self.ctx.firmware_version.write() {
             firmware_state.clear();
+        } else {
+            return Err(DriverError::PoisonedLock);
         }
 
-        Ok(())
+        self.send_reliable(FirmwareVersionQueryCommand::new().to_frame())?;
+
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(version) = self.firmware_version_cached() {
+                return Ok(version);
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(DriverError::Timeout);
+            }
+
+            if !self.rx_thread_alive() || !self.tx_thread_alive() {
+                return Err(DriverError::ChannelClosed);
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// 获取主从模式控制模式指令状态（无锁）
@@ -637,10 +601,12 @@ impl Piper {
                 return Err(DriverError::Timeout);
             }
 
-            // 检查是否收到有效反馈（任意状态的时间戳 > 0 即可）
-            let joint_pos = self.get_joint_position();
-            if joint_pos.hardware_timestamp_us > 0 {
+            if self.is_connected() {
                 return Ok(());
+            }
+
+            if !self.rx_thread_alive() || !self.tx_thread_alive() {
+                return Err(DriverError::ChannelClosed);
             }
 
             // 短暂休眠，避免 CPU 空转
@@ -991,9 +957,7 @@ impl Piper {
 
     /// 内部方法：发送实时命令（统一处理单个帧和帧包）
     fn send_realtime_command(&self, command: RealtimeCommand) -> Result<(), DriverError> {
-        let realtime_slot = self.realtime_slot.as_ref().ok_or(DriverError::NotDualThread)?;
-
-        match realtime_slot.lock() {
+        match self.realtime_slot.lock() {
             Ok(mut slot) => {
                 // 检测是否发生覆盖（如果插槽已有数据）
                 let is_overwrite = slot.is_some();
@@ -1066,9 +1030,7 @@ impl Piper {
     /// - `DriverError::ChannelClosed`: 命令通道已关闭（TX 线程退出）
     /// - `DriverError::ChannelFull`: 队列满（非阻塞）
     pub fn send_reliable(&self, frame: PiperFrame) -> Result<(), DriverError> {
-        let reliable_tx = self.reliable_tx.as_ref().ok_or(DriverError::NotDualThread)?;
-
-        match reliable_tx.try_send(frame) {
+        match self.cmd_tx.try_send(frame) {
             Ok(_) => {
                 self.metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -1119,9 +1081,7 @@ impl Piper {
         frame: PiperFrame,
         timeout: std::time::Duration,
     ) -> Result<(), DriverError> {
-        let reliable_tx = self.reliable_tx.as_ref().ok_or(DriverError::NotDualThread)?;
-
-        match reliable_tx.send_timeout(frame, timeout) {
+        match self.cmd_tx.send_timeout(frame, timeout) {
             Ok(_) => {
                 self.metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -1136,20 +1096,15 @@ impl Piper {
 
 impl Drop for Piper {
     fn drop(&mut self) {
-        // 设置运行标志为 false，通知所有线程退出
-        // 使用 Release 确保所有之前的写入对其他线程可见
         self.is_running.store(false, Ordering::Release);
 
-        // 关闭命令通道（通知 IO 线程退出）
-        // 关键：必须在 join 线程之前真正 drop 掉 Sender，否则接收端不会 Disconnected。
         unsafe {
             ManuallyDrop::drop(&mut self.cmd_tx);
         }
 
         let join_timeout = Duration::from_secs(2);
 
-        // 等待 RX 线程退出（使用 join_timeout 替代 polling）
-        if let Some(handle) = self.rx_thread.take()
+        if let Some(handle) = self.workers.rx_thread.take()
             && let Err(_e) = handle.join_timeout(join_timeout)
         {
             error!(
@@ -1158,22 +1113,11 @@ impl Drop for Piper {
             );
         }
 
-        // 等待 TX 线程退出（使用 join_timeout 替代 polling）
-        if let Some(handle) = self.tx_thread.take()
+        if let Some(handle) = self.workers.tx_thread.take()
             && let Err(_e) = handle.join_timeout(join_timeout)
         {
             error!(
                 "TX thread panicked or failed to shut down within {:?}",
-                join_timeout
-            );
-        }
-
-        // 等待 IO 线程退出（单线程模式，使用 join_timeout 替代 polling）
-        if let Some(handle) = self.io_thread.take()
-            && let Err(_e) = handle.join_timeout(join_timeout)
-        {
-            error!(
-                "IO thread panicked or failed to shut down within {:?}",
                 join_timeout
             );
         }
@@ -1183,9 +1127,9 @@ impl Drop for Piper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piper_can::PiperFrame;
+    use piper_can::{CanAdapter, PiperFrame, SplittableAdapter};
+    use std::collections::VecDeque;
 
-    // 简单的 Mock CanAdapter 用于测试
     struct MockCanAdapter;
 
     impl CanAdapter for MockCanAdapter {
@@ -1199,10 +1143,61 @@ mod tests {
         }
     }
 
+    struct MockRxAdapter;
+
+    impl piper_can::RxAdapter for MockRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            Err(CanError::Timeout)
+        }
+    }
+
+    struct MockTxAdapter;
+
+    impl piper_can::TxAdapter for MockTxAdapter {
+        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+            Ok(())
+        }
+    }
+
+    impl SplittableAdapter for MockCanAdapter {
+        type RxAdapter = MockRxAdapter;
+        type TxAdapter = MockTxAdapter;
+
+        fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+            Ok((MockRxAdapter, MockTxAdapter))
+        }
+    }
+
+    struct ScriptedRxAdapter {
+        frames: VecDeque<PiperFrame>,
+        first_delay: Duration,
+        emitted_first_frame: bool,
+    }
+
+    impl ScriptedRxAdapter {
+        fn new(frames: Vec<PiperFrame>, first_delay: Duration) -> Self {
+            Self {
+                frames: frames.into(),
+                first_delay,
+                emitted_first_frame: false,
+            }
+        }
+    }
+
+    impl piper_can::RxAdapter for ScriptedRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            if !self.emitted_first_frame && !self.first_delay.is_zero() {
+                std::thread::sleep(self.first_delay);
+                self.emitted_first_frame = true;
+            }
+            self.frames.pop_front().ok_or(CanError::Timeout)
+        }
+    }
+
     #[test]
     fn test_piper_new() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // 验证可以获取状态（默认状态）
         let joint_pos = piper.get_joint_position();
@@ -1216,7 +1211,7 @@ mod tests {
     #[test]
     fn test_piper_drop() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
         // drop 应该能够正常退出，IO 线程被 join
         drop(piper);
     }
@@ -1224,7 +1219,7 @@ mod tests {
     #[test]
     fn test_piper_get_motion_state() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
         let motion = piper.get_motion_state();
         assert_eq!(motion.joint_position.hardware_timestamp_us, 0);
         assert_eq!(motion.joint_dynamic.group_timestamp_us, 0);
@@ -1233,7 +1228,7 @@ mod tests {
     #[test]
     fn test_piper_send_frame_channel_full() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
         let frame = PiperFrame::new_standard(0x123, &[0x01]);
 
         // 填满命令通道（容量 10）
@@ -1267,7 +1262,7 @@ mod tests {
     #[test]
     fn test_get_aligned_motion_aligned() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // 由于 MockCanAdapter 不发送帧，时间戳都为 0
         // 测试默认状态下的对齐检查（时间戳都为 0，应该是对齐的）
@@ -1287,7 +1282,7 @@ mod tests {
     #[test]
     fn test_get_aligned_motion_misaligned_threshold() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // 测试不同的时间差阈值
         // 由于时间戳都是 0，应该是对齐的
@@ -1309,7 +1304,7 @@ mod tests {
     #[test]
     fn test_get_robot_control() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         let control = piper.get_robot_control();
         assert_eq!(control.hardware_timestamp_us, 0);
@@ -1320,7 +1315,7 @@ mod tests {
     #[test]
     fn test_get_joint_driver_low_speed() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         let driver_state = piper.get_joint_driver_low_speed();
         assert_eq!(driver_state.hardware_timestamp_us, 0);
@@ -1330,7 +1325,7 @@ mod tests {
     #[test]
     fn test_get_joint_limit_config() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         let limits = piper.get_joint_limit_config().unwrap();
         assert_eq!(limits.joint_limits_max, [0.0; 6]);
@@ -1339,7 +1334,7 @@ mod tests {
     #[test]
     fn test_wait_for_feedback_timeout() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // MockCanAdapter 不发送帧，所以应该超时
         let result = piper.wait_for_feedback(std::time::Duration::from_millis(10));
@@ -1348,9 +1343,63 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_for_feedback_uses_connection_monitor() {
+        let frame = PiperFrame::new_standard(0x251, &[0; 8]);
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        assert!(piper.wait_for_feedback(Duration::from_millis(200)).is_ok());
+        assert!(piper.health().connected);
+    }
+
+    #[test]
+    fn test_health_reports_runtime_only_faults() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+
+        let health = piper.health();
+        assert!(health.rx_alive);
+        assert!(health.tx_alive);
+        assert!(!health.connected);
+        assert!(health.fault.is_none());
+    }
+
+    #[test]
+    fn test_read_firmware_version_timeout_does_not_pollute_health_fault() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+
+        let result = piper.read_firmware_version(Duration::from_millis(10));
+        assert!(matches!(result, Err(DriverError::Timeout)));
+        assert!(piper.health().fault.is_none());
+    }
+
+    #[test]
+    fn test_read_firmware_version_success() {
+        let frame =
+            PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"S-V1.8-1");
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        let version = piper
+            .read_firmware_version(Duration::from_millis(200))
+            .expect("firmware version should be available");
+        assert_eq!(version, "S-V1.8-1");
+        assert!(piper.health().fault.is_none());
+    }
+
+    #[test]
     fn test_send_frame_blocking_timeout() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
         let frame = PiperFrame::new_standard(0x123, &[0x01]);
 
         // 快速填充通道（如果 IO 线程来不及消费）
@@ -1374,7 +1423,7 @@ mod tests {
     #[test]
     fn test_get_aligned_motion_with_time_diff() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // 测试对齐阈值边界情况
         // 时间戳都为 0 时，time_diff_us 应该是 0
@@ -1394,7 +1443,7 @@ mod tests {
     #[test]
     fn test_get_motion_state_returns_combined() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         let motion = piper.get_motion_state();
         // 验证返回的是组合状态
@@ -1407,7 +1456,7 @@ mod tests {
     #[test]
     fn test_send_frame_non_blocking() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
         let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
 
         // 非阻塞发送应该总是成功（除非通道满或关闭）
@@ -1418,7 +1467,7 @@ mod tests {
     #[test]
     fn test_get_joint_dynamic_default() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         let joint_dynamic = piper.get_joint_dynamic();
         assert_eq!(joint_dynamic.group_timestamp_us, 0);
@@ -1430,7 +1479,7 @@ mod tests {
     #[test]
     fn test_get_joint_position_default() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         let joint_pos = piper.get_joint_position();
         assert_eq!(joint_pos.hardware_timestamp_us, 0);
@@ -1444,7 +1493,7 @@ mod tests {
     #[test]
     fn test_joint_driver_low_speed_clone() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // 测试读取并克隆诊断状态
         let driver1 = piper.get_joint_driver_low_speed();
@@ -1458,7 +1507,7 @@ mod tests {
     #[test]
     fn test_joint_limit_config_read_lock() {
         let mock_can = MockCanAdapter;
-        let piper = Piper::new(mock_can, None).unwrap();
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // 测试可以多次读取配置状态
         let limits1 = piper.get_joint_limit_config().unwrap();

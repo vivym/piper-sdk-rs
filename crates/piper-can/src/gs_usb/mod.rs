@@ -52,7 +52,7 @@ impl GsUsbCanAdapter {
     ///
     /// 如果没有指定序列号，自动选择第一个找到的设备。
     pub fn new() -> Result<Self, CanError> {
-        Self::new_with_serial(None)
+        Self::new_with_selector(GsUsbDeviceSelector::any())
     }
 
     /// 创建新的适配器（按序列号指定设备）
@@ -63,17 +63,29 @@ impl GsUsbCanAdapter {
     /// # 错误
     /// - `CanError::Device`: 如果没有找到匹配的设备，或者扫描失败
     pub fn new_with_serial(serial_number: Option<&str>) -> Result<Self, CanError> {
+        let selector = match serial_number {
+            Some(sn) => GsUsbDeviceSelector::by_serial(sn),
+            None => GsUsbDeviceSelector::any(),
+        };
+        Self::new_with_selector(selector)
+    }
+
+    /// 创建新的适配器（按选择器指定设备）
+    pub fn new_with_selector(selector: GsUsbDeviceSelector) -> Result<Self, CanError> {
         // 两段式：scan_info 用于决策/告警，open 才真正占用 handle
-        let infos = GsUsbDevice::scan_info_with_filter(serial_number).map_err(|e| {
-            CanError::Device(CanDeviceError::new(
-                CanDeviceErrorKind::Backend,
-                format!("Failed to scan devices: {}", e),
-            ))
-        })?;
+        let infos =
+            GsUsbDevice::scan_info_with_filter(selector.serial_number.as_deref()).map_err(|e| {
+                CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::Backend,
+                    format!("Failed to scan devices: {}", e),
+                ))
+            })?;
 
         if infos.is_empty() {
-            let error_msg = if let Some(sn) = serial_number {
+            let error_msg = if let Some(sn) = selector.serial_number.as_deref() {
                 format!("No GS-USB device found with serial number: {}", sn)
+            } else if let (Some(bus), Some(addr)) = (selector.bus_number, selector.address) {
+                format!("No GS-USB device found at {}:{}", bus, addr)
             } else {
                 "No GS-USB device found".to_string()
             };
@@ -81,10 +93,15 @@ impl GsUsbCanAdapter {
         }
 
         if infos.len() > 1 {
-            let warning_msg = if let Some(sn) = serial_number {
+            let warning_msg = if let Some(sn) = selector.serial_number.as_deref() {
                 format!(
                     "Multiple GS-USB devices found with serial number '{}', using the first one",
                     sn
+                )
+            } else if let (Some(bus), Some(addr)) = (selector.bus_number, selector.address) {
+                format!(
+                    "Multiple GS-USB devices found at {}:{}, using the first one",
+                    bus, addr
                 )
             } else {
                 "Multiple GS-USB devices found, using the first one".to_string()
@@ -92,10 +109,6 @@ impl GsUsbCanAdapter {
             tracing::warn!("{}", warning_msg);
         }
 
-        let selector = match serial_number {
-            Some(sn) => GsUsbDeviceSelector::by_serial(sn),
-            None => GsUsbDeviceSelector::any(),
-        };
         let device = GsUsbDevice::open(&selector).map_err(|e| {
             let (kind, message) = match e {
                 crate::gs_usb::error::GsUsbError::DeviceNotFound => {

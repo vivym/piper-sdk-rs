@@ -13,6 +13,7 @@ name = "gs_usb_daemon"
 path = "src/main.rs"
 
 [dependencies]
+piper-can = { workspace = true }
 piper-sdk = { workspace = true }
 piper-driver = { workspace = true }
 piper-protocol = { workspace = true }

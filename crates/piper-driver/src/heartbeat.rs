@@ -8,7 +8,7 @@
 //! - Safe to store in AtomicU64 for lock-free access
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Global anchor point for monotonic time
@@ -31,6 +31,7 @@ fn get_monotonic_micros() -> u64 {
 /// Tracks the time since last feedback was received from the robot.
 pub struct ConnectionMonitor {
     last_feedback: AtomicU64,
+    seen_feedback: AtomicBool,
     timeout: Duration,
 }
 
@@ -47,10 +48,9 @@ impl ConnectionMonitor {
     /// let monitor = ConnectionMonitor::new(Duration::from_secs(1));
     /// ```
     pub fn new(timeout: Duration) -> Self {
-        // Initialize with current time (app start relative)
-        let now = get_monotonic_micros();
         Self {
-            last_feedback: AtomicU64::new(now),
+            last_feedback: AtomicU64::new(0),
+            seen_feedback: AtomicBool::new(false),
             timeout,
         }
     }
@@ -59,6 +59,10 @@ impl ConnectionMonitor {
     ///
     /// Returns true if feedback received within timeout window
     pub fn check_connection(&self) -> bool {
+        if !self.seen_feedback.load(Ordering::Relaxed) {
+            return false;
+        }
+
         let last_us = self.last_feedback.load(Ordering::Relaxed);
         let now_us = get_monotonic_micros();
 
@@ -75,10 +79,15 @@ impl ConnectionMonitor {
     pub fn register_feedback(&self) {
         let now = get_monotonic_micros();
         self.last_feedback.store(now, Ordering::Relaxed);
+        self.seen_feedback.store(true, Ordering::Relaxed);
     }
 
     /// Get time since last feedback
     pub fn time_since_last_feedback(&self) -> Duration {
+        if !self.seen_feedback.load(Ordering::Relaxed) {
+            return Duration::MAX;
+        }
+
         let last_us = self.last_feedback.load(Ordering::Relaxed);
         let now_us = get_monotonic_micros();
         Duration::from_micros(now_us.saturating_sub(last_us))
@@ -103,8 +112,8 @@ mod tests {
     fn test_connection_monitor_initially_alive() {
         let monitor = ConnectionMonitor::new(Duration::from_secs(1));
         assert!(
-            monitor.check_connection(),
-            "Connection should be alive initially"
+            !monitor.check_connection(),
+            "Connection should start disconnected"
         );
     }
 
@@ -112,7 +121,10 @@ mod tests {
     fn test_connection_monitor_timeout_after_delay() {
         let monitor = ConnectionMonitor::new(Duration::from_millis(50));
 
-        // Initially alive
+        // Initially disconnected until first feedback arrives
+        assert!(!monitor.check_connection());
+
+        monitor.register_feedback();
         assert!(monitor.check_connection());
 
         // Wait for timeout
@@ -150,6 +162,9 @@ mod tests {
     fn test_time_since_last_feedback() {
         let monitor = ConnectionMonitor::new(Duration::from_secs(1));
 
+        assert_eq!(monitor.time_since_last_feedback(), Duration::MAX);
+
+        monitor.register_feedback();
         thread::sleep(Duration::from_millis(10));
         let elapsed = monitor.time_since_last_feedback();
 

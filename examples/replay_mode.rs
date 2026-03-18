@@ -43,11 +43,9 @@ async fn main() -> anyhow::Result<()> {
     // === 1. 构建并连接 ===
 
     println!("⏳ 连接到机器人...");
-    let robot = PiperBuilder::new()
-        .interface(&args.interface)
+    let standby = PiperBuilder::new()
+        .socketcan(&args.interface)
         .build()?;
-
-    let standby = robot.connect()?;
     println!("✅ 已连接");
     println!();
 

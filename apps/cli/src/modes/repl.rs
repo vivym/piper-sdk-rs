@@ -3,11 +3,12 @@
 //! 使用方案 B：专用输入线程 + mpsc 通道
 //! 保留历史记录，不阻塞 tokio
 
+use crate::connection::client_builder;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, bounded};
+use piper_client::Piper;
 use piper_client::state::{Active, DisableConfig, PositionMode, PositionModeConfig, Standby};
 use piper_client::types::{JointArray, Rad};
-use piper_client::{Piper, PiperBuilder};
 use rustyline::Editor;
 use std::panic;
 use std::thread;
@@ -65,10 +66,7 @@ impl ReplSession {
 
         println!("⏳ 连接到机器人...");
 
-        let mut builder = PiperBuilder::new();
-        if let Some(iface) = interface {
-            builder = builder.interface(iface);
-        }
+        let builder = client_builder(interface, None, None);
 
         let robot = builder.build()?;
         self.state = ReplState::Standby(robot);

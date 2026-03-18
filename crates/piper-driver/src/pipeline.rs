@@ -3,6 +3,7 @@
 //! 负责后台 IO 线程的 CAN 帧接收、解析和状态更新逻辑。
 
 use crate::metrics::PiperMetrics;
+use crate::piper::RuntimeFaultKind;
 use crate::state::*;
 use crossbeam_channel::Receiver;
 use piper_can::{CanAdapter, CanError, PiperFrame, RxAdapter, TxAdapter};
@@ -10,7 +11,7 @@ use piper_protocol::config::*;
 use piper_protocol::feedback::*;
 use piper_protocol::ids::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, error, trace, warn};
 
@@ -43,6 +44,10 @@ fn safe_system_timestamp_us() -> u64 {
             0
         },
     }
+}
+
+fn record_fault(slot: &AtomicU8, fault: RuntimeFaultKind) {
+    let _ = slot.compare_exchange(0, fault as u8, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Pipeline 配置
@@ -124,12 +129,10 @@ pub struct ParserState<'a> {
     pub pending_joint_dynamic: JointDynamicState,
     /// 速度帧更新掩码（Bit 0-5 对应 Joint 1-6）
     pub vel_update_mask: u8,
-    /// 上次速度帧提交时间（硬件时间戳，微秒）
-    pub last_vel_commit_time_us: u64,
+    /// 当前速度分组开始时间（系统时间，用于统一超时语义）
+    pub pending_velocity_started_at: Option<Instant>,
     /// 上次速度帧到达时间（硬件时间戳，微秒）
     pub last_vel_packet_time_us: u64,
-    /// 上次速度帧到达时间（系统时间，用于超时检查）
-    pub last_vel_packet_instant: Option<Instant>,
 
     // === 主从模式关节控制指令状态：帧组同步（0x155-0x157） ===
     /// 待提交的主从模式关节目标角度（度）
@@ -159,9 +162,8 @@ impl<'a> ParserState<'a> {
             end_pose_frame_mask: 0,
             pending_joint_dynamic: JointDynamicState::default(),
             vel_update_mask: 0,
-            last_vel_commit_time_us: 0,
+            pending_velocity_started_at: None,
             last_vel_packet_time_us: 0,
-            last_vel_packet_instant: None,
             pending_joint_target_deg: [0; 6],
             joint_control_frame_mask: 0,
             _phantom: std::marker::PhantomData,
@@ -172,6 +174,64 @@ impl<'a> ParserState<'a> {
 impl<'a> Default for ParserState<'a> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn reset_pending_velocity(state: &mut ParserState) {
+    state.pending_joint_dynamic = JointDynamicState::default();
+    state.vel_update_mask = 0;
+    state.pending_velocity_started_at = None;
+    state.last_vel_packet_time_us = 0;
+}
+
+fn commit_pending_velocity(
+    ctx: &Arc<PiperContext>,
+    state: &mut ParserState,
+    group_timestamp_us: u64,
+    warning: Option<&'static str>,
+) {
+    if state.vel_update_mask == 0 || group_timestamp_us == 0 {
+        reset_pending_velocity(state);
+        return;
+    }
+
+    let commit_mask = state.vel_update_mask;
+    state.pending_joint_dynamic.group_timestamp_us = group_timestamp_us;
+    state.pending_joint_dynamic.valid_mask = commit_mask;
+    ctx.joint_dynamic.store(Arc::new(state.pending_joint_dynamic.clone()));
+    ctx.fps_stats
+        .load()
+        .joint_dynamic_updates
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    if let Some(message) = warning {
+        warn!("{message}: mask={commit_mask:06b}, committing incomplete data");
+    }
+
+    reset_pending_velocity(state);
+}
+
+fn flush_pending_velocity_on_idle(
+    ctx: &Arc<PiperContext>,
+    config: &PipelineConfig,
+    state: &mut ParserState,
+) {
+    if state.vel_update_mask == 0 {
+        return;
+    }
+
+    let Some(started_at) = state.pending_velocity_started_at else {
+        return;
+    };
+
+    let timeout = Duration::from_micros(config.velocity_buffer_timeout_us);
+    if started_at.elapsed() >= timeout {
+        commit_pending_velocity(
+            ctx,
+            state,
+            state.last_vel_packet_time_us,
+            Some("Velocity buffer timeout"),
+        );
     }
 }
 
@@ -235,43 +295,7 @@ pub fn io_loop(
                 // === 检查速度帧缓冲区超时（关键：避免僵尸缓冲区） ===
                 // 使用系统时间 Instant 检查，因为硬件时间戳和系统时间戳不能直接比较
                 // 如果缓冲区不为空，且距离上次速度帧到达已经超时，强制提交或丢弃
-                if state.vel_update_mask != 0
-                    && let Some(last_vel_instant) = state.last_vel_packet_instant
-                {
-                    let elapsed_since_last_vel = last_vel_instant.elapsed();
-                    // 超时阈值：设置为 6ms，与正常提交逻辑的超时阈值保持一致
-                    // 如果每个关节的帧是 200Hz（5ms 周期），6 个关节的帧应该在 5ms 内全部到达
-                    // 因此超时阈值应该 >= 5ms，这里设置为 6ms 以提供一定的容错空间
-                    let vel_timeout_threshold = Duration::from_micros(6000); // 6ms 超时（防止僵尸数据）
-
-                    if elapsed_since_last_vel > vel_timeout_threshold {
-                        // 超时：强制提交不完整的数据（设置 valid_mask 标记不完整）
-                        warn!(
-                            "Velocity buffer timeout: mask={:06b}, forcing commit with incomplete data",
-                            state.vel_update_mask
-                        );
-                        // 注意：这里使用上次记录的硬件时间戳（如果为 0，说明没有收到过，此时不应该提交）
-                        if state.last_vel_packet_time_us > 0 {
-                            state.pending_joint_dynamic.group_timestamp_us =
-                                state.last_vel_packet_time_us;
-                            state.pending_joint_dynamic.valid_mask = state.vel_update_mask;
-                            ctx.joint_dynamic.store(Arc::new(state.pending_joint_dynamic.clone()));
-                            ctx.fps_stats
-                                .load()
-                                .joint_dynamic_updates
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                            // 重置状态
-                            state.vel_update_mask = 0;
-                            state.last_vel_commit_time_us = state.last_vel_packet_time_us;
-                            state.last_vel_packet_instant = None;
-                        } else {
-                            // 如果时间戳为 0，说明没有收到过有效帧，直接丢弃
-                            state.vel_update_mask = 0;
-                            state.last_vel_packet_instant = None;
-                        }
-                    }
-                }
+                flush_pending_velocity_on_idle(&ctx, &config, &mut state);
 
                 continue;
             },
@@ -372,6 +396,7 @@ pub fn rx_loop(
     config: PipelineConfig,
     is_running: Arc<AtomicBool>,
     metrics: Arc<PiperMetrics>,
+    last_fault: Arc<AtomicU8>,
 ) {
     // 设置线程优先级（可选 feature）
     #[cfg(feature = "realtime")]
@@ -433,36 +458,7 @@ pub fn rx_loop(
                 }
 
                 // === 检查速度帧缓冲区超时 ===
-                if state.vel_update_mask != 0
-                    && let Some(last_vel_instant) = state.last_vel_packet_instant
-                {
-                    let elapsed_since_last_vel = last_vel_instant.elapsed();
-                    let vel_timeout_threshold = Duration::from_micros(6000); // 6ms 超时
-
-                    if elapsed_since_last_vel > vel_timeout_threshold {
-                        warn!(
-                            "Velocity buffer timeout: mask={:06b}, forcing commit with incomplete data",
-                            state.vel_update_mask
-                        );
-                        if state.last_vel_packet_time_us > 0 {
-                            state.pending_joint_dynamic.group_timestamp_us =
-                                state.last_vel_packet_time_us;
-                            state.pending_joint_dynamic.valid_mask = state.vel_update_mask;
-                            ctx.joint_dynamic.store(Arc::new(state.pending_joint_dynamic.clone()));
-                            ctx.fps_stats
-                                .load()
-                                .joint_dynamic_updates
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                            state.vel_update_mask = 0;
-                            state.last_vel_commit_time_us = state.last_vel_packet_time_us;
-                            state.last_vel_packet_instant = None;
-                        } else {
-                            state.vel_update_mask = 0;
-                            state.last_vel_packet_instant = None;
-                        }
-                    }
-                }
+                flush_pending_velocity_on_idle(&ctx, &config, &mut state);
 
                 continue;
             },
@@ -476,6 +472,7 @@ pub fn rx_loop(
 
                 if is_fatal {
                     error!("RX thread: Fatal error detected, setting is_running = false");
+                    record_fault(&last_fault, RuntimeFaultKind::TransportError);
                     // Release: All writes before this are visible to threads that see the false value
                     is_running.store(false, Ordering::Release);
                     break;
@@ -503,8 +500,15 @@ pub fn rx_loop(
         // ============================================================
         // 复用 io_loop 中的解析逻辑（通过调用辅助函数）
         parse_and_update_state(&frame, &ctx, &config, &mut state);
+
+        // 双线程 runtime 也必须刷新连接监控，否则 health()/wait_for_feedback()
+        // 会永远基于初始状态判断。
+        ctx.connection_monitor.register_feedback();
     }
 
+    if is_running.load(Ordering::Acquire) {
+        record_fault(&last_fault, RuntimeFaultKind::RxExited);
+    }
     trace!("RX thread: loop exited");
 }
 
@@ -527,6 +531,7 @@ pub fn tx_loop_mailbox(
     is_running: Arc<AtomicBool>,
     metrics: Arc<PiperMetrics>,
     ctx: Arc<PiperContext>,
+    last_fault: Arc<AtomicU8>,
 ) {
     // 饿死保护：连续处理 N 个 Realtime 包后，强制检查一次普通队列
     const REALTIME_BURST_LIMIT: usize = 100;
@@ -585,6 +590,7 @@ pub fn tx_loop_mailbox(
                         let is_fatal = matches!(e, CanError::Device(_) | CanError::BufferOverflow);
                         if is_fatal {
                             error!("TX thread: Fatal error detected, setting is_running = false");
+                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
                             // Release: All writes before this are visible to threads that see the false value
                             is_running.store(false, Ordering::Release);
                             should_break = true;
@@ -648,6 +654,7 @@ pub fn tx_loop_mailbox(
 
                     if is_fatal {
                         error!("TX thread: Fatal error detected, setting is_running = false");
+                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
                         // Release: All writes before this are visible to threads that see the false value
                         is_running.store(false, Ordering::Release);
                         break;
@@ -664,6 +671,9 @@ pub fn tx_loop_mailbox(
         spin_sleep::sleep(Duration::from_micros(50));
     }
 
+    if is_running.load(Ordering::Acquire) {
+        record_fault(&last_fault, RuntimeFaultKind::TxExited);
+    }
     trace!("TX thread: loop exited");
 }
 
@@ -732,7 +742,7 @@ fn parse_and_update_state(
                     joint_pos: state.pending_joint_pos,
                     frame_valid_mask: state.joint_pos_frame_mask,
                 };
-                ctx.joint_position.store(Arc::new(new_joint_pos_state));
+                ctx.publish_joint_position(new_joint_pos_state);
                 ctx.fps_stats
                     .load()
                     .joint_position_updates
@@ -781,7 +791,7 @@ fn parse_and_update_state(
                     end_pose: state.pending_end_pose,
                     frame_valid_mask: state.end_pose_frame_mask,
                 };
-                ctx.end_pose.store(Arc::new(new_end_pose_state));
+                ctx.publish_end_pose(new_end_pose_state);
                 ctx.fps_stats
                     .load()
                     .end_pose_updates
@@ -806,49 +816,28 @@ fn parse_and_update_state(
                 state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us;
 
                 // 2. 标记该关节已更新
+                let now = Instant::now();
+                if state.vel_update_mask == 0 {
+                    state.pending_velocity_started_at = Some(now);
+                }
                 state.vel_update_mask |= 1 << joint_index;
                 state.last_vel_packet_time_us = frame.timestamp_us;
-                state.last_vel_packet_instant = Some(std::time::Instant::now());
+                let all_received = state.vel_update_mask == 0b111111;
+                let timeout = Duration::from_micros(config.velocity_buffer_timeout_us);
+                let timed_out = state
+                    .pending_velocity_started_at
+                    .map(|started_at| now.duration_since(started_at) >= timeout)
+                    .unwrap_or(false);
 
-                // 3. 判断是否提交（混合策略：集齐或超时）
-                let all_received = state.vel_update_mask == 0b111111; // 0x3F，6 个关节全部收到
-
-                // Calculate time since last commit (handle initial state)
-                // First frame ever: treat as if no time has elapsed
-                // This allows the first complete frame group to be committed immediately
-                let time_since_last_commit = if state.last_vel_commit_time_us == 0 {
-                    0 // First frame - no time elapsed
+                if all_received || timed_out {
+                    let warning = if all_received {
+                        None
+                    } else {
+                        Some("Velocity frame commit timeout")
+                    };
+                    commit_pending_velocity(ctx, state, frame.timestamp_us, warning);
                 } else {
-                    // Normal wrap-around subtraction for subsequent frames
-                    frame.timestamp_us.wrapping_sub(state.last_vel_commit_time_us)
-                };
-
-                // Use configured timeout threshold
-                let timeout_threshold_us = config.velocity_buffer_timeout_us;
-
-                if all_received || time_since_last_commit > timeout_threshold_us {
-                    // 原子性地一次性提交所有关节的速度
-                    state.pending_joint_dynamic.group_timestamp_us = frame.timestamp_us;
                     state.pending_joint_dynamic.valid_mask = state.vel_update_mask;
-
-                    ctx.joint_dynamic.store(Arc::new(state.pending_joint_dynamic.clone()));
-                    ctx.fps_stats
-                        .load()
-                        .joint_dynamic_updates
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                    // 重置状态（准备下一轮）
-                    state.vel_update_mask = 0;
-                    state.last_vel_commit_time_us = frame.timestamp_us;
-                    state.last_vel_packet_instant = None;
-
-                    if !all_received {
-                        warn!(
-                            "Velocity frame commit timeout: mask={:06b}, incomplete data",
-                            state.vel_update_mask
-                        );
-                    }
-                    // Hot path: removed trace! call for successful commit (200Hz)
                 }
             }
         },

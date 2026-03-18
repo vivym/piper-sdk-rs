@@ -29,6 +29,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod connection;
 mod modes;
 mod safety;
 mod script;

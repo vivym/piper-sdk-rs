@@ -4,7 +4,7 @@
 //!
 //! 参考：`daemon_implementation_plan.md` 第 4.1.5 节
 
-use piper_sdk::can::gs_usb_udp::protocol::CanIdFilter;
+use piper_can::gs_usb_udp::protocol::CanIdFilter;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -341,7 +341,7 @@ impl Default for ClientManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piper_sdk::can::gs_usb_udp::protocol::CanIdFilter;
+    use piper_can::gs_usb_udp::protocol::CanIdFilter;
 
     #[test]
     fn test_client_register() {

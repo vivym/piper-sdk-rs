@@ -29,7 +29,12 @@
 
 // 内部模块结构（重新导出各个层）
 pub mod can {
-    pub use piper_can::*;
+    #[cfg(feature = "mock")]
+    pub use piper_can::MockCanAdapter;
+    pub use piper_can::{
+        CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RxAdapter,
+        SplittableAdapter, TxAdapter,
+    };
 }
 
 pub mod protocol {
@@ -100,7 +105,7 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 ///     piper_sdk::init_logger!();
 ///
 ///     // 连接机器人
-///     let driver = PiperBuilder::new().interface("can0").build()?;
+///     let driver = PiperBuilder::new().socketcan("can0").build()?;
 ///
 ///     // 现在可以使用 tracing::info!, tracing::warn! 等宏
 ///     tracing::info!("Connected to robot");

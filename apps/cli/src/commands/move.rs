@@ -2,10 +2,10 @@
 //!
 //! 移动机器人到目标位置，包含安全检查和确认机制
 
+use crate::connection::client_builder;
 use crate::validation::JointValidator;
 use anyhow::{Context, Result};
 use clap::Args;
-use piper_client::PiperBuilder;
 use piper_client::state::PositionModeConfig;
 use piper_tools::SafetyConfig;
 
@@ -98,13 +98,11 @@ impl MoveCommand {
         }
 
         // 确定接口和序列号（命令行参数优先）
-        let interface = self.interface.as_ref().or(config.interface.as_ref()).map(|s| s.as_str());
+        let interface = self.interface.as_deref().or(config.interface.as_deref());
+        let serial = self.serial.as_deref().or(config.serial.as_deref());
 
         // 创建 Piper 实例
-        let mut builder = PiperBuilder::new();
-        if let Some(iface) = interface {
-            builder = builder.interface(iface);
-        }
+        let builder = client_builder(interface, serial, None);
 
         println!("🔌 连接到机器人...");
         let robot = builder.build()?;

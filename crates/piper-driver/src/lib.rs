@@ -25,7 +25,7 @@ mod piper; // 原 robot_impl.rs
 pub mod recording;
 pub mod state;
 
-pub use builder::{DriverType, PiperBuilder};
+pub use builder::{ConnectionTarget, PiperBuilder};
 pub use command::{CommandPriority, PiperCommand};
 pub use error::DriverError; // 原 DriverError
 pub use fps_stats::{FpsCounts, FpsResult};

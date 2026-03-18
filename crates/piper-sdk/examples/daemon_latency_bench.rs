@@ -6,7 +6,7 @@
 //! - 吞吐量（fps）
 //! - 客户端阻塞处理
 
-use piper_sdk::can::gs_usb_udp::GsUsbUdpAdapter;
+use piper_can::gs_usb_udp::GsUsbUdpAdapter;
 use piper_sdk::can::{CanAdapter, PiperFrame};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;

@@ -5,7 +5,7 @@
 //! 运行方式：
 //!   sudo cargo run --example gs_usb_direct_test
 
-use piper_sdk::can::gs_usb::protocol::*;
+use piper_can::gs_usb::protocol::*;
 use rusb::{DeviceHandle, GlobalContext};
 use std::time::Duration;
 

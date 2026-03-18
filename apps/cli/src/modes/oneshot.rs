@@ -7,10 +7,8 @@
 //! 4. 断开连接
 
 use anyhow::Result;
-use piper_client::PiperBuilder as ClientPiperBuilder;
 use piper_sdk::driver::{
-    EndPoseState, FpsResult, GripperState, JointDynamicState, JointPositionState,
-    PiperBuilder as DriverPiperBuilder, RobotControlState,
+    EndPoseState, FpsResult, GripperState, JointDynamicState, JointPositionState, RobotControlState,
 };
 use piper_tools::SafetyConfig;
 use std::sync::Arc;
@@ -18,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::signal;
 
 use crate::commands::{MoveCommand, PositionCommand, RecordCommand, StopCommand};
+use crate::connection::{client_builder, driver_builder};
 use crate::safety;
 
 /// One-shot 模式配置
@@ -27,7 +26,6 @@ pub struct OneShotConfig {
     pub interface: Option<String>,
 
     /// 设备序列号
-    #[allow(dead_code)]
     pub serial: Option<String>,
 
     /// 安全配置
@@ -117,36 +115,43 @@ impl OneShotMode {
     pub async fn home(&mut self) -> Result<()> {
         // ✅ 实际连接并执行回零
         // 🟡 P1-2 修复：优先使用 serial（如果提供），其次使用 interface
-        let connection_target = self.config.serial.clone().or(self.config.interface.clone());
+        match (
+            self.config.interface.as_deref(),
+            self.config.serial.as_deref(),
+        ) {
+            (Some(interface), _) => {
+                #[cfg(target_os = "linux")]
+                {
+                    println!("使用 CAN 接口: {} (SocketCAN)", interface);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    println!("使用设备序列号: {}", interface);
+                }
+            },
+            (None, Some(serial)) => println!("使用设备序列号: {}", serial),
+            (None, None) => {
+                #[cfg(target_os = "linux")]
+                {
+                    println!("使用默认 CAN 接口: can0 (SocketCAN)");
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let default_daemon = "127.0.0.1:18888";
+                    println!("使用默认守护进程: {} (UDP)", default_daemon);
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    println!("自动扫描 GS-USB 设备...");
+                }
+            },
+        }
 
-        let builder = if let Some(target) = connection_target {
-            #[cfg(target_os = "linux")]
-            {
-                println!("使用 CAN 接口: {} (SocketCAN)", target);
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                println!("使用设备序列号: {}", target);
-            }
-            ClientPiperBuilder::new().interface(target)
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                println!("使用默认 CAN 接口: can0 (SocketCAN)");
-                ClientPiperBuilder::new().interface("can0")
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let default_daemon = "127.0.0.1:18888";
-                println!("使用默认守护进程: {} (UDP)", default_daemon);
-                ClientPiperBuilder::new().with_daemon(default_daemon)
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                println!("自动扫描 GS-USB 设备...");
-                ClientPiperBuilder::new()
-            }
-        };
+        let builder = client_builder(
+            self.config.interface.as_deref(),
+            self.config.serial.as_deref(),
+            None,
+        );
 
         println!("⏳ 连接到机器人...");
         let robot = builder.build()?;
@@ -181,36 +186,43 @@ impl OneShotMode {
 
         // 创建 Piper 实例（使用 driver 层 API 以支持 FPS 统计）
         // 🟡 P1-2 修复：优先使用 serial（如果提供），其次使用 interface
-        let connection_target = self.config.serial.clone().or(self.config.interface.clone());
+        match (
+            self.config.interface.as_deref(),
+            self.config.serial.as_deref(),
+        ) {
+            (Some(interface), _) => {
+                #[cfg(target_os = "linux")]
+                {
+                    println!("使用 CAN 接口: {} (SocketCAN)", interface);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    println!("使用设备序列号: {}", interface);
+                }
+            },
+            (None, Some(serial)) => println!("使用设备序列号: {}", serial),
+            (None, None) => {
+                #[cfg(target_os = "linux")]
+                {
+                    println!("使用默认 CAN 接口: can0 (SocketCAN)");
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let default_daemon = "127.0.0.1:18888";
+                    println!("使用默认守护进程: {} (UDP)", default_daemon);
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    println!("自动扫描 GS-USB 设备...");
+                }
+            },
+        }
 
-        let builder = if let Some(target) = connection_target {
-            #[cfg(target_os = "linux")]
-            {
-                println!("使用 CAN 接口: {} (SocketCAN)", target);
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                println!("使用设备序列号: {}", target);
-            }
-            DriverPiperBuilder::new().interface(target)
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                println!("使用默认 CAN 接口: can0 (SocketCAN)");
-                DriverPiperBuilder::new().interface("can0")
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let default_daemon = "127.0.0.1:18888";
-                println!("使用默认守护进程: {} (UDP)", default_daemon);
-                DriverPiperBuilder::new().with_daemon(default_daemon)
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                println!("自动扫描 GS-USB 设备...");
-                DriverPiperBuilder::new()
-            }
-        };
+        let builder = driver_builder(
+            self.config.interface.as_deref(),
+            self.config.serial.as_deref(),
+            None,
+        );
 
         let piper = builder.build()?;
         println!("✅ 已连接");

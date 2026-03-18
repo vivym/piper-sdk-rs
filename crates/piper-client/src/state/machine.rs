@@ -5,11 +5,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::connection::initialize_connected_driver;
 use crate::types::*;
 use crate::{observer::Observer, raw_commander::RawCommander};
 use piper_protocol::control::InstallPosition;
-use semver::Version;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 // ==================== 状态类型（零大小类型）====================
 
@@ -89,7 +89,7 @@ pub struct ErrorState;
 /// # use piper_client::{PiperBuilder};
 /// # fn main() -> anyhow::Result<()> {
 /// let robot = PiperBuilder::new()
-///     .interface("can0")
+///     .socketcan("can0")
 ///     .build()?;
 ///
 /// let standby = robot.connect()?;
@@ -162,34 +162,22 @@ impl From<MotionType> for piper_protocol::feedback::MoveMode {
     }
 }
 
-// ==================== 辅助函数 ====================
-
-/// 解析固件版本字符串
-///
-/// 将 "S-V1.6-3" 格式的字符串解析为 semver::Version
-fn parse_firmware_version(version_str: &str) -> Option<Version> {
-    let version_str = version_str.trim();
-    let version_part = version_str.strip_prefix("S-V")?;
-    let normalized = version_part.replace('-', ".");
-    Version::parse(&normalized).ok()
-}
-
 // ==================== 连接配置 ====================
 
 /// 连接配置
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
-    /// CAN 接口名称（如 "can0"）
-    pub interface: String,
-    /// 连接超时
-    pub timeout: Duration,
+    /// 等待第一帧反馈的超时。
+    pub feedback_timeout: Duration,
+    /// 固件版本握手超时。
+    pub firmware_timeout: Duration,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
         ConnectionConfig {
-            interface: "can0".to_string(),
-            timeout: Duration::from_secs(5),
+            feedback_timeout: Duration::from_secs(5),
+            firmware_timeout: Duration::from_millis(100),
         }
     }
 }
@@ -392,38 +380,17 @@ impl Piper<Disconnected> {
     {
         use piper_driver::Piper as RobotPiper;
 
-        // ✅ 使用 driver 模块创建双线程模式的 Piper
         let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
-
-        // 等待接收到第一个有效反馈
-        driver.wait_for_feedback(config.timeout)?;
-
-        // 查询固件版本（用于 DeviceQuirks）
-        let _ = driver.query_firmware_version();
-
-        // 创建 DeviceQuirks
-        let quirks = if let Some(version_str) = driver.get_firmware_version() {
-            match parse_firmware_version(&version_str) {
-                Some(version) => DeviceQuirks::from_firmware_version(version),
-                None => {
-                    warn!(
-                        "Failed to parse firmware version '{}'. Using default quirks.",
-                        version_str
-                    );
-                    DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
-                },
-            }
-        } else {
-            DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
-        };
-
-        // 创建 Observer（View 模式）
-        let observer = Observer::new(driver.clone());
+        let connected = initialize_connected_driver(
+            driver.clone(),
+            config.feedback_timeout,
+            config.firmware_timeout,
+        )?;
 
         Ok(Piper {
             driver,
-            observer,
-            quirks,
+            observer: connected.observer,
+            quirks: connected.quirks,
             _state: Standby,
         })
     }
@@ -466,36 +433,18 @@ impl Piper<Disconnected> {
         // 1. 创建新的 driver 实例
         use piper_driver::Piper as RobotPiper;
         let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
-
-        // 2. 等待反馈
-        driver.wait_for_feedback(config.timeout)?;
-
-        // 3. 查询固件版本并创建 DeviceQuirks
-        let _ = driver.query_firmware_version();
-        let quirks = if let Some(version_str) = driver.get_firmware_version() {
-            match parse_firmware_version(&version_str) {
-                Some(version) => DeviceQuirks::from_firmware_version(version),
-                None => {
-                    warn!(
-                        "Failed to parse firmware version '{}'. Using default quirks.",
-                        version_str
-                    );
-                    DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
-                },
-            }
-        } else {
-            DeviceQuirks::from_firmware_version(Version::new(1, 9, 0))
-        };
-
-        // 4. 创建 observer
-        let observer = Observer::new(driver.clone());
+        let connected = initialize_connected_driver(
+            driver.clone(),
+            config.feedback_timeout,
+            config.firmware_timeout,
+        )?;
 
         // 5. 返回到 Standby 状态
         info!("Reconnection successful");
         Ok(Piper {
             driver,
-            observer,
-            quirks,
+            observer: connected.observer,
+            quirks: connected.quirks,
             _state: Standby,
         })
     }
@@ -835,10 +784,9 @@ impl Piper<Standby> {
     /// ```rust,ignore
     /// # use piper_client::{PiperBuilder, recording::{RecordingConfig, StopCondition}};
     /// # fn example() -> Result<()> {
-    /// let builder = PiperBuilder::new()
-    ///     .interface("can0");
-    ///
-    /// let standby = Piper::connect(builder)?;
+    /// let standby = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
     ///
     /// // 启动录制
     /// let (standby, handle) = standby.start_recording(RecordingConfig {
@@ -924,12 +872,11 @@ impl Piper<Standby> {
     /// # 示例
     ///
     /// ```rust,ignore
-    /// # use piper_client::{Piper, PiperBuilder};
+    /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let builder = PiperBuilder::new()
-    ///     .interface("can0");
-    ///
-    /// let standby = Piper::connect(builder)?;
+    /// let standby = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
     ///
     /// let (standby, handle) = standby.start_recording(config)?;
     ///
@@ -1016,12 +963,11 @@ impl Piper<Standby> {
     /// # 示例
     ///
     /// ```rust,ignore
-    /// # use piper_client::{Piper, PiperBuilder};
+    /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let builder = PiperBuilder::new()
-    ///     .interface("can0");
-    ///
-    /// let standby = Piper::connect(builder)?;
+    /// let standby = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
     ///
     /// // 进入回放模式
     /// let replay = standby.enter_replay_mode()?;
@@ -1068,7 +1014,7 @@ impl Piper<Standby> {
     /// ```rust,ignore
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let standby = PiperBuilder::new().interface("can0").build()?;
+    /// let standby = PiperBuilder::new().socketcan("can0").build()?;
     ///
     /// // 所有关节设置为等级 5（中等保护）
     /// standby.set_collision_protection([5, 5, 5, 5, 5, 5])?;
@@ -1105,7 +1051,7 @@ impl Piper<Standby> {
     /// ```rust,ignore
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let standby = PiperBuilder::new().interface("can0").build()?;
+    /// let standby = PiperBuilder::new().socketcan("can0").build()?;
     ///
     /// // 设置 J1 的当前位置为零点
     /// // 注意：确保 J1 已移动到预期的零点位置
@@ -1142,7 +1088,7 @@ impl<State> Piper<State> {
     /// ```rust,ignore
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let robot = PiperBuilder::new().interface("can0").build()?;
+    /// let robot = PiperBuilder::new().socketcan("can0").build()?;
     ///
     /// // 获取固件特性
     /// let quirks = robot.quirks();
@@ -1395,7 +1341,7 @@ impl<M> Piper<Active<M>> {
     /// # use piper_client::{Piper, PiperBuilder};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let robot = PiperBuilder::new()
-    ///     .interface("can0")
+    ///     .socketcan("can0")
     ///     .build()?;
     ///
     /// let active = robot.enable_position_mode(Default::default())?;
@@ -1447,10 +1393,9 @@ impl<M> Piper<Active<M>> {
     /// ```rust,ignore
     /// # use piper_client::{PiperBuilder, recording::{RecordingConfig, StopCondition}};
     /// # fn example() -> Result<()> {
-    /// let builder = PiperBuilder::new()
-    ///     .interface("can0");
-    ///
-    /// let standby = Piper::connect(builder)?;
+    /// let standby = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
     /// let active = standby.enable_mit_mode(Default::default())?;
     ///
     /// // 启动录制（Active 状态）
@@ -1537,12 +1482,11 @@ impl<M> Piper<Active<M>> {
     /// # 示例
     ///
     /// ```rust,ignore
-    /// # use piper_client::{Piper, PiperBuilder};
+    /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let builder = PiperBuilder::new()
-    ///     .interface("can0");
-    ///
-    /// let standby = Piper::connect(builder)?;
+    /// let standby = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
     /// let active = standby.enable_mit_mode(Default::default())?;
     ///
     /// let (active, handle) = active.start_recording(config)?;
@@ -1619,7 +1563,7 @@ impl<M> Piper<Active<M>> {
     /// ```rust,ignore
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let standby = PiperBuilder::new().interface("can0").build()?;
+    /// let standby = PiperBuilder::new().socketcan("can0").build()?;
     /// let active = standby.enable_position_mode(Default::default())?;
     ///
     /// // 运行时提高碰撞保护级别（例如进入精密操作区域）
@@ -2125,12 +2069,11 @@ impl Piper<ReplayMode> {
     /// # 示例
     ///
     /// ```rust,ignore
-    /// # use piper_client::{Piper, PiperBuilder};
+    /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let builder = PiperBuilder::new()
-    ///     .interface("can0");
-    ///
-    /// let standby = Piper::connect(builder)?;
+    /// let standby = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
     /// let replay = standby.enter_replay_mode()?;
     ///
     /// // 回放录制（1.0x 速度，原始速度）
@@ -2311,7 +2254,7 @@ impl Piper<ReplayMode> {
     /// # use std::sync::Arc;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let robot = PiperBuilder::new()
-    ///     .interface("can0")
+    ///     .socketcan("can0")
     ///     .build()?;
     ///
     /// let replay = robot.enter_replay_mode()?;
@@ -2500,12 +2443,11 @@ impl Piper<ReplayMode> {
     /// # 示例
     ///
     /// ```rust,ignore
-    /// # use piper_client::{Piper, PiperBuilder};
+    /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let builder = PiperBuilder::new()
-    ///     .interface("can0");
-    ///
-    /// let standby = Piper::connect(builder)?;
+    /// let standby = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
     /// let replay = standby.enter_replay_mode()?;
     ///
     /// // 提前退出回放模式

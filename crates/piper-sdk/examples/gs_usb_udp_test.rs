@@ -22,7 +22,7 @@
 //!
 
 use clap::Parser;
-use piper_sdk::can::gs_usb_udp::GsUsbUdpAdapter;
+use piper_can::gs_usb_udp::GsUsbUdpAdapter;
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

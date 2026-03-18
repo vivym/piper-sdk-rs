@@ -11,47 +11,32 @@ pub use piper_protocol::PiperFrame;
 // SocketCAN (Linux only)
 // 优先级：mock 优先级最高，然后是显式 feature，最后是 auto-backend
 #[cfg(all(
-    not(feature = "mock"),                          // ⚠️ 确保 mock 模式下彻底禁用硬件
-    any(
-        feature = "socketcan",                      // 显式启用
-        all(feature = "auto-backend", target_os = "linux")  // 自动推导
-    )
+    target_os = "linux",
+    any(feature = "socketcan", feature = "auto-backend")
 ))]
 pub mod socketcan;
 
 #[cfg(all(
-    not(feature = "mock"),
-    any(
-        feature = "socketcan",
-        all(feature = "auto-backend", target_os = "linux")
-    )
+    target_os = "linux",
+    any(feature = "socketcan", feature = "auto-backend")
 ))]
 pub use socketcan::SocketCanAdapter;
 
 #[cfg(all(
-    not(feature = "mock"),
-    any(
-        feature = "socketcan",
-        all(feature = "auto-backend", target_os = "linux")
-    )
+    target_os = "linux",
+    any(feature = "socketcan", feature = "auto-backend")
 ))]
 pub use socketcan::split::{SocketCanRxAdapter, SocketCanTxAdapter};
 
 // GS-USB (所有平台)
 // 优先级：mock 优先级最高，然后是显式 feature，最后是 auto-backend
-#[cfg(all(
-    not(feature = "mock"),                          // mock 模式下禁用
-    any(
-        feature = "gs_usb",                         // 显式启用
-        feature = "auto-backend"                    // 自动推导
-    )
+#[cfg(any(
+    feature = "gs_usb",      // 显式启用
+    feature = "auto-backend" // 自动推导
 ))]
 pub mod gs_usb;
 
-#[cfg(all(
-    not(feature = "mock"),
-    any(feature = "gs_usb", feature = "auto-backend")
-))]
+#[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
 pub use gs_usb::GsUsbCanAdapter;
 
 // GS-UDP 守护进程客户端库（UDS/UDP）
@@ -59,10 +44,7 @@ pub use gs_usb::GsUsbCanAdapter;
 pub mod gs_usb_udp;
 
 // 导出 split 相关的类型（如果可用）
-#[cfg(all(
-    not(feature = "mock"),
-    any(feature = "gs_usb", feature = "auto-backend")
-))]
+#[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
 pub use gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
 
 // Mock Adapter (用于测试)
@@ -165,8 +147,26 @@ pub trait RxAdapter {
     fn receive(&mut self) -> Result<PiperFrame, CanError>;
 }
 
+impl<T> RxAdapter for Box<T>
+where
+    T: RxAdapter + ?Sized,
+{
+    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        (**self).receive()
+    }
+}
+
 pub trait TxAdapter {
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError>;
+}
+
+impl<T> TxAdapter for Box<T>
+where
+    T: TxAdapter + ?Sized,
+{
+    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        (**self).send(frame)
+    }
 }
 
 pub trait SplittableAdapter: CanAdapter {

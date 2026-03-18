@@ -23,22 +23,25 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("1. Creating Piper instance with dual-threaded mode...");
     // Note: Dual-threaded mode is automatically enabled when the adapter supports splitting
     let robot = PiperBuilder::new()
-        .interface("can0")  // Linux: SocketCAN interface name
+        .socketcan("can0")  // Linux: SocketCAN interface name
         .baud_rate(1_000_000)  // CAN baud rate
         .build()?;
     println!("   ✓ Piper instance created (dual-threaded if supported)\n");
 
     // Check thread health
     println!("2. Checking thread health...");
-    if robot.is_healthy() {
+    let health = robot.health();
+    if health.rx_alive && health.tx_alive {
         println!("   ✓ All threads are running normally\n");
     } else {
-        let (rx_alive, tx_alive) = robot.check_health();
-        if !rx_alive {
+        if !health.rx_alive {
             eprintln!("   ✗ RX thread has stopped!");
         }
-        if !tx_alive {
+        if !health.tx_alive {
             eprintln!("   ✗ TX thread has stopped!");
+        }
+        if let Some(fault) = health.fault {
+            eprintln!("   ✗ Runtime fault: {:?}", fault);
         }
         return Err("Thread health check failed".into());
     }
@@ -148,7 +151,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Final health check
     println!("7. Final thread health check...");
-    if robot.is_healthy() {
+    let health = robot.health();
+    if health.rx_alive && health.tx_alive {
         println!("   ✓ All threads are still running normally");
     } else {
         eprintln!("   ✗ Thread health check failed!");

@@ -2,9 +2,9 @@
 //!
 //! 回放录制的数据
 
+use crate::connection::client_builder;
 use anyhow::Result;
 use clap::Args;
-use piper_sdk::PiperBuilder;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::spawn_blocking;
@@ -188,7 +188,7 @@ impl ReplayCommand {
 
         println!("⏳ 连接到机器人...");
 
-        let builder = if let Some(interface) = &interface {
+        if let Some(interface) = &interface {
             #[cfg(target_os = "linux")]
             {
                 println!("   使用 CAN 接口: {} (SocketCAN)", interface);
@@ -197,28 +197,25 @@ impl ReplayCommand {
             {
                 println!("   使用设备序列号: {}", interface);
             }
-            PiperBuilder::new().interface(interface)
         } else if let Some(serial) = &serial {
             println!("   使用设备序列号: {}", serial);
-            PiperBuilder::new().interface(serial)
         } else {
             #[cfg(target_os = "linux")]
             {
                 println!("   使用默认 CAN 接口: can0");
-                PiperBuilder::new().interface("can0")
             }
             #[cfg(target_os = "macos")]
             {
                 let default_daemon = "127.0.0.1:18888";
                 println!("   使用默认守护进程: {}", default_daemon);
-                PiperBuilder::new().with_daemon(default_daemon)
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 println!("   自动扫描 GS-USB 设备...");
-                PiperBuilder::new()
             }
-        };
+        }
+
+        let builder = client_builder(interface.as_deref(), serial.as_deref(), None);
 
         let standby = builder.build()?;
         println!("✅ 已连接");

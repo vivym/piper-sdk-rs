@@ -2,8 +2,8 @@
 //!
 //! JSON 脚本执行和回放
 
+use crate::connection::client_builder;
 use anyhow::{Context, Result};
-use piper_client::PiperBuilder;
 use piper_client::state::PositionModeConfig;
 use piper_client::types::{JointArray, Rad};
 use serde::{Deserialize, Serialize};
@@ -154,11 +154,11 @@ impl ScriptExecutor {
         // 连接到机器人
         println!("🔌 连接到机器人...");
         // 🟡 P1-2 修复：优先使用 serial（如果提供），其次使用 interface
-        let mut builder = PiperBuilder::new();
-        let connection_target = self.config.serial.clone().or(self.config.interface.clone());
-        if let Some(target) = connection_target {
-            builder = builder.interface(&target);
-        }
+        let builder = client_builder(
+            self.config.interface.as_deref(),
+            self.config.serial.as_deref(),
+            None,
+        );
 
         let robot = builder.build()?;
         println!("✅ 已连接");

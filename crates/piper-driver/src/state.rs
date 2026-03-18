@@ -91,7 +91,7 @@ impl EndPoseState {
 ///
 /// 用于在同一时刻捕获多个运动相关状态，保证逻辑上的原子性。
 /// 这是一个栈上对象（Stack Allocated），开销极小。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MotionSnapshot {
     /// 关节位置状态
     pub joint_position: JointPositionState,
@@ -913,6 +913,8 @@ pub struct PiperContext {
     pub joint_position: Arc<ArcSwap<JointPositionState>>,
     /// 末端位姿状态（帧组同步：0x2A2-0x2A4）
     pub end_pose: Arc<ArcSwap<EndPoseState>>,
+    /// 运动状态快照（单次 load 保证逻辑原子）
+    pub motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
     /// 关节动态状态（独立帧 + Buffered Commit：关节速度 + 电流）
     pub joint_dynamic: Arc<ArcSwap<JointDynamicState>>,
 
@@ -1026,6 +1028,7 @@ impl PiperContext {
             // 热数据：ArcSwap，无锁读取
             joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
             end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
+            motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
             joint_dynamic: Arc::new(ArcSwap::from_pointee(JointDynamicState::default())),
 
             // 温数据：ArcSwap
@@ -1088,10 +1091,27 @@ impl PiperContext {
     /// println!("End pose: {:?}", snapshot.end_pose.end_pose);
     /// ```
     pub fn capture_motion_snapshot(&self) -> MotionSnapshot {
-        MotionSnapshot {
-            joint_position: self.joint_position.load().as_ref().clone(),
-            end_pose: self.end_pose.load().as_ref().clone(),
-        }
+        self.motion_snapshot.load().as_ref().clone()
+    }
+
+    /// 发布新的关节位置，并与当前末端位姿组合成逻辑原子快照。
+    pub fn publish_joint_position(&self, joint_position: JointPositionState) {
+        let end_pose = self.end_pose.load();
+        self.joint_position.store(Arc::new(joint_position.clone()));
+        self.motion_snapshot.store(Arc::new(MotionSnapshot {
+            joint_position,
+            end_pose: end_pose.as_ref().clone(),
+        }));
+    }
+
+    /// 发布新的末端位姿，并与当前关节位置组合成逻辑原子快照。
+    pub fn publish_end_pose(&self, end_pose: EndPoseState) {
+        let joint_position = self.joint_position.load();
+        self.end_pose.store(Arc::new(end_pose.clone()));
+        self.motion_snapshot.store(Arc::new(MotionSnapshot {
+            joint_position: joint_position.as_ref().clone(),
+            end_pose,
+        }));
     }
 }
 
@@ -1570,6 +1590,45 @@ mod tests {
         assert_eq!(snapshot.end_pose.hardware_timestamp_us, 0);
         assert_eq!(snapshot.joint_position.joint_pos, [0.0; 6]);
         assert_eq!(snapshot.end_pose.end_pose, [0.0; 6]);
+    }
+
+    #[test]
+    fn test_piper_context_motion_snapshot_matches_published_state() {
+        let ctx = PiperContext::new();
+
+        let joint_position = JointPositionState {
+            hardware_timestamp_us: 101,
+            system_timestamp_us: 202,
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        };
+        ctx.publish_joint_position(joint_position.clone());
+
+        let snapshot_after_joint = ctx.capture_motion_snapshot();
+        assert_eq!(
+            snapshot_after_joint.joint_position.hardware_timestamp_us,
+            joint_position.hardware_timestamp_us
+        );
+        assert_eq!(snapshot_after_joint.end_pose.hardware_timestamp_us, 0);
+
+        let end_pose = EndPoseState {
+            hardware_timestamp_us: 303,
+            system_timestamp_us: 404,
+            end_pose: [2.0; 6],
+            frame_valid_mask: 0b111,
+        };
+        ctx.publish_end_pose(end_pose.clone());
+
+        let snapshot_after_end = ctx.capture_motion_snapshot();
+        assert_eq!(
+            snapshot_after_end.joint_position.hardware_timestamp_us,
+            joint_position.hardware_timestamp_us
+        );
+        assert_eq!(
+            snapshot_after_end.end_pose.hardware_timestamp_us,
+            end_pose.hardware_timestamp_us
+        );
+        assert_eq!(snapshot_after_end.end_pose.end_pose, end_pose.end_pose);
     }
 
     #[test]

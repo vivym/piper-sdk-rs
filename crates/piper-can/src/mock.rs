@@ -2,7 +2,9 @@
 //!
 //! 提供无硬件依赖的 CAN 适配器实现，用于 CI 测试和单元测试。
 
-use crate::{CanAdapter, CanError, PiperFrame};
+use crate::{CanAdapter, CanError, PiperFrame, RxAdapter, SplittableAdapter, TxAdapter};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Mock CAN 适配器（无硬件依赖）
@@ -36,12 +38,7 @@ use std::time::Duration;
 /// # Ok::<(), CanError>(())
 /// ```
 pub struct MockCanAdapter {
-    /// 接收队列（模拟 CAN 总线）
-    frames: Vec<PiperFrame>,
-    /// 模拟接收超时（用于测试超时逻辑）
-    timeout_mode: bool,
-    /// 超时计数器
-    timeout_count: usize,
+    inner: Arc<Mutex<MockBusInner>>,
 }
 
 impl MockCanAdapter {
@@ -56,9 +53,7 @@ impl MockCanAdapter {
     /// ```
     pub fn new() -> Self {
         Self {
-            frames: Vec::new(),
-            timeout_mode: false,
-            timeout_count: 0,
+            inner: Arc::new(Mutex::new(MockBusInner::default())),
         }
     }
 
@@ -78,7 +73,7 @@ impl MockCanAdapter {
     /// adapter.inject(frame);
     /// ```
     pub fn inject(&mut self, frame: PiperFrame) {
-        self.frames.push(frame);
+        self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
     }
 
     /// 启用超时模式（用于测试超时逻辑）
@@ -107,14 +102,16 @@ impl MockCanAdapter {
     /// // let _ = adapter.receive();
     /// ```
     pub fn set_timeout_mode(&mut self, count: usize) {
-        self.timeout_mode = true;
-        self.timeout_count = count;
+        let mut inner = self.inner.lock().expect("mock bus poisoned");
+        inner.timeout_mode = true;
+        inner.timeout_count = count;
     }
 
     /// 禁用超时模式
     pub fn clear_timeout_mode(&mut self) {
-        self.timeout_mode = false;
-        self.timeout_count = 0;
+        let mut inner = self.inner.lock().expect("mock bus poisoned");
+        inner.timeout_mode = false;
+        inner.timeout_count = 0;
     }
 
     /// 获取队列中的帧数量
@@ -131,7 +128,7 @@ impl MockCanAdapter {
     /// assert_eq!(adapter.len(), 1);
     /// ```
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.inner.lock().expect("mock bus poisoned").frames.len()
     }
 
     /// 检查队列是否为空
@@ -145,7 +142,7 @@ impl MockCanAdapter {
     /// assert!(adapter.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.inner.lock().expect("mock bus poisoned").frames.is_empty()
     }
 
     /// 清空队列
@@ -161,7 +158,7 @@ impl MockCanAdapter {
     /// assert!(adapter.is_empty());
     /// ```
     pub fn clear(&mut self) {
-        self.frames.clear();
+        self.inner.lock().expect("mock bus poisoned").frames.clear();
     }
 }
 
@@ -191,9 +188,10 @@ impl CanAdapter for MockCanAdapter {
     /// assert_eq!(rx_frame.id, 0x123);
     /// ```
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
-        // 模拟发送：将帧放入接收队列（回环）
-        self.frames.push(frame);
-        Ok(())
+        MockTxAdapter {
+            inner: Arc::clone(&self.inner),
+        }
+        .send(frame)
     }
 
     /// 接收帧
@@ -216,14 +214,10 @@ impl CanAdapter for MockCanAdapter {
     /// assert_eq!(frame.id, 0x123);
     /// ```
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
-        // 检查超时模式
-        if self.timeout_mode && self.timeout_count > 0 {
-            self.timeout_count -= 1;
-            return Err(CanError::Timeout);
+        MockRxAdapter {
+            inner: Arc::clone(&self.inner),
         }
-
-        // 从队列中取出帧（FIFO）
-        self.frames.pop().ok_or(CanError::Timeout)
+        .receive()
     }
 
     /// 设置接收超时（Mock 实现：无操作）
@@ -231,6 +225,57 @@ impl CanAdapter for MockCanAdapter {
     /// Mock 适配器不使用超时，所有操作立即完成。
     fn set_receive_timeout(&mut self, _timeout: Duration) {
         // Mock 实现：无操作
+    }
+}
+
+impl SplittableAdapter for MockCanAdapter {
+    type RxAdapter = MockRxAdapter;
+    type TxAdapter = MockTxAdapter;
+
+    fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+        Ok((
+            MockRxAdapter {
+                inner: Arc::clone(&self.inner),
+            },
+            MockTxAdapter {
+                inner: Arc::clone(&self.inner),
+            },
+        ))
+    }
+}
+
+#[derive(Default)]
+struct MockBusInner {
+    frames: VecDeque<PiperFrame>,
+    timeout_mode: bool,
+    timeout_count: usize,
+}
+
+pub struct MockRxAdapter {
+    inner: Arc<Mutex<MockBusInner>>,
+}
+
+impl RxAdapter for MockRxAdapter {
+    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        let mut inner = self.inner.lock().expect("mock bus poisoned");
+
+        if inner.timeout_mode && inner.timeout_count > 0 {
+            inner.timeout_count -= 1;
+            return Err(CanError::Timeout);
+        }
+
+        inner.frames.pop_front().ok_or(CanError::Timeout)
+    }
+}
+
+pub struct MockTxAdapter {
+    inner: Arc<Mutex<MockBusInner>>,
+}
+
+impl TxAdapter for MockTxAdapter {
+    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
+        Ok(())
     }
 }
 
@@ -308,13 +353,13 @@ mod tests {
 
         // FIFO 顺序
         let frame1 = adapter.receive().unwrap();
-        assert_eq!(frame1.id, 0x300);
+        assert_eq!(frame1.id, 0x100);
 
         let frame2 = adapter.receive().unwrap();
         assert_eq!(frame2.id, 0x200);
 
         let frame3 = adapter.receive().unwrap();
-        assert_eq!(frame3.id, 0x100);
+        assert_eq!(frame3.id, 0x300);
     }
 
     #[test]
@@ -382,5 +427,15 @@ mod tests {
         let rx_frame = adapter.receive().unwrap();
         assert_eq!(rx_frame.id, 0x12345678);
         assert!(rx_frame.is_extended);
+    }
+
+    #[test]
+    fn test_mock_adapter_split() {
+        let adapter = MockCanAdapter::new();
+        let (mut rx, mut tx) = adapter.split().unwrap();
+
+        tx.send(PiperFrame::new_standard(0x123, &[1, 2, 3])).unwrap();
+        let frame = rx.receive().unwrap();
+        assert_eq!(frame.id, 0x123);
     }
 }

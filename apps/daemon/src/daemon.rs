@@ -5,7 +5,7 @@
 //! 参考：`daemon_implementation_plan.md` 第 4.1.3 节
 
 use crate::client_manager::{ClientAddr, ClientManager};
-use piper_sdk::can::gs_usb::{
+use piper_can::gs_usb::{
     GsUsbCanAdapter,
     split::{GsUsbRxAdapter, GsUsbTxAdapter},
 };
@@ -674,7 +674,7 @@ impl Daemon {
         );
 
         // 先扫描所有设备，打印信息
-        use piper_sdk::can::gs_usb::device::GsUsbDevice;
+        use piper_can::gs_usb::device::GsUsbDevice;
         match GsUsbDevice::scan_info() {
             Ok(infos) => {
                 eprintln!("[Daemon] Found {} GS-USB device(s):", infos.len());
@@ -975,7 +975,7 @@ impl Daemon {
                     // 零拷贝编码（使用栈上缓冲区）
                     let mut buf = [0u8; 64];
                     let encoded =
-                        match piper_sdk::can::gs_usb_udp::protocol::encode_receive_frame_zero_copy(
+                        match piper_can::gs_usb_udp::protocol::encode_receive_frame_zero_copy(
                             &frame, &mut buf,
                         ) {
                             Ok(data) => data,
@@ -1219,9 +1219,7 @@ impl Daemon {
             match socket.recv_from(&mut buf) {
                 Ok((len, client_addr)) => {
                     // 解析消息
-                    if let Ok(msg) =
-                        piper_sdk::can::gs_usb_udp::protocol::decode_message(&buf[..len])
-                    {
+                    if let Ok(msg) = piper_can::gs_usb_udp::protocol::decode_message(&buf[..len]) {
                         // 更新统计（接收 IPC 消息）
                         stats.read().unwrap().increment_ipc_received();
                         Self::handle_ipc_message(
@@ -1272,9 +1270,7 @@ impl Daemon {
             match socket.recv_from(&mut buf) {
                 Ok((len, client_addr)) => {
                     // 解析消息
-                    if let Ok(msg) =
-                        piper_sdk::can::gs_usb_udp::protocol::decode_message(&buf[..len])
-                    {
+                    if let Ok(msg) = piper_can::gs_usb_udp::protocol::decode_message(&buf[..len]) {
                         // 更新统计（接收 IPC 消息）
                         stats.read().unwrap().increment_ipc_received();
 
@@ -1309,7 +1305,7 @@ impl Daemon {
     /// 使用 TX adapter，与 RX 完全隔离
     #[cfg(unix)]
     fn handle_ipc_message(
-        msg: piper_sdk::can::gs_usb_udp::protocol::Message,
+        msg: piper_can::gs_usb_udp::protocol::Message,
         client_addr: std::os::unix::net::SocketAddr,
         tx_adapter: &Arc<Mutex<Option<GsUsbTxAdapter>>>,
         _device_state: &Arc<RwLock<DeviceState>>,
@@ -1318,13 +1314,13 @@ impl Daemon {
         stats: &Arc<RwLock<DaemonStats>>,
     ) {
         match msg {
-            piper_sdk::can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
+            piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
                 // 更新客户端活动时间
                 if let Err(e) = clients.write().unwrap().update_activity(client_id) {
                     eprintln!("[Client {}] Failed to update activity: {}", client_id, e);
                 }
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::Connect { client_id, filters } => {
+            piper_can::gs_usb_udp::protocol::Message::Connect { client_id, filters } => {
                 // 注册客户端（使用从 recv_from 获取的真实地址）
                 // 尝试从 UnixSocketAddr 获取路径（如果可用）
                 // 支持自动 ID 分配：client_id = 0 表示自动分配
@@ -1393,7 +1389,7 @@ impl Daemon {
                 } else {
                     1 // 失败（通常是客户端 ID 已存在）
                 };
-                let encoded_ack = piper_sdk::can::gs_usb_udp::protocol::encode_connect_ack(
+                let encoded_ack = piper_can::gs_usb_udp::protocol::encode_connect_ack(
                     actual_id, // 使用实际 ID（自动分配或手动指定）
                     status,
                     0, // seq = 0 for ConnectAck
@@ -1416,10 +1412,10 @@ impl Daemon {
                     eprintln!("Failed to register client {}: {}", actual_id, e);
                 }
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::Disconnect { client_id } => {
+            piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id } => {
                 clients.write().unwrap().unregister(client_id);
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::SendFrame { frame, seq: _seq } => {
+            piper_can::gs_usb_udp::protocol::Message::SendFrame { frame, seq: _seq } => {
                 // 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
@@ -1438,7 +1434,7 @@ impl Daemon {
                     eprintln!("[Client] TX adapter not available, frame dropped");
                 }
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
+            piper_can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
                 // ✅ SetFilter 消息处理
                 let mut clients_guard = clients.write().unwrap();
                 match clients_guard.set_filters(client_id, filters.clone()) {
@@ -1455,7 +1451,7 @@ impl Daemon {
                 }
                 // 可选：发送确认消息给客户端
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::GetStatus => {
+            piper_can::gs_usb_udp::protocol::Message::GetStatus => {
                 // ✅ 新增：GetStatus 消息处理
                 // 按需提取地址字符串（性能优化：仅在此分支内转换）
                 let addr_str = match client_addr.as_pathname() {
@@ -1475,7 +1471,7 @@ impl Daemon {
                 let tx_fps = stats_guard.get_tx_fps();
 
                 // 构建 StatusResponse
-                let status = piper_sdk::can::gs_usb_udp::protocol::StatusResponse {
+                let status = piper_can::gs_usb_udp::protocol::StatusResponse {
                     device_state: match *device_state_guard {
                         DeviceState::Connected => 1,
                         DeviceState::Disconnected => 0,
@@ -1499,7 +1495,7 @@ impl Daemon {
 
                 // 编码并发送 StatusResponse 回请求者
                 let mut status_buf = [0u8; 64];
-                if let Ok(encoded) = piper_sdk::can::gs_usb_udp::protocol::encode_status_response(
+                if let Ok(encoded) = piper_can::gs_usb_udp::protocol::encode_status_response(
                     &status,
                     0, // seq (GetStatus 不需要序列号，使用 0)
                     &mut status_buf,
@@ -1527,7 +1523,7 @@ impl Daemon {
     /// 2. `socket` 是 `UdpSocket` 而不是 `UnixDatagram`
     /// 3. UDP Connect 消息使用 `register()` 而不是 `register_with_unix_addr()`
     fn handle_ipc_message_udp(
-        msg: piper_sdk::can::gs_usb_udp::protocol::Message,
+        msg: piper_can::gs_usb_udp::protocol::Message,
         client_addr: std::net::SocketAddr, // ← UDP 地址（SocketAddr）
         tx_adapter: &Arc<Mutex<Option<GsUsbTxAdapter>>>,
         device_state: &Arc<RwLock<DeviceState>>,
@@ -1536,7 +1532,7 @@ impl Daemon {
         stats: &Arc<RwLock<DaemonStats>>,
     ) {
         match msg {
-            piper_sdk::can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
+            piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
                 // 更新客户端活动时间
                 if let Err(e) = clients.write().unwrap().update_activity(client_id) {
                     eprintln!(
@@ -1545,7 +1541,7 @@ impl Daemon {
                     );
                 }
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::Connect { client_id, filters } => {
+            piper_can::gs_usb_udp::protocol::Message::Connect { client_id, filters } => {
                 let addr = ClientAddr::Udp(client_addr); // ← 使用 UDP 地址
 
                 // 支持自动 ID 分配：client_id = 0 表示自动分配
@@ -1581,7 +1577,7 @@ impl Daemon {
                 } else {
                     1 // 失败（通常是客户端 ID 已存在）
                 };
-                let encoded_ack = piper_sdk::can::gs_usb_udp::protocol::encode_connect_ack(
+                let encoded_ack = piper_can::gs_usb_udp::protocol::encode_connect_ack(
                     actual_id, // 使用实际 ID（自动分配或手动指定）
                     status,
                     0, // seq = 0 for ConnectAck
@@ -1607,10 +1603,10 @@ impl Daemon {
                     eprintln!("Failed to register UDP client {}: {}", actual_id, e);
                 }
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::Disconnect { client_id } => {
+            piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id } => {
                 clients.write().unwrap().unregister(client_id);
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::SendFrame { frame, seq: _seq } => {
+            piper_can::gs_usb_udp::protocol::Message::SendFrame { frame, seq: _seq } => {
                 // ✅ 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
@@ -1626,7 +1622,7 @@ impl Daemon {
                     eprintln!("[UDP Client] TX adapter not available, frame dropped");
                 }
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
+            piper_can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
                 // ✅ SetFilter 消息处理（UDP）
                 let mut clients_guard = clients.write().unwrap();
                 match clients_guard.set_filters(client_id, filters.clone()) {
@@ -1642,7 +1638,7 @@ impl Daemon {
                     },
                 }
             },
-            piper_sdk::can::gs_usb_udp::protocol::Message::GetStatus => {
+            piper_can::gs_usb_udp::protocol::Message::GetStatus => {
                 // ✅ GetStatus 消息处理（UDP）
                 // UDP 地址可以直接使用 SocketAddr，无需转换字符串
 
@@ -1655,7 +1651,7 @@ impl Daemon {
                 let tx_fps = stats_guard.get_tx_fps();
 
                 // 构建 StatusResponse
-                let status = piper_sdk::can::gs_usb_udp::protocol::StatusResponse {
+                let status = piper_can::gs_usb_udp::protocol::StatusResponse {
                     device_state: match *device_state_guard {
                         DeviceState::Connected => 1,
                         DeviceState::Disconnected => 0,
@@ -1679,7 +1675,7 @@ impl Daemon {
 
                 // 编码并发送 StatusResponse 回请求者
                 let mut status_buf = [0u8; 64];
-                if let Ok(encoded) = piper_sdk::can::gs_usb_udp::protocol::encode_status_response(
+                if let Ok(encoded) = piper_can::gs_usb_udp::protocol::encode_status_response(
                     &status,
                     0, // seq (GetStatus 不需要序列号，使用 0)
                     &mut status_buf,
