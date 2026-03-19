@@ -11,7 +11,7 @@ use crate::metrics::{MetricsSnapshot, PiperMetrics};
 use crate::pipeline::*;
 use crate::state::*;
 use crossbeam_channel::{Receiver, Sender};
-use piper_can::{CanError, PiperFrame, RxAdapter, SplittableAdapter, TxAdapter};
+use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -322,7 +322,7 @@ impl Piper {
     /// 使用已拆分的 RX/TX 适配器创建双线程 runtime。
     pub fn new_dual_thread_parts(
         rx_adapter: impl RxAdapter + Send + 'static,
-        tx_adapter: impl TxAdapter + Send + 'static,
+        tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
     ) -> Result<Self, CanError> {
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
@@ -1475,8 +1475,19 @@ mod tests {
 
     struct MockTxAdapter;
 
-    impl piper_can::TxAdapter for MockTxAdapter {
-        fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+    impl piper_can::RealtimeTxAdapter for MockTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
             if deadline <= Instant::now() {
                 return Err(CanError::Timeout);
             }
@@ -1488,8 +1499,20 @@ mod tests {
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
     }
 
-    impl piper_can::TxAdapter for RecordingTxAdapter {
-        fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+    impl piper_can::RealtimeTxAdapter for RecordingTxAdapter {
+        fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
             if deadline <= Instant::now() {
                 return Err(CanError::Timeout);
             }
@@ -1503,8 +1526,23 @@ mod tests {
         sends: usize,
     }
 
-    impl piper_can::TxAdapter for FailOnNthTxAdapter {
-        fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+    impl piper_can::RealtimeTxAdapter for FailOnNthTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sends += 1;
+            if self.sends == self.fail_on {
+                return Err(CanError::BufferOverflow);
+            }
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
             if deadline <= Instant::now() {
                 return Err(CanError::Timeout);
             }
@@ -1522,8 +1560,22 @@ mod tests {
         first_send: bool,
     }
 
-    impl piper_can::TxAdapter for CoordinatedFailTxAdapter {
-        fn send_until(&mut self, _frame: PiperFrame, _deadline: Instant) -> Result<(), CanError> {
+    impl piper_can::RealtimeTxAdapter for CoordinatedFailTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, _budget: Duration) -> Result<(), CanError> {
+            if !self.first_send {
+                self.first_send = true;
+                let _ = self.started_tx.send(());
+                let _ = self.release_rx.recv();
+                return Err(CanError::BufferOverflow);
+            }
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            _deadline: Instant,
+        ) -> Result<(), CanError> {
             if !self.first_send {
                 self.first_send = true;
                 let _ = self.started_tx.send(());
@@ -1541,8 +1593,8 @@ mod tests {
         sends: usize,
     }
 
-    impl piper_can::TxAdapter for BlockingFirstSendTxAdapter {
-        fn send_until(&mut self, frame: PiperFrame, _deadline: Instant) -> Result<(), CanError> {
+    impl piper_can::RealtimeTxAdapter for BlockingFirstSendTxAdapter {
+        fn send_control(&mut self, frame: PiperFrame, _budget: Duration) -> Result<(), CanError> {
             self.sends += 1;
             self.sent_frames.lock().expect("sent frames lock").push(frame);
             if self.sends == 1 {
@@ -1551,14 +1603,38 @@ mod tests {
             }
             Ok(())
         }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            _deadline: Instant,
+        ) -> Result<(), CanError> {
+            self.send_control(frame, Duration::from_millis(1))
+        }
     }
 
     struct SlowTxAdapter {
         delay: Duration,
     }
 
-    impl piper_can::TxAdapter for SlowTxAdapter {
-        fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+    impl piper_can::RealtimeTxAdapter for SlowTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            if budget < self.delay {
+                std::thread::sleep(budget);
+                return Err(CanError::Timeout);
+            }
+            std::thread::sleep(self.delay);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
             let now = Instant::now();
             let Some(remaining) = deadline.checked_duration_since(now) else {
                 return Err(CanError::Timeout);

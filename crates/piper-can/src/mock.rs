@@ -2,7 +2,7 @@
 //!
 //! 提供无硬件依赖的 CAN 适配器实现，用于 CI 测试和单元测试。
 
-use crate::{CanAdapter, CanError, PiperFrame, RxAdapter, SplittableAdapter, TxAdapter};
+use crate::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -188,10 +188,8 @@ impl CanAdapter for MockCanAdapter {
     /// assert_eq!(rx_frame.id, 0x123);
     /// ```
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
-        MockTxAdapter {
-            inner: Arc::clone(&self.inner),
-        }
-        .send_until(frame, Instant::now() + Duration::from_secs(60))
+        self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
+        Ok(())
     }
 
     /// 接收帧
@@ -272,8 +270,20 @@ pub struct MockTxAdapter {
     inner: Arc<Mutex<MockBusInner>>,
 }
 
-impl TxAdapter for MockTxAdapter {
-    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for MockTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
+        Ok(())
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         if deadline <= Instant::now() {
             return Err(CanError::Timeout);
         }
@@ -437,9 +447,9 @@ mod tests {
         let adapter = MockCanAdapter::new();
         let (mut rx, mut tx) = adapter.split().unwrap();
 
-        tx.send_until(
+        tx.send_control(
             PiperFrame::new_standard(0x123, &[1, 2, 3]),
-            Instant::now() + Duration::from_millis(10),
+            Duration::from_millis(10),
         )
         .unwrap();
         let frame = rx.receive().unwrap();

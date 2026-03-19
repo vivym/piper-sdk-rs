@@ -9,12 +9,8 @@ use crate::piper::Piper;
 use piper_can::SocketCanAdapter;
 use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_can::gs_usb::device::GsUsbDeviceSelector;
-use piper_can::gs_usb_udp::GsUsbUdpAdapter;
-use piper_can::{
-    CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, RxAdapter, SplittableAdapter,
-    TxAdapter,
-};
-use std::path::{Path, PathBuf};
+use piper_can::{CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// 类型化的连接目标。
@@ -50,7 +46,7 @@ enum GsUsbSelectorSpec {
 
 struct BuiltBackend {
     rx: Box<dyn RxAdapter + Send>,
-    tx: Box<dyn TxAdapter + Send>,
+    tx: Box<dyn RealtimeTxAdapter + Send>,
     interface: String,
     bus_speed: u32,
 }
@@ -58,7 +54,7 @@ struct BuiltBackend {
 impl BuiltBackend {
     fn new(
         rx: impl RxAdapter + Send + 'static,
-        tx: impl TxAdapter + Send + 'static,
+        tx: impl RealtimeTxAdapter + Send + 'static,
         interface: impl Into<String>,
         bus_speed: u32,
     ) -> Self {
@@ -85,20 +81,6 @@ trait BackendFactory {
     fn open_gs_usb(
         &self,
         selector: GsUsbSelectorSpec,
-        baud_rate: u32,
-        receive_timeout: Duration,
-    ) -> Result<BuiltBackend, DriverError>;
-
-    fn open_daemon_udp(
-        &self,
-        addr: &str,
-        baud_rate: u32,
-        receive_timeout: Duration,
-    ) -> Result<BuiltBackend, DriverError>;
-
-    fn open_daemon_uds(
-        &self,
-        path: &Path,
         baud_rate: u32,
         receive_timeout: Duration,
     ) -> Result<BuiltBackend, DriverError>;
@@ -165,54 +147,6 @@ impl BackendFactory for RealBackendFactory {
         };
 
         Ok(BuiltBackend::new(rx, tx, interface, baud_rate))
-    }
-
-    fn open_daemon_udp(
-        &self,
-        addr: &str,
-        baud_rate: u32,
-        receive_timeout: Duration,
-    ) -> Result<BuiltBackend, DriverError> {
-        let mut can = GsUsbUdpAdapter::new_udp(addr).map_err(DriverError::Can)?;
-        can.set_receive_timeout(receive_timeout);
-        can.connect(vec![]).map_err(DriverError::Can)?;
-        let (rx, tx) = can.split().map_err(DriverError::Can)?;
-        Ok(BuiltBackend::new(
-            rx,
-            tx,
-            format!("daemon:udp:{addr}"),
-            baud_rate,
-        ))
-    }
-
-    fn open_daemon_uds(
-        &self,
-        path: &Path,
-        baud_rate: u32,
-        receive_timeout: Duration,
-    ) -> Result<BuiltBackend, DriverError> {
-        #[cfg(unix)]
-        {
-            let mut can =
-                GsUsbUdpAdapter::new_uds(path.to_string_lossy()).map_err(DriverError::Can)?;
-            can.set_receive_timeout(receive_timeout);
-            can.connect(vec![]).map_err(DriverError::Can)?;
-            let (rx, tx) = can.split().map_err(DriverError::Can)?;
-            Ok(BuiltBackend::new(
-                rx,
-                tx,
-                format!("daemon:uds:{}", path.display()),
-                baud_rate,
-            ))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (path, baud_rate, receive_timeout);
-            Err(DriverError::Can(CanError::Device(CanDeviceError::new(
-                CanDeviceErrorKind::UnsupportedConfig,
-                "Unix Domain Sockets are not supported on this platform",
-            ))))
-        }
     }
 }
 
@@ -319,11 +253,11 @@ impl PiperBuilder {
                 self.baud_rate,
                 receive_timeout,
             )?,
-            ConnectionTarget::DaemonUdp { addr } => {
-                factory.open_daemon_udp(addr, self.baud_rate, receive_timeout)?
-            },
-            ConnectionTarget::DaemonUds { path } => {
-                factory.open_daemon_uds(path, self.baud_rate, receive_timeout)?
+            ConnectionTarget::DaemonUdp { .. } | ConnectionTarget::DaemonUds { .. } => {
+                return Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::UnsupportedConfig,
+                    "daemon UDP/UDS targets are non-realtime backends and cannot be used with the dual-thread Piper driver",
+                ))));
             },
         };
 
@@ -372,8 +306,19 @@ mod tests {
 
     struct TestTxAdapter;
 
-    impl TxAdapter for TestTxAdapter {
-        fn send_until(
+    impl RealtimeTxAdapter for TestTxAdapter {
+        fn send_control(
+            &mut self,
+            _frame: piper_can::PiperFrame,
+            budget: Duration,
+        ) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+
+        fn send_shutdown_until(
             &mut self,
             _frame: piper_can::PiperFrame,
             deadline: Instant,
@@ -429,24 +374,6 @@ mod tests {
                 },
             };
             Ok(self.backend(label, baud_rate))
-        }
-
-        fn open_daemon_udp(
-            &self,
-            addr: &str,
-            baud_rate: u32,
-            _receive_timeout: Duration,
-        ) -> Result<BuiltBackend, DriverError> {
-            Ok(self.backend(format!("daemon:udp:{addr}"), baud_rate))
-        }
-
-        fn open_daemon_uds(
-            &self,
-            path: &Path,
-            baud_rate: u32,
-            _receive_timeout: Duration,
-        ) -> Result<BuiltBackend, DriverError> {
-            Ok(self.backend(format!("daemon:uds:{}", path.display()), baud_rate))
         }
     }
 
@@ -509,17 +436,22 @@ mod tests {
             .gs_usb_serial("ABC123")
             .build_with_factory(&factory)
             .unwrap();
-        let _ = PiperBuilder::new()
+        let err = PiperBuilder::new()
             .daemon_udp("127.0.0.1:18888")
             .build_with_factory(&factory)
-            .unwrap();
+            .err()
+            .expect("daemon targets should be rejected for realtime dual-thread driver");
+        assert!(matches!(
+            err,
+            DriverError::Can(CanError::Device(CanDeviceError {
+                kind: CanDeviceErrorKind::UnsupportedConfig,
+                ..
+            }))
+        ));
 
         assert_eq!(
             factory.calls.lock().unwrap().as_slice(),
-            &[
-                "gs-usb:serial:ABC123".to_string(),
-                "daemon:udp:127.0.0.1:18888".to_string(),
-            ]
+            &["gs-usb:serial:ABC123".to_string()]
         );
     }
 

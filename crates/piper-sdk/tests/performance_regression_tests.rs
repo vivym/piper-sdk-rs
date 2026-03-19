@@ -6,7 +6,7 @@
 //! 3. 确保新功能（命令优先级、超时 API）不引入性能开销
 //! 4. 可集成到 CI，作为性能门禁
 
-use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::command::{PiperCommand, ReliableCommand, ShutdownCommand};
 use piper_sdk::driver::{
     NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
@@ -314,8 +314,31 @@ impl SimpleTxAdapter {
     }
 }
 
-impl TxAdapter for SimpleTxAdapter {
-    fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for SimpleTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        let start = Instant::now();
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        let sleep_for = self.send_delay.min(budget);
+        thread::sleep(sleep_for);
+        if self.send_delay > budget {
+            return Err(CanError::Timeout);
+        }
+        let duration = start.elapsed();
+
+        self.sent_count.fetch_add(1, Ordering::Relaxed);
+        self.send_times.lock().unwrap().push((start, duration));
+
+        let _ = frame;
+        Ok(())
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         let start = Instant::now();
         let Some(remaining) = deadline.checked_duration_since(start) else {
             return Err(CanError::Timeout);
@@ -330,6 +353,7 @@ impl TxAdapter for SimpleTxAdapter {
         self.sent_count.fetch_add(1, Ordering::Relaxed);
         self.send_times.lock().unwrap().push((start, duration));
 
+        let _ = frame;
         Ok(())
     }
 }
@@ -351,11 +375,11 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let send_times = tx_adapter.send_times.clone();
 
     // 创建命令通道
-    let (realtime_tx, _realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let realtime_slot_tx = Arc::clone(&realtime_slot);
 
     // 启动 RX 线程
     let ctx_rx = ctx.clone();
@@ -425,23 +449,23 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             &[command_count as u8; 8],
         );
 
-        if realtime_tx.try_send(frame).is_ok() {
-            // 等待发送完成
-            let mut retries = 0;
-            while retries < 100 {
-                let times = send_times.lock().unwrap();
-                if times.len() > command_count as usize {
-                    let (send_time, _) = times[command_count as usize];
-                    let latency = send_time.duration_since(api_call_time);
-                    tx_latencies.push(latency);
-                    break;
-                }
-                drop(times);
-                thread::sleep(Duration::from_micros(100));
-                retries += 1;
+        *realtime_slot_tx.lock().unwrap() =
+            Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
+
+        let mut retries = 0;
+        while retries < 100 {
+            let times = send_times.lock().unwrap();
+            if times.len() > command_count as usize {
+                let (send_time, _) = times[command_count as usize];
+                let latency = send_time.duration_since(api_call_time);
+                tx_latencies.push(latency);
+                break;
             }
-            command_count += 1;
+            drop(times);
+            thread::sleep(Duration::from_micros(100));
+            retries += 1;
         }
+        command_count += 1;
 
         thread::sleep(Duration::from_millis(2)); // 500Hz
     }
@@ -558,11 +582,11 @@ fn test_command_priority_performance() {
     let tx_adapter = SimpleTxAdapter::new(Duration::from_micros(100));
 
     // 创建命令通道
-    let (realtime_tx, _realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let realtime_slot_tx = Arc::clone(&realtime_slot);
 
     // 启动 TX 线程
     let ctx_tx = ctx.clone();
@@ -594,9 +618,9 @@ fn test_command_priority_performance() {
             0x200 + (direct_send_count % 10) as u16,
             &[direct_send_count as u8; 8],
         );
-        if realtime_tx.try_send(frame).is_ok() {
-            direct_send_count += 1;
-        }
+        *realtime_slot_tx.lock().unwrap() =
+            Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
+        direct_send_count += 1;
         thread::sleep(Duration::from_millis(2));
     }
 
@@ -616,11 +640,11 @@ fn test_command_priority_performance() {
     let last_fault2 = Arc::new(AtomicU8::new(0));
     let metrics2 = Arc::new(PiperMetrics::new());
     let tx_adapter2 = SimpleTxAdapter::new(Duration::from_micros(100));
-    let (realtime_tx2, _realtime_rx2) = crossbeam_channel::bounded::<PiperFrame>(1);
     let (_reliable_tx2, reliable_rx2) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let (_shutdown_tx2, shutdown_rx2) = crossbeam_channel::bounded::<ShutdownCommand>(4);
     let realtime_slot2: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let realtime_slot2_tx = Arc::clone(&realtime_slot2);
 
     let ctx_tx2 = ctx.clone();
     let is_running_tx2 = is_running2.clone();
@@ -651,9 +675,10 @@ fn test_command_priority_performance() {
             &[command_send_count as u8; 8],
         );
         let cmd = PiperCommand::realtime(frame);
-        if realtime_tx2.try_send(cmd.frame()).is_ok() {
-            command_send_count += 1;
-        }
+        *realtime_slot2_tx.lock().unwrap() = Some(
+            piper_sdk::driver::command::RealtimeCommand::single(cmd.frame()),
+        );
+        command_send_count += 1;
         thread::sleep(Duration::from_millis(2));
     }
 

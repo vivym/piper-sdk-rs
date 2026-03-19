@@ -2,11 +2,12 @@
 //!
 //! 测试各种协议反馈帧的解析和状态更新。
 
-use piper_sdk::can::{CanAdapter, CanError, PiperFrame, SplittableAdapter};
+use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter};
 use piper_sdk::driver::*;
 use piper_sdk::protocol::ids::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// MockCanAdapter 用于测试
 struct MockCanAdapter {
@@ -52,8 +53,16 @@ struct MockTxAdapter {
     sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
 }
 
-impl piper_sdk::can::TxAdapter for MockTxAdapter {
-    fn send_until(
+impl RealtimeTxAdapter for MockTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        self.sent_frames.lock().unwrap().push(frame);
+        Ok(())
+    }
+
+    fn send_shutdown_until(
         &mut self,
         frame: PiperFrame,
         deadline: std::time::Instant,

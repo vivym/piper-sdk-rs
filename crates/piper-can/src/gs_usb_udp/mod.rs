@@ -4,7 +4,7 @@
 
 pub mod protocol;
 
-use crate::{CanAdapter, CanError, PiperFrame, RxAdapter, SplittableAdapter, TxAdapter};
+use crate::{CanAdapter, CanError, PiperFrame, RxAdapter, TxAdapter};
 use protocol::{CanIdFilter, Message};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
@@ -388,6 +388,22 @@ impl GsUsbUdpAdapter {
         })
     }
 
+    /// 分离为 bridge-only RX/TX 句柄。
+    ///
+    /// 该 split 仅用于 daemon bridge / monitor / replay 等 best-effort 场景，
+    /// 不满足实时控制 backend 的契约，因此不实现 `SplittableAdapter`。
+    pub fn split_bridge(self) -> Result<(GsUsbUdpRxAdapter, GsUsbUdpTxAdapter), CanError> {
+        Ok((
+            GsUsbUdpRxAdapter {
+                session: Arc::clone(&self.session),
+                rx_buffer: self.rx_buffer,
+            },
+            GsUsbUdpTxAdapter {
+                session: self.session,
+            },
+        ))
+    }
+
     /// 连接到守护进程
     pub fn connect(&mut self, filters: Vec<CanIdFilter>) -> Result<(), CanError> {
         if self.session.is_connected() {
@@ -516,23 +532,6 @@ impl TxAdapter for GsUsbUdpTxAdapter {
             return Err(CanError::Timeout);
         }
         send_frame(&self.session, frame)
-    }
-}
-
-impl SplittableAdapter for GsUsbUdpAdapter {
-    type RxAdapter = GsUsbUdpRxAdapter;
-    type TxAdapter = GsUsbUdpTxAdapter;
-
-    fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
-        Ok((
-            GsUsbUdpRxAdapter {
-                session: Arc::clone(&self.session),
-                rx_buffer: self.rx_buffer,
-            },
-            GsUsbUdpTxAdapter {
-                session: self.session,
-            },
-        ))
     }
 }
 
@@ -750,7 +749,7 @@ mod tests {
         adapter.connect(vec![]).unwrap();
         ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let (mut rx, mut tx) = adapter.split().unwrap();
+        let (mut rx, mut tx) = adapter.split_bridge().unwrap();
         let outbound = PiperFrame::new_standard(0x321, &[9, 8, 7, 6]);
         tx.send_until(outbound, Instant::now() + Duration::from_millis(50)).unwrap();
 

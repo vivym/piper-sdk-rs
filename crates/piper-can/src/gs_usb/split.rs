@@ -10,7 +10,9 @@ use crate::gs_usb::protocol::{
     CAN_ERR_CRTL_TX_BUS_OFF, CAN_ERR_CRTL_TX_PASSIVE, CAN_ERR_FLAG, CAN_ERR_PROT_FORM,
     GS_CAN_MODE_LOOP_BACK, GS_USB_ECHO_ID,
 };
-use crate::{CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RxAdapter, TxAdapter};
+use crate::{
+    CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -338,7 +340,19 @@ impl GsUsbTxAdapter {
         Self { device }
     }
 
-    /// 发送 CAN 帧
+    /// 在固定 budget 内发送普通控制帧。
+    pub fn send_frame_with_budget(
+        &mut self,
+        frame: PiperFrame,
+        budget: Duration,
+    ) -> Result<(), CanError> {
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        self.send_frame_until(frame, Instant::now() + budget)
+    }
+
+    /// 在绝对 deadline 内发送停机帧。
     pub fn send_frame_until(
         &mut self,
         frame: PiperFrame,
@@ -363,7 +377,9 @@ impl GsUsbTxAdapter {
         // 发送到 USB Endpoint OUT
         self.device.send_raw_until(&gs_frame, deadline).map_err(|e| {
             let kind = match e {
-                crate::gs_usb::error::GsUsbError::WriteTimeout => CanDeviceErrorKind::Busy,
+                crate::gs_usb::error::GsUsbError::WriteTimeout => {
+                    return CanError::Timeout;
+                },
                 crate::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
                     CanDeviceErrorKind::NoDevice
                 },
@@ -380,8 +396,16 @@ impl GsUsbTxAdapter {
     }
 }
 
-impl TxAdapter for GsUsbTxAdapter {
-    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for GsUsbTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        self.send_frame_with_budget(frame, budget)
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         self.send_frame_until(frame, deadline)
     }
 }

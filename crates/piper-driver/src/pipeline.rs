@@ -6,7 +6,7 @@ use crate::metrics::PiperMetrics;
 use crate::piper::{NORMAL_FRAME_SEND_BUDGET, NormalSendGate, RuntimeFaultKind, RuntimePhase};
 use crate::state::*;
 use crossbeam_channel::Receiver;
-use piper_can::{CanAdapter, CanError, PiperFrame, RxAdapter, TxAdapter};
+use piper_can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_protocol::config::*;
 use piper_protocol::feedback::*;
 use piper_protocol::ids::*;
@@ -571,7 +571,7 @@ pub fn rx_loop(
 /// - `ctx`: 共享状态上下文（用于触发 TX 回调，v1.2.1）
 #[allow(clippy::too_many_arguments)]
 pub fn tx_loop_mailbox(
-    mut tx: impl TxAdapter,
+    mut tx: impl RealtimeTxAdapter,
     realtime_slot: Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
     shutdown_rx: Receiver<crate::command::ShutdownCommand>,
     reliable_rx: Receiver<crate::command::ReliableCommand>,
@@ -595,7 +595,7 @@ pub fn tx_loop_mailbox(
 
         if let Ok(command) = shutdown_rx.try_recv() {
             let frame = command.frame();
-            let send_result = match tx.send_until(frame, command.deadline()) {
+            let send_result = match tx.send_shutdown_until(frame, command.deadline()) {
                 Ok(_) => {
                     metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
                     metrics.tx_shutdown_sent_total.fetch_add(1, Ordering::Relaxed);
@@ -671,7 +671,7 @@ pub fn tx_loop_mailbox(
                     break;
                 }
 
-                match tx.send_until(frame, Instant::now() + NORMAL_FRAME_SEND_BUDGET) {
+                match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
@@ -758,8 +758,7 @@ pub fn tx_loop_mailbox(
 
             let frame = command.frame();
             let ack = command.take_ack();
-            let send_result = match tx.send_until(frame, Instant::now() + NORMAL_FRAME_SEND_BUDGET)
-            {
+            let send_result = match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
                 Ok(_) => {
                     metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 

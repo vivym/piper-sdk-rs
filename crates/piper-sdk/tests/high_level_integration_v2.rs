@@ -12,7 +12,7 @@
 
 use piper_sdk::client::state::*;
 // 注意：不导入 types::* 以避免 Result 类型别名冲突
-use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
+use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter};
 use piper_sdk::client::ControlReadPolicy;
 use piper_sdk::client::types::{Joint, NewtonMeter, Rad};
 use piper_sdk::prelude::JointArray;
@@ -90,8 +90,20 @@ pub struct MockTxAdapter {
     sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
 }
 
-impl piper_sdk::can::TxAdapter for MockTxAdapter {
-    fn send_until(
+impl RealtimeTxAdapter for MockTxAdapter {
+    fn send_control(
+        &mut self,
+        frame: PiperFrame,
+        budget: std::time::Duration,
+    ) -> std::result::Result<(), CanError> {
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        self.sent_frames.lock().unwrap().push(frame);
+        Ok(())
+    }
+
+    fn send_shutdown_until(
         &mut self,
         frame: PiperFrame,
         deadline: std::time::Instant,

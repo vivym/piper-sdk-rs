@@ -7,7 +7,7 @@
 //! 4. 支持多种测试场景（500Hz/1kHz、USB故障、CAN高负载）
 //! 5. 生成测试报告（Markdown）
 
-use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::{
     NormalSendGate, PipelineConfig, PiperContext, PiperMetrics,
     command::{RealtimeCommand, ReliableCommand, ShutdownCommand},
@@ -350,8 +350,34 @@ impl ConfigurableTxAdapter {
     }
 }
 
-impl TxAdapter for ConfigurableTxAdapter {
-    fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for ConfigurableTxAdapter {
+    fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        let start = Instant::now();
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+
+        if rand::random::<f64>() < self.error_probability {
+            return Err(CanError::Io(std::io::Error::other("Simulated error")));
+        }
+
+        thread::sleep(self.send_delay.min(budget));
+        if self.send_delay > budget {
+            return Err(CanError::Timeout);
+        }
+        let duration = start.elapsed();
+
+        self.sent_count.fetch_add(1, Ordering::Relaxed);
+        self.send_times.lock().unwrap().push((start, duration));
+
+        Ok(())
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        _frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         let start = Instant::now();
         let Some(remaining) = deadline.checked_duration_since(start) else {
             return Err(CanError::Timeout);

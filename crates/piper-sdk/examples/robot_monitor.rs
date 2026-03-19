@@ -253,18 +253,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. 创建 Piper 实例
     // 优先级：
-    // 1. 如果指定了 --uds，使用守护进程模式
+    // 1. 如果指定了 --uds，直接拒绝（daemon backend 已降级为非实时链路）
     // 2. 如果指定了 --interface，使用指定的接口/设备序列号
     // 3. 在 Linux 平台下，默认使用 can0（SocketCAN）
-    // 4. 在 macOS 平台下，默认使用 UDP 守护进程模式（127.0.0.1:18888）
-    // 5. 在其他平台下，自动扫描 GS-USB 设备
+    // 4. 在非 Linux 平台下，默认自动扫描 GS-USB 设备
     let builder = if let Some(daemon_addr) = &args.uds {
-        println!("使用守护进程模式: {}", daemon_addr);
-        if daemon_addr.starts_with('/') {
-            PiperBuilder::new().daemon_uds(daemon_addr)
-        } else {
-            PiperBuilder::new().daemon_udp(daemon_addr)
-        }
+        return Err(format!(
+            "守护进程后端 ({daemon_addr}) 已被降级为非实时链路，robot_monitor 不再支持它；请改用 SocketCAN 或 GS-USB direct"
+        )
+        .into());
     } else if let Some(interface) = &args.interface {
         #[cfg(target_os = "linux")]
         {
@@ -282,13 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("使用默认 CAN 接口: can0 (SocketCAN)");
             PiperBuilder::new().socketcan("can0")
         }
-        #[cfg(target_os = "macos")]
-        {
-            let default_daemon = "127.0.0.1:18888";
-            println!("使用默认守护进程模式: {} (UDP)", default_daemon);
-            PiperBuilder::new().daemon_udp(default_daemon)
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(target_os = "linux"))]
         {
             println!("自动扫描 GS-USB 设备...");
             PiperBuilder::new()

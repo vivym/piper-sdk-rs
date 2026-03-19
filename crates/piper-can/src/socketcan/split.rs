@@ -22,7 +22,7 @@
 //! - **线程安全**：RX 和 TX 适配器可以在不同线程中并发使用
 //! - **时间戳支持**：使用 `recvmsg` 和 CMSG 提取硬件/软件时间戳（与 `SocketCanAdapter` 一致）
 
-use crate::{CanError, PiperFrame, RxAdapter, TxAdapter};
+use crate::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socketcan::{
@@ -601,39 +601,36 @@ impl SocketCanTxAdapter {
         self.current_write_timeout = timeout;
         Ok(())
     }
-}
 
-impl TxAdapter for SocketCanTxAdapter {
-    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(CanError::Timeout);
-        };
-        self.set_write_timeout_if_needed(remaining)?;
-
-        // 转换 PiperFrame -> CanFrame
-        let can_frame = if frame.is_extended {
-            // 扩展帧
+    fn build_can_frame(frame: PiperFrame) -> Result<CanFrame, CanError> {
+        if frame.is_extended {
             ExtendedId::new(frame.id)
                 .and_then(|id| CanFrame::new(id, &frame.data[..frame.len as usize]))
                 .ok_or_else(|| {
                     CanError::Device(
                         format!("Failed to create extended frame with ID 0x{:X}", frame.id).into(),
                     )
-                })?
+                })
         } else {
-            // 标准帧
             StandardId::new(frame.id as u16)
                 .and_then(|id| CanFrame::new(id, &frame.data[..frame.len as usize]))
                 .ok_or_else(|| {
                     CanError::Device(
                         format!("Failed to create standard frame with ID 0x{:X}", frame.id).into(),
                     )
-                })?
-        };
+                })
+        }
+    }
 
-        // 发送（带 deadline，由 SO_SNDTIMEO 控制）
+    fn transmit_with_timeout(
+        &mut self,
+        frame: PiperFrame,
+        timeout: Duration,
+    ) -> Result<(), CanError> {
+        self.set_write_timeout_if_needed(timeout)?;
+        let can_frame = Self::build_can_frame(frame)?;
+
         self.socket.transmit(&can_frame).map_err(|e| {
-            // 检查是否为超时错误
             if let socketcan::Error::Io(io_err) = &e
                 && (io_err.kind() == std::io::ErrorKind::TimedOut
                     || io_err.kind() == std::io::ErrorKind::WouldBlock)
@@ -646,8 +643,27 @@ impl TxAdapter for SocketCanTxAdapter {
             )))
         })?;
 
-        // Hot path: removed trace! call (TX can be high frequency)
         Ok(())
+    }
+}
+
+impl RealtimeTxAdapter for SocketCanTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        self.transmit_with_timeout(frame, budget)
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(CanError::Timeout);
+        };
+        self.transmit_with_timeout(frame, remaining)
     }
 }
 

@@ -3,7 +3,7 @@
 //! 这些测试保留在默认 `cargo test` 中，但只验证进度、队列语义和 metrics 准确性，
 //! 不再依赖 wall-clock P95/P99 阈值。
 
-use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::command::{ReliableCommand, ShutdownCommand};
 use piper_sdk::driver::{
     NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
@@ -58,8 +58,29 @@ impl RecordingTxAdapter {
     }
 }
 
-impl TxAdapter for RecordingTxAdapter {
-    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for RecordingTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        let deadline = Instant::now() + budget;
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(CanError::Timeout);
+        };
+        let sleep_for = self.send_delay.min(remaining);
+        if !sleep_for.is_zero() {
+            thread::sleep(sleep_for);
+        }
+        if self.send_delay > remaining {
+            return Err(CanError::Timeout);
+        }
+        self.sent_frames.lock().unwrap().push(frame);
+        Ok(())
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         let now = Instant::now();
         let Some(remaining) = deadline.checked_duration_since(now) else {
             return Err(CanError::Timeout);
@@ -94,8 +115,8 @@ impl BlockingFirstTxAdapter {
     }
 }
 
-impl TxAdapter for BlockingFirstTxAdapter {
-    fn send_until(&mut self, frame: PiperFrame, _deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for BlockingFirstTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, _budget: Duration) -> Result<(), CanError> {
         self.sent_frames.lock().unwrap().push(frame);
 
         if !self.first_send_blocked {
@@ -107,6 +128,14 @@ impl TxAdapter for BlockingFirstTxAdapter {
         }
 
         Ok(())
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        frame: PiperFrame,
+        _deadline: Instant,
+    ) -> Result<(), CanError> {
+        self.send_control(frame, Duration::from_millis(1))
     }
 }
 
@@ -133,7 +162,7 @@ fn start_rx_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn start_tx_loop(
-    tx_adapter: impl TxAdapter + Send + 'static,
+    tx_adapter: impl RealtimeTxAdapter + Send + 'static,
     ctx: Arc<PiperContext>,
     metrics: Arc<PiperMetrics>,
     is_running: Arc<AtomicBool>,

@@ -2688,7 +2688,7 @@ mod tests {
     use super::*;
     use crate::observer::CollisionProtectionSnapshot;
     use crate::observer::Observer;
-    use piper_can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+    use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_driver::Piper as RobotPiper;
     use piper_protocol::control::MitControlCommand;
     use semver::Version;
@@ -2714,8 +2714,20 @@ mod tests {
         }
     }
 
-    impl TxAdapter for RecordingTxAdapter {
-        fn send_until(
+    impl RealtimeTxAdapter for RecordingTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: std::time::Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
             &mut self,
             frame: PiperFrame,
             deadline: std::time::Instant,

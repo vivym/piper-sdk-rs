@@ -2,7 +2,7 @@
 //!
 //! 测试高频读取性能（500Hz 控制循环）
 
-use piper_sdk::can::{CanAdapter, CanError, PiperFrame, SplittableAdapter};
+use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter};
 use piper_sdk::driver::*;
 use std::time::Instant;
 
@@ -39,8 +39,23 @@ impl piper_sdk::can::RxAdapter for MockRxAdapter {
 
 struct MockTxAdapter;
 
-impl piper_sdk::can::TxAdapter for MockTxAdapter {
-    fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for MockTxAdapter {
+    fn send_control(
+        &mut self,
+        _frame: PiperFrame,
+        budget: std::time::Duration,
+    ) -> Result<(), CanError> {
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        Ok(())
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        _frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         if deadline <= Instant::now() {
             return Err(CanError::Timeout);
         }

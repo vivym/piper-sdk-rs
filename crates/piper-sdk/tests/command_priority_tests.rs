@@ -5,7 +5,7 @@
 //! 2. 配置帧不被丢弃（可靠命令队列）
 //! 3. 实时命令支持覆盖（Overwrite 策略）
 
-use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::command::{CommandPriority, PiperCommand, ReliableCommand, ShutdownCommand};
 use piper_sdk::driver::{
     NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
@@ -58,8 +58,27 @@ impl MockTxAdapter {
     }
 }
 
-impl TxAdapter for MockTxAdapter {
-    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for MockTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        let sleep_for = self.send_delay.min(budget);
+        if !sleep_for.is_zero() {
+            thread::sleep(sleep_for);
+        }
+        if self.send_delay > budget {
+            return Err(CanError::Timeout);
+        }
+        self.sent_frames.lock().unwrap().push_back(frame);
+        Ok(())
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         let now = Instant::now();
         let Some(remaining) = deadline.checked_duration_since(now) else {
             return Err(CanError::Timeout);
@@ -234,8 +253,22 @@ fn test_reliable_command_not_dropped() {
         }
     }
 
-    impl TxAdapter for SlowTxAdapter {
-        fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+    impl RealtimeTxAdapter for SlowTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget < self.send_delay {
+                thread::sleep(budget);
+                return Err(CanError::Timeout);
+            }
+            thread::sleep(self.send_delay);
+            self.sent_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
             let now = Instant::now();
             let Some(remaining) = deadline.checked_duration_since(now) else {
                 return Err(CanError::Timeout);
@@ -375,19 +408,27 @@ fn test_realtime_overwrite_strategy() {
         }
     }
 
-    impl TxAdapter for SlowTxAdapter {
-        fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
-            let now = Instant::now();
-            let Some(remaining) = deadline.checked_duration_since(now) else {
-                return Err(CanError::Timeout);
-            };
-            if remaining < self.send_delay {
-                thread::sleep(remaining);
+    impl RealtimeTxAdapter for SlowTxAdapter {
+        fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget < self.send_delay {
+                thread::sleep(budget);
                 return Err(CanError::Timeout);
             }
             thread::sleep(self.send_delay);
             self.sent_frames.lock().unwrap().push_back(frame);
             Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return Err(CanError::Timeout);
+            };
+            self.send_control(frame, remaining)
         }
     }
 

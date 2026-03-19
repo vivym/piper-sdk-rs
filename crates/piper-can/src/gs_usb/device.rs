@@ -574,8 +574,8 @@ impl GsUsbDevice {
 
     /// 在绝对 deadline 内发送原始 GS-USB 帧。
     ///
-    /// deadline 超过前仍未完成 USB Bulk OUT，则返回 `WriteTimeout` 并执行与 `send_raw`
-    /// 相同的 halt 清理逻辑。
+    /// deadline 超过前仍未完成 USB Bulk OUT，则直接返回 `WriteTimeout`。
+    /// 实时控制路径不在热路径内做 endpoint 恢复，后续恢复应由显式 reopen/recover 流程处理。
     pub fn send_raw_until(&self, frame: &GsUsbFrame, deadline: Instant) -> Result<(), GsUsbError> {
         let mut buf = bytes::BytesMut::new();
         frame.pack_to(&mut buf, self.hw_timestamp);
@@ -584,31 +584,9 @@ impl GsUsbDevice {
             return Err(GsUsbError::WriteTimeout);
         };
 
-        // 使用可配置的写超时（支持实时模式）
-        // 默认 1000ms（向后兼容），实时模式下可设为 5ms（快速失败）
-        // 在 Loopback 模式下，设备 CPU 负载很高（收->拷->发），USB 控制器可能返回 NAK
-        // 如果超时设置太短，会导致偶发的 Write timeout 错误
-        // 注意：这里的超时是最大允许等待时间，正常情况下传输是微秒级的
-        // 只有在设备忙碌时才会等待，所以增加超时不会影响正常吞吐量
         match self.handle.write_bulk(self.endpoint_out, &buf, timeout) {
             Ok(_) => Ok(()),
-            Err(rusb::Error::Timeout) => {
-                // USB 批量传输超时后，endpoint 可能进入 STALL 状态
-                // 必须清除 halt 才能恢复设备，否则后续操作会失败
-                use tracing::warn;
-                if let Err(clear_err) = self.handle.clear_halt(self.endpoint_out) {
-                    warn!("Failed to clear endpoint halt after timeout: {}", clear_err);
-                } else {
-                    // 清除 STALL 成功，表示发生了 STALL，统计计数
-                    if let Some(ref callback) = self.stall_count_callback {
-                        callback();
-                    }
-                    // 清除成功后，延迟让设备恢复
-                    // 注意：某些设备可能需要更长的恢复时间，特别是连续超时后
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(GsUsbError::WriteTimeout)
-            },
+            Err(rusb::Error::Timeout) => Err(GsUsbError::WriteTimeout),
             Err(e) => Err(GsUsbError::Usb(e)),
         }
     }

@@ -169,8 +169,36 @@ where
     }
 }
 
+/// 实时控制专用 TX 适配器。
+///
+/// 普通控制帧和故障停机帧走两条不同语义的发送路径：
+/// - `send_control` 只用于 steady-state realtime / reliable 控制帧，调用方提供固定 budget。
+/// - `send_shutdown_until` 只用于 fault shutdown lane，调用方提供绝对 deadline。
+pub trait RealtimeTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError>;
+    fn send_shutdown_until(&mut self, frame: PiperFrame, deadline: Instant)
+    -> Result<(), CanError>;
+}
+
+impl<T> RealtimeTxAdapter for Box<T>
+where
+    T: RealtimeTxAdapter + ?Sized,
+{
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        (**self).send_control(frame, budget)
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
+        (**self).send_shutdown_until(frame, deadline)
+    }
+}
+
 pub trait SplittableAdapter: CanAdapter {
     type RxAdapter: RxAdapter;
-    type TxAdapter: TxAdapter;
+    type TxAdapter: RealtimeTxAdapter;
     fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError>;
 }

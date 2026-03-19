@@ -6,7 +6,7 @@
 //! 3. 线程生命周期联动机制正常工作
 
 use piper_sdk::can::{
-    CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RxAdapter, TxAdapter,
+    CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
 };
 use piper_sdk::driver::command::{ReliableCommand, ShutdownCommand};
 use piper_sdk::driver::{
@@ -106,8 +106,8 @@ impl MockTxAdapter {
     }
 }
 
-impl TxAdapter for MockTxAdapter {
-    fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+impl RealtimeTxAdapter for MockTxAdapter {
+    fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
         if self.should_fail.load(Ordering::Relaxed) {
             return Err(CanError::Device(CanDeviceError::new(
                 CanDeviceErrorKind::NoDevice,
@@ -116,19 +116,40 @@ impl TxAdapter for MockTxAdapter {
         }
 
         if self.should_timeout.load(Ordering::Relaxed) {
-            // 模拟长时间阻塞（超过超时时间）
-            let now = Instant::now();
-            let Some(remaining) = deadline.checked_duration_since(now) else {
-                return Err(CanError::Timeout);
-            };
-            thread::sleep(remaining.min(Duration::from_millis(100)));
+            thread::sleep(budget.min(Duration::from_millis(100)));
             return Err(CanError::Timeout);
         }
 
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        thread::sleep(self.send_delay.min(budget));
+        if self.send_delay > budget {
+            return Err(CanError::Timeout);
+        }
+        self.sent_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn send_shutdown_until(
+        &mut self,
+        _frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         let now = Instant::now();
         let Some(remaining) = deadline.checked_duration_since(now) else {
             return Err(CanError::Timeout);
         };
+        if self.should_fail.load(Ordering::Relaxed) {
+            return Err(CanError::Device(CanDeviceError::new(
+                CanDeviceErrorKind::NoDevice,
+                "Device disconnected",
+            )));
+        }
+        if self.should_timeout.load(Ordering::Relaxed) {
+            thread::sleep(remaining.min(Duration::from_millis(100)));
+            return Err(CanError::Timeout);
+        }
         thread::sleep(self.send_delay.min(remaining));
         if self.send_delay > remaining {
             return Err(CanError::Timeout);

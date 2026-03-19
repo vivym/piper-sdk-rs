@@ -2,12 +2,13 @@
 //!
 //! 使用 MockCanAdapter 模拟 CAN 帧输入，验证完整的状态更新流程。
 
-use piper_sdk::can::{CanAdapter, CanError, PiperFrame, SplittableAdapter};
+use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter};
 use piper_sdk::driver::DriverError;
 use piper_sdk::driver::*;
 use piper_sdk::protocol::ids::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// 完善的 MockCanAdapter，支持队列帧和控制发送行为
 pub struct MockCanAdapter {
@@ -83,8 +84,16 @@ pub struct MockTxAdapter {
     sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
 }
 
-impl piper_sdk::can::TxAdapter for MockTxAdapter {
-    fn send_until(
+impl RealtimeTxAdapter for MockTxAdapter {
+    fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+        if budget.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        self.sent_frames.lock().unwrap().push(frame);
+        Ok(())
+    }
+
+    fn send_shutdown_until(
         &mut self,
         frame: PiperFrame,
         deadline: std::time::Instant,

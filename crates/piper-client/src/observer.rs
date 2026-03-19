@@ -522,7 +522,7 @@ unsafe impl Sync for Observer {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piper_can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+    use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_protocol::ids::{
         ID_GRIPPER_FEEDBACK, ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12,
         ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
@@ -582,8 +582,19 @@ mod tests {
 
     struct IdleTxAdapter;
 
-    impl TxAdapter for IdleTxAdapter {
-        fn send_until(
+    impl RealtimeTxAdapter for IdleTxAdapter {
+        fn send_control(
+            &mut self,
+            _frame: PiperFrame,
+            budget: std::time::Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+
+        fn send_shutdown_until(
             &mut self,
             _frame: PiperFrame,
             deadline: std::time::Instant,

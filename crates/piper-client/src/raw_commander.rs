@@ -439,7 +439,7 @@ unsafe impl<'a> Sync for RawCommander<'a> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piper_can::{CanError, RxAdapter, TxAdapter};
+    use piper_can::{CanError, RealtimeTxAdapter, RxAdapter};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -462,8 +462,20 @@ mod tests {
         }
     }
 
-    impl TxAdapter for RecordingTxAdapter {
-        fn send_until(
+    impl RealtimeTxAdapter for RecordingTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().unwrap().push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
             &mut self,
             frame: PiperFrame,
             deadline: Instant,

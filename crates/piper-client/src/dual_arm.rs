@@ -1458,7 +1458,7 @@ mod tests {
     use super::*;
     use crate::observer::Observer;
     use crate::types::RadPerSecond;
-    use piper_can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+    use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_driver::Piper as RobotPiper;
     use piper_protocol::control::MitControlCommand;
     use piper_protocol::ids::{
@@ -1528,8 +1528,20 @@ mod tests {
         }
     }
 
-    impl TxAdapter for RecordingTxAdapter {
-        fn send_until(
+    impl RealtimeTxAdapter for RecordingTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
             &mut self,
             frame: PiperFrame,
             deadline: Instant,
@@ -1547,8 +1559,25 @@ mod tests {
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
     }
 
-    impl TxAdapter for SlowRecordingTxAdapter {
-        fn send_until(
+    impl RealtimeTxAdapter for SlowRecordingTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            if budget < self.delay {
+                thread::sleep(budget);
+                return Err(CanError::Timeout);
+            }
+            thread::sleep(self.delay);
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
             &mut self,
             frame: PiperFrame,
             deadline: Instant,
@@ -1572,8 +1601,23 @@ mod tests {
         sends: usize,
     }
 
-    impl TxAdapter for FailOnNthFatalTxAdapter {
-        fn send_until(
+    impl RealtimeTxAdapter for FailOnNthFatalTxAdapter {
+        fn send_control(
+            &mut self,
+            _frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sends += 1;
+            if self.sends == self.fail_on {
+                return Err(CanError::BufferOverflow);
+            }
+            Ok(())
+        }
+
+        fn send_shutdown_until(
             &mut self,
             _frame: PiperFrame,
             deadline: Instant,
@@ -1655,7 +1699,7 @@ mod tests {
         state: State,
     ) -> Piper<State>
     where
-        T: TxAdapter + Send + 'static,
+        T: RealtimeTxAdapter + Send + 'static,
     {
         build_piper_with_adapters(
             ScriptedRxAdapter::new(frames),
@@ -1673,7 +1717,7 @@ mod tests {
     ) -> Piper<State>
     where
         R: RxAdapter + Send + 'static,
-        T: TxAdapter + Send + 'static,
+        T: RealtimeTxAdapter + Send + 'static,
     {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(rx_adapter, tx_adapter, None)
@@ -1702,7 +1746,7 @@ mod tests {
     ) -> Piper<Active<MitMode>>
     where
         R: RxAdapter + Send + 'static,
-        T: TxAdapter + Send + 'static,
+        T: RealtimeTxAdapter + Send + 'static,
     {
         build_piper_with_adapters(
             rx_adapter,
@@ -1719,7 +1763,7 @@ mod tests {
         state: State,
     ) -> Piper<State>
     where
-        T: TxAdapter + Send + 'static,
+        T: RealtimeTxAdapter + Send + 'static,
     {
         build_piper_with_frames_and_tx_adapter(
             scripted_frames(timestamp_us),
