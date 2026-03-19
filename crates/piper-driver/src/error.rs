@@ -19,6 +19,10 @@ pub enum DriverError {
     #[error("Command channel closed")]
     ChannelClosed,
 
+    /// 正常控制路径已关闭（故障锁存后只允许停机命令）
+    #[error("Normal control path closed")]
+    ControlPathClosed,
+
     /// 命令通道已满（缓冲区容量 10）
     #[error("Command channel full (buffer size: 10)")]
     ChannelFull,
@@ -73,6 +77,10 @@ pub enum DriverError {
         source: CanError,
     },
 
+    /// 命令因故障锁存而在 TX 线程中止
+    #[error("Command aborted because runtime fault latched")]
+    CommandAbortedByFault,
+
     /// 已确认的实时命令等待 TX 线程确认超时
     #[error("Realtime delivery confirmation timed out")]
     RealtimeDeliveryTimeout,
@@ -114,6 +122,10 @@ mod tests {
         let driver_error = DriverError::ChannelClosed;
         let msg = format!("{}", driver_error);
         assert_eq!(msg, "Command channel closed");
+
+        let driver_error = DriverError::ControlPathClosed;
+        let msg = format!("{}", driver_error);
+        assert_eq!(msg, "Normal control path closed");
 
         // 测试 ChannelFull
         let driver_error = DriverError::ChannelFull;
@@ -157,6 +169,10 @@ mod tests {
         };
         let msg = format!("{}", driver_error);
         assert!(msg.contains("Reliable delivery failed"));
+
+        let driver_error = DriverError::CommandAbortedByFault;
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("runtime fault latched"));
 
         let driver_error = DriverError::RealtimeDeliveryTimeout;
         let msg = format!("{}", driver_error);

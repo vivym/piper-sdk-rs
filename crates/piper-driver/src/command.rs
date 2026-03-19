@@ -164,6 +164,13 @@ impl ReliableCommand {
     pub fn take_ack(&mut self) -> Option<ReliableAck> {
         self.ack.take()
     }
+
+    #[inline]
+    pub fn complete(mut self, result: Result<(), DriverError>) {
+        if let Some(ack) = self.ack.take() {
+            let _ = ack.send(result);
+        }
+    }
 }
 
 /// 命令优先级

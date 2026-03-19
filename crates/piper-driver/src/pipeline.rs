@@ -3,7 +3,7 @@
 //! 负责后台 IO 线程的 CAN 帧接收、解析和状态更新逻辑。
 
 use crate::metrics::PiperMetrics;
-use crate::piper::RuntimeFaultKind;
+use crate::piper::{RuntimeFaultKind, RuntimePhase};
 use crate::state::*;
 use crossbeam_channel::Receiver;
 use piper_can::{CanAdapter, CanError, PiperFrame, RxAdapter, TxAdapter};
@@ -48,6 +48,14 @@ fn safe_system_timestamp_us() -> u64 {
 
 fn record_fault(slot: &AtomicU8, fault: RuntimeFaultKind) {
     let _ = slot.compare_exchange(0, fault as u8, Ordering::AcqRel, Ordering::Acquire);
+}
+
+fn load_runtime_phase(slot: &AtomicU8) -> RuntimePhase {
+    RuntimePhase::from_raw(slot.load(Ordering::Acquire))
+}
+
+fn store_runtime_phase(slot: &AtomicU8, phase: RuntimePhase) {
+    slot.store(phase as u8, Ordering::Release);
 }
 
 /// Pipeline 配置
@@ -388,13 +396,15 @@ fn drain_tx_queue(can: &mut impl CanAdapter, cmd_rx: &Receiver<PiperFrame>) -> b
 /// - `rx`: RX 适配器（只读）
 /// - `ctx`: 共享状态上下文
 /// - `config`: Pipeline 配置
-/// - `is_running`: 运行标志（用于生命周期联动）
+/// - `workers_running`: worker 生命周期标志
+/// - `runtime_phase`: 运行时阶段（用于 fault latch）
 /// - `metrics`: 性能指标
 pub fn rx_loop(
     mut rx: impl RxAdapter,
     ctx: Arc<PiperContext>,
     config: PipelineConfig,
-    is_running: Arc<AtomicBool>,
+    workers_running: Arc<AtomicBool>,
+    runtime_phase: Arc<AtomicU8>,
     metrics: Arc<PiperMetrics>,
     last_fault: Arc<AtomicU8>,
 ) {
@@ -428,8 +438,8 @@ pub fn rx_loop(
     loop {
         // 检查运行标志
         // Acquire: If we see false, we must see all cleanup writes from other threads
-        if !is_running.load(Ordering::Acquire) {
-            trace!("RX thread: is_running flag is false, exiting");
+        if !workers_running.load(Ordering::Acquire) {
+            trace!("RX thread: workers_running flag is false, exiting");
             break;
         }
 
@@ -471,10 +481,9 @@ pub fn rx_loop(
                 let is_fatal = matches!(e, CanError::Device(_) | CanError::BufferOverflow);
 
                 if is_fatal {
-                    error!("RX thread: Fatal error detected, setting is_running = false");
+                    error!("RX thread: Fatal error detected, latching runtime fault");
                     record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                    // Release: All writes before this are visible to threads that see the false value
-                    is_running.store(false, Ordering::Release);
+                    store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
                     break;
                 }
 
@@ -506,7 +515,9 @@ pub fn rx_loop(
         ctx.connection_monitor.register_feedback();
     }
 
-    if is_running.load(Ordering::Acquire) {
+    if workers_running.load(Ordering::Acquire)
+        && load_runtime_phase(&runtime_phase) == RuntimePhase::Running
+    {
         record_fault(&last_fault, RuntimeFaultKind::RxExited);
     }
     trace!("RX thread: loop exited");
@@ -520,15 +531,20 @@ pub fn rx_loop(
 /// # 参数
 /// - `tx`: TX 适配器（只写）
 /// - `realtime_slot`: 实时命令邮箱（共享插槽）
+/// - `shutdown_rx`: 停机专用命令队列（最高优先级）
 /// - `reliable_rx`: 可靠命令队列接收端（容量 10）
-/// - `is_running`: 运行标志（用于生命周期联动）
+/// - `workers_running`: worker 生命周期标志
+/// - `runtime_phase`: 运行时阶段（用于关闭正常控制路径）
 /// - `metrics`: 性能指标
 /// - `ctx`: 共享状态上下文（用于触发 TX 回调，v1.2.1）
+#[allow(clippy::too_many_arguments)]
 pub fn tx_loop_mailbox(
     mut tx: impl TxAdapter,
     realtime_slot: Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
+    shutdown_rx: Receiver<crate::command::ReliableCommand>,
     reliable_rx: Receiver<crate::command::ReliableCommand>,
-    is_running: Arc<AtomicBool>,
+    workers_running: Arc<AtomicBool>,
+    runtime_phase: Arc<AtomicU8>,
     metrics: Arc<PiperMetrics>,
     ctx: Arc<PiperContext>,
     last_fault: Arc<AtomicU8>,
@@ -538,34 +554,64 @@ pub fn tx_loop_mailbox(
     let mut realtime_burst_count = 0;
 
     loop {
-        // 检查运行标志
-        // Acquire: If we see false, we must see all cleanup writes from other threads
-        if !is_running.load(Ordering::Acquire) {
-            trace!("TX thread: is_running flag is false, exiting");
+        let phase = load_runtime_phase(&runtime_phase);
+        if phase == RuntimePhase::Stopping || !workers_running.load(Ordering::Acquire) {
+            trace!("TX thread: stopping runtime, exiting");
             break;
         }
 
-        // 优先级调度 (Priority 1: 实时邮箱)
-        // 使用短暂的作用域确保锁立即释放
-        let realtime_command = {
-            match realtime_slot.lock() {
-                Ok(mut slot) => slot.take(), // 取出数据，插槽变为 None
-                Err(_) => {
-                    // 锁中毒（TX 线程自己持有锁时不会发生，只可能是其他线程 panic）
-                    error!("TX thread: Realtime slot lock poisoned");
-                    None
+        if let Ok(mut command) = shutdown_rx.try_recv() {
+            let frame = command.frame();
+            let ack = command.take_ack();
+            let send_result = match tx.send(frame) {
+                Ok(_) => {
+                    metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(hooks) = ctx.hooks.try_read() {
+                        hooks.trigger_all_sent(&frame);
+                    }
+                    Ok(())
                 },
+                Err(e) => {
+                    error!("TX thread: Failed to send shutdown frame: {}", e);
+                    metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                    metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                    record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                    store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                    Err(crate::DriverError::ReliableDeliveryFailed { source: e })
+                },
+            };
+
+            let should_break = send_result.is_err();
+            if let Some(ack) = ack {
+                let _ = ack.send(send_result);
             }
+
+            if should_break {
+                break;
+            }
+            continue;
+        }
+
+        if phase == RuntimePhase::FaultLatched {
+            abort_realtime_slot(&realtime_slot);
+            drain_reliable_queue(&reliable_rx, &metrics, true);
+            spin_sleep::sleep(Duration::from_micros(50));
+            continue;
+        }
+
+        let realtime_command = match realtime_slot.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => {
+                error!("TX thread: Realtime slot lock poisoned");
+                None
+            },
         };
 
         if let Some(mut command) = realtime_command {
-            // 处理实时命令（统一使用 FrameBuffer，不需要 match 分支）
-            // 单个帧只是 len=1 的特殊情况，循环只执行一次，开销极低
             let ack = command.take_ack();
             let frames = command.into_frames();
             let total_frames = frames.len();
             let mut sent_count = 0;
-            let mut should_break = false;
             let mut send_error = None;
 
             for frame in frames {
@@ -573,11 +619,8 @@ pub fn tx_loop_mailbox(
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
-                        // 🆕 v1.2.1: 触发 TX 回调（仅在发送成功后）
-                        // 使用 try_read 避免阻塞
                         if let Ok(hooks) = ctx.hooks.try_read() {
                             hooks.trigger_all_sent(&frame);
-                            // ^^^v 非阻塞，<1μs
                         }
                     },
                     Err(e) => {
@@ -587,25 +630,15 @@ pub fn tx_loop_mailbox(
                         );
                         metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                         metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-
-                        // 检测致命错误
-                        let is_fatal = matches!(e, CanError::Device(_) | CanError::BufferOverflow);
-                        if is_fatal {
-                            error!("TX thread: Fatal error detected, setting is_running = false");
-                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                            // Release: All writes before this are visible to threads that see the false value
-                            is_running.store(false, Ordering::Release);
-                            should_break = true;
-                        }
-
-                        // 停止发送后续帧（部分原子性）
-                        // 注意：CAN 总线特性决定了已发送的帧无法回滚
+                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
                         send_error = Some(e);
                         break;
                     },
                 }
             }
 
+            let had_send_error = send_error.is_some();
             if let Some(ack) = ack {
                 let result = match send_error {
                     Some(source) => Err(crate::DriverError::RealtimeDeliveryFailed {
@@ -618,7 +651,6 @@ pub fn tx_loop_mailbox(
                 let _ = ack.send(result);
             }
 
-            // 记录包发送统计
             if sent_count > 0 {
                 metrics.tx_package_sent.fetch_add(1, Ordering::Relaxed);
                 if sent_count < total_frames {
@@ -626,30 +658,22 @@ pub fn tx_loop_mailbox(
                 }
             }
 
-            if should_break {
+            if had_send_error {
                 break;
             }
 
-            // 饿死保护：连续处理多个 Realtime 包后，重置计数器并检查普通队列
             realtime_burst_count += 1;
-            if realtime_burst_count >= REALTIME_BURST_LIMIT {
-                // 达到限制，重置计数器，继续处理普通队列（不 continue，自然掉落）
-                realtime_burst_count = 0;
-                // 注意：这里不执行 continue，代码会自然向下执行，检查 reliable_rx
-            } else {
-                // 未达到限制，立即回到循环开始（再次检查实时插槽）
+            if realtime_burst_count < REALTIME_BURST_LIMIT {
                 continue;
             }
+            realtime_burst_count = 0;
         } else {
-            // 没有实时命令，重置计数器
             realtime_burst_count = 0;
         }
 
-        // Priority 2: 可靠命令队列
         if let Ok(mut command) = reliable_rx.try_recv() {
             let frame = command.frame();
             let ack = command.take_ack();
-            let mut should_break = false;
             let send_result = match tx.send(frame) {
                 Ok(_) => {
                     metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
@@ -663,20 +687,13 @@ pub fn tx_loop_mailbox(
                     error!("TX thread: Failed to send reliable frame: {}", e);
                     metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                     metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-
-                    let is_fatal = matches!(e, CanError::Device(_) | CanError::BufferOverflow);
-
-                    if is_fatal {
-                        error!("TX thread: Fatal error detected, setting is_running = false");
-                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        is_running.store(false, Ordering::Release);
-                        should_break = true;
-                    }
-
+                    record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                    store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
                     Err(crate::DriverError::ReliableDeliveryFailed { source: e })
                 },
             };
 
+            let should_break = send_result.is_err();
             if let Some(ack) = ack {
                 let _ = ack.send(send_result);
             }
@@ -694,15 +711,48 @@ pub fn tx_loop_mailbox(
         spin_sleep::sleep(Duration::from_micros(50));
     }
 
-    if is_running.load(Ordering::Acquire) {
+    if workers_running.load(Ordering::Acquire)
+        && load_runtime_phase(&runtime_phase) == RuntimePhase::Running
+    {
         record_fault(&last_fault, RuntimeFaultKind::TxExited);
     }
+    drain_reliable_queue(&shutdown_rx, &metrics, false);
+    drain_reliable_queue(&reliable_rx, &metrics, false);
+    abort_realtime_slot_with(&realtime_slot, crate::DriverError::ChannelClosed);
+    trace!("TX thread: loop exited");
+}
+
+fn abort_realtime_slot(
+    realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
+) {
+    abort_realtime_slot_with(realtime_slot, crate::DriverError::CommandAbortedByFault);
+}
+
+fn abort_realtime_slot_with(
+    realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
+    reason: crate::DriverError,
+) {
     if let Ok(mut slot) = realtime_slot.lock()
         && let Some(command) = slot.take()
     {
-        command.complete(Err(crate::DriverError::ChannelClosed));
+        command.complete(Err(reason));
     }
-    trace!("TX thread: loop exited");
+}
+
+fn drain_reliable_queue(
+    reliable_rx: &Receiver<crate::command::ReliableCommand>,
+    metrics: &Arc<PiperMetrics>,
+    fault_latched: bool,
+) {
+    while let Ok(command) = reliable_rx.try_recv() {
+        metrics.tx_reliable_drops.fetch_add(1, Ordering::Relaxed);
+        let reason = if fault_latched {
+            crate::DriverError::CommandAbortedByFault
+        } else {
+            crate::DriverError::ChannelClosed
+        };
+        command.complete(Err(reason));
+    }
 }
 
 /// 辅助函数：解析帧并更新状态

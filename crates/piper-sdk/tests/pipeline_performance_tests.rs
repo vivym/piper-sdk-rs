@@ -105,6 +105,7 @@ fn start_rx_loop(
     ctx: Arc<PiperContext>,
     metrics: Arc<PiperMetrics>,
     is_running: Arc<AtomicBool>,
+    runtime_phase: Arc<AtomicU8>,
     fault: Arc<AtomicU8>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -113,27 +114,33 @@ fn start_rx_loop(
             ctx,
             PipelineConfig::default(),
             is_running,
+            runtime_phase,
             metrics,
             fault,
         );
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_tx_loop(
     tx_adapter: impl TxAdapter + Send + 'static,
     ctx: Arc<PiperContext>,
     metrics: Arc<PiperMetrics>,
     is_running: Arc<AtomicBool>,
+    runtime_phase: Arc<AtomicU8>,
     fault: Arc<AtomicU8>,
     realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>>,
+    shutdown_rx: crossbeam_channel::Receiver<ReliableCommand>,
     reliable_rx: crossbeam_channel::Receiver<ReliableCommand>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
+            shutdown_rx,
             reliable_rx,
             is_running,
+            runtime_phase,
             metrics,
             ctx,
             fault,
@@ -147,6 +154,7 @@ fn test_rx_loop_processes_burst_without_transport_fault() {
     let ctx = Arc::new(PiperContext::new());
     let metrics = Arc::new(PiperMetrics::new());
     let is_running = Arc::new(AtomicBool::new(true));
+    let runtime_phase = Arc::new(AtomicU8::new(0));
     let fault = Arc::new(AtomicU8::new(0));
 
     let handle = start_rx_loop(
@@ -154,6 +162,7 @@ fn test_rx_loop_processes_burst_without_transport_fault() {
         ctx,
         metrics.clone(),
         is_running.clone(),
+        runtime_phase,
         fault.clone(),
     );
 
@@ -175,9 +184,11 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
     let ctx = Arc::new(PiperContext::new());
     let metrics = Arc::new(PiperMetrics::new());
     let is_running = Arc::new(AtomicBool::new(true));
+    let runtime_phase = Arc::new(AtomicU8::new(0));
     let fault = Arc::new(AtomicU8::new(0));
     let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(2));
     let sent_frames = tx_adapter.sent_frames.clone();
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
 
@@ -186,8 +197,10 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
         ctx,
         metrics.clone(),
         is_running.clone(),
+        runtime_phase,
         fault.clone(),
         realtime_slot,
+        shutdown_rx,
         reliable_rx,
     );
 
@@ -220,9 +233,11 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
     let ctx = Arc::new(PiperContext::new());
     let metrics = Arc::new(PiperMetrics::new());
     let is_running = Arc::new(AtomicBool::new(true));
+    let runtime_phase = Arc::new(AtomicU8::new(0));
     let fault = Arc::new(AtomicU8::new(0));
     let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(1));
     let sent_frames = tx_adapter.sent_frames.clone();
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_writer = realtime_slot.clone();
@@ -232,8 +247,10 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
         ctx,
         metrics.clone(),
         is_running.clone(),
+        runtime_phase,
         fault.clone(),
         realtime_slot,
+        shutdown_rx,
         reliable_rx,
     );
 
@@ -280,6 +297,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
     let ctx = Arc::new(PiperContext::new());
     let metrics = Arc::new(PiperMetrics::new());
     let is_running = Arc::new(AtomicBool::new(true));
+    let runtime_phase = Arc::new(AtomicU8::new(0));
     let fault = Arc::new(AtomicU8::new(0));
 
     let rx_frames: Vec<PiperFrame> = (0..6)
@@ -290,10 +308,12 @@ fn test_metrics_snapshot_matches_processed_frames() {
         ctx.clone(),
         metrics.clone(),
         is_running.clone(),
+        runtime_phase.clone(),
         fault.clone(),
     );
 
     let tx_adapter = RecordingTxAdapter::new(Duration::ZERO);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let tx_handle = start_tx_loop(
@@ -301,8 +321,10 @@ fn test_metrics_snapshot_matches_processed_frames() {
         ctx,
         metrics.clone(),
         is_running.clone(),
+        runtime_phase,
         fault.clone(),
         realtime_slot,
+        shutdown_rx,
         reliable_rx,
     );
 
@@ -335,11 +357,13 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
     let ctx = Arc::new(PiperContext::new());
     let metrics = Arc::new(PiperMetrics::new());
     let is_running = Arc::new(AtomicBool::new(true));
+    let runtime_phase = Arc::new(AtomicU8::new(0));
     let fault = Arc::new(AtomicU8::new(0));
     let (first_frame_tx, first_frame_rx) = mpsc::channel();
     let (release_first_tx, release_first_rx) = mpsc::channel();
     let tx_adapter = BlockingFirstTxAdapter::new(first_frame_tx, release_first_rx);
     let sent_frames = tx_adapter.sent_frames.clone();
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_writer = realtime_slot.clone();
@@ -349,8 +373,10 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
         ctx,
         metrics.clone(),
         is_running.clone(),
+        runtime_phase,
         fault.clone(),
         realtime_slot,
+        shutdown_rx,
         reliable_rx,
     );
 

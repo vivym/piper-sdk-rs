@@ -92,7 +92,7 @@ impl DualArmActiveMit {
     }
 
     pub fn safe_hold(&self, anchor: &DualArmHoldAnchor, cfg: &DualArmSafetyConfig) -> Result<()> {
-        self.safe_hold_from_anchor(anchor, cfg, HoldTarget::Both, Instant::now())
+        self.safe_hold_from_anchor(anchor, cfg, Instant::now())
     }
 
     pub fn disable_both(self, cfg: DisableConfig) -> Result<DualArmStandby> {
@@ -211,7 +211,6 @@ impl DualArmActiveMit {
                         hold_anchor,
                         Instant::now(),
                         &cfg.safety,
-                        HoldTarget::Both,
                     );
                     let arms = active
                         .disable_both(cfg.disable_config.clone())
@@ -229,7 +228,6 @@ impl DualArmActiveMit {
                         hold_anchor,
                         Instant::now(),
                         &cfg.safety,
-                        HoldTarget::Both,
                     );
                     if !hold_succeeded || compensation_failure_streak > 1 {
                         report.exit_reason = Some(BilateralExitReason::CompensationFault);
@@ -281,7 +279,6 @@ impl DualArmActiveMit {
                         hold_anchor,
                         Instant::now(),
                         &cfg.safety,
-                        HoldTarget::Both,
                     );
                     if !hold_succeeded
                         || read_failure_streak
@@ -326,7 +323,6 @@ impl DualArmActiveMit {
                             hold_anchor,
                             Instant::now(),
                             &cfg.safety,
-                            HoldTarget::Both,
                         );
                         if !hold_succeeded || compensation_failure_streak > 1 {
                             report.exit_reason = Some(BilateralExitReason::CompensationFault);
@@ -365,7 +361,6 @@ impl DualArmActiveMit {
                         hold_anchor,
                         Instant::now(),
                         &cfg.safety,
-                        HoldTarget::Both,
                     );
                     let arms = active
                         .disable_both(cfg.disable_config.clone())
@@ -388,13 +383,6 @@ impl DualArmActiveMit {
                 report.submission_faults += 1;
                 report.exit_reason = Some(BilateralExitReason::SubmissionFault);
                 report.last_error = Some(err.to_string());
-                let _ = best_effort_hold_from_anchor(
-                    &active,
-                    hold_anchor,
-                    Instant::now(),
-                    &cfg.safety,
-                    HoldTarget::Left,
-                );
                 let (arms, shutdown) = active.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
                 report.left_stop_attempt = shutdown.left_stop_attempt;
                 report.right_stop_attempt = shutdown.right_stop_attempt;
@@ -412,13 +400,6 @@ impl DualArmActiveMit {
                 report.submission_faults += 1;
                 report.exit_reason = Some(BilateralExitReason::SubmissionFault);
                 report.last_error = Some(err.to_string());
-                let _ = best_effort_hold_from_anchor(
-                    &active,
-                    hold_anchor,
-                    Instant::now(),
-                    &cfg.safety,
-                    HoldTarget::Right,
-                );
                 let (arms, shutdown) = active.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
                 report.left_stop_attempt = shutdown.left_stop_attempt;
                 report.right_stop_attempt = shutdown.right_stop_attempt;
@@ -449,26 +430,23 @@ impl DualArmActiveMit {
         &self,
         anchor: &DualArmHoldAnchor,
         cfg: &DualArmSafetyConfig,
-        target: HoldTarget,
         now: Instant,
     ) -> Result<()> {
         validate_hold_anchor(anchor, now, cfg.safe_hold_max_duration)?;
-        match target {
-            HoldTarget::Left => command_hold(&self.left, &anchor.left_position, cfg)?,
-            HoldTarget::Right => command_hold(&self.right, &anchor.right_position, cfg)?,
-            HoldTarget::Both => {
-                command_hold(&self.right, &anchor.right_position, cfg)?;
-                command_hold(&self.left, &anchor.left_position, cfg)?;
-            },
-        }
+        command_hold(&self.right, &anchor.right_position, cfg)?;
+        command_hold(&self.left, &anchor.left_position, cfg)?;
         Ok(())
     }
 
     fn fault_shutdown(self, timeout: Duration) -> (DualArmErrorState, FaultShutdown) {
         let health = self.observer().runtime_health();
+        self.left.driver.latch_fault();
+        self.right.driver.latch_fault();
         let left_stop_attempt = attempt_confirmed_stop(&self.left, health.left.tx_alive, timeout);
         let right_stop_attempt =
             attempt_confirmed_stop(&self.right, health.right.tx_alive, timeout);
+        self.left.driver.request_stop();
+        self.right.driver.request_stop();
         (
             DualArmErrorState {
                 left: force_error_state(self.left),
@@ -1187,13 +1165,6 @@ struct InterArmSkew {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HoldTarget {
-    Left,
-    Right,
-    Both,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FaultShutdown {
     left_stop_attempt: StopAttemptResult,
     right_stop_attempt: StopAttemptResult,
@@ -1280,9 +1251,11 @@ fn classify_runtime_transport_fault(health: DualArmRuntimeHealth) -> bool {
 fn stop_attempt_from_driver_error(err: &DriverError) -> StopAttemptResult {
     match err {
         DriverError::ChannelClosed => StopAttemptResult::ChannelClosed,
+        DriverError::ControlPathClosed => StopAttemptResult::ChannelClosed,
         DriverError::ChannelFull => StopAttemptResult::QueueRejected,
         DriverError::Timeout => StopAttemptResult::Timeout,
         DriverError::ReliableDeliveryFailed { .. } => StopAttemptResult::TransportFailed,
+        DriverError::CommandAbortedByFault => StopAttemptResult::TransportFailed,
         _ => StopAttemptResult::TransportFailed,
     }
 }
@@ -1444,13 +1417,12 @@ fn best_effort_hold_from_anchor(
     anchor: Option<DualArmHoldAnchor>,
     now: Instant,
     cfg: &DualArmSafetyConfig,
-    target: HoldTarget,
 ) -> bool {
     let Some(anchor) = anchor else {
         return false;
     };
 
-    active.safe_hold_from_anchor(&anchor, cfg, target, now).is_ok()
+    active.safe_hold_from_anchor(&anchor, cfg, now).is_ok()
 }
 
 fn update_report_metrics(
@@ -1500,6 +1472,34 @@ mod tests {
     impl RxAdapter for ScriptedRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
             self.frames.pop_front().ok_or(CanError::Timeout)
+        }
+    }
+
+    struct FailAfterFramesRxAdapter {
+        frames: VecDeque<PiperFrame>,
+        tripped: bool,
+    }
+
+    impl FailAfterFramesRxAdapter {
+        fn new(frames: Vec<PiperFrame>) -> Self {
+            Self {
+                frames: frames.into(),
+                tripped: false,
+            }
+        }
+    }
+
+    impl RxAdapter for FailAfterFramesRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            if let Some(frame) = self.frames.pop_front() {
+                return Ok(frame);
+            }
+            if !self.tripped {
+                self.tripped = true;
+                Err(CanError::BufferOverflow)
+            } else {
+                Err(CanError::Timeout)
+            }
         }
     }
 
@@ -1603,8 +1603,26 @@ mod tests {
     where
         T: TxAdapter + Send + 'static,
     {
+        build_piper_with_adapters(
+            ScriptedRxAdapter::new(frames),
+            tx_adapter,
+            post_feedback_delay,
+            state,
+        )
+    }
+
+    fn build_piper_with_adapters<R, T, State>(
+        rx_adapter: R,
+        tx_adapter: T,
+        post_feedback_delay: Duration,
+        state: State,
+    ) -> Piper<State>
+    where
+        R: RxAdapter + Send + 'static,
+        T: TxAdapter + Send + 'static,
+    {
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(ScriptedRxAdapter::new(frames), tx_adapter, None)
+            RobotPiper::new_dual_thread_parts(rx_adapter, tx_adapter, None)
                 .expect("driver should start"),
         );
         let observer = Observer::new(driver.clone());
@@ -1621,6 +1639,23 @@ mod tests {
             quirks: crate::types::DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
             _state: state,
         }
+    }
+
+    fn build_active_mit_piper_with_rx_and_tx_adapter<R, T>(
+        rx_adapter: R,
+        tx_adapter: T,
+        post_feedback_delay: Duration,
+    ) -> Piper<Active<MitMode>>
+    where
+        R: RxAdapter + Send + 'static,
+        T: TxAdapter + Send + 'static,
+    {
+        build_piper_with_adapters(
+            rx_adapter,
+            tx_adapter,
+            post_feedback_delay,
+            active_mit_marker(),
+        )
     }
 
     fn build_piper_with_tx_adapter<T, State>(
@@ -2631,7 +2666,7 @@ mod tests {
         arms.safe_hold(&anchor, &DualArmSafetyConfig::default())
             .expect("safe hold should succeed");
 
-        let left_frames = wait_for_sent_frames(&left_sent, 6);
+        let left_frames = wait_for_sent_frames(&left_sent, 1);
         let expected = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
             .expect("expected command should be valid")
             .to_frame();
@@ -2772,7 +2807,7 @@ mod tests {
             DualArmLoopExit::Faulted { .. } => panic!("expected standby exit"),
         }
 
-        let left_frames = wait_for_sent_frames(&left_sent, 6);
+        let left_frames = wait_for_sent_frames(&left_sent, 1);
         let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
             .expect("expected hold command")
             .to_frame();
@@ -2783,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_bilateral_submission_failure_holds_other_arm_when_anchor_is_fresh() {
+    fn test_run_bilateral_submission_failure_does_not_hold_other_arm_even_with_fresh_anchor() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let arms = DualArmActiveMit {
@@ -2832,13 +2867,13 @@ mod tests {
             },
         }
 
-        let left_frames = wait_for_sent_frames(&left_sent, 7);
+        let left_frames = wait_for_sent_frames(&left_sent, 1);
         let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
             .expect("expected hold command")
             .to_frame();
         assert!(
-            left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
-            "fresh anchor should trigger best-effort hold on the other arm",
+            !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
+            "submission fault should go straight to fault shutdown",
         );
     }
 
@@ -2967,13 +3002,76 @@ mod tests {
             },
         }
 
-        let left_frames = wait_for_sent_frames(&left_sent, 6);
+        let left_frames = wait_for_sent_frames(&left_sent, 1);
         let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
             .expect("expected hold command")
             .to_frame();
         assert!(
             !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
             "runtime unhealthy exit should not inject an extra hold",
+        );
+    }
+
+    #[test]
+    fn test_run_bilateral_runtime_transport_fault_from_rx_fatal_keeps_stop_attempt_confirmed() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper(1_000, left_sent.clone()),
+            right: build_active_mit_piper_with_rx_and_tx_adapter(
+                FailAfterFramesRxAdapter::new(scripted_frames(1_000)),
+                RecordingTxAdapter::new(right_sent),
+                Duration::from_millis(20),
+            ),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                ForwardingController::default(),
+                BilateralLoopConfig {
+                    frequency_hz: 50.0,
+                    warmup_cycles: 0,
+                    max_iterations: Some(10),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_secs(1),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("rx fatal should converge to faulted exit");
+
+        match exit {
+            DualArmLoopExit::Standby { .. } => panic!("expected faulted exit"),
+            DualArmLoopExit::Faulted { report, .. } => {
+                assert_eq!(report.submission_faults, 0);
+                assert_eq!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::RuntimeTransportFault)
+                );
+                assert_eq!(
+                    report.last_runtime_fault_right,
+                    Some(RuntimeFaultKind::TransportError)
+                );
+                assert_eq!(report.left_stop_attempt, StopAttemptResult::ConfirmedSent);
+                assert_eq!(report.right_stop_attempt, StopAttemptResult::ConfirmedSent);
+            },
+        }
+
+        let left_frames = wait_for_sent_frames(&left_sent, 1);
+        let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
+            .expect("expected hold command")
+            .to_frame();
+        assert!(
+            !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
+            "runtime fault path should skip hold injection even when tx remains alive",
         );
     }
 

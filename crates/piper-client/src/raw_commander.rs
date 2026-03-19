@@ -161,7 +161,7 @@ impl<'a> RawCommander<'a> {
     pub(crate) fn emergency_stop_confirmed(&self, timeout: Duration) -> Result<()> {
         let cmd = EmergencyStopCommand::emergency_stop();
         let frame = cmd.to_frame();
-        self.driver.send_reliable_confirmed(frame, timeout)?;
+        self.driver.send_shutdown_confirmed(frame, timeout)?;
         Ok(())
     }
 
