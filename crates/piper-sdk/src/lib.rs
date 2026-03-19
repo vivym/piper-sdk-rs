@@ -69,11 +69,38 @@ pub use driver::DriverError;
 // 导出 client::Piper 为 Piper（这是大多数用户应该使用的）
 pub use client::Piper; // Type State Pattern 的状态机
 pub use client::{
+    BilateralCommand,
+    BilateralControlFrame,
+    BilateralController,
+    BilateralDynamicsCompensation,
+    BilateralDynamicsCompensator,
+    BilateralLoopConfig,
+    BilateralRunReport,
+    CompensationFaultAction,
+    ControllerFaultAction,
+    DualArmActiveMit,
+    DualArmBuilder,
+    DualArmCalibration,
+    DualArmError,
+    DualArmErrorState,
+    DualArmLoopExit,
+    DualArmObserver,
+    DualArmReadPolicy,
+    DualArmRuntimeHealth,
+    DualArmSafetyConfig,
+    DualArmSnapshot,
+    GripperTeleopConfig,
+    JointMirrorMap,
+    JointSpaceBilateralController,
+    LoopTimingMode,
+    MasterFollowerController,
     Observer,
     PiperBuilder, // Client 层 Builder（推荐使用）
+    ReadFaultAction,
+    RuntimeFaultAction,
+    // 类型系统通过 types 模块导出
     RuntimeFaultKind,
     RuntimeHealthSnapshot,
-    // 类型系统通过 types 模块导出
 };
 
 // 导出 recording 模块的常用类型

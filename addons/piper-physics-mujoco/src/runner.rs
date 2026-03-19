@@ -1,8 +1,6 @@
 //! Reusable real-robot gravity compensation runner
 
-use crate::{
-    GravityCompensation, GravityCompensationRunnerError, JointState, JointTorques,
-};
+use crate::{GravityCompensation, GravityCompensationRunnerError, JointState, JointTorques};
 use piper_sdk::client::state::{Active, MitMode};
 use piper_sdk::client::types::{JointArray, NewtonMeter, Rad, Result as RobotResult};
 use piper_sdk::client::{ControlReadPolicy, ControlSnapshot, Piper, RuntimeHealthSnapshot};
@@ -279,19 +277,21 @@ fn ensure_runtime_healthy(health: RuntimeHealthSnapshot) -> RobotResult<()> {
         return Ok(());
     }
 
-    Err(piper_sdk::client::types::RobotError::runtime_health_unhealthy(
-        health.rx_alive,
-        health.tx_alive,
-        health.fault,
-    ))
+    Err(
+        piper_sdk::client::types::RobotError::runtime_health_unhealthy(
+            health.rx_alive,
+            health.tx_alive,
+            health.fault,
+        ),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_sdk::client::RuntimeFaultKind;
     use piper_sdk::client::types::RadPerSecond;
     use piper_sdk::client::types::RobotError;
-    use piper_sdk::client::RuntimeFaultKind;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -449,7 +449,10 @@ mod tests {
     #[test]
     fn runner_stops_cleanly_when_cancelled() {
         let robot = FakeRobot::new(
-            vec![Ok(snapshot_with_velocity(0.0)), Ok(snapshot_with_velocity(0.0))],
+            vec![
+                Ok(snapshot_with_velocity(0.0)),
+                Ok(snapshot_with_velocity(0.0)),
+            ],
             vec![healthy_runtime()],
             Vec::<RobotResult<()>>::new(),
         );
@@ -669,7 +672,10 @@ mod tests {
                 Ok(snapshot_with_velocity(1.5)),
             ],
             vec![healthy_runtime(), healthy_runtime(), healthy_runtime()],
-            vec![Ok(()), Err(RobotError::CanIoError("shutdown failed".to_string()))],
+            vec![
+                Ok(()),
+                Err(RobotError::CanIoError("shutdown failed".to_string())),
+            ],
         );
         let mut gravity = FakeGravity::new(vec![Ok(JointState::repeat(2.0))]);
         let mut runner = GravityCompensationRunner::new(

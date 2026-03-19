@@ -77,12 +77,17 @@
 // Re-export nalgebra to avoid version conflicts
 pub use nalgebra;
 
+mod dual_arm;
 mod error;
 mod runner;
 mod traits;
 mod types;
 
 // Re-export common types
+pub use dual_arm::{
+    DualArmMujocoCompensatorConfig, DynamicsMode, MujocoDualArmCompensator, PayloadSpec,
+    SharedModeState, SharedPayloadState,
+};
 pub use error::{GravityCompensationRunnerError, PhysicsError};
 pub use runner::{
     GravityCompensationRobot, GravityCompensationRunFailure, GravityCompensationRunStats,

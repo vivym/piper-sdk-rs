@@ -120,6 +120,26 @@ pub struct ControlSnapshot {
     pub skew_us: i64,
 }
 
+/// 可直接用于双臂协调的完整控制快照
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ControlSnapshotFull {
+    /// 对齐后的控制状态
+    pub state: ControlSnapshot,
+    /// 位置反馈主机时间戳
+    pub position_system_timestamp_us: u64,
+    /// 动态反馈主机时间戳
+    pub dynamic_system_timestamp_us: u64,
+    /// 反馈年龄（取位置/动态中的较大值）
+    pub feedback_age: Duration,
+}
+
+impl ControlSnapshotFull {
+    /// 获取该快照的最新主机时间戳（微秒）
+    pub fn latest_system_timestamp_us(self) -> u64 {
+        self.position_system_timestamp_us.max(self.dynamic_system_timestamp_us)
+    }
+}
+
 /// Driver 运行时健康状态快照
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeHealthSnapshot {
@@ -166,6 +186,11 @@ impl Observer {
     ///
     /// 任一条件不满足都会返回错误，不会返回“半可用”数据。
     pub fn control_snapshot(&self, policy: ControlReadPolicy) -> Result<ControlSnapshot> {
+        self.control_snapshot_full(policy).map(|snapshot| snapshot.state)
+    }
+
+    /// 获取带主机时间戳和反馈年龄的完整控制快照
+    pub fn control_snapshot_full(&self, policy: ControlReadPolicy) -> Result<ControlSnapshotFull> {
         match self.driver.get_aligned_motion(policy.max_state_skew_us) {
             AlignmentResult::Ok(state) => {
                 if !state.is_complete() {
@@ -183,18 +208,23 @@ impl Observer {
                     return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
                 }
 
-                Ok(ControlSnapshot {
-                    position: JointArray::new(state.joint_pos.map(Rad)),
-                    velocity: JointArray::new(state.joint_vel.map(RadPerSecond)),
-                    torque: JointArray::new(std::array::from_fn(|index| {
-                        NewtonMeter(piper_driver::JointDynamicState::calculate_torque(
-                            index,
-                            state.joint_current[index],
-                        ))
-                    })),
-                    position_timestamp_us: state.position_timestamp_us,
-                    dynamic_timestamp_us: state.dynamic_timestamp_us,
-                    skew_us: state.skew_us,
+                Ok(ControlSnapshotFull {
+                    state: ControlSnapshot {
+                        position: JointArray::new(state.joint_pos.map(Rad)),
+                        velocity: JointArray::new(state.joint_vel.map(RadPerSecond)),
+                        torque: JointArray::new(std::array::from_fn(|index| {
+                            NewtonMeter(piper_driver::JointDynamicState::calculate_torque(
+                                index,
+                                state.joint_current[index],
+                            ))
+                        })),
+                        position_timestamp_us: state.position_timestamp_us,
+                        dynamic_timestamp_us: state.dynamic_timestamp_us,
+                        skew_us: state.skew_us,
+                    },
+                    position_system_timestamp_us: state.position_system_timestamp_us,
+                    dynamic_system_timestamp_us: state.dynamic_system_timestamp_us,
+                    feedback_age: age,
                 })
             },
             AlignmentResult::Misaligned { state, .. } => {
@@ -578,6 +608,25 @@ mod tests {
         let _: JointArray<NewtonMeter> = snapshot.torque;
     }
 
+    #[test]
+    fn test_control_snapshot_full_structure() {
+        let snapshot = ControlSnapshotFull {
+            state: ControlSnapshot {
+                position: JointArray::splat(Rad(0.0)),
+                velocity: JointArray::splat(RadPerSecond(0.0)),
+                torque: JointArray::splat(NewtonMeter(0.0)),
+                position_timestamp_us: 100,
+                dynamic_timestamp_us: 100,
+                skew_us: 0,
+            },
+            position_system_timestamp_us: 1_000,
+            dynamic_system_timestamp_us: 2_000,
+            feedback_age: Duration::from_millis(5),
+        };
+
+        assert_eq!(snapshot.latest_system_timestamp_us(), 2_000);
+    }
+
     fn joint_feedback_frame(
         can_id: u16,
         first_deg_milli: i32,
@@ -717,6 +766,42 @@ mod tests {
         assert_eq!(snapshot.dynamic_timestamp_us, dynamic_timestamp_us);
         assert_eq!(snapshot.skew_us, 0);
         assert_eq!(snapshot.velocity[Joint::J1], RadPerSecond(1.0));
+    }
+
+    #[test]
+    fn test_control_snapshot_full_exposes_metadata() {
+        let position_timestamp_us = 1_000;
+        let dynamic_timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, position_timestamp_us),
+            joint_dynamic_frame(1, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(2, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(3, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(4, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(5, 1000, 1000, dynamic_timestamp_us),
+            joint_dynamic_frame(6, 1000, 1000, dynamic_timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let snapshot = observer
+            .control_snapshot_full(ControlReadPolicy {
+                max_state_skew_us: 500,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .expect("aligned full snapshot should succeed");
+
+        assert_eq!(snapshot.state.position_timestamp_us, position_timestamp_us);
+        assert_eq!(snapshot.state.dynamic_timestamp_us, dynamic_timestamp_us);
+        assert!(snapshot.position_system_timestamp_us > 0);
+        assert!(snapshot.dynamic_system_timestamp_us > 0);
+        assert!(snapshot.feedback_age < Duration::from_millis(200));
     }
 
     #[test]
@@ -963,6 +1048,7 @@ mod tests {
         assert_send_sync::<GripperState>();
         assert_send_sync::<ControlReadPolicy>();
         assert_send_sync::<ControlSnapshot>();
+        assert_send_sync::<ControlSnapshotFull>();
         assert_send_sync::<RuntimeHealthSnapshot>();
     }
 }

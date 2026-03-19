@@ -28,6 +28,7 @@ log = "0.4"
 piper-sdk = { version = "0.0.3", path = "../../crates/piper-sdk" }
 env_logger = "0.10"
 approx = "0.5"
+clap = { version = "4.5", features = ["derive"] }
 
 # 用于真实机械臂控制的example
 ctrlc = "3.4"

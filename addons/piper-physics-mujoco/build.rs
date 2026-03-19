@@ -29,7 +29,9 @@ fn main() {
         // Error: user needs to run via just or set environment manually
         println!("cargo:warning=MUJOCO_DYNAMIC_LINK_DIR not set");
         println!("cargo:warning=Please use: just build-physics");
-        println!("cargo:warning=Or validate with: just check-physics / just test-physics / just clippy-physics");
+        println!(
+            "cargo:warning=Or validate with: just check-physics / just test-physics / just clippy-physics"
+        );
         println!("cargo:warning=Or set: export MUJOCO_DYNAMIC_LINK_DIR=/path/to/mujoco/lib");
     }
 }

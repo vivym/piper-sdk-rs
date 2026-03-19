@@ -23,6 +23,7 @@ pub mod builder; // Client 层 Builder
 mod connection;
 pub mod control;
 pub mod diagnostics;
+pub mod dual_arm;
 pub mod heartbeat;
 pub mod observer;
 pub(crate) mod raw_commander;
@@ -37,8 +38,17 @@ mod recording_tests;
 // 重新导出常用类型
 pub use builder::PiperBuilder;
 pub use diagnostics::PiperDiagnostics;
+pub use dual_arm::{
+    BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
+    BilateralDynamicsCompensator, BilateralLoopConfig, BilateralRunReport, CompensationFaultAction,
+    ControllerFaultAction, DualArmActiveMit, DualArmBuilder, DualArmCalibration, DualArmError,
+    DualArmErrorState, DualArmLoopExit, DualArmObserver, DualArmReadPolicy, DualArmRuntimeHealth,
+    DualArmSafetyConfig, DualArmSnapshot, GripperTeleopConfig, JointMirrorMap,
+    JointSpaceBilateralController, LoopTimingMode, MasterFollowerController, ReadFaultAction,
+    RuntimeFaultAction,
+};
 pub use observer::{
-    CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, Observer,
+    CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, ControlSnapshotFull, Observer,
     RuntimeHealthSnapshot,
 };
 pub use piper_driver::RuntimeFaultKind;

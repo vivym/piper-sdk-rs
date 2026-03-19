@@ -1,4 +1,41 @@
-# MuJoCo Feature 编译错误摘要
+# piper-physics 文档索引（当前入口 + 历史记录）
+
+## 当前状态
+
+`piper-physics-mujoco` 当前已经有可用实现，且支持：
+
+- 双臂 MuJoCo 补偿桥接
+- 双臂 MIT 遥操 / 双边控制 demo
+- 运行时 payload / dynamics mode 热更新
+
+当前有效入口：
+
+- **正式联调文档**: [DUAL_ARM_BILATERAL_ROBOT_GUIDE.md](./DUAL_ARM_BILATERAL_ROBOT_GUIDE.md)
+- **联调记录模板**: [DUAL_ARM_BILATERAL_TUNING_LOG_TEMPLATE.md](./DUAL_ARM_BILATERAL_TUNING_LOG_TEMPLATE.md)
+- **Addon README**: [../../../addons/piper-physics-mujoco/README.md](../../../addons/piper-physics-mujoco/README.md)
+- **双臂 demo**: [../../../addons/piper-physics-mujoco/examples/dual_arm_bilateral_mujoco.rs](../../../addons/piper-physics-mujoco/examples/dual_arm_bilateral_mujoco.rs)
+- **双臂 MuJoCo bridge**: [../../../addons/piper-physics-mujoco/src/dual_arm.rs](../../../addons/piper-physics-mujoco/src/dual_arm.rs)
+
+建议阅读顺序：
+
+1. [DUAL_ARM_BILATERAL_ROBOT_GUIDE.md](./DUAL_ARM_BILATERAL_ROBOT_GUIDE.md)
+2. [DUAL_ARM_BILATERAL_TUNING_LOG_TEMPLATE.md](./DUAL_ARM_BILATERAL_TUNING_LOG_TEMPLATE.md)
+3. [../../../addons/piper-physics-mujoco/README.md](../../../addons/piper-physics-mujoco/README.md)
+4. [../../../addons/piper-physics-mujoco/examples/dual_arm_bilateral_mujoco.rs](../../../addons/piper-physics-mujoco/examples/dual_arm_bilateral_mujoco.rs)
+
+---
+
+## 历史说明
+
+本文件下方内容保留的是 **2025 年早期阶段的历史问题分析**，主要记录当时 MuJoCo 编译错误和修复思路。
+
+它们仍然有参考价值，但**不应再被视为当前实现状态**。
+
+如果你关注当前可运行方案，请以上面的“当前有效入口”为准。
+
+---
+
+# MuJoCo Feature 编译错误摘要（历史文档）
 
 > **详细分析报告**: [MUJOCO_COMPILATION_ERRORS_ANALYSIS.md](./MUJOCO_COMPILATION_ERRORS_ANALYSIS.md)
 

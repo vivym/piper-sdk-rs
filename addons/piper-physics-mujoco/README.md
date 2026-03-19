@@ -220,6 +220,12 @@ cargo run --example gravity_compensation_mujoco
 
 # Run real robot control example
 cargo run --example gravity_compensation_robot -- can0
+
+# Run dual-arm bilateral MuJoCo example
+cargo run --manifest-path addons/piper-physics-mujoco/Cargo.toml --example dual_arm_bilateral_mujoco -- \
+  --left-interface can0 \
+  --right-interface can1 \
+  --teleop-mode bilateral
 ```
 
 Real-robot gravity compensation now uses a reusable runner with two distinct layers of torque handling:
@@ -242,9 +248,11 @@ Real-robot gravity compensation now uses a reusable runner with two distinct lay
 
 For detailed analysis and design decisions, see:
 
-- **[docs/v0/mujoco_vs_k_decision_report.md](docs/v0/mujoco_vs_k_decision_report.md)** - Architecture decision: why MuJoCo is the default
-- **[docs/v0/rnea_implementation_report.md](docs/v0/rnea_implementation_report.md)** - Analysis of implementing RNEA manually
-- **[docs/v0/mit_mode_analysis_report.md](docs/v0/mit_mode_analysis_report.md)** - MIT mode support analysis
+- **[docs/dual_arm_bilateral_robot_guide.md](docs/dual_arm_bilateral_robot_guide.md)** - Real robot bring-up, tuning order, runtime commands, and safety checks for dual-arm bilateral control
+- **[../../docs/v0/piper-physics/DUAL_ARM_BILATERAL_TUNING_LOG_TEMPLATE.md](../../docs/v0/piper-physics/DUAL_ARM_BILATERAL_TUNING_LOG_TEMPLATE.md)** - Session log template for recording parameters, payload updates, runtime reports, and acceptance results
+- **[../../docs/v0/mujoco_vs_k_decision_report.md](../../docs/v0/mujoco_vs_k_decision_report.md)** - Architecture decision: why MuJoCo is the default
+- **[../../docs/v0/rnea_implementation_report.md](../../docs/v0/rnea_implementation_report.md)** - Analysis of implementing RNEA manually
+- **[../../docs/v0/mit_mode_analysis_report.md](../../docs/v0/mit_mode_analysis_report.md)** - MIT mode support analysis
 
 ---
 
