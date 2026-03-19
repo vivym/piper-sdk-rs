@@ -439,12 +439,13 @@ impl DualArmActiveMit {
     }
 
     fn fault_shutdown(self, timeout: Duration) -> (DualArmErrorState, FaultShutdown) {
-        let health = self.observer().runtime_health();
         self.left.driver.latch_fault();
         self.right.driver.latch_fault();
-        let left_stop_attempt = attempt_confirmed_stop(&self.left, health.left.tx_alive, timeout);
-        let right_stop_attempt =
-            attempt_confirmed_stop(&self.right, health.right.tx_alive, timeout);
+        let left_pending = enqueue_stop_attempt(&self.left);
+        let right_pending = enqueue_stop_attempt(&self.right);
+        let deadline = Instant::now() + timeout;
+        let left_stop_attempt = resolve_stop_attempt(left_pending, deadline);
+        let right_stop_attempt = resolve_stop_attempt(right_pending, deadline);
         self.left.driver.request_stop();
         self.right.driver.request_stop();
         (
@@ -692,10 +693,12 @@ pub struct BilateralRunReport {
     pub max_inter_arm_skew: Duration,
     pub max_real_dt: Duration,
     pub max_cycle_lag: Duration,
-    pub left_tx_realtime_overwrites: u64,
-    pub right_tx_realtime_overwrites: u64,
-    pub left_tx_frames_total: u64,
-    pub right_tx_frames_total: u64,
+    pub left_tx_realtime_overwrites_total: u64,
+    pub right_tx_realtime_overwrites_total: u64,
+    pub left_tx_frames_sent_total: u64,
+    pub right_tx_frames_sent_total: u64,
+    pub left_tx_fault_aborts_total: u64,
+    pub right_tx_fault_aborts_total: u64,
     pub last_runtime_fault_left: Option<RuntimeFaultKind>,
     pub last_runtime_fault_right: Option<RuntimeFaultKind>,
     pub exit_reason: Option<BilateralExitReason>,
@@ -714,10 +717,12 @@ impl Default for BilateralRunReport {
             max_inter_arm_skew: Duration::ZERO,
             max_real_dt: Duration::ZERO,
             max_cycle_lag: Duration::ZERO,
-            left_tx_realtime_overwrites: 0,
-            right_tx_realtime_overwrites: 0,
-            left_tx_frames_total: 0,
-            right_tx_frames_total: 0,
+            left_tx_realtime_overwrites_total: 0,
+            right_tx_realtime_overwrites_total: 0,
+            left_tx_frames_sent_total: 0,
+            right_tx_frames_sent_total: 0,
+            left_tx_fault_aborts_total: 0,
+            right_tx_fault_aborts_total: 0,
             last_runtime_fault_left: None,
             last_runtime_fault_right: None,
             exit_reason: None,
@@ -1255,6 +1260,7 @@ fn stop_attempt_from_driver_error(err: &DriverError) -> StopAttemptResult {
         DriverError::ChannelFull => StopAttemptResult::QueueRejected,
         DriverError::Timeout => StopAttemptResult::Timeout,
         DriverError::ReliableDeliveryFailed { .. } => StopAttemptResult::TransportFailed,
+        DriverError::RealtimeDeliveryAbortedByFault { .. } => StopAttemptResult::TransportFailed,
         DriverError::CommandAbortedByFault => StopAttemptResult::TransportFailed,
         _ => StopAttemptResult::TransportFailed,
     }
@@ -1267,18 +1273,25 @@ fn stop_attempt_from_robot_error(err: &RobotError) -> StopAttemptResult {
     }
 }
 
-fn attempt_confirmed_stop(
-    piper: &Piper<Active<MitMode>>,
-    tx_alive: bool,
-    timeout: Duration,
-) -> StopAttemptResult {
-    if !tx_alive {
-        return StopAttemptResult::ChannelClosed;
-    }
+enum PendingStopAttempt {
+    Receipt(piper_driver::ShutdownReceipt),
+    Immediate(StopAttemptResult),
+}
 
-    match RawCommander::new(&piper.driver).emergency_stop_confirmed(timeout) {
-        Ok(()) => StopAttemptResult::ConfirmedSent,
-        Err(err) => stop_attempt_from_robot_error(&err),
+fn enqueue_stop_attempt(piper: &Piper<Active<MitMode>>) -> PendingStopAttempt {
+    match RawCommander::new(&piper.driver).emergency_stop_enqueue() {
+        Ok(receipt) => PendingStopAttempt::Receipt(receipt),
+        Err(err) => PendingStopAttempt::Immediate(stop_attempt_from_robot_error(&err)),
+    }
+}
+
+fn resolve_stop_attempt(pending: PendingStopAttempt, deadline: Instant) -> StopAttemptResult {
+    match pending {
+        PendingStopAttempt::Receipt(receipt) => match receipt.wait_until(deadline) {
+            Ok(()) => StopAttemptResult::ConfirmedSent,
+            Err(err) => stop_attempt_from_driver_error(&err),
+        },
+        PendingStopAttempt::Immediate(result) => result,
     }
 }
 
@@ -1432,10 +1445,12 @@ fn update_report_metrics(
 ) {
     let left_metrics = left.get_metrics();
     let right_metrics = right.get_metrics();
-    report.left_tx_realtime_overwrites = left_metrics.tx_realtime_overwrites;
-    report.right_tx_realtime_overwrites = right_metrics.tx_realtime_overwrites;
-    report.left_tx_frames_total = left_metrics.tx_frames_total;
-    report.right_tx_frames_total = right_metrics.tx_frames_total;
+    report.left_tx_realtime_overwrites_total = left_metrics.tx_realtime_overwrites_total;
+    report.right_tx_realtime_overwrites_total = right_metrics.tx_realtime_overwrites_total;
+    report.left_tx_frames_sent_total = left_metrics.tx_frames_sent_total;
+    report.right_tx_frames_sent_total = right_metrics.tx_frames_sent_total;
+    report.left_tx_fault_aborts_total = left_metrics.tx_fault_aborts_total;
+    report.right_tx_fault_aborts_total = right_metrics.tx_fault_aborts_total;
 }
 
 #[cfg(test)]
@@ -1515,6 +1530,19 @@ mod tests {
 
     impl TxAdapter for RecordingTxAdapter {
         fn send(&mut self, frame: PiperFrame) -> std::result::Result<(), CanError> {
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
+    struct SlowRecordingTxAdapter {
+        delay: Duration,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    }
+
+    impl TxAdapter for SlowRecordingTxAdapter {
+        fn send(&mut self, frame: PiperFrame) -> std::result::Result<(), CanError> {
+            thread::sleep(self.delay);
             self.sent_frames.lock().expect("sent frames lock").push(frame);
             Ok(())
         }
@@ -2427,8 +2455,17 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
 
         standby
-            .capture_calibration(JointMirrorMap::left_right_mirror())
-            .expect("default calibration policy should tolerate this feedback age");
+            .capture_calibration_with_policy(
+                JointMirrorMap::left_right_mirror(),
+                DualArmReadPolicy {
+                    per_arm: ControlReadPolicy {
+                        max_state_skew_us: 2_000,
+                        max_feedback_age: Duration::from_millis(100),
+                    },
+                    max_inter_arm_skew: Duration::from_secs(1),
+                },
+            )
+            .expect("relaxed calibration policy should tolerate this feedback age");
 
         let error = standby
             .capture_calibration_with_policy(
@@ -3073,6 +3110,34 @@ mod tests {
             !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
             "runtime fault path should skip hold injection even when tx remains alive",
         );
+    }
+
+    #[test]
+    fn test_fault_shutdown_preserves_ready_stop_ack_after_shared_deadline_passes() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_piper_with_tx_adapter(
+                1_000,
+                SlowRecordingTxAdapter {
+                    delay: Duration::from_millis(50),
+                    sent_frames: left_sent.clone(),
+                },
+                Duration::ZERO,
+                active_mit_marker(),
+            ),
+            right: build_active_mit_piper(1_000, right_sent.clone()),
+        };
+
+        let (_arms, shutdown) = arms.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+
+        assert_eq!(shutdown.left_stop_attempt, StopAttemptResult::Timeout);
+        assert_eq!(
+            shutdown.right_stop_attempt,
+            StopAttemptResult::ConfirmedSent
+        );
+        let right_frames = wait_for_sent_frames(&right_sent, 1);
+        assert_eq!(right_frames.len(), 1);
     }
 
     #[test]

@@ -51,7 +51,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let start_metrics = robot.get_metrics();
     println!("   Initial metrics:");
     println!("     - RX frames total: {}", start_metrics.rx_frames_total);
-    println!("     - TX frames total: {}", start_metrics.tx_frames_total);
+    println!(
+        "     - TX frames sent total: {}",
+        start_metrics.tx_frames_sent_total
+    );
     println!("     - RX timeouts: {}", start_metrics.rx_timeouts);
     println!("     - TX timeouts: {}", start_metrics.tx_timeouts);
     println!();
@@ -109,9 +112,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         end_metrics.rx_frames_total - start_metrics.rx_frames_total
     );
     println!(
-        "     - TX frames total: {} (+{})",
-        end_metrics.tx_frames_total,
-        end_metrics.tx_frames_total - start_metrics.tx_frames_total
+        "     - TX frames sent total: {} (+{})",
+        end_metrics.tx_frames_sent_total,
+        end_metrics.tx_frames_sent_total - start_metrics.tx_frames_sent_total
     );
     println!(
         "     - RX timeouts: {} (+{})",
@@ -125,9 +128,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "     - Realtime overwrites: {}",
-        end_metrics.tx_realtime_overwrites
+        end_metrics.tx_realtime_overwrites_total
     );
-    println!("     - Reliable drops: {}", end_metrics.tx_reliable_drops);
+    println!(
+        "     - Realtime enqueued: {}",
+        end_metrics.tx_realtime_enqueued_total
+    );
+    println!(
+        "     - Reliable queue full: {}",
+        end_metrics.tx_reliable_queue_full_total
+    );
     println!();
 
     // Demonstrate command priority

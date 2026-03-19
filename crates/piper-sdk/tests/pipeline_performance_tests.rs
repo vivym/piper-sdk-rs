@@ -222,7 +222,7 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
     assert_eq!(sent, expected);
 
     let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.tx_frames_total, expected.len() as u64);
+    assert_eq!(snapshot.tx_frames_sent_total, expected.len() as u64);
     assert_eq!(snapshot.tx_timeouts, 0);
     assert_eq!(snapshot.device_errors, 0);
     assert_eq!(fault.load(Ordering::Relaxed), 0);
@@ -338,7 +338,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
     wait_until(Duration::from_secs(1), || {
         let snapshot = metrics.snapshot();
         snapshot.rx_frames_valid == rx_frames.len() as u64
-            && snapshot.tx_frames_total == tx_frames.len() as u64
+            && snapshot.tx_frames_sent_total == tx_frames.len() as u64
     });
 
     is_running.store(false, Ordering::Relaxed);
@@ -347,7 +347,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
 
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.rx_frames_valid, rx_frames.len() as u64);
-    assert_eq!(snapshot.tx_frames_total, tx_frames.len() as u64);
+    assert_eq!(snapshot.tx_frames_sent_total, tx_frames.len() as u64);
     assert_eq!(snapshot.device_errors, 0);
     assert_eq!(snapshot.tx_timeouts, 0);
 }
@@ -410,6 +410,6 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
     let sent = sent_frames.lock().unwrap().clone();
     assert_eq!(sent[0].id, first.id);
     assert_eq!(sent[1].id, latest.id);
-    assert_eq!(metrics.snapshot().tx_frames_total, 2);
+    assert_eq!(metrics.snapshot().tx_frames_sent_total, 2);
     assert_eq!(fault.load(Ordering::Relaxed), 0);
 }

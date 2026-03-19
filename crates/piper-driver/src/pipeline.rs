@@ -58,6 +58,22 @@ fn store_runtime_phase(slot: &AtomicU8, phase: RuntimePhase) {
     slot.store(phase as u8, Ordering::Release);
 }
 
+fn count_fault_abort(metrics: &Arc<PiperMetrics>) {
+    metrics.tx_fault_aborts_total.fetch_add(1, Ordering::Relaxed);
+}
+
+fn reliable_abort_error(fault_latched: bool) -> crate::DriverError {
+    if fault_latched {
+        crate::DriverError::CommandAbortedByFault
+    } else {
+        crate::DriverError::ChannelClosed
+    }
+}
+
+fn realtime_abort_error(sent: usize, total: usize) -> crate::DriverError {
+    crate::DriverError::RealtimeDeliveryAbortedByFault { sent, total }
+}
+
 /// Pipeline 配置
 ///
 /// 控制 IO 线程的行为，包括接收超时和帧组超时设置。
@@ -565,7 +581,8 @@ pub fn tx_loop_mailbox(
             let ack = command.take_ack();
             let send_result = match tx.send(frame) {
                 Ok(_) => {
-                    metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.tx_shutdown_sent_total.fetch_add(1, Ordering::Relaxed);
                     if let Ok(hooks) = ctx.hooks.try_read() {
                         hooks.trigger_all_sent(&frame);
                     }
@@ -593,8 +610,8 @@ pub fn tx_loop_mailbox(
         }
 
         if phase == RuntimePhase::FaultLatched {
-            abort_realtime_slot(&realtime_slot);
-            drain_reliable_queue(&reliable_rx, &metrics, true);
+            abort_realtime_slot_fault(&realtime_slot, &metrics);
+            drain_reliable_queue(&reliable_rx, &metrics, true, true);
             spin_sleep::sleep(Duration::from_micros(50));
             continue;
         }
@@ -612,13 +629,31 @@ pub fn tx_loop_mailbox(
             let frames = command.into_frames();
             let total_frames = frames.len();
             let mut sent_count = 0;
-            let mut send_error = None;
+            let phase_before_send = load_runtime_phase(&runtime_phase);
+            let mut delivery_error = if phase_before_send == RuntimePhase::Running {
+                None
+            } else {
+                count_fault_abort(&metrics);
+                Some(realtime_abort_error(0, total_frames))
+            };
+            let mut transport_error = false;
 
             for frame in frames {
+                if delivery_error.is_some() {
+                    break;
+                }
+
+                let phase_before_frame = load_runtime_phase(&runtime_phase);
+                if phase_before_frame != RuntimePhase::Running {
+                    count_fault_abort(&metrics);
+                    delivery_error = Some(realtime_abort_error(sent_count, total_frames));
+                    break;
+                }
+
                 match tx.send(frame) {
                     Ok(_) => {
                         sent_count += 1;
-                        metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
+                        metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
                         if let Ok(hooks) = ctx.hooks.try_read() {
                             hooks.trigger_all_sent(&frame);
                         }
@@ -632,20 +667,21 @@ pub fn tx_loop_mailbox(
                         metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
                         record_fault(&last_fault, RuntimeFaultKind::TransportError);
                         store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        send_error = Some(e);
+                        delivery_error = Some(crate::DriverError::RealtimeDeliveryFailed {
+                            sent: sent_count,
+                            total: total_frames,
+                            source: e,
+                        });
+                        transport_error = true;
                         break;
                     },
                 }
             }
 
-            let had_send_error = send_error.is_some();
+            let had_delivery_error = delivery_error.is_some();
             if let Some(ack) = ack {
-                let result = match send_error {
-                    Some(source) => Err(crate::DriverError::RealtimeDeliveryFailed {
-                        sent: sent_count,
-                        total: total_frames,
-                        source,
-                    }),
+                let result = match delivery_error {
+                    Some(err) => Err(err),
                     None => Ok(()),
                 };
                 let _ = ack.send(result);
@@ -658,8 +694,12 @@ pub fn tx_loop_mailbox(
                 }
             }
 
-            if had_send_error {
+            if transport_error {
                 break;
+            }
+
+            if had_delivery_error {
+                continue;
             }
 
             realtime_burst_count += 1;
@@ -672,11 +712,20 @@ pub fn tx_loop_mailbox(
         }
 
         if let Ok(mut command) = reliable_rx.try_recv() {
+            let phase_before_send = load_runtime_phase(&runtime_phase);
+            if phase_before_send != RuntimePhase::Running {
+                count_fault_abort(&metrics);
+                command.complete(Err(reliable_abort_error(
+                    phase_before_send == RuntimePhase::FaultLatched,
+                )));
+                continue;
+            }
+
             let frame = command.frame();
             let ack = command.take_ack();
             let send_result = match tx.send(frame) {
                 Ok(_) => {
-                    metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 
                     if let Ok(hooks) = ctx.hooks.try_read() {
                         hooks.trigger_all_sent(&frame);
@@ -716,25 +765,42 @@ pub fn tx_loop_mailbox(
     {
         record_fault(&last_fault, RuntimeFaultKind::TxExited);
     }
-    drain_reliable_queue(&shutdown_rx, &metrics, false);
-    drain_reliable_queue(&reliable_rx, &metrics, false);
-    abort_realtime_slot_with(&realtime_slot, crate::DriverError::ChannelClosed);
+    drain_reliable_queue(&shutdown_rx, &metrics, false, false);
+    drain_reliable_queue(&reliable_rx, &metrics, false, true);
+    abort_realtime_slot_with(
+        &realtime_slot,
+        &metrics,
+        crate::DriverError::ChannelClosed,
+        true,
+    );
     trace!("TX thread: loop exited");
 }
 
-fn abort_realtime_slot(
+fn abort_realtime_slot_fault(
     realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
-) {
-    abort_realtime_slot_with(realtime_slot, crate::DriverError::CommandAbortedByFault);
-}
-
-fn abort_realtime_slot_with(
-    realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
-    reason: crate::DriverError,
+    metrics: &Arc<PiperMetrics>,
 ) {
     if let Ok(mut slot) = realtime_slot.lock()
         && let Some(command) = slot.take()
     {
+        count_fault_abort(metrics);
+        let total = command.len();
+        command.complete(Err(realtime_abort_error(0, total)));
+    }
+}
+
+fn abort_realtime_slot_with(
+    realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
+    metrics: &Arc<PiperMetrics>,
+    reason: crate::DriverError,
+    count_as_fault_abort: bool,
+) {
+    if let Ok(mut slot) = realtime_slot.lock()
+        && let Some(command) = slot.take()
+    {
+        if count_as_fault_abort {
+            count_fault_abort(metrics);
+        }
         command.complete(Err(reason));
     }
 }
@@ -743,14 +809,13 @@ fn drain_reliable_queue(
     reliable_rx: &Receiver<crate::command::ReliableCommand>,
     metrics: &Arc<PiperMetrics>,
     fault_latched: bool,
+    count_as_fault_abort: bool,
 ) {
     while let Ok(command) = reliable_rx.try_recv() {
-        metrics.tx_reliable_drops.fetch_add(1, Ordering::Relaxed);
-        let reason = if fault_latched {
-            crate::DriverError::CommandAbortedByFault
-        } else {
-            crate::DriverError::ChannelClosed
-        };
+        if count_as_fault_abort {
+            count_fault_abort(metrics);
+        }
+        let reason = reliable_abort_error(fault_latched);
         command.complete(Err(reason));
     }
 }

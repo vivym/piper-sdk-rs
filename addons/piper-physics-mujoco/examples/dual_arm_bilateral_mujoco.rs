@@ -505,14 +505,22 @@ fn print_report(report: &BilateralRunReport) {
     );
     println!(
         "left tx realtime overwrites: {}",
-        report.left_tx_realtime_overwrites
+        report.left_tx_realtime_overwrites_total
     );
     println!(
         "right tx realtime overwrites: {}",
-        report.right_tx_realtime_overwrites
+        report.right_tx_realtime_overwrites_total
     );
-    println!("left tx frames total: {}", report.left_tx_frames_total);
-    println!("right tx frames total: {}", report.right_tx_frames_total);
+    println!("left tx frames sent total: {}", report.left_tx_frames_sent_total);
+    println!(
+        "right tx frames sent total: {}",
+        report.right_tx_frames_sent_total
+    );
+    println!("left tx fault aborts total: {}", report.left_tx_fault_aborts_total);
+    println!(
+        "right tx fault aborts total: {}",
+        report.right_tx_fault_aborts_total
+    );
     println!("last_runtime_fault_left: {:?}", report.last_runtime_fault_left);
     println!("last_runtime_fault_right: {:?}", report.last_runtime_fault_right);
     if let Some(last_error) = &report.last_error {

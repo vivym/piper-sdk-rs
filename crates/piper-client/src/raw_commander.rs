@@ -157,12 +157,11 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
-    /// 急停并等待 TX 线程确认已尝试发送。
-    pub(crate) fn emergency_stop_confirmed(&self, timeout: Duration) -> Result<()> {
+    /// 将急停命令加入 shutdown lane，并返回确认句柄。
+    pub(crate) fn emergency_stop_enqueue(&self) -> Result<piper_driver::ShutdownReceipt> {
         let cmd = EmergencyStopCommand::emergency_stop();
         let frame = cmd.to_frame();
-        self.driver.send_shutdown_confirmed(frame, timeout)?;
-        Ok(())
+        Ok(self.driver.enqueue_shutdown(frame)?)
     }
 
     /// 停止运动（用于优雅关闭）

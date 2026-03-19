@@ -37,17 +37,32 @@ pub struct PiperMetrics {
     /// RX 过滤掉的 Echo 帧数（GS-USB 特有）
     pub rx_echo_filtered: AtomicU64,
 
-    /// TX 发送的总帧数
-    pub tx_frames_total: AtomicU64,
+    /// TX 成功发送到底层适配器的总帧数
+    pub tx_frames_sent_total: AtomicU64,
+
+    /// TX 实时命令成功进入 mailbox 的总次数
+    pub tx_realtime_enqueued_total: AtomicU64,
 
     /// TX 实时队列覆盖（Overwrite）次数
     ///
     /// 如果这个值快速增长，说明 TX 线程处理速度跟不上命令生成速度，
     /// 或者总线/设备存在瓶颈。
-    pub tx_realtime_overwrites: AtomicU64,
+    pub tx_realtime_overwrites_total: AtomicU64,
 
-    /// TX 可靠队列满（阻塞/失败）次数
-    pub tx_reliable_drops: AtomicU64,
+    /// TX 普通可靠命令成功进入 FIFO 的总次数
+    pub tx_reliable_enqueued_total: AtomicU64,
+
+    /// TX 普通可靠队列满次数
+    pub tx_reliable_queue_full_total: AtomicU64,
+
+    /// TX 停机命令成功进入 shutdown lane 的总次数
+    pub tx_shutdown_enqueued_total: AtomicU64,
+
+    /// TX 停机命令成功发送到底层适配器的总次数
+    pub tx_shutdown_sent_total: AtomicU64,
+
+    /// 因故障锁存或停止阶段而被主动中止的普通控制命令总次数
+    pub tx_fault_aborts_total: AtomicU64,
 
     /// USB/CAN 设备错误次数
     pub device_errors: AtomicU64,
@@ -83,9 +98,14 @@ impl PiperMetrics {
             rx_frames_total: self.rx_frames_total.load(Ordering::Relaxed),
             rx_frames_valid: self.rx_frames_valid.load(Ordering::Relaxed),
             rx_echo_filtered: self.rx_echo_filtered.load(Ordering::Relaxed),
-            tx_frames_total: self.tx_frames_total.load(Ordering::Relaxed),
-            tx_realtime_overwrites: self.tx_realtime_overwrites.load(Ordering::Relaxed),
-            tx_reliable_drops: self.tx_reliable_drops.load(Ordering::Relaxed),
+            tx_frames_sent_total: self.tx_frames_sent_total.load(Ordering::Relaxed),
+            tx_realtime_enqueued_total: self.tx_realtime_enqueued_total.load(Ordering::Relaxed),
+            tx_realtime_overwrites_total: self.tx_realtime_overwrites_total.load(Ordering::Relaxed),
+            tx_reliable_enqueued_total: self.tx_reliable_enqueued_total.load(Ordering::Relaxed),
+            tx_reliable_queue_full_total: self.tx_reliable_queue_full_total.load(Ordering::Relaxed),
+            tx_shutdown_enqueued_total: self.tx_shutdown_enqueued_total.load(Ordering::Relaxed),
+            tx_shutdown_sent_total: self.tx_shutdown_sent_total.load(Ordering::Relaxed),
+            tx_fault_aborts_total: self.tx_fault_aborts_total.load(Ordering::Relaxed),
             device_errors: self.device_errors.load(Ordering::Relaxed),
             rx_timeouts: self.rx_timeouts.load(Ordering::Relaxed),
             tx_timeouts: self.tx_timeouts.load(Ordering::Relaxed),
@@ -101,9 +121,14 @@ impl PiperMetrics {
         self.rx_frames_total.store(0, Ordering::Relaxed);
         self.rx_frames_valid.store(0, Ordering::Relaxed);
         self.rx_echo_filtered.store(0, Ordering::Relaxed);
-        self.tx_frames_total.store(0, Ordering::Relaxed);
-        self.tx_realtime_overwrites.store(0, Ordering::Relaxed);
-        self.tx_reliable_drops.store(0, Ordering::Relaxed);
+        self.tx_frames_sent_total.store(0, Ordering::Relaxed);
+        self.tx_realtime_enqueued_total.store(0, Ordering::Relaxed);
+        self.tx_realtime_overwrites_total.store(0, Ordering::Relaxed);
+        self.tx_reliable_enqueued_total.store(0, Ordering::Relaxed);
+        self.tx_reliable_queue_full_total.store(0, Ordering::Relaxed);
+        self.tx_shutdown_enqueued_total.store(0, Ordering::Relaxed);
+        self.tx_shutdown_sent_total.store(0, Ordering::Relaxed);
+        self.tx_fault_aborts_total.store(0, Ordering::Relaxed);
         self.device_errors.store(0, Ordering::Relaxed);
         self.rx_timeouts.store(0, Ordering::Relaxed);
         self.tx_timeouts.store(0, Ordering::Relaxed);
@@ -123,12 +148,22 @@ pub struct MetricsSnapshot {
     pub rx_frames_valid: u64,
     /// RX 过滤掉的 Echo 帧数
     pub rx_echo_filtered: u64,
-    /// TX 发送的总帧数
-    pub tx_frames_total: u64,
+    /// TX 成功发送的总帧数
+    pub tx_frames_sent_total: u64,
+    /// TX 实时命令入队总次数
+    pub tx_realtime_enqueued_total: u64,
     /// TX 实时队列覆盖次数
-    pub tx_realtime_overwrites: u64,
-    /// TX 可靠队列满次数
-    pub tx_reliable_drops: u64,
+    pub tx_realtime_overwrites_total: u64,
+    /// TX 普通可靠命令入队总次数
+    pub tx_reliable_enqueued_total: u64,
+    /// TX 普通可靠队列满次数
+    pub tx_reliable_queue_full_total: u64,
+    /// TX 停机命令入队总次数
+    pub tx_shutdown_enqueued_total: u64,
+    /// TX 停机命令发送总次数
+    pub tx_shutdown_sent_total: u64,
+    /// 因故障锁存或停止阶段被主动中止的普通控制命令总次数
+    pub tx_fault_aborts_total: u64,
     /// 设备错误次数
     pub device_errors: u64,
     /// RX 超时次数
@@ -164,7 +199,7 @@ impl MetricsSnapshot {
 
     /// 计算实时队列覆盖率（百分比）
     ///
-    /// 返回 0.0 到 100.0 之间的值。如果 `tx_frames_total` 为 0，返回 0.0。
+    /// 返回 0.0 到 100.0 之间的值。如果 `tx_realtime_enqueued_total` 为 0，返回 0.0。
     ///
     /// # 阈值说明
     /// - < 30%: 正常情况（高频控制，预期行为）
@@ -184,10 +219,10 @@ impl MetricsSnapshot {
     /// }
     /// ```
     pub fn overwrite_rate(&self) -> f64 {
-        if self.tx_frames_total == 0 {
+        if self.tx_realtime_enqueued_total == 0 {
             return 0.0;
         }
-        (self.tx_realtime_overwrites as f64 / self.tx_frames_total as f64) * 100.0
+        (self.tx_realtime_overwrites_total as f64 / self.tx_realtime_enqueued_total as f64) * 100.0
     }
 
     /// 检查覆盖率是否异常
@@ -223,7 +258,8 @@ mod tests {
 
         assert_eq!(snapshot.rx_frames_total, 0);
         assert_eq!(snapshot.rx_frames_valid, 0);
-        assert_eq!(snapshot.tx_frames_total, 0);
+        assert_eq!(snapshot.tx_frames_sent_total, 0);
+        assert_eq!(snapshot.tx_realtime_enqueued_total, 0);
     }
 
     #[test]
@@ -245,17 +281,17 @@ mod tests {
         let metrics = Arc::new(PiperMetrics::new());
 
         metrics.rx_frames_total.fetch_add(100, Ordering::Relaxed);
-        metrics.tx_frames_total.fetch_add(50, Ordering::Relaxed);
+        metrics.tx_frames_sent_total.fetch_add(50, Ordering::Relaxed);
 
         let snapshot_before = metrics.snapshot();
         assert_eq!(snapshot_before.rx_frames_total, 100);
-        assert_eq!(snapshot_before.tx_frames_total, 50);
+        assert_eq!(snapshot_before.tx_frames_sent_total, 50);
 
         metrics.reset();
 
         let snapshot_after = metrics.snapshot();
         assert_eq!(snapshot_after.rx_frames_total, 0);
-        assert_eq!(snapshot_after.tx_frames_total, 0);
+        assert_eq!(snapshot_after.tx_frames_sent_total, 0);
     }
 
     #[test]
@@ -289,9 +325,14 @@ mod tests {
             rx_frames_total: 100,
             rx_frames_valid: 80,
             rx_echo_filtered: 20,
-            tx_frames_total: 50,
-            tx_realtime_overwrites: 5,
-            tx_reliable_drops: 0,
+            tx_frames_sent_total: 50,
+            tx_realtime_enqueued_total: 50,
+            tx_realtime_overwrites_total: 5,
+            tx_reliable_enqueued_total: 0,
+            tx_reliable_queue_full_total: 0,
+            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_sent_total: 0,
+            tx_fault_aborts_total: 0,
             device_errors: 0,
             rx_timeouts: 10,
             tx_timeouts: 0,
@@ -310,9 +351,14 @@ mod tests {
             rx_frames_total: 0,
             rx_frames_valid: 0,
             rx_echo_filtered: 0,
-            tx_frames_total: 0,
-            tx_realtime_overwrites: 0,
-            tx_reliable_drops: 0,
+            tx_frames_sent_total: 0,
+            tx_realtime_enqueued_total: 0,
+            tx_realtime_overwrites_total: 0,
+            tx_reliable_enqueued_total: 0,
+            tx_reliable_queue_full_total: 0,
+            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_sent_total: 0,
+            tx_fault_aborts_total: 0,
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
@@ -331,9 +377,14 @@ mod tests {
             rx_frames_total: 0,
             rx_frames_valid: 0,
             rx_echo_filtered: 0,
-            tx_frames_total: 1000,
-            tx_realtime_overwrites: 200,
-            tx_reliable_drops: 0,
+            tx_frames_sent_total: 1000,
+            tx_realtime_enqueued_total: 1000,
+            tx_realtime_overwrites_total: 200,
+            tx_reliable_enqueued_total: 0,
+            tx_reliable_queue_full_total: 0,
+            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_sent_total: 0,
+            tx_fault_aborts_total: 0,
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
@@ -347,8 +398,8 @@ mod tests {
 
         // 60% 覆盖率（异常情况）
         let abnormal = MetricsSnapshot {
-            tx_frames_total: 1000,
-            tx_realtime_overwrites: 600,
+            tx_realtime_enqueued_total: 1000,
+            tx_realtime_overwrites_total: 600,
             ..snapshot
         };
         assert_eq!(abnormal.overwrite_rate(), 60.0);
@@ -361,9 +412,14 @@ mod tests {
             rx_frames_total: 0,
             rx_frames_valid: 0,
             rx_echo_filtered: 0,
-            tx_frames_total: 0,
-            tx_realtime_overwrites: 0,
-            tx_reliable_drops: 0,
+            tx_frames_sent_total: 0,
+            tx_realtime_enqueued_total: 0,
+            tx_realtime_overwrites_total: 0,
+            tx_reliable_enqueued_total: 0,
+            tx_reliable_queue_full_total: 0,
+            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_sent_total: 0,
+            tx_fault_aborts_total: 0,
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
@@ -377,15 +433,44 @@ mod tests {
     }
 
     #[test]
+    fn test_overwrite_rate_uses_realtime_enqueued_denominator() {
+        let snapshot = MetricsSnapshot {
+            rx_frames_total: 0,
+            rx_frames_valid: 0,
+            rx_echo_filtered: 0,
+            tx_frames_sent_total: 10,
+            tx_realtime_enqueued_total: 100,
+            tx_realtime_overwrites_total: 25,
+            tx_reliable_enqueued_total: 40,
+            tx_reliable_queue_full_total: 3,
+            tx_shutdown_enqueued_total: 2,
+            tx_shutdown_sent_total: 2,
+            tx_fault_aborts_total: 7,
+            device_errors: 0,
+            rx_timeouts: 0,
+            tx_timeouts: 0,
+            tx_package_sent: 0,
+            tx_package_partial: 0,
+        };
+
+        assert_eq!(snapshot.overwrite_rate(), 25.0);
+    }
+
+    #[test]
     fn test_overwrite_rate_thresholds() {
         // 测试阈值边界
         let normal = MetricsSnapshot {
             rx_frames_total: 0,
             rx_frames_valid: 0,
             rx_echo_filtered: 0,
-            tx_frames_total: 1000,
-            tx_realtime_overwrites: 299, // 29.9% < 30%
-            tx_reliable_drops: 0,
+            tx_frames_sent_total: 1000,
+            tx_realtime_enqueued_total: 1000,
+            tx_realtime_overwrites_total: 299, // 29.9% < 30%
+            tx_reliable_enqueued_total: 0,
+            tx_reliable_queue_full_total: 0,
+            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_sent_total: 0,
+            tx_fault_aborts_total: 0,
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
@@ -395,15 +480,15 @@ mod tests {
         assert!(!normal.is_overwrite_rate_abnormal());
 
         let moderate = MetricsSnapshot {
-            tx_frames_total: 1000,
-            tx_realtime_overwrites: 400, // 40% (30-50%)
+            tx_realtime_enqueued_total: 1000,
+            tx_realtime_overwrites_total: 400, // 40% (30-50%)
             ..normal
         };
         assert!(!moderate.is_overwrite_rate_abnormal()); // 40% < 50%，不算异常
 
         let abnormal = MetricsSnapshot {
-            tx_frames_total: 1000,
-            tx_realtime_overwrites: 501, // 50.1% > 50%
+            tx_realtime_enqueued_total: 1000,
+            tx_realtime_overwrites_total: 501, // 50.1% > 50%
             ..normal
         };
         assert!(abnormal.is_overwrite_rate_abnormal());

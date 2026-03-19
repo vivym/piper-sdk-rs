@@ -69,6 +69,15 @@ pub enum DriverError {
         source: CanError,
     },
 
+    /// 已确认的实时命令在故障锁存后被中止
+    #[error("Realtime delivery aborted by fault after sending {sent}/{total} frames")]
+    RealtimeDeliveryAbortedByFault {
+        /// 已成功发送的帧数
+        sent: usize,
+        /// 计划发送的总帧数
+        total: usize,
+    },
+
     /// 已确认的可靠命令在 TX 线程中发送失败
     #[error("Reliable delivery failed: {source}")]
     ReliableDeliveryFailed {
@@ -169,6 +178,10 @@ mod tests {
         };
         let msg = format!("{}", driver_error);
         assert!(msg.contains("Reliable delivery failed"));
+
+        let driver_error = DriverError::RealtimeDeliveryAbortedByFault { sent: 1, total: 6 };
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("aborted by fault"));
 
         let driver_error = DriverError::CommandAbortedByFault;
         let msg = format!("{}", driver_error);

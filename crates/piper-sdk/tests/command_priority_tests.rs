@@ -318,7 +318,10 @@ fn test_reliable_command_not_dropped() {
 
     // 验证：metrics 中的可靠命令丢弃数应该为 0（如果使用阻塞发送）
     let snapshot = metrics.snapshot();
-    println!("Reliable drops: {}", snapshot.tx_reliable_drops);
+    println!(
+        "Reliable queue full: {}",
+        snapshot.tx_reliable_queue_full_total
+    );
     // 注意：如果使用 try_send，可能会有丢弃，但使用 send_timeout 应该没有丢弃
 }
 
@@ -416,7 +419,10 @@ fn test_realtime_overwrite_strategy() {
 
     // 验证：metrics 中的覆盖次数应该 > 0
     let snapshot = metrics.snapshot();
-    println!("Realtime overwrites: {}", snapshot.tx_realtime_overwrites);
+    println!(
+        "Realtime overwrites: {}",
+        snapshot.tx_realtime_overwrites_total
+    );
     // 注意：由于并发，覆盖次数可能不是精确的，但应该 > 0
 }
 
