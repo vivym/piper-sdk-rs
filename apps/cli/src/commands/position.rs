@@ -80,8 +80,8 @@ mod tests {
     fn position_command_accepts_target_override() {
         let cmd = PositionCommand {
             target: TargetArgs {
-                target: Some(TargetSpec::DaemonUdp {
-                    addr: "127.0.0.1:18888".to_string(),
+                target: Some(TargetSpec::SocketCan {
+                    iface: "can0".to_string(),
                 }),
             },
             format: "json".to_string(),
@@ -89,8 +89,8 @@ mod tests {
 
         assert_eq!(
             cmd.target.target,
-            Some(TargetSpec::DaemonUdp {
-                addr: "127.0.0.1:18888".to_string()
+            Some(TargetSpec::SocketCan {
+                iface: "can0".to_string()
             })
         );
     }

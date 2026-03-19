@@ -10,7 +10,6 @@ use piper_can::SocketCanAdapter;
 use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_can::gs_usb::device::GsUsbDeviceSelector;
 use piper_can::{CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter};
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// 类型化的连接目标。
@@ -28,12 +27,6 @@ pub enum ConnectionTarget {
     GsUsbBusAddress {
         bus: u8,
         address: u8,
-    },
-    DaemonUdp {
-        addr: String,
-    },
-    DaemonUds {
-        path: PathBuf,
     },
 }
 
@@ -201,18 +194,6 @@ impl PiperBuilder {
         self
     }
 
-    /// 通过 UDP daemon 连接。
-    pub fn daemon_udp(mut self, addr: impl Into<String>) -> Self {
-        self.target = ConnectionTarget::DaemonUdp { addr: addr.into() };
-        self
-    }
-
-    /// 通过 UDS daemon 连接。
-    pub fn daemon_uds(mut self, path: impl Into<PathBuf>) -> Self {
-        self.target = ConnectionTarget::DaemonUds { path: path.into() };
-        self
-    }
-
     /// 设置 CAN 波特率。
     pub fn baud_rate(mut self, baud_rate: u32) -> Self {
         self.baud_rate = baud_rate;
@@ -253,12 +234,6 @@ impl PiperBuilder {
                 self.baud_rate,
                 receive_timeout,
             )?,
-            ConnectionTarget::DaemonUdp { .. } | ConnectionTarget::DaemonUds { .. } => {
-                return Err(DriverError::Can(CanError::Device(CanDeviceError::new(
-                    CanDeviceErrorKind::UnsupportedConfig,
-                    "daemon UDP/UDS targets are non-realtime backends and cannot be used with the dual-thread Piper driver",
-                ))));
-            },
         };
 
         Piper::new_dual_thread_parts(backend.rx, backend.tx, Some(self.pipeline_config))
@@ -436,18 +411,6 @@ mod tests {
             .gs_usb_serial("ABC123")
             .build_with_factory(&factory)
             .unwrap();
-        let err = PiperBuilder::new()
-            .daemon_udp("127.0.0.1:18888")
-            .build_with_factory(&factory)
-            .err()
-            .expect("daemon targets should be rejected for realtime dual-thread driver");
-        assert!(matches!(
-            err,
-            DriverError::Can(CanError::Device(CanDeviceError {
-                kind: CanDeviceErrorKind::UnsupportedConfig,
-                ..
-            }))
-        ));
 
         assert_eq!(
             factory.calls.lock().unwrap().as_slice(),

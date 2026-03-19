@@ -11,7 +11,8 @@ use crate::gs_usb::protocol::{
     GS_CAN_MODE_LOOP_BACK, GS_USB_ECHO_ID,
 };
 use crate::{
-    CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
+    BridgeTxAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter,
+    RxAdapter,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -389,6 +390,9 @@ impl GsUsbTxAdapter {
                 crate::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
                     CanDeviceErrorKind::NotFound
                 },
+                crate::gs_usb::error::GsUsbError::PartialWrite { .. } => {
+                    CanDeviceErrorKind::Backend
+                },
                 _ => CanDeviceErrorKind::Backend,
             };
             CanError::Device(CanDeviceError::new(kind, format!("USB send failed: {}", e)))
@@ -407,5 +411,11 @@ impl RealtimeTxAdapter for GsUsbTxAdapter {
         deadline: Instant,
     ) -> Result<(), CanError> {
         self.send_frame_until(frame, deadline)
+    }
+}
+
+impl BridgeTxAdapter for GsUsbTxAdapter {
+    fn send_bridge(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
+        self.send_frame_with_budget(frame, timeout)
     }
 }

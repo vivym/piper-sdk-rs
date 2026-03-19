@@ -71,6 +71,12 @@ struct Args {
     /// 默认: 30
     #[arg(long, default_value = "30")]
     client_timeout: u64,
+
+    /// bridge/debug 链路发送超时（毫秒）
+    ///
+    /// 默认: 100
+    #[arg(long, default_value = "100")]
+    bridge_tx_timeout_ms: u64,
 }
 
 /// 获取默认锁文件路径
@@ -241,6 +247,7 @@ fn main() {
         reconnect_interval: Duration::from_secs(args.reconnect_interval),
         reconnect_debounce: Duration::from_millis(args.reconnect_debounce),
         client_timeout: Duration::from_secs(args.client_timeout),
+        bridge_tx_timeout: Duration::from_millis(args.bridge_tx_timeout_ms),
     };
 
     // 打印启动信息

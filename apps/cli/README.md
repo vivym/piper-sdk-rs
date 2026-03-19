@@ -21,8 +21,6 @@ CLI 和配置文件统一使用强类型 target spec：
 - `gs-usb-auto`
 - `gs-usb-serial:ABC123`
 - `gs-usb-bus-address:1:8`
-- `daemon-udp:127.0.0.1:18888`
-- `daemon-uds:/tmp/gs_usb.sock`
 
 默认值是 `auto`。
 
@@ -172,7 +170,7 @@ piper-cli stop --target socketcan:can0
 它会新建一个 one-shot 连接并发送 `disable_all()`。  
 是否可靠取决于底层后端是否允许并发访问：
 
-- SocketCAN / daemon：通常可作为外部 stop 路径
+- SocketCAN：通常可作为外部 stop 路径
 - 独占式 GS-USB：不应把跨进程 `stop` 当成 REPL 急停的替代方案
 
 ## 监控 / 录制 / 回放 / 脚本

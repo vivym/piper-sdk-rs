@@ -6,7 +6,6 @@
 //! - 显示关节位置、速度、电流等实时数据
 //! - 包含中文状态转换函数，便于理解
 //! - 支持 Ctrl+C 优雅退出
-//! - 支持通过 UDS 连接守护进程（macOS/Windows）
 //!
 //! **注意**：此示例用于实时监控，不发送任何控制指令，仅被动监听。
 //! 如需学习 API 用法，请参考 `state_api_demo` 示例。
@@ -16,20 +15,13 @@
 //! # Linux 平台：默认使用 can0（SocketCAN）
 //! cargo run --example robot_monitor
 //!
-//! # macOS 平台：默认使用 UDP 守护进程模式（127.0.0.1:18888）
+//! # 非 Linux 平台：自动扫描 GS-USB 设备
 //! cargo run --example robot_monitor
 //!
-//! # 其他平台：自动扫描 GS-USB 设备
-//! cargo run --example robot_monitor
-//!
-//! # 通过守护进程连接（所有平台）
-//! cargo run --example robot_monitor -- --uds 127.0.0.1:18888
-//!
-//! # 或使用 UDS 路径
-//! cargo run --example robot_monitor -- --uds /tmp/gs_usb_daemon.sock
-//!
-//! # 指定 CAN 接口（Linux: SocketCAN）或设备序列号（所有平台: GS-USB）
+//! # Linux: 指定 SocketCAN 接口
 //! cargo run --example robot_monitor -- --interface can0
+//!
+//! # 非 Linux: 指定 GS-USB 设备序列号
 //! cargo run --example robot_monitor -- --interface ABC123456  # 使用 GS-USB 设备序列号
 //! ```
 
@@ -47,9 +39,9 @@ use std::time::Duration;
 #[command(name = "robot_monitor")]
 #[command(about = "机器人实时监控工具")]
 struct Args {
-    /// CAN 接口名称或设备序列号
+    /// Linux 下的 CAN 接口名称，或非 Linux 平台下的 GS-USB 设备序列号
     ///
-    /// - Linux: "can0"/"can1" 等 SocketCAN 接口名，或设备序列号（使用 GS-USB）
+    /// - Linux: "can0"/"can1" 等 SocketCAN 接口名
     /// - macOS/Windows: GS-USB 设备序列号
     #[arg(long)]
     interface: Option<String>,
@@ -57,14 +49,6 @@ struct Args {
     /// CAN 波特率（默认: 1000000）
     #[arg(long, default_value = "1000000")]
     baud_rate: u32,
-
-    /// 守护进程地址（通过守护进程连接，所有平台）
-    ///
-    /// 如果指定此参数，将通过 gs_usb_daemon 连接，而不是直接连接设备。
-    /// 支持 UDS 路径（如 "/tmp/gs_usb_daemon.sock"）或 UDP 地址（如 "127.0.0.1:18888"）
-    /// 如果不指定此参数，在 Linux 平台下将默认使用 can0 接口（SocketCAN）
-    #[arg(long)]
-    uds: Option<String>,
 }
 
 /// 控制模式转换为字符串
@@ -253,16 +237,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. 创建 Piper 实例
     // 优先级：
-    // 1. 如果指定了 --uds，直接拒绝（daemon backend 已降级为非实时链路）
-    // 2. 如果指定了 --interface，使用指定的接口/设备序列号
-    // 3. 在 Linux 平台下，默认使用 can0（SocketCAN）
-    // 4. 在非 Linux 平台下，默认自动扫描 GS-USB 设备
-    let builder = if let Some(daemon_addr) = &args.uds {
-        return Err(format!(
-            "守护进程后端 ({daemon_addr}) 已被降级为非实时链路，robot_monitor 不再支持它；请改用 SocketCAN 或 GS-USB direct"
-        )
-        .into());
-    } else if let Some(interface) = &args.interface {
+    // 1. 如果指定了 --interface，使用指定的接口/设备序列号
+    // 2. 在 Linux 平台下，默认使用 can0（SocketCAN）
+    // 3. 在非 Linux 平台下，默认自动扫描 GS-USB 设备
+    let builder = if let Some(interface) = &args.interface {
         #[cfg(target_os = "linux")]
         {
             println!("使用 CAN 接口: {} (SocketCAN)", interface);

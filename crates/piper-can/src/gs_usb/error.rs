@@ -35,6 +35,10 @@ pub enum GsUsbError {
     #[error("Write timeout")]
     WriteTimeout,
 
+    /// USB Bulk OUT 只完成了部分写入
+    #[error("Partial write: transferred {transferred} bytes, expected {expected}")]
+    PartialWrite { transferred: usize, expected: usize },
+
     /// 无效响应
     #[error("Invalid response from device: expected {expected} bytes, got {actual}")]
     InvalidResponse { expected: usize, actual: usize },
@@ -92,11 +96,16 @@ mod tests {
         let err2 = GsUsbError::DeviceNotOpen;
         let err3 = GsUsbError::Usb(rusb::Error::NoDevice);
         let err4 = GsUsbError::InvalidFrame("test".to_string());
+        let err5 = GsUsbError::PartialWrite {
+            transferred: 8,
+            expected: 20,
+        };
 
         assert!(!err1.is_timeout());
         assert!(!err2.is_timeout());
         assert!(!err3.is_timeout());
         assert!(!err4.is_timeout());
+        assert!(!err5.is_timeout());
     }
 
     #[test]
@@ -133,6 +142,14 @@ mod tests {
         assert!(err7.to_string().contains("Unsupported bitrate"));
         assert!(err7.to_string().contains("1000000"));
         assert!(err7.to_string().contains("80000000"));
+
+        let err8 = GsUsbError::PartialWrite {
+            transferred: 8,
+            expected: 20,
+        };
+        assert!(err8.to_string().contains("Partial write"));
+        assert!(err8.to_string().contains("8"));
+        assert!(err8.to_string().contains("20"));
     }
 
     #[test]

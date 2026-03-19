@@ -565,6 +565,9 @@ impl CanAdapter for GsUsbCanAdapter {
                     crate::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
                         CanDeviceErrorKind::NotFound
                     },
+                    crate::gs_usb::error::GsUsbError::PartialWrite { .. } => {
+                        CanDeviceErrorKind::Backend
+                    },
                     _ => CanDeviceErrorKind::Backend,
                 };
                 return Err(CanError::Device(CanDeviceError::new(

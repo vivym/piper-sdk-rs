@@ -156,19 +156,6 @@ where
     }
 }
 
-pub trait TxAdapter {
-    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError>;
-}
-
-impl<T> TxAdapter for Box<T>
-where
-    T: TxAdapter + ?Sized,
-{
-    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
-        (**self).send_until(frame, deadline)
-    }
-}
-
 /// 实时控制专用 TX 适配器。
 ///
 /// 普通控制帧和故障停机帧走两条不同语义的发送路径：
@@ -194,6 +181,25 @@ where
         deadline: Instant,
     ) -> Result<(), CanError> {
         (**self).send_shutdown_until(frame, deadline)
+    }
+}
+
+/// bridge / daemon / debug 用 TX 适配器。
+///
+/// 这条路径明确是 best-effort 非实时语义：
+/// - 不参与 realtime dual-thread driver
+/// - 不承诺 bounded shutdown
+/// - 调用方通过相对 timeout 指定 bridge 发送预算
+pub trait BridgeTxAdapter {
+    fn send_bridge(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError>;
+}
+
+impl<T> BridgeTxAdapter for Box<T>
+where
+    T: BridgeTxAdapter + ?Sized,
+{
+    fn send_bridge(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
+        (**self).send_bridge(frame, timeout)
     }
 }
 

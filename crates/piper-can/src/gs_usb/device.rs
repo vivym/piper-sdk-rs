@@ -89,6 +89,33 @@ pub struct GsUsbDevice {
 }
 
 impl GsUsbDevice {
+    fn usb_timeout_from_deadline(deadline: Instant, now: Instant) -> Result<Duration, GsUsbError> {
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(GsUsbError::WriteTimeout);
+        };
+
+        if remaining.as_millis() == 0 {
+            return Err(GsUsbError::WriteTimeout);
+        }
+
+        Ok(Duration::from_millis(remaining.as_millis() as u64))
+    }
+
+    fn validate_bulk_write(transferred: usize, expected: usize) -> Result<(), GsUsbError> {
+        if transferred == expected {
+            return Ok(());
+        }
+
+        if transferred == 0 {
+            return Err(GsUsbError::WriteTimeout);
+        }
+
+        Err(GsUsbError::PartialWrite {
+            transferred,
+            expected,
+        })
+    }
+
     /// 检查是否为 GS-USB 设备
     fn is_gs_usb_device(vendor_id: u16, product_id: u16) -> bool {
         matches!(
@@ -566,8 +593,10 @@ impl GsUsbDevice {
 
     /// 发送原始 GS-USB 帧（Fire-and-Forget）
     ///
-    /// **错误恢复**：如果 USB 批量传输超时，endpoint 可能进入 STALL 状态。
-    /// 超时后会自动清除 endpoint halt，恢复设备状态，避免需要重新插拔设备。
+    /// 这条路径遵循 exact-write + fail-fast 语义：
+    /// - 只有整帧写满才算成功
+    /// - timeout / partial write 会立即返回错误
+    /// - 不在发送热路径内做 endpoint 恢复
     pub fn send_raw(&self, frame: &GsUsbFrame) -> Result<(), GsUsbError> {
         self.send_raw_until(frame, Instant::now() + self.write_timeout)
     }
@@ -580,12 +609,10 @@ impl GsUsbDevice {
         let mut buf = bytes::BytesMut::new();
         frame.pack_to(&mut buf, self.hw_timestamp);
 
-        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(GsUsbError::WriteTimeout);
-        };
+        let timeout = Self::usb_timeout_from_deadline(deadline, Instant::now())?;
 
         match self.handle.write_bulk(self.endpoint_out, &buf, timeout) {
-            Ok(_) => Ok(()),
+            Ok(transferred) => Self::validate_bulk_write(transferred, buf.len()),
             Err(rusb::Error::Timeout) => Err(GsUsbError::WriteTimeout),
             Err(e) => Err(GsUsbError::Usb(e)),
         }
@@ -719,6 +746,52 @@ mod tests {
         assert_eq!(data[1], 0xBE);
         assert_eq!(data[2], 0x00);
         assert_eq!(data[3], 0x00);
+    }
+
+    #[test]
+    fn test_usb_timeout_from_deadline_rejects_elapsed_deadline() {
+        let now = Instant::now();
+        let err = GsUsbDevice::usb_timeout_from_deadline(now, now).unwrap_err();
+        assert!(matches!(err, GsUsbError::WriteTimeout));
+    }
+
+    #[test]
+    fn test_usb_timeout_from_deadline_rejects_sub_millisecond_budget() {
+        let now = Instant::now();
+        let err = GsUsbDevice::usb_timeout_from_deadline(now + Duration::from_micros(999), now)
+            .unwrap_err();
+        assert!(matches!(err, GsUsbError::WriteTimeout));
+    }
+
+    #[test]
+    fn test_usb_timeout_from_deadline_uses_millisecond_granularity_without_round_up() {
+        let now = Instant::now();
+        let timeout =
+            GsUsbDevice::usb_timeout_from_deadline(now + Duration::from_micros(2500), now).unwrap();
+        assert_eq!(timeout, Duration::from_millis(2));
+    }
+
+    #[test]
+    fn test_validate_bulk_write_accepts_exact_write() {
+        assert!(GsUsbDevice::validate_bulk_write(20, 20).is_ok());
+    }
+
+    #[test]
+    fn test_validate_bulk_write_zero_bytes_is_timeout() {
+        let err = GsUsbDevice::validate_bulk_write(0, 20).unwrap_err();
+        assert!(matches!(err, GsUsbError::WriteTimeout));
+    }
+
+    #[test]
+    fn test_validate_bulk_write_partial_write_is_error() {
+        let err = GsUsbDevice::validate_bulk_write(8, 20).unwrap_err();
+        assert!(matches!(
+            err,
+            GsUsbError::PartialWrite {
+                transferred: 8,
+                expected: 20
+            }
+        ));
     }
 
     // 注意：scan() 和实际 USB 操作的测试需要硬件，放在集成测试中

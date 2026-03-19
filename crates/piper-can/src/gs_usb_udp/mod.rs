@@ -1,10 +1,11 @@
 //! GS-USB UDP/UDS 适配器
 //!
 //! 通过守护进程访问 GS-USB 设备的客户端库。
+//! 这是 bridge/debug/replay 用的非实时链路，不参与 dual-thread realtime driver。
 
 pub mod protocol;
 
-use crate::{CanAdapter, CanError, PiperFrame, RxAdapter, TxAdapter};
+use crate::{BridgeTxAdapter, CanAdapter, CanError, PiperFrame, RxAdapter};
 use protocol::{CanIdFilter, Message};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -69,12 +70,23 @@ pub struct GsUsbUdpTxAdapter {
 
 impl Socket {
     fn send_to_daemon(&self, data: &[u8], daemon_addr: &DaemonAddr) -> Result<(), CanError> {
+        self.send_to_daemon_with_timeout(data, daemon_addr, None)
+    }
+
+    fn send_to_daemon_with_timeout(
+        &self,
+        data: &[u8],
+        daemon_addr: &DaemonAddr,
+        timeout: Option<Duration>,
+    ) -> Result<(), CanError> {
         match (self, daemon_addr) {
             #[cfg(unix)]
             (Socket::Unix(socket), DaemonAddr::Unix(path)) => {
+                socket.set_write_timeout(timeout).map_err(CanError::Io)?;
                 socket.send_to(data, path).map_err(CanError::Io)?;
             },
             (Socket::Udp(socket), DaemonAddr::Udp(addr)) => {
+                socket.set_write_timeout(timeout).map_err(CanError::Io)?;
                 socket.send_to(data, *addr).map_err(CanError::Io)?;
             },
             #[cfg(unix)]
@@ -150,6 +162,10 @@ impl DaemonSession {
 
     fn send_to_daemon(&self, data: &[u8]) -> Result<(), CanError> {
         self.socket.send_to_daemon(data, &self.daemon_addr)
+    }
+
+    fn send_to_daemon_with_timeout(&self, data: &[u8], timeout: Duration) -> Result<(), CanError> {
+        self.socket.send_to_daemon_with_timeout(data, &self.daemon_addr, Some(timeout))
     }
 
     fn recv_from_daemon(&self, buf: &mut [u8]) -> Result<usize, CanError> {
@@ -526,12 +542,28 @@ impl RxAdapter for GsUsbUdpRxAdapter {
     }
 }
 
-impl TxAdapter for GsUsbUdpTxAdapter {
-    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
-        if deadline <= Instant::now() {
+impl BridgeTxAdapter for GsUsbUdpTxAdapter {
+    fn send_bridge(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
+        if timeout.is_zero() {
             return Err(CanError::Timeout);
         }
-        send_frame(&self.session, frame)
+        if !self.session.is_connected() {
+            return Err(CanError::Device("Not connected to daemon".into()));
+        }
+
+        let seq = self.session.seq_counter.fetch_add(1, Ordering::Relaxed);
+        let mut buf = [0u8; 64];
+        let encoded =
+            protocol::encode_send_frame_with_seq(&frame, seq, &mut buf).map_err(|err| {
+                CanError::Device(format!("Failed to encode send frame: {err:?}").into())
+            })?;
+
+        if let Err(error) = self.session.send_to_daemon_with_timeout(encoded, timeout) {
+            self.session.mark_transport_lost();
+            return Err(error);
+        }
+
+        Ok(())
     }
 }
 
@@ -751,7 +783,7 @@ mod tests {
 
         let (mut rx, mut tx) = adapter.split_bridge().unwrap();
         let outbound = PiperFrame::new_standard(0x321, &[9, 8, 7, 6]);
-        tx.send_until(outbound, Instant::now() + Duration::from_millis(50)).unwrap();
+        tx.send_bridge(outbound, Duration::from_millis(50)).unwrap();
 
         let inbound = rx.receive().unwrap();
         assert_eq!(inbound.id, outbound.id);

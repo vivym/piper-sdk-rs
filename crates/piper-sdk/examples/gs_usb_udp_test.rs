@@ -1,6 +1,7 @@
 //! GS-USB UDP/UDS 适配器测试示例
 //!
 //! 此示例演示如何通过 UDP 或 UDS (Unix Domain Socket) 连接到 gs_usb_daemon 并测试 CAN 总线功能。
+//! 该链路仅用于 bridge/debug/replay，不属于 MIT / 双臂 / fault-stop 的实时控制路径。
 //!
 //! 使用前请确保：
 //! 1. gs_usb_daemon 已经启动（默认 UDP 地址: 127.0.0.1:18888）

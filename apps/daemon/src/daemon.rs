@@ -5,7 +5,7 @@
 //! 参考：`daemon_implementation_plan.md` 第 4.1.3 节
 
 use crate::client_manager::{ClientAddr, ClientManager};
-use piper_can::RealtimeTxAdapter;
+use piper_can::BridgeTxAdapter;
 use piper_can::gs_usb::{
     GsUsbCanAdapter,
     split::{GsUsbRxAdapter, GsUsbTxAdapter},
@@ -71,6 +71,9 @@ pub struct DaemonConfig {
 
     /// 客户端超时时间（默认 30 秒）
     pub client_timeout: Duration,
+
+    /// bridge/debug 链路的发送超时（默认 100ms）
+    pub bridge_tx_timeout: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -83,6 +86,7 @@ impl Default for DaemonConfig {
             reconnect_interval: Duration::from_secs(1),
             reconnect_debounce: Duration::from_millis(500),
             client_timeout: Duration::from_secs(30),
+            bridge_tx_timeout: Duration::from_millis(100),
         }
     }
 }
@@ -134,6 +138,14 @@ struct DaemonStats {
     start_time: Instant,
     /// 详细统计信息（健康度监控）
     detailed: Arc<RwLock<DetailedStats>>,
+}
+
+struct IpcHandlerContext<'a> {
+    tx_adapter: &'a Arc<Mutex<Option<GsUsbTxAdapter>>>,
+    device_state: &'a Arc<RwLock<DeviceState>>,
+    clients: &'a Arc<RwLock<ClientManager>>,
+    stats: &'a Arc<RwLock<DaemonStats>>,
+    bridge_tx_timeout: Duration,
 }
 
 /// 详细统计信息（健康度监控）
@@ -1208,6 +1220,7 @@ impl Daemon {
         device_state: Arc<RwLock<DeviceState>>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
+        bridge_tx_timeout: Duration,
     ) {
         // 设置高优先级（macOS QoS）
         // 注意：在非 macOS 平台上这是空操作，可以安全调用
@@ -1226,11 +1239,14 @@ impl Daemon {
                         Self::handle_ipc_message(
                             msg,
                             client_addr,
-                            &tx_adapter,
-                            &device_state,
-                            &clients,
+                            IpcHandlerContext {
+                                tx_adapter: &tx_adapter,
+                                device_state: &device_state,
+                                clients: &clients,
+                                stats: &stats,
+                                bridge_tx_timeout,
+                            },
                             &socket,
-                            &stats,
                         );
                     }
                 },
@@ -1259,6 +1275,7 @@ impl Daemon {
         device_state: Arc<RwLock<DeviceState>>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
+        bridge_tx_timeout: Duration,
     ) {
         // 设置高优先级（macOS QoS）
         // 注意：在非 macOS 平台上这是空操作，可以安全调用
@@ -1279,11 +1296,14 @@ impl Daemon {
                         Self::handle_ipc_message_udp(
                             msg,
                             client_addr, // ← SocketAddr（UDP 地址）
-                            &tx_adapter,
-                            &device_state,
-                            &clients,
+                            IpcHandlerContext {
+                                tx_adapter: &tx_adapter,
+                                device_state: &device_state,
+                                clients: &clients,
+                                stats: &stats,
+                                bridge_tx_timeout,
+                            },
                             &socket, // ← UdpSocket
-                            &stats,
                         );
                     }
                 },
@@ -1308,12 +1328,16 @@ impl Daemon {
     fn handle_ipc_message(
         msg: piper_can::gs_usb_udp::protocol::Message,
         client_addr: std::os::unix::net::SocketAddr,
-        tx_adapter: &Arc<Mutex<Option<GsUsbTxAdapter>>>,
-        _device_state: &Arc<RwLock<DeviceState>>,
-        clients: &Arc<RwLock<ClientManager>>,
+        ctx: IpcHandlerContext<'_>,
         socket: &std::os::unix::net::UnixDatagram,
-        stats: &Arc<RwLock<DaemonStats>>,
     ) {
+        let IpcHandlerContext {
+            tx_adapter,
+            device_state: _device_state,
+            clients,
+            stats,
+            bridge_tx_timeout,
+        } = ctx;
         match msg {
             piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
                 // 更新客户端活动时间
@@ -1420,7 +1444,7 @@ impl Daemon {
                 // 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
-                    match adapter_ref.send_control(frame, Duration::from_millis(5)) {
+                    match adapter_ref.send_bridge(frame, bridge_tx_timeout) {
                         Ok(_) => {
                             // 更新统计（USB 发送成功）
                             stats.read().unwrap().increment_tx();
@@ -1526,12 +1550,16 @@ impl Daemon {
     fn handle_ipc_message_udp(
         msg: piper_can::gs_usb_udp::protocol::Message,
         client_addr: std::net::SocketAddr, // ← UDP 地址（SocketAddr）
-        tx_adapter: &Arc<Mutex<Option<GsUsbTxAdapter>>>,
-        device_state: &Arc<RwLock<DeviceState>>,
-        clients: &Arc<RwLock<ClientManager>>,
+        ctx: IpcHandlerContext<'_>,
         socket: &std::net::UdpSocket, // ← UdpSocket
-        stats: &Arc<RwLock<DaemonStats>>,
     ) {
+        let IpcHandlerContext {
+            tx_adapter,
+            device_state,
+            clients,
+            stats,
+            bridge_tx_timeout,
+        } = ctx;
         match msg {
             piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
                 // 更新客户端活动时间
@@ -1611,7 +1639,7 @@ impl Daemon {
                 // ✅ 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
-                    match adapter_ref.send_control(frame, Duration::from_millis(5)) {
+                    match adapter_ref.send_bridge(frame, bridge_tx_timeout) {
                         Ok(_) => {
                             stats.read().unwrap().increment_tx();
                         },
@@ -1956,6 +1984,7 @@ impl Daemon {
             let device_state_clone = Arc::clone(&self.device_state);
             let clients_clone = Arc::clone(&self.clients);
             let stats_clone = Arc::clone(&self.stats);
+            let bridge_tx_timeout = self.config.bridge_tx_timeout;
 
             thread::Builder::new()
                 .name("ipc_receive_uds".into())
@@ -1966,6 +1995,7 @@ impl Daemon {
                         device_state_clone,
                         clients_clone,
                         stats_clone,
+                        bridge_tx_timeout,
                     );
                 })
                 .map_err(|e| {
@@ -1979,6 +2009,7 @@ impl Daemon {
             let device_state_clone = Arc::clone(&self.device_state);
             let clients_clone = Arc::clone(&self.clients);
             let stats_clone = Arc::clone(&self.stats);
+            let bridge_tx_timeout = self.config.bridge_tx_timeout;
 
             thread::Builder::new()
                 .name("ipc_receive_udp".into())
@@ -1989,6 +2020,7 @@ impl Daemon {
                         device_state_clone,
                         clients_clone,
                         stats_clone,
+                        bridge_tx_timeout,
                     );
                 })
                 .map_err(|e| {
@@ -2064,6 +2096,7 @@ mod tests {
         assert_eq!(config.reconnect_interval, Duration::from_secs(1));
         assert_eq!(config.reconnect_debounce, Duration::from_millis(500));
         assert_eq!(config.client_timeout, Duration::from_secs(30));
+        assert_eq!(config.bridge_tx_timeout, Duration::from_millis(100));
     }
 
     #[test]

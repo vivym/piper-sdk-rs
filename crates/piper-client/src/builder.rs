@@ -52,16 +52,6 @@ impl PiperBuilder {
         self
     }
 
-    pub fn daemon_udp(mut self, addr: impl Into<String>) -> Self {
-        self.target = ConnectionTarget::DaemonUdp { addr: addr.into() };
-        self
-    }
-
-    pub fn daemon_uds(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.target = ConnectionTarget::DaemonUds { path: path.into() };
-        self
-    }
-
     pub fn baud_rate(mut self, baud_rate: u32) -> Self {
         self.baud_rate = baud_rate;
         self

@@ -17,6 +17,7 @@
   - 显示关节位置、速度、电流等实时数据
   - 包含中文状态转换函数，便于理解
   - 支持 Ctrl+C 优雅退出
+  - 实时 backend 仅支持 SocketCAN（Linux）和 GS-USB direct（跨平台）
   - 运行：`cargo run --example robot_monitor`
 
 ### 工具示例
@@ -24,6 +25,11 @@
 - **`timestamp_verification`** - SocketCAN 硬件时间戳验证程序
   - 验证 Linux SocketCAN 是否支持硬件时间戳（SO_TIMESTAMPING）
   - 运行：`cargo run --example timestamp_verification`
+
+- **`gs_usb_udp_test`** - GS-USB daemon bridge 调试工具
+  - 用于 bridge/debug/replay 场景
+  - 明确是非实时链路，不用于 MIT / 双臂 / fault-stop 主控制链
+  - 运行：`cargo run --example gs_usb_udp_test`
 
 ### 计划中的示例
 

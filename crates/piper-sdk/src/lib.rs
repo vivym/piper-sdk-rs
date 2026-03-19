@@ -32,8 +32,8 @@ pub mod can {
     #[cfg(feature = "mock")]
     pub use piper_can::MockCanAdapter;
     pub use piper_can::{
-        CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter,
-        RxAdapter, SplittableAdapter, TxAdapter,
+        BridgeTxAdapter, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame,
+        RealtimeTxAdapter, RxAdapter, SplittableAdapter,
     };
 }
 

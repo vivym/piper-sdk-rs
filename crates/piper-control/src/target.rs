@@ -2,7 +2,6 @@ use piper_client::PiperBuilder as ClientPiperBuilder;
 use piper_driver::{ConnectionTarget, PiperBuilder as DriverPiperBuilder};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -19,10 +18,6 @@ pub enum TargetSpec {
     GsUsbSerial { serial: String },
     #[serde(rename = "gs-usb-bus-address")]
     GsUsbBusAddress { bus: u8, address: u8 },
-    #[serde(rename = "daemon-udp")]
-    DaemonUdp { addr: String },
-    #[serde(rename = "daemon-uds")]
-    DaemonUds { path: PathBuf },
 }
 
 impl TargetSpec {
@@ -41,8 +36,6 @@ impl From<TargetSpec> for ConnectionTarget {
             TargetSpec::GsUsbBusAddress { bus, address } => {
                 ConnectionTarget::GsUsbBusAddress { bus, address }
             },
-            TargetSpec::DaemonUdp { addr } => ConnectionTarget::DaemonUdp { addr },
-            TargetSpec::DaemonUds { path } => ConnectionTarget::DaemonUds { path },
         }
     }
 }
@@ -57,8 +50,6 @@ impl From<ConnectionTarget> for TargetSpec {
             ConnectionTarget::GsUsbBusAddress { bus, address } => {
                 TargetSpec::GsUsbBusAddress { bus, address }
             },
-            ConnectionTarget::DaemonUdp { addr } => TargetSpec::DaemonUdp { addr },
-            ConnectionTarget::DaemonUds { path } => TargetSpec::DaemonUds { path },
         }
     }
 }
@@ -73,8 +64,6 @@ impl fmt::Display for TargetSpec {
             TargetSpec::GsUsbBusAddress { bus, address } => {
                 write!(f, "gs-usb-bus-address:{bus}:{address}")
             },
-            TargetSpec::DaemonUdp { addr } => write!(f, "daemon-udp:{addr}"),
-            TargetSpec::DaemonUds { path } => write!(f, "daemon-uds:{}", path.display()),
         }
     }
 }
@@ -120,22 +109,6 @@ impl FromStr for TargetSpec {
                     address.parse::<u8>().map_err(|_| "invalid GS-USB address".to_string())?;
                 Ok(Self::GsUsbBusAddress { bus, address })
             },
-            "daemon-udp" => {
-                if value.is_empty() {
-                    return Err("daemon-udp target requires an address".to_string());
-                }
-                Ok(Self::DaemonUdp {
-                    addr: value.to_string(),
-                })
-            },
-            "daemon-uds" => {
-                if value.is_empty() {
-                    return Err("daemon-uds target requires a socket path".to_string());
-                }
-                Ok(Self::DaemonUds {
-                    path: PathBuf::from(value),
-                })
-            },
             _ => Err(format!("unsupported target kind: {kind}")),
         }
     }
@@ -161,8 +134,6 @@ mod tests {
             "socketcan:vcan0",
             "gs-usb-serial:ABC123",
             "gs-usb-bus-address:1:8",
-            "daemon-udp:127.0.0.1:18888",
-            "daemon-uds:/tmp/gs_usb.sock",
         ];
 
         for case in cases {
@@ -187,16 +158,6 @@ mod tests {
             Wrapper {
                 target: TargetSpec::GsUsbBusAddress { bus: 2, address: 9 },
             },
-            Wrapper {
-                target: TargetSpec::DaemonUdp {
-                    addr: "127.0.0.1:18888".to_string(),
-                },
-            },
-            Wrapper {
-                target: TargetSpec::DaemonUds {
-                    path: PathBuf::from("/tmp/gs_usb.sock"),
-                },
-            },
         ];
 
         for wrapper in wrappers {
@@ -207,8 +168,6 @@ mod tests {
                 TargetSpec::GsUsbAuto => "gs-usb-auto",
                 TargetSpec::GsUsbSerial { .. } => "gs-usb-serial",
                 TargetSpec::GsUsbBusAddress { .. } => "gs-usb-bus-address",
-                TargetSpec::DaemonUdp { .. } => "daemon-udp",
-                TargetSpec::DaemonUds { .. } => "daemon-uds",
             };
             assert!(toml.contains(&format!("kind = \"{kind}\"")));
 
@@ -239,5 +198,11 @@ mod tests {
                 iface: "can0".to_string()
             }
         );
+    }
+
+    #[test]
+    fn daemon_targets_are_rejected() {
+        assert!("daemon-udp:127.0.0.1:18888".parse::<TargetSpec>().is_err());
+        assert!("daemon-uds:/tmp/gs_usb.sock".parse::<TargetSpec>().is_err());
     }
 }
