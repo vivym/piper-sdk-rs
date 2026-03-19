@@ -76,8 +76,6 @@ pub use client::{
     BilateralDynamicsCompensator,
     BilateralLoopConfig,
     BilateralRunReport,
-    CompensationFaultAction,
-    ControllerFaultAction,
     DualArmActiveMit,
     DualArmBuilder,
     DualArmCalibration,
@@ -96,8 +94,6 @@ pub use client::{
     MasterFollowerController,
     Observer,
     PiperBuilder, // Client 层 Builder（推荐使用）
-    ReadFaultAction,
-    RuntimeFaultAction,
     // 类型系统通过 types 模块导出
     RuntimeFaultKind,
     RuntimeHealthSnapshot,

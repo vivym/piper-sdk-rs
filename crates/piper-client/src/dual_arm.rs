@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::builder::PiperBuilder;
+use crate::control::scheduler::{CycleScheduler, SleepStrategy};
 use crate::observer::{ControlReadPolicy, ControlSnapshotFull, Observer, RuntimeHealthSnapshot};
 use crate::state::machine::ErrorState;
 use crate::state::{Active, DisableConfig, MitMode, MitModeConfig, Piper, Standby};
@@ -60,9 +61,16 @@ impl DualArmStandby {
 
     pub fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration> {
         map.validate()?;
+        let snapshot = self.observer().snapshot(DualArmReadPolicy {
+            per_arm: ControlReadPolicy {
+                max_state_skew_us: DualArmReadPolicy::default().per_arm.max_state_skew_us,
+                max_feedback_age: Duration::from_millis(100),
+            },
+            max_inter_arm_skew: Duration::from_millis(25),
+        })?;
         Ok(DualArmCalibration {
-            master_zero: self.left.observer().joint_positions(),
-            slave_zero: self.right.observer().joint_positions(),
+            master_zero: snapshot.left.state.position,
+            slave_zero: snapshot.right.state.position,
             map,
         })
     }
@@ -79,27 +87,12 @@ impl DualArmActiveMit {
         DualArmObserver::new(self.left.observer().clone(), self.right.observer().clone())
     }
 
-    pub fn safe_hold(&self, cfg: &DualArmSafetyConfig) -> Result<()> {
-        let left_positions = self.left.observer().joint_positions();
-        let right_positions = self.right.observer().joint_positions();
-        let zero_velocities = JointArray::splat(0.0);
-        let zero_torques = JointArray::splat(NewtonMeter::ZERO);
-
-        self.right.command_torques(
-            &right_positions,
-            &zero_velocities,
-            &cfg.safe_hold_kp,
-            &cfg.safe_hold_kd,
-            &zero_torques,
-        )?;
-        self.left.command_torques(
-            &left_positions,
-            &zero_velocities,
-            &cfg.safe_hold_kp,
-            &cfg.safe_hold_kd,
-            &zero_torques,
-        )?;
-        Ok(())
+    pub fn safe_hold_from_snapshot(
+        &self,
+        snapshot: &DualArmSnapshot,
+        cfg: &DualArmSafetyConfig,
+    ) -> Result<()> {
+        self.safe_hold_from_anchor(&DualArmHoldAnchor::from_snapshot(snapshot), cfg)
     }
 
     pub fn disable_both(self, cfg: DisableConfig) -> Result<DualArmStandby> {
@@ -152,6 +145,11 @@ impl DualArmActiveMit {
         if cfg.frequency_hz <= 0.0 {
             return Err(DualArmError::Config("frequency_hz must be > 0".to_string()));
         }
+        if cfg.dt_clamp_multiplier <= 0.0 {
+            return Err(DualArmError::Config(
+                "dt_clamp_multiplier must be > 0".to_string(),
+            ));
+        }
         if cfg.gripper.update_divider == 0 {
             return Err(DualArmError::Config(
                 "gripper.update_divider must be >= 1".to_string(),
@@ -163,12 +161,16 @@ impl DualArmActiveMit {
         let active = self;
         let mut report = BilateralRunReport::default();
         let mut shaping_state = OutputShapingState::default();
-        let mut last_time = Instant::now();
+        let mut scheduler = CycleScheduler::new(
+            nominal_period,
+            sleep_strategy_from_loop_timing(cfg.timing_mode),
+        );
         let mut iteration = 0usize;
         let mut read_failure_streak = 0u32;
         let mut read_failure_since: Option<Instant> = None;
         let mut compensation_failure_streak = 0u32;
         let mut gripper_counter = 0usize;
+        let mut hold_anchor: Option<DualArmHoldAnchor> = None;
 
         loop {
             if let Some(max_iterations) = cfg.max_iterations
@@ -190,19 +192,33 @@ impl DualArmActiveMit {
                 return Ok(DualArmLoopExit::Standby { arms, report });
             }
 
-            let now = Instant::now();
-            let real_dt = now.saturating_duration_since(last_time);
+            let cycle = scheduler.wait_next();
+            report.deadline_misses += cycle.missed_deadlines;
+            report.max_real_dt = report.max_real_dt.max(cycle.real_dt);
+            report.max_cycle_lag = report.max_cycle_lag.max(cycle.lag);
+
+            let now = cycle.tick_start;
+            let real_dt = cycle.real_dt;
             let mut dt = real_dt;
             if real_dt > max_dt {
-                controller
-                    .on_time_jump(real_dt)
-                    .map_err(|err| DualArmError::Controller(err.to_string()))?;
+                if let Err(err) = controller.on_time_jump(real_dt) {
+                    report.last_error = Some(err.to_string());
+                    let _ =
+                        best_effort_safe_hold_from_anchor(&active, hold_anchor, now, &cfg.safety);
+                    let arms = active
+                        .disable_both(cfg.disable_config.clone())
+                        .map_err(DualArmError::from)?;
+                    update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
+                    return Ok(DualArmLoopExit::Standby { arms, report });
+                }
                 if let Some(compensator) = compensator.as_deref_mut()
                     && let Err(err) = compensator.on_time_jump(real_dt)
                 {
                     compensation_failure_streak += 1;
                     report.last_error = Some(err);
-                    if active.safe_hold(&cfg.safety).is_err() || compensation_failure_streak > 1 {
+                    let hold_succeeded =
+                        best_effort_safe_hold_from_anchor(&active, hold_anchor, now, &cfg.safety);
+                    if !hold_succeeded || compensation_failure_streak > 1 {
                         let arms = active
                             .disable_both(cfg.disable_config.clone())
                             .map_err(DualArmError::from)?;
@@ -212,8 +228,6 @@ impl DualArmActiveMit {
 
                     report.iterations += 1;
                     iteration += 1;
-                    last_time = now;
-                    sleep_until_next_cycle(cfg.timing_mode, nominal_period);
                     continue;
                 }
                 dt = max_dt;
@@ -227,17 +241,9 @@ impl DualArmActiveMit {
                 return Ok(DualArmLoopExit::EmergencyStopped { arms, report });
             }
 
-            if iteration < cfg.warmup_cycles {
-                active.safe_hold(&cfg.safety).map_err(DualArmError::from)?;
-                report.iterations += 1;
-                iteration += 1;
-                last_time = now;
-                sleep_until_next_cycle(cfg.timing_mode, nominal_period);
-                continue;
-            }
-
             let snapshot = match active.observer().snapshot(cfg.read_policy) {
                 Ok(snapshot) => {
+                    hold_anchor = Some(DualArmHoldAnchor::from_snapshot(&snapshot));
                     read_failure_streak = 0;
                     read_failure_since = None;
                     report.max_inter_arm_skew =
@@ -249,10 +255,13 @@ impl DualArmActiveMit {
                     report.read_faults += 1;
                     report.last_error = Some(err.to_string());
                     let failure_start = read_failure_since.get_or_insert(now);
-                    if active.safe_hold(&cfg.safety).is_err()
+                    let hold_succeeded =
+                        best_effort_safe_hold_from_anchor(&active, hold_anchor, now, &cfg.safety);
+                    if !hold_succeeded
                         || read_failure_streak
                             >= cfg.safety.consecutive_read_failures_before_disable
-                        || failure_start.elapsed() >= cfg.safety.safe_hold_max_duration
+                        || now.saturating_duration_since(*failure_start)
+                            >= cfg.safety.safe_hold_max_duration
                     {
                         let arms = active
                             .disable_both(cfg.disable_config.clone())
@@ -263,11 +272,18 @@ impl DualArmActiveMit {
 
                     report.iterations += 1;
                     iteration += 1;
-                    last_time = now;
-                    sleep_until_next_cycle(cfg.timing_mode, nominal_period);
                     continue;
                 },
             };
+
+            if iteration < cfg.warmup_cycles {
+                active
+                    .safe_hold_from_snapshot(&snapshot, &cfg.safety)
+                    .map_err(DualArmError::from)?;
+                report.iterations += 1;
+                iteration += 1;
+                continue;
+            }
 
             let compensation = if let Some(compensator) = compensator.as_deref_mut() {
                 match compensator.compute(&snapshot, dt) {
@@ -278,8 +294,13 @@ impl DualArmActiveMit {
                     Err(err) => {
                         compensation_failure_streak += 1;
                         report.last_error = Some(err);
-                        if active.safe_hold(&cfg.safety).is_err() || compensation_failure_streak > 1
-                        {
+                        let hold_succeeded = best_effort_safe_hold_from_anchor(
+                            &active,
+                            hold_anchor,
+                            now,
+                            &cfg.safety,
+                        );
+                        if !hold_succeeded || compensation_failure_streak > 1 {
                             let arms = active
                                 .disable_both(cfg.disable_config.clone())
                                 .map_err(DualArmError::from)?;
@@ -293,8 +314,6 @@ impl DualArmActiveMit {
 
                         report.iterations += 1;
                         iteration += 1;
-                        last_time = now;
-                        sleep_until_next_cycle(cfg.timing_mode, nominal_period);
                         continue;
                     },
                 }
@@ -311,11 +330,8 @@ impl DualArmActiveMit {
                 Ok(command) => command,
                 Err(err) => {
                     report.last_error = Some(err.to_string());
-                    if active.safe_hold(&cfg.safety).is_err() {
-                        let arms = active.emergency_stop_both().map_err(DualArmError::from)?;
-                        update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
-                        return Ok(DualArmLoopExit::EmergencyStopped { arms, report });
-                    }
+                    let _ =
+                        best_effort_safe_hold_from_anchor(&active, hold_anchor, now, &cfg.safety);
                     let arms = active
                         .disable_both(cfg.disable_config.clone())
                         .map_err(DualArmError::from)?;
@@ -324,27 +340,22 @@ impl DualArmActiveMit {
                 },
             };
 
-            if let Some(compensation) = frame.compensation {
-                apply_model_compensation(&mut command, compensation);
-            }
-
             apply_output_shaping(&cfg, &frame.snapshot, dt, &mut shaping_state, &mut command);
+            let final_torques = assemble_final_torques(&command, frame.compensation);
 
             if let Err(err) = active.right.command_torques(
                 &command.slave_position,
                 &command.slave_velocity,
                 &command.slave_kp,
                 &command.slave_kd,
-                &command.slave_torque,
+                &final_torques.slave,
             ) {
                 report.command_faults += 1;
                 report.last_error = Some(err.to_string());
-                let _ = active.left.command_torques(
-                    &frame.snapshot.left.state.position,
-                    &JointArray::splat(0.0),
-                    &cfg.safety.safe_hold_kp,
-                    &cfg.safety.safe_hold_kd,
-                    &JointArray::splat(NewtonMeter::ZERO),
+                let _ = best_effort_command_hold(
+                    &active.left,
+                    hold_anchor.map(|anchor| anchor.left_position),
+                    &cfg.safety,
                 );
                 let arms = active.emergency_stop_both().map_err(DualArmError::from)?;
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
@@ -356,16 +367,14 @@ impl DualArmActiveMit {
                 &command.master_velocity,
                 &command.master_kp,
                 &command.master_kd,
-                &command.master_torque,
+                &final_torques.master,
             ) {
                 report.command_faults += 1;
                 report.last_error = Some(err.to_string());
-                let _ = active.right.command_torques(
-                    &frame.snapshot.right.state.position,
-                    &JointArray::splat(0.0),
-                    &cfg.safety.safe_hold_kp,
-                    &cfg.safety.safe_hold_kd,
-                    &JointArray::splat(NewtonMeter::ZERO),
+                let _ = best_effort_command_hold(
+                    &active.right,
+                    hold_anchor.map(|anchor| anchor.right_position),
+                    &cfg.safety,
                 );
                 let arms = active.emergency_stop_both().map_err(DualArmError::from)?;
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
@@ -388,9 +397,17 @@ impl DualArmActiveMit {
 
             report.iterations += 1;
             iteration += 1;
-            last_time = now;
-            sleep_until_next_cycle(cfg.timing_mode, nominal_period);
         }
+    }
+
+    fn safe_hold_from_anchor(
+        &self,
+        anchor: &DualArmHoldAnchor,
+        cfg: &DualArmSafetyConfig,
+    ) -> Result<()> {
+        command_hold(&self.right, &anchor.right_position, cfg)?;
+        command_hold(&self.left, &anchor.left_position, cfg)?;
+        Ok(())
     }
 }
 
@@ -504,11 +521,6 @@ pub struct DualArmSafetyConfig {
     pub safe_hold_kd: JointArray<f64>,
     pub safe_hold_max_duration: Duration,
     pub consecutive_read_failures_before_disable: u32,
-    pub consecutive_command_failures_before_emergency_stop: u32,
-    pub runtime_fault_action: RuntimeFaultAction,
-    pub read_fault_action: ReadFaultAction,
-    pub controller_error_action: ControllerFaultAction,
-    pub compensation_error_action: CompensationFaultAction,
 }
 
 impl Default for DualArmSafetyConfig {
@@ -518,33 +530,8 @@ impl Default for DualArmSafetyConfig {
             safe_hold_kd: JointArray::splat(0.8),
             safe_hold_max_duration: Duration::from_millis(100),
             consecutive_read_failures_before_disable: 3,
-            consecutive_command_failures_before_emergency_stop: 1,
-            runtime_fault_action: RuntimeFaultAction::EmergencyStopBoth,
-            read_fault_action: ReadFaultAction::SafeHoldThenDisable,
-            controller_error_action: ControllerFaultAction::SafeHoldThenDisable,
-            compensation_error_action: CompensationFaultAction::SafeHoldThenDisable,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeFaultAction {
-    EmergencyStopBoth,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadFaultAction {
-    SafeHoldThenDisable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControllerFaultAction {
-    SafeHoldThenDisable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompensationFaultAction {
-    SafeHoldThenDisable,
 }
 
 /// 夹爪镜像策略
@@ -589,12 +576,12 @@ pub struct BilateralLoopConfig {
     pub safety: DualArmSafetyConfig,
     pub disable_config: DisableConfig,
     pub gripper: GripperTeleopConfig,
-    pub reflection_lpf_cutoff_hz: f64,
-    pub master_reflection_limit: JointArray<NewtonMeter>,
+    pub master_interaction_lpf_cutoff_hz: f64,
+    pub master_interaction_limit: JointArray<NewtonMeter>,
     pub slave_feedforward_limit: JointArray<NewtonMeter>,
-    pub reflection_slew_limit: JointArray<NewtonMeter>,
-    pub passivity_enabled: bool,
-    pub passivity_max_damping: JointArray<f64>,
+    pub master_interaction_slew_limit: JointArray<NewtonMeter>,
+    pub master_passivity_enabled: bool,
+    pub master_passivity_max_damping: JointArray<f64>,
 }
 
 impl Default for BilateralLoopConfig {
@@ -610,12 +597,12 @@ impl Default for BilateralLoopConfig {
             safety: DualArmSafetyConfig::default(),
             disable_config: DisableConfig::default(),
             gripper: GripperTeleopConfig::default(),
-            reflection_lpf_cutoff_hz: 20.0,
-            master_reflection_limit: JointArray::splat(NewtonMeter(1.5)),
+            master_interaction_lpf_cutoff_hz: 20.0,
+            master_interaction_limit: JointArray::splat(NewtonMeter(1.5)),
             slave_feedforward_limit: JointArray::splat(NewtonMeter(4.0)),
-            reflection_slew_limit: JointArray::splat(NewtonMeter(0.25)),
-            passivity_enabled: true,
-            passivity_max_damping: JointArray::splat(1.0),
+            master_interaction_slew_limit: JointArray::splat(NewtonMeter(0.25)),
+            master_passivity_enabled: true,
+            master_passivity_max_damping: JointArray::splat(1.0),
         }
     }
 }
@@ -626,7 +613,10 @@ pub struct BilateralRunReport {
     pub iterations: usize,
     pub read_faults: u32,
     pub command_faults: u32,
+    pub deadline_misses: u64,
     pub max_inter_arm_skew: Duration,
+    pub max_real_dt: Duration,
+    pub max_cycle_lag: Duration,
     pub left_tx_realtime_overwrites: u64,
     pub right_tx_realtime_overwrites: u64,
     pub left_tx_frames_total: u64,
@@ -640,7 +630,10 @@ impl Default for BilateralRunReport {
             iterations: 0,
             read_faults: 0,
             command_faults: 0,
+            deadline_misses: 0,
             max_inter_arm_skew: Duration::ZERO,
+            max_real_dt: Duration::ZERO,
+            max_cycle_lag: Duration::ZERO,
             left_tx_realtime_overwrites: 0,
             right_tx_realtime_overwrites: 0,
             left_tx_frames_total: 0,
@@ -770,12 +763,12 @@ pub struct BilateralCommand {
     pub slave_velocity: JointArray<f64>,
     pub slave_kp: JointArray<f64>,
     pub slave_kd: JointArray<f64>,
-    pub slave_torque: JointArray<NewtonMeter>,
+    pub slave_feedforward_torque: JointArray<NewtonMeter>,
     pub master_position: JointArray<Rad>,
     pub master_velocity: JointArray<f64>,
     pub master_kp: JointArray<f64>,
     pub master_kd: JointArray<f64>,
-    pub master_torque: JointArray<NewtonMeter>,
+    pub master_interaction_torque: JointArray<NewtonMeter>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -892,12 +885,12 @@ impl BilateralController for MasterFollowerController {
             slave_velocity: self.calibration.master_to_slave_velocity(snapshot.left.state.velocity),
             slave_kp: self.track_kp,
             slave_kd: self.track_kd,
-            slave_torque: JointArray::splat(NewtonMeter::ZERO),
+            slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
             master_position: snapshot.left.state.position,
             master_velocity: JointArray::splat(0.0),
             master_kp: JointArray::splat(0.0),
             master_kd: self.master_damping,
-            master_torque: JointArray::splat(NewtonMeter::ZERO),
+            master_interaction_torque: JointArray::splat(NewtonMeter::ZERO),
         })
     }
 }
@@ -981,12 +974,12 @@ impl BilateralController for JointSpaceBilateralController {
                 .master_to_slave_velocity(frame.snapshot.left.state.velocity),
             slave_kp: self.track_kp,
             slave_kd: self.track_kd,
-            slave_torque: JointArray::splat(NewtonMeter::ZERO),
+            slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
             master_position: frame.snapshot.left.state.position,
             master_velocity: JointArray::splat(0.0),
             master_kp: JointArray::splat(0.0),
             master_kd: self.master_damping,
-            master_torque: mapped_slave_torque,
+            master_interaction_torque: mapped_slave_torque,
         })
     }
 }
@@ -1036,31 +1029,60 @@ where
 
 #[derive(Debug)]
 struct OutputShapingState {
-    reflection_filtered: JointArray<NewtonMeter>,
-    last_master_reflection: JointArray<NewtonMeter>,
+    master_interaction_filtered: JointArray<NewtonMeter>,
+    last_master_interaction: JointArray<NewtonMeter>,
     passivity_energy: f64,
 }
 
 impl Default for OutputShapingState {
     fn default() -> Self {
         Self {
-            reflection_filtered: JointArray::splat(NewtonMeter::ZERO),
-            last_master_reflection: JointArray::splat(NewtonMeter::ZERO),
+            master_interaction_filtered: JointArray::splat(NewtonMeter::ZERO),
+            last_master_interaction: JointArray::splat(NewtonMeter::ZERO),
             passivity_energy: 0.0,
         }
     }
 }
 
-fn apply_model_compensation(
-    command: &mut BilateralCommand,
-    compensation: BilateralDynamicsCompensation,
-) {
-    for joint in Joint::ALL {
-        command.master_torque[joint] =
-            NewtonMeter(command.master_torque[joint].0 + compensation.master_model_torque[joint].0);
-        command.slave_torque[joint] =
-            NewtonMeter(command.slave_torque[joint].0 + compensation.slave_model_torque[joint].0);
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FinalTorques {
+    master: JointArray<NewtonMeter>,
+    slave: JointArray<NewtonMeter>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DualArmHoldAnchor {
+    left_position: JointArray<Rad>,
+    right_position: JointArray<Rad>,
+    captured_at: Instant,
+}
+
+impl DualArmHoldAnchor {
+    fn from_snapshot(snapshot: &DualArmSnapshot) -> Self {
+        Self {
+            left_position: snapshot.left.state.position,
+            right_position: snapshot.right.state.position,
+            captured_at: snapshot.host_cycle_timestamp,
+        }
     }
+
+    fn is_fresh(self, now: Instant, max_age: Duration) -> bool {
+        now.saturating_duration_since(self.captured_at) <= max_age
+    }
+}
+
+fn assemble_final_torques(
+    command: &BilateralCommand,
+    compensation: Option<BilateralDynamicsCompensation>,
+) -> FinalTorques {
+    let compensation = compensation.unwrap_or_default();
+    let mut master = command.master_interaction_torque;
+    let mut slave = command.slave_feedforward_torque;
+    for joint in Joint::ALL {
+        master[joint] = NewtonMeter(master[joint].0 + compensation.master_model_torque[joint].0);
+        slave[joint] = NewtonMeter(slave[joint].0 + compensation.slave_model_torque[joint].0);
+    }
+    FinalTorques { master, slave }
 }
 
 fn apply_output_shaping(
@@ -1071,8 +1093,8 @@ fn apply_output_shaping(
     command: &mut BilateralCommand,
 ) {
     let dt_sec = dt.as_secs_f64().max(f64::EPSILON);
-    let rc = if cfg.reflection_lpf_cutoff_hz > 0.0 {
-        1.0 / (2.0 * std::f64::consts::PI * cfg.reflection_lpf_cutoff_hz)
+    let rc = if cfg.master_interaction_lpf_cutoff_hz > 0.0 {
+        1.0 / (2.0 * std::f64::consts::PI * cfg.master_interaction_lpf_cutoff_hz)
     } else {
         0.0
     };
@@ -1083,30 +1105,32 @@ fn apply_output_shaping(
     };
 
     for joint in Joint::ALL {
-        let raw = command.master_torque[joint];
+        let raw = command.master_interaction_torque[joint];
         let filtered = NewtonMeter(
-            state.reflection_filtered[joint].0
-                + alpha * (raw.0 - state.reflection_filtered[joint].0),
+            state.master_interaction_filtered[joint].0
+                + alpha * (raw.0 - state.master_interaction_filtered[joint].0),
         );
-        state.reflection_filtered[joint] = filtered;
+        state.master_interaction_filtered[joint] = filtered;
 
-        let last = state.last_master_reflection[joint];
-        let limit = cfg.reflection_slew_limit[joint].0;
+        let last = state.last_master_interaction[joint];
+        let limit = cfg.master_interaction_slew_limit[joint].0;
         let delta = (filtered.0 - last.0).clamp(-limit, limit);
         let shaped = NewtonMeter(last.0 + delta).clamp(
-            -cfg.master_reflection_limit[joint],
-            cfg.master_reflection_limit[joint],
+            -cfg.master_interaction_limit[joint],
+            cfg.master_interaction_limit[joint],
         );
-        command.master_torque[joint] = shaped;
+        command.master_interaction_torque[joint] = shaped;
     }
 
     let power: f64 = Joint::ALL
         .into_iter()
-        .map(|joint| command.master_torque[joint].0 * snapshot.left.state.velocity[joint].0)
+        .map(|joint| {
+            command.master_interaction_torque[joint].0 * snapshot.left.state.velocity[joint].0
+        })
         .sum();
     state.passivity_energy = (state.passivity_energy + power * dt_sec).max(0.0);
 
-    if cfg.passivity_enabled && state.passivity_energy > 0.0 {
+    if cfg.master_passivity_enabled && state.passivity_energy > 0.0 {
         let velocity_sq: f64 = Joint::ALL
             .into_iter()
             .map(|joint| snapshot.left.state.velocity[joint].0.powi(2))
@@ -1114,17 +1138,17 @@ fn apply_output_shaping(
         if velocity_sq > f64::EPSILON {
             let target_damping = (state.passivity_energy / (velocity_sq * dt_sec)).max(0.0);
             let damping = Joint::ALL.into_iter().fold(JointArray::splat(0.0), |mut acc, joint| {
-                acc[joint] = target_damping.min(cfg.passivity_max_damping[joint]);
+                acc[joint] = target_damping.min(cfg.master_passivity_max_damping[joint]);
                 acc
             });
 
             let mut dissipated = 0.0;
             for joint in Joint::ALL {
                 let tau_damp = -damping[joint] * snapshot.left.state.velocity[joint].0;
-                command.master_torque[joint] =
-                    NewtonMeter(command.master_torque[joint].0 + tau_damp).clamp(
-                        -cfg.master_reflection_limit[joint],
-                        cfg.master_reflection_limit[joint],
+                command.master_interaction_torque[joint] =
+                    NewtonMeter(command.master_interaction_torque[joint].0 + tau_damp).clamp(
+                        -cfg.master_interaction_limit[joint],
+                        cfg.master_interaction_limit[joint],
                     );
                 dissipated +=
                     damping[joint] * snapshot.left.state.velocity[joint].0.powi(2) * dt_sec;
@@ -1134,19 +1158,59 @@ fn apply_output_shaping(
     }
 
     for joint in Joint::ALL {
-        command.slave_torque[joint] = command.slave_torque[joint].clamp(
+        command.slave_feedforward_torque[joint] = command.slave_feedforward_torque[joint].clamp(
             -cfg.slave_feedforward_limit[joint],
             cfg.slave_feedforward_limit[joint],
         );
-        state.last_master_reflection[joint] = command.master_torque[joint];
+        state.last_master_interaction[joint] = command.master_interaction_torque[joint];
     }
 }
 
-fn sleep_until_next_cycle(mode: LoopTimingMode, period: Duration) {
+fn sleep_strategy_from_loop_timing(mode: LoopTimingMode) -> SleepStrategy {
     match mode {
-        LoopTimingMode::Sleep => std::thread::sleep(period),
-        LoopTimingMode::Spin => spin_sleep::SpinSleeper::default().sleep(period),
+        LoopTimingMode::Sleep => SleepStrategy::Sleep,
+        LoopTimingMode::Spin => SleepStrategy::Spin,
     }
+}
+
+fn command_hold(
+    arm: &Piper<Active<MitMode>>,
+    position: &JointArray<Rad>,
+    cfg: &DualArmSafetyConfig,
+) -> Result<()> {
+    arm.command_torques(
+        position,
+        &JointArray::splat(0.0),
+        &cfg.safe_hold_kp,
+        &cfg.safe_hold_kd,
+        &JointArray::splat(NewtonMeter::ZERO),
+    )
+}
+
+fn best_effort_command_hold(
+    arm: &Piper<Active<MitMode>>,
+    position: Option<JointArray<Rad>>,
+    cfg: &DualArmSafetyConfig,
+) -> bool {
+    let Some(position) = position else {
+        return false;
+    };
+
+    command_hold(arm, &position, cfg).is_ok()
+}
+
+fn best_effort_safe_hold_from_anchor(
+    active: &DualArmActiveMit,
+    anchor: Option<DualArmHoldAnchor>,
+    now: Instant,
+    cfg: &DualArmSafetyConfig,
+) -> bool {
+    let Some(anchor) = anchor.filter(|anchor| anchor.is_fresh(now, cfg.safe_hold_max_duration))
+    else {
+        return false;
+    };
+
+    active.safe_hold_from_anchor(&anchor, cfg).is_ok()
 }
 
 fn update_report_metrics(
@@ -1262,14 +1326,19 @@ mod tests {
         ]
     }
 
-    fn build_active_mit_piper(
+    fn build_piper_with_tx_adapter<T, State>(
         timestamp_us: u64,
-        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
-    ) -> Piper<Active<MitMode>> {
+        tx_adapter: T,
+        post_feedback_delay: Duration,
+        state: State,
+    ) -> Piper<State>
+    where
+        T: TxAdapter + Send + 'static,
+    {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 ScriptedRxAdapter::new(scripted_frames(timestamp_us)),
-                RecordingTxAdapter::new(sent_frames),
+                tx_adapter,
                 None,
             )
             .expect("driver should start"),
@@ -1278,14 +1347,54 @@ mod tests {
         driver
             .wait_for_feedback(Duration::from_millis(200))
             .expect("feedback should arrive");
-        thread::sleep(Duration::from_millis(20));
+        if !post_feedback_delay.is_zero() {
+            thread::sleep(post_feedback_delay);
+        }
 
         Piper {
             driver,
             observer,
             quirks: crate::types::DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
-            _state: active_mit_marker(),
+            _state: state,
         }
+    }
+
+    fn build_active_mit_piper(
+        timestamp_us: u64,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    ) -> Piper<Active<MitMode>> {
+        build_piper_with_tx_adapter(
+            timestamp_us,
+            RecordingTxAdapter::new(sent_frames),
+            Duration::from_millis(20),
+            active_mit_marker(),
+        )
+    }
+
+    fn build_active_mit_piper_with_delay(
+        timestamp_us: u64,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+        post_feedback_delay: Duration,
+    ) -> Piper<Active<MitMode>> {
+        build_piper_with_tx_adapter(
+            timestamp_us,
+            RecordingTxAdapter::new(sent_frames),
+            post_feedback_delay,
+            active_mit_marker(),
+        )
+    }
+
+    fn build_standby_piper(
+        timestamp_us: u64,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+        post_feedback_delay: Duration,
+    ) -> Piper<Standby> {
+        build_piper_with_tx_adapter(
+            timestamp_us,
+            RecordingTxAdapter::new(sent_frames),
+            post_feedback_delay,
+            Standby,
+        )
     }
 
     fn active_mit_marker() -> Active<MitMode> {
@@ -1378,10 +1487,6 @@ mod tests {
             }
         }
 
-        fn time_jump_counter(&self) -> Arc<AtomicUsize> {
-            self.time_jump_calls.clone()
-        }
-
         fn reset_counter(&self) -> Arc<AtomicUsize> {
             self.reset_calls.clone()
         }
@@ -1435,12 +1540,40 @@ mod tests {
                 slave_velocity: JointArray::splat(0.0),
                 slave_kp: JointArray::splat(0.0),
                 slave_kd: JointArray::splat(0.0),
-                slave_torque: JointArray::splat(NewtonMeter::ZERO),
+                slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
                 master_position: JointArray::splat(Rad(0.0)),
                 master_velocity: JointArray::splat(0.0),
                 master_kp: JointArray::splat(0.0),
                 master_kd: JointArray::splat(0.0),
-                master_torque: JointArray::splat(NewtonMeter::ZERO),
+                master_interaction_torque: JointArray::splat(NewtonMeter::ZERO),
+            })
+        }
+    }
+
+    struct SlowForwardingController {
+        sleep_duration: Duration,
+    }
+
+    impl BilateralController for SlowForwardingController {
+        type Error = Infallible;
+
+        fn tick(
+            &mut self,
+            _snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            thread::sleep(self.sleep_duration);
+            Ok(BilateralCommand {
+                slave_position: JointArray::splat(Rad(0.0)),
+                slave_velocity: JointArray::splat(0.0),
+                slave_kp: JointArray::splat(0.0),
+                slave_kd: JointArray::splat(0.0),
+                slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
+                master_position: JointArray::splat(Rad(0.0)),
+                master_velocity: JointArray::splat(0.0),
+                master_kp: JointArray::splat(0.0),
+                master_kd: JointArray::splat(0.0),
+                master_interaction_torque: JointArray::splat(NewtonMeter::ZERO),
             })
         }
     }
@@ -1579,9 +1712,18 @@ mod tests {
             .tick(&snapshot, Duration::from_millis(5))
             .expect("controller should succeed");
 
-        assert_eq!(output.master_torque[Joint::J1], NewtonMeter(1.0));
-        assert_eq!(output.master_torque[Joint::J2], NewtonMeter(-1.0));
-        assert_eq!(output.master_torque[Joint::J4], NewtonMeter(1.0));
+        assert_eq!(
+            output.master_interaction_torque[Joint::J1],
+            NewtonMeter(1.0)
+        );
+        assert_eq!(
+            output.master_interaction_torque[Joint::J2],
+            NewtonMeter(-1.0)
+        );
+        assert_eq!(
+            output.master_interaction_torque[Joint::J4],
+            NewtonMeter(1.0)
+        );
     }
 
     #[test]
@@ -1612,8 +1754,14 @@ mod tests {
             .tick_with_compensation(&frame, Duration::from_millis(5))
             .expect("controller should succeed");
 
-        assert_eq!(output.master_torque[Joint::J1], NewtonMeter(1.0));
-        assert_eq!(output.master_torque[Joint::J2], NewtonMeter(-1.0));
+        assert_eq!(
+            output.master_interaction_torque[Joint::J1],
+            NewtonMeter(1.0)
+        );
+        assert_eq!(
+            output.master_interaction_torque[Joint::J2],
+            NewtonMeter(-1.0)
+        );
     }
 
     #[test]
@@ -1624,11 +1772,11 @@ mod tests {
             JointArray::splat(NewtonMeter::ZERO),
         );
         let cfg = BilateralLoopConfig {
-            reflection_lpf_cutoff_hz: 0.0,
-            reflection_slew_limit: JointArray::splat(NewtonMeter(0.25)),
-            master_reflection_limit: JointArray::splat(NewtonMeter(0.5)),
+            master_interaction_lpf_cutoff_hz: 0.0,
+            master_interaction_slew_limit: JointArray::splat(NewtonMeter(0.25)),
+            master_interaction_limit: JointArray::splat(NewtonMeter(0.5)),
             slave_feedforward_limit: JointArray::splat(NewtonMeter(4.0)),
-            passivity_enabled: false,
+            master_passivity_enabled: false,
             ..Default::default()
         };
         let mut state = OutputShapingState::default();
@@ -1637,12 +1785,12 @@ mod tests {
             slave_velocity: JointArray::splat(0.0),
             slave_kp: JointArray::splat(0.0),
             slave_kd: JointArray::splat(0.0),
-            slave_torque: JointArray::splat(NewtonMeter(10.0)),
+            slave_feedforward_torque: JointArray::splat(NewtonMeter(10.0)),
             master_position: JointArray::splat(Rad(0.0)),
             master_velocity: JointArray::splat(0.0),
             master_kp: JointArray::splat(0.0),
             master_kd: JointArray::splat(0.0),
-            master_torque: JointArray::splat(NewtonMeter(2.0)),
+            master_interaction_torque: JointArray::splat(NewtonMeter(2.0)),
         };
 
         apply_output_shaping(
@@ -1652,10 +1800,16 @@ mod tests {
             &mut state,
             &mut command,
         );
-        assert_eq!(command.master_torque, JointArray::splat(NewtonMeter(0.25)));
-        assert_eq!(command.slave_torque, JointArray::splat(NewtonMeter(4.0)));
+        assert_eq!(
+            command.master_interaction_torque,
+            JointArray::splat(NewtonMeter(0.25))
+        );
+        assert_eq!(
+            command.slave_feedforward_torque,
+            JointArray::splat(NewtonMeter(4.0))
+        );
 
-        command.master_torque = JointArray::splat(NewtonMeter(2.0));
+        command.master_interaction_torque = JointArray::splat(NewtonMeter(2.0));
         apply_output_shaping(
             &cfg,
             &snapshot,
@@ -1663,7 +1817,10 @@ mod tests {
             &mut state,
             &mut command,
         );
-        assert_eq!(command.master_torque, JointArray::splat(NewtonMeter(0.5)));
+        assert_eq!(
+            command.master_interaction_torque,
+            JointArray::splat(NewtonMeter(0.5))
+        );
     }
 
     #[test]
@@ -1674,11 +1831,11 @@ mod tests {
             JointArray::splat(NewtonMeter::ZERO),
         );
         let cfg = BilateralLoopConfig {
-            reflection_lpf_cutoff_hz: 0.0,
-            reflection_slew_limit: JointArray::splat(NewtonMeter(10.0)),
-            master_reflection_limit: JointArray::splat(NewtonMeter(10.0)),
-            passivity_enabled: true,
-            passivity_max_damping: JointArray::splat(1.0),
+            master_interaction_lpf_cutoff_hz: 0.0,
+            master_interaction_slew_limit: JointArray::splat(NewtonMeter(10.0)),
+            master_interaction_limit: JointArray::splat(NewtonMeter(10.0)),
+            master_passivity_enabled: true,
+            master_passivity_max_damping: JointArray::splat(1.0),
             ..Default::default()
         };
         let mut state = OutputShapingState::default();
@@ -1687,12 +1844,12 @@ mod tests {
             slave_velocity: JointArray::splat(0.0),
             slave_kp: JointArray::splat(0.0),
             slave_kd: JointArray::splat(0.0),
-            slave_torque: JointArray::splat(NewtonMeter::ZERO),
+            slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
             master_position: JointArray::splat(Rad(0.0)),
             master_velocity: JointArray::splat(0.0),
             master_kp: JointArray::splat(0.0),
             master_kd: JointArray::splat(0.0),
-            master_torque: JointArray::splat(NewtonMeter(1.0)),
+            master_interaction_torque: JointArray::splat(NewtonMeter(1.0)),
         };
 
         apply_output_shaping(
@@ -1703,8 +1860,110 @@ mod tests {
             &mut command,
         );
 
-        assert_eq!(command.master_torque, JointArray::splat(NewtonMeter(0.0)));
+        assert_eq!(
+            command.master_interaction_torque,
+            JointArray::splat(NewtonMeter(0.0))
+        );
         assert_eq!(state.passivity_energy, 0.0);
+    }
+
+    #[test]
+    fn test_assemble_final_torques_keeps_model_compensation_outside_interaction_limits() {
+        let snapshot = snapshot_with_state(
+            JointArray::splat(Rad(0.0)),
+            JointArray::splat(RadPerSecond(0.0)),
+            JointArray::splat(NewtonMeter::ZERO),
+        );
+        let cfg = BilateralLoopConfig {
+            master_interaction_lpf_cutoff_hz: 0.0,
+            master_interaction_slew_limit: JointArray::splat(NewtonMeter(0.5)),
+            master_interaction_limit: JointArray::splat(NewtonMeter(0.5)),
+            slave_feedforward_limit: JointArray::splat(NewtonMeter(4.0)),
+            master_passivity_enabled: false,
+            ..Default::default()
+        };
+        let mut state = OutputShapingState::default();
+        let mut command = BilateralCommand {
+            slave_position: JointArray::splat(Rad(0.0)),
+            slave_velocity: JointArray::splat(0.0),
+            slave_kp: JointArray::splat(0.0),
+            slave_kd: JointArray::splat(0.0),
+            slave_feedforward_torque: JointArray::splat(NewtonMeter(10.0)),
+            master_position: JointArray::splat(Rad(0.0)),
+            master_velocity: JointArray::splat(0.0),
+            master_kp: JointArray::splat(0.0),
+            master_kd: JointArray::splat(0.0),
+            master_interaction_torque: JointArray::splat(NewtonMeter(2.0)),
+        };
+
+        apply_output_shaping(
+            &cfg,
+            &snapshot,
+            Duration::from_millis(5),
+            &mut state,
+            &mut command,
+        );
+
+        let final_torques = assemble_final_torques(
+            &command,
+            Some(BilateralDynamicsCompensation {
+                master_model_torque: JointArray::splat(NewtonMeter(3.0)),
+                slave_model_torque: JointArray::splat(NewtonMeter(2.0)),
+                master_external_torque_est: JointArray::splat(NewtonMeter::ZERO),
+                slave_external_torque_est: JointArray::splat(NewtonMeter::ZERO),
+            }),
+        );
+
+        assert_eq!(
+            command.master_interaction_torque,
+            JointArray::splat(NewtonMeter(0.5))
+        );
+        assert_eq!(final_torques.master, JointArray::splat(NewtonMeter(3.5)));
+        assert_eq!(final_torques.slave, JointArray::splat(NewtonMeter(6.0)));
+    }
+
+    #[test]
+    fn test_capture_calibration_uses_aligned_snapshot() {
+        let standby = DualArmStandby {
+            left: build_standby_piper(1_000, Arc::new(Mutex::new(Vec::new())), Duration::ZERO),
+            right: build_standby_piper(1_000, Arc::new(Mutex::new(Vec::new())), Duration::ZERO),
+        };
+
+        let calibration = standby
+            .capture_calibration(JointMirrorMap::left_right_mirror())
+            .expect("calibration should succeed with a fresh aligned snapshot");
+
+        assert_eq!(calibration.master_zero, JointArray::splat(Rad(0.0)));
+        assert_eq!(calibration.slave_zero, JointArray::splat(Rad(0.0)));
+    }
+
+    #[test]
+    fn test_capture_calibration_rejects_stale_or_misaligned_snapshot() {
+        let stale = DualArmStandby {
+            left: build_standby_piper(
+                1_000,
+                Arc::new(Mutex::new(Vec::new())),
+                Duration::from_millis(125),
+            ),
+            right: build_standby_piper(
+                1_000,
+                Arc::new(Mutex::new(Vec::new())),
+                Duration::from_millis(125),
+            ),
+        };
+        let stale_error = stale
+            .capture_calibration(JointMirrorMap::left_right_mirror())
+            .expect_err("stale calibration snapshot should fail");
+        assert!(matches!(stale_error, RobotError::FeedbackStale { .. }));
+
+        let left = build_standby_piper(1_000, Arc::new(Mutex::new(Vec::new())), Duration::ZERO);
+        thread::sleep(Duration::from_millis(40));
+        let right = build_standby_piper(1_000, Arc::new(Mutex::new(Vec::new())), Duration::ZERO);
+        let skewed = DualArmStandby { left, right };
+        let skew_error = skewed
+            .capture_calibration(JointMirrorMap::left_right_mirror())
+            .expect_err("misaligned calibration snapshot should fail");
+        assert!(matches!(skew_error, RobotError::StateMisaligned { .. }));
     }
 
     #[test]
@@ -1730,15 +1989,16 @@ mod tests {
                 compensator,
                 BilateralLoopConfig {
                     warmup_cycles: 0,
-                    max_iterations: Some(2),
+                    max_iterations: Some(1),
+                    frequency_hz: 20.0,
                     gripper: GripperTeleopConfig {
                         enabled: false,
                         ..Default::default()
                     },
-                    reflection_lpf_cutoff_hz: 0.0,
-                    reflection_slew_limit: JointArray::splat(NewtonMeter(10.0)),
-                    master_reflection_limit: JointArray::splat(NewtonMeter(10.0)),
-                    passivity_enabled: false,
+                    master_interaction_lpf_cutoff_hz: 0.0,
+                    master_interaction_slew_limit: JointArray::splat(NewtonMeter(10.0)),
+                    master_interaction_limit: JointArray::splat(NewtonMeter(10.0)),
+                    master_passivity_enabled: false,
                     read_policy: DualArmReadPolicy {
                         per_arm: ControlReadPolicy {
                             max_state_skew_us: 2_000,
@@ -1753,7 +2013,7 @@ mod tests {
 
         match exit {
             DualArmLoopExit::Standby { report, .. } => {
-                assert_eq!(report.iterations, 2);
+                assert_eq!(report.iterations, 1);
             },
             DualArmLoopExit::EmergencyStopped { .. } => {
                 panic!("expected standby exit");
@@ -1781,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_hold_sends_current_position_zero_velocity_and_default_gains() {
+    fn test_safe_hold_from_snapshot_sends_current_position_zero_velocity_and_default_gains() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let arms = DualArmActiveMit {
@@ -1789,7 +2049,12 @@ mod tests {
             right: build_active_mit_piper(1_000, right_sent.clone()),
         };
 
-        arms.safe_hold(&DualArmSafetyConfig::default())
+        let snapshot = snapshot_with_state(
+            JointArray::splat(Rad(0.0)),
+            JointArray::splat(RadPerSecond(0.0)),
+            JointArray::splat(NewtonMeter::ZERO),
+        );
+        arms.safe_hold_from_snapshot(&snapshot, &DualArmSafetyConfig::default())
             .expect("safe hold should succeed");
 
         let left_frames = wait_for_sent_frames(&left_sent, 6);
@@ -1798,6 +2063,61 @@ mod tests {
             .to_frame();
         assert_eq!(left_frames[0].id, expected.id);
         assert_eq!(left_frames[0].data, expected.data);
+    }
+
+    #[test]
+    fn test_run_bilateral_read_fault_uses_anchor_hold_then_disables() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper_with_delay(1_000, left_sent.clone(), Duration::ZERO),
+            right: build_active_mit_piper_with_delay(1_000, right_sent, Duration::ZERO),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                ForwardingController::default(),
+                BilateralLoopConfig {
+                    frequency_hz: 5.0,
+                    warmup_cycles: 0,
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    safety: DualArmSafetyConfig {
+                        safe_hold_max_duration: Duration::from_millis(500),
+                        consecutive_read_failures_before_disable: 2,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_millis(100),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("read fault should converge to standby");
+
+        match exit {
+            DualArmLoopExit::Standby { report, .. } => {
+                assert!(report.read_faults >= 1);
+            },
+            DualArmLoopExit::EmergencyStopped { .. } => {
+                panic!("expected standby exit");
+            },
+        }
+
+        let left_frames = wait_for_sent_frames(&left_sent, 12);
+        let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
+            .expect("expected hold command")
+            .to_frame();
+        assert!(
+            left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
+            "expected anchor-based hold command after read fault",
+        );
     }
 
     #[test]
@@ -1941,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_bilateral_with_compensation_propagates_time_jump_to_compensator() {
+    fn test_run_bilateral_with_compensation_resets_compensator_before_run() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let arms = DualArmActiveMit {
@@ -1949,14 +2269,15 @@ mod tests {
             right: build_active_mit_piper(1_000, right_sent),
         };
 
-        let controller = ForwardingController::default();
+        let controller = SlowForwardingController {
+            sleep_duration: Duration::from_millis(10),
+        };
         let compensator = FakeCompensator::from_results([Ok(BilateralDynamicsCompensation {
             master_model_torque: JointArray::splat(NewtonMeter::ZERO),
             slave_model_torque: JointArray::splat(NewtonMeter::ZERO),
             master_external_torque_est: JointArray::splat(NewtonMeter::ZERO),
             slave_external_torque_est: JointArray::splat(NewtonMeter::ZERO),
         })]);
-        let time_jump_counter = compensator.time_jump_counter();
         let reset_counter = compensator.reset_counter();
 
         let exit = arms
@@ -1965,8 +2286,9 @@ mod tests {
                 compensator,
                 BilateralLoopConfig {
                     warmup_cycles: 0,
-                    max_iterations: Some(2),
-                    frequency_hz: 1_000_000.0,
+                    max_iterations: Some(3),
+                    frequency_hz: 2_000.0,
+                    dt_clamp_multiplier: 0.01,
                     read_policy: DualArmReadPolicy {
                         per_arm: ControlReadPolicy {
                             max_state_skew_us: 2_000,
@@ -1980,18 +2302,12 @@ mod tests {
             .expect("bilateral run should succeed");
 
         match exit {
-            DualArmLoopExit::Standby { report, .. } => {
-                assert!(report.iterations >= 1);
-            },
+            DualArmLoopExit::Standby { .. } => {},
             DualArmLoopExit::EmergencyStopped { .. } => {
                 panic!("expected standby exit");
             },
         }
 
         assert_eq!(reset_counter.load(AtomicOrdering::Relaxed), 1);
-        assert!(
-            time_jump_counter.load(AtomicOrdering::Relaxed) >= 1,
-            "expected compensator on_time_jump to be called at least once"
-        );
     }
 }

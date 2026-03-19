@@ -29,11 +29,12 @@
 //! ```
 
 use super::controller::Controller;
+use super::scheduler::{CycleScheduler, SleepStrategy};
 use crate::Piper;
 use crate::observer::ControlReadPolicy;
 use crate::state::{Active, MitMode};
 use crate::types::RobotError;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 控制循环配置
 #[derive(Debug, Clone)]
@@ -148,7 +149,7 @@ where
     let nominal_period = Duration::from_secs_f64(1.0 / config.frequency_hz);
     let max_dt = nominal_period.mul_f64(config.dt_clamp_multiplier);
 
-    let mut last_time = Instant::now();
+    let mut scheduler = CycleScheduler::new(nominal_period, SleepStrategy::Sleep);
     let mut iteration = 0;
 
     loop {
@@ -160,8 +161,8 @@ where
         }
 
         // 1. 计算 dt
-        let now = Instant::now();
-        let real_dt = now - last_time;
+        let cycle = scheduler.wait_next();
+        let real_dt = cycle.real_dt;
         let mut dt = real_dt;
 
         // 2. dt 钳位
@@ -193,11 +194,7 @@ where
         )?;
 
         // 6. 更新时间
-        last_time = now;
         iteration += 1;
-
-        // 7. 休眠到下一个周期
-        std::thread::sleep(nominal_period);
     }
 }
 
@@ -215,8 +212,6 @@ where
     C: Controller,
     RobotError: From<C::Error>,
 {
-    use spin_sleep::SpinSleeper;
-
     // ✅ 输入验证
     if config.frequency_hz <= 0.0 {
         return Err(RobotError::ConfigError(format!(
@@ -239,9 +234,7 @@ where
 
     let nominal_period = Duration::from_secs_f64(1.0 / config.frequency_hz);
     let max_dt = nominal_period.mul_f64(config.dt_clamp_multiplier);
-    let sleeper = SpinSleeper::default();
-
-    let mut last_time = Instant::now();
+    let mut scheduler = CycleScheduler::new(nominal_period, SleepStrategy::Spin);
     let mut iteration = 0;
 
     loop {
@@ -251,8 +244,8 @@ where
             return Ok(());
         }
 
-        let now = Instant::now();
-        let real_dt = now - last_time;
+        let cycle = scheduler.wait_next();
+        let real_dt = cycle.real_dt;
         let mut dt = real_dt;
 
         if real_dt > max_dt {
@@ -275,10 +268,7 @@ where
             &torques,
         )?;
 
-        last_time = now;
         iteration += 1;
-
-        sleeper.sleep(nominal_period);
     }
 }
 

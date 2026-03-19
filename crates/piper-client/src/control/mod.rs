@@ -12,6 +12,7 @@ pub mod controller;
 pub mod loop_runner;
 pub mod mit_controller;
 pub mod pid;
+pub(crate) mod scheduler;
 pub mod trajectory;
 pub mod zeroing_token;
 

@@ -230,7 +230,7 @@ fn main() -> AppResult<()> {
             enabled: !args.disable_gripper_mirror,
             ..Default::default()
         },
-        passivity_enabled: !args.disable_passivity,
+        master_passivity_enabled: !args.disable_passivity,
         ..Default::default()
     };
 
