@@ -11,11 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use piper_driver::RuntimeFaultKind;
 use thiserror::Error;
 
 use crate::builder::PiperBuilder;
 use crate::control::scheduler::{CycleScheduler, SleepStrategy};
 use crate::observer::{ControlReadPolicy, ControlSnapshotFull, Observer, RuntimeHealthSnapshot};
+use crate::raw_commander::RawCommander;
 use crate::state::machine::ErrorState;
 use crate::state::{Active, DisableConfig, MitMode, MitModeConfig, Piper, Standby};
 use crate::types::{Joint, JointArray, NewtonMeter, Rad, Result, RobotError};
@@ -60,14 +62,16 @@ impl DualArmStandby {
     }
 
     pub fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration> {
+        self.capture_calibration_with_policy(map, calibration_read_policy())
+    }
+
+    pub fn capture_calibration_with_policy(
+        &self,
+        map: JointMirrorMap,
+        policy: DualArmReadPolicy,
+    ) -> Result<DualArmCalibration> {
         map.validate()?;
-        let snapshot = self.observer().snapshot(DualArmReadPolicy {
-            per_arm: ControlReadPolicy {
-                max_state_skew_us: DualArmReadPolicy::default().per_arm.max_state_skew_us,
-                max_feedback_age: Duration::from_millis(100),
-            },
-            max_inter_arm_skew: Duration::from_millis(25),
-        })?;
+        let snapshot = self.observer().snapshot(policy)?;
         Ok(DualArmCalibration {
             master_zero: snapshot.left.state.position,
             slave_zero: snapshot.right.state.position,
@@ -87,12 +91,8 @@ impl DualArmActiveMit {
         DualArmObserver::new(self.left.observer().clone(), self.right.observer().clone())
     }
 
-    pub fn safe_hold_from_snapshot(
-        &self,
-        snapshot: &DualArmSnapshot,
-        cfg: &DualArmSafetyConfig,
-    ) -> Result<()> {
-        self.safe_hold_from_anchor(&DualArmHoldAnchor::from_snapshot(snapshot), cfg)
+    pub fn safe_hold(&self, anchor: &DualArmHoldAnchor, cfg: &DualArmSafetyConfig) -> Result<()> {
+        self.safe_hold_from_anchor(anchor, cfg, HoldTarget::Both, Instant::now())
     }
 
     pub fn disable_both(self, cfg: DisableConfig) -> Result<DualArmStandby> {
@@ -203,8 +203,13 @@ impl DualArmActiveMit {
             if real_dt > max_dt {
                 if let Err(err) = controller.on_time_jump(real_dt) {
                     report.last_error = Some(err.to_string());
-                    let _ =
-                        best_effort_safe_hold_from_anchor(&active, hold_anchor, now, &cfg.safety);
+                    let _ = best_effort_hold_from_anchor(
+                        &active,
+                        hold_anchor,
+                        Instant::now(),
+                        &cfg.safety,
+                        HoldTarget::Both,
+                    );
                     let arms = active
                         .disable_both(cfg.disable_config.clone())
                         .map_err(DualArmError::from)?;
@@ -216,8 +221,13 @@ impl DualArmActiveMit {
                 {
                     compensation_failure_streak += 1;
                     report.last_error = Some(err);
-                    let hold_succeeded =
-                        best_effort_safe_hold_from_anchor(&active, hold_anchor, now, &cfg.safety);
+                    let hold_succeeded = best_effort_hold_from_anchor(
+                        &active,
+                        hold_anchor,
+                        Instant::now(),
+                        &cfg.safety,
+                        HoldTarget::Both,
+                    );
                     if !hold_succeeded || compensation_failure_streak > 1 {
                         let arms = active
                             .disable_both(cfg.disable_config.clone())
@@ -233,10 +243,15 @@ impl DualArmActiveMit {
                 dt = max_dt;
             }
 
+            // Steady-state MIT commands stay unconfirmed to minimize loop jitter.
+            // Real TX/transport failures are expected to surface here on the next cycle.
             let health = active.observer().runtime_health();
             if health.any_unhealthy() {
-                report.last_error = Some("runtime health unhealthy".to_string());
-                let arms = active.emergency_stop_both().map_err(DualArmError::from)?;
+                report.runtime_fault_exits += 1;
+                report.last_runtime_fault_left = health.left.fault;
+                report.last_runtime_fault_right = health.right.fault;
+                report.last_error = Some(format_runtime_health_error(health));
+                let arms = active.best_effort_runtime_fault_stop();
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
                 return Ok(DualArmLoopExit::EmergencyStopped { arms, report });
             }
@@ -255,8 +270,13 @@ impl DualArmActiveMit {
                     report.read_faults += 1;
                     report.last_error = Some(err.to_string());
                     let failure_start = read_failure_since.get_or_insert(now);
-                    let hold_succeeded =
-                        best_effort_safe_hold_from_anchor(&active, hold_anchor, now, &cfg.safety);
+                    let hold_succeeded = best_effort_hold_from_anchor(
+                        &active,
+                        hold_anchor,
+                        Instant::now(),
+                        &cfg.safety,
+                        HoldTarget::Both,
+                    );
                     if !hold_succeeded
                         || read_failure_streak
                             >= cfg.safety.consecutive_read_failures_before_disable
@@ -277,9 +297,9 @@ impl DualArmActiveMit {
             };
 
             if iteration < cfg.warmup_cycles {
-                active
-                    .safe_hold_from_snapshot(&snapshot, &cfg.safety)
-                    .map_err(DualArmError::from)?;
+                let anchor = DualArmHoldAnchor::from_snapshot(&snapshot);
+                hold_anchor = Some(anchor);
+                active.safe_hold(&anchor, &cfg.safety).map_err(DualArmError::from)?;
                 report.iterations += 1;
                 iteration += 1;
                 continue;
@@ -294,11 +314,12 @@ impl DualArmActiveMit {
                     Err(err) => {
                         compensation_failure_streak += 1;
                         report.last_error = Some(err);
-                        let hold_succeeded = best_effort_safe_hold_from_anchor(
+                        let hold_succeeded = best_effort_hold_from_anchor(
                             &active,
                             hold_anchor,
-                            now,
+                            Instant::now(),
                             &cfg.safety,
+                            HoldTarget::Both,
                         );
                         if !hold_succeeded || compensation_failure_streak > 1 {
                             let arms = active
@@ -330,8 +351,13 @@ impl DualArmActiveMit {
                 Ok(command) => command,
                 Err(err) => {
                     report.last_error = Some(err.to_string());
-                    let _ =
-                        best_effort_safe_hold_from_anchor(&active, hold_anchor, now, &cfg.safety);
+                    let _ = best_effort_hold_from_anchor(
+                        &active,
+                        hold_anchor,
+                        Instant::now(),
+                        &cfg.safety,
+                        HoldTarget::Both,
+                    );
                     let arms = active
                         .disable_both(cfg.disable_config.clone())
                         .map_err(DualArmError::from)?;
@@ -350,12 +376,14 @@ impl DualArmActiveMit {
                 &command.slave_kd,
                 &final_torques.slave,
             ) {
-                report.command_faults += 1;
+                report.submission_faults += 1;
                 report.last_error = Some(err.to_string());
-                let _ = best_effort_command_hold(
-                    &active.left,
-                    hold_anchor.map(|anchor| anchor.left_position),
+                let _ = best_effort_hold_from_anchor(
+                    &active,
+                    hold_anchor,
+                    Instant::now(),
                     &cfg.safety,
+                    HoldTarget::Left,
                 );
                 let arms = active.emergency_stop_both().map_err(DualArmError::from)?;
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
@@ -369,12 +397,14 @@ impl DualArmActiveMit {
                 &command.master_kd,
                 &final_torques.master,
             ) {
-                report.command_faults += 1;
+                report.submission_faults += 1;
                 report.last_error = Some(err.to_string());
-                let _ = best_effort_command_hold(
-                    &active.right,
-                    hold_anchor.map(|anchor| anchor.right_position),
+                let _ = best_effort_hold_from_anchor(
+                    &active,
+                    hold_anchor,
+                    Instant::now(),
                     &cfg.safety,
+                    HoldTarget::Right,
                 );
                 let arms = active.emergency_stop_both().map_err(DualArmError::from)?;
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
@@ -404,10 +434,28 @@ impl DualArmActiveMit {
         &self,
         anchor: &DualArmHoldAnchor,
         cfg: &DualArmSafetyConfig,
+        target: HoldTarget,
+        now: Instant,
     ) -> Result<()> {
-        command_hold(&self.right, &anchor.right_position, cfg)?;
-        command_hold(&self.left, &anchor.left_position, cfg)?;
+        validate_hold_anchor(anchor, now, cfg.safe_hold_max_duration)?;
+        match target {
+            HoldTarget::Left => command_hold(&self.left, &anchor.left_position, cfg)?,
+            HoldTarget::Right => command_hold(&self.right, &anchor.right_position, cfg)?,
+            HoldTarget::Both => {
+                command_hold(&self.right, &anchor.right_position, cfg)?;
+                command_hold(&self.left, &anchor.left_position, cfg)?;
+            },
+        }
         Ok(())
+    }
+
+    fn best_effort_runtime_fault_stop(self) -> DualArmErrorState {
+        let _ = RawCommander::new(&self.left.driver).emergency_stop();
+        let _ = RawCommander::new(&self.right.driver).emergency_stop();
+        DualArmErrorState {
+            left: force_error_state(self.left),
+            right: force_error_state(self.right),
+        }
     }
 }
 
@@ -435,17 +483,19 @@ impl DualArmObserver {
         Self { left, right }
     }
 
+    pub fn hold_anchor(&self, policy: DualArmReadPolicy) -> Result<DualArmHoldAnchor> {
+        self.snapshot(policy)
+            .map(|snapshot| DualArmHoldAnchor::from_snapshot(&snapshot))
+    }
+
     pub fn snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
         let left = self.left.control_snapshot_full(policy.per_arm)?;
         let right = self.right.control_snapshot_full(policy.per_arm)?;
 
-        let left_us = left.latest_system_timestamp_us();
-        let right_us = right.latest_system_timestamp_us();
-        let diff_us = left_us.abs_diff(right_us);
-        let inter_arm_skew = Duration::from_micros(diff_us);
-        if inter_arm_skew > policy.max_inter_arm_skew {
+        let skew = compute_inter_arm_skew(&left, &right);
+        if skew.effective > policy.max_inter_arm_skew {
             return Err(RobotError::state_misaligned(
-                left_us as i64 - right_us as i64,
+                skew.signed_effective_skew_us,
                 policy.max_inter_arm_skew.as_micros() as u64,
             ));
         }
@@ -453,7 +503,7 @@ impl DualArmObserver {
         Ok(DualArmSnapshot {
             left,
             right,
-            inter_arm_skew,
+            inter_arm_skew: skew.effective,
             host_cycle_timestamp: Instant::now(),
         })
     }
@@ -612,7 +662,8 @@ impl Default for BilateralLoopConfig {
 pub struct BilateralRunReport {
     pub iterations: usize,
     pub read_faults: u32,
-    pub command_faults: u32,
+    pub submission_faults: u32,
+    pub runtime_fault_exits: u32,
     pub deadline_misses: u64,
     pub max_inter_arm_skew: Duration,
     pub max_real_dt: Duration,
@@ -621,6 +672,8 @@ pub struct BilateralRunReport {
     pub right_tx_realtime_overwrites: u64,
     pub left_tx_frames_total: u64,
     pub right_tx_frames_total: u64,
+    pub last_runtime_fault_left: Option<RuntimeFaultKind>,
+    pub last_runtime_fault_right: Option<RuntimeFaultKind>,
     pub last_error: Option<String>,
 }
 
@@ -629,7 +682,8 @@ impl Default for BilateralRunReport {
         Self {
             iterations: 0,
             read_faults: 0,
-            command_faults: 0,
+            submission_faults: 0,
+            runtime_fault_exits: 0,
             deadline_misses: 0,
             max_inter_arm_skew: Duration::ZERO,
             max_real_dt: Duration::ZERO,
@@ -638,6 +692,8 @@ impl Default for BilateralRunReport {
             right_tx_realtime_overwrites: 0,
             left_tx_frames_total: 0,
             right_tx_frames_total: 0,
+            last_runtime_fault_left: None,
+            last_runtime_fault_right: None,
             last_error: None,
         }
     }
@@ -1051,7 +1107,7 @@ struct FinalTorques {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DualArmHoldAnchor {
+pub struct DualArmHoldAnchor {
     left_position: JointArray<Rad>,
     right_position: JointArray<Rad>,
     captured_at: Instant,
@@ -1066,8 +1122,104 @@ impl DualArmHoldAnchor {
         }
     }
 
-    fn is_fresh(self, now: Instant, max_age: Duration) -> bool {
-        now.saturating_duration_since(self.captured_at) <= max_age
+    fn age(self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.captured_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InterArmSkew {
+    position: Duration,
+    dynamic: Duration,
+    effective: Duration,
+    signed_effective_skew_us: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldTarget {
+    Left,
+    Right,
+    Both,
+}
+
+fn compute_inter_arm_skew(left: &ControlSnapshotFull, right: &ControlSnapshotFull) -> InterArmSkew {
+    let signed_position_skew_us = signed_us_diff(
+        left.position_system_timestamp_us,
+        right.position_system_timestamp_us,
+    );
+    let signed_dynamic_skew_us = signed_us_diff(
+        left.dynamic_system_timestamp_us,
+        right.dynamic_system_timestamp_us,
+    );
+    let position = Duration::from_micros(
+        left.position_system_timestamp_us.abs_diff(right.position_system_timestamp_us),
+    );
+    let dynamic = Duration::from_micros(
+        left.dynamic_system_timestamp_us.abs_diff(right.dynamic_system_timestamp_us),
+    );
+
+    let (effective, signed_effective_skew_us) = if position >= dynamic {
+        (position, signed_position_skew_us)
+    } else {
+        (dynamic, signed_dynamic_skew_us)
+    };
+
+    InterArmSkew {
+        position,
+        dynamic,
+        effective,
+        signed_effective_skew_us,
+    }
+}
+
+fn calibration_read_policy() -> DualArmReadPolicy {
+    DualArmReadPolicy {
+        per_arm: ControlReadPolicy {
+            max_state_skew_us: DualArmReadPolicy::default().per_arm.max_state_skew_us,
+            max_feedback_age: Duration::from_millis(100),
+        },
+        max_inter_arm_skew: Duration::from_millis(25),
+    }
+}
+
+fn signed_us_diff(left: u64, right: u64) -> i64 {
+    let diff = left as i128 - right as i128;
+    diff.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn validate_hold_anchor(anchor: &DualArmHoldAnchor, now: Instant, max_age: Duration) -> Result<()> {
+    let age = anchor.age(now);
+    if age > max_age {
+        return Err(RobotError::feedback_stale(age, max_age));
+    }
+    Ok(())
+}
+
+fn format_runtime_health_error(health: DualArmRuntimeHealth) -> String {
+    format!(
+        "runtime health unhealthy: left(connected={}, rx_alive={}, tx_alive={}, fault={:?}), right(connected={}, rx_alive={}, tx_alive={}, fault={:?})",
+        health.left.connected,
+        health.left.rx_alive,
+        health.left.tx_alive,
+        health.left.fault,
+        health.right.connected,
+        health.right.rx_alive,
+        health.right.tx_alive,
+        health.right.fault,
+    )
+}
+
+fn force_error_state(piper: Piper<Active<MitMode>>) -> Piper<ErrorState> {
+    let piper = std::mem::ManuallyDrop::new(piper);
+
+    Piper {
+        // SAFETY: `piper.driver` remains valid and is moved exactly once into the new state wrapper.
+        driver: unsafe { std::ptr::read(&piper.driver) },
+        // SAFETY: `piper.observer` remains valid and is moved exactly once into the new state wrapper.
+        observer: unsafe { std::ptr::read(&piper.observer) },
+        // SAFETY: `piper.quirks` is moved exactly once into the new state wrapper.
+        quirks: unsafe { std::ptr::read(&piper.quirks) },
+        _state: ErrorState,
     }
 }
 
@@ -1187,30 +1339,18 @@ fn command_hold(
     )
 }
 
-fn best_effort_command_hold(
-    arm: &Piper<Active<MitMode>>,
-    position: Option<JointArray<Rad>>,
-    cfg: &DualArmSafetyConfig,
-) -> bool {
-    let Some(position) = position else {
-        return false;
-    };
-
-    command_hold(arm, &position, cfg).is_ok()
-}
-
-fn best_effort_safe_hold_from_anchor(
+fn best_effort_hold_from_anchor(
     active: &DualArmActiveMit,
     anchor: Option<DualArmHoldAnchor>,
     now: Instant,
     cfg: &DualArmSafetyConfig,
+    target: HoldTarget,
 ) -> bool {
-    let Some(anchor) = anchor.filter(|anchor| anchor.is_fresh(now, cfg.safe_hold_max_duration))
-    else {
+    let Some(anchor) = anchor else {
         return false;
     };
 
-    active.safe_hold_from_anchor(&anchor, cfg).is_ok()
+    active.safe_hold_from_anchor(&anchor, cfg, target, now).is_ok()
 }
 
 fn update_report_metrics(
@@ -1280,6 +1420,21 @@ mod tests {
         }
     }
 
+    struct FailOnNthFatalTxAdapter {
+        fail_on: usize,
+        sends: usize,
+    }
+
+    impl TxAdapter for FailOnNthFatalTxAdapter {
+        fn send(&mut self, _frame: PiperFrame) -> std::result::Result<(), CanError> {
+            self.sends += 1;
+            if self.sends == self.fail_on {
+                return Err(CanError::BufferOverflow);
+            }
+            Ok(())
+        }
+    }
+
     fn joint_feedback_frame(
         can_id: u16,
         first_deg_milli: i32,
@@ -1326,8 +1481,21 @@ mod tests {
         ]
     }
 
-    fn build_piper_with_tx_adapter<T, State>(
-        timestamp_us: u64,
+    fn incomplete_scripted_frames(timestamp_us: u64) -> Vec<PiperFrame> {
+        vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 0, timestamp_us),
+            joint_dynamic_frame(2, 0, 0, timestamp_us),
+            joint_dynamic_frame(3, 0, 0, timestamp_us),
+            joint_dynamic_frame(4, 0, 0, timestamp_us),
+            joint_dynamic_frame(5, 0, 0, timestamp_us),
+        ]
+    }
+
+    fn build_piper_with_frames_and_tx_adapter<T, State>(
+        frames: Vec<PiperFrame>,
         tx_adapter: T,
         post_feedback_delay: Duration,
         state: State,
@@ -1336,12 +1504,8 @@ mod tests {
         T: TxAdapter + Send + 'static,
     {
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(
-                ScriptedRxAdapter::new(scripted_frames(timestamp_us)),
-                tx_adapter,
-                None,
-            )
-            .expect("driver should start"),
+            RobotPiper::new_dual_thread_parts(ScriptedRxAdapter::new(frames), tx_adapter, None)
+                .expect("driver should start"),
         );
         let observer = Observer::new(driver.clone());
         driver
@@ -1357,6 +1521,23 @@ mod tests {
             quirks: crate::types::DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
             _state: state,
         }
+    }
+
+    fn build_piper_with_tx_adapter<T, State>(
+        timestamp_us: u64,
+        tx_adapter: T,
+        post_feedback_delay: Duration,
+        state: State,
+    ) -> Piper<State>
+    where
+        T: TxAdapter + Send + 'static,
+    {
+        build_piper_with_frames_and_tx_adapter(
+            scripted_frames(timestamp_us),
+            tx_adapter,
+            post_feedback_delay,
+            state,
+        )
     }
 
     fn build_active_mit_piper(
@@ -1394,6 +1575,18 @@ mod tests {
             RecordingTxAdapter::new(sent_frames),
             post_feedback_delay,
             Standby,
+        )
+    }
+
+    fn build_active_mit_piper_with_frames(
+        frames: Vec<PiperFrame>,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    ) -> Piper<Active<MitMode>> {
+        build_piper_with_frames_and_tx_adapter(
+            frames,
+            RecordingTxAdapter::new(sent_frames),
+            Duration::ZERO,
+            active_mit_marker(),
         )
     }
 
@@ -1458,6 +1651,25 @@ mod tests {
             },
             inter_arm_skew: Duration::ZERO,
             host_cycle_timestamp: Instant::now(),
+        }
+    }
+
+    fn control_snapshot_full_with_timestamps(
+        position_system_timestamp_us: u64,
+        dynamic_system_timestamp_us: u64,
+    ) -> ControlSnapshotFull {
+        ControlSnapshotFull {
+            state: crate::observer::ControlSnapshot {
+                position: JointArray::splat(Rad(0.0)),
+                velocity: JointArray::splat(RadPerSecond(0.0)),
+                torque: JointArray::splat(NewtonMeter::ZERO),
+                position_timestamp_us: position_system_timestamp_us,
+                dynamic_timestamp_us: dynamic_system_timestamp_us,
+                skew_us: signed_us_diff(position_system_timestamp_us, dynamic_system_timestamp_us),
+            },
+            position_system_timestamp_us,
+            dynamic_system_timestamp_us,
+            feedback_age: Duration::from_millis(1),
         }
     }
 
@@ -1578,6 +1790,44 @@ mod tests {
         }
     }
 
+    struct InvalidSlavePositionController {
+        sleep_duration: Duration,
+    }
+
+    impl BilateralController for InvalidSlavePositionController {
+        type Error = Infallible;
+
+        fn tick(
+            &mut self,
+            snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            if !self.sleep_duration.is_zero() {
+                thread::sleep(self.sleep_duration);
+            }
+
+            Ok(BilateralCommand {
+                slave_position: JointArray::from([
+                    Rad(100.0),
+                    Rad(0.0),
+                    Rad(0.0),
+                    Rad(0.0),
+                    Rad(0.0),
+                    Rad(0.0),
+                ]),
+                slave_velocity: JointArray::splat(0.0),
+                slave_kp: JointArray::splat(0.0),
+                slave_kd: JointArray::splat(0.0),
+                slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
+                master_position: snapshot.left.state.position,
+                master_velocity: JointArray::splat(0.0),
+                master_kp: JointArray::splat(0.0),
+                master_kd: JointArray::splat(0.0),
+                master_interaction_torque: JointArray::splat(NewtonMeter::ZERO),
+            })
+        }
+    }
+
     #[test]
     fn test_joint_mirror_map_default_mapping() {
         let map = JointMirrorMap::left_right_mirror();
@@ -1650,6 +1900,102 @@ mod tests {
             .expect_err("inter-arm skew should fail");
 
         assert!(matches!(error, RobotError::StateMisaligned { .. }));
+    }
+
+    #[test]
+    fn test_dual_arm_observer_snapshot_reports_public_effective_inter_arm_skew() {
+        let left = build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new())));
+        thread::sleep(Duration::from_millis(4));
+        let right = build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new())));
+        let observer = DualArmObserver::new(left.observer().clone(), right.observer().clone());
+
+        let snapshot = observer
+            .snapshot(DualArmReadPolicy {
+                per_arm: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_secs(1),
+                },
+                max_inter_arm_skew: Duration::from_secs(1),
+            })
+            .expect("aligned snapshot should succeed");
+
+        let expected = compute_inter_arm_skew(&snapshot.left, &snapshot.right);
+        assert_eq!(snapshot.inter_arm_skew, expected.effective);
+    }
+
+    #[test]
+    fn test_dual_arm_observer_public_misalignment_uses_effective_signed_skew() {
+        let left = build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new())));
+        thread::sleep(Duration::from_millis(4));
+        let right = build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new())));
+        let observer = DualArmObserver::new(left.observer().clone(), right.observer().clone());
+        let per_arm = ControlReadPolicy {
+            max_state_skew_us: 2_000,
+            max_feedback_age: Duration::from_secs(1),
+        };
+        let left_snapshot = left
+            .observer()
+            .control_snapshot_full(per_arm)
+            .expect("left snapshot should succeed");
+        let right_snapshot = right
+            .observer()
+            .control_snapshot_full(per_arm)
+            .expect("right snapshot should succeed");
+        let expected = compute_inter_arm_skew(&left_snapshot, &right_snapshot);
+
+        let error = observer
+            .snapshot(DualArmReadPolicy {
+                per_arm,
+                max_inter_arm_skew: Duration::from_millis(1),
+            })
+            .expect_err("inter-arm skew should exceed strict threshold");
+
+        assert!(matches!(
+            error,
+            RobotError::StateMisaligned {
+                skew_us,
+                max_skew_us
+            } if skew_us == expected.signed_effective_skew_us && max_skew_us == 1_000
+        ));
+    }
+
+    #[test]
+    fn test_compute_inter_arm_skew_rejects_cross_cancelled_timestamps() {
+        let left = control_snapshot_full_with_timestamps(100_000, 95_000);
+        let right = control_snapshot_full_with_timestamps(95_000, 100_000);
+
+        let skew = compute_inter_arm_skew(&left, &right);
+
+        assert_eq!(skew.position, Duration::from_millis(5));
+        assert_eq!(skew.dynamic, Duration::from_millis(5));
+        assert_eq!(skew.effective, Duration::from_millis(5));
+        assert_eq!(skew.signed_effective_skew_us, 5_000);
+    }
+
+    #[test]
+    fn test_compute_inter_arm_skew_uses_larger_channel_skew() {
+        let left = control_snapshot_full_with_timestamps(100_000, 100_000);
+        let right = control_snapshot_full_with_timestamps(98_500, 99_500);
+
+        let skew = compute_inter_arm_skew(&left, &right);
+
+        assert_eq!(skew.position, Duration::from_micros(1_500));
+        assert_eq!(skew.dynamic, Duration::from_micros(500));
+        assert_eq!(skew.effective, Duration::from_micros(1_500));
+        assert_eq!(skew.signed_effective_skew_us, 1_500);
+    }
+
+    #[test]
+    fn test_compute_inter_arm_skew_prefers_signed_larger_channel() {
+        let left = control_snapshot_full_with_timestamps(100_000, 99_000);
+        let right = control_snapshot_full_with_timestamps(99_750, 101_000);
+
+        let skew = compute_inter_arm_skew(&left, &right);
+
+        assert_eq!(skew.position, Duration::from_micros(250));
+        assert_eq!(skew.dynamic, Duration::from_micros(2_000));
+        assert_eq!(skew.effective, Duration::from_micros(2_000));
+        assert_eq!(skew.signed_effective_skew_us, -2_000);
     }
 
     #[test]
@@ -1938,6 +2284,34 @@ mod tests {
     }
 
     #[test]
+    fn test_capture_calibration_with_policy_uses_explicit_thresholds() {
+        let standby = DualArmStandby {
+            left: build_standby_piper(1_000, Arc::new(Mutex::new(Vec::new())), Duration::ZERO),
+            right: build_standby_piper(1_000, Arc::new(Mutex::new(Vec::new())), Duration::ZERO),
+        };
+        thread::sleep(Duration::from_millis(20));
+
+        standby
+            .capture_calibration(JointMirrorMap::left_right_mirror())
+            .expect("default calibration policy should tolerate this feedback age");
+
+        let error = standby
+            .capture_calibration_with_policy(
+                JointMirrorMap::left_right_mirror(),
+                DualArmReadPolicy {
+                    per_arm: ControlReadPolicy {
+                        max_state_skew_us: 2_000,
+                        max_feedback_age: Duration::from_millis(5),
+                    },
+                    max_inter_arm_skew: Duration::from_secs(1),
+                },
+            )
+            .expect_err("strict calibration policy should reject the same feedback age");
+
+        assert!(matches!(error, RobotError::FeedbackStale { .. }));
+    }
+
+    #[test]
     fn test_capture_calibration_rejects_stale_or_misaligned_snapshot() {
         let stale = DualArmStandby {
             left: build_standby_piper(
@@ -2041,7 +2415,102 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_hold_from_snapshot_sends_current_position_zero_velocity_and_default_gains() {
+    fn test_hold_anchor_returns_only_on_successful_snapshot() {
+        let fresh_observer = DualArmObserver::new(
+            build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new())))
+                .observer()
+                .clone(),
+            build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new())))
+                .observer()
+                .clone(),
+        );
+        fresh_observer
+            .hold_anchor(DualArmReadPolicy {
+                per_arm: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_secs(1),
+                },
+                max_inter_arm_skew: Duration::from_secs(1),
+            })
+            .expect("fresh aligned snapshot should yield hold anchor");
+
+        let stale_observer = DualArmObserver::new(
+            build_active_mit_piper_with_delay(
+                1_000,
+                Arc::new(Mutex::new(Vec::new())),
+                Duration::from_millis(125),
+            )
+            .observer()
+            .clone(),
+            build_active_mit_piper_with_delay(
+                1_000,
+                Arc::new(Mutex::new(Vec::new())),
+                Duration::from_millis(125),
+            )
+            .observer()
+            .clone(),
+        );
+        let stale_error = stale_observer
+            .hold_anchor(DualArmReadPolicy {
+                per_arm: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_millis(50),
+                },
+                max_inter_arm_skew: Duration::from_secs(1),
+            })
+            .expect_err("stale snapshot should not yield hold anchor");
+        assert!(matches!(stale_error, RobotError::FeedbackStale { .. }));
+
+        let misaligned_observer = DualArmObserver::new(
+            build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new())))
+                .observer()
+                .clone(),
+            build_active_mit_piper(30_000, Arc::new(Mutex::new(Vec::new())))
+                .observer()
+                .clone(),
+        );
+        let misaligned_error = misaligned_observer
+            .hold_anchor(DualArmReadPolicy {
+                per_arm: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_secs(1),
+                },
+                max_inter_arm_skew: Duration::from_millis(1),
+            })
+            .expect_err("misaligned snapshot should not yield hold anchor");
+        assert!(matches!(
+            misaligned_error,
+            RobotError::StateMisaligned { .. }
+        ));
+
+        let incomplete_observer = DualArmObserver::new(
+            build_active_mit_piper_with_frames(
+                incomplete_scripted_frames(1_000),
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .observer()
+            .clone(),
+            build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new())))
+                .observer()
+                .clone(),
+        );
+        let incomplete_error = incomplete_observer
+            .hold_anchor(DualArmReadPolicy {
+                per_arm: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_secs(1),
+                },
+                max_inter_arm_skew: Duration::from_secs(1),
+            })
+            .expect_err("incomplete snapshot should not yield hold anchor");
+        assert!(matches!(
+            incomplete_error,
+            RobotError::ControlStateIncomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn test_safe_hold_sends_current_position_zero_velocity_and_default_gains() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let arms = DualArmActiveMit {
@@ -2049,12 +2518,17 @@ mod tests {
             right: build_active_mit_piper(1_000, right_sent.clone()),
         };
 
-        let snapshot = snapshot_with_state(
-            JointArray::splat(Rad(0.0)),
-            JointArray::splat(RadPerSecond(0.0)),
-            JointArray::splat(NewtonMeter::ZERO),
-        );
-        arms.safe_hold_from_snapshot(&snapshot, &DualArmSafetyConfig::default())
+        let anchor = arms
+            .observer()
+            .hold_anchor(DualArmReadPolicy {
+                per_arm: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_secs(1),
+                },
+                max_inter_arm_skew: Duration::from_secs(1),
+            })
+            .expect("fresh hold anchor should succeed");
+        arms.safe_hold(&anchor, &DualArmSafetyConfig::default())
             .expect("safe hold should succeed");
 
         let left_frames = wait_for_sent_frames(&left_sent, 6);
@@ -2063,6 +2537,47 @@ mod tests {
             .to_frame();
         assert_eq!(left_frames[0].id, expected.id);
         assert_eq!(left_frames[0].data, expected.data);
+    }
+
+    #[test]
+    fn test_safe_hold_rejects_expired_anchor_without_sending_commands() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper(1_000, left_sent.clone()),
+            right: build_active_mit_piper(1_000, right_sent.clone()),
+        };
+        let anchor = arms
+            .observer()
+            .hold_anchor(DualArmReadPolicy {
+                per_arm: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_secs(1),
+                },
+                max_inter_arm_skew: Duration::from_secs(1),
+            })
+            .expect("fresh hold anchor should succeed");
+
+        thread::sleep(Duration::from_millis(30));
+        let error = arms
+            .safe_hold(
+                &anchor,
+                &DualArmSafetyConfig {
+                    safe_hold_max_duration: Duration::from_millis(5),
+                    ..Default::default()
+                },
+            )
+            .expect_err("expired hold anchor should be rejected");
+
+        assert!(matches!(error, RobotError::FeedbackStale { .. }));
+        assert!(
+            left_sent.lock().expect("sent frames lock").is_empty(),
+            "expired anchor must not send hold commands",
+        );
+        assert!(
+            right_sent.lock().expect("sent frames lock").is_empty(),
+            "expired anchor must not send hold commands",
+        );
     }
 
     #[test]
@@ -2117,6 +2632,232 @@ mod tests {
         assert!(
             left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
             "expected anchor-based hold command after read fault",
+        );
+    }
+
+    #[test]
+    fn test_run_bilateral_warmup_uses_anchor_hold() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper(1_000, left_sent.clone()),
+            right: build_active_mit_piper(1_000, right_sent),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                ForwardingController::default(),
+                BilateralLoopConfig {
+                    warmup_cycles: 1,
+                    max_iterations: Some(1),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_secs(1),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("warmup hold should succeed");
+
+        match exit {
+            DualArmLoopExit::Standby { report, .. } => assert_eq!(report.iterations, 1),
+            DualArmLoopExit::EmergencyStopped { .. } => panic!("expected standby exit"),
+        }
+
+        let left_frames = wait_for_sent_frames(&left_sent, 6);
+        let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
+            .expect("expected hold command")
+            .to_frame();
+        assert!(
+            left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
+            "expected warmup hold command",
+        );
+    }
+
+    #[test]
+    fn test_run_bilateral_submission_failure_holds_other_arm_when_anchor_is_fresh() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper(1_000, left_sent.clone()),
+            right: build_active_mit_piper(1_000, right_sent),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                InvalidSlavePositionController {
+                    sleep_duration: Duration::ZERO,
+                },
+                BilateralLoopConfig {
+                    warmup_cycles: 0,
+                    max_iterations: Some(1),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_secs(1),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    safety: DualArmSafetyConfig {
+                        safe_hold_max_duration: Duration::from_millis(100),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("invalid command should converge to emergency stop");
+
+        match exit {
+            DualArmLoopExit::Standby { .. } => panic!("expected emergency stop"),
+            DualArmLoopExit::EmergencyStopped { report, .. } => {
+                assert_eq!(report.submission_faults, 1);
+                assert_eq!(report.runtime_fault_exits, 0);
+            },
+        }
+
+        let left_frames = wait_for_sent_frames(&left_sent, 7);
+        let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
+            .expect("expected hold command")
+            .to_frame();
+        assert!(
+            left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
+            "fresh anchor should trigger best-effort hold on the other arm",
+        );
+    }
+
+    #[test]
+    fn test_run_bilateral_submission_failure_skips_hold_when_anchor_is_expired() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper(1_000, left_sent.clone()),
+            right: build_active_mit_piper(1_000, right_sent),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                InvalidSlavePositionController {
+                    sleep_duration: Duration::from_millis(40),
+                },
+                BilateralLoopConfig {
+                    frequency_hz: 50.0,
+                    warmup_cycles: 0,
+                    max_iterations: Some(1),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_secs(1),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    safety: DualArmSafetyConfig {
+                        safe_hold_max_duration: Duration::from_millis(5),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("invalid command should converge to emergency stop");
+
+        match exit {
+            DualArmLoopExit::Standby { .. } => panic!("expected emergency stop"),
+            DualArmLoopExit::EmergencyStopped { report, .. } => {
+                assert_eq!(report.submission_faults, 1);
+                assert_eq!(report.runtime_fault_exits, 0);
+            },
+        }
+
+        let left_frames = wait_for_sent_frames(&left_sent, 1);
+        let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
+            .expect("expected hold command")
+            .to_frame();
+        assert!(
+            !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
+            "expired anchor must not trigger best-effort hold",
+        );
+    }
+
+    #[test]
+    fn test_run_bilateral_runtime_transport_fault_exits_without_submission_fault() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper(1_000, left_sent.clone()),
+            right: build_piper_with_tx_adapter(
+                1_000,
+                FailOnNthFatalTxAdapter {
+                    fail_on: 1,
+                    sends: 0,
+                },
+                Duration::ZERO,
+                active_mit_marker(),
+            ),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                ForwardingController::default(),
+                BilateralLoopConfig {
+                    frequency_hz: 50.0,
+                    warmup_cycles: 0,
+                    max_iterations: Some(10),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_secs(1),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("transport failure should converge to emergency stop");
+
+        match exit {
+            DualArmLoopExit::Standby { .. } => panic!("expected emergency stop"),
+            DualArmLoopExit::EmergencyStopped { report, .. } => {
+                assert_eq!(report.submission_faults, 0);
+                assert_eq!(report.runtime_fault_exits, 1);
+                assert_eq!(
+                    report.last_runtime_fault_right,
+                    Some(RuntimeFaultKind::TransportError)
+                );
+                assert!(
+                    report
+                        .last_error
+                        .as_deref()
+                        .map(|last_error| last_error.contains("TransportError"))
+                        .unwrap_or(false),
+                    "last_error should preserve the transport failure cause",
+                );
+            },
+        }
+
+        let left_frames = wait_for_sent_frames(&left_sent, 6);
+        let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
+            .expect("expected hold command")
+            .to_frame();
+        assert!(
+            !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
+            "runtime unhealthy exit should not inject an extra hold",
         );
     }
 

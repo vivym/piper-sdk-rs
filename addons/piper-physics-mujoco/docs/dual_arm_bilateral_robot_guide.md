@@ -249,7 +249,8 @@ Payload symptoms:
 Watch these outputs after each session:
 
 - `read_faults`
-- `command_faults`
+- `submission_faults`
+- `runtime_fault_exits`
 - `max_inter_arm_skew`
 - `left tx realtime overwrites`
 - `right tx realtime overwrites`
@@ -257,7 +258,8 @@ Watch these outputs after each session:
 
 Healthy first-session expectations:
 
-- `command_faults = 0`
+- `submission_faults = 0`
+- `runtime_fault_exits = 0`
 - `read_faults = 0` in steady state
 - `max_inter_arm_skew` stays comfortably below the default threshold
 - realtime overwrite counters do not climb continuously
@@ -273,7 +275,7 @@ The loop should safely converge if:
 Expected behavior:
 
 - stale or misaligned state: safe-hold, then disable
-- runtime health unhealthy: emergency stop path
+- runtime health unhealthy: next-cycle emergency stop path
 - compensator failure: safe-hold, then disable
 
 During testing, intentionally verify at least:

@@ -205,7 +205,8 @@
 |------|----|
 | `iterations` | |
 | `read_faults` | |
-| `command_faults` | |
+| `submission_faults` | |
+| `runtime_fault_exits` | |
 | `max_inter_arm_skew` | |
 | `left tx realtime overwrites` | |
 | `right tx realtime overwrites` | |

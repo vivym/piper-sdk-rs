@@ -41,10 +41,10 @@ pub use diagnostics::PiperDiagnostics;
 pub use dual_arm::{
     BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
     BilateralDynamicsCompensator, BilateralLoopConfig, BilateralRunReport, DualArmActiveMit,
-    DualArmBuilder, DualArmCalibration, DualArmError, DualArmErrorState, DualArmLoopExit,
-    DualArmObserver, DualArmReadPolicy, DualArmRuntimeHealth, DualArmSafetyConfig, DualArmSnapshot,
-    GripperTeleopConfig, JointMirrorMap, JointSpaceBilateralController, LoopTimingMode,
-    MasterFollowerController,
+    DualArmBuilder, DualArmCalibration, DualArmError, DualArmErrorState, DualArmHoldAnchor,
+    DualArmLoopExit, DualArmObserver, DualArmReadPolicy, DualArmRuntimeHealth, DualArmSafetyConfig,
+    DualArmSnapshot, GripperTeleopConfig, JointMirrorMap, JointSpaceBilateralController,
+    LoopTimingMode, MasterFollowerController,
 };
 pub use observer::{
     CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, ControlSnapshotFull, Observer,

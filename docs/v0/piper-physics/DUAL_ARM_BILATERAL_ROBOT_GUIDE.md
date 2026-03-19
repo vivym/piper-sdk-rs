@@ -323,7 +323,8 @@ payload 典型异常：
 
 - `iterations`
 - `read_faults`
-- `command_faults`
+- `submission_faults`
+- `runtime_fault_exits`
 - `max_inter_arm_skew`
 - `left tx realtime overwrites`
 - `right tx realtime overwrites`
@@ -331,7 +332,8 @@ payload 典型异常：
 
 首轮联调的健康预期：
 
-- `command_faults = 0`
+- `submission_faults = 0`
+- `runtime_fault_exits = 0`
 - 稳态运行时 `read_faults = 0`
 - `max_inter_arm_skew` 保持在默认阈值以内
 - overwrite 计数不会持续上涨
@@ -345,7 +347,7 @@ payload 典型异常：
 - 任一臂反馈 stale / misaligned:
   `safe_hold -> disable`
 - 任一臂 runtime health unhealthy:
-  `emergency stop path`
+  `next-cycle emergency stop path`
 - MuJoCo compensator 返回错误:
   `safe_hold -> disable`
 

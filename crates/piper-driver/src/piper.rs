@@ -268,13 +268,16 @@ impl Piper {
         let tx_alive = self.tx_thread_alive();
         let connected = self.is_connected();
         let last_feedback_age = self.connection_age();
+        let runtime_fault = RuntimeFaultKind::from_raw(self.runtime_fault.load(Ordering::Acquire));
 
-        let fault = if !rx_alive {
+        let fault = if runtime_fault.is_some() {
+            runtime_fault
+        } else if !rx_alive {
             Some(RuntimeFaultKind::RxExited)
         } else if !tx_alive {
             Some(RuntimeFaultKind::TxExited)
         } else {
-            RuntimeFaultKind::from_raw(self.runtime_fault.load(Ordering::Acquire))
+            None
         };
 
         HealthStatus {
@@ -1677,6 +1680,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_health_prefers_latched_transport_fault_over_tx_exited() {
+        let (started_tx, started_rx) = mpsc::channel();
+        drop(started_rx);
+        let (release_tx, release_rx) = mpsc::channel();
+        drop(release_tx);
+        let piper = Piper::new_dual_thread_parts(
+            MockRxAdapter,
+            CoordinatedFailTxAdapter {
+                started_tx,
+                release_rx,
+                first_send: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        let error = piper
+            .send_realtime_package_confirmed(
+                [PiperFrame::new_standard(0x155, &[0x01])],
+                Duration::from_millis(200),
+            )
+            .expect_err("fatal transport error should fail confirmed send");
+        assert!(matches!(
+            error,
+            DriverError::RealtimeDeliveryFailed { .. } | DriverError::ChannelClosed
+        ));
+
+        std::thread::sleep(Duration::from_millis(20));
+        let health = piper.health();
+        assert!(!health.tx_alive);
+        assert_eq!(health.fault, Some(RuntimeFaultKind::TransportError));
     }
 
     #[test]

@@ -135,6 +135,8 @@ pub struct ControlSnapshotFull {
 
 impl ControlSnapshotFull {
     /// 获取该快照的最新主机时间戳（微秒）
+    ///
+    /// 该值仅适用于诊断/监控场景，不应用于双臂跨设备对齐判定。
     pub fn latest_system_timestamp_us(self) -> u64 {
         self.position_system_timestamp_us.max(self.dynamic_system_timestamp_us)
     }

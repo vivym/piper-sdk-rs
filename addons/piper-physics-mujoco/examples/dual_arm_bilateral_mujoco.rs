@@ -495,7 +495,8 @@ fn wait_for_enter(prompt: &str) -> io::Result<()> {
 fn print_report(report: &BilateralRunReport) {
     println!("iterations: {}", report.iterations);
     println!("read_faults: {}", report.read_faults);
-    println!("command_faults: {}", report.command_faults);
+    println!("submission_faults: {}", report.submission_faults);
+    println!("runtime_fault_exits: {}", report.runtime_fault_exits);
     println!(
         "max_inter_arm_skew: {} us",
         report.max_inter_arm_skew.as_micros()
@@ -510,6 +511,8 @@ fn print_report(report: &BilateralRunReport) {
     );
     println!("left tx frames total: {}", report.left_tx_frames_total);
     println!("right tx frames total: {}", report.right_tx_frames_total);
+    println!("last_runtime_fault_left: {:?}", report.last_runtime_fault_left);
+    println!("last_runtime_fault_right: {:?}", report.last_runtime_fault_right);
     if let Some(last_error) = &report.last_error {
         println!("last_error: {last_error}");
     }

@@ -81,6 +81,7 @@ pub use client::{
     DualArmCalibration,
     DualArmError,
     DualArmErrorState,
+    DualArmHoldAnchor,
     DualArmLoopExit,
     DualArmObserver,
     DualArmReadPolicy,

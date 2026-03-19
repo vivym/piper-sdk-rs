@@ -12,10 +12,10 @@ pub use crate::client::{
     BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
     BilateralDynamicsCompensator, BilateralLoopConfig, BilateralRunReport, ControlReadPolicy,
     ControlSnapshot, ControlSnapshotFull, DualArmActiveMit, DualArmBuilder, DualArmCalibration,
-    DualArmError, DualArmErrorState, DualArmLoopExit, DualArmObserver, DualArmReadPolicy,
-    DualArmRuntimeHealth, DualArmSafetyConfig, DualArmSnapshot, GripperTeleopConfig,
-    JointMirrorMap, JointSpaceBilateralController, LoopTimingMode, MasterFollowerController,
-    Observer, PiperBuilder, RuntimeFaultKind, RuntimeHealthSnapshot,
+    DualArmError, DualArmErrorState, DualArmHoldAnchor, DualArmLoopExit, DualArmObserver,
+    DualArmReadPolicy, DualArmRuntimeHealth, DualArmSafetyConfig, DualArmSnapshot,
+    GripperTeleopConfig, JointMirrorMap, JointSpaceBilateralController, LoopTimingMode,
+    MasterFollowerController, Observer, PiperBuilder, RuntimeFaultKind, RuntimeHealthSnapshot,
 };
 // 类型系统（通过 types 模块导出）
 pub use crate::client::types::*;
