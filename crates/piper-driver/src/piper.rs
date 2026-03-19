@@ -2,7 +2,7 @@
 //!
 //! 提供对外的 `Piper` 结构体，封装底层 IO 线程和状态同步细节。
 
-use crate::command::{CommandPriority, PiperCommand, RealtimeCommand};
+use crate::command::{CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
 use crate::metrics::{MetricsSnapshot, PiperMetrics};
@@ -14,7 +14,7 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{JoinHandle, spawn};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 /// Extension trait for timeout-capable thread joins
@@ -97,7 +97,7 @@ pub struct HealthStatus {
 /// Piper 机械臂驱动（对外 API）
 pub struct Piper {
     /// 可靠命令发送通道。
-    cmd_tx: ManuallyDrop<Sender<PiperFrame>>,
+    cmd_tx: ManuallyDrop<Sender<ReliableCommand>>,
     /// 实时命令插槽（邮箱模式，Overwrite）
     realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>>,
     /// 共享状态上下文
@@ -202,7 +202,7 @@ impl Piper {
         config: Option<PipelineConfig>,
     ) -> Result<Self, CanError> {
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
-        let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+        let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
         let ctx = Arc::new(PiperContext::new());
         let is_running = Arc::new(AtomicBool::new(true));
         let metrics = Arc::new(PiperMetrics::new());
@@ -717,10 +717,7 @@ impl Piper {
     /// - `DriverError::ChannelClosed`: 命令通道已关闭（IO 线程退出）
     /// - `DriverError::ChannelFull`: 命令队列已满（缓冲区容量 10）
     pub fn send_frame(&self, frame: PiperFrame) -> Result<(), DriverError> {
-        self.cmd_tx.try_send(frame).map_err(|e| match e {
-            crossbeam_channel::TrySendError::Full(_) => DriverError::ChannelFull,
-            crossbeam_channel::TrySendError::Disconnected(_) => DriverError::ChannelClosed,
-        })
+        self.enqueue_reliable(ReliableCommand::single(frame))
     }
 
     /// 获取钩子管理器的引用（用于高级诊断）
@@ -875,10 +872,7 @@ impl Piper {
         frame: PiperFrame,
         timeout: std::time::Duration,
     ) -> Result<(), DriverError> {
-        self.cmd_tx.send_timeout(frame, timeout).map_err(|e| match e {
-            crossbeam_channel::SendTimeoutError::Timeout(_) => DriverError::Timeout,
-            crossbeam_channel::SendTimeoutError::Disconnected(_) => DriverError::ChannelClosed,
-        })
+        self.enqueue_reliable_timeout(ReliableCommand::single(frame), timeout)
     }
 
     /// 发送实时控制命令（邮箱模式，覆盖策略）
@@ -1084,20 +1078,7 @@ impl Piper {
     /// - `DriverError::ChannelClosed`: 命令通道已关闭（TX 线程退出）
     /// - `DriverError::ChannelFull`: 队列满（非阻塞）
     pub fn send_reliable(&self, frame: PiperFrame) -> Result<(), DriverError> {
-        match self.cmd_tx.try_send(frame) {
-            Ok(_) => {
-                self.metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            },
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                // 队列满，记录丢弃
-                self.metrics.tx_reliable_drops.fetch_add(1, Ordering::Relaxed);
-                Err(DriverError::ChannelFull)
-            },
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                Err(DriverError::ChannelClosed)
-            },
-        }
+        self.enqueue_reliable(ReliableCommand::single(frame))
     }
 
     /// 发送命令（根据优先级自动选择队列）
@@ -1135,7 +1116,65 @@ impl Piper {
         frame: PiperFrame,
         timeout: std::time::Duration,
     ) -> Result<(), DriverError> {
-        match self.cmd_tx.send_timeout(frame, timeout) {
+        self.enqueue_reliable_timeout(ReliableCommand::single(frame), timeout)
+    }
+
+    /// 发送可靠命令并等待 TX 线程确认实际发送结果。
+    pub fn send_reliable_confirmed(
+        &self,
+        frame: PiperFrame,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        if !self.tx_thread_alive() || !self.is_running.load(Ordering::Acquire) {
+            return Err(DriverError::ChannelClosed);
+        }
+
+        let start = Instant::now();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let command = ReliableCommand::confirmed(frame, ack_tx);
+
+        if timeout.is_zero() {
+            self.enqueue_reliable(command)?;
+        } else {
+            self.enqueue_reliable_timeout(command, timeout)?;
+        }
+
+        let elapsed = start.elapsed();
+        let Some(remaining) = timeout.checked_sub(elapsed) else {
+            return Err(DriverError::Timeout);
+        };
+
+        match ack_rx.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(DriverError::ChannelClosed)
+            },
+        }
+    }
+
+    fn enqueue_reliable(&self, command: ReliableCommand) -> Result<(), DriverError> {
+        match self.cmd_tx.try_send(command) {
+            Ok(_) => {
+                self.metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                self.metrics.tx_reliable_drops.fetch_add(1, Ordering::Relaxed);
+                Err(DriverError::ChannelFull)
+            },
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                Err(DriverError::ChannelClosed)
+            },
+        }
+    }
+
+    fn enqueue_reliable_timeout(
+        &self,
+        command: ReliableCommand,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        match self.cmd_tx.send_timeout(command, timeout) {
             Ok(_) => {
                 self.metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -1261,6 +1300,17 @@ mod tests {
                 let _ = self.release_rx.recv();
                 return Err(CanError::BufferOverflow);
             }
+            Ok(())
+        }
+    }
+
+    struct SlowTxAdapter {
+        delay: Duration,
+    }
+
+    impl piper_can::TxAdapter for SlowTxAdapter {
+        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+            std::thread::sleep(self.delay);
             Ok(())
         }
     }
@@ -1620,6 +1670,87 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn test_send_reliable_confirmed_success() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts(
+            MockRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let frame = PiperFrame::new_standard(0x471, &[0x01]);
+
+        piper
+            .send_reliable_confirmed(frame, Duration::from_millis(200))
+            .expect("confirmed reliable send should succeed");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[frame]);
+    }
+
+    #[test]
+    fn test_send_reliable_confirmed_channel_closed_when_tx_thread_exits() {
+        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
+        piper.is_running.store(false, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!piper.tx_thread_alive());
+
+        let error = piper
+            .send_reliable_confirmed(
+                PiperFrame::new_standard(0x471, &[0x01]),
+                Duration::from_millis(50),
+            )
+            .expect_err("stopped tx thread should reject confirmed reliable send");
+
+        assert!(matches!(error, DriverError::ChannelClosed));
+    }
+
+    #[test]
+    fn test_send_reliable_confirmed_reports_transport_failure() {
+        let piper = Piper::new_dual_thread_parts(
+            MockRxAdapter,
+            FailOnNthTxAdapter {
+                fail_on: 1,
+                sends: 0,
+            },
+            None,
+        )
+        .unwrap();
+
+        let error = piper
+            .send_reliable_confirmed(
+                PiperFrame::new_standard(0x471, &[0x01]),
+                Duration::from_millis(200),
+            )
+            .expect_err("transport error should fail confirmed reliable send");
+
+        assert!(matches!(error, DriverError::ReliableDeliveryFailed { .. }));
+    }
+
+    #[test]
+    fn test_send_reliable_confirmed_times_out_waiting_for_ack() {
+        let piper = Piper::new_dual_thread_parts(
+            MockRxAdapter,
+            SlowTxAdapter {
+                delay: Duration::from_millis(50),
+            },
+            None,
+        )
+        .unwrap();
+
+        let error = piper
+            .send_reliable_confirmed(
+                PiperFrame::new_standard(0x471, &[0x01]),
+                Duration::from_millis(5),
+            )
+            .expect_err("slow tx should time out confirmed reliable send");
+
+        assert!(matches!(error, DriverError::Timeout));
     }
 
     #[test]

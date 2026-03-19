@@ -190,8 +190,8 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             println!("\n双臂循环已退出，机械臂回到 Standby。");
             print_report(&report);
         },
-        DualArmLoopExit::EmergencyStopped { report, .. } => {
-            eprintln!("\n双臂循环因故障进入 EmergencyStopped。");
+        DualArmLoopExit::Faulted { report, .. } => {
+            eprintln!("\n双臂循环进入 Faulted，已停止控制并执行有界停机尝试。");
             print_report(&report);
         },
     }
@@ -271,9 +271,11 @@ fn wait_for_enter(prompt: &str) -> io::Result<()> {
 
 fn print_report(report: &BilateralRunReport) {
     println!("iterations: {}", report.iterations);
+    println!("exit_reason: {:?}", report.exit_reason);
     println!("read_faults: {}", report.read_faults);
     println!("submission_faults: {}", report.submission_faults);
-    println!("runtime_fault_exits: {}", report.runtime_fault_exits);
+    println!("left_stop_attempt: {:?}", report.left_stop_attempt);
+    println!("right_stop_attempt: {:?}", report.right_stop_attempt);
     println!(
         "max_inter_arm_skew: {} us",
         report.max_inter_arm_skew.as_micros()

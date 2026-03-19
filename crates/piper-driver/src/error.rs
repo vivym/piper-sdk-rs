@@ -65,6 +65,14 @@ pub enum DriverError {
         source: CanError,
     },
 
+    /// 已确认的可靠命令在 TX 线程中发送失败
+    #[error("Reliable delivery failed: {source}")]
+    ReliableDeliveryFailed {
+        /// 底层 CAN 发送错误
+        #[source]
+        source: CanError,
+    },
+
     /// 已确认的实时命令等待 TX 线程确认超时
     #[error("Realtime delivery confirmation timed out")]
     RealtimeDeliveryTimeout,
@@ -143,6 +151,12 @@ mod tests {
         };
         let msg = format!("{}", driver_error);
         assert!(msg.contains("1/6"));
+
+        let driver_error = DriverError::ReliableDeliveryFailed {
+            source: CanError::Timeout,
+        };
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("Reliable delivery failed"));
 
         let driver_error = DriverError::RealtimeDeliveryTimeout;
         let msg = format!("{}", driver_error);

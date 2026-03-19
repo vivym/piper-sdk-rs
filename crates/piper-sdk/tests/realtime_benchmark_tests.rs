@@ -9,7 +9,9 @@
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
 use piper_sdk::driver::{
-    PipelineConfig, PiperContext, PiperMetrics, command::RealtimeCommand, rx_loop, tx_loop_mailbox,
+    PipelineConfig, PiperContext, PiperMetrics,
+    command::{RealtimeCommand, ReliableCommand},
+    rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -580,7 +582,7 @@ fn test_tx_latency_benchmark() {
     let send_times = tx_adapter.send_times.clone();
 
     // 创建命令通道
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -690,7 +692,7 @@ fn test_send_duration_benchmark() {
     let send_times = tx_adapter.send_times.clone();
 
     // 创建命令通道
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 

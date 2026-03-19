@@ -4,6 +4,7 @@
 //! 不再依赖 wall-clock P95/P99 阈值。
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
+use piper_sdk::driver::command::ReliableCommand;
 use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -125,7 +126,7 @@ fn start_tx_loop(
     is_running: Arc<AtomicBool>,
     fault: Arc<AtomicU8>,
     realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>>,
-    reliable_rx: crossbeam_channel::Receiver<PiperFrame>,
+    reliable_rx: crossbeam_channel::Receiver<ReliableCommand>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         tx_loop_mailbox(
@@ -177,7 +178,7 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
     let fault = Arc::new(AtomicU8::new(0));
     let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(2));
     let sent_frames = tx_adapter.sent_frames.clone();
-    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
 
     let handle = start_tx_loop(
@@ -194,7 +195,7 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
         .map(|i| PiperFrame::new_standard((0x180 + i) as u16, &[i as u8; 8]))
         .collect();
     for frame in &expected {
-        reliable_tx.send(*frame).unwrap();
+        reliable_tx.send(ReliableCommand::single(*frame)).unwrap();
     }
 
     wait_until(Duration::from_secs(2), || {
@@ -222,7 +223,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
     let fault = Arc::new(AtomicU8::new(0));
     let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(1));
     let sent_frames = tx_adapter.sent_frames.clone();
-    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_writer = realtime_slot.clone();
 
@@ -240,7 +241,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
         .map(|i| PiperFrame::new_standard((0x300 + i) as u16, &[0xAA, i as u8]))
         .collect();
     for frame in &reliable_frames {
-        reliable_tx.send(*frame).unwrap();
+        reliable_tx.send(ReliableCommand::single(*frame)).unwrap();
     }
 
     let realtime_writer = thread::spawn(move || {
@@ -293,7 +294,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
     );
 
     let tx_adapter = RecordingTxAdapter::new(Duration::ZERO);
-    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let tx_handle = start_tx_loop(
         tx_adapter,
@@ -309,7 +310,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
         .map(|i| PiperFrame::new_standard((0x500 + i) as u16, &[i as u8; 8]))
         .collect();
     for frame in &tx_frames {
-        reliable_tx.send(*frame).unwrap();
+        reliable_tx.send(ReliableCommand::single(*frame)).unwrap();
     }
 
     wait_until(Duration::from_secs(1), || {
@@ -339,7 +340,7 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
     let (release_first_tx, release_first_rx) = mpsc::channel();
     let tx_adapter = BlockingFirstTxAdapter::new(first_frame_tx, release_first_rx);
     let sent_frames = tx_adapter.sent_frames.clone();
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_writer = realtime_slot.clone();
 

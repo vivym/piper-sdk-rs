@@ -248,9 +248,11 @@ Payload symptoms:
 
 Watch these outputs after each session:
 
+- `exit_reason`
 - `read_faults`
 - `submission_faults`
-- `runtime_fault_exits`
+- `left_stop_attempt`
+- `right_stop_attempt`
 - `max_inter_arm_skew`
 - `left tx realtime overwrites`
 - `right tx realtime overwrites`
@@ -258,8 +260,10 @@ Watch these outputs after each session:
 
 Healthy first-session expectations:
 
+- `exit_reason = Cancelled` or `MaxIterations` during normal manual shutdown
 - `submission_faults = 0`
-- `runtime_fault_exits = 0`
+- `left_stop_attempt = NotAttempted`
+- `right_stop_attempt = NotAttempted`
 - `read_faults = 0` in steady state
 - `max_inter_arm_skew` stays comfortably below the default threshold
 - realtime overwrite counters do not climb continuously

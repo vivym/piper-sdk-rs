@@ -265,8 +265,8 @@ fn main() -> AppResult<()> {
             println!("\ndual-arm loop exited cleanly to Standby.");
             print_report(&report);
         },
-        DualArmLoopExit::EmergencyStopped { report, .. } => {
-            eprintln!("\ndual-arm loop entered EmergencyStopped.");
+        DualArmLoopExit::Faulted { report, .. } => {
+            eprintln!("\ndual-arm loop entered Faulted after a bounded shutdown attempt.");
             print_report(&report);
         },
     }
@@ -494,9 +494,11 @@ fn wait_for_enter(prompt: &str) -> io::Result<()> {
 
 fn print_report(report: &BilateralRunReport) {
     println!("iterations: {}", report.iterations);
+    println!("exit_reason: {:?}", report.exit_reason);
     println!("read_faults: {}", report.read_faults);
     println!("submission_faults: {}", report.submission_faults);
-    println!("runtime_fault_exits: {}", report.runtime_fault_exits);
+    println!("left_stop_attempt: {:?}", report.left_stop_attempt);
+    println!("right_stop_attempt: {:?}", report.right_stop_attempt);
     println!(
         "max_inter_arm_skew: {} us",
         report.max_inter_arm_skew.as_micros()

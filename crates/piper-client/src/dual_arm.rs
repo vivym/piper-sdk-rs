@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use piper_driver::RuntimeFaultKind;
+use piper_driver::{DriverError, RuntimeFaultKind};
 use thiserror::Error;
 
 use crate::builder::PiperBuilder;
@@ -176,6 +176,7 @@ impl DualArmActiveMit {
             if let Some(max_iterations) = cfg.max_iterations
                 && iteration >= max_iterations
             {
+                report.exit_reason = Some(BilateralExitReason::MaxIterations);
                 let arms =
                     active.disable_both(cfg.disable_config.clone()).map_err(DualArmError::from)?;
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
@@ -185,6 +186,7 @@ impl DualArmActiveMit {
             if let Some(cancel_signal) = &cfg.cancel_signal
                 && cancel_signal.load(Ordering::Acquire)
             {
+                report.exit_reason = Some(BilateralExitReason::Cancelled);
                 report.last_error = Some("bilateral loop cancelled".to_string());
                 let arms =
                     active.disable_both(cfg.disable_config.clone()).map_err(DualArmError::from)?;
@@ -202,6 +204,7 @@ impl DualArmActiveMit {
             let mut dt = real_dt;
             if real_dt > max_dt {
                 if let Err(err) = controller.on_time_jump(real_dt) {
+                    report.exit_reason = Some(BilateralExitReason::ControllerFault);
                     report.last_error = Some(err.to_string());
                     let _ = best_effort_hold_from_anchor(
                         &active,
@@ -229,6 +232,7 @@ impl DualArmActiveMit {
                         HoldTarget::Both,
                     );
                     if !hold_succeeded || compensation_failure_streak > 1 {
+                        report.exit_reason = Some(BilateralExitReason::CompensationFault);
                         let arms = active
                             .disable_both(cfg.disable_config.clone())
                             .map_err(DualArmError::from)?;
@@ -246,14 +250,16 @@ impl DualArmActiveMit {
             // Steady-state MIT commands stay unconfirmed to minimize loop jitter.
             // Real TX/transport failures are expected to surface here on the next cycle.
             let health = active.observer().runtime_health();
-            if health.any_unhealthy() {
-                report.runtime_fault_exits += 1;
+            if classify_runtime_transport_fault(health) {
+                report.exit_reason = Some(BilateralExitReason::RuntimeTransportFault);
                 report.last_runtime_fault_left = health.left.fault;
                 report.last_runtime_fault_right = health.right.fault;
                 report.last_error = Some(format_runtime_health_error(health));
-                let arms = active.best_effort_runtime_fault_stop();
+                let (arms, shutdown) = active.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                report.left_stop_attempt = shutdown.left_stop_attempt;
+                report.right_stop_attempt = shutdown.right_stop_attempt;
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
-                return Ok(DualArmLoopExit::EmergencyStopped { arms, report });
+                return Ok(DualArmLoopExit::Faulted { arms, report });
             }
 
             let snapshot = match active.observer().snapshot(cfg.read_policy) {
@@ -283,6 +289,7 @@ impl DualArmActiveMit {
                         || now.saturating_duration_since(*failure_start)
                             >= cfg.safety.safe_hold_max_duration
                     {
+                        report.exit_reason = Some(BilateralExitReason::ReadFault);
                         let arms = active
                             .disable_both(cfg.disable_config.clone())
                             .map_err(DualArmError::from)?;
@@ -322,6 +329,7 @@ impl DualArmActiveMit {
                             HoldTarget::Both,
                         );
                         if !hold_succeeded || compensation_failure_streak > 1 {
+                            report.exit_reason = Some(BilateralExitReason::CompensationFault);
                             let arms = active
                                 .disable_both(cfg.disable_config.clone())
                                 .map_err(DualArmError::from)?;
@@ -350,6 +358,7 @@ impl DualArmActiveMit {
             let mut command = match controller.tick_with_compensation(&frame, dt) {
                 Ok(command) => command,
                 Err(err) => {
+                    report.exit_reason = Some(BilateralExitReason::ControllerFault);
                     report.last_error = Some(err.to_string());
                     let _ = best_effort_hold_from_anchor(
                         &active,
@@ -377,6 +386,7 @@ impl DualArmActiveMit {
                 &final_torques.slave,
             ) {
                 report.submission_faults += 1;
+                report.exit_reason = Some(BilateralExitReason::SubmissionFault);
                 report.last_error = Some(err.to_string());
                 let _ = best_effort_hold_from_anchor(
                     &active,
@@ -385,9 +395,11 @@ impl DualArmActiveMit {
                     &cfg.safety,
                     HoldTarget::Left,
                 );
-                let arms = active.emergency_stop_both().map_err(DualArmError::from)?;
+                let (arms, shutdown) = active.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                report.left_stop_attempt = shutdown.left_stop_attempt;
+                report.right_stop_attempt = shutdown.right_stop_attempt;
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
-                return Ok(DualArmLoopExit::EmergencyStopped { arms, report });
+                return Ok(DualArmLoopExit::Faulted { arms, report });
             }
 
             if let Err(err) = active.left.command_torques(
@@ -398,6 +410,7 @@ impl DualArmActiveMit {
                 &final_torques.master,
             ) {
                 report.submission_faults += 1;
+                report.exit_reason = Some(BilateralExitReason::SubmissionFault);
                 report.last_error = Some(err.to_string());
                 let _ = best_effort_hold_from_anchor(
                     &active,
@@ -406,9 +419,11 @@ impl DualArmActiveMit {
                     &cfg.safety,
                     HoldTarget::Right,
                 );
-                let arms = active.emergency_stop_both().map_err(DualArmError::from)?;
+                let (arms, shutdown) = active.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                report.left_stop_attempt = shutdown.left_stop_attempt;
+                report.right_stop_attempt = shutdown.right_stop_attempt;
                 update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
-                return Ok(DualArmLoopExit::EmergencyStopped { arms, report });
+                return Ok(DualArmLoopExit::Faulted { arms, report });
             }
 
             gripper_counter += 1;
@@ -449,13 +464,21 @@ impl DualArmActiveMit {
         Ok(())
     }
 
-    fn best_effort_runtime_fault_stop(self) -> DualArmErrorState {
-        let _ = RawCommander::new(&self.left.driver).emergency_stop();
-        let _ = RawCommander::new(&self.right.driver).emergency_stop();
-        DualArmErrorState {
-            left: force_error_state(self.left),
-            right: force_error_state(self.right),
-        }
+    fn fault_shutdown(self, timeout: Duration) -> (DualArmErrorState, FaultShutdown) {
+        let health = self.observer().runtime_health();
+        let left_stop_attempt = attempt_confirmed_stop(&self.left, health.left.tx_alive, timeout);
+        let right_stop_attempt =
+            attempt_confirmed_stop(&self.right, health.right.tx_alive, timeout);
+        (
+            DualArmErrorState {
+                left: force_error_state(self.left),
+                right: force_error_state(self.right),
+            },
+            FaultShutdown {
+                left_stop_attempt,
+                right_stop_attempt,
+            },
+        )
     }
 }
 
@@ -552,6 +575,8 @@ pub struct DualArmRuntimeHealth {
 }
 
 impl DualArmRuntimeHealth {
+    /// Diagnostic aggregate only.
+    /// Control-loop fault exits use a narrower runtime transport classification.
     pub fn any_unhealthy(self) -> bool {
         !self.left.connected
             || !self.right.connected
@@ -562,6 +587,28 @@ impl DualArmRuntimeHealth {
             || self.left.fault.is_some()
             || self.right.fault.is_some()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BilateralExitReason {
+    MaxIterations,
+    Cancelled,
+    ReadFault,
+    ControllerFault,
+    CompensationFault,
+    SubmissionFault,
+    RuntimeTransportFault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopAttemptResult {
+    #[default]
+    NotAttempted,
+    ConfirmedSent,
+    Timeout,
+    ChannelClosed,
+    QueueRejected,
+    TransportFailed,
 }
 
 /// 双臂安全策略
@@ -663,7 +710,6 @@ pub struct BilateralRunReport {
     pub iterations: usize,
     pub read_faults: u32,
     pub submission_faults: u32,
-    pub runtime_fault_exits: u32,
     pub deadline_misses: u64,
     pub max_inter_arm_skew: Duration,
     pub max_real_dt: Duration,
@@ -674,6 +720,9 @@ pub struct BilateralRunReport {
     pub right_tx_frames_total: u64,
     pub last_runtime_fault_left: Option<RuntimeFaultKind>,
     pub last_runtime_fault_right: Option<RuntimeFaultKind>,
+    pub exit_reason: Option<BilateralExitReason>,
+    pub left_stop_attempt: StopAttemptResult,
+    pub right_stop_attempt: StopAttemptResult,
     pub last_error: Option<String>,
 }
 
@@ -683,7 +732,6 @@ impl Default for BilateralRunReport {
             iterations: 0,
             read_faults: 0,
             submission_faults: 0,
-            runtime_fault_exits: 0,
             deadline_misses: 0,
             max_inter_arm_skew: Duration::ZERO,
             max_real_dt: Duration::ZERO,
@@ -694,6 +742,9 @@ impl Default for BilateralRunReport {
             right_tx_frames_total: 0,
             last_runtime_fault_left: None,
             last_runtime_fault_right: None,
+            exit_reason: None,
+            left_stop_attempt: StopAttemptResult::NotAttempted,
+            right_stop_attempt: StopAttemptResult::NotAttempted,
             last_error: None,
         }
     }
@@ -705,7 +756,7 @@ pub enum DualArmLoopExit {
         arms: DualArmStandby,
         report: BilateralRunReport,
     },
-    EmergencyStopped {
+    Faulted {
         arms: DualArmErrorState,
         report: BilateralRunReport,
     },
@@ -1142,6 +1193,14 @@ enum HoldTarget {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FaultShutdown {
+    left_stop_attempt: StopAttemptResult,
+    right_stop_attempt: StopAttemptResult,
+}
+
+const FAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(10);
+
 fn compute_inter_arm_skew(left: &ControlSnapshotFull, right: &ControlSnapshotFull) -> InterArmSkew {
     let signed_position_skew_us = signed_us_diff(
         left.position_system_timestamp_us,
@@ -1207,6 +1266,47 @@ fn format_runtime_health_error(health: DualArmRuntimeHealth) -> String {
         health.right.tx_alive,
         health.right.fault,
     )
+}
+
+fn classify_runtime_transport_fault(health: DualArmRuntimeHealth) -> bool {
+    !health.left.rx_alive
+        || !health.left.tx_alive
+        || !health.right.rx_alive
+        || !health.right.tx_alive
+        || health.left.fault.is_some()
+        || health.right.fault.is_some()
+}
+
+fn stop_attempt_from_driver_error(err: &DriverError) -> StopAttemptResult {
+    match err {
+        DriverError::ChannelClosed => StopAttemptResult::ChannelClosed,
+        DriverError::ChannelFull => StopAttemptResult::QueueRejected,
+        DriverError::Timeout => StopAttemptResult::Timeout,
+        DriverError::ReliableDeliveryFailed { .. } => StopAttemptResult::TransportFailed,
+        _ => StopAttemptResult::TransportFailed,
+    }
+}
+
+fn stop_attempt_from_robot_error(err: &RobotError) -> StopAttemptResult {
+    match err {
+        RobotError::Infrastructure(driver) => stop_attempt_from_driver_error(driver),
+        _ => StopAttemptResult::TransportFailed,
+    }
+}
+
+fn attempt_confirmed_stop(
+    piper: &Piper<Active<MitMode>>,
+    tx_alive: bool,
+    timeout: Duration,
+) -> StopAttemptResult {
+    if !tx_alive {
+        return StopAttemptResult::ChannelClosed;
+    }
+
+    match RawCommander::new(&piper.driver).emergency_stop_confirmed(timeout) {
+        Ok(()) => StopAttemptResult::ConfirmedSent,
+        Err(err) => stop_attempt_from_robot_error(&err),
+    }
 }
 
 fn force_error_state(piper: Piper<Active<MitMode>>) -> Piper<ErrorState> {
@@ -2389,7 +2489,7 @@ mod tests {
             DualArmLoopExit::Standby { report, .. } => {
                 assert_eq!(report.iterations, 1);
             },
-            DualArmLoopExit::EmergencyStopped { .. } => {
+            DualArmLoopExit::Faulted { .. } => {
                 panic!("expected standby exit");
             },
         }
@@ -2619,8 +2719,9 @@ mod tests {
         match exit {
             DualArmLoopExit::Standby { report, .. } => {
                 assert!(report.read_faults >= 1);
+                assert_eq!(report.exit_reason, Some(BilateralExitReason::ReadFault));
             },
-            DualArmLoopExit::EmergencyStopped { .. } => {
+            DualArmLoopExit::Faulted { .. } => {
                 panic!("expected standby exit");
             },
         }
@@ -2668,7 +2769,7 @@ mod tests {
 
         match exit {
             DualArmLoopExit::Standby { report, .. } => assert_eq!(report.iterations, 1),
-            DualArmLoopExit::EmergencyStopped { .. } => panic!("expected standby exit"),
+            DualArmLoopExit::Faulted { .. } => panic!("expected standby exit"),
         }
 
         let left_frames = wait_for_sent_frames(&left_sent, 6);
@@ -2716,13 +2817,18 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect("invalid command should converge to emergency stop");
+            .expect("invalid command should converge to faulted exit");
 
         match exit {
-            DualArmLoopExit::Standby { .. } => panic!("expected emergency stop"),
-            DualArmLoopExit::EmergencyStopped { report, .. } => {
+            DualArmLoopExit::Standby { .. } => panic!("expected faulted exit"),
+            DualArmLoopExit::Faulted { report, .. } => {
                 assert_eq!(report.submission_faults, 1);
-                assert_eq!(report.runtime_fault_exits, 0);
+                assert_eq!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::SubmissionFault)
+                );
+                assert_eq!(report.left_stop_attempt, StopAttemptResult::ConfirmedSent);
+                assert_eq!(report.right_stop_attempt, StopAttemptResult::ConfirmedSent);
             },
         }
 
@@ -2772,13 +2878,18 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect("invalid command should converge to emergency stop");
+            .expect("invalid command should converge to faulted exit");
 
         match exit {
-            DualArmLoopExit::Standby { .. } => panic!("expected emergency stop"),
-            DualArmLoopExit::EmergencyStopped { report, .. } => {
+            DualArmLoopExit::Standby { .. } => panic!("expected faulted exit"),
+            DualArmLoopExit::Faulted { report, .. } => {
                 assert_eq!(report.submission_faults, 1);
-                assert_eq!(report.runtime_fault_exits, 0);
+                assert_eq!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::SubmissionFault)
+                );
+                assert_eq!(report.left_stop_attempt, StopAttemptResult::ConfirmedSent);
+                assert_eq!(report.right_stop_attempt, StopAttemptResult::ConfirmedSent);
             },
         }
 
@@ -2829,22 +2940,27 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect("transport failure should converge to emergency stop");
+            .expect("transport failure should converge to faulted exit");
 
         match exit {
-            DualArmLoopExit::Standby { .. } => panic!("expected emergency stop"),
-            DualArmLoopExit::EmergencyStopped { report, .. } => {
+            DualArmLoopExit::Standby { .. } => panic!("expected faulted exit"),
+            DualArmLoopExit::Faulted { report, .. } => {
                 assert_eq!(report.submission_faults, 0);
-                assert_eq!(report.runtime_fault_exits, 1);
+                assert_eq!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::RuntimeTransportFault)
+                );
                 assert_eq!(
                     report.last_runtime_fault_right,
                     Some(RuntimeFaultKind::TransportError)
                 );
+                assert_eq!(report.left_stop_attempt, StopAttemptResult::ConfirmedSent);
+                assert_eq!(report.right_stop_attempt, StopAttemptResult::ChannelClosed);
                 assert!(
                     report
                         .last_error
                         .as_deref()
-                        .map(|last_error| last_error.contains("TransportError"))
+                        .map(|last_error: &str| last_error.contains("TransportError"))
                         .unwrap_or(false),
                     "last_error should preserve the transport failure cause",
                 );
@@ -2859,6 +2975,53 @@ mod tests {
             !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
             "runtime unhealthy exit should not inject an extra hold",
         );
+    }
+
+    #[test]
+    fn test_run_bilateral_ignores_connected_false_for_faulted_exit() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let stale_but_acceptable_delay = Duration::from_millis(1_100);
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper_with_delay(1_000, left_sent, stale_but_acceptable_delay),
+            right: build_active_mit_piper_with_delay(1_000, right_sent, stale_but_acceptable_delay),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                ForwardingController::default(),
+                BilateralLoopConfig {
+                    warmup_cycles: 0,
+                    max_iterations: Some(1),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_secs(5),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("connected=false alone should not trigger faulted exit");
+
+        match exit {
+            DualArmLoopExit::Standby { report, .. } => {
+                assert_eq!(report.exit_reason, Some(BilateralExitReason::ReadFault));
+                assert!(report.read_faults >= 1);
+                assert_eq!(report.left_stop_attempt, StopAttemptResult::NotAttempted);
+                assert_eq!(report.right_stop_attempt, StopAttemptResult::NotAttempted);
+                assert_eq!(report.last_runtime_fault_left, None);
+                assert_eq!(report.last_runtime_fault_right, None);
+            },
+            DualArmLoopExit::Faulted { .. } => {
+                panic!("connected=false should remain on the non-faulted path");
+            },
+        }
     }
 
     #[test]
@@ -2898,7 +3061,7 @@ mod tests {
             DualArmLoopExit::Standby { report, .. } => {
                 assert_eq!(report.iterations, 1);
             },
-            DualArmLoopExit::EmergencyStopped { .. } => {
+            DualArmLoopExit::Faulted { .. } => {
                 panic!("expected standby exit");
             },
         }
@@ -2936,12 +3099,13 @@ mod tests {
         match exit {
             DualArmLoopExit::Standby { report, .. } => {
                 assert_eq!(report.iterations, 0);
+                assert_eq!(report.exit_reason, Some(BilateralExitReason::Cancelled));
                 assert_eq!(
                     report.last_error.as_deref(),
                     Some("bilateral loop cancelled")
                 );
             },
-            DualArmLoopExit::EmergencyStopped { .. } => {
+            DualArmLoopExit::Faulted { .. } => {
                 panic!("expected standby exit");
             },
         }
@@ -2988,11 +3152,15 @@ mod tests {
             DualArmLoopExit::Standby { report, .. } => {
                 assert!(report.iterations >= 1);
                 assert_eq!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::CompensationFault)
+                );
+                assert_eq!(
                     report.last_error.as_deref(),
                     Some("second compensation failure")
                 );
             },
-            DualArmLoopExit::EmergencyStopped { .. } => {
+            DualArmLoopExit::Faulted { .. } => {
                 panic!("expected standby exit");
             },
         }
@@ -3044,7 +3212,7 @@ mod tests {
 
         match exit {
             DualArmLoopExit::Standby { .. } => {},
-            DualArmLoopExit::EmergencyStopped { .. } => {
+            DualArmLoopExit::Faulted { .. } => {
                 panic!("expected standby exit");
             },
         }

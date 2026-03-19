@@ -527,7 +527,7 @@ pub fn rx_loop(
 pub fn tx_loop_mailbox(
     mut tx: impl TxAdapter,
     realtime_slot: Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
-    reliable_rx: Receiver<PiperFrame>,
+    reliable_rx: Receiver<crate::command::ReliableCommand>,
     is_running: Arc<AtomicBool>,
     metrics: Arc<PiperMetrics>,
     ctx: Arc<PiperContext>,
@@ -646,35 +646,43 @@ pub fn tx_loop_mailbox(
         }
 
         // Priority 2: 可靠命令队列
-        if let Ok(frame) = reliable_rx.try_recv() {
-            match tx.send(frame) {
+        if let Ok(mut command) = reliable_rx.try_recv() {
+            let frame = command.frame();
+            let ack = command.take_ack();
+            let mut should_break = false;
+            let send_result = match tx.send(frame) {
                 Ok(_) => {
-                    // 更新 metrics（可靠命令发送）
                     metrics.tx_frames_total.fetch_add(1, Ordering::Relaxed);
 
-                    // 🆕 v1.2.1: 触发 TX 回调（仅在发送成功后）
-                    // 使用 try_read 避免阻塞
                     if let Ok(hooks) = ctx.hooks.try_read() {
                         hooks.trigger_all_sent(&frame);
-                        // ^^^v 非阻塞，<1μs
                     }
+                    Ok(())
                 },
                 Err(e) => {
                     error!("TX thread: Failed to send reliable frame: {}", e);
                     metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                     metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
 
-                    // 检测致命错误
                     let is_fatal = matches!(e, CanError::Device(_) | CanError::BufferOverflow);
 
                     if is_fatal {
                         error!("TX thread: Fatal error detected, setting is_running = false");
                         record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        // Release: All writes before this are visible to threads that see the false value
                         is_running.store(false, Ordering::Release);
-                        break;
+                        should_break = true;
                     }
+
+                    Err(crate::DriverError::ReliableDeliveryFailed { source: e })
                 },
+            };
+
+            if let Some(ack) = ack {
+                let _ = ack.send(send_result);
+            }
+
+            if should_break {
+                break;
             }
             continue;
         }

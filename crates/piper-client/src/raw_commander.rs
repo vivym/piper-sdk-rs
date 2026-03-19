@@ -157,6 +157,14 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
+    /// 急停并等待 TX 线程确认已尝试发送。
+    pub(crate) fn emergency_stop_confirmed(&self, timeout: Duration) -> Result<()> {
+        let cmd = EmergencyStopCommand::emergency_stop();
+        let frame = cmd.to_frame();
+        self.driver.send_reliable_confirmed(frame, timeout)?;
+        Ok(())
+    }
+
     /// 停止运动（用于优雅关闭）
     ///
     /// 发送停止运动命令，用于优雅关闭序列。与急停不同，此方法更平滑地停止机器人。

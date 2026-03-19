@@ -74,6 +74,7 @@ pub use client::{
     BilateralController,
     BilateralDynamicsCompensation,
     BilateralDynamicsCompensator,
+    BilateralExitReason,
     BilateralLoopConfig,
     BilateralRunReport,
     DualArmActiveMit,
@@ -98,6 +99,7 @@ pub use client::{
     // 类型系统通过 types 模块导出
     RuntimeFaultKind,
     RuntimeHealthSnapshot,
+    StopAttemptResult,
 };
 
 // 导出 recording 模块的常用类型

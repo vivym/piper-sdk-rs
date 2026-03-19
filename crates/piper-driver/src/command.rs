@@ -48,6 +48,7 @@ pub type FrameBuffer = SmallVec<[PiperFrame; 6]>;
 /// - 简化 TX 线程逻辑（不需要 match 分支）
 /// - 消除 CPU 分支预测压力
 pub type RealtimeAck = Sender<Result<(), DriverError>>;
+pub type ReliableAck = Sender<Result<(), DriverError>>;
 
 #[derive(Debug)]
 pub struct RealtimeCommand {
@@ -131,6 +132,37 @@ impl RealtimeCommand {
         if let Some(ack) = self.ack.take() {
             let _ = ack.send(result);
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReliableCommand {
+    frame: PiperFrame,
+    ack: Option<ReliableAck>,
+}
+
+impl ReliableCommand {
+    #[inline]
+    pub fn single(frame: PiperFrame) -> Self {
+        Self { frame, ack: None }
+    }
+
+    #[inline]
+    pub fn confirmed(frame: PiperFrame, ack: ReliableAck) -> Self {
+        Self {
+            frame,
+            ack: Some(ack),
+        }
+    }
+
+    #[inline]
+    pub fn frame(&self) -> PiperFrame {
+        self.frame
+    }
+
+    #[inline]
+    pub fn take_ack(&mut self) -> Option<ReliableAck> {
+        self.ack.take()
     }
 }
 
@@ -293,5 +325,22 @@ mod realtime_command_tests {
         let cmd = RealtimeCommand::package(frames);
         let buffer = cmd.into_frames();
         assert_eq!(buffer.len(), 2);
+    }
+
+    #[test]
+    fn test_reliable_command_single() {
+        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+        let cmd = ReliableCommand::single(frame);
+        assert_eq!(cmd.frame(), frame);
+    }
+
+    #[test]
+    fn test_reliable_command_confirmed() {
+        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+        let (ack_tx, _ack_rx) = crossbeam_channel::bounded(1);
+        let mut cmd = ReliableCommand::confirmed(frame, ack_tx);
+        assert_eq!(cmd.frame(), frame);
+        assert!(cmd.take_ack().is_some());
+        assert!(cmd.take_ack().is_none());
     }
 }

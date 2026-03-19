@@ -204,9 +204,11 @@
 | 字段 | 值 |
 |------|----|
 | `iterations` | |
+| `exit_reason` | |
 | `read_faults` | |
 | `submission_faults` | |
-| `runtime_fault_exits` | |
+| `left_stop_attempt` | |
+| `right_stop_attempt` | |
 | `max_inter_arm_skew` | |
 | `left tx realtime overwrites` | |
 | `right tx realtime overwrites` | |

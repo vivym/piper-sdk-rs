@@ -8,6 +8,7 @@
 use piper_sdk::can::{
     CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RxAdapter, TxAdapter,
 };
+use piper_sdk::driver::command::ReliableCommand;
 use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -149,7 +150,7 @@ fn test_rx_unaffected_by_tx_timeout() {
     let tx_adapter = MockTxAdapter::new(Duration::from_millis(1));
 
     // 创建命令通道
-    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -195,7 +196,12 @@ fn test_rx_unaffected_by_tx_timeout() {
     // 模拟 TX 超时：设置 TX 适配器超时
     // 注意：由于 MockTxAdapter 是移动的，我们需要通过其他方式模拟
     // 这里我们发送一个会导致超时的命令（在实际场景中，这可能是总线错误）
-    reliable_tx.send(PiperFrame::new_standard(0x123, &[1, 2, 3])).unwrap();
+    reliable_tx
+        .send(ReliableCommand::single(PiperFrame::new_standard(
+            0x123,
+            &[1, 2, 3],
+        )))
+        .unwrap();
 
     // 等待 100ms，观察 RX 是否受影响
     thread::sleep(Duration::from_millis(100));
@@ -254,7 +260,7 @@ fn test_tx_detects_rx_failure() {
     let tx_adapter = MockTxAdapter::new(Duration::from_millis(1));
 
     // 创建命令通道
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -361,7 +367,7 @@ fn test_thread_lifecycle_linkage() {
     let tx_adapter = MockTxAdapter::new(Duration::from_millis(1));
 
     // 创建命令通道
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 

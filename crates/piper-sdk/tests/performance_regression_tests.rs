@@ -7,7 +7,7 @@
 //! 4. 可集成到 CI，作为性能门禁
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
-use piper_sdk::driver::command::PiperCommand;
+use piper_sdk::driver::command::{PiperCommand, ReliableCommand};
 use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -342,7 +342,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
 
     // 创建命令通道
     let (realtime_tx, _realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -540,7 +540,7 @@ fn test_command_priority_performance() {
 
     // 创建命令通道
     let (realtime_tx, _realtime_rx) = crossbeam_channel::bounded::<PiperFrame>(1);
-    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -591,7 +591,7 @@ fn test_command_priority_performance() {
     let metrics2 = Arc::new(PiperMetrics::new());
     let tx_adapter2 = SimpleTxAdapter::new(Duration::from_micros(100));
     let (realtime_tx2, _realtime_rx2) = crossbeam_channel::bounded::<PiperFrame>(1);
-    let (_reliable_tx2, reliable_rx2) = crossbeam_channel::bounded::<PiperFrame>(10);
+    let (_reliable_tx2, reliable_rx2) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot2: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 

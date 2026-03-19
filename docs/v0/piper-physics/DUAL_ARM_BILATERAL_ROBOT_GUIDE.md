@@ -322,9 +322,11 @@ payload 典型异常：
 每次结束都看 demo 输出的这些字段：
 
 - `iterations`
+- `exit_reason`
 - `read_faults`
 - `submission_faults`
-- `runtime_fault_exits`
+- `left_stop_attempt`
+- `right_stop_attempt`
 - `max_inter_arm_skew`
 - `left tx realtime overwrites`
 - `right tx realtime overwrites`
@@ -332,8 +334,10 @@ payload 典型异常：
 
 首轮联调的健康预期：
 
+- 正常人工退出时 `exit_reason = Cancelled` 或 `MaxIterations`
 - `submission_faults = 0`
-- `runtime_fault_exits = 0`
+- `left_stop_attempt = NotAttempted`
+- `right_stop_attempt = NotAttempted`
 - 稳态运行时 `read_faults = 0`
 - `max_inter_arm_skew` 保持在默认阈值以内
 - overwrite 计数不会持续上涨
