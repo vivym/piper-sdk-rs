@@ -73,10 +73,14 @@ pub struct PiperMetrics {
     /// TX 超时次数（异常现象，说明设备响应慢）
     pub tx_timeouts: AtomicU64,
 
-    /// 实时帧包发送成功次数
-    pub tx_package_sent: AtomicU64,
-    /// 实时帧包部分发送次数（发送失败）
-    pub tx_package_partial: AtomicU64,
+    /// 实时帧包完整发送成功次数
+    pub tx_packages_completed_total: AtomicU64,
+    /// 实时帧包部分发送次数（底层 transport 失败前已发送前缀帧）
+    pub tx_packages_partial_total: AtomicU64,
+    /// 实时帧包因故障锁存而中止的次数
+    pub tx_packages_fault_aborted_total: AtomicU64,
+    /// 实时帧包因底层 transport 错误而完全失败（0 帧成功发送）的次数
+    pub tx_packages_transport_failed_total: AtomicU64,
 }
 
 impl PiperMetrics {
@@ -109,8 +113,14 @@ impl PiperMetrics {
             device_errors: self.device_errors.load(Ordering::Relaxed),
             rx_timeouts: self.rx_timeouts.load(Ordering::Relaxed),
             tx_timeouts: self.tx_timeouts.load(Ordering::Relaxed),
-            tx_package_sent: self.tx_package_sent.load(Ordering::Relaxed),
-            tx_package_partial: self.tx_package_partial.load(Ordering::Relaxed),
+            tx_packages_completed_total: self.tx_packages_completed_total.load(Ordering::Relaxed),
+            tx_packages_partial_total: self.tx_packages_partial_total.load(Ordering::Relaxed),
+            tx_packages_fault_aborted_total: self
+                .tx_packages_fault_aborted_total
+                .load(Ordering::Relaxed),
+            tx_packages_transport_failed_total: self
+                .tx_packages_transport_failed_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -132,15 +142,17 @@ impl PiperMetrics {
         self.device_errors.store(0, Ordering::Relaxed);
         self.rx_timeouts.store(0, Ordering::Relaxed);
         self.tx_timeouts.store(0, Ordering::Relaxed);
-        self.tx_package_sent.store(0, Ordering::Relaxed);
-        self.tx_package_partial.store(0, Ordering::Relaxed);
+        self.tx_packages_completed_total.store(0, Ordering::Relaxed);
+        self.tx_packages_partial_total.store(0, Ordering::Relaxed);
+        self.tx_packages_fault_aborted_total.store(0, Ordering::Relaxed);
+        self.tx_packages_transport_failed_total.store(0, Ordering::Relaxed);
     }
 }
 
 /// 指标快照（不可变，用于读取）
 ///
 /// 包含所有计数器的当前值，用于一次性读取所有指标，避免多次原子操作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MetricsSnapshot {
     /// RX 接收的总帧数
     pub rx_frames_total: u64,
@@ -170,10 +182,14 @@ pub struct MetricsSnapshot {
     pub rx_timeouts: u64,
     /// TX 超时次数
     pub tx_timeouts: u64,
-    /// 实时帧包发送成功次数
-    pub tx_package_sent: u64,
-    /// 实时帧包部分发送次数（发送失败）
-    pub tx_package_partial: u64,
+    /// 实时帧包完整发送成功次数
+    pub tx_packages_completed_total: u64,
+    /// 实时帧包部分发送次数（发送失败前已发送前缀帧）
+    pub tx_packages_partial_total: u64,
+    /// 实时帧包因故障锁存而中止的次数
+    pub tx_packages_fault_aborted_total: u64,
+    /// 实时帧包因 transport 错误在 0 帧成功发送时失败的次数
+    pub tx_packages_transport_failed_total: u64,
 }
 
 impl MetricsSnapshot {
@@ -336,8 +352,10 @@ mod tests {
             device_errors: 0,
             rx_timeouts: 10,
             tx_timeouts: 0,
-            tx_package_sent: 0,
-            tx_package_partial: 0,
+            tx_packages_completed_total: 0,
+            tx_packages_partial_total: 0,
+            tx_packages_fault_aborted_total: 0,
+            tx_packages_transport_failed_total: 0,
         };
 
         assert_eq!(snapshot.echo_filter_rate(), 20.0);
@@ -362,8 +380,10 @@ mod tests {
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
-            tx_package_sent: 0,
-            tx_package_partial: 0,
+            tx_packages_completed_total: 0,
+            tx_packages_partial_total: 0,
+            tx_packages_fault_aborted_total: 0,
+            tx_packages_transport_failed_total: 0,
         };
 
         assert_eq!(snapshot.echo_filter_rate(), 0.0);
@@ -388,8 +408,10 @@ mod tests {
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
-            tx_package_sent: 0,
-            tx_package_partial: 0,
+            tx_packages_completed_total: 0,
+            tx_packages_partial_total: 0,
+            tx_packages_fault_aborted_total: 0,
+            tx_packages_transport_failed_total: 0,
         };
 
         // 20% 覆盖率（正常情况）
@@ -423,8 +445,10 @@ mod tests {
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
-            tx_package_sent: 0,
-            tx_package_partial: 0,
+            tx_packages_completed_total: 0,
+            tx_packages_partial_total: 0,
+            tx_packages_fault_aborted_total: 0,
+            tx_packages_transport_failed_total: 0,
         };
 
         // 总数为 0 时，覆盖率应该为 0.0
@@ -449,8 +473,10 @@ mod tests {
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
-            tx_package_sent: 0,
-            tx_package_partial: 0,
+            tx_packages_completed_total: 0,
+            tx_packages_partial_total: 0,
+            tx_packages_fault_aborted_total: 0,
+            tx_packages_transport_failed_total: 0,
         };
 
         assert_eq!(snapshot.overwrite_rate(), 25.0);
@@ -474,8 +500,10 @@ mod tests {
             device_errors: 0,
             rx_timeouts: 0,
             tx_timeouts: 0,
-            tx_package_sent: 0,
-            tx_package_partial: 0,
+            tx_packages_completed_total: 0,
+            tx_packages_partial_total: 0,
+            tx_packages_fault_aborted_total: 0,
+            tx_packages_transport_failed_total: 0,
         };
         assert!(!normal.is_overwrite_rate_abnormal());
 

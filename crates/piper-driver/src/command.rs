@@ -6,6 +6,7 @@ use crate::DriverError;
 use crossbeam_channel::Sender;
 use piper_can::PiperFrame;
 use smallvec::SmallVec;
+use std::time::Instant;
 
 // 编译期断言：确保 PiperFrame 永远实现 Copy，这对 SmallVec 性能至关重要
 // 如果未来有人给 PiperFrame 添加非 Copy 字段（如 String），这里会编译失败
@@ -49,6 +50,7 @@ pub type FrameBuffer = SmallVec<[PiperFrame; 6]>;
 /// - 消除 CPU 分支预测压力
 pub type RealtimeAck = Sender<Result<(), DriverError>>;
 pub type ReliableAck = Sender<Result<(), DriverError>>;
+pub type ShutdownAck = Sender<Result<(), DriverError>>;
 
 #[derive(Debug)]
 pub struct RealtimeCommand {
@@ -139,6 +141,39 @@ impl RealtimeCommand {
 pub struct ReliableCommand {
     frame: PiperFrame,
     ack: Option<ReliableAck>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShutdownCommand {
+    frame: PiperFrame,
+    deadline: Instant,
+    ack: ShutdownAck,
+}
+
+impl ShutdownCommand {
+    #[inline]
+    pub fn confirmed(frame: PiperFrame, deadline: Instant, ack: ShutdownAck) -> Self {
+        Self {
+            frame,
+            deadline,
+            ack,
+        }
+    }
+
+    #[inline]
+    pub fn frame(&self) -> PiperFrame {
+        self.frame
+    }
+
+    #[inline]
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    #[inline]
+    pub fn complete(self, result: Result<(), DriverError>) {
+        let _ = self.ack.send(result);
+    }
 }
 
 impl ReliableCommand {

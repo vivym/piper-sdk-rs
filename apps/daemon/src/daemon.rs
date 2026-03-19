@@ -5,6 +5,7 @@
 //! 参考：`daemon_implementation_plan.md` 第 4.1.3 节
 
 use crate::client_manager::{ClientAddr, ClientManager};
+use piper_can::TxAdapter;
 use piper_can::gs_usb::{
     GsUsbCanAdapter,
     split::{GsUsbRxAdapter, GsUsbTxAdapter},
@@ -1419,7 +1420,7 @@ impl Daemon {
                 // 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
-                    match adapter_ref.send(frame) {
+                    match adapter_ref.send_until(frame, Instant::now() + Duration::from_millis(5)) {
                         Ok(_) => {
                             // 更新统计（USB 发送成功）
                             stats.read().unwrap().increment_tx();
@@ -1610,7 +1611,7 @@ impl Daemon {
                 // ✅ 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
-                    match adapter_ref.send(frame) {
+                    match adapter_ref.send_until(frame, Instant::now() + Duration::from_millis(5)) {
                         Ok(_) => {
                             stats.read().unwrap().increment_tx();
                         },

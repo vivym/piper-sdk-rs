@@ -34,7 +34,7 @@ use std::mem;
 use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, trace, warn};
 
 /// 检查 socket 是否启用了 SO_TIMESTAMPING
@@ -555,6 +555,7 @@ impl Drop for SocketCanRxAdapter {
 /// - **FD 共享**：通过 `try_clone()` 共享同一个打开的文件描述，共享文件状态标志
 pub struct SocketCanTxAdapter {
     socket: CanSocket,
+    current_write_timeout: Duration,
 }
 
 impl SocketCanTxAdapter {
@@ -580,12 +581,35 @@ impl SocketCanTxAdapter {
 
         trace!("SocketCanTxAdapter created with 5ms write timeout");
 
-        Ok(Self { socket: tx_socket })
+        Ok(Self {
+            socket: tx_socket,
+            current_write_timeout: Duration::from_millis(5),
+        })
+    }
+
+    fn set_write_timeout_if_needed(&mut self, timeout: Duration) -> Result<(), CanError> {
+        if self.current_write_timeout == timeout {
+            return Ok(());
+        }
+
+        self.socket.set_write_timeout(timeout).map_err(|e| {
+            CanError::Io(std::io::Error::other(format!(
+                "Failed to set write timeout on TX socket: {}",
+                e
+            )))
+        })?;
+        self.current_write_timeout = timeout;
+        Ok(())
     }
 }
 
 impl TxAdapter for SocketCanTxAdapter {
-    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(CanError::Timeout);
+        };
+        self.set_write_timeout_if_needed(remaining)?;
+
         // 转换 PiperFrame -> CanFrame
         let can_frame = if frame.is_extended {
             // 扩展帧
@@ -607,7 +631,7 @@ impl TxAdapter for SocketCanTxAdapter {
                 })?
         };
 
-        // 发送（带超时，由 SO_SNDTIMEO 控制）
+        // 发送（带 deadline，由 SO_SNDTIMEO 控制）
         self.socket.transmit(&can_frame).map_err(|e| {
             // 检查是否为超时错误
             if let socketcan::Error::Io(io_err) = &e

@@ -360,6 +360,7 @@ impl Default for PiperBuilder {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Instant;
 
     struct TestRxAdapter;
 
@@ -372,7 +373,14 @@ mod tests {
     struct TestTxAdapter;
 
     impl TxAdapter for TestTxAdapter {
-        fn send(&mut self, _frame: piper_can::PiperFrame) -> Result<(), CanError> {
+        fn send_until(
+            &mut self,
+            _frame: piper_can::PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
             Ok(())
         }
     }

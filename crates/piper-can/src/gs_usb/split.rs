@@ -13,7 +13,7 @@ use crate::gs_usb::protocol::{
 use crate::{CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RxAdapter, TxAdapter};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
 
 /// 只读适配器（用于 RX 线程）
@@ -339,7 +339,11 @@ impl GsUsbTxAdapter {
     }
 
     /// 发送 CAN 帧
-    pub fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+    pub fn send_frame_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<(), CanError> {
         // 转换 PiperFrame -> GsUsbFrame
         let gs_frame = GsUsbFrame {
             echo_id: GS_USB_ECHO_ID,
@@ -357,7 +361,7 @@ impl GsUsbTxAdapter {
         };
 
         // 发送到 USB Endpoint OUT
-        self.device.send_raw(&gs_frame).map_err(|e| {
+        self.device.send_raw_until(&gs_frame, deadline).map_err(|e| {
             let kind = match e {
                 crate::gs_usb::error::GsUsbError::WriteTimeout => CanDeviceErrorKind::Busy,
                 crate::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
@@ -377,7 +381,7 @@ impl GsUsbTxAdapter {
 }
 
 impl TxAdapter for GsUsbTxAdapter {
-    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
-        self.send(frame)
+    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+        self.send_frame_until(frame, deadline)
     }
 }

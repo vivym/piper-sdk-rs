@@ -5,7 +5,7 @@
 use crate::{CanAdapter, CanError, PiperFrame, RxAdapter, SplittableAdapter, TxAdapter};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Mock CAN 适配器（无硬件依赖）
 ///
@@ -191,7 +191,7 @@ impl CanAdapter for MockCanAdapter {
         MockTxAdapter {
             inner: Arc::clone(&self.inner),
         }
-        .send(frame)
+        .send_until(frame, Instant::now() + Duration::from_secs(60))
     }
 
     /// 接收帧
@@ -273,7 +273,10 @@ pub struct MockTxAdapter {
 }
 
 impl TxAdapter for MockTxAdapter {
-    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+        if deadline <= Instant::now() {
+            return Err(CanError::Timeout);
+        }
         self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
         Ok(())
     }
@@ -434,7 +437,11 @@ mod tests {
         let adapter = MockCanAdapter::new();
         let (mut rx, mut tx) = adapter.split().unwrap();
 
-        tx.send(PiperFrame::new_standard(0x123, &[1, 2, 3])).unwrap();
+        tx.send_until(
+            PiperFrame::new_standard(0x123, &[1, 2, 3]),
+            Instant::now() + Duration::from_millis(10),
+        )
+        .unwrap();
         let frame = rx.receive().unwrap();
         assert_eq!(frame.id, 0x123);
     }

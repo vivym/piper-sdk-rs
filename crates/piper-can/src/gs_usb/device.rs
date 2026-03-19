@@ -4,7 +4,7 @@
 
 use rusb::{DeviceHandle, GlobalContext};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::trace;
 
 use crate::gs_usb::error::GsUsbError;
@@ -569,8 +569,20 @@ impl GsUsbDevice {
     /// **错误恢复**：如果 USB 批量传输超时，endpoint 可能进入 STALL 状态。
     /// 超时后会自动清除 endpoint halt，恢复设备状态，避免需要重新插拔设备。
     pub fn send_raw(&self, frame: &GsUsbFrame) -> Result<(), GsUsbError> {
+        self.send_raw_until(frame, Instant::now() + self.write_timeout)
+    }
+
+    /// 在绝对 deadline 内发送原始 GS-USB 帧。
+    ///
+    /// deadline 超过前仍未完成 USB Bulk OUT，则返回 `WriteTimeout` 并执行与 `send_raw`
+    /// 相同的 halt 清理逻辑。
+    pub fn send_raw_until(&self, frame: &GsUsbFrame, deadline: Instant) -> Result<(), GsUsbError> {
         let mut buf = bytes::BytesMut::new();
         frame.pack_to(&mut buf, self.hw_timestamp);
+
+        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(GsUsbError::WriteTimeout);
+        };
 
         // 使用可配置的写超时（支持实时模式）
         // 默认 1000ms（向后兼容），实时模式下可设为 5ms（快速失败）
@@ -578,7 +590,7 @@ impl GsUsbDevice {
         // 如果超时设置太短，会导致偶发的 Write timeout 错误
         // 注意：这里的超时是最大允许等待时间，正常情况下传输是微秒级的
         // 只有在设备忙碌时才会等待，所以增加超时不会影响正常吞吐量
-        match self.handle.write_bulk(self.endpoint_out, &buf, self.write_timeout) {
+        match self.handle.write_bulk(self.endpoint_out, &buf, timeout) {
             Ok(_) => Ok(()),
             Err(rusb::Error::Timeout) => {
                 // USB 批量传输超时后，endpoint 可能进入 STALL 状态

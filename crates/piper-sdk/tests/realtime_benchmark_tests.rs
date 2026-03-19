@@ -9,8 +9,8 @@
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
 use piper_sdk::driver::{
-    PipelineConfig, PiperContext, PiperMetrics,
-    command::{RealtimeCommand, ReliableCommand},
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics,
+    command::{RealtimeCommand, ReliableCommand, ShutdownCommand},
     rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
@@ -351,15 +351,21 @@ impl ConfigurableTxAdapter {
 }
 
 impl TxAdapter for ConfigurableTxAdapter {
-    fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+    fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
         let start = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(start) else {
+            return Err(CanError::Timeout);
+        };
 
         // 模拟错误
         if rand::random::<f64>() < self.error_probability {
             return Err(CanError::Io(std::io::Error::other("Simulated error")));
         }
 
-        thread::sleep(self.send_delay);
+        thread::sleep(self.send_delay.min(remaining));
+        if self.send_delay > remaining {
+            return Err(CanError::Timeout);
+        }
         let duration = start.elapsed();
 
         self.sent_count.fetch_add(1, Ordering::Relaxed);
@@ -590,7 +596,7 @@ fn test_tx_latency_benchmark() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -602,6 +608,7 @@ fn test_tx_latency_benchmark() {
     let last_fault_tx = last_fault.clone();
     let realtime_slot_tx = realtime_slot.clone();
     let tx_handle = thread::spawn(move || {
+        let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot_tx,
@@ -609,6 +616,7 @@ fn test_tx_latency_benchmark() {
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
+            normal_send_gate,
             metrics_tx,
             ctx_tx,
             last_fault_tx,
@@ -705,7 +713,7 @@ fn test_send_duration_benchmark() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -717,6 +725,7 @@ fn test_send_duration_benchmark() {
     let last_fault_tx = last_fault.clone();
     let realtime_slot_tx = realtime_slot.clone();
     let tx_handle = thread::spawn(move || {
+        let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot_tx,
@@ -724,6 +733,7 @@ fn test_send_duration_benchmark() {
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
+            normal_send_gate,
             metrics_tx,
             ctx_tx,
             last_fault_tx,

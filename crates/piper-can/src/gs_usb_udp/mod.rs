@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -511,7 +511,10 @@ impl RxAdapter for GsUsbUdpRxAdapter {
 }
 
 impl TxAdapter for GsUsbUdpTxAdapter {
-    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+        if deadline <= Instant::now() {
+            return Err(CanError::Timeout);
+        }
         send_frame(&self.session, frame)
     }
 }
@@ -749,7 +752,7 @@ mod tests {
 
         let (mut rx, mut tx) = adapter.split().unwrap();
         let outbound = PiperFrame::new_standard(0x321, &[9, 8, 7, 6]);
-        tx.send(outbound).unwrap();
+        tx.send_until(outbound, Instant::now() + Duration::from_millis(50)).unwrap();
 
         let inbound = rx.receive().unwrap();
         assert_eq!(inbound.id, outbound.id);

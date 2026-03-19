@@ -40,7 +40,10 @@ impl piper_sdk::can::RxAdapter for MockRxAdapter {
 struct MockTxAdapter;
 
 impl piper_sdk::can::TxAdapter for MockTxAdapter {
-    fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+    fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+        if deadline <= Instant::now() {
+            return Err(CanError::Timeout);
+        }
         Ok(())
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! CAN 硬件抽象层，提供统一的 CAN 接口抽象。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 // 重新导出 piper-protocol 中的 PiperFrame
@@ -157,15 +157,15 @@ where
 }
 
 pub trait TxAdapter {
-    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError>;
+    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError>;
 }
 
 impl<T> TxAdapter for Box<T>
 where
     T: TxAdapter + ?Sized,
 {
-    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
-        (**self).send(frame)
+    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+        (**self).send_until(frame, deadline)
     }
 }
 

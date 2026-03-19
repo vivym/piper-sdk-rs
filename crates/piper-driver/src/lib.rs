@@ -34,6 +34,6 @@ pub use hooks::{FrameCallback, HookManager};
 pub use metrics::{MetricsSnapshot, PiperMetrics};
 pub use mode::{AtomicDriverMode, DriverMode};
 pub use pipeline::{PipelineConfig, io_loop, rx_loop, tx_loop_mailbox};
-pub use piper::{HealthStatus, Piper, RuntimeFaultKind, ShutdownReceipt};
+pub use piper::{HealthStatus, NormalSendGate, Piper, RuntimeFaultKind, ShutdownReceipt};
 pub use recording::{AsyncRecordingHook, TimestampedFrame};
 pub use state::*;

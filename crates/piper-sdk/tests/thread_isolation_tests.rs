@@ -8,8 +8,10 @@
 use piper_sdk::can::{
     CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RxAdapter, TxAdapter,
 };
-use piper_sdk::driver::command::ReliableCommand;
-use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
+use piper_sdk::driver::command::{ReliableCommand, ShutdownCommand};
+use piper_sdk::driver::{
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -105,7 +107,7 @@ impl MockTxAdapter {
 }
 
 impl TxAdapter for MockTxAdapter {
-    fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+    fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
         if self.should_fail.load(Ordering::Relaxed) {
             return Err(CanError::Device(CanDeviceError::new(
                 CanDeviceErrorKind::NoDevice,
@@ -115,11 +117,22 @@ impl TxAdapter for MockTxAdapter {
 
         if self.should_timeout.load(Ordering::Relaxed) {
             // 模拟长时间阻塞（超过超时时间）
-            thread::sleep(Duration::from_millis(100));
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return Err(CanError::Timeout);
+            };
+            thread::sleep(remaining.min(Duration::from_millis(100)));
             return Err(CanError::Timeout);
         }
 
-        thread::sleep(self.send_delay);
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(CanError::Timeout);
+        };
+        thread::sleep(self.send_delay.min(remaining));
+        if self.send_delay > remaining {
+            return Err(CanError::Timeout);
+        }
         self.sent_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -152,7 +165,7 @@ fn test_rx_unaffected_by_tx_timeout() {
 
     // 创建命令通道
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -181,6 +194,7 @@ fn test_rx_unaffected_by_tx_timeout() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let tx_handle = thread::spawn(move || {
+        let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
@@ -188,6 +202,7 @@ fn test_rx_unaffected_by_tx_timeout() {
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
+            normal_send_gate,
             metrics_tx,
             ctx_tx,
             last_fault_tx,
@@ -269,7 +284,7 @@ fn test_tx_detects_rx_failure() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -298,6 +313,7 @@ fn test_tx_detects_rx_failure() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let tx_handle = thread::spawn(move || {
+        let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
@@ -305,6 +321,7 @@ fn test_tx_detects_rx_failure() {
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
+            normal_send_gate,
             metrics_tx,
             ctx_tx,
             last_fault_tx,
@@ -383,7 +400,7 @@ fn test_thread_lifecycle_linkage() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -412,6 +429,7 @@ fn test_thread_lifecycle_linkage() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let tx_handle = thread::spawn(move || {
+        let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
@@ -419,6 +437,7 @@ fn test_thread_lifecycle_linkage() {
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
+            normal_send_gate,
             metrics_tx,
             ctx_tx,
             last_fault_tx,

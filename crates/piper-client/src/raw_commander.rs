@@ -158,10 +158,13 @@ impl<'a> RawCommander<'a> {
     }
 
     /// 将急停命令加入 shutdown lane，并返回确认句柄。
-    pub(crate) fn emergency_stop_enqueue(&self) -> Result<piper_driver::ShutdownReceipt> {
+    pub(crate) fn emergency_stop_enqueue(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<piper_driver::ShutdownReceipt> {
         let cmd = EmergencyStopCommand::emergency_stop();
         let frame = cmd.to_frame();
-        Ok(self.driver.enqueue_shutdown(frame)?)
+        Ok(self.driver.enqueue_shutdown(frame, deadline)?)
     }
 
     /// 停止运动（用于优雅关闭）
@@ -460,7 +463,14 @@ mod tests {
     }
 
     impl TxAdapter for RecordingTxAdapter {
-        fn send(&mut self, frame: PiperFrame) -> std::result::Result<(), CanError> {
+        fn send_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
             self.sent_frames.lock().unwrap().push(frame);
             Ok(())
         }

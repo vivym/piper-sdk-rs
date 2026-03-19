@@ -583,7 +583,14 @@ mod tests {
     struct IdleTxAdapter;
 
     impl TxAdapter for IdleTxAdapter {
-        fn send(&mut self, _frame: PiperFrame) -> std::result::Result<(), CanError> {
+        fn send_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: std::time::Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= std::time::Instant::now() {
+                return Err(CanError::Timeout);
+            }
             Ok(())
         }
     }

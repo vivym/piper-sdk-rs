@@ -2,7 +2,9 @@
 //!
 //! 提供对外的 `Piper` 结构体，封装底层 IO 线程和状态同步细节。
 
-use crate::command::{CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand};
+use crate::command::{
+    CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand, ShutdownCommand,
+};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
 use crate::metrics::{MetricsSnapshot, PiperMetrics};
@@ -12,7 +14,7 @@ use crossbeam_channel::{Receiver, Sender};
 use piper_can::{CanError, PiperFrame, RxAdapter, SplittableAdapter, TxAdapter};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{JoinHandle, spawn};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -103,6 +105,68 @@ pub(crate) enum RuntimePhase {
     Stopping = 2,
 }
 
+pub(crate) const NORMAL_FRAME_SEND_BUDGET: Duration = Duration::from_millis(5);
+
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct NormalSendGate {
+    closed: AtomicBool,
+    epoch: AtomicU64,
+    inflight_normal_sends: AtomicUsize,
+}
+
+#[derive(Debug)]
+pub(crate) struct NormalSendPermit<'a> {
+    gate: &'a NormalSendGate,
+    epoch: u64,
+}
+
+impl NormalSendGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn acquire(&self) -> Option<NormalSendPermit<'_>> {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+
+        self.inflight_normal_sends.fetch_add(1, Ordering::AcqRel);
+
+        let closed = self.closed.load(Ordering::Acquire);
+        let current_epoch = self.epoch.load(Ordering::Acquire);
+        if closed || current_epoch != epoch {
+            self.inflight_normal_sends.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+
+        Some(NormalSendPermit { gate: self, epoch })
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn inflight_normal_sends(&self) -> usize {
+        self.inflight_normal_sends.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for NormalSendPermit<'_> {
+    fn drop(&mut self) {
+        self.gate.inflight_normal_sends.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl NormalSendPermit<'_> {
+    pub(crate) fn still_open(&self) -> bool {
+        !self.gate.closed.load(Ordering::Acquire)
+            && self.gate.epoch.load(Ordering::Acquire) == self.epoch
+    }
+}
+
 /// 停机命令的有界确认句柄。
 ///
 /// 只服务 shutdown lane，不扩展到普通 reliable/realtime 命令。
@@ -112,27 +176,13 @@ pub struct ShutdownReceipt {
 }
 
 impl ShutdownReceipt {
-    /// 等待到绝对 deadline，确认停机帧已被 TX 线程尝试发送。
-    pub fn wait_until(self, deadline: Instant) -> Result<(), DriverError> {
-        match self.ack_rx.try_recv() {
-            Ok(result) => return result,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                return Err(DriverError::ChannelClosed);
-            },
-            Err(crossbeam_channel::TryRecvError::Empty) => {},
-        }
-
-        let now = Instant::now();
-        let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Err(DriverError::Timeout);
-        };
-
-        match self.ack_rx.recv_timeout(remaining) {
+    /// 等待 TX 线程返回停机帧发送结果。
+    ///
+    /// timeout 语义已经在 enqueue 时绑定到 shutdown command，本方法只等待 ack。
+    pub fn wait(self) -> Result<(), DriverError> {
+        match self.ack_rx.recv() {
             Ok(result) => result,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(DriverError::ChannelClosed)
-            },
+            Err(_) => Err(DriverError::ChannelClosed),
         }
     }
 }
@@ -152,7 +202,7 @@ pub struct Piper {
     /// 普通可靠命令发送通道。
     reliable_tx: ManuallyDrop<Sender<ReliableCommand>>,
     /// 停机专用命令发送通道。
-    shutdown_tx: ManuallyDrop<Sender<ReliableCommand>>,
+    shutdown_tx: ManuallyDrop<Sender<ShutdownCommand>>,
     /// 实时命令插槽（邮箱模式，Overwrite）
     realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>>,
     /// 共享状态上下文
@@ -163,6 +213,8 @@ pub struct Piper {
     workers_running: Arc<AtomicBool>,
     /// 运行时阶段（控制路径开关）。
     runtime_phase: Arc<AtomicU8>,
+    /// 普通控制帧发送门闩。
+    normal_send_gate: Arc<NormalSendGate>,
     /// 性能指标（原子计数器）
     metrics: Arc<PiperMetrics>,
     /// 最近一次运行时故障。
@@ -275,10 +327,11 @@ impl Piper {
     ) -> Result<Self, CanError> {
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
         let ctx = Arc::new(PiperContext::new());
         let workers_running = Arc::new(AtomicBool::new(true));
         let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let normal_send_gate = Arc::new(NormalSendGate::new());
         let metrics = Arc::new(PiperMetrics::new());
         let runtime_fault = Arc::new(AtomicU8::new(0));
 
@@ -304,6 +357,7 @@ impl Piper {
         let ctx_tx = ctx.clone();
         let workers_running_tx = workers_running.clone();
         let runtime_phase_tx = runtime_phase.clone();
+        let normal_send_gate_tx = normal_send_gate.clone();
         let metrics_tx = metrics.clone();
         let realtime_slot_tx = realtime_slot.clone();
         let runtime_fault_tx = runtime_fault.clone();
@@ -316,6 +370,7 @@ impl Piper {
                 reliable_rx,
                 workers_running_tx,
                 runtime_phase_tx,
+                normal_send_gate_tx,
                 metrics_tx,
                 ctx_tx,
                 runtime_fault_tx,
@@ -335,6 +390,7 @@ impl Piper {
             },
             workers_running,
             runtime_phase,
+            normal_send_gate,
             metrics,
             runtime_fault,
             interface: "unknown".to_string(),
@@ -383,14 +439,16 @@ impl Piper {
         if previous == RuntimePhase::Stopping {
             return;
         }
+        self.normal_send_gate.close();
         self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
     }
 
     /// 请求 worker 停止并关闭所有命令通路。
     pub fn request_stop(&self) {
         self.runtime_phase.store(RuntimePhase::Stopping as u8, Ordering::Release);
+        self.normal_send_gate.close();
         self.workers_running.store(false, Ordering::Release);
-        self.clear_realtime_slot(DriverError::ChannelClosed, true);
+        self.clear_realtime_slot(DriverError::ChannelClosed, false);
     }
 
     /// 获取性能指标快照
@@ -1184,6 +1242,7 @@ impl Piper {
         {
             if count_fault_abort {
                 self.metrics.tx_fault_aborts_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics.tx_packages_fault_aborted_total.fetch_add(1, Ordering::Relaxed);
             }
             command.complete(Err(reason));
         }
@@ -1244,7 +1303,11 @@ impl Piper {
     }
 
     /// 将停机专用命令加入 shutdown lane，并返回确认句柄。
-    pub fn enqueue_shutdown(&self, frame: PiperFrame) -> Result<ShutdownReceipt, DriverError> {
+    pub fn enqueue_shutdown(
+        &self,
+        frame: PiperFrame,
+        deadline: Instant,
+    ) -> Result<ShutdownReceipt, DriverError> {
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
@@ -1253,7 +1316,7 @@ impl Piper {
         }
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        let command = ReliableCommand::confirmed(frame, ack_tx);
+        let command = ShutdownCommand::confirmed(frame, deadline, ack_tx);
         self.enqueue_shutdown_command(command)?;
         Ok(ShutdownReceipt { ack_rx })
     }
@@ -1310,7 +1373,7 @@ impl Piper {
         }
     }
 
-    fn enqueue_shutdown_command(&self, command: ReliableCommand) -> Result<(), DriverError> {
+    fn enqueue_shutdown_command(&self, command: ShutdownCommand) -> Result<(), DriverError> {
         if !self.tx_thread_alive() || !self.shutdown_lane_open() {
             command.complete(Err(DriverError::ChannelClosed));
             return Err(DriverError::ChannelClosed);
@@ -1335,6 +1398,7 @@ impl Piper {
 impl Drop for Piper {
     fn drop(&mut self) {
         self.runtime_phase.store(RuntimePhase::Stopping as u8, Ordering::Release);
+        self.normal_send_gate.close();
         self.workers_running.store(false, Ordering::Release);
 
         unsafe {
@@ -1342,7 +1406,7 @@ impl Drop for Piper {
             ManuallyDrop::drop(&mut self.shutdown_tx);
         }
 
-        self.clear_realtime_slot(DriverError::ChannelClosed, true);
+        self.clear_realtime_slot(DriverError::ChannelClosed, false);
 
         let join_timeout = Duration::from_secs(2);
 
@@ -1412,7 +1476,10 @@ mod tests {
     struct MockTxAdapter;
 
     impl piper_can::TxAdapter for MockTxAdapter {
-        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+        fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
             Ok(())
         }
     }
@@ -1422,7 +1489,10 @@ mod tests {
     }
 
     impl piper_can::TxAdapter for RecordingTxAdapter {
-        fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
             self.sent_frames.lock().expect("sent frames lock").push(frame);
             Ok(())
         }
@@ -1434,10 +1504,13 @@ mod tests {
     }
 
     impl piper_can::TxAdapter for FailOnNthTxAdapter {
-        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+        fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
             self.sends += 1;
             if self.sends == self.fail_on {
-                return Err(CanError::Timeout);
+                return Err(CanError::BufferOverflow);
             }
             Ok(())
         }
@@ -1450,7 +1523,7 @@ mod tests {
     }
 
     impl piper_can::TxAdapter for CoordinatedFailTxAdapter {
-        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+        fn send_until(&mut self, _frame: PiperFrame, _deadline: Instant) -> Result<(), CanError> {
             if !self.first_send {
                 self.first_send = true;
                 let _ = self.started_tx.send(());
@@ -1469,7 +1542,7 @@ mod tests {
     }
 
     impl piper_can::TxAdapter for BlockingFirstSendTxAdapter {
-        fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        fn send_until(&mut self, frame: PiperFrame, _deadline: Instant) -> Result<(), CanError> {
             self.sends += 1;
             self.sent_frames.lock().expect("sent frames lock").push(frame);
             if self.sends == 1 {
@@ -1485,7 +1558,15 @@ mod tests {
     }
 
     impl piper_can::TxAdapter for SlowTxAdapter {
-        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+        fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return Err(CanError::Timeout);
+            };
+            if remaining < self.delay {
+                std::thread::sleep(remaining);
+                return Err(CanError::Timeout);
+            }
             std::thread::sleep(self.delay);
             Ok(())
         }
@@ -1505,8 +1586,8 @@ mod tests {
         frame: PiperFrame,
         timeout: Duration,
     ) -> Result<(), DriverError> {
-        let receipt = piper.enqueue_shutdown(frame)?;
-        receipt.wait_until(Instant::now() + timeout)
+        let receipt = piper.enqueue_shutdown(frame, Instant::now() + timeout)?;
+        receipt.wait()
     }
 
     struct ScriptedRxAdapter {
@@ -1885,7 +1966,10 @@ mod tests {
         assert!(!piper.tx_thread_alive());
 
         let error = piper
-            .enqueue_shutdown(PiperFrame::new_standard(0x471, &[0x01]))
+            .enqueue_shutdown(
+                PiperFrame::new_standard(0x471, &[0x01]),
+                Instant::now() + Duration::from_millis(50),
+            )
             .expect_err("stopped tx thread should reject confirmed shutdown send");
 
         assert!(matches!(error, DriverError::ChannelClosed));
@@ -1945,10 +2029,10 @@ mod tests {
         )
         .unwrap();
         let receipt = piper
-            .enqueue_shutdown(PiperFrame::new_standard(0x471, &[0x01]))
+            .enqueue_shutdown(PiperFrame::new_standard(0x471, &[0x01]), Instant::now())
             .expect("enqueue should succeed");
         let error = receipt
-            .wait_until(Instant::now())
+            .wait()
             .expect_err("an expired deadline without a ready ack must time out");
 
         assert!(matches!(error, DriverError::Timeout));
@@ -1958,12 +2042,15 @@ mod tests {
     fn test_shutdown_receipt_returns_ready_ack_even_after_deadline_passes() {
         let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
         let receipt = piper
-            .enqueue_shutdown(PiperFrame::new_standard(0x471, &[0x01]))
+            .enqueue_shutdown(
+                PiperFrame::new_standard(0x471, &[0x01]),
+                Instant::now() + Duration::from_millis(10),
+            )
             .expect("enqueue should succeed");
         std::thread::sleep(Duration::from_millis(20));
 
         receipt
-            .wait_until(Instant::now())
+            .wait()
             .expect("ready ack should still be observed after the shared deadline passes");
     }
 
@@ -2116,8 +2203,9 @@ mod tests {
         let metrics = piper.get_metrics();
         assert_eq!(metrics.tx_frames_sent_total, 1);
         assert_eq!(metrics.tx_fault_aborts_total, 1);
-        assert_eq!(metrics.tx_package_sent, 1);
-        assert_eq!(metrics.tx_package_partial, 1);
+        assert_eq!(metrics.tx_packages_fault_aborted_total, 1);
+        assert_eq!(metrics.tx_packages_completed_total, 0);
+        assert_eq!(metrics.tx_packages_partial_total, 0);
     }
 
     #[test]
@@ -2217,6 +2305,18 @@ mod tests {
                 piper_clone.send_realtime_package_confirmed(second, Duration::from_millis(500));
             *pending_result_clone.lock().expect("pending result lock") = Some(result);
         });
+
+        let enqueue_deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if piper.realtime_slot.lock().expect("realtime slot lock").is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < enqueue_deadline,
+                "second confirmed realtime package should be pending before transport failure"
+            );
+            std::thread::yield_now();
+        }
 
         let _ = release_tx.send(());
         handle.join().expect("confirmed send thread should finish");

@@ -439,13 +439,13 @@ impl DualArmActiveMit {
     }
 
     fn fault_shutdown(self, timeout: Duration) -> (DualArmErrorState, FaultShutdown) {
+        let deadline = Instant::now() + timeout;
         self.left.driver.latch_fault();
         self.right.driver.latch_fault();
-        let left_pending = enqueue_stop_attempt(&self.left);
-        let right_pending = enqueue_stop_attempt(&self.right);
-        let deadline = Instant::now() + timeout;
-        let left_stop_attempt = resolve_stop_attempt(left_pending, deadline);
-        let right_stop_attempt = resolve_stop_attempt(right_pending, deadline);
+        let left_pending = enqueue_stop_attempt(&self.left, deadline);
+        let right_pending = enqueue_stop_attempt(&self.right, deadline);
+        let left_stop_attempt = resolve_stop_attempt(left_pending);
+        let right_stop_attempt = resolve_stop_attempt(right_pending);
         self.left.driver.request_stop();
         self.right.driver.request_stop();
         (
@@ -1278,16 +1278,16 @@ enum PendingStopAttempt {
     Immediate(StopAttemptResult),
 }
 
-fn enqueue_stop_attempt(piper: &Piper<Active<MitMode>>) -> PendingStopAttempt {
-    match RawCommander::new(&piper.driver).emergency_stop_enqueue() {
+fn enqueue_stop_attempt(piper: &Piper<Active<MitMode>>, deadline: Instant) -> PendingStopAttempt {
+    match RawCommander::new(&piper.driver).emergency_stop_enqueue(deadline) {
         Ok(receipt) => PendingStopAttempt::Receipt(receipt),
         Err(err) => PendingStopAttempt::Immediate(stop_attempt_from_robot_error(&err)),
     }
 }
 
-fn resolve_stop_attempt(pending: PendingStopAttempt, deadline: Instant) -> StopAttemptResult {
+fn resolve_stop_attempt(pending: PendingStopAttempt) -> StopAttemptResult {
     match pending {
-        PendingStopAttempt::Receipt(receipt) => match receipt.wait_until(deadline) {
+        PendingStopAttempt::Receipt(receipt) => match receipt.wait() {
             Ok(()) => StopAttemptResult::ConfirmedSent,
             Err(err) => stop_attempt_from_driver_error(&err),
         },
@@ -1529,7 +1529,14 @@ mod tests {
     }
 
     impl TxAdapter for RecordingTxAdapter {
-        fn send(&mut self, frame: PiperFrame) -> std::result::Result<(), CanError> {
+        fn send_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
             self.sent_frames.lock().expect("sent frames lock").push(frame);
             Ok(())
         }
@@ -1541,7 +1548,19 @@ mod tests {
     }
 
     impl TxAdapter for SlowRecordingTxAdapter {
-        fn send(&mut self, frame: PiperFrame) -> std::result::Result<(), CanError> {
+        fn send_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return Err(CanError::Timeout);
+            };
+            if remaining < self.delay {
+                thread::sleep(remaining);
+                return Err(CanError::Timeout);
+            }
             thread::sleep(self.delay);
             self.sent_frames.lock().expect("sent frames lock").push(frame);
             Ok(())
@@ -1554,7 +1573,14 @@ mod tests {
     }
 
     impl TxAdapter for FailOnNthFatalTxAdapter {
-        fn send(&mut self, _frame: PiperFrame) -> std::result::Result<(), CanError> {
+        fn send_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
             self.sends += 1;
             if self.sends == self.fail_on {
                 return Err(CanError::BufferOverflow);

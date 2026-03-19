@@ -53,7 +53,14 @@ struct MockTxAdapter {
 }
 
 impl piper_sdk::can::TxAdapter for MockTxAdapter {
-    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+    fn send_until(
+        &mut self,
+        frame: PiperFrame,
+        deadline: std::time::Instant,
+    ) -> Result<(), CanError> {
+        if deadline <= std::time::Instant::now() {
+            return Err(CanError::Timeout);
+        }
         self.sent_frames.lock().unwrap().push(frame);
         Ok(())
     }

@@ -6,13 +6,15 @@
 //! 3. 实时命令支持覆盖（Overwrite 策略）
 
 use piper_sdk::can::{CanError, PiperFrame, RxAdapter, TxAdapter};
-use piper_sdk::driver::command::{CommandPriority, PiperCommand, ReliableCommand};
-use piper_sdk::driver::{PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox};
+use piper_sdk::driver::command::{CommandPriority, PiperCommand, ReliableCommand, ShutdownCommand};
+use piper_sdk::driver::{
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
+};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Mock RX 适配器：模拟正常接收
 struct MockRxAdapter {
@@ -57,8 +59,18 @@ impl MockTxAdapter {
 }
 
 impl TxAdapter for MockTxAdapter {
-    fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
-        thread::sleep(self.send_delay);
+    fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(CanError::Timeout);
+        };
+        let sleep_for = self.send_delay.min(remaining);
+        if !sleep_for.is_zero() {
+            thread::sleep(sleep_for);
+        }
+        if self.send_delay > remaining {
+            return Err(CanError::Timeout);
+        }
         self.sent_frames.lock().unwrap().push_back(frame);
         Ok(())
     }
@@ -92,7 +104,8 @@ fn test_priority_scheduling() {
 
     // 创建命令通道
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let normal_send_gate = Arc::new(NormalSendGate::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_clone = realtime_slot.clone();
@@ -129,6 +142,7 @@ fn test_priority_scheduling() {
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
+            normal_send_gate,
             metrics_tx,
             ctx_tx,
             last_fault_tx,
@@ -221,7 +235,15 @@ fn test_reliable_command_not_dropped() {
     }
 
     impl TxAdapter for SlowTxAdapter {
-        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+        fn send_until(&mut self, _frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return Err(CanError::Timeout);
+            };
+            if remaining < self.send_delay {
+                thread::sleep(remaining);
+                return Err(CanError::Timeout);
+            }
             thread::sleep(self.send_delay);
             self.sent_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -233,7 +255,8 @@ fn test_reliable_command_not_dropped() {
 
     // 创建命令通道（可靠队列容量 10）
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let normal_send_gate = Arc::new(NormalSendGate::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -251,6 +274,7 @@ fn test_reliable_command_not_dropped() {
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
+            normal_send_gate,
             metrics_tx,
             ctx_tx,
             last_fault_tx,
@@ -352,7 +376,15 @@ fn test_realtime_overwrite_strategy() {
     }
 
     impl TxAdapter for SlowTxAdapter {
-        fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        fn send_until(&mut self, frame: PiperFrame, deadline: Instant) -> Result<(), CanError> {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return Err(CanError::Timeout);
+            };
+            if remaining < self.send_delay {
+                thread::sleep(remaining);
+                return Err(CanError::Timeout);
+            }
             thread::sleep(self.send_delay);
             self.sent_frames.lock().unwrap().push_back(frame);
             Ok(())
@@ -364,7 +396,8 @@ fn test_realtime_overwrite_strategy() {
 
     // 创建命令通道（实时队列容量 1）
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ReliableCommand>(4);
+    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let normal_send_gate = Arc::new(NormalSendGate::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_clone = realtime_slot.clone();
@@ -383,6 +416,7 @@ fn test_realtime_overwrite_strategy() {
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
+            normal_send_gate,
             metrics_tx,
             ctx_tx,
             last_fault_tx,
