@@ -4,7 +4,7 @@
 //!
 //! 参考：`daemon_implementation_plan.md` 第 4.1.3 节
 
-use crate::client_manager::{ClientAddr, ClientManager};
+use crate::client_manager::{BridgePeerAuth, ClientAddr, ClientManager};
 use piper_can::BridgeTxAdapter;
 use piper_can::gs_usb::{GsUsbCanAdapter, split::GsUsbRxAdapter};
 use piper_can::gs_usb_udp::protocol::{self, ErrorCode, Message, StatusResponse};
@@ -1480,9 +1480,25 @@ impl Daemon {
         };
         match msg {
             piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
-                // 更新客户端活动时间
-                if let Err(e) = clients.write().unwrap().update_activity(client_id) {
-                    eprintln!("[Client {}] Failed to update activity: {}", client_id, e);
+                let mut clients_guard = clients.write().unwrap();
+                match clients_guard.authorize_peer(&peer.addr, Some(client_id)) {
+                    BridgePeerAuth::Authorized { active_id } => {
+                        if let Err(e) = clients_guard.update_activity(active_id) {
+                            eprintln!("[Client {}] Failed to update activity: {}", active_id, e);
+                        }
+                    },
+                    BridgePeerAuth::NotConnected => {
+                        eprintln!(
+                            "[Unix IPC] Ignoring heartbeat from unregistered peer {}",
+                            peer.reply_path
+                        );
+                    },
+                    BridgePeerAuth::ClientIdMismatch { active_id } => {
+                        eprintln!(
+                            "[Unix IPC] Ignoring heartbeat for client {} from peer {} (active client {})",
+                            client_id, peer.reply_path, active_id
+                        );
+                    },
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::Connect {
@@ -1558,7 +1574,38 @@ impl Daemon {
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id, seq } => {
-                clients.write().unwrap().unregister(client_id);
+                let mut clients_guard = clients.write().unwrap();
+                match clients_guard.authorize_peer(&peer.addr, Some(client_id)) {
+                    BridgePeerAuth::Authorized { active_id } => {
+                        clients_guard.unregister(active_id);
+                    },
+                    BridgePeerAuth::NotConnected => {
+                        drop(clients_guard);
+                        send_unix_error_response(
+                            socket,
+                            peer.reply_path.as_str(),
+                            ErrorCode::NotConnected,
+                            "Peer is not connected",
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::ClientIdMismatch { active_id } => {
+                        drop(clients_guard);
+                        send_unix_error_response(
+                            socket,
+                            peer.reply_path.as_str(),
+                            ErrorCode::InvalidMessage,
+                            &format!(
+                                "Client {} does not match active session {} for peer",
+                                client_id, active_id
+                            ),
+                            seq,
+                        );
+                        return;
+                    },
+                }
+                drop(clients_guard);
 
                 let mut ack_buf = [0u8; 8];
                 let encoded =
@@ -1569,6 +1616,23 @@ impl Daemon {
                 }
             },
             Message::SendFrame { frame, seq } => {
+                match clients.read().unwrap().authorize_peer(&peer.addr, None) {
+                    BridgePeerAuth::Authorized { .. } => {},
+                    BridgePeerAuth::NotConnected => {
+                        send_unix_error_response(
+                            socket,
+                            peer.reply_path.as_str(),
+                            ErrorCode::NotConnected,
+                            "Peer is not connected",
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::ClientIdMismatch { .. } => {
+                        unreachable!("send-frame authorization does not compare client ids")
+                    },
+                }
+
                 // 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
@@ -1610,21 +1674,32 @@ impl Daemon {
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
-                // ✅ SetFilter 消息处理
                 let mut clients_guard = clients.write().unwrap();
-                match clients_guard.set_filters(client_id, filters.clone()) {
-                    Ok(()) => {
+                match clients_guard.authorize_peer(&peer.addr, Some(client_id)) {
+                    BridgePeerAuth::Authorized { active_id } => {
+                        if let Err(e) = clients_guard.set_filters(active_id, filters.clone()) {
+                            eprintln!("[Client {}] Failed to set filters: {}", active_id, e);
+                        } else {
+                            eprintln!(
+                                "[Client {}] Filters updated: {} rules",
+                                active_id,
+                                filters.len()
+                            );
+                        }
+                    },
+                    BridgePeerAuth::NotConnected => {
                         eprintln!(
-                            "[Client {}] Filters updated: {} rules",
-                            client_id,
-                            filters.len()
+                            "[Unix IPC] Ignoring SetFilter from unregistered peer {}",
+                            peer.reply_path
                         );
                     },
-                    Err(e) => {
-                        eprintln!("[Client {}] Failed to set filters: {}", client_id, e);
+                    BridgePeerAuth::ClientIdMismatch { active_id } => {
+                        eprintln!(
+                            "[Unix IPC] Ignoring SetFilter for client {} from peer {} (active client {})",
+                            client_id, peer.reply_path, active_id
+                        );
                     },
                 }
-                // 可选：发送确认消息给客户端
             },
             piper_can::gs_usb_udp::protocol::Message::GetStatus { seq } => {
                 let clients_guard = clients.read().unwrap();
@@ -1700,12 +1775,29 @@ impl Daemon {
         } = ctx;
         match msg {
             piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
-                // 更新客户端活动时间
-                if let Err(e) = clients.write().unwrap().update_activity(client_id) {
-                    eprintln!(
-                        "[UDP Client {}] Failed to update activity: {}",
-                        client_id, e
-                    );
+                let peer_addr = ClientAddr::Udp(client_addr);
+                let mut clients_guard = clients.write().unwrap();
+                match clients_guard.authorize_peer(&peer_addr, Some(client_id)) {
+                    BridgePeerAuth::Authorized { active_id } => {
+                        if let Err(e) = clients_guard.update_activity(active_id) {
+                            eprintln!(
+                                "[UDP Client {}] Failed to update activity: {}",
+                                active_id, e
+                            );
+                        }
+                    },
+                    BridgePeerAuth::NotConnected => {
+                        eprintln!(
+                            "[UDP IPC] Ignoring heartbeat from unregistered peer {}",
+                            client_addr
+                        );
+                    },
+                    BridgePeerAuth::ClientIdMismatch { active_id } => {
+                        eprintln!(
+                            "[UDP IPC] Ignoring heartbeat for client {} from peer {} (active client {})",
+                            client_id, client_addr, active_id
+                        );
+                    },
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::Connect {
@@ -1787,7 +1879,39 @@ impl Daemon {
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id, seq } => {
-                clients.write().unwrap().unregister(client_id);
+                let peer_addr = ClientAddr::Udp(client_addr);
+                let mut clients_guard = clients.write().unwrap();
+                match clients_guard.authorize_peer(&peer_addr, Some(client_id)) {
+                    BridgePeerAuth::Authorized { active_id } => {
+                        clients_guard.unregister(active_id);
+                    },
+                    BridgePeerAuth::NotConnected => {
+                        drop(clients_guard);
+                        send_udp_error_response(
+                            socket,
+                            client_addr,
+                            ErrorCode::NotConnected,
+                            "Peer is not connected",
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::ClientIdMismatch { active_id } => {
+                        drop(clients_guard);
+                        send_udp_error_response(
+                            socket,
+                            client_addr,
+                            ErrorCode::InvalidMessage,
+                            &format!(
+                                "Client {} does not match active session {} for peer",
+                                client_id, active_id
+                            ),
+                            seq,
+                        );
+                        return;
+                    },
+                }
+                drop(clients_guard);
 
                 let mut ack_buf = [0u8; 8];
                 let encoded =
@@ -1798,6 +1922,24 @@ impl Daemon {
                 }
             },
             Message::SendFrame { frame, seq } => {
+                let peer_addr = ClientAddr::Udp(client_addr);
+                match clients.read().unwrap().authorize_peer(&peer_addr, None) {
+                    BridgePeerAuth::Authorized { .. } => {},
+                    BridgePeerAuth::NotConnected => {
+                        send_udp_error_response(
+                            socket,
+                            client_addr,
+                            ErrorCode::NotConnected,
+                            "Peer is not connected",
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::ClientIdMismatch { .. } => {
+                        unreachable!("send-frame authorization does not compare client ids")
+                    },
+                }
+
                 // ✅ 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
@@ -1838,18 +1980,31 @@ impl Daemon {
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
-                // ✅ SetFilter 消息处理（UDP）
+                let peer_addr = ClientAddr::Udp(client_addr);
                 let mut clients_guard = clients.write().unwrap();
-                match clients_guard.set_filters(client_id, filters.clone()) {
-                    Ok(()) => {
+                match clients_guard.authorize_peer(&peer_addr, Some(client_id)) {
+                    BridgePeerAuth::Authorized { active_id } => {
+                        if let Err(e) = clients_guard.set_filters(active_id, filters.clone()) {
+                            eprintln!("[UDP Client {}] Failed to set filters: {}", active_id, e);
+                        } else {
+                            eprintln!(
+                                "[UDP Client {}] Filters updated: {} rules",
+                                active_id,
+                                filters.len()
+                            );
+                        }
+                    },
+                    BridgePeerAuth::NotConnected => {
                         eprintln!(
-                            "[UDP Client {}] Filters updated: {} rules",
-                            client_id,
-                            filters.len()
+                            "[UDP IPC] Ignoring SetFilter from unregistered peer {}",
+                            client_addr
                         );
                     },
-                    Err(e) => {
-                        eprintln!("[UDP Client {}] Failed to set filters: {}", client_id, e);
+                    BridgePeerAuth::ClientIdMismatch { active_id } => {
+                        eprintln!(
+                            "[UDP IPC] Ignoring SetFilter for client {} from peer {} (active client {})",
+                            client_id, client_addr, active_id
+                        );
                     },
                 }
             },
@@ -2283,6 +2438,28 @@ mod tests {
         }
     }
 
+    fn test_handler_ctx(test_ctx: &TestIpcContext) -> IpcHandlerContext<'_> {
+        IpcHandlerContext {
+            tx_adapter: &test_ctx.tx_adapter,
+            device_state: &test_ctx.device_state,
+            clients: &test_ctx.clients,
+            stats: &test_ctx.stats,
+        }
+    }
+
+    fn recv_udp_protocol_message(socket: &std::net::UdpSocket) -> Message {
+        let mut buf = [0u8; 256];
+        let (len, _) = socket.recv_from(&mut buf).unwrap();
+        protocol::decode_message(&buf[..len]).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn recv_unix_protocol_message(socket: &UnixDatagram) -> Message {
+        let mut buf = [0u8; 256];
+        let len = socket.recv(&mut buf).unwrap();
+        protocol::decode_message(&buf[..len]).unwrap()
+    }
+
     #[cfg(unix)]
     fn unique_test_socket_path(label: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2360,12 +2537,7 @@ mod tests {
     #[test]
     fn test_handle_ipc_message_udp_connect_commits_only_after_ack_send() {
         let test_ctx = test_ipc_context();
-        let ctx = IpcHandlerContext {
-            tx_adapter: &test_ctx.tx_adapter,
-            device_state: &test_ctx.device_state,
-            clients: &test_ctx.clients,
-            stats: &test_ctx.stats,
-        };
+        let ctx = test_handler_ctx(&test_ctx);
 
         let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2406,12 +2578,7 @@ mod tests {
     #[test]
     fn test_handle_ipc_message_unix_connect_commits_only_after_ack_send() {
         let test_ctx = test_ipc_context();
-        let ctx = IpcHandlerContext {
-            tx_adapter: &test_ctx.tx_adapter,
-            device_state: &test_ctx.device_state,
-            clients: &test_ctx.clients,
-            stats: &test_ctx.stats,
-        };
+        let ctx = test_handler_ctx(&test_ctx);
 
         let server_path = unique_test_socket_path("server");
         let client_path = unique_test_socket_path("client");
@@ -2462,12 +2629,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let test_ctx = test_ipc_context();
-        let ctx = IpcHandlerContext {
-            tx_adapter: &test_ctx.tx_adapter,
-            device_state: &test_ctx.device_state,
-            clients: &test_ctx.clients,
-            stats: &test_ctx.stats,
-        };
+        let ctx = test_handler_ctx(&test_ctx);
 
         let server_path = unique_test_socket_path("server_no_path_peer");
         let _ = std::fs::remove_file(&server_path);
@@ -2504,12 +2666,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let test_ctx = test_ipc_context();
-        let ctx = IpcHandlerContext {
-            tx_adapter: &test_ctx.tx_adapter,
-            device_state: &test_ctx.device_state,
-            clients: &test_ctx.clients,
-            stats: &test_ctx.stats,
-        };
+        let ctx = test_handler_ctx(&test_ctx);
 
         let server_path = unique_test_socket_path("server_invalid_utf8_peer");
         let client_path = unique_invalid_utf8_socket_path("invalid_utf8_client");
@@ -2608,5 +2765,374 @@ mod tests {
         assert!(test_ctx.clients.read().unwrap().contains(7));
 
         let _ = std::fs::remove_file(&server_path);
+    }
+
+    #[test]
+    fn test_handle_ipc_message_udp_enforces_sender_auth_for_steady_state_messages() {
+        let test_ctx = test_ipc_context();
+
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for socket in [&peer_a, &peer_b, &peer_c] {
+            socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        }
+
+        let addr_a = peer_a.local_addr().unwrap();
+        let addr_b = peer_b.local_addr().unwrap();
+        let addr_c = peer_c.local_addr().unwrap();
+
+        let filters = vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
+            0x100, 0x1ff,
+        )];
+        {
+            let mut clients = test_ctx.clients.write().unwrap();
+            clients.register(7, ClientAddr::Udp(addr_a), filters.clone()).unwrap();
+            clients.register(8, ClientAddr::Udp(addr_b), vec![]).unwrap();
+
+            let prepared = clients
+                .prepare_registration_manual(
+                    17,
+                    ClientAddr::Udp(addr_a),
+                    filters.clone(),
+                    #[cfg(unix)]
+                    None,
+                )
+                .unwrap();
+            clients.commit_prepared_registration(prepared);
+        }
+
+        let send_count = Arc::new(TestAtomicU32::new(0));
+        *test_ctx.tx_adapter.lock().unwrap() = Some(Box::new(CountingBridgeTxAdapter {
+            sends: Arc::clone(&send_count),
+        }));
+
+        std::thread::sleep(Duration::from_millis(5));
+        let last_active_before = test_ctx.clients.read().unwrap().last_active_for(17).unwrap();
+
+        Daemon::handle_ipc_message_udp(
+            Message::Heartbeat { client_id: 17 },
+            addr_b,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        assert_eq!(
+            test_ctx.clients.read().unwrap().last_active_for(17),
+            Some(last_active_before)
+        );
+
+        Daemon::handle_ipc_message_udp(
+            Message::Heartbeat { client_id: 7 },
+            addr_a,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        assert_eq!(
+            test_ctx.clients.read().unwrap().last_active_for(17),
+            Some(last_active_before)
+        );
+
+        Daemon::handle_ipc_message_udp(
+            Message::SetFilter {
+                client_id: 17,
+                filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
+                    0x300, 0x3ff,
+                )],
+            },
+            addr_b,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        assert_eq!(
+            test_ctx.clients.read().unwrap().filters_for(17),
+            Some(filters.clone())
+        );
+
+        Daemon::handle_ipc_message_udp(
+            Message::SetFilter {
+                client_id: 7,
+                filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
+                    0x400, 0x4ff,
+                )],
+            },
+            addr_a,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        assert_eq!(
+            test_ctx.clients.read().unwrap().filters_for(17),
+            Some(filters.clone())
+        );
+
+        Daemon::handle_ipc_message_udp(
+            Message::Disconnect {
+                client_id: 17,
+                seq: 41,
+            },
+            addr_b,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_udp_protocol_message(&peer_b) {
+            Message::Error { seq, code, .. } => {
+                assert_eq!(seq, 41);
+                assert_eq!(code, ErrorCode::InvalidMessage);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+        assert!(test_ctx.clients.read().unwrap().contains(17));
+
+        Daemon::handle_ipc_message_udp(
+            Message::Disconnect {
+                client_id: 7,
+                seq: 42,
+            },
+            addr_a,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_udp_protocol_message(&peer_a) {
+            Message::Error { seq, code, .. } => {
+                assert_eq!(seq, 42);
+                assert_eq!(code, ErrorCode::InvalidMessage);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+        assert!(test_ctx.clients.read().unwrap().contains(17));
+        assert!(!test_ctx.clients.read().unwrap().contains(7));
+
+        Daemon::handle_ipc_message_udp(
+            Message::SendFrame {
+                frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
+                seq: 43,
+            },
+            addr_c,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_udp_protocol_message(&peer_c) {
+            Message::Error { seq, code, .. } => {
+                assert_eq!(seq, 43);
+                assert_eq!(code, ErrorCode::NotConnected);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+        assert_eq!(send_count.load(Ordering::Relaxed), 0);
+
+        Daemon::handle_ipc_message_udp(
+            Message::SendFrame {
+                frame: piper_can::PiperFrame::new_standard(0x124, &[4, 5, 6]),
+                seq: 44,
+            },
+            addr_a,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_udp_protocol_message(&peer_a) {
+            Message::SendAck { seq, status } => {
+                assert_eq!(seq, 44);
+                assert_eq!(status, 0);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+        assert_eq!(send_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_ipc_message_unix_enforces_sender_auth_for_steady_state_messages() {
+        let test_ctx = test_ipc_context();
+
+        let server_path = unique_test_socket_path("auth_server");
+        let peer_a_path = unique_test_socket_path("auth_peer_a");
+        let peer_b_path = unique_test_socket_path("auth_peer_b");
+        let peer_c_path = unique_test_socket_path("auth_peer_c");
+        for path in [&server_path, &peer_a_path, &peer_b_path, &peer_c_path] {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let server = UnixDatagram::bind(&server_path).unwrap();
+        let peer_a = UnixDatagram::bind(&peer_a_path).unwrap();
+        let peer_b = UnixDatagram::bind(&peer_b_path).unwrap();
+        let peer_c = UnixDatagram::bind(&peer_c_path).unwrap();
+        for socket in [&peer_a, &peer_b, &peer_c] {
+            socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        }
+
+        let addr_a = std::os::unix::net::SocketAddr::from_pathname(&peer_a_path).unwrap();
+        let addr_b = std::os::unix::net::SocketAddr::from_pathname(&peer_b_path).unwrap();
+        let addr_c = std::os::unix::net::SocketAddr::from_pathname(&peer_c_path).unwrap();
+
+        let peer_a_key = ClientAddr::Unix(peer_a_path.clone());
+        let peer_b_key = ClientAddr::Unix(peer_b_path.clone());
+        let filters = vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
+            0x100, 0x1ff,
+        )];
+        {
+            let mut clients = test_ctx.clients.write().unwrap();
+            let prepared = clients
+                .prepare_registration_manual(
+                    7,
+                    peer_a_key.clone(),
+                    filters.clone(),
+                    Some(addr_a.clone()),
+                )
+                .unwrap();
+            clients.commit_prepared_registration(prepared);
+            let prepared = clients
+                .prepare_registration_manual(8, peer_b_key.clone(), vec![], Some(addr_b.clone()))
+                .unwrap();
+            clients.commit_prepared_registration(prepared);
+
+            let prepared = clients
+                .prepare_registration_manual(
+                    17,
+                    peer_a_key.clone(),
+                    filters.clone(),
+                    Some(addr_a.clone()),
+                )
+                .unwrap();
+            clients.commit_prepared_registration(prepared);
+        }
+
+        let send_count = Arc::new(TestAtomicU32::new(0));
+        *test_ctx.tx_adapter.lock().unwrap() = Some(Box::new(CountingBridgeTxAdapter {
+            sends: Arc::clone(&send_count),
+        }));
+
+        std::thread::sleep(Duration::from_millis(5));
+        let last_active_before = test_ctx.clients.read().unwrap().last_active_for(17).unwrap();
+
+        Daemon::handle_ipc_message(
+            Message::Heartbeat { client_id: 17 },
+            addr_b.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        assert_eq!(
+            test_ctx.clients.read().unwrap().last_active_for(17),
+            Some(last_active_before)
+        );
+
+        Daemon::handle_ipc_message(
+            Message::Heartbeat { client_id: 7 },
+            addr_a.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        assert_eq!(
+            test_ctx.clients.read().unwrap().last_active_for(17),
+            Some(last_active_before)
+        );
+
+        Daemon::handle_ipc_message(
+            Message::SetFilter {
+                client_id: 17,
+                filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
+                    0x300, 0x3ff,
+                )],
+            },
+            addr_b.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        assert_eq!(
+            test_ctx.clients.read().unwrap().filters_for(17),
+            Some(filters.clone())
+        );
+
+        Daemon::handle_ipc_message(
+            Message::SetFilter {
+                client_id: 7,
+                filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
+                    0x400, 0x4ff,
+                )],
+            },
+            addr_a.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        assert_eq!(
+            test_ctx.clients.read().unwrap().filters_for(17),
+            Some(filters.clone())
+        );
+
+        Daemon::handle_ipc_message(
+            Message::Disconnect {
+                client_id: 17,
+                seq: 51,
+            },
+            addr_b.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_unix_protocol_message(&peer_b) {
+            Message::Error { seq, code, .. } => {
+                assert_eq!(seq, 51);
+                assert_eq!(code, ErrorCode::InvalidMessage);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+        assert!(test_ctx.clients.read().unwrap().contains(17));
+
+        Daemon::handle_ipc_message(
+            Message::Disconnect {
+                client_id: 7,
+                seq: 52,
+            },
+            addr_a.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_unix_protocol_message(&peer_a) {
+            Message::Error { seq, code, .. } => {
+                assert_eq!(seq, 52);
+                assert_eq!(code, ErrorCode::InvalidMessage);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+        assert!(test_ctx.clients.read().unwrap().contains(17));
+        assert!(!test_ctx.clients.read().unwrap().contains(7));
+
+        Daemon::handle_ipc_message(
+            Message::SendFrame {
+                frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
+                seq: 53,
+            },
+            addr_c.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_unix_protocol_message(&peer_c) {
+            Message::Error { seq, code, .. } => {
+                assert_eq!(seq, 53);
+                assert_eq!(code, ErrorCode::NotConnected);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+        assert_eq!(send_count.load(Ordering::Relaxed), 0);
+
+        Daemon::handle_ipc_message(
+            Message::SendFrame {
+                frame: piper_can::PiperFrame::new_standard(0x124, &[4, 5, 6]),
+                seq: 54,
+            },
+            addr_a,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_unix_protocol_message(&peer_a) {
+            Message::SendAck { seq, status } => {
+                assert_eq!(seq, 54);
+                assert_eq!(status, 0);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+        assert_eq!(send_count.load(Ordering::Relaxed), 1);
+
+        for path in [&server_path, &peer_a_path, &peer_b_path, &peer_c_path] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

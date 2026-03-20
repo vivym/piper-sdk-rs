@@ -113,6 +113,14 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+/// bridge steady-state sender 身份校验结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgePeerAuth {
+    NotConnected,
+    Authorized { active_id: u32 },
+    ClientIdMismatch { active_id: u32 },
+}
+
 /// 客户端管理器
 pub struct ClientManager {
     clients: HashMap<u32, Client>,
@@ -369,6 +377,24 @@ impl ClientManager {
         self.remove_client_internal(id);
     }
 
+    /// 按 active peer 地址校验 steady-state sender 身份
+    pub fn authorize_peer(
+        &self,
+        addr: &ClientAddr,
+        claimed_client_id: Option<u32>,
+    ) -> BridgePeerAuth {
+        let Some(active_id) = self.addr_to_id.get(addr).copied() else {
+            return BridgePeerAuth::NotConnected;
+        };
+
+        match claimed_client_id {
+            Some(claimed_id) if claimed_id != active_id => {
+                BridgePeerAuth::ClientIdMismatch { active_id }
+            },
+            _ => BridgePeerAuth::Authorized { active_id },
+        }
+    }
+
     /// 更新客户端活动时间（用于心跳）
     ///
     /// # 返回
@@ -444,6 +470,16 @@ impl ClientManager {
     #[cfg(test)]
     pub fn active_client_id_for_addr(&self, addr: &ClientAddr) -> Option<u32> {
         self.addr_to_id.get(addr).copied()
+    }
+
+    #[cfg(test)]
+    pub fn last_active_for(&self, id: u32) -> Option<Instant> {
+        self.clients.get(&id).map(|client| client.last_active)
+    }
+
+    #[cfg(test)]
+    pub fn filters_for(&self, id: u32) -> Option<Vec<CanIdFilter>> {
+        self.clients.get(&id).map(|client| client.filters.clone())
     }
 }
 
@@ -856,5 +892,81 @@ mod tests {
         assert!(manager.contains(old_id));
         assert_eq!(manager.count(), 1);
         assert_eq!(manager.active_client_id_for_addr(&addr), Some(old_id));
+    }
+
+    #[test]
+    fn test_authorize_peer_matching_id() {
+        let mut manager = ClientManager::new();
+        let addr = ClientAddr::Udp("127.0.0.1:9060".parse().unwrap());
+        manager.register(7, addr.clone(), vec![]).unwrap();
+
+        assert_eq!(
+            manager.authorize_peer(&addr, Some(7)),
+            BridgePeerAuth::Authorized { active_id: 7 }
+        );
+    }
+
+    #[test]
+    fn test_authorize_peer_mismatched_id() {
+        let mut manager = ClientManager::new();
+        let addr = ClientAddr::Udp("127.0.0.1:9061".parse().unwrap());
+        manager.register(7, addr.clone(), vec![]).unwrap();
+
+        assert_eq!(
+            manager.authorize_peer(&addr, Some(9)),
+            BridgePeerAuth::ClientIdMismatch { active_id: 7 }
+        );
+    }
+
+    #[test]
+    fn test_authorize_peer_not_connected() {
+        let manager = ClientManager::new();
+        let addr = ClientAddr::Udp("127.0.0.1:9062".parse().unwrap());
+
+        assert_eq!(
+            manager.authorize_peer(&addr, Some(1)),
+            BridgePeerAuth::NotConnected
+        );
+        assert_eq!(
+            manager.authorize_peer(&addr, None),
+            BridgePeerAuth::NotConnected
+        );
+    }
+
+    #[test]
+    fn test_authorize_peer_ignores_pending_replacement_until_commit() {
+        let mut manager = ClientManager::new();
+        let addr = ClientAddr::Udp("127.0.0.1:9063".parse().unwrap());
+
+        let old_id = manager.register_auto(addr.clone(), vec![]).unwrap();
+        let prepared = manager
+            .prepare_registration_manual(
+                77,
+                addr.clone(),
+                vec![],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.authorize_peer(&addr, Some(old_id)),
+            BridgePeerAuth::Authorized { active_id: old_id }
+        );
+        assert_eq!(
+            manager.authorize_peer(&addr, Some(77)),
+            BridgePeerAuth::ClientIdMismatch { active_id: old_id }
+        );
+
+        manager.commit_prepared_registration(prepared);
+
+        assert_eq!(
+            manager.authorize_peer(&addr, Some(77)),
+            BridgePeerAuth::Authorized { active_id: 77 }
+        );
+        assert_eq!(
+            manager.authorize_peer(&addr, Some(old_id)),
+            BridgePeerAuth::ClientIdMismatch { active_id: 77 }
+        );
     }
 }
