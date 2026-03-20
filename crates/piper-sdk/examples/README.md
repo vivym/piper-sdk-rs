@@ -36,6 +36,11 @@
   - 评估非实时 bridge/debug 链路的 host-side request/event 开销
   - 运行：`cargo run --example bridge_latency_bench`
 
+- **`embedded_bridge_host`** - 控制进程内嵌 bridge host 示例
+  - 先创建控制进程，再把非实时 bridge host attach 到控制面
+  - 默认不开 raw frame tap，只有客户端显式订阅时才启用
+  - 运行：`cargo run --example embedded_bridge_host`
+
 ### 计划中的示例
 
 - `torque_control` - 力控演示

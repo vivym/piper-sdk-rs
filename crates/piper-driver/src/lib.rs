@@ -30,7 +30,7 @@ pub use command::{CommandPriority, PiperCommand};
 pub use error::DriverError; // 原 DriverError
 pub use fps_stats::{FpsCounts, FpsResult};
 pub use heartbeat::ConnectionMonitor;
-pub use hooks::{FrameCallback, HookManager};
+pub use hooks::{FrameCallback, HookHandle, HookManager};
 pub use metrics::{MetricsSnapshot, PiperMetrics};
 pub use mode::{AtomicDriverMode, DriverMode};
 pub use pipeline::{PipelineConfig, io_loop, rx_loop, tx_loop_mailbox};

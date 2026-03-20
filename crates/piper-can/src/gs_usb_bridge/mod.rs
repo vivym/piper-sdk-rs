@@ -383,6 +383,19 @@ impl GsUsbBridgeClient {
         }
     }
 
+    pub fn set_raw_frame_tap(&mut self, enabled: bool) -> BridgeResult<()> {
+        self.ensure_connected()?;
+        let request_id = self.next_request_id();
+        self.send_request(ClientRequest::SetRawFrameTap {
+            request_id,
+            enabled,
+        })?;
+        match self.wait_for_response(request_id)? {
+            ServerResponse::Ok { .. } => Ok(()),
+            response => Err(self.unexpected_response("ok response", response)),
+        }
+    }
+
     pub fn ping(&mut self) -> BridgeResult<()> {
         self.ensure_connected()?;
         let request_id = self.next_request_id();

@@ -90,6 +90,15 @@ pub trait FrameCallback: Send + Sync {
     }
 }
 
+/// Runtime hook registration handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HookHandle(u64);
+
+struct HookEntry {
+    handle: HookHandle,
+    callback: Arc<dyn FrameCallback>,
+}
+
 /// 钩子管理器
 ///
 /// 专门管理运行时回调列表。
@@ -132,10 +141,16 @@ pub trait FrameCallback: Send + Sync {
 ///     hooks.trigger_all(&frame);
 /// }
 /// ```
-#[derive(Default)]
 pub struct HookManager {
+    next_handle: u64,
     /// 回调列表
-    callbacks: Vec<Arc<dyn FrameCallback>>,
+    callbacks: Vec<HookEntry>,
+}
+
+impl Default for HookManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HookManager {
@@ -143,6 +158,7 @@ impl HookManager {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            next_handle: 1,
             callbacks: Vec::new(),
         }
     }
@@ -169,8 +185,21 @@ impl HookManager {
     /// let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
     /// hooks.add_callback(callback);
     /// ```
-    pub fn add_callback(&mut self, callback: Arc<dyn FrameCallback>) {
-        self.callbacks.push(callback);
+    pub fn add_callback(&mut self, callback: Arc<dyn FrameCallback>) -> HookHandle {
+        let handle = HookHandle(self.next_handle);
+        self.next_handle = self.next_handle.wrapping_add(1).max(1);
+        self.callbacks.push(HookEntry { handle, callback });
+        handle
+    }
+
+    /// 移除指定回调。
+    pub fn remove_callback(&mut self, handle: HookHandle) -> bool {
+        if let Some(index) = self.callbacks.iter().position(|entry| entry.handle == handle) {
+            self.callbacks.swap_remove(index);
+            true
+        } else {
+            false
+        }
     }
 
     /// 移除所有回调
@@ -210,8 +239,8 @@ impl HookManager {
     /// hooks.trigger_all(&frame);
     /// ```
     pub fn trigger_all(&self, frame: &PiperFrame) {
-        for callback in self.callbacks.iter() {
-            callback.on_frame_received(frame);
+        for entry in self.callbacks.iter() {
+            entry.callback.on_frame_received(frame);
             // ^^^^ 使用 try_send，<1μs，非阻塞
         }
     }
@@ -240,8 +269,8 @@ impl HookManager {
     /// hooks.trigger_all_sent(&frame);
     /// ```
     pub fn trigger_all_sent(&self, frame: &PiperFrame) {
-        for callback in self.callbacks.iter() {
-            callback.on_frame_sent(frame);
+        for entry in self.callbacks.iter() {
+            entry.callback.on_frame_sent(frame);
         }
     }
 
@@ -295,7 +324,7 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
         let callback = Arc::new(TestCallback { tx, count });
 
-        hooks.add_callback(callback);
+        let _handle = hooks.add_callback(callback);
         assert_eq!(hooks.len(), 1);
     }
 
@@ -372,5 +401,19 @@ mod tests {
 
         hooks.clear();
         assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn test_hook_manager_remove_callback() {
+        let mut hooks = HookManager::new();
+        let (tx, _rx) = bounded(10);
+        let count = Arc::new(AtomicU64::new(0));
+        let callback = Arc::new(TestCallback { tx, count });
+
+        let handle = hooks.add_callback(callback);
+        assert_eq!(hooks.len(), 1);
+        assert!(hooks.remove_callback(handle));
+        assert!(hooks.is_empty());
+        assert!(!hooks.remove_callback(handle));
     }
 }

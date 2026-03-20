@@ -73,6 +73,10 @@ impl PiperBridgeClient {
         self.inner.set_filters(filters)
     }
 
+    pub fn set_raw_frame_tap(&mut self, enabled: bool) -> BridgeResult<()> {
+        self.inner.set_raw_frame_tap(enabled)
+    }
+
     pub fn ping(&mut self) -> BridgeResult<()> {
         self.inner.ping()
     }

@@ -43,7 +43,10 @@ pub use bridge::{
     BridgeRole, BridgeStatus, BridgeTlsClientConfig, CanIdFilter, ErrorCode, MaintenanceLease,
     PiperBridgeClient, SessionToken,
 };
-pub use bridge_host::{BridgeHostConfig, BridgeHostError, BridgeTlsServerConfig, PiperBridgeHost};
+pub use bridge_host::{
+    BridgeControllerBackend, BridgeHostConfig, BridgeHostError, BridgeMaintenanceState,
+    BridgeStatusInput, BridgeTlsServerConfig, PiperBridgeBackend, PiperBridgeHost,
+};
 pub use builder::PiperBuilder;
 pub use diagnostics::PiperDiagnostics;
 pub use dual_arm::{

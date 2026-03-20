@@ -273,6 +273,7 @@ fn run_receive_bench(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = connect_client(endpoint, args, BridgeRole::Observer, timeout)?;
+    client.set_raw_frame_tap(true)?;
     let mut stats = LatencyStats::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     while stats.samples.len() < receive_count as usize && Instant::now() < deadline {

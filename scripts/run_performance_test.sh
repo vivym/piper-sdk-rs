@@ -1,10 +1,10 @@
 #!/bin/bash
-# Piper Bridge Host 性能测试脚本
+# Piper Embedded Bridge Host 性能测试脚本
 
 set -e
 
 echo "=========================================="
-echo "Piper Bridge Host 性能测试"
+echo "Piper Embedded Bridge Host 性能测试"
 echo "=========================================="
 echo ""
 
@@ -12,8 +12,8 @@ echo ""
 if [ ! -S "/tmp/piper_bridge.sock" ]; then
     echo "❌ Bridge host 未运行或 socket 文件不存在"
     echo ""
-    echo "请先启动 bridge host:"
-    echo "  cargo run --bin piper_bridge_host"
+    echo "请先启动 embedded bridge host:"
+    echo "  cargo run --example embedded_bridge_host"
     echo ""
     exit 1
 fi

@@ -30,7 +30,7 @@
   - **Hardware timestamps**: Direct use of kernel/driver interrupt timestamps
   - **TX safety**: Only records frames after successful `send()`
   - **Drop monitoring**: Built-in `dropped_frames` counter for loss tracking
-- 📊 **Advanced Health Monitoring** (`piper_bridge_host`, controller-owned non-realtime bridge/debug path):
+- 📊 **Advanced Health Monitoring** (`embedded_bridge_host`, controller-embedded non-realtime bridge/debug path):
   - **CAN Bus Off Detection**: Detects CAN Bus Off events (critical system failure) with debounce mechanism
   - **Error Passive Monitoring**: Monitors Error Passive state (pre-Bus Off warning) for early detection
   - **USB STALL Tracking**: Tracks USB endpoint STALL errors for USB communication health
@@ -51,8 +51,7 @@ piper-sdk-rs/
 │   ├── piper-tools/       # Recording and analysis tools
 │   └── piper-sdk/         # Compatibility layer (re-exports all)
 └── apps/
-    ├── cli/               # Command-line interface
-    └── daemon/            # Controller-owned bridge host binary
+    └── cli/               # Command-line interface
 ```
 
 ### Layer Overview

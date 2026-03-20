@@ -1,4 +1,4 @@
-# GS-USB Daemon 性能测试指南
+# Embedded Bridge Host 性能测试指南
 
 ## 概述
 
@@ -6,14 +6,14 @@
 
 ## 测试前准备
 
-### 1. 启动 Daemon
+### 1. 启动 Embedded Bridge Host
 
 ```bash
-# 在终端 1 中启动 daemon
-cargo run --bin piper_bridge_host
+# 在终端 1 中启动 embedded bridge host
+cargo run --example embedded_bridge_host
 ```
 
-确保 daemon 成功启动并连接到 GS-USB 设备。
+确保 embedded bridge host 成功启动并连接到设备。
 
 ### 2. 运行性能测试
 
@@ -26,7 +26,7 @@ cargo run --example bridge_latency_bench
 
 ### 场景 1: 发送延迟测试
 
-测试从客户端发送帧到 daemon 的延迟。
+测试从客户端发送帧到 embedded bridge host 的延迟。
 
 **预期结果**:
 - P50 延迟: < 100μs
@@ -35,7 +35,7 @@ cargo run --example bridge_latency_bench
 
 ### 场景 2: 接收延迟测试
 
-测试从 daemon 接收帧的延迟（需要外部数据源）。
+测试从 embedded bridge host 接收帧的延迟（需要外部数据源）。
 
 **注意**: 如果没有外部 CAN 数据源，此测试会超时。
 
@@ -51,10 +51,10 @@ cargo run --example bridge_latency_bench
 测试故障客户端是否会被正确断开。
 
 **手动测试步骤**:
-1. 启动 daemon
+1. 启动 embedded bridge host
 2. 运行性能测试
 3. 在另一个终端运行一个"卡死"客户端（连接但不读取数据）
-4. 观察 daemon 日志，验证：
+4. 观察 bridge host 日志，验证：
    - 日志限频生效（不会洪水）
    - 1 秒后客户端被断开
    - 其他客户端不受影响
@@ -73,10 +73,10 @@ cargo run --example bridge_latency_bench
 
 ### 问题 1: 无法连接到 daemon
 
-**错误**: `无法连接到 daemon: ...`
+**错误**: `无法连接到 bridge host: ...`
 
 **解决方案**:
-1. 确认 bridge host 已启动: `ps aux | grep piper_bridge_host`
+1. 确认 embedded bridge host 已启动: `ps aux | grep embedded_bridge_host`
 2. 检查 socket 文件: `ls -l /tmp/piper_bridge.sock`
 3. 确认 daemon 日志显示设备已连接
 

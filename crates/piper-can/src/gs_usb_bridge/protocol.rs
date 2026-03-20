@@ -14,10 +14,11 @@ pub const MAX_PAYLOAD_LEN: usize = 8 * 1024;
 const TAG_HELLO: u8 = 0x01;
 const TAG_GET_STATUS: u8 = 0x02;
 const TAG_SET_FILTERS: u8 = 0x03;
-const TAG_ACQUIRE_WRITER_LEASE: u8 = 0x04;
-const TAG_RELEASE_WRITER_LEASE: u8 = 0x05;
-const TAG_SEND_FRAME: u8 = 0x06;
-const TAG_PING: u8 = 0x07;
+const TAG_SET_RAW_FRAME_TAP: u8 = 0x04;
+const TAG_ACQUIRE_WRITER_LEASE: u8 = 0x05;
+const TAG_RELEASE_WRITER_LEASE: u8 = 0x06;
+const TAG_SEND_FRAME: u8 = 0x07;
+const TAG_PING: u8 = 0x08;
 
 const TAG_HELLO_ACK: u8 = 0x81;
 const TAG_OK: u8 = 0x82;
@@ -163,6 +164,10 @@ pub enum ClientRequest {
     SetFilters {
         request_id: u32,
         filters: Vec<CanIdFilter>,
+    },
+    SetRawFrameTap {
+        request_id: u32,
+        enabled: bool,
     },
     AcquireWriterLease {
         request_id: u32,
@@ -429,6 +434,14 @@ fn encode_payload_from_request(message: &ClientRequest) -> Result<Vec<u8>, Proto
             put_u32(&mut buf, *request_id);
             put_filters(&mut buf, filters)?;
         },
+        ClientRequest::SetRawFrameTap {
+            request_id,
+            enabled,
+        } => {
+            put_u8(&mut buf, TAG_SET_RAW_FRAME_TAP);
+            put_u32(&mut buf, *request_id);
+            put_u8(&mut buf, u8::from(*enabled));
+        },
         ClientRequest::AcquireWriterLease {
             request_id,
             timeout_ms,
@@ -566,6 +579,10 @@ pub fn decode_client_request(payload: &[u8]) -> Result<ClientRequest, ProtocolEr
         TAG_SET_FILTERS => ClientRequest::SetFilters {
             request_id,
             filters: cursor.filters()?,
+        },
+        TAG_SET_RAW_FRAME_TAP => ClientRequest::SetRawFrameTap {
+            request_id,
+            enabled: cursor.u8()? != 0,
         },
         TAG_ACQUIRE_WRITER_LEASE => ClientRequest::AcquireWriterLease {
             request_id,
@@ -709,6 +726,17 @@ mod tests {
             session_token: TEST_TOKEN,
             role_request: BridgeRole::WriterCandidate,
             filters: vec![CanIdFilter::new(0x100, 0x1FF)],
+        };
+        let encoded = encode_client_request(&request).unwrap();
+        let decoded = decode_client_request(&encoded[4..]).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn test_set_raw_frame_tap_roundtrip() {
+        let request = ClientRequest::SetRawFrameTap {
+            request_id: 11,
+            enabled: true,
         };
         let encoded = encode_client_request(&request).unwrap();
         let decoded = decode_client_request(&encoded[4..]).unwrap();

@@ -12,7 +12,7 @@ use piper_can::bridge::protocol::{
     ErrorCode, ServerMessage, ServerResponse, SessionToken,
 };
 use piper_driver::hooks::FrameCallback;
-use piper_driver::{DriverError, HealthStatus, Piper as RobotPiper};
+use piper_driver::{DriverError, HealthStatus, HookHandle, Piper as RobotPiper};
 use rustls::pki_types::PrivateKeyDer;
 use rustls::server::{ServerConfig, ServerConnection, WebPkiClientVerifier};
 use rustls::{RootCertStore, StreamOwned};
@@ -66,7 +66,7 @@ pub struct BridgeHostConfig {
     pub uds_path: Option<PathBuf>,
     pub tcp_tls: Option<BridgeTlsServerConfig>,
     pub maintenance_mode: bool,
-    pub enable_raw_frame_tap: bool,
+    pub allow_raw_frame_tap: bool,
 }
 
 impl Default for BridgeHostConfig {
@@ -78,7 +78,7 @@ impl Default for BridgeHostConfig {
             uds_path: None,
             tcp_tls: None,
             maintenance_mode: false,
-            enable_raw_frame_tap: true,
+            allow_raw_frame_tap: false,
         }
     }
 }
@@ -89,6 +89,7 @@ pub enum BridgeHostError {
     Io(String),
     InvalidConfig(String),
     Driver(String),
+    Backend(String),
     AlreadyRunning,
 }
 
@@ -99,12 +100,117 @@ impl std::fmt::Display for BridgeHostError {
             Self::Io(message) => write!(f, "{message}"),
             Self::InvalidConfig(message) => write!(f, "{message}"),
             Self::Driver(message) => write!(f, "{message}"),
+            Self::Backend(message) => write!(f, "{message}"),
             Self::AlreadyRunning => write!(f, "bridge host is already running"),
         }
     }
 }
 
 impl std::error::Error for BridgeHostError {}
+
+#[derive(Debug, Clone)]
+pub struct BridgeStatusInput {
+    pub health: HealthStatus,
+    pub usb_stall_count: u64,
+    pub can_bus_off_count: u64,
+    pub can_error_passive_count: u64,
+    pub cpu_usage_percent: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeMaintenanceState {
+    DeniedFaulted,
+    DeniedActiveControl,
+    DeniedTransportDown,
+    AllowedStandby,
+    AllowedMaintenanceMode,
+}
+
+impl BridgeMaintenanceState {
+    fn allows_lease(self) -> bool {
+        matches!(self, Self::AllowedStandby | Self::AllowedMaintenanceMode)
+    }
+
+    fn denial_message(self) -> &'static str {
+        match self {
+            Self::DeniedFaulted => {
+                "maintenance writes are disabled while a runtime fault is latched"
+            },
+            Self::DeniedActiveControl => {
+                "maintenance writes are disabled while active control is enabled"
+            },
+            Self::DeniedTransportDown => {
+                "maintenance writes are disabled while transport is disconnected"
+            },
+            Self::AllowedStandby | Self::AllowedMaintenanceMode => "maintenance allowed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BridgeBackendError {
+    code: ErrorCode,
+    message: String,
+}
+
+impl BridgeBackendError {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn code(&self) -> ErrorCode {
+        self.code
+    }
+
+    fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for BridgeBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for BridgeBackendError {}
+
+trait RawTapCleanup: Send + Sync {
+    fn uninstall(&self);
+}
+
+pub struct RawTapSubscription {
+    cleanup: Option<Box<dyn RawTapCleanup>>,
+}
+
+impl RawTapSubscription {
+    fn new(cleanup: impl RawTapCleanup + 'static) -> Self {
+        Self {
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+}
+
+impl Drop for RawTapSubscription {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.uninstall();
+        }
+    }
+}
+
+pub trait BridgeControllerBackend: Send + Sync {
+    fn status_snapshot(&self) -> BridgeStatusInput;
+    fn maintenance_state(&self, maintenance_mode: bool) -> BridgeMaintenanceState;
+    fn send_maintenance_frame(&self, frame: PiperFrame) -> Result<(), BridgeBackendError>;
+    fn install_raw_frame_tap(
+        &self,
+        tx: Sender<PiperFrame>,
+    ) -> Result<RawTapSubscription, BridgeBackendError>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseAcquireResult {
@@ -138,6 +244,13 @@ enum ConnectionOutput {
     Event(BridgeEvent),
     CloseAfterEvent(BridgeEvent),
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueFrameResult {
+    Delivered,
+    QueueFull,
+    Inactive,
 }
 
 trait SessionControl: Send + Sync {
@@ -190,16 +303,8 @@ impl BridgeHostStats {
         Self::fps(&self.ipc_out_total, self.elapsed_secs())
     }
 
-    fn health_score(&self, health: HealthStatus) -> u8 {
-        let mut score = if health.fault.is_some() {
-            40i32
-        } else if health.connected {
-            100
-        } else if health.rx_alive || health.tx_alive {
-            70
-        } else {
-            40
-        };
+    fn apply_queue_drop_penalty(&self, base_score: u8) -> u8 {
+        let mut score = base_score as i32;
         let dropped = self.queue_drop_total.load(Ordering::Relaxed);
         if dropped > 0 {
             score -= (dropped.min(1000) / 20) as i32;
@@ -385,6 +490,61 @@ impl FrameCallback for RawFrameTap {
     }
 }
 
+struct DriverRawTapCleanup {
+    hooks: Arc<std::sync::RwLock<piper_driver::HookManager>>,
+    handle: HookHandle,
+}
+
+impl RawTapCleanup for DriverRawTapCleanup {
+    fn uninstall(&self) {
+        if let Ok(mut hooks) = self.hooks.write() {
+            hooks.remove_callback(self.handle);
+        }
+    }
+}
+
+struct RawTapManager {
+    allow: bool,
+    tx: Sender<PiperFrame>,
+    subscription: Option<RawTapSubscription>,
+}
+
+impl RawTapManager {
+    fn new(allow: bool, tx: Sender<PiperFrame>) -> Self {
+        Self {
+            allow,
+            tx,
+            subscription: None,
+        }
+    }
+
+    fn allowed(&self) -> bool {
+        self.allow
+    }
+
+    fn reconcile(
+        &mut self,
+        sessions: &SessionManager,
+        backend: &Arc<dyn BridgeControllerBackend>,
+    ) -> Result<(), BridgeHostError> {
+        let desired = self.allow && sessions.raw_frame_tap_subscriber_count() > 0;
+        match (desired, self.subscription.is_some()) {
+            (true, false) => {
+                self.subscription = Some(
+                    backend
+                        .install_raw_frame_tap(self.tx.clone())
+                        .map_err(|err| BridgeHostError::Backend(err.to_string()))?,
+                );
+            },
+            (false, true) => {
+                self.subscription = None;
+            },
+            _ => {},
+        }
+        Ok(())
+    }
+}
+
 struct BridgeSession {
     session_id: u32,
     session_token: SessionToken,
@@ -393,6 +553,7 @@ struct BridgeSession {
     control_tx: Sender<ConnectionOutput>,
     pending_gap: AtomicU32,
     lifecycle: AtomicU8,
+    raw_frame_tap_enabled: AtomicBool,
     control: Arc<dyn SessionControl>,
 }
 
@@ -413,6 +574,7 @@ impl BridgeSession {
             control_tx,
             pending_gap: AtomicU32::new(0),
             lifecycle: AtomicU8::new(SessionLifecycle::Active as u8),
+            raw_frame_tap_enabled: AtomicBool::new(false),
             control,
         }
     }
@@ -456,6 +618,14 @@ impl BridgeSession {
         *self.filters.write().unwrap() = filters;
     }
 
+    fn raw_frame_tap_enabled(&self) -> bool {
+        self.raw_frame_tap_enabled.load(Ordering::Acquire)
+    }
+
+    fn set_raw_frame_tap_enabled(&self, enabled: bool) {
+        self.raw_frame_tap_enabled.store(enabled, Ordering::Release);
+    }
+
     fn matches_filter(&self, can_id: u32) -> bool {
         let filters = self.filters.read().unwrap();
         if filters.is_empty() {
@@ -464,9 +634,9 @@ impl BridgeSession {
         filters.iter().any(|filter| filter.matches(can_id))
     }
 
-    fn enqueue_frame(&self, frame: PiperFrame) -> bool {
+    fn enqueue_frame(&self, frame: PiperFrame) -> EnqueueFrameResult {
         if !self.is_active() {
-            return false;
+            return EnqueueFrameResult::Inactive;
         }
 
         let dropped = self.pending_gap.swap(0, Ordering::AcqRel);
@@ -477,17 +647,17 @@ impl BridgeSession {
                 .is_err()
         {
             self.pending_gap.fetch_add(dropped + 1, Ordering::AcqRel);
-            return false;
+            return EnqueueFrameResult::QueueFull;
         }
 
         match self
             .event_tx
             .try_send(ConnectionOutput::Event(BridgeEvent::ReceiveFrame(frame)))
         {
-            Ok(()) => true,
+            Ok(()) => EnqueueFrameResult::Delivered,
             Err(_) => {
                 self.pending_gap.fetch_add(1, Ordering::AcqRel);
-                false
+                EnqueueFrameResult::QueueFull
             },
         }
     }
@@ -684,11 +854,24 @@ impl SessionManager {
         self.registry.read().unwrap().sessions.len() as u32
     }
 
+    fn raw_frame_tap_subscriber_count(&self) -> usize {
+        self.registry
+            .read()
+            .unwrap()
+            .sessions
+            .values()
+            .filter(|session| session.raw_frame_tap_enabled())
+            .count()
+    }
+
     fn broadcast_frame(&self, frame: PiperFrame) -> u64 {
         let registry = self.registry.read().unwrap();
         let mut dropped = 0u64;
         for session in registry.sessions.values() {
-            if session.matches_filter(frame.id) && !session.enqueue_frame(frame) {
+            if !session.raw_frame_tap_enabled() || !session.matches_filter(frame.id) {
+                continue;
+            }
+            if session.enqueue_frame(frame) == EnqueueFrameResult::QueueFull {
                 dropped += 1;
             }
         }
@@ -698,6 +881,15 @@ impl SessionManager {
     fn set_filters(&self, session_id: u32, filters: Vec<CanIdFilter>) -> bool {
         if let Some(session) = self.active_session(session_id) {
             session.set_filters(filters);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_raw_frame_tap(&self, session_id: u32, enabled: bool) -> bool {
+        if let Some(session) = self.active_session(session_id) {
+            session.set_raw_frame_tap_enabled(enabled);
             true
         } else {
             false
@@ -769,15 +961,16 @@ impl SessionManager {
 }
 
 struct ConnectionContext<'a> {
-    driver: &'a Arc<RobotPiper>,
+    backend: &'a Arc<dyn BridgeControllerBackend>,
     sessions: &'a Arc<SessionManager>,
     maintenance_mode: &'a Arc<AtomicBool>,
+    raw_tap: &'a Arc<Mutex<RawTapManager>>,
     stats: &'a Arc<BridgeHostStats>,
     warn_limiter: &'a Arc<WarnRateLimiter>,
 }
 
 pub struct PiperBridgeHost {
-    driver: Arc<RobotPiper>,
+    backend: Arc<dyn BridgeControllerBackend>,
     config: BridgeHostConfig,
     sessions: Arc<SessionManager>,
     maintenance_mode: Arc<AtomicBool>,
@@ -787,9 +980,9 @@ pub struct PiperBridgeHost {
 }
 
 impl PiperBridgeHost {
-    pub fn from_driver(driver: Arc<RobotPiper>, config: BridgeHostConfig) -> Self {
+    pub fn attach(backend: Arc<dyn BridgeControllerBackend>, config: BridgeHostConfig) -> Self {
         Self {
-            driver,
+            backend,
             maintenance_mode: Arc::new(AtomicBool::new(config.maintenance_mode)),
             config,
             sessions: Arc::new(SessionManager::new()),
@@ -797,10 +990,6 @@ impl PiperBridgeHost {
             warn_limiter: Arc::new(WarnRateLimiter::new(AUTH_LOG_WINDOW)),
             started: AtomicBool::new(false),
         }
-    }
-
-    pub fn from_piper<State>(piper: &crate::state::Piper<State>, config: BridgeHostConfig) -> Self {
-        Self::from_driver(Arc::clone(&piper.driver), config)
     }
 
     pub fn set_maintenance_mode(&self, enabled: bool) {
@@ -821,13 +1010,8 @@ impl PiperBridgeHost {
             ));
         }
 
-        let raw_frame_rx = if self.config.enable_raw_frame_tap {
-            Some(self.install_raw_frame_tap()?)
-        } else {
-            None
-        };
-
-        if let Some(rx) = raw_frame_rx {
+        let raw_tap = if self.config.allow_raw_frame_tap {
+            let (tx, rx) = bounded(RAW_FRAME_TAP_QUEUE_CAPACITY);
             let sessions = Arc::clone(&self.sessions);
             let stats = Arc::clone(&self.stats);
             thread::Builder::new()
@@ -836,15 +1020,21 @@ impl PiperBridgeHost {
                 .map_err(|err| {
                     BridgeHostError::Io(format!("failed to spawn frame fanout loop: {err}"))
                 })?;
-        }
+            Arc::new(Mutex::new(RawTapManager::new(true, tx)))
+        } else {
+            Arc::new(Mutex::new(RawTapManager::new(
+                false,
+                bounded::<PiperFrame>(1).0,
+            )))
+        };
 
         {
-            let driver = Arc::clone(&self.driver);
+            let backend = Arc::clone(&self.backend);
             let sessions = Arc::clone(&self.sessions);
             let maintenance_mode = Arc::clone(&self.maintenance_mode);
             thread::Builder::new()
                 .name("bridge_lease_monitor".into())
-                .spawn(move || Self::lease_monitor_loop(driver, sessions, maintenance_mode))
+                .spawn(move || Self::lease_monitor_loop(backend, sessions, maintenance_mode))
                 .map_err(|err| {
                     BridgeHostError::Io(format!("failed to spawn lease monitor loop: {err}"))
                 })?;
@@ -868,9 +1058,10 @@ impl PiperBridgeHost {
                     path.display()
                 ))
             })?;
-            let driver = Arc::clone(&self.driver);
+            let backend = Arc::clone(&self.backend);
             let sessions = Arc::clone(&self.sessions);
             let maintenance_mode = Arc::clone(&self.maintenance_mode);
+            let raw_tap_manager = Arc::clone(&raw_tap);
             let stats = Arc::clone(&self.stats);
             let warn_limiter = Arc::clone(&self.warn_limiter);
             handles.push(
@@ -880,9 +1071,10 @@ impl PiperBridgeHost {
                         for incoming in listener.incoming() {
                             match incoming {
                                 Ok(stream) => {
-                                    let driver = Arc::clone(&driver);
+                                    let backend = Arc::clone(&backend);
                                     let sessions = Arc::clone(&sessions);
                                     let maintenance_mode = Arc::clone(&maintenance_mode);
+                                    let raw_tap_manager = Arc::clone(&raw_tap_manager);
                                     let stats = Arc::clone(&stats);
                                     let warn_limiter = Arc::clone(&warn_limiter);
                                     thread::spawn(move || {
@@ -894,9 +1086,10 @@ impl PiperBridgeHost {
                                             reader,
                                             writer,
                                             ConnectionContext {
-                                                driver: &driver,
+                                                backend: &backend,
                                                 sessions: &sessions,
                                                 maintenance_mode: &maintenance_mode,
+                                                raw_tap: &raw_tap_manager,
                                                 stats: &stats,
                                                 warn_limiter: &warn_limiter,
                                             },
@@ -919,9 +1112,10 @@ impl PiperBridgeHost {
             let listener = TcpListener::bind(addr).map_err(|err| {
                 BridgeHostError::Listener(format!("failed to bind tcp tls listener {addr}: {err}"))
             })?;
-            let driver = Arc::clone(&self.driver);
+            let backend = Arc::clone(&self.backend);
             let sessions = Arc::clone(&self.sessions);
             let maintenance_mode = Arc::clone(&self.maintenance_mode);
+            let raw_tap_manager = Arc::clone(&raw_tap);
             let stats = Arc::clone(&self.stats);
             let warn_limiter = Arc::clone(&self.warn_limiter);
             let tls_listener = Arc::clone(&tls_listener);
@@ -935,9 +1129,10 @@ impl PiperBridgeHost {
                                     if let Err(err) = stream.set_nodelay(true) {
                                         warn!("failed to set tcp nodelay: {err}");
                                     }
-                                    let driver = Arc::clone(&driver);
+                                    let backend = Arc::clone(&backend);
                                     let sessions = Arc::clone(&sessions);
                                     let maintenance_mode = Arc::clone(&maintenance_mode);
+                                    let raw_tap_manager = Arc::clone(&raw_tap_manager);
                                     let stats = Arc::clone(&stats);
                                     let warn_limiter = Arc::clone(&warn_limiter);
                                     let tls_listener = Arc::clone(&tls_listener);
@@ -947,9 +1142,10 @@ impl PiperBridgeHost {
                                                 stream,
                                                 control,
                                                 ConnectionContext {
-                                                    driver: &driver,
+                                                    backend: &backend,
                                                     sessions: &sessions,
                                                     maintenance_mode: &maintenance_mode,
+                                                    raw_tap: &raw_tap_manager,
                                                     stats: &stats,
                                                     warn_limiter: &warn_limiter,
                                                 },
@@ -979,17 +1175,6 @@ impl PiperBridgeHost {
         Ok(())
     }
 
-    fn install_raw_frame_tap(&self) -> Result<Receiver<PiperFrame>, BridgeHostError> {
-        let (tx, rx) = bounded(RAW_FRAME_TAP_QUEUE_CAPACITY);
-        let callback = Arc::new(RawFrameTap { tx }) as Arc<dyn FrameCallback>;
-        self.driver
-            .hooks()
-            .write()
-            .map_err(|_| BridgeHostError::Driver("bridge hook registry lock poisoned".to_string()))?
-            .add_callback(callback);
-        Ok(rx)
-    }
-
     fn frame_fanout_loop(
         rx: Receiver<PiperFrame>,
         sessions: Arc<SessionManager>,
@@ -1005,13 +1190,15 @@ impl PiperBridgeHost {
     }
 
     fn lease_monitor_loop(
-        driver: Arc<RobotPiper>,
+        backend: Arc<dyn BridgeControllerBackend>,
         sessions: Arc<SessionManager>,
         maintenance_mode: Arc<AtomicBool>,
     ) {
         loop {
             thread::sleep(LEASE_MONITOR_INTERVAL);
-            if !Self::maintenance_allowed(&driver, &maintenance_mode)
+            let maintenance_state =
+                backend.maintenance_state(maintenance_mode.load(Ordering::Acquire));
+            if !Self::maintenance_allowed(maintenance_state)
                 && let Some(holder) = sessions.revoke_maintenance_lease()
             {
                 holder.revoke_maintenance_lease();
@@ -1019,48 +1206,46 @@ impl PiperBridgeHost {
         }
     }
 
-    fn maintenance_allowed(driver: &RobotPiper, maintenance_mode: &AtomicBool) -> bool {
-        let health = driver.health();
-        if health.fault.is_some() || !health.rx_alive || !health.tx_alive {
-            return false;
-        }
-
-        let control = driver.get_robot_control();
-        if control.is_enabled {
-            return false;
-        }
-
-        health.connected || maintenance_mode.load(Ordering::Acquire)
+    fn maintenance_allowed(maintenance_state: BridgeMaintenanceState) -> bool {
+        maintenance_state.allows_lease()
     }
 
     fn build_status(
-        driver: &RobotPiper,
+        backend: &dyn BridgeControllerBackend,
         sessions: &SessionManager,
         stats: &BridgeHostStats,
     ) -> BridgeStatus {
-        let health = driver.health();
-        let device_state = if health.connected {
-            BridgeDeviceState::Connected
-        } else if health.rx_alive || health.tx_alive {
-            BridgeDeviceState::Reconnecting
-        } else {
-            BridgeDeviceState::Disconnected
-        };
+        let status_input = backend.status_snapshot();
 
         BridgeStatus {
-            device_state,
+            device_state: if status_input.health.connected {
+                BridgeDeviceState::Connected
+            } else if status_input.health.rx_alive || status_input.health.tx_alive {
+                BridgeDeviceState::Reconnecting
+            } else {
+                BridgeDeviceState::Disconnected
+            },
             rx_fps_x1000: (stats.frame_rx_fps() * 1000.0) as u32,
             tx_fps_x1000: (stats.maintenance_tx_fps() * 1000.0) as u32,
             ipc_out_fps_x1000: (stats.ipc_out_fps() * 1000.0) as u32,
             ipc_in_fps_x1000: (stats.ipc_in_fps() * 1000.0) as u32,
-            health_score: stats.health_score(health),
-            usb_stall_count: 0,
-            can_bus_off_count: 0,
-            can_error_passive_count: 0,
-            cpu_usage_percent: 0,
+            health_score: stats
+                .apply_queue_drop_penalty(backend_health_score(&status_input.health)),
+            usb_stall_count: status_input.usb_stall_count,
+            can_bus_off_count: status_input.can_bus_off_count,
+            can_error_passive_count: status_input.can_error_passive_count,
+            cpu_usage_percent: status_input.cpu_usage_percent,
             session_count: sessions.count(),
             queue_drop_count: stats.queue_drop_total.load(Ordering::Relaxed),
         }
+    }
+
+    fn reconcile_raw_tap(
+        raw_tap: &Arc<Mutex<RawTapManager>>,
+        sessions: &Arc<SessionManager>,
+        backend: &Arc<dyn BridgeControllerBackend>,
+    ) -> Result<(), BridgeHostError> {
+        raw_tap.lock().unwrap().reconcile(sessions, backend)
     }
 
     fn build_tls_listener_config(
@@ -1404,6 +1589,11 @@ impl PiperBridgeHost {
                     if let Some(replaced) = register.replaced {
                         replaced.replace_and_close();
                     }
+                    if let Err(err) =
+                        Self::reconcile_raw_tap(ctx.raw_tap, ctx.sessions, ctx.backend)
+                    {
+                        warn!("failed to reconcile raw frame tap after hello: {err}");
+                    }
                 },
                 other => {
                     let Some(active_session) = session.as_ref().cloned() else {
@@ -1438,7 +1628,8 @@ impl PiperBridgeHost {
 
                     match other {
                         ClientRequest::GetStatus { request_id } => {
-                            let status = Self::build_status(ctx.driver, ctx.sessions, ctx.stats);
+                            let status =
+                                Self::build_status(ctx.backend.as_ref(), ctx.sessions, ctx.stats);
                             let _ = Self::write_server_message(
                                 &writer,
                                 &ServerMessage::Response(ServerResponse::StatusResponse {
@@ -1468,17 +1659,64 @@ impl PiperBridgeHost {
                                 ctx.stats,
                             );
                         },
-                        ClientRequest::AcquireWriterLease {
+                        ClientRequest::SetRawFrameTap {
                             request_id,
-                            timeout_ms,
+                            enabled,
                         } => {
-                            if !Self::maintenance_allowed(ctx.driver, ctx.maintenance_mode) {
+                            if !ctx.raw_tap.lock().unwrap().allowed() {
                                 let _ = Self::send_error(
                                     &writer,
                                     ctx.stats,
                                     request_id,
                                     ErrorCode::PermissionDenied,
-                                    "maintenance lease only available while robot is not actively controlling and no runtime fault is latched",
+                                    "raw frame tap is disabled by bridge host policy",
+                                );
+                                continue;
+                            }
+                            if !ctx.sessions.set_raw_frame_tap(active_session.session_id(), enabled)
+                            {
+                                let _ = Self::send_error(
+                                    &writer,
+                                    ctx.stats,
+                                    request_id,
+                                    ErrorCode::NotConnected,
+                                    "bridge session was replaced or closed",
+                                );
+                                break;
+                            }
+                            match Self::reconcile_raw_tap(ctx.raw_tap, ctx.sessions, ctx.backend) {
+                                Ok(()) => {
+                                    let _ = Self::write_server_message(
+                                        &writer,
+                                        &ServerMessage::Response(ServerResponse::Ok { request_id }),
+                                        ctx.stats,
+                                    );
+                                },
+                                Err(err) => {
+                                    let _ = Self::send_error(
+                                        &writer,
+                                        ctx.stats,
+                                        request_id,
+                                        ErrorCode::DeviceError,
+                                        err.to_string(),
+                                    );
+                                },
+                            }
+                        },
+                        ClientRequest::AcquireWriterLease {
+                            request_id,
+                            timeout_ms,
+                        } => {
+                            let maintenance_state = ctx
+                                .backend
+                                .maintenance_state(ctx.maintenance_mode.load(Ordering::Acquire));
+                            if !Self::maintenance_allowed(maintenance_state) {
+                                let _ = Self::send_error(
+                                    &writer,
+                                    ctx.stats,
+                                    request_id,
+                                    ErrorCode::PermissionDenied,
+                                    maintenance_state.denial_message(),
                                 );
                                 continue;
                             }
@@ -1527,13 +1765,16 @@ impl PiperBridgeHost {
                             );
                         },
                         ClientRequest::SendFrame { request_id, frame } => {
-                            if !Self::maintenance_allowed(ctx.driver, ctx.maintenance_mode) {
+                            let maintenance_state = ctx
+                                .backend
+                                .maintenance_state(ctx.maintenance_mode.load(Ordering::Acquire));
+                            if !Self::maintenance_allowed(maintenance_state) {
                                 let _ = Self::send_error(
                                     &writer,
                                     ctx.stats,
                                     request_id,
                                     ErrorCode::PermissionDenied,
-                                    "maintenance writes are disabled while active control or runtime fault is present",
+                                    maintenance_state.denial_message(),
                                 );
                                 continue;
                             }
@@ -1554,7 +1795,7 @@ impl PiperBridgeHost {
                                 continue;
                             }
 
-                            match ctx.driver.send_frame(frame) {
+                            match ctx.backend.send_maintenance_frame(frame) {
                                 Ok(()) => {
                                     ctx.stats.maintenance_tx_total.fetch_add(1, Ordering::Relaxed);
                                     let _ = Self::write_server_message(
@@ -1568,8 +1809,8 @@ impl PiperBridgeHost {
                                         &writer,
                                         ctx.stats,
                                         request_id,
-                                        driver_error_code(&err),
-                                        err.to_string(),
+                                        err.code(),
+                                        err.message(),
                                     );
                                 },
                             }
@@ -1591,6 +1832,9 @@ impl PiperBridgeHost {
             && let Some(removed) = ctx.sessions.unregister_session(active_session.session_id())
         {
             removed.shutdown();
+            if let Err(err) = Self::reconcile_raw_tap(ctx.raw_tap, ctx.sessions, ctx.backend) {
+                warn!("failed to reconcile raw frame tap after disconnect: {err}");
+            }
         }
     }
 
@@ -1729,6 +1973,11 @@ impl PiperBridgeHost {
                     if let Some(replaced) = register.replaced {
                         replaced.replace_and_close();
                     }
+                    if let Err(err) =
+                        Self::reconcile_raw_tap(ctx.raw_tap, ctx.sessions, ctx.backend)
+                    {
+                        warn!("failed to reconcile raw frame tap after tls hello: {err}");
+                    }
                 },
                 other => {
                     let Some(active_session) = session.as_ref().cloned() else {
@@ -1763,7 +2012,8 @@ impl PiperBridgeHost {
 
                     match other {
                         ClientRequest::GetStatus { request_id } => {
-                            let status = Self::build_status(ctx.driver, ctx.sessions, ctx.stats);
+                            let status =
+                                Self::build_status(ctx.backend.as_ref(), ctx.sessions, ctx.stats);
                             let _ = Self::write_server_message_direct(
                                 &mut stream,
                                 &ServerMessage::Response(ServerResponse::StatusResponse {
@@ -1793,17 +2043,64 @@ impl PiperBridgeHost {
                                 ctx.stats,
                             );
                         },
-                        ClientRequest::AcquireWriterLease {
+                        ClientRequest::SetRawFrameTap {
                             request_id,
-                            timeout_ms,
+                            enabled,
                         } => {
-                            if !Self::maintenance_allowed(ctx.driver, ctx.maintenance_mode) {
+                            if !ctx.raw_tap.lock().unwrap().allowed() {
                                 let _ = Self::send_error_direct(
                                     &mut stream,
                                     ctx.stats,
                                     request_id,
                                     ErrorCode::PermissionDenied,
-                                    "maintenance lease only available while robot is not actively controlling and no runtime fault is latched",
+                                    "raw frame tap is disabled by bridge host policy",
+                                );
+                                continue;
+                            }
+                            if !ctx.sessions.set_raw_frame_tap(active_session.session_id(), enabled)
+                            {
+                                let _ = Self::send_error_direct(
+                                    &mut stream,
+                                    ctx.stats,
+                                    request_id,
+                                    ErrorCode::NotConnected,
+                                    "bridge session was replaced or closed",
+                                );
+                                break;
+                            }
+                            match Self::reconcile_raw_tap(ctx.raw_tap, ctx.sessions, ctx.backend) {
+                                Ok(()) => {
+                                    let _ = Self::write_server_message_direct(
+                                        &mut stream,
+                                        &ServerMessage::Response(ServerResponse::Ok { request_id }),
+                                        ctx.stats,
+                                    );
+                                },
+                                Err(err) => {
+                                    let _ = Self::send_error_direct(
+                                        &mut stream,
+                                        ctx.stats,
+                                        request_id,
+                                        ErrorCode::DeviceError,
+                                        err.to_string(),
+                                    );
+                                },
+                            }
+                        },
+                        ClientRequest::AcquireWriterLease {
+                            request_id,
+                            timeout_ms,
+                        } => {
+                            let maintenance_state = ctx
+                                .backend
+                                .maintenance_state(ctx.maintenance_mode.load(Ordering::Acquire));
+                            if !Self::maintenance_allowed(maintenance_state) {
+                                let _ = Self::send_error_direct(
+                                    &mut stream,
+                                    ctx.stats,
+                                    request_id,
+                                    ErrorCode::PermissionDenied,
+                                    maintenance_state.denial_message(),
                                 );
                                 continue;
                             }
@@ -1852,13 +2149,16 @@ impl PiperBridgeHost {
                             );
                         },
                         ClientRequest::SendFrame { request_id, frame } => {
-                            if !Self::maintenance_allowed(ctx.driver, ctx.maintenance_mode) {
+                            let maintenance_state = ctx
+                                .backend
+                                .maintenance_state(ctx.maintenance_mode.load(Ordering::Acquire));
+                            if !Self::maintenance_allowed(maintenance_state) {
                                 let _ = Self::send_error_direct(
                                     &mut stream,
                                     ctx.stats,
                                     request_id,
                                     ErrorCode::PermissionDenied,
-                                    "maintenance writes are disabled while active control or runtime fault is present",
+                                    maintenance_state.denial_message(),
                                 );
                                 continue;
                             }
@@ -1879,7 +2179,7 @@ impl PiperBridgeHost {
                                 continue;
                             }
 
-                            match ctx.driver.send_frame(frame) {
+                            match ctx.backend.send_maintenance_frame(frame) {
                                 Ok(()) => {
                                     ctx.stats.maintenance_tx_total.fetch_add(1, Ordering::Relaxed);
                                     let _ = Self::write_server_message_direct(
@@ -1893,8 +2193,8 @@ impl PiperBridgeHost {
                                         &mut stream,
                                         ctx.stats,
                                         request_id,
-                                        driver_error_code(&err),
-                                        err.to_string(),
+                                        err.code(),
+                                        err.message(),
                                     );
                                 },
                             }
@@ -1916,13 +2216,28 @@ impl PiperBridgeHost {
             && let Some(removed) = ctx.sessions.unregister_session(active_session.session_id())
         {
             removed.shutdown();
+            if let Err(err) = Self::reconcile_raw_tap(ctx.raw_tap, ctx.sessions, ctx.backend) {
+                warn!("failed to reconcile raw frame tap after tls disconnect: {err}");
+            }
         }
         stream.shutdown();
     }
 }
 
-fn driver_error_code(error: &DriverError) -> ErrorCode {
-    match error {
+fn backend_health_score(health: &HealthStatus) -> u8 {
+    if health.fault.is_some() {
+        40
+    } else if health.connected {
+        100
+    } else if health.rx_alive || health.tx_alive {
+        70
+    } else {
+        40
+    }
+}
+
+fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
+    let code = match error {
         DriverError::Timeout | DriverError::RealtimeDeliveryTimeout => ErrorCode::Timeout,
         DriverError::ChannelFull | DriverError::ShutdownConflict => ErrorCode::Busy,
         DriverError::ControlPathClosed
@@ -1949,6 +2264,82 @@ fn driver_error_code(error: &DriverError) -> ErrorCode {
         | DriverError::ReliableDeliveryFailed { .. }
         | DriverError::RealtimeDeliveryFailed { .. }
         | DriverError::RealtimeDeliveryOverwritten => ErrorCode::DeviceError,
+    };
+    BridgeBackendError::new(code, error.to_string())
+}
+
+pub struct PiperBridgeBackend {
+    driver: Arc<RobotPiper>,
+}
+
+impl PiperBridgeBackend {
+    pub fn from_piper<State>(
+        piper: &crate::state::Piper<State>,
+    ) -> Arc<dyn BridgeControllerBackend> {
+        Arc::new(Self {
+            driver: Arc::clone(&piper.driver),
+        })
+    }
+}
+
+impl BridgeControllerBackend for PiperBridgeBackend {
+    fn status_snapshot(&self) -> BridgeStatusInput {
+        BridgeStatusInput {
+            health: self.driver.health(),
+            usb_stall_count: 0,
+            can_bus_off_count: 0,
+            can_error_passive_count: 0,
+            cpu_usage_percent: 0,
+        }
+    }
+
+    fn maintenance_state(&self, maintenance_mode: bool) -> BridgeMaintenanceState {
+        let health = self.driver.health();
+        if health.fault.is_some() {
+            return BridgeMaintenanceState::DeniedFaulted;
+        }
+        if !health.rx_alive || !health.tx_alive || !health.connected {
+            return BridgeMaintenanceState::DeniedTransportDown;
+        }
+
+        let control = self.driver.get_robot_control();
+        if control.is_enabled {
+            return BridgeMaintenanceState::DeniedActiveControl;
+        }
+
+        if maintenance_mode {
+            BridgeMaintenanceState::AllowedMaintenanceMode
+        } else {
+            BridgeMaintenanceState::AllowedStandby
+        }
+    }
+
+    fn send_maintenance_frame(&self, frame: PiperFrame) -> Result<(), BridgeBackendError> {
+        self.driver
+            .send_frame(frame)
+            .map_err(|err| bridge_backend_error_from_driver(&err))
+    }
+
+    fn install_raw_frame_tap(
+        &self,
+        tx: Sender<PiperFrame>,
+    ) -> Result<RawTapSubscription, BridgeBackendError> {
+        let callback = Arc::new(RawFrameTap { tx }) as Arc<dyn FrameCallback>;
+        let handle = self
+            .driver
+            .hooks()
+            .write()
+            .map_err(|_| {
+                BridgeBackendError::new(
+                    ErrorCode::DeviceError,
+                    "bridge hook registry lock poisoned",
+                )
+            })?
+            .add_callback(callback);
+        Ok(RawTapSubscription::new(DriverRawTapCleanup {
+            hooks: self.driver.hooks(),
+            handle,
+        }))
     }
 }
 
@@ -2008,6 +2399,7 @@ fn request_id_of(request: &ClientRequest) -> u32 {
         ClientRequest::Hello { request_id, .. }
         | ClientRequest::GetStatus { request_id }
         | ClientRequest::SetFilters { request_id, .. }
+        | ClientRequest::SetRawFrameTap { request_id, .. }
         | ClientRequest::AcquireWriterLease { request_id, .. }
         | ClientRequest::ReleaseWriterLease { request_id }
         | ClientRequest::SendFrame { request_id, .. }
@@ -2020,6 +2412,7 @@ fn message_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Hello { .. } => "Hello",
         ClientRequest::GetStatus { .. } => "GetStatus",
         ClientRequest::SetFilters { .. } => "SetFilters",
+        ClientRequest::SetRawFrameTap { .. } => "SetRawFrameTap",
         ClientRequest::AcquireWriterLease { .. } => "AcquireWriterLease",
         ClientRequest::ReleaseWriterLease { .. } => "ReleaseWriterLease",
         ClientRequest::SendFrame { .. } => "SendFrame",
@@ -2092,9 +2485,13 @@ mod tests {
             control_tx,
             Arc::new(NoopControl),
         );
+        session.set_raw_frame_tap_enabled(true);
 
         for _ in 0..OUTBOUND_QUEUE_CAPACITY {
-            assert!(session.enqueue_frame(PiperFrame::new_standard(0x123, &[1])));
+            assert_eq!(
+                session.enqueue_frame(PiperFrame::new_standard(0x123, &[1])),
+                EnqueueFrameResult::Delivered
+            );
         }
 
         session.replace_and_close();
@@ -2103,5 +2500,23 @@ mod tests {
             ConnectionOutput::CloseAfterEvent(BridgeEvent::SessionReplaced) => {},
             other => panic!("unexpected control output: {other:?}"),
         }
+    }
+
+    #[test]
+    fn inactive_sessions_do_not_count_as_queue_drops() {
+        let manager = SessionManager::new();
+        let register = manager.commit_prepared(manager.prepare_session(
+            token(3),
+            BridgeRole::Observer,
+            vec![],
+            Arc::new(NoopControl),
+        ));
+        register.session.set_raw_frame_tap_enabled(true);
+        register.session.mark_closing();
+
+        assert_eq!(
+            manager.broadcast_frame(PiperFrame::new_standard(0x120, &[1, 2, 3])),
+            0
+        );
     }
 }

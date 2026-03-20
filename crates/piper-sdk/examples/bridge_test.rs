@@ -1,6 +1,6 @@
 //! Controller-owned bridge 调试示例。
 //!
-//! 该示例通过 UDS/TCP-TLS stream 连接 `piper_bridge_host`，用于 bridge/debug/replay。
+//! 该示例通过 UDS/TCP-TLS stream 连接内嵌式 bridge host，用于 bridge/debug/replay。
 //! 它不是 MIT / 双臂 / fault-stop 的实时控制路径。
 
 use clap::Parser;
@@ -322,6 +322,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         BridgeRole::Observer
     };
     let mut client = connect_client(&endpoint, &args, role, timeout)?;
+    if matches!(args.mode.as_str(), "receive" | "interactive") {
+        client.set_raw_frame_tap(true)?;
+    }
 
     match args.mode.as_str() {
         "status" => print_status(&mut client)?,

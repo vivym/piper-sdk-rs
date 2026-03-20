@@ -30,7 +30,7 @@
   - **硬件时间戳**：直接使用内核/驱动中断时间戳
   - **TX 安全**：仅在成功 `send()` 后录制帧
   - **丢帧监控**：内置 `dropped_frames` 计数器
-- 📊 **高级健康监控**（piper_bridge_host，控制进程持有的非实时 bridge/debug 路径）：
+- 📊 **高级健康监控**（embedded_bridge_host，控制进程内嵌的非实时 bridge/debug 路径）：
   - **CAN Bus Off 检测**：检测 CAN Bus Off 事件（关键系统故障），带防抖机制
   - **Error Passive 监控**：监控 Error Passive 状态（Bus Off 前警告），用于早期检测
   - **USB STALL 跟踪**：跟踪 USB 端点 STALL 错误，监控 USB 通信健康状态
@@ -51,8 +51,7 @@ piper-sdk-rs/
 │   ├── piper-tools/       # 录制和分析工具
 │   └── piper-sdk/         # 兼容层（重新导出所有）
 └── apps/
-    ├── cli/               # 命令行接口
-    └── daemon/            # 控制进程持有的 bridge host 二进制
+    └── cli/               # 命令行接口
 ```
 
 ### 层次概览

@@ -397,7 +397,7 @@ fn main() {
 
 #### 高级用法（自定义配置）
 
-如需文件输出、日志轮转等高级功能，请参考 `apps/daemon/src/main.rs` 的 `init_logging()` 函数实现。
+如需将 bridge host 嵌入控制进程，请参考 `crates/piper-sdk/examples/embedded_bridge_host.rs` 的组合方式，并按需自行扩展日志输出与轮转。
 
 ## ❓ 问题？
 

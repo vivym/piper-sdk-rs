@@ -38,9 +38,9 @@ cargo run --example robot_monitor             # Real-time monitoring tool
 cargo run --example timestamp_verification    # Verify SocketCAN hardware timestamps
 ```
 
-### Building Binaries
+### Running Bridge Host
 ```bash
-cargo build --release --bin piper_bridge_host # Build the controller-owned bridge host
+cargo run --example embedded_bridge_host      # Run the controller-embedded bridge host
 ```
 
 ## Architecture Overview
@@ -182,8 +182,8 @@ src/
 │   ├── observer.rs     # Observer (read-only state access)
 │   ├── state/          # Type state pattern markers
 │   └── types/          # Type system (units, joints, errors)
-└── bin/
-    └── daemon/         # Controller-owned bridge host binary
+└── examples/
+    └── embedded_bridge_host.rs  # Controller-embedded bridge host example
 ```
 
 ## Protocol Notes
