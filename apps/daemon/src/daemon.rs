@@ -13,28 +13,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 获取临时 socket 路径（XDG 合规）
-///
-/// 使用 `dirs` crate 确保跨平台兼容性和 XDG 规范合规性：
-/// - Linux: $XDG_RUNTIME_DIR 或 /tmp
-/// - macOS: $TMPDIR 或 /tmp
-/// - Windows: %TEMP%
-#[cfg(unix)]
-fn get_temp_socket_path(socket_name: &str) -> String {
-    // ✅ 优先使用 XDG_RUNTIME_DIR（Linux/macOS，符合 XDG 规范）
-    if let Some(runtime_dir) = dirs::runtime_dir() {
-        let path = runtime_dir.join(socket_name);
-        if let Some(parent) = path.parent()
-            && (parent.exists() || std::fs::create_dir_all(parent).is_ok())
-        {
-            return path.to_string_lossy().to_string();
-        }
-    }
-
-    // ✅ 其次使用系统临时目录（跨平台）
-    std::env::temp_dir().join(socket_name).to_string_lossy().to_string()
-}
-
 fn bridge_error_code(error: &piper_can::CanError) -> ErrorCode {
     match error {
         piper_can::CanError::Timeout => ErrorCode::Timeout,
@@ -80,25 +58,67 @@ fn mark_bridge_device_disconnected(
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone)]
+struct SupportedUnixPeer {
+    addr: ClientAddr,
+    reply_path: String,
+    debug_addr: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum UnsupportedUnixPeerReason {
+    MissingPathname,
+    NonUtf8Pathname,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for UnsupportedUnixPeerReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnsupportedUnixPeerReason::MissingPathname => {
+                write!(f, "unix datagram peer has no pathname")
+            },
+            UnsupportedUnixPeerReason::NonUtf8Pathname => {
+                write!(f, "unix datagram peer pathname is not valid UTF-8")
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
+fn resolve_supported_unix_peer(
+    client_addr: &std::os::unix::net::SocketAddr,
+) -> Result<SupportedUnixPeer, UnsupportedUnixPeerReason> {
+    let Some(path) = client_addr.as_pathname() else {
+        return Err(UnsupportedUnixPeerReason::MissingPathname);
+    };
+    let Some(path_str) = path.to_str() else {
+        return Err(UnsupportedUnixPeerReason::NonUtf8Pathname);
+    };
+
+    Ok(SupportedUnixPeer {
+        addr: ClientAddr::Unix(path_str.to_string()),
+        reply_path: path_str.to_string(),
+        debug_addr: format!("{:?}", client_addr),
+    })
+}
+
+#[cfg(unix)]
 fn send_unix_error_response(
     socket: &std::os::unix::net::UnixDatagram,
-    client_addr: &std::os::unix::net::SocketAddr,
+    reply_path: &str,
     code: ErrorCode,
     message: &str,
     seq: u32,
 ) {
-    let Some(path) = client_addr.as_pathname() else {
-        eprintln!("[Client] Failed to send Error response: client address has no pathname");
-        return;
-    };
-
     let mut error_buf = [0u8; 256];
     let Ok(encoded) = protocol::encode_error(code, message, seq, &mut error_buf) else {
         eprintln!("[Client] Failed to encode Error response");
         return;
     };
 
-    if let Err(error) = socket.send_to(encoded, path) {
+    if let Err(error) = socket.send_to(encoded, reply_path) {
         eprintln!("[Client] Failed to send Error response: {}", error);
     }
 }
@@ -1448,6 +1468,16 @@ impl Daemon {
             clients,
             stats,
         } = ctx;
+        let peer = match resolve_supported_unix_peer(&client_addr) {
+            Ok(peer) => peer,
+            Err(reason) => {
+                eprintln!(
+                    "[Unix IPC] Dropping message from unsupported unix peer {:?}: {}",
+                    client_addr, reason
+                );
+                return;
+            },
+        };
         match msg {
             piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
                 // 更新客户端活动时间
@@ -1460,38 +1490,18 @@ impl Daemon {
                 filters,
                 seq,
             } => {
-                // 注册客户端（使用从 recv_from 获取的真实地址）
-                // 尝试从 UnixSocketAddr 获取路径（如果可用）
-                // 支持自动 ID 分配：client_id = 0 表示自动分配
-                let addr_str = match client_addr.as_pathname() {
-                    Some(path) => match path.to_str() {
-                        Some(s) => s.to_string(),
-                        None => {
-                            // 对于自动分配，暂时使用临时路径，实际 ID 会从分配结果获取
-                            eprintln!(
-                                "Warning: Client path contains invalid UTF-8, using fallback"
-                            );
-                            // ✅ 使用 XDG 合规路径
-                            get_temp_socket_path("gs_usb_client_auto.sock")
-                        },
-                    },
-                    None => {
-                        eprintln!("Warning: Client address is abstract, using fallback path");
-                        // ✅ 使用 XDG 合规路径
-                        get_temp_socket_path("gs_usb_client_auto.sock")
-                    },
-                };
-
-                let addr = ClientAddr::Unix(addr_str.clone());
-                let unix_addr_debug = format!("{:?}", client_addr);
                 let prepared_result = {
                     let mut clients_guard = clients.write().unwrap();
                     if client_id == 0 {
-                        clients_guard.prepare_registration_auto(addr, filters, Some(client_addr))
+                        clients_guard.prepare_registration_auto(
+                            peer.addr.clone(),
+                            filters,
+                            Some(client_addr),
+                        )
                     } else {
                         clients_guard.prepare_registration_manual(
                             client_id,
-                            addr,
+                            peer.addr.clone(),
                             filters,
                             Some(client_addr),
                         )
@@ -1513,7 +1523,7 @@ impl Daemon {
                 );
 
                 // 发送 ConnectAck 到客户端
-                if let Err(e) = socket.send_to(encoded_ack, &addr_str) {
+                if let Err(e) = socket.send_to(encoded_ack, peer.reply_path.as_str()) {
                     eprintln!("Failed to send ConnectAck to client {}: {}", actual_id, e);
                     if let Some(prepared) = prepared_registration.take() {
                         clients.write().unwrap().abort_prepared_registration(prepared);
@@ -1532,12 +1542,12 @@ impl Daemon {
                         if client_id == 0 {
                             eprintln!(
                                 "Client {} auto-assigned and connected from {} (path: {})",
-                                actual_id, unix_addr_debug, addr_str
+                                actual_id, peer.debug_addr, peer.reply_path
                             );
                         } else {
                             eprintln!(
                                 "Client {} connected from {} (path: {})",
-                                actual_id, unix_addr_debug, addr_str
+                                actual_id, peer.debug_addr, peer.reply_path
                             );
                         }
                     }
@@ -1554,9 +1564,7 @@ impl Daemon {
                 let encoded =
                     piper_can::gs_usb_udp::protocol::encode_disconnect_ack(seq, &mut ack_buf);
 
-                if let Some(path) = client_addr.as_pathname()
-                    && let Err(error) = socket.send_to(encoded, path)
-                {
+                if let Err(error) = socket.send_to(encoded, peer.reply_path.as_str()) {
                     eprintln!("[Client] Failed to send DisconnectAck: {}", error);
                 }
             },
@@ -1570,9 +1578,7 @@ impl Daemon {
                             stats.read().unwrap().increment_tx();
                             let mut ack_buf = [0u8; 12];
                             let encoded = protocol::encode_send_ack(seq, 0, &mut ack_buf);
-                            if let Some(path) = client_addr.as_pathname()
-                                && let Err(error) = socket.send_to(encoded, path)
-                            {
+                            if let Err(error) = socket.send_to(encoded, peer.reply_path.as_str()) {
                                 eprintln!("[Client] Failed to send SendAck: {}", error);
                             }
                         },
@@ -1584,7 +1590,7 @@ impl Daemon {
 
                             send_unix_error_response(
                                 socket,
-                                &client_addr,
+                                peer.reply_path.as_str(),
                                 bridge_error_code(&e),
                                 &e.to_string(),
                                 seq,
@@ -1596,7 +1602,7 @@ impl Daemon {
                     drop(adapter_guard);
                     send_unix_error_response(
                         socket,
-                        &client_addr,
+                        peer.reply_path.as_str(),
                         ErrorCode::NotConnected,
                         "TX adapter not available",
                         seq,
@@ -1621,16 +1627,6 @@ impl Daemon {
                 // 可选：发送确认消息给客户端
             },
             piper_can::gs_usb_udp::protocol::Message::GetStatus { seq } => {
-                // ✅ 新增：GetStatus 消息处理
-                // 按需提取地址字符串（性能优化：仅在此分支内转换）
-                let addr_str = match client_addr.as_pathname() {
-                    Some(path) => match path.to_str() {
-                        Some(s) => s.to_string(),
-                        None => get_temp_socket_path("gs_usb_client.sock"), // ✅ XDG 合规
-                    },
-                    None => get_temp_socket_path("gs_usb_client.sock"), // ✅ XDG 合规
-                };
-
                 let clients_guard = clients.read().unwrap();
                 let stats_guard = stats.read().unwrap();
                 let detailed_guard = stats_guard.detailed.read().unwrap();
@@ -1669,11 +1665,11 @@ impl Daemon {
                     &mut status_buf,
                 ) {
                     // ✅ 关键：发送到请求者（而不是广播给所有客户端）
-                    // ✅ 注意：GetStatus 的请求者可能尚未注册，所以必须使用 recv_from 获取的地址
-                    if let Err(e) = socket.send_to(encoded, &addr_str) {
+                    // ✅ 注意：GetStatus 的请求者可能尚未注册，所以必须使用已验证的真实 peer 地址
+                    if let Err(e) = socket.send_to(encoded, peer.reply_path.as_str()) {
                         eprintln!("Failed to send StatusResponse: {}", e);
                     } else {
-                        eprintln!("[GetStatus] Sent StatusResponse to {}", addr_str);
+                        eprintln!("[GetStatus] Sent StatusResponse to {}", peer.reply_path);
                     }
                 }
             },
@@ -2260,7 +2256,15 @@ impl Drop for Daemon {
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    #[cfg(unix)]
     use std::os::unix::net::UnixDatagram;
+    #[cfg(unix)]
+    use std::sync::Mutex as TestMutex;
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicU32 as TestAtomicU32;
     use std::sync::atomic::AtomicU64;
 
     struct TestIpcContext {
@@ -2283,15 +2287,38 @@ mod tests {
     fn unique_test_socket_path(label: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir()
-            .join(format!(
-                "piper_daemon_test_{}_{}_{}.sock",
-                label,
-                std::process::id(),
-                id
-            ))
-            .to_string_lossy()
-            .to_string()
+        let label: String = label.chars().take(8).collect();
+        format!("/tmp/pd_{}_{}_{}.sock", label, std::process::id(), id)
+    }
+
+    #[cfg(unix)]
+    fn unique_invalid_utf8_socket_path(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let valid = format!("/tmp/pd_{}_{}_sock", label, id);
+        let mut bytes = std::ffi::OsStr::new(&valid).as_bytes().to_vec();
+        let insert_at = bytes.iter().rposition(|byte| *byte == b'.').unwrap_or(bytes.len());
+        bytes.insert(insert_at, 0xFF);
+        std::path::PathBuf::from(OsString::from_vec(bytes))
+    }
+
+    #[cfg(unix)]
+    static UNSUPPORTED_UNIX_PEER_TEST_LOCK: TestMutex<()> = TestMutex::new(());
+
+    #[cfg(unix)]
+    struct CountingBridgeTxAdapter {
+        sends: Arc<TestAtomicU32>,
+    }
+
+    #[cfg(unix)]
+    impl BridgeTxAdapter for CountingBridgeTxAdapter {
+        fn send_bridge(
+            &mut self,
+            _frame: piper_can::PiperFrame,
+        ) -> Result<(), piper_can::CanError> {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 
     #[test]
@@ -2426,5 +2453,160 @@ mod tests {
 
         let _ = std::fs::remove_file(&server_path);
         let _ = std::fs::remove_file(&client_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_ipc_message_unix_connect_rejects_unnamed_peer_without_fake_ack() {
+        let _guard = UNSUPPORTED_UNIX_PEER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let test_ctx = test_ipc_context();
+        let ctx = IpcHandlerContext {
+            tx_adapter: &test_ctx.tx_adapter,
+            device_state: &test_ctx.device_state,
+            clients: &test_ctx.clients,
+            stats: &test_ctx.stats,
+        };
+
+        let server_path = unique_test_socket_path("server_no_path_peer");
+        let _ = std::fs::remove_file(&server_path);
+
+        let server = UnixDatagram::bind(&server_path).unwrap();
+
+        let client = UnixDatagram::unbound().unwrap();
+        client.send_to(&[0xAA], &server_path).unwrap();
+
+        let mut probe = [0u8; 16];
+        let (_, client_addr) = server.recv_from(&mut probe).unwrap();
+        assert!(client_addr.as_pathname().is_none());
+
+        Daemon::handle_ipc_message(
+            Message::Connect {
+                client_id: 0,
+                filters: vec![],
+                seq: 101,
+            },
+            client_addr,
+            ctx,
+            &server,
+        );
+
+        assert_eq!(test_ctx.clients.read().unwrap().count(), 0);
+
+        let _ = std::fs::remove_file(&server_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_ipc_message_unix_connect_rejects_invalid_utf8_peer_without_fake_ack() {
+        let _guard = UNSUPPORTED_UNIX_PEER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let test_ctx = test_ipc_context();
+        let ctx = IpcHandlerContext {
+            tx_adapter: &test_ctx.tx_adapter,
+            device_state: &test_ctx.device_state,
+            clients: &test_ctx.clients,
+            stats: &test_ctx.stats,
+        };
+
+        let server_path = unique_test_socket_path("server_invalid_utf8_peer");
+        let client_path = unique_invalid_utf8_socket_path("invalid_utf8_client");
+        let _ = std::fs::remove_file(&server_path);
+
+        let server = UnixDatagram::bind(&server_path).unwrap();
+        let client_addr = std::os::unix::net::SocketAddr::from_pathname(&client_path).unwrap();
+        assert!(client_addr.as_pathname().is_some());
+        assert!(client_addr.as_pathname().unwrap().to_str().is_none());
+
+        Daemon::handle_ipc_message(
+            Message::Connect {
+                client_id: 0,
+                filters: vec![],
+                seq: 102,
+            },
+            client_addr,
+            ctx,
+            &server,
+        );
+
+        assert_eq!(test_ctx.clients.read().unwrap().count(), 0);
+
+        let _ = std::fs::remove_file(&server_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_ipc_message_unix_unsupported_peer_drops_status_send_and_disconnect() {
+        let _guard = UNSUPPORTED_UNIX_PEER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let test_ctx = test_ipc_context();
+        let existing_path = unique_test_socket_path("existing_client");
+        let existing_addr = ClientAddr::Unix(existing_path.clone());
+        test_ctx.clients.write().unwrap().register(7, existing_addr, vec![]).unwrap();
+
+        let send_count = Arc::new(TestAtomicU32::new(0));
+        *test_ctx.tx_adapter.lock().unwrap() = Some(Box::new(CountingBridgeTxAdapter {
+            sends: Arc::clone(&send_count),
+        }));
+
+        let server_path = unique_test_socket_path("server_unsupported_peer_ops");
+        let _ = std::fs::remove_file(&server_path);
+
+        let server = UnixDatagram::bind(&server_path).unwrap();
+
+        let client = UnixDatagram::unbound().unwrap();
+        client.send_to(&[0xCC], &server_path).unwrap();
+
+        let mut probe = [0u8; 16];
+        let (_, client_addr) = server.recv_from(&mut probe).unwrap();
+        assert!(client_addr.as_pathname().is_none());
+
+        Daemon::handle_ipc_message(
+            Message::GetStatus { seq: 11 },
+            client_addr.clone(),
+            IpcHandlerContext {
+                tx_adapter: &test_ctx.tx_adapter,
+                device_state: &test_ctx.device_state,
+                clients: &test_ctx.clients,
+                stats: &test_ctx.stats,
+            },
+            &server,
+        );
+        Daemon::handle_ipc_message(
+            Message::SendFrame {
+                frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
+                seq: 12,
+            },
+            client_addr.clone(),
+            IpcHandlerContext {
+                tx_adapter: &test_ctx.tx_adapter,
+                device_state: &test_ctx.device_state,
+                clients: &test_ctx.clients,
+                stats: &test_ctx.stats,
+            },
+            &server,
+        );
+        Daemon::handle_ipc_message(
+            Message::Disconnect {
+                client_id: 7,
+                seq: 13,
+            },
+            client_addr,
+            IpcHandlerContext {
+                tx_adapter: &test_ctx.tx_adapter,
+                device_state: &test_ctx.device_state,
+                clients: &test_ctx.clients,
+                stats: &test_ctx.stats,
+            },
+            &server,
+        );
+
+        assert_eq!(send_count.load(Ordering::Relaxed), 0);
+        assert!(test_ctx.clients.read().unwrap().contains(7));
+
+        let _ = std::fs::remove_file(&server_path);
     }
 }

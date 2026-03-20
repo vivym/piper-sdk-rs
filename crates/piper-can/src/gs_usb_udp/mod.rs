@@ -5,6 +5,8 @@
 //! `set_receive_timeout()` 只影响 receive path；`send()` 始终使用固定的 `bridge_timeout`
 //! 作为 round-trip budget。若 send timeout、控制平面失同步，或 receive path 看见
 //! 不该出现的 `SendAck/Error(seq)`，当前 session 会 fail-closed 并要求显式 reconnect。
+//! UDS 模式仅支持 pathname Unix datagram client；abstract namespace 或 non-UTF8
+//! peer 会被 daemon 侧直接拒绝。
 
 pub mod protocol;
 
@@ -26,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// GS-USB UDP/UDS 适配器
 ///
 /// 通过守护进程访问 GS-USB 设备，支持 UDS（Unix Domain Socket）和 UDP 两种传输方式。
+/// UDS bridge/debug 模式要求客户端使用 pathname Unix datagram socket。
 pub struct GsUsbUdpAdapter {
     session: Arc<DaemonSession>,
     rx_buffer: VecDeque<PiperFrame>,

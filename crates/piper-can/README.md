@@ -159,6 +159,8 @@ pub trait CanAdapter {
 `set_receive_timeout()` 只影响 receive path；`send()` 始终使用固定的 `bridge_timeout`
 作为 round-trip budget。若 send timeout、控制平面失同步，或 receive path 看见
 `SendAck/Error(seq)`，session 会 fail-closed 并要求显式 `reconnect()`。
+UDS 模式仅支持 pathname Unix datagram client；abstract namespace 或 non-UTF8
+peer 会被 daemon 侧直接拒绝。
 
 ### 分离适配器（Splittable Adapter）
 

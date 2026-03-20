@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 
 /// 客户端地址（支持 UDS 和 UDP）
 ///
-/// 注意：UnixSocketAddr 不实现 Hash，所以我们使用 String 表示 UDS 路径
+/// 注意：UnixSocketAddr 不实现 Hash，所以我们使用已经过验证的 UTF-8 pathname
+/// 作为 UDS peer 的稳定 key；abstract 或 non-UTF8 peer 不会进入 registry。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientAddr {
     #[cfg(unix)]
-    Unix(String), // UDS 路径（如 "/tmp/gs_usb_daemon.sock"）
+    Unix(String), // 已验证的 UDS pathname（如 "/tmp/gs_usb_daemon.sock"）
     Udp(SocketAddr), // UDP 地址（如 "127.0.0.1:8888"）
 }
 
