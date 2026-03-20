@@ -2259,6 +2259,40 @@ impl Drop for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixDatagram;
+    use std::sync::atomic::AtomicU64;
+
+    struct TestIpcContext {
+        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
+        device_state: Arc<DeviceStateCell>,
+        clients: Arc<RwLock<ClientManager>>,
+        stats: Arc<RwLock<DaemonStats>>,
+    }
+
+    fn test_ipc_context() -> TestIpcContext {
+        TestIpcContext {
+            tx_adapter: Arc::new(Mutex::new(None)),
+            device_state: Arc::new(DeviceStateCell::new(DeviceState::Connected)),
+            clients: Arc::new(RwLock::new(ClientManager::new())),
+            stats: Arc::new(RwLock::new(DaemonStats::new())),
+        }
+    }
+
+    #[cfg(unix)]
+    fn unique_test_socket_path(label: &str) -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "piper_daemon_test_{}_{}_{}.sock",
+                label,
+                std::process::id(),
+                id
+            ))
+            .to_string_lossy()
+            .to_string()
+    }
 
     #[test]
     fn test_device_state_transitions() {
@@ -2294,5 +2328,103 @@ mod tests {
         // 验证 RX 和 TX adapter 初始为 None
         assert!(daemon.rx_adapter.lock().unwrap().is_none());
         assert!(daemon.tx_adapter.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_handle_ipc_message_udp_connect_commits_only_after_ack_send() {
+        let test_ctx = test_ipc_context();
+        let ctx = IpcHandlerContext {
+            tx_adapter: &test_ctx.tx_adapter,
+            device_state: &test_ctx.device_state,
+            clients: &test_ctx.clients,
+            stats: &test_ctx.stats,
+        };
+
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+
+        client.send(&[0xAA]).unwrap();
+        let mut probe = [0u8; 16];
+        let (_, client_addr) = server.recv_from(&mut probe).unwrap();
+
+        assert_eq!(test_ctx.clients.read().unwrap().count(), 0);
+
+        Daemon::handle_ipc_message_udp(
+            Message::Connect {
+                client_id: 0,
+                filters: vec![],
+                seq: 77,
+            },
+            client_addr,
+            ctx,
+            &server,
+        );
+
+        let mut ack_buf = [0u8; 64];
+        let len = client.recv(&mut ack_buf).unwrap();
+        match protocol::decode_message(&ack_buf[..len]).unwrap() {
+            Message::ConnectAck { seq, status, .. } => {
+                assert_eq!(seq, 77);
+                assert_eq!(status, 0);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+
+        assert_eq!(test_ctx.clients.read().unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_ipc_message_unix_connect_commits_only_after_ack_send() {
+        let test_ctx = test_ipc_context();
+        let ctx = IpcHandlerContext {
+            tx_adapter: &test_ctx.tx_adapter,
+            device_state: &test_ctx.device_state,
+            clients: &test_ctx.clients,
+            stats: &test_ctx.stats,
+        };
+
+        let server_path = unique_test_socket_path("server");
+        let client_path = unique_test_socket_path("client");
+        let _ = std::fs::remove_file(&server_path);
+        let _ = std::fs::remove_file(&client_path);
+
+        let server = UnixDatagram::bind(&server_path).unwrap();
+        let client = UnixDatagram::bind(&client_path).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        client.send_to(&[0xAA], &server_path).unwrap();
+
+        let mut probe = [0u8; 16];
+        let (_, client_addr) = server.recv_from(&mut probe).unwrap();
+
+        assert_eq!(test_ctx.clients.read().unwrap().count(), 0);
+
+        Daemon::handle_ipc_message(
+            Message::Connect {
+                client_id: 0,
+                filters: vec![],
+                seq: 88,
+            },
+            client_addr,
+            ctx,
+            &server,
+        );
+
+        let mut ack_buf = [0u8; 64];
+        let len = client.recv(&mut ack_buf).unwrap();
+        match protocol::decode_message(&ack_buf[..len]).unwrap() {
+            Message::ConnectAck { seq, status, .. } => {
+                assert_eq!(seq, 88);
+                assert_eq!(status, 0);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+
+        assert_eq!(test_ctx.clients.read().unwrap().count(), 1);
+
+        let _ = std::fs::remove_file(&server_path);
+        let _ = std::fs::remove_file(&client_path);
     }
 }

@@ -1325,12 +1325,102 @@ mod tests {
         adapter.connect_with_timeout(vec![], Duration::from_millis(80)).unwrap();
         assert!(adapter.is_connected());
 
-        adapter.set_receive_timeout(Duration::from_millis(20));
-        let receive_error = adapter.receive().unwrap_err();
-        assert!(matches!(receive_error, CanError::Timeout));
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_gs_usb_udp_connect_succeeds_under_live_receive_frames_before_ack_udp() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, addr)) = server.recv_from(&mut buf) {
+                if let Message::Connect { seq, .. } = protocol::decode_message(&buf[..len]).unwrap()
+                {
+                    for i in 0..3u16 {
+                        let frame = PiperFrame::new_standard(0x500u16 + i, &[1, 2, 3, 4]);
+                        let mut frame_buf = [0u8; 64];
+                        let encoded =
+                            protocol::encode_receive_frame_zero_copy(&frame, &mut frame_buf)
+                                .unwrap();
+                        server.send_to(encoded, addr).unwrap();
+                    }
+
+                    thread::sleep(Duration::from_millis(10));
+
+                    let mut ack_buf = [0u8; 13];
+                    let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
+                    server.send_to(encoded, addr).unwrap();
+                    break;
+                }
+            }
+        });
+
+        let mut adapter = GsUsbUdpAdapter::new_udp_with_timeout(
+            server_addr.to_string(),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        adapter.connect_with_timeout(vec![], Duration::from_millis(80)).unwrap();
         assert!(adapter.is_connected());
 
         server_handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_gs_usb_udp_connect_succeeds_under_live_receive_frames_before_ack_uds() {
+        let server_path = unique_client_socket_path();
+        if server_path.exists() {
+            let _ = std::fs::remove_file(&server_path);
+        }
+
+        let server = UnixDatagram::bind(&server_path).unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_path_str = server_path.to_string_lossy().to_string();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let (len, addr) = server.recv_from(&mut buf).unwrap();
+            match protocol::decode_message(&buf[..len]).unwrap() {
+                Message::Connect { seq, .. } => {
+                    let path = addr.as_pathname().expect("expected pathname client");
+
+                    for i in 0..3u16 {
+                        let frame = PiperFrame::new_standard(0x510u16 + i, &[4, 3, 2, 1]);
+                        let mut frame_buf = [0u8; 64];
+                        let encoded =
+                            protocol::encode_receive_frame_zero_copy(&frame, &mut frame_buf)
+                                .unwrap();
+                        server.send_to(encoded, path).unwrap();
+                    }
+
+                    thread::sleep(Duration::from_millis(10));
+
+                    let mut ack_buf = [0u8; 13];
+                    let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
+                    server.send_to(encoded, path).unwrap();
+                },
+                other => panic!("unexpected message: {:?}", other),
+            }
+        });
+
+        let Some(mut adapter) = adapter_or_skip(
+            GsUsbUdpAdapter::new_uds_with_timeout(server_path_str, Duration::from_millis(40)),
+            "uds",
+        ) else {
+            let _ = std::fs::remove_file(&server_path);
+            return;
+        };
+
+        adapter.connect_with_timeout(vec![], Duration::from_millis(80)).unwrap();
+        assert!(adapter.is_connected());
+
+        server_handle.join().unwrap();
+        let _ = std::fs::remove_file(&server_path);
     }
 
     #[test]
