@@ -8,7 +8,7 @@ use crate::client_manager::{ClientAddr, ClientManager};
 use piper_can::BridgeTxAdapter;
 use piper_can::gs_usb::{GsUsbCanAdapter, split::GsUsbRxAdapter};
 use piper_can::gs_usb_udp::protocol::{self, ErrorCode, Message, StatusResponse};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,14 +69,14 @@ fn record_bridge_tx_error(stats: &Arc<RwLock<DaemonStats>>, error: &piper_can::C
 }
 
 fn mark_bridge_device_disconnected(
-    device_state: &Arc<RwLock<DeviceState>>,
+    device_state: &Arc<DeviceStateCell>,
     tx_adapter: &Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
 ) {
     {
         let mut tx_guard = tx_adapter.lock().unwrap();
         *tx_guard = None;
     }
-    *device_state.write().unwrap() = DeviceState::Disconnected;
+    device_state.store(DeviceState::Disconnected);
 }
 
 #[cfg(unix)]
@@ -123,6 +123,7 @@ fn send_udp_error_response(
 
 /// 设备状态机
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum DeviceState {
     /// 设备已连接，正常工作
     Connected,
@@ -130,6 +131,41 @@ pub enum DeviceState {
     Disconnected,
     /// 正在重连中
     Reconnecting,
+}
+
+impl DeviceState {
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            x if x == DeviceState::Connected as u8 => DeviceState::Connected,
+            x if x == DeviceState::Reconnecting as u8 => DeviceState::Reconnecting,
+            _ => DeviceState::Disconnected,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DeviceStateCell {
+    state: AtomicU8,
+}
+
+impl DeviceStateCell {
+    fn new(initial: DeviceState) -> Self {
+        Self {
+            state: AtomicU8::new(initial.as_u8()),
+        }
+    }
+
+    fn load(&self) -> DeviceState {
+        DeviceState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    fn store(&self, state: DeviceState) {
+        self.state.store(state.as_u8(), Ordering::Release);
+    }
 }
 
 /// 守护进程配置
@@ -226,7 +262,7 @@ struct DaemonStats {
 
 struct IpcHandlerContext<'a> {
     tx_adapter: &'a Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-    device_state: &'a Arc<RwLock<DeviceState>>,
+    device_state: &'a Arc<DeviceStateCell>,
     clients: &'a Arc<RwLock<ClientManager>>,
     stats: &'a Arc<RwLock<DaemonStats>>,
 }
@@ -648,7 +684,7 @@ pub struct Daemon {
     tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
 
     /// 设备状态
-    device_state: Arc<RwLock<DeviceState>>,
+    device_state: Arc<DeviceStateCell>,
 
     /// UDS Socket（Unix Domain Socket）
     #[cfg(unix)]
@@ -677,7 +713,7 @@ impl Daemon {
             // 分离 RX 和 TX adapter
             rx_adapter: Arc::new(Mutex::new(None)),
             tx_adapter: Arc::new(Mutex::new(None)),
-            device_state: Arc::new(RwLock::new(DeviceState::Disconnected)),
+            device_state: Arc::new(DeviceStateCell::new(DeviceState::Disconnected)),
             #[cfg(unix)]
             socket_uds: None,
             socket_udp: None,
@@ -851,7 +887,7 @@ impl Daemon {
     fn device_manager_loop(
         rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
         tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-        device_state: Arc<RwLock<DeviceState>>,
+        device_state: Arc<DeviceStateCell>,
         stats: Arc<RwLock<DaemonStats>>,
         config: DaemonConfig,
     ) {
@@ -859,7 +895,7 @@ impl Daemon {
         let mut last_disconnect_time: Option<Instant> = None;
 
         loop {
-            let current_state = *device_state.read().unwrap();
+            let current_state = device_state.load();
 
             match current_state {
                 DeviceState::Connected => {
@@ -881,17 +917,14 @@ impl Daemon {
 
                     // 进入重连状态前，先清空 adapters
                     {
-                        let mut state_guard = device_state.write().unwrap();
-                        {
-                            let mut rx_guard = rx_adapter.lock().unwrap();
-                            let mut tx_guard = tx_adapter.lock().unwrap();
+                        let mut rx_guard = rx_adapter.lock().unwrap();
+                        let mut tx_guard = tx_adapter.lock().unwrap();
 
-                            *rx_guard = None;
-                            *tx_guard = None;
-                        }
-                        *state_guard = DeviceState::Reconnecting;
-                        eprintln!("[DeviceManager] Entering reconnecting state");
+                        *rx_guard = None;
+                        *tx_guard = None;
                     }
+                    device_state.store(DeviceState::Reconnecting);
+                    eprintln!("[DeviceManager] Entering reconnecting state");
                 },
                 DeviceState::Reconnecting => {
                     // 尝试连接设备并原子性更新 RX/TX adapter
@@ -938,10 +971,7 @@ impl Daemon {
                             // 乐观策略：默认假设设备支持 Bus Off 检测（现代 GS-USB 设备普遍支持）
                             // 只有在明确检测到不支持时才降级
 
-                            // 原子性更新（在 device_state 写锁保护下）
-                            let mut state_guard = device_state.write().unwrap();
                             {
-                                // ✅ 锁顺序：device_state → rx_adapter → tx_adapter（防死锁）
                                 let mut rx_guard = rx_adapter.lock().unwrap();
                                 let mut tx_guard = tx_adapter.lock().unwrap();
 
@@ -949,9 +979,9 @@ impl Daemon {
                                 *tx_guard = Some(new_tx_adapter);
 
                                 eprintln!("[DeviceManager] Updated RX and TX adapters");
-                            } // ✅ 释放 adapter 锁
+                            }
 
-                            *state_guard = DeviceState::Connected;
+                            device_state.store(DeviceState::Connected);
                             eprintln!("[DeviceManager] Device reconnected successfully");
                             last_disconnect_time = None; // 重置去抖动计时器
                         },
@@ -977,7 +1007,7 @@ impl Daemon {
     /// 使用 RX adapter，锁粒度最小化
     fn usb_receive_loop(
         rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
-        device_state: Arc<RwLock<DeviceState>>,
+        device_state: Arc<DeviceStateCell>,
         clients: Arc<RwLock<ClientManager>>,
         #[cfg(unix)] socket_uds: Option<std::os::unix::net::UnixDatagram>,
         #[cfg(not(unix))] _socket_uds: Option<()>,
@@ -986,7 +1016,7 @@ impl Daemon {
     ) {
         loop {
             // 1. 检查设备状态（快速检查，不要阻塞）
-            if *device_state.read().unwrap() != DeviceState::Connected {
+            if device_state.load() != DeviceState::Connected {
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -1044,7 +1074,7 @@ impl Daemon {
                             };
 
                             if should_disconnect {
-                                *device_state.write().unwrap() = DeviceState::Disconnected;
+                                device_state.store(DeviceState::Disconnected);
                             }
 
                             // 短暂等待后重试，避免死循环
@@ -1302,7 +1332,7 @@ impl Daemon {
     fn ipc_receive_loop(
         socket: std::os::unix::net::UnixDatagram,
         tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-        device_state: Arc<RwLock<DeviceState>>,
+        device_state: Arc<DeviceStateCell>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
     ) {
@@ -1355,7 +1385,7 @@ impl Daemon {
     fn ipc_receive_loop_udp(
         socket: std::net::UdpSocket,
         tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-        device_state: Arc<RwLock<DeviceState>>,
+        device_state: Arc<DeviceStateCell>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
     ) {
@@ -1528,7 +1558,13 @@ impl Daemon {
                         Ok(_) => {
                             // 更新统计（USB 发送成功）
                             stats.read().unwrap().increment_tx();
-                            // 发送成功，可以发送 SendAck（可选）
+                            let mut ack_buf = [0u8; 12];
+                            let encoded = protocol::encode_send_ack(seq, 0, &mut ack_buf);
+                            if let Some(path) = client_addr.as_pathname()
+                                && let Err(error) = socket.send_to(encoded, path)
+                            {
+                                eprintln!("[Client] Failed to send SendAck: {}", error);
+                            }
                         },
                         Err(e) => {
                             eprintln!("[Client] Failed to send frame: {}", e);
@@ -1587,7 +1623,6 @@ impl Daemon {
 
                 let clients_guard = clients.read().unwrap();
                 let stats_guard = stats.read().unwrap();
-                let device_state_guard = device_state.read().unwrap();
                 let detailed_guard = stats_guard.detailed.read().unwrap();
 
                 let rx_fps = stats_guard.get_rx_fps();
@@ -1595,7 +1630,7 @@ impl Daemon {
 
                 // 构建 StatusResponse
                 let status = StatusResponse {
-                    device_state: match *device_state_guard {
+                    device_state: match device_state.load() {
                         DeviceState::Connected => 1,
                         DeviceState::Disconnected => 0,
                         DeviceState::Reconnecting => 2,
@@ -1739,6 +1774,11 @@ impl Daemon {
                     match adapter_ref.send_bridge(frame) {
                         Ok(_) => {
                             stats.read().unwrap().increment_tx();
+                            let mut ack_buf = [0u8; 12];
+                            let encoded = protocol::encode_send_ack(seq, 0, &mut ack_buf);
+                            if let Err(error) = socket.send_to(encoded, client_addr) {
+                                eprintln!("[UDP Client] Failed to send SendAck: {}", error);
+                            }
                         },
                         Err(e) => {
                             eprintln!("[UDP Client] Failed to send frame: {}", e);
@@ -1789,7 +1829,6 @@ impl Daemon {
 
                 let clients_guard = clients.read().unwrap();
                 let stats_guard = stats.read().unwrap();
-                let device_state_guard = device_state.read().unwrap();
                 let detailed_guard = stats_guard.detailed.read().unwrap();
 
                 let rx_fps = stats_guard.get_rx_fps();
@@ -1797,7 +1836,7 @@ impl Daemon {
 
                 // 构建 StatusResponse
                 let status = StatusResponse {
-                    device_state: match *device_state_guard {
+                    device_state: match device_state.load() {
                         DeviceState::Connected => 1,
                         DeviceState::Disconnected => 0,
                         DeviceState::Reconnecting => 2,
@@ -1901,7 +1940,7 @@ impl Daemon {
     /// 每次打印后重置统计信息，使 FPS 显示最近一段时间的平均值
     fn status_print_loop(
         clients: Arc<RwLock<ClientManager>>,
-        device_state: Arc<RwLock<DeviceState>>,
+        device_state: Arc<DeviceStateCell>,
         stats: Arc<RwLock<DaemonStats>>,
         interval: Duration,
     ) {
@@ -1917,7 +1956,7 @@ impl Daemon {
                 let ids: Vec<u32> = clients_guard.iter().map(|client| client.id).collect();
                 (clients_guard.count(), ids) // ← 使用 count() 方法，更语义化
             };
-            let state = *device_state.read().unwrap();
+            let state = device_state.load();
 
             // 读取统计信息并计算 FPS + 健康度
             // 更新性能基线（必须由定时器触发，确保固定时间间隔）
@@ -2189,16 +2228,16 @@ mod tests {
 
     #[test]
     fn test_device_state_transitions() {
-        let state = Arc::new(RwLock::new(DeviceState::Connected));
+        let state = Arc::new(DeviceStateCell::new(DeviceState::Connected));
         // 验证状态转换
-        *state.write().unwrap() = DeviceState::Disconnected;
-        assert_eq!(*state.read().unwrap(), DeviceState::Disconnected);
+        state.store(DeviceState::Disconnected);
+        assert_eq!(state.load(), DeviceState::Disconnected);
 
-        *state.write().unwrap() = DeviceState::Reconnecting;
-        assert_eq!(*state.read().unwrap(), DeviceState::Reconnecting);
+        state.store(DeviceState::Reconnecting);
+        assert_eq!(state.load(), DeviceState::Reconnecting);
 
-        *state.write().unwrap() = DeviceState::Connected;
-        assert_eq!(*state.read().unwrap(), DeviceState::Connected);
+        state.store(DeviceState::Connected);
+        assert_eq!(state.load(), DeviceState::Connected);
     }
 
     #[test]
@@ -2217,10 +2256,7 @@ mod tests {
         let daemon = Daemon::new(config).unwrap();
 
         // 验证初始状态
-        assert_eq!(
-            *daemon.device_state.read().unwrap(),
-            DeviceState::Disconnected
-        );
+        assert_eq!(daemon.device_state.load(), DeviceState::Disconnected);
         // 验证 RX 和 TX adapter 初始为 None
         assert!(daemon.rx_adapter.lock().unwrap().is_none());
         assert!(daemon.tx_adapter.lock().unwrap().is_none());

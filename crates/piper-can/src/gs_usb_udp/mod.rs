@@ -5,7 +5,7 @@
 
 pub mod protocol;
 
-use crate::{BridgeTxAdapter, CanAdapter, CanError, PiperFrame, RxAdapter};
+use crate::{CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame};
 use protocol::{CanIdFilter, Message};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,10 +36,11 @@ struct DaemonSession {
     client_id: AtomicU32,
     daemon_addr: DaemonAddr,
     socket: Arc<Socket>,
+    bridge_timeout: Duration,
     seq_counter: AtomicU32,
     heartbeat_stop: Arc<AtomicBool>,
     heartbeat_handle: Mutex<Option<thread::JoinHandle<()>>>,
-    connected: AtomicBool,
+    connected: Arc<AtomicBool>,
     #[cfg(unix)]
     client_socket_path: Option<PathBuf>,
 }
@@ -57,17 +58,6 @@ enum Socket {
     #[cfg(unix)]
     Unix(UnixDatagram),
     Udp(UdpSocket),
-}
-
-#[doc(hidden)]
-pub struct GsUsbUdpRxAdapter {
-    session: Arc<DaemonSession>,
-    rx_buffer: VecDeque<PiperFrame>,
-}
-
-#[doc(hidden)]
-pub struct GsUsbUdpTxAdapter {
-    session: Arc<DaemonSession>,
 }
 
 impl Socket {
@@ -136,16 +126,18 @@ impl DaemonSession {
     fn new(
         daemon_addr: DaemonAddr,
         socket: Arc<Socket>,
+        bridge_timeout: Duration,
         #[cfg(unix)] client_socket_path: Option<PathBuf>,
     ) -> Self {
         Self {
             client_id: AtomicU32::new(0),
             daemon_addr,
             socket,
+            bridge_timeout,
             seq_counter: AtomicU32::new(0),
             heartbeat_stop: Arc::new(AtomicBool::new(false)),
             heartbeat_handle: Mutex::new(None),
-            connected: AtomicBool::new(false),
+            connected: Arc::new(AtomicBool::new(false)),
             #[cfg(unix)]
             client_socket_path,
         }
@@ -167,24 +159,32 @@ impl DaemonSession {
         self.socket.recv_from_daemon(buf)
     }
 
-    fn mark_transport_lost(&self) {
+    fn mark_transport_lost_local(&self) {
         self.connected.store(false, Ordering::Release);
-        self.stop_heartbeat();
+        self.heartbeat_stop.store(true, Ordering::Release);
     }
 
     fn start_heartbeat(&self) -> Result<(), CanError> {
-        self.stop_heartbeat();
+        self.stop_heartbeat_join();
         self.heartbeat_stop.store(false, Ordering::Release);
 
         let client_id = self.client_id.load(Ordering::Acquire);
         let daemon_addr = self.daemon_addr.clone();
+        let bridge_timeout = self.bridge_timeout;
         let socket = Arc::clone(&self.socket);
         let stop_flag = Arc::clone(&self.heartbeat_stop);
+        let connected = Arc::clone(&self.connected);
 
         let handle = thread::Builder::new()
             .name("heartbeat".into())
             .spawn(move || {
                 let mut buf = [0u8; 12];
+                let heartbeat_interval = Duration::from_secs(5);
+                let stop_poll_interval = if bridge_timeout.is_zero() {
+                    Duration::from_millis(1)
+                } else {
+                    bridge_timeout.min(Duration::from_millis(100))
+                };
                 loop {
                     if stop_flag.load(Ordering::Acquire) {
                         return;
@@ -193,14 +193,27 @@ impl DaemonSession {
                     let encoded = protocol::encode_heartbeat(client_id, 0, &mut buf);
                     match socket.send_to_daemon(encoded, &daemon_addr) {
                         Ok(()) => {},
-                        Err(_) => return,
+                        Err(_) => {
+                            stop_flag.store(true, Ordering::Release);
+                            connected.store(false, Ordering::Release);
+                            return;
+                        },
                     }
 
-                    for _ in 0..50 {
+                    let next_tick = Instant::now() + heartbeat_interval;
+                    loop {
                         if stop_flag.load(Ordering::Acquire) {
                             return;
                         }
-                        thread::sleep(Duration::from_millis(100));
+
+                        let now = Instant::now();
+                        if now >= next_tick {
+                            break;
+                        }
+
+                        let sleep_for =
+                            next_tick.saturating_duration_since(now).min(stop_poll_interval);
+                        thread::sleep(sleep_for);
                     }
                 }
             })
@@ -210,7 +223,7 @@ impl DaemonSession {
         Ok(())
     }
 
-    fn stop_heartbeat(&self) {
+    fn stop_heartbeat_join(&self) {
         self.heartbeat_stop.store(true, Ordering::Release);
         if let Some(handle) = self.heartbeat_handle.lock().expect("heartbeat lock poisoned").take()
         {
@@ -219,7 +232,7 @@ impl DaemonSession {
     }
 
     fn disconnect(&self) -> Result<(), CanError> {
-        self.stop_heartbeat();
+        self.stop_heartbeat_join();
 
         if !self.connected.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -265,7 +278,18 @@ fn unique_client_socket_path() -> PathBuf {
     ))
 }
 
-fn send_frame(session: &DaemonSession, frame: PiperFrame) -> Result<(), CanError> {
+fn protocol_error(message: impl Into<String>) -> CanError {
+    CanError::Device(CanDeviceError::new(
+        CanDeviceErrorKind::InvalidResponse,
+        message,
+    ))
+}
+
+fn send_frame_and_wait_ack(
+    session: &DaemonSession,
+    frame: PiperFrame,
+    rx_buffer: &mut VecDeque<PiperFrame>,
+) -> Result<(), CanError> {
     if !session.is_connected() {
         return Err(CanError::Device("Not connected to daemon".into()));
     }
@@ -276,11 +300,74 @@ fn send_frame(session: &DaemonSession, frame: PiperFrame) -> Result<(), CanError
         .map_err(|err| CanError::Device(format!("Failed to encode send frame: {err:?}").into()))?;
 
     if let Err(error) = session.send_to_daemon(encoded) {
-        session.mark_transport_lost();
+        session.mark_transport_lost_local();
         return Err(error);
     }
 
-    Ok(())
+    let deadline = Instant::now() + session.bridge_timeout;
+    let mut response_buf = [0u8; 1024];
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(CanError::Timeout);
+        }
+
+        let len = match session.recv_from_daemon(&mut response_buf) {
+            Ok(len) => len,
+            Err(CanError::Timeout) => continue,
+            Err(error) => {
+                tracing::warn!("[GsUsbUdpAdapter] recv_from_daemon error: {:?}", error);
+                session.mark_transport_lost_local();
+                return Err(error);
+            },
+        };
+
+        let msg = match protocol::decode_message(&response_buf[..len]) {
+            Ok(msg) => msg,
+            Err(_) => continue,
+        };
+
+        match msg {
+            Message::ReceiveFrame(frame) => rx_buffer.push_back(frame),
+            Message::SendAck {
+                seq: ack_seq,
+                status,
+            } => {
+                if ack_seq != seq {
+                    return Err(protocol_error(format!(
+                        "Unexpected SendAck seq {ack_seq}, expected {seq}"
+                    )));
+                }
+                if status != 0 {
+                    return Err(CanError::Device(
+                        format!("Send failed with status: {status}").into(),
+                    ));
+                }
+                return Ok(());
+            },
+            Message::Error {
+                seq: error_seq,
+                code,
+                message,
+            } => {
+                if error_seq != seq {
+                    return Err(protocol_error(format!(
+                        "Unexpected Error seq {error_seq}, expected {seq}: {:?}: {}",
+                        code, message
+                    )));
+                }
+                return Err(CanError::Device(
+                    format!("Error {:?}: {}", code, message).into(),
+                ));
+            },
+            unexpected => {
+                return Err(protocol_error(format!(
+                    "Unexpected daemon message while waiting for send ack: {:?}",
+                    unexpected
+                )));
+            },
+        }
+    }
 }
 
 fn receive_frame(
@@ -309,7 +396,7 @@ fn receive_frame(
             },
             Err(error) => {
                 tracing::warn!("[GsUsbUdpAdapter] recv_from_daemon error: {:?}", error);
-                session.mark_transport_lost();
+                session.mark_transport_lost_local();
                 return Err(error);
             },
         };
@@ -323,17 +410,17 @@ fn receive_frame(
 
         match msg {
             Message::ReceiveFrame(frame) => rx_buffer.push_back(frame),
-            Message::Error { code, message } => {
-                return Err(CanError::Device(
-                    format!("Error {:?}: {}", code, message).into(),
-                ));
+            Message::Error { seq, code, message } => {
+                return Err(protocol_error(format!(
+                    "Unexpected Error in receive path (seq {}): {:?}: {}",
+                    seq, code, message
+                )));
             },
-            Message::SendAck { status, .. } => {
-                if status != 0 {
-                    return Err(CanError::Device(
-                        format!("Send failed with status: {status}").into(),
-                    ));
-                }
+            Message::SendAck { seq, status } => {
+                return Err(protocol_error(format!(
+                    "Unexpected SendAck in receive path (seq {}, status {})",
+                    seq, status
+                )));
             },
             Message::ConnectAck { .. } | Message::Heartbeat { .. } => {},
             _ => {},
@@ -372,6 +459,7 @@ impl GsUsbUdpAdapter {
         let session = Arc::new(DaemonSession::new(
             DaemonAddr::Unix(uds_path.as_ref().to_string()),
             socket,
+            bridge_timeout,
             Some(client_socket_path),
         ));
 
@@ -407,6 +495,7 @@ impl GsUsbUdpAdapter {
         let session = Arc::new(DaemonSession::new(
             DaemonAddr::Udp(addr),
             socket,
+            bridge_timeout,
             #[cfg(unix)]
             None,
         ));
@@ -416,22 +505,6 @@ impl GsUsbUdpAdapter {
             rx_buffer: VecDeque::new(),
             receive_timeout,
         })
-    }
-
-    /// 分离为 bridge-only RX/TX 句柄。
-    ///
-    /// 该 split 仅用于 daemon bridge / monitor / replay 等 best-effort 场景，
-    /// 不满足实时控制 backend 的契约，因此不实现 `SplittableAdapter`。
-    pub fn split_bridge(self) -> Result<(GsUsbUdpRxAdapter, GsUsbUdpTxAdapter), CanError> {
-        Ok((
-            GsUsbUdpRxAdapter {
-                session: Arc::clone(&self.session),
-                rx_buffer: self.rx_buffer,
-            },
-            GsUsbUdpTxAdapter {
-                session: self.session,
-            },
-        ))
     }
 
     /// 连接到守护进程
@@ -477,7 +550,11 @@ impl GsUsbUdpAdapter {
                             self.session.start_heartbeat()?;
                             return Ok(());
                         },
-                        Message::Error { code, message } => {
+                        Message::Error {
+                            seq: _,
+                            code,
+                            message,
+                        } => {
                             return Err(CanError::Device(
                                 format!("Connect error {:?}: {}", code, message).into(),
                             ));
@@ -537,7 +614,7 @@ impl GsUsbUdpAdapter {
 
 impl CanAdapter for GsUsbUdpAdapter {
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
-        send_frame(&self.session, frame)
+        send_frame_and_wait_ack(&self.session, frame, &mut self.rx_buffer)
     }
 
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
@@ -547,34 +624,6 @@ impl CanAdapter for GsUsbUdpAdapter {
     fn set_receive_timeout(&mut self, timeout: Duration) {
         self.receive_timeout = timeout;
         let _ = self.session.set_receive_timeout(timeout);
-    }
-}
-
-impl RxAdapter for GsUsbUdpRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
-        receive_frame(&self.session, &mut self.rx_buffer)
-    }
-}
-
-impl BridgeTxAdapter for GsUsbUdpTxAdapter {
-    fn send_bridge(&mut self, frame: PiperFrame) -> Result<(), CanError> {
-        if !self.session.is_connected() {
-            return Err(CanError::Device("Not connected to daemon".into()));
-        }
-
-        let seq = self.session.seq_counter.fetch_add(1, Ordering::Relaxed);
-        let mut buf = [0u8; 64];
-        let encoded =
-            protocol::encode_send_frame_with_seq(&frame, seq, &mut buf).map_err(|err| {
-                CanError::Device(format!("Failed to encode send frame: {err:?}").into())
-            })?;
-
-        if let Err(error) = self.session.send_to_daemon(encoded) {
-            self.session.mark_transport_lost();
-            return Err(error);
-        }
-
-        Ok(())
     }
 }
 
@@ -739,8 +788,45 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_gs_usb_udp_adapter_split_udp_roundtrip() {
+    fn test_gs_usb_udp_heartbeat_send_failure_marks_session_disconnected() {
+        let client_socket_path = unique_client_socket_path();
+        let missing_daemon_path = unique_client_socket_path();
+
+        if client_socket_path.exists() {
+            let _ = std::fs::remove_file(&client_socket_path);
+        }
+
+        let socket = Arc::new(Socket::Unix(
+            UnixDatagram::bind(&client_socket_path).unwrap(),
+        ));
+        socket.set_write_timeout(Some(Duration::from_millis(20))).unwrap();
+
+        let session = DaemonSession::new(
+            DaemonAddr::Unix(missing_daemon_path.to_string_lossy().to_string()),
+            socket,
+            Duration::from_millis(20),
+            Some(client_socket_path.clone()),
+        );
+        session.client_id.store(42, Ordering::Release);
+        session.connected.store(true, Ordering::Release);
+        session.start_heartbeat().unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while session.is_connected() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            !session.is_connected(),
+            "heartbeat send failure should mark session disconnected"
+        );
+        session.stop_heartbeat_join();
+    }
+
+    #[test]
+    fn test_gs_usb_udp_adapter_udp_roundtrip() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -792,16 +878,62 @@ mod tests {
         adapter.connect(vec![]).unwrap();
         ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let (mut rx, mut tx) = adapter.split_bridge().unwrap();
         let outbound = PiperFrame::new_standard(0x321, &[9, 8, 7, 6]);
-        tx.send_bridge(outbound).unwrap();
+        adapter.send(outbound).unwrap();
 
-        let inbound = rx.receive().unwrap();
+        let inbound = adapter.receive().unwrap();
         assert_eq!(inbound.id, outbound.id);
         assert_eq!(
             inbound.data[..inbound.len as usize],
             outbound.data[..outbound.len as usize]
         );
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_gs_usb_udp_adapter_send_error_returns_from_send() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+
+            while let Ok((len, addr)) = server.recv_from(&mut buf) {
+                let msg = protocol::decode_message(&buf[..len]).unwrap();
+                match msg {
+                    Message::Connect { .. } => {
+                        let mut ack_buf = [0u8; 13];
+                        let encoded = protocol::encode_connect_ack(42, 0, 0, &mut ack_buf);
+                        server.send_to(encoded, addr).unwrap();
+                        ready_tx.send(()).unwrap();
+                    },
+                    Message::SendFrame { seq, .. } => {
+                        let mut err_buf = [0u8; 256];
+                        let encoded = protocol::encode_error(
+                            protocol::ErrorCode::DeviceError,
+                            "bridge send failed",
+                            seq,
+                            &mut err_buf,
+                        )
+                        .unwrap();
+                        server.send_to(encoded, addr).unwrap();
+                        break;
+                    },
+                    _ => {},
+                }
+            }
+        });
+
+        let mut adapter = GsUsbUdpAdapter::new_udp(server_addr.to_string()).unwrap();
+        adapter.connect(vec![]).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let outbound = PiperFrame::new_standard(0x321, &[9, 8, 7, 6]);
+        let error = adapter.send(outbound).unwrap_err();
+        assert!(error.to_string().contains("bridge send failed"));
 
         server_handle.join().unwrap();
     }

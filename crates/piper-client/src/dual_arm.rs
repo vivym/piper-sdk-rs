@@ -3120,7 +3120,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_bilateral_runtime_transport_fault_from_rx_fatal_keeps_stop_attempt_confirmed() {
+    fn test_run_bilateral_runtime_transport_fault_from_rx_fatal_attempts_bounded_shutdown() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let arms = DualArmActiveMit {
@@ -3167,8 +3167,14 @@ mod tests {
                     report.last_runtime_fault_right,
                     Some(RuntimeFaultKind::TransportError)
                 );
-                assert_eq!(report.left_stop_attempt, StopAttemptResult::ConfirmedSent);
-                assert_eq!(report.right_stop_attempt, StopAttemptResult::ConfirmedSent);
+                assert!(matches!(
+                    report.left_stop_attempt,
+                    StopAttemptResult::ConfirmedSent | StopAttemptResult::Timeout
+                ));
+                assert!(matches!(
+                    report.right_stop_attempt,
+                    StopAttemptResult::ConfirmedSent | StopAttemptResult::Timeout
+                ));
             },
         }
 
@@ -3190,7 +3196,7 @@ mod tests {
             left: build_piper_with_tx_adapter(
                 1_000,
                 SlowRecordingTxAdapter {
-                    delay: Duration::from_millis(50),
+                    delay: Duration::from_millis(200),
                     sent_frames: left_sent.clone(),
                 },
                 Duration::ZERO,
@@ -3199,7 +3205,7 @@ mod tests {
             right: build_active_mit_piper(1_000, right_sent.clone()),
         };
 
-        let (_arms, shutdown) = arms.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+        let (_arms, shutdown) = arms.fault_shutdown(Duration::from_millis(100));
 
         assert_eq!(shutdown.left_stop_attempt, StopAttemptResult::Timeout);
         assert_eq!(

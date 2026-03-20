@@ -252,6 +252,7 @@ pub enum Message {
         client_send_blocked: u64,
     },
     Error {
+        seq: u32,
         code: ErrorCode,
         message: String,
     },
@@ -659,7 +660,11 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
             }
             let code = ErrorCode::from_u8(data[8]);
             let message = String::from_utf8_lossy(&data[9..]).to_string();
-            Ok(Message::Error { code, message })
+            Ok(Message::Error {
+                seq: header.seq,
+                code,
+                message,
+            })
         },
         MessageType::ConnectAck => {
             if data.len() < 13 {
@@ -1055,7 +1060,8 @@ mod tests {
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
-            Message::Error { code, message } => {
+            Message::Error { seq, code, message } => {
+                assert_eq!(seq, 0);
                 assert_eq!(code, ErrorCode::DeviceNotFound);
                 assert_eq!(message, "Device not found");
             },
@@ -1286,7 +1292,8 @@ mod tests {
 
         let decoded = decode_message(result.unwrap()).unwrap();
         match decoded {
-            Message::Error { code, message } => {
+            Message::Error { seq, code, message } => {
+                assert_eq!(seq, 0);
                 assert_eq!(code, ErrorCode::DeviceNotFound);
                 assert_eq!(message, "test");
             },
