@@ -781,8 +781,12 @@ mod tests {
 
     fn start_monitor_only_observer(frames: Vec<PiperFrame>) -> (Arc<RobotPiper>, Observer) {
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(MonitorOnlyRxAdapter::new(frames), IdleTxAdapter, None)
-                .expect("driver should start"),
+            RobotPiper::new_dual_thread_parts(
+                MonitorOnlyRxAdapter::new(frames),
+                IdleTxAdapter,
+                None,
+            )
+            .expect("driver should start"),
         );
         let observer = Observer::new(driver.clone());
         (driver, observer)

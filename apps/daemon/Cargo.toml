@@ -30,3 +30,4 @@ libc = { workspace = true }
 dirs = "6.0"
 # ✅ 系统信息（CPU 使用率监控）
 sysinfo = "0.38"
+crossbeam-channel = { workspace = true }

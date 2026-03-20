@@ -26,10 +26,11 @@
   - 验证 Linux SocketCAN 是否支持硬件时间戳（SO_TIMESTAMPING）
   - 运行：`cargo run --example timestamp_verification`
 
-- **`gs_usb_udp_test`** - GS-USB daemon bridge 调试工具
+- **`gs_usb_bridge_test`** - GS-USB bridge v2 调试工具
   - 用于 bridge/debug/replay 场景
+  - 基于 UDS/TCP stream，会话由 logical session token 管理
   - 明确是非实时链路，不用于 MIT / 双臂 / fault-stop 主控制链
-  - 运行：`cargo run --example gs_usb_udp_test`
+  - 运行：`cargo run --example gs_usb_bridge_test`
 
 ### 计划中的示例
 

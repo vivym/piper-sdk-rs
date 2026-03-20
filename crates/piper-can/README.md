@@ -150,20 +150,35 @@ pub trait CanAdapter {
 }
 ```
 
-**支持的适配器**：
+**支持的适配器 / 客户端**：
 - `SocketCanAdapter`：Linux SocketCAN 接口
 - `GsUsbCanAdapter`：GS-USB 设备（跨平台）
-- `GsUsbUdpAdapter`：GS-USB 守护进程 bridge/debug 客户端（非实时）
+- `GsUsbBridgeClient`：GS-USB 守护进程 bridge/debug 客户端（非实时）
 
-`GsUsbUdpAdapter` 是 bridge/debug/replay 链路，不参与 realtime driver。
-`set_receive_timeout()` 只影响 receive path；`send()` 始终使用固定的 `bridge_timeout`
-作为 round-trip budget。若 send timeout、控制平面失同步，或 receive path 看见
-`SendAck/Error(seq)`，session 会 fail-closed 并要求显式 `reconnect()`。
-UDS 模式仅支持 pathname Unix datagram client；abstract namespace 或 non-UTF8
-peer 会被 daemon 侧直接拒绝。
-bridge session 现在由显式 `SessionToken([u8; 16])` 标识；默认构造函数会自动生成随机
-token，而 `new_udp_with_timeout_and_token` / `new_uds_with_timeout_and_token` 允许调用方
-提供稳定 token，以便跨进程或地址变化时立即替换旧 logical session。
+`GsUsbBridgeClient` 使用 UDS/TCP stream 协议，只用于 bridge/debug/replay，
+不参与 realtime driver，也不能进入 MIT / 双臂 / fault-stop 主控制链。
+bridge 会话在 `Hello` 握手阶段通过 `SessionToken([u8; 16])` 建立；steady-state
+阶段不再靠 peer 地址或 caller-supplied `client_id` 补丁式鉴权。
+
+默认角色是只读 observer。若需要写 CAN，必须显式获取独占 `WriterLease`：
+
+```rust
+use piper_can::{
+    BridgeClientOptions, BridgeEndpoint, BridgeRole, GsUsbBridgeClient,
+};
+
+let options = BridgeClientOptions {
+    role_request: BridgeRole::WriterCandidate,
+    ..Default::default()
+};
+let mut client = GsUsbBridgeClient::connect(
+    BridgeEndpoint::Tcp("127.0.0.1:18888".parse()?),
+    options,
+)?;
+let mut lease = client.acquire_writer_lease(std::time::Duration::from_millis(500))?;
+lease.send_frame(PiperFrame::new_standard(0x123, &[1, 2, 3, 4]))?;
+lease.release()?;
+```
 
 ### 分离适配器（Splittable Adapter）
 

@@ -705,8 +705,8 @@ mod tests {
                 dynamic_timestamp_us: 1,
                 skew_us: 0,
             },
-            position_system_timestamp_us: 1,
-            dynamic_system_timestamp_us: 1,
+            position_host_rx_mono_us: 1,
+            dynamic_host_rx_mono_us: 1,
             feedback_age: Duration::from_millis(1),
         };
 

@@ -39,9 +39,15 @@ pub mod gs_usb;
 #[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
 pub use gs_usb::GsUsbCanAdapter;
 
-// GS-UDP 守护进程客户端库（UDS/UDP）
-// 不受 mock 模式影响（因为它是网络层，不直接访问硬件）
-pub mod gs_usb_udp;
+// GS-USB bridge v2 client (UnixStream/TCP)
+// Non-realtime debug / record / replay path only.
+pub mod gs_usb_bridge;
+pub use gs_usb_bridge::protocol::{
+    BridgeDeviceState, BridgeEvent, BridgeRole, BridgeStatus, CanIdFilter, ErrorCode, SessionToken,
+};
+pub use gs_usb_bridge::{
+    BridgeClientOptions, BridgeEndpoint, BridgeError, BridgeResult, GsUsbBridgeClient, WriterLease,
+};
 
 // 导出 split 相关的类型（如果可用）
 #[cfg(any(feature = "gs_usb", feature = "auto-backend"))]

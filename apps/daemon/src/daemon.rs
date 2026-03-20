@@ -1,158 +1,52 @@
-//! 守护进程核心逻辑
+//! Bridge v2 daemon core.
 //!
-//! 实现多线程阻塞架构、设备状态机、热拔插恢复
-//!
-//! 参考：`daemon_implementation_plan.md` 第 4.1.3 节
+//! The daemon keeps exclusive ownership of the GS-USB device and exposes a
+//! non-realtime stream bridge for debug / record / replay workloads.
 
-use crate::client_manager::{BridgePeerAuth, ClientAddr, ClientManager};
+use crate::session_manager::{
+    ConnectionOutput, LeaseAcquireResult, SessionControl, SessionManager,
+};
 use piper_can::BridgeTxAdapter;
+use piper_can::CanError;
 use piper_can::gs_usb::{GsUsbCanAdapter, split::GsUsbRxAdapter};
-#[cfg(test)]
-use piper_can::gs_usb_udp::protocol::SessionToken;
-use piper_can::gs_usb_udp::protocol::{self, ErrorCode, Message, StatusResponse};
+use piper_can::gs_usb_bridge::protocol::{
+    self, BridgeDeviceState, BridgeStatus, ClientRequest, ErrorCode, ServerMessage, ServerResponse,
+};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
-fn bridge_error_code(error: &piper_can::CanError) -> ErrorCode {
+const STATUS_PRINT_INTERVAL: Duration = Duration::from_secs(5);
+const CPU_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+const AUTH_LOG_WINDOW: Duration = Duration::from_secs(1);
+
+fn bridge_error_code(error: &CanError) -> ErrorCode {
     match error {
-        piper_can::CanError::Timeout => ErrorCode::Timeout,
-        piper_can::CanError::Device(device) => match device.kind {
+        CanError::Timeout => ErrorCode::Timeout,
+        CanError::Device(device) => match device.kind {
             piper_can::CanDeviceErrorKind::NoDevice | piper_can::CanDeviceErrorKind::NotFound => {
                 ErrorCode::DeviceNotFound
             },
             piper_can::CanDeviceErrorKind::Busy => ErrorCode::DeviceBusy,
+            piper_can::CanDeviceErrorKind::InvalidResponse => ErrorCode::ProtocolError,
             _ => ErrorCode::DeviceError,
         },
         _ => ErrorCode::DeviceError,
     }
 }
 
-fn record_bridge_tx_error(stats: &Arc<RwLock<DaemonStats>>, error: &piper_can::CanError) {
-    let stats_guard = stats.read().unwrap();
-    let detailed = stats_guard.detailed.read().unwrap();
-    detailed.usb_transfer_errors.fetch_add(1, Ordering::Relaxed);
-
-    match error {
-        piper_can::CanError::Timeout => {
-            detailed.usb_timeout_count.fetch_add(1, Ordering::Relaxed);
-        },
-        piper_can::CanError::Device(device)
-            if device.kind == piper_can::CanDeviceErrorKind::NoDevice
-                || device.kind == piper_can::CanDeviceErrorKind::NotFound =>
-        {
-            detailed.usb_no_device_count.fetch_add(1, Ordering::Relaxed);
-        },
-        _ => {},
-    }
-}
-
-fn mark_bridge_device_disconnected(
-    device_state: &Arc<DeviceStateCell>,
-    tx_adapter: &Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-) {
-    {
-        let mut tx_guard = tx_adapter.lock().unwrap();
-        *tx_guard = None;
-    }
-    device_state.store(DeviceState::Disconnected);
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone)]
-struct SupportedUnixPeer {
-    addr: ClientAddr,
-    reply_path: String,
-    debug_addr: String,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
-enum UnsupportedUnixPeerReason {
-    MissingPathname,
-    NonUtf8Pathname,
-}
-
-#[cfg(unix)]
-impl std::fmt::Display for UnsupportedUnixPeerReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UnsupportedUnixPeerReason::MissingPathname => {
-                write!(f, "unix datagram peer has no pathname")
-            },
-            UnsupportedUnixPeerReason::NonUtf8Pathname => {
-                write!(f, "unix datagram peer pathname is not valid UTF-8")
-            },
-        }
-    }
-}
-
-#[cfg(unix)]
-fn resolve_supported_unix_peer(
-    client_addr: &std::os::unix::net::SocketAddr,
-) -> Result<SupportedUnixPeer, UnsupportedUnixPeerReason> {
-    let Some(path) = client_addr.as_pathname() else {
-        return Err(UnsupportedUnixPeerReason::MissingPathname);
-    };
-    let Some(path_str) = path.to_str() else {
-        return Err(UnsupportedUnixPeerReason::NonUtf8Pathname);
-    };
-
-    Ok(SupportedUnixPeer {
-        addr: ClientAddr::Unix(path_str.to_string()),
-        reply_path: path_str.to_string(),
-        debug_addr: format!("{:?}", client_addr),
-    })
-}
-
-#[cfg(unix)]
-fn send_unix_error_response(
-    socket: &std::os::unix::net::UnixDatagram,
-    reply_path: &str,
-    code: ErrorCode,
-    message: &str,
-    seq: u32,
-) {
-    let mut error_buf = [0u8; 256];
-    let Ok(encoded) = protocol::encode_error(code, message, seq, &mut error_buf) else {
-        eprintln!("[Client] Failed to encode Error response");
-        return;
-    };
-
-    if let Err(error) = socket.send_to(encoded, reply_path) {
-        eprintln!("[Client] Failed to send Error response: {}", error);
-    }
-}
-
-fn send_udp_error_response(
-    socket: &std::net::UdpSocket,
-    client_addr: std::net::SocketAddr,
-    code: ErrorCode,
-    message: &str,
-    seq: u32,
-) {
-    let mut error_buf = [0u8; 256];
-    let Ok(encoded) = protocol::encode_error(code, message, seq, &mut error_buf) else {
-        eprintln!("[UDP Client] Failed to encode Error response");
-        return;
-    };
-
-    if let Err(error) = socket.send_to(encoded, client_addr) {
-        eprintln!("[UDP Client] Failed to send Error response: {}", error);
-    }
-}
-
-/// 设备状态机
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DeviceState {
-    /// 设备已连接，正常工作
     Connected,
-    /// 设备断开（物理拔出或错误）
     Disconnected,
-    /// 正在重连中
     Reconnecting,
 }
 
@@ -163,9 +57,17 @@ impl DeviceState {
 
     fn from_u8(value: u8) -> Self {
         match value {
-            x if x == DeviceState::Connected as u8 => DeviceState::Connected,
-            x if x == DeviceState::Reconnecting as u8 => DeviceState::Reconnecting,
-            _ => DeviceState::Disconnected,
+            x if x == Self::Connected as u8 => Self::Connected,
+            x if x == Self::Reconnecting as u8 => Self::Reconnecting,
+            _ => Self::Disconnected,
+        }
+    }
+
+    fn as_bridge_state(self) -> BridgeDeviceState {
+        match self {
+            Self::Connected => BridgeDeviceState::Connected,
+            Self::Disconnected => BridgeDeviceState::Disconnected,
+            Self::Reconnecting => BridgeDeviceState::Reconnecting,
         }
     }
 }
@@ -191,151 +93,159 @@ impl DeviceStateCell {
     }
 }
 
-/// 守护进程配置
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
-    /// UDS Socket 路径（可选，默认不使用）
     pub uds_path: Option<String>,
-
-    /// UDP 监听地址（默认传输方式，如 "127.0.0.1:18888"）
-    pub udp_addr: Option<String>,
-
-    /// CAN 波特率（默认 1000000）
+    pub tcp_addr: Option<String>,
     pub bitrate: u32,
-
-    /// 设备序列号（可选，用于多设备场景）
     pub serial_number: Option<String>,
-
-    /// 重连间隔（秒，默认 1 秒）
     pub reconnect_interval: Duration,
-
-    /// 重连冷却时间（防止 USB 枚举抖动，默认 500ms）
     pub reconnect_debounce: Duration,
-
-    /// 客户端超时时间（默认 30 秒）
-    pub client_timeout: Duration,
-
-    /// bridge/debug 链路的发送超时（默认 100ms）
     pub bridge_tx_timeout: Duration,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            uds_path: None,                                // UDS 不再作为默认，使用 UDP
-            udp_addr: Some("127.0.0.1:18888".to_string()), // UDP 作为默认传输方式
+            #[cfg(unix)]
+            uds_path: Some("/tmp/gs_usb_daemon.sock".to_string()),
+            #[cfg(not(unix))]
+            uds_path: None,
+            #[cfg(unix)]
+            tcp_addr: None,
+            #[cfg(not(unix))]
+            tcp_addr: Some("127.0.0.1:18888".to_string()),
             bitrate: 1_000_000,
             serial_number: None,
             reconnect_interval: Duration::from_secs(1),
             reconnect_debounce: Duration::from_millis(500),
-            client_timeout: Duration::from_secs(30),
             bridge_tx_timeout: Duration::from_millis(100),
         }
     }
 }
 
-/// 守护进程错误类型
 #[derive(Debug, Clone)]
 pub enum DaemonError {
+    SocketInit(String),
     DeviceInit(String),
     DeviceConfig(String),
-    SocketInit(String),
     Io(String),
 }
 
 impl std::fmt::Display for DaemonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DaemonError::DeviceInit(msg) => write!(f, "Device init error: {}", msg),
-            DaemonError::DeviceConfig(msg) => write!(f, "Device config error: {}", msg),
-            DaemonError::SocketInit(msg) => write!(f, "Socket init error: {}", msg),
-            DaemonError::Io(e) => write!(f, "IO error: {}", e),
+            Self::SocketInit(msg) => write!(f, "{msg}"),
+            Self::DeviceInit(msg) => write!(f, "{msg}"),
+            Self::DeviceConfig(msg) => write!(f, "{msg}"),
+            Self::Io(msg) => write!(f, "{msg}"),
         }
     }
 }
 
 impl std::error::Error for DaemonError {}
 
-impl From<std::io::Error> for DaemonError {
-    fn from(e: std::io::Error) -> Self {
-        DaemonError::Io(e.to_string())
+#[derive(Debug)]
+struct DaemonStats {
+    started_at: Instant,
+    rx_total: AtomicU64,
+    tx_total: AtomicU64,
+    ipc_in_total: AtomicU64,
+    ipc_out_total: AtomicU64,
+    queue_drop_total: AtomicU64,
+    usb_stall_count: AtomicU64,
+    can_bus_off_count: AtomicU64,
+    can_error_passive_count: AtomicU64,
+    cpu_usage_percent: AtomicU32,
+}
+
+impl DaemonStats {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            rx_total: AtomicU64::new(0),
+            tx_total: AtomicU64::new(0),
+            ipc_in_total: AtomicU64::new(0),
+            ipc_out_total: AtomicU64::new(0),
+            queue_drop_total: AtomicU64::new(0),
+            usb_stall_count: AtomicU64::new(0),
+            can_bus_off_count: AtomicU64::new(0),
+            can_error_passive_count: AtomicU64::new(0),
+            cpu_usage_percent: AtomicU32::new(0),
+        }
+    }
+
+    fn inc_rx(&self) {
+        self.rx_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_tx(&self) {
+        self.tx_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_ipc_in(&self) {
+        self.ipc_in_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_ipc_out(&self) {
+        self.ipc_out_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_queue_drops(&self, dropped: u64) {
+        self.queue_drop_total.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        self.started_at.elapsed().as_secs_f64().max(0.001)
+    }
+
+    fn fps(counter: &AtomicU64, elapsed: f64) -> f64 {
+        counter.load(Ordering::Relaxed) as f64 / elapsed
+    }
+
+    fn rx_fps(&self) -> f64 {
+        Self::fps(&self.rx_total, self.elapsed_secs())
+    }
+
+    fn tx_fps(&self) -> f64 {
+        Self::fps(&self.tx_total, self.elapsed_secs())
+    }
+
+    fn ipc_in_fps(&self) -> f64 {
+        Self::fps(&self.ipc_in_total, self.elapsed_secs())
+    }
+
+    fn ipc_out_fps(&self) -> f64 {
+        Self::fps(&self.ipc_out_total, self.elapsed_secs())
+    }
+
+    fn health_score(&self, device_state: DeviceState) -> u8 {
+        let mut score = match device_state {
+            DeviceState::Connected => 100i32,
+            DeviceState::Reconnecting => 70,
+            DeviceState::Disconnected => 40,
+        };
+        let dropped = self.queue_drop_total.load(Ordering::Relaxed);
+        if dropped > 0 {
+            score -= (dropped.min(1000) / 20) as i32;
+        }
+        score.clamp(0, 100) as u8
     }
 }
 
-/// 守护进程统计信息（基础版本）
 #[derive(Debug)]
-struct DaemonStats {
-    /// 接收到的 CAN 帧总数（从 USB）
-    rx_frames: AtomicU64,
-    /// 发送的 CAN 帧总数（到 USB）
-    tx_frames: AtomicU64,
-    /// 发送到客户端的帧总数（IPC）
-    ipc_sent: AtomicU64,
-    /// 从客户端接收的帧总数（IPC）
-    ipc_received: AtomicU64,
-    /// 客户端发送阻塞次数（WouldBlock/ENOBUFS）
-    client_send_blocked: AtomicU64,
-    /// 主动断开的客户端数量
-    client_disconnected: AtomicU64,
-    /// 统计开始时间
-    start_time: Instant,
-    /// 详细统计信息（健康度监控）
-    detailed: Arc<RwLock<DetailedStats>>,
-}
-
-struct IpcHandlerContext<'a> {
-    tx_adapter: &'a Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-    device_state: &'a Arc<DeviceStateCell>,
-    clients: &'a Arc<RwLock<ClientManager>>,
-    stats: &'a Arc<RwLock<DaemonStats>>,
-    auth_log_limiter: &'a Arc<AuthLogLimiter>,
-}
-
-const AUTH_LOG_WINDOW: Duration = Duration::from_secs(1);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum AuthTransport {
-    Unix,
-    Udp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum AuthMessageType {
-    GetStatus,
-    Heartbeat,
-    Disconnect,
-    SetFilter,
-    SendFrame,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum AuthFailureKind {
-    NotConnected,
-    PeerMismatch,
-    ClientIdMismatch,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AuthLogKey {
-    transport: AuthTransport,
-    peer: ClientAddr,
-    message_type: AuthMessageType,
-    failure: AuthFailureKind,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AuthLogState {
-    last_logged_at: Instant,
+struct WarnLogState {
+    last_logged: Instant,
     suppressed: u64,
 }
 
 #[derive(Debug)]
-struct AuthLogLimiter {
+struct WarnRateLimiter {
     window: Duration,
-    states: Mutex<HashMap<AuthLogKey, AuthLogState>>,
+    states: Mutex<HashMap<&'static str, WarnLogState>>,
 }
 
-impl AuthLogLimiter {
+impl WarnRateLimiter {
     fn new(window: Duration) -> Self {
         Self {
             window,
@@ -343,790 +253,245 @@ impl AuthLogLimiter {
         }
     }
 
-    fn warn(
-        &self,
-        transport: AuthTransport,
-        peer: ClientAddr,
-        message_type: AuthMessageType,
-        failure: AuthFailureKind,
-        message: impl FnOnce() -> String,
-    ) {
-        let now = Instant::now();
-        let key = AuthLogKey {
-            transport,
-            peer: peer.clone(),
-            message_type,
-            failure,
-        };
-
+    fn warn<F>(&self, key: &'static str, message: F)
+    where
+        F: FnOnce() -> String,
+    {
         let mut states = self.states.lock().unwrap();
-        if let Some(state) = states.get_mut(&key) {
-            if now.duration_since(state.last_logged_at) < self.window {
-                state.suppressed = state.suppressed.saturating_add(1);
-                return;
-            }
+        let now = Instant::now();
+        let entry = states.entry(key).or_insert(WarnLogState {
+            last_logged: now.checked_sub(self.window).unwrap_or(now),
+            suppressed: 0,
+        });
 
-            let suppressed = state.suppressed;
-            state.last_logged_at = now;
-            state.suppressed = 0;
-            drop(states);
-
-            if suppressed > 0 {
-                tracing::warn!(
-                    ?transport,
-                    ?peer,
-                    ?message_type,
-                    ?failure,
-                    suppressed,
-                    "suppressed similar auth failures"
+        if now.duration_since(entry.last_logged) >= self.window {
+            if entry.suppressed > 0 {
+                warn!(
+                    "{} (suppressed {} similar warnings)",
+                    message(),
+                    entry.suppressed
                 );
+                entry.suppressed = 0;
+            } else {
+                warn!("{}", message());
             }
-            tracing::warn!(?transport, ?peer, ?message_type, ?failure, "{}", message());
-            return;
-        }
-
-        states.insert(
-            key,
-            AuthLogState {
-                last_logged_at: now,
-                suppressed: 0,
-            },
-        );
-        drop(states);
-
-        tracing::warn!(?transport, ?peer, ?message_type, ?failure, "{}", message());
-    }
-}
-
-/// 详细统计信息（健康度监控）
-#[derive(Debug)]
-struct DetailedStats {
-    // USB 传输错误
-    usb_transfer_errors: AtomicU64, // libusb 底层错误计数
-    usb_timeout_count: AtomicU64,   // 超时次数（区分于其他错误）
-    usb_stall_count: AtomicU64,     // USB 端点 STALL 次数
-    usb_no_device_count: AtomicU64, // NoDevice 错误次数
-
-    // CAN 总线健康度
-    can_error_frames: AtomicU64,              // CAN 总线错误帧计数
-    can_bus_off_count: AtomicU64,             // Bus Off 事件发生次数
-    is_bus_off: AtomicBool,                   // Bus Off 状态标志（用于防抖）
-    bus_off_monitoring_supported: AtomicBool, // 设备是否支持 Bus Off 检测（Log Once 使用）
-    can_error_passive_count: AtomicU64,       // Error Passive 状态进入次数
-    is_error_passive: AtomicBool,             // Error Passive 状态标志（用于防抖）
-
-    // 客户端健康度
-    /// 降频的客户端数（仅在 Unix 平台上使用）
-    #[cfg_attr(not(unix), allow(dead_code))]
-    client_degraded: AtomicU64,
-
-    // 系统资源
-    cpu_usage_percent: AtomicU32, // CPU 占用率（0-100）
-    memory_usage_mb: AtomicU32,   // 内存占用（MB）
-
-    // 性能基线
-    baseline_rx_fps: AtomicU64, // 基线 RX 帧率（f64 位模式存储）
-    baseline_tx_fps: AtomicU64, // 基线 TX 帧率（f64 位模式存储）
-    is_warmed_up: AtomicBool,   // 预热期标志
-}
-
-impl DetailedStats {
-    fn new() -> Self {
-        Self {
-            usb_transfer_errors: AtomicU64::new(0),
-            usb_timeout_count: AtomicU64::new(0),
-            usb_stall_count: AtomicU64::new(0),
-            usb_no_device_count: AtomicU64::new(0),
-            can_error_frames: AtomicU64::new(0),
-            can_bus_off_count: AtomicU64::new(0),
-            is_bus_off: AtomicBool::new(false),
-            bus_off_monitoring_supported: AtomicBool::new(true), // 默认为 true（乐观策略），现代 GS-USB 设备普遍支持
-            can_error_passive_count: AtomicU64::new(0),
-            is_error_passive: AtomicBool::new(false),
-            client_degraded: AtomicU64::new(0),
-            cpu_usage_percent: AtomicU32::new(0),
-            memory_usage_mb: AtomicU32::new(0),
-            baseline_rx_fps: AtomicU64::new(0), // 初始化为 0.0 的位模式
-            baseline_tx_fps: AtomicU64::new(0), // 初始化为 0.0 的位模式
-            is_warmed_up: AtomicBool::new(false), // 预热期标志
-        }
-    }
-
-    // ============================================================
-    // 基线计算配置常量（集中管理，便于调优）
-    // ============================================================
-
-    /// 预热期时长（秒）
-    const WARMUP_PERIOD_SECS: u64 = 10;
-
-    /// EWMA 平滑因子（0.0 - 1.0）
-    /// 值越小，基线更新越慢，越稳定；值越大，基线更新越快，越敏感
-    const EWMA_ALPHA: f64 = 0.01;
-
-    // ============================================================
-    // 性能基线访问方法（位模式转换）
-    // ============================================================
-
-    /// 获取 RX 基线 FPS
-    fn baseline_rx_fps(&self) -> f64 {
-        f64::from_bits(self.baseline_rx_fps.load(Ordering::Relaxed))
-    }
-
-    /// 设置 RX 基线 FPS
-    fn set_baseline_rx_fps(&self, fps: f64) {
-        self.baseline_rx_fps.store(fps.to_bits(), Ordering::Relaxed);
-    }
-
-    /// 获取 TX 基线 FPS
-    fn baseline_tx_fps(&self) -> f64 {
-        f64::from_bits(self.baseline_tx_fps.load(Ordering::Relaxed))
-    }
-
-    /// 设置 TX 基线 FPS
-    fn set_baseline_tx_fps(&self, fps: f64) {
-        self.baseline_tx_fps.store(fps.to_bits(), Ordering::Relaxed);
-    }
-
-    /// 检查是否已预热完成
-    fn is_warmed_up(&self) -> bool {
-        self.is_warmed_up.load(Ordering::Relaxed)
-    }
-
-    /// 更新性能基线（启动后稳定期计算 + 动态更新）
-    ///
-    /// # 参数
-    /// - `rx_fps`: 当前 RX 帧率
-    /// - `tx_fps`: 当前 TX 帧率
-    /// - `elapsed`: 从启动开始经过的时间
-    ///
-    /// # 注意
-    /// - **必须由定时器触发**，确保固定时间间隔（例如每秒一次）
-    /// - 如果调用间隔波动很大，EWMA 的衰减速度会变得不稳定
-    /// - ⚠️ 虽然 `AtomicU64` 保证了单个值的原子性，但两个基线的更新不是原子的
-    ///   在极少数情况下，可能会读到一个"旧的 RX 基线"和一个"新的 TX 基线"
-    ///   这对监控指标来说通常不是问题，因为这只是统计数据
-    pub fn update_baseline(&self, rx_fps: f64, tx_fps: f64, elapsed: Duration) {
-        let elapsed_secs = elapsed.as_secs();
-
-        // 预热期：累积计算平均值
-        if elapsed_secs < Self::WARMUP_PERIOD_SECS {
-            let samples = elapsed_secs.max(1); // 避免除零
-            let current_rx = self.baseline_rx_fps();
-            let current_tx = self.baseline_tx_fps();
-
-            // 累积平均
-            let new_rx = (current_rx * (samples - 1) as f64 + rx_fps) / samples as f64;
-            let new_tx = (current_tx * (samples - 1) as f64 + tx_fps) / samples as f64;
-
-            self.set_baseline_rx_fps(new_rx);
-            self.set_baseline_tx_fps(new_tx);
+            entry.last_logged = now;
         } else {
-            // 预热期结束，标记为已预热
-            if !self.is_warmed_up() {
-                self.is_warmed_up.store(true, Ordering::Relaxed);
-                tracing::info!(
-                    "Performance baseline established: RX={:.1} fps, TX={:.1} fps",
-                    self.baseline_rx_fps(),
-                    self.baseline_tx_fps()
-                );
-            }
-
-            // 动态基线更新：使用指数加权移动平均 (EWMA)
-            // ⚠️ 注意：此公式假设 update_baseline 以固定时间间隔（例如每秒）调用
-            // 如果调用间隔波动很大，EWMA 的衰减速度会变得不稳定
-            // 解决方案：必须由定时器（Timer）触发，或根据 elapsed 动态调整 ALPHA
-            // 简化实施：对于守护进程的统计报告，通常就是每秒一次，固定 ALPHA 足够
-            let current_rx = self.baseline_rx_fps();
-            let current_tx = self.baseline_tx_fps();
-
-            let new_rx = current_rx * (1.0 - Self::EWMA_ALPHA) + rx_fps * Self::EWMA_ALPHA;
-            let new_tx = current_tx * (1.0 - Self::EWMA_ALPHA) + tx_fps * Self::EWMA_ALPHA;
-
-            self.set_baseline_rx_fps(new_rx);
-            self.set_baseline_tx_fps(new_tx);
-        }
-    }
-
-    /// 检测性能异常（仅在预热期后检测）
-    ///
-    /// # 参数
-    /// - `current_rx_fps`: 当前 RX 帧率
-    /// - `current_tx_fps`: 当前 TX 帧率
-    ///
-    /// # 返回
-    /// - `true`: 性能下降（当前 FPS 低于基线的 50%）
-    /// - `false`: 性能正常或预热期未结束
-    pub fn is_performance_degraded(&self, current_rx_fps: f64, current_tx_fps: f64) -> bool {
-        // 预热期内不进行异常检测（避免误报）
-        if !self.is_warmed_up() {
-            return false;
-        }
-
-        let baseline_rx = self.baseline_rx_fps();
-        let baseline_tx = self.baseline_tx_fps();
-
-        if baseline_rx == 0.0 || baseline_tx == 0.0 {
-            return false; // 基线未建立
-        }
-
-        // 如果当前 FPS 低于基线的 50%，认为性能下降
-        current_rx_fps < baseline_rx * 0.5 || current_tx_fps < baseline_tx * 0.5
-    }
-
-    /// 健康度评分（0-100）
-    ///
-    /// # 参数
-    /// - `current_rx_fps`: 当前 RX 帧率（用于性能基线异常检测）
-    /// - `current_tx_fps`: 当前 TX 帧率（用于性能基线异常检测）
-    pub fn health_score(&self, current_rx_fps: f64, current_tx_fps: f64) -> u8 {
-        let mut score = 100u8;
-
-        // Bus Off 检测（最高优先级，系统瘫痪级别故障）
-        let bus_off_count = self.can_bus_off_count.load(Ordering::Relaxed);
-        if bus_off_count > 0 {
-            // Bus Off 是系统瘫痪级别故障，直接设为 0
-            score = 0;
-            // 或者严重扣分（根据业务需求）
-            // score = score.saturating_sub(50);
-        }
-
-        // 如果设备不支持 Bus Off 检测，给予固定扣分（-5 分）
-        // 反映监控能力的缺失（对于安全关键应用很重要）
-        if !self.bus_off_monitoring_supported.load(Ordering::Relaxed) {
-            score = score.saturating_sub(5); // 扣 5 分（监控能力缺失）
-        }
-
-        // USB 错误扣分（包括 STALL）
-        let usb_errors = self.usb_transfer_errors.load(Ordering::Relaxed);
-        let usb_stalls = self.usb_stall_count.load(Ordering::Relaxed);
-        let total_usb_errors = usb_errors + usb_stalls;
-
-        if total_usb_errors > 100 {
-            score = score.saturating_sub(20);
-        } else if total_usb_errors > 10 {
-            score = score.saturating_sub(10);
-        }
-
-        // CAN 错误扣分
-        let can_errors = self.can_error_frames.load(Ordering::Relaxed);
-        if can_errors > 1000 {
-            score = score.saturating_sub(30);
-        } else if can_errors > 100 {
-            score = score.saturating_sub(15);
-        }
-
-        // 性能基线异常检测（性能下降扣分）
-        // 如果当前 FPS 低于基线的 50%，认为性能下降，扣 10 分
-        // 这反映了系统性能问题，可能导致控制延迟
-        if self.is_performance_degraded(current_rx_fps, current_tx_fps) {
-            score = score.saturating_sub(10); // 扣 10 分（性能下降）
-        }
-
-        // 客户端问题扣分（通过 DaemonStats 访问）
-        // 注意：这里我们只评估 USB/CAN 错误，客户端问题在 DaemonStats 中
-
-        // CPU 占用扣分
-        let cpu = self.cpu_usage_percent.load(Ordering::Relaxed);
-        if cpu > 90 {
-            score = score.saturating_sub(15);
-        } else if cpu > 70 {
-            score = score.saturating_sub(10);
-        } else if cpu > 50 {
-            score = score.saturating_sub(5);
-        }
-
-        // 内存占用扣分（通常不是问题，但监控）
-        let memory = self.memory_usage_mb.load(Ordering::Relaxed);
-        if memory > 1000 {
-            score = score.saturating_sub(5);
-        }
-
-        score
-    }
-
-    /// 检查并更新 Bus Off 状态（带防抖）
-    ///
-    /// 只有状态从 false -> true 的转换才计数（上升沿检测）
-    /// 统计的是"Bus Off 事件发生的次数"，而不是"处于 Bus Off 状态的帧数"
-    pub fn update_bus_off_status(&self, is_bus_off_now: bool) {
-        let was_bus_off = self.is_bus_off.load(Ordering::Relaxed);
-
-        // 上升沿检测：只有从 false -> true 的转换才计数
-        if !was_bus_off && is_bus_off_now {
-            // 新进入 Bus Off 状态，计数加 1
-            let count = self.can_bus_off_count.fetch_add(1, Ordering::Relaxed) + 1;
-            self.is_bus_off.store(true, Ordering::Relaxed);
-
-            tracing::error!("CAN Bus Off detected! Total occurrences: {}", count);
-            // 注意：Bus Off 发生后，健康度评分会被设为 0（系统瘫痪级别）
-            // 可以考虑触发额外的告警或自动恢复流程（例如：通知监控系统、自动重启设备等）
-        } else if was_bus_off && !is_bus_off_now {
-            // 从 Bus Off 状态恢复，重置标志
-            self.is_bus_off.store(false, Ordering::Relaxed);
-            tracing::info!("CAN Bus Off recovered. Ready for next detection.");
-        }
-        // 如果状态未变化，不做任何操作
-    }
-
-    /// 强制重置 Bus Off 状态标志（设备重连或手动复位后调用）
-    pub fn reset_bus_off_status(&self) {
-        let was_bus_off = self.is_bus_off.swap(false, Ordering::Relaxed);
-        if was_bus_off {
-            tracing::info!("Bus Off status flag reset (device reconnected or manually reset)");
-        }
-    }
-
-    // ============================================================
-    // Error Passive 检测（Bus Off 之前的警告）
-    // ============================================================
-
-    /// 检查并更新 Error Passive 状态（带防抖，与 Bus Off 相同）
-    ///
-    /// # 参数
-    /// - `is_error_passive_now`: 当前是否处于 Error Passive 状态
-    ///
-    /// 统计的是"Error Passive 事件发生的次数"，而不是"处于 Error Passive 状态的帧数"
-    pub fn update_error_passive_status(&self, is_error_passive_now: bool) {
-        let was_error_passive = self.is_error_passive.load(Ordering::Relaxed);
-
-        // 上升沿检测：只有从 false -> true 的转换才计数
-        if !was_error_passive && is_error_passive_now {
-            // 新进入 Error Passive 状态，计数加 1
-            let count = self.can_error_passive_count.fetch_add(1, Ordering::Relaxed) + 1;
-            self.is_error_passive.store(true, Ordering::Relaxed);
-
-            tracing::warn!(
-                "CAN Error Passive detected! Total occurrences: {} (warning: may lead to Bus Off)",
-                count
-            );
-        } else if was_error_passive && !is_error_passive_now {
-            // 从 Error Passive 状态恢复，重置标志
-            self.is_error_passive.store(false, Ordering::Relaxed);
-            tracing::info!("CAN Error Passive recovered. Ready for next detection.");
-        }
-        // 如果状态未变化，不做任何操作
-    }
-
-    /// 强制重置 Error Passive 状态标志（设备重连或手动复位后调用）
-    pub fn reset_error_passive_status(&self) {
-        let was_error_passive = self.is_error_passive.swap(false, Ordering::Relaxed);
-        if was_error_passive {
-            tracing::info!(
-                "Error Passive status flag reset (device reconnected or manually reset)"
-            );
+            entry.suppressed += 1;
         }
     }
 }
 
-impl DaemonStats {
-    fn new() -> Self {
-        Self {
-            rx_frames: AtomicU64::new(0),
-            tx_frames: AtomicU64::new(0),
-            ipc_sent: AtomicU64::new(0),
-            ipc_received: AtomicU64::new(0),
-            client_send_blocked: AtomicU64::new(0),
-            client_disconnected: AtomicU64::new(0),
-            start_time: Instant::now(),
-            detailed: Arc::new(RwLock::new(DetailedStats::new())),
-        }
-    }
-
-    fn increment_rx(&self) {
-        self.rx_frames.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn increment_tx(&self) {
-        self.tx_frames.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn increment_ipc_sent(&self) {
-        self.ipc_sent.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn increment_ipc_received(&self) {
-        self.ipc_received.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn get_rx_fps(&self) -> f64 {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            self.rx_frames.load(Ordering::Relaxed) as f64 / elapsed
-        } else {
-            0.0
-        }
-    }
-
-    fn get_tx_fps(&self) -> f64 {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            self.tx_frames.load(Ordering::Relaxed) as f64 / elapsed
-        } else {
-            0.0
-        }
-    }
-
-    fn get_ipc_sent_fps(&self) -> f64 {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            self.ipc_sent.load(Ordering::Relaxed) as f64 / elapsed
-        } else {
-            0.0
-        }
-    }
-
-    fn get_ipc_received_fps(&self) -> f64 {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            self.ipc_received.load(Ordering::Relaxed) as f64 / elapsed
-        } else {
-            0.0
-        }
-    }
-
-    /// 重置统计信息（重置计数器和开始时间）
-    fn reset(&mut self) {
-        self.rx_frames.store(0, Ordering::Relaxed);
-        self.tx_frames.store(0, Ordering::Relaxed);
-        self.ipc_sent.store(0, Ordering::Relaxed);
-        self.ipc_received.store(0, Ordering::Relaxed);
-        self.client_send_blocked.store(0, Ordering::Relaxed);
-        self.client_disconnected.store(0, Ordering::Relaxed);
-        self.start_time = Instant::now();
-        // 详细统计不重置（累积历史数据）
-    }
-
-    /// 获取健康度评分
-    ///
-    /// # 参数
-    /// - `rx_fps`: 当前 RX 帧率（用于性能基线异常检测）
-    /// - `tx_fps`: 当前 TX 帧率（用于性能基线异常检测）
-    fn health_score(&self, rx_fps: f64, tx_fps: f64) -> u8 {
-        self.detailed.read().unwrap().health_score(rx_fps, tx_fps)
-    }
-}
-
-/// 守护进程状态
-pub struct Daemon {
-    /// RX 适配器（只读，用于 USB 接收线程）
-    rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
-
-    /// TX 适配器（只写，用于 IPC 接收线程）
-    tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-
-    /// 设备状态
-    device_state: Arc<DeviceStateCell>,
-
-    /// UDS Socket（Unix Domain Socket）
+enum ServerStream {
     #[cfg(unix)]
-    socket_uds: Option<std::os::unix::net::UnixDatagram>,
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
 
-    /// UDP Socket（可选，用于跨机器调试）
-    socket_udp: Option<std::net::UdpSocket>,
+impl ServerStream {
+    fn shutdown(&self) {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            },
+            Self::Tcp(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            },
+        }
+    }
 
-    /// UDS Socket 路径（用于退出时清理）
-    uds_path: Option<String>,
+    fn peer_label(&self) -> String {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => format!("{:?}", stream.peer_addr()),
+            Self::Tcp(stream) => stream
+                .peer_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| "<tcp-peer-unknown>".to_string()),
+        }
+    }
+}
 
-    /// 客户端管理器（使用 RwLock 优化读取性能）
-    clients: Arc<RwLock<ClientManager>>,
+impl Read for ServerStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buf),
+            Self::Tcp(stream) => stream.read(buf),
+        }
+    }
+}
 
-    /// 守护进程配置
+impl Write for ServerStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.write(buf),
+            Self::Tcp(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.flush(),
+            Self::Tcp(stream) => stream.flush(),
+        }
+    }
+}
+
+struct StreamControl {
+    writer: Arc<Mutex<ServerStream>>,
+}
+
+impl SessionControl for StreamControl {
+    fn shutdown(&self) {
+        self.writer.lock().unwrap().shutdown();
+    }
+}
+
+struct ConnectionContext<'a> {
+    sessions: &'a Arc<SessionManager>,
+    tx_adapter: &'a Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
+    device_state: &'a Arc<DeviceStateCell>,
+    stats: &'a Arc<DaemonStats>,
+    warn_limiter: &'a Arc<WarnRateLimiter>,
+}
+
+pub struct Daemon {
+    rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
+    tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
+    device_state: Arc<DeviceStateCell>,
+    sessions: Arc<SessionManager>,
     config: DaemonConfig,
-
-    /// 统计信息
-    stats: Arc<RwLock<DaemonStats>>,
-
-    /// unauthorized steady-state auth 日志节流器
-    auth_log_limiter: Arc<AuthLogLimiter>,
+    stats: Arc<DaemonStats>,
+    warn_limiter: Arc<WarnRateLimiter>,
 }
 
 impl Daemon {
-    /// 创建新的守护进程实例
     pub fn new(config: DaemonConfig) -> Result<Self, DaemonError> {
         Ok(Self {
-            // 分离 RX 和 TX adapter
             rx_adapter: Arc::new(Mutex::new(None)),
             tx_adapter: Arc::new(Mutex::new(None)),
             device_state: Arc::new(DeviceStateCell::new(DeviceState::Disconnected)),
-            #[cfg(unix)]
-            socket_uds: None,
-            socket_udp: None,
-            uds_path: config.uds_path.clone(),
-            clients: Arc::new(RwLock::new(ClientManager::with_timeout(
-                config.client_timeout,
-            ))),
+            sessions: Arc::new(SessionManager::new()),
             config,
-            stats: Arc::new(RwLock::new(DaemonStats::new())),
-            auth_log_limiter: Arc::new(AuthLogLimiter::new(AUTH_LOG_WINDOW)),
+            stats: Arc::new(DaemonStats::new()),
+            warn_limiter: Arc::new(WarnRateLimiter::new(AUTH_LOG_WINDOW)),
         })
     }
 
-    /// 清理 UDS Socket 文件
-    ///
-    /// 在守护进程退出时调用，删除 socket 文件
-    fn cleanup_uds_socket(&self) {
-        if let Some(ref uds_path) = self.uds_path
-            && std::path::Path::new(uds_path).exists()
-        {
-            if let Err(e) = std::fs::remove_file(uds_path) {
-                eprintln!(
-                    "Warning: Failed to remove UDS socket file {}: {}",
-                    uds_path, e
-                );
-            } else {
-                eprintln!("Cleaned up UDS socket file: {}", uds_path);
-            }
+    #[cfg(unix)]
+    fn init_unix_listener(&self) -> Result<Option<UnixListener>, DaemonError> {
+        let Some(path) = self.config.uds_path.as_ref() else {
+            return Ok(None);
+        };
+        if std::path::Path::new(path).exists() {
+            std::fs::remove_file(path).map_err(|err| {
+                DaemonError::SocketInit(format!(
+                    "failed to remove existing uds socket {path}: {err}"
+                ))
+            })?;
         }
+        let listener = UnixListener::bind(path).map_err(|err| {
+            DaemonError::SocketInit(format!("failed to bind uds listener: {err}"))
+        })?;
+        Ok(Some(listener))
     }
 
-    /// 初始化 Socket（UDS 优先，UDP 可选）
-    fn init_sockets(&mut self) -> Result<(), DaemonError> {
-        // 初始化 UDS Socket
-        #[cfg(unix)]
-        if let Some(ref uds_path) = self.config.uds_path {
-            // 如果 socket 文件已存在，先删除它（可能是上次异常退出留下的）
-            if std::path::Path::new(uds_path).exists() {
-                if let Err(e) = std::fs::remove_file(uds_path) {
-                    eprintln!(
-                        "Warning: Failed to remove existing UDS socket file {}: {}",
-                        uds_path, e
-                    );
-                    // 继续尝试绑定，如果文件被占用会失败
-                } else {
-                    eprintln!("Removed existing UDS socket file: {}", uds_path);
-                }
-            }
-
-            let socket = std::os::unix::net::UnixDatagram::bind(uds_path).map_err(|e| {
-                DaemonError::SocketInit(format!("Failed to bind UDS socket: {}", e))
-            })?;
-
-            // 设置非阻塞模式（关键修复）
-            // 防止故障客户端缓冲区满时阻塞整个 daemon
-            socket.set_nonblocking(true).map_err(|e| {
-                DaemonError::SocketInit(format!("Failed to set non-blocking mode: {}", e))
-            })?;
-
-            self.socket_uds = Some(socket);
-        }
-        #[cfg(not(unix))]
-        if self.config.uds_path.is_some() {
-            return Err(DaemonError::SocketInit(
-                "Unix Domain Sockets are not supported on this platform".to_string(),
-            ));
-        }
-
-        // 初始化 UDP Socket（可选）
-        if let Some(ref udp_addr) = self.config.udp_addr {
-            let socket = std::net::UdpSocket::bind(udp_addr).map_err(|e| {
-                DaemonError::SocketInit(format!("Failed to bind UDP socket: {}", e))
-            })?;
-            self.socket_udp = Some(socket);
-        }
-
-        Ok(())
+    #[cfg(not(unix))]
+    fn init_unix_listener(&self) -> Result<Option<()>, DaemonError> {
+        Ok(None)
     }
 
-    /// 尝试连接设备并分离为 RX/TX adapter
-    ///
-    /// 返回分离的 RX 和 TX adapter，支持并发访问
+    fn init_tcp_listener(&self) -> Result<Option<TcpListener>, DaemonError> {
+        let Some(addr) = self.config.tcp_addr.as_ref() else {
+            return Ok(None);
+        };
+        let listener = TcpListener::bind(addr).map_err(|err| {
+            DaemonError::SocketInit(format!("failed to bind tcp listener: {err}"))
+        })?;
+        Ok(Some(listener))
+    }
+
     fn try_connect_device(
         config: &DaemonConfig,
-        stats: Arc<RwLock<DaemonStats>>,
+        stats: Arc<DaemonStats>,
     ) -> Result<(GsUsbRxAdapter, Box<dyn BridgeTxAdapter + Send>), DaemonError> {
-        // 1. 扫描设备
-        eprintln!(
-            "[Daemon] Scanning for GS-USB devices (serial: {:?})...",
-            config.serial_number
-        );
-
-        // 先扫描所有设备，打印信息
-        use piper_can::gs_usb::device::GsUsbDevice;
-        match GsUsbDevice::scan_info() {
-            Ok(infos) => {
-                eprintln!("[Daemon] Found {} GS-USB device(s):", infos.len());
-                for (i, info) in infos.iter().enumerate() {
-                    eprintln!(
-                        "  [{}] VID:PID={:04x}:{:04x} bus={} addr={} serial={:?}",
-                        i,
-                        info.vendor_id,
-                        info.product_id,
-                        info.bus_number,
-                        info.address,
-                        info.serial_number.as_deref()
-                    );
-                }
-            },
-            Err(e) => {
-                eprintln!("[Daemon] Warning: Failed to scan devices for info: {}", e);
-            },
-        }
-
         let mut adapter = GsUsbCanAdapter::new_with_serial(config.serial_number.as_deref())
-            .map_err(|e| DaemonError::DeviceInit(format!("{}", e)))?;
-
-        eprintln!("[Daemon] Device found and initialized successfully");
-
-        // 设定接收超时（从 200ms 减小到 2ms，降低延迟抖动）
-        // 注意：虽然会增加 CPU 占用，但对于实时控制场景，延迟比功耗更重要
+            .map_err(|err| DaemonError::DeviceInit(err.to_string()))?;
         adapter.set_receive_timeout(Duration::from_millis(2));
-
-        // 打印已打开设备信息（避免后续排障只能靠枚举列表推断）
-        let (vid, pid, bus, addr, serial) = adapter.device_info();
-        eprintln!(
-            "[Daemon] Opened device: VID:PID={:04x}:{:04x} bus={} addr={} serial={:?}",
-            vid, pid, bus, addr, serial
-        );
-
-        // 2. 配置设备
-        eprintln!(
-            "[Daemon] Configuring device: bitrate={} bps, mode=NORMAL|HW_TIMESTAMP",
-            config.bitrate
-        );
         adapter
             .configure(config.bitrate)
-            .map_err(|e| DaemonError::DeviceConfig(format!("{}", e)))?;
+            .map_err(|err| DaemonError::DeviceConfig(err.to_string()))?;
 
-        eprintln!("[Daemon] Device configured and started successfully");
-
-        // 设置 USB STALL 计数回调（必须在 split() 之前）
         let stats_for_stall = Arc::clone(&stats);
         adapter.set_stall_count_callback(move || {
-            let stats_guard = stats_for_stall.read().unwrap();
-            let detailed = stats_guard.detailed.read().unwrap();
-            detailed.usb_stall_count.fetch_add(1, Ordering::Relaxed);
+            stats_for_stall.usb_stall_count.fetch_add(1, Ordering::Relaxed);
         });
 
-        // 分离为 RX 和 TX adapter
-        let (rx_adapter, tx_adapter) = adapter
+        let (mut rx_adapter, tx_adapter) = adapter
             .split()
-            .map_err(|e| DaemonError::DeviceInit(format!("Failed to split adapter: {}", e)))?;
-        let bridge_tx = Box::new(tx_adapter.into_bridge(config.bridge_tx_timeout))
-            as Box<dyn BridgeTxAdapter + Send>;
+            .map_err(|err| DaemonError::DeviceInit(format!("failed to split adapter: {err}")))?;
 
-        // 注意：Bus Off 和 Error Passive 回调在 device_manager_loop 中设置
-        // 因为在设备重连时需要重新设置回调，且需要访问 stats
-        // 详见 device_manager_loop 中的回调设置代码
+        let stats_for_bus_off = Arc::clone(&stats);
+        rx_adapter.set_bus_off_callback(move |is_bus_off| {
+            if is_bus_off {
+                stats_for_bus_off.can_bus_off_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
 
-        eprintln!("[Daemon] Adapter split into RX and TX adapters");
-        Ok((rx_adapter, bridge_tx))
+        let stats_for_error_passive = Arc::clone(&stats);
+        rx_adapter.set_error_passive_callback(move |is_error_passive| {
+            if is_error_passive {
+                stats_for_error_passive.can_error_passive_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        Ok((
+            rx_adapter,
+            Box::new(tx_adapter.into_bridge(config.bridge_tx_timeout)),
+        ))
     }
 
-    /// 设备管理循环（状态机 + 热拔插恢复）
-    ///
-    /// **关键**：无论 USB 发生什么错误，守护进程都不应退出，而是进入重连模式。
-    ///
-    /// **去抖动机制**：在进入 `Reconnecting` 状态前，增加冷却时间，避免 macOS USB 枚举抖动。
-    ///
-    /// 使用分离的 RX 和 TX adapter
     fn device_manager_loop(
         rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
         tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
         device_state: Arc<DeviceStateCell>,
-        stats: Arc<RwLock<DaemonStats>>,
+        stats: Arc<DaemonStats>,
         config: DaemonConfig,
     ) {
-        // 去抖动：记录最后一次断开时间
-        let mut last_disconnect_time: Option<Instant> = None;
+        let mut last_disconnect = None;
 
         loop {
-            let current_state = device_state.load();
-
-            match current_state {
-                DeviceState::Connected => {
-                    // 检查设备是否仍然可用（可选：定期健康检查）
-                    // 如果检测到错误，转入 Disconnected
-                    // 注意：这里可以添加定期健康检查逻辑
-                    thread::sleep(Duration::from_millis(100)); // 设备管理线程可以 sleep
-                },
+            match device_state.load() {
+                DeviceState::Connected => thread::sleep(Duration::from_millis(100)),
                 DeviceState::Disconnected => {
-                    // **去抖动**：检查是否在冷却期内
                     let now = Instant::now();
-                    if let Some(last_time) = last_disconnect_time
-                        && now.duration_since(last_time) < config.reconnect_debounce
-                    {
-                        // 仍在冷却期内，等待
-                        thread::sleep(config.reconnect_debounce - now.duration_since(last_time));
+                    if let Some(last) = last_disconnect {
+                        let since_last = now.duration_since(last);
+                        if since_last < config.reconnect_debounce {
+                            thread::sleep(config.reconnect_debounce - since_last);
+                        }
                     }
-                    last_disconnect_time = Some(now);
-
-                    // 进入重连状态前，先清空 adapters
-                    {
-                        let mut rx_guard = rx_adapter.lock().unwrap();
-                        let mut tx_guard = tx_adapter.lock().unwrap();
-
-                        *rx_guard = None;
-                        *tx_guard = None;
-                    }
+                    last_disconnect = Some(now);
+                    *rx_adapter.lock().unwrap() = None;
+                    *tx_adapter.lock().unwrap() = None;
                     device_state.store(DeviceState::Reconnecting);
-                    eprintln!("[DeviceManager] Entering reconnecting state");
+                    warn!("bridge daemon entering reconnecting state");
                 },
                 DeviceState::Reconnecting => {
-                    // 尝试连接设备并原子性更新 RX/TX adapter
                     match Self::try_connect_device(&config, Arc::clone(&stats)) {
-                        Ok((mut new_rx_adapter, new_tx_adapter)) => {
-                            // 设备重连成功后，重置 Bus Off 状态标志
-                            // 设备重连成功后，重置 Error Passive 状态标志
-                            // 重置设备支持标志位（连接新设备后重新检测）
-                            {
-                                let stats_guard = stats.read().unwrap();
-                                let detailed = stats_guard.detailed.read().unwrap();
-                                detailed.reset_bus_off_status();
-                                detailed.reset_error_passive_status();
-                                // ✅ 重置支持标志位为 true（乐观策略），现代 GS-USB 设备普遍支持
-                                detailed
-                                    .bus_off_monitoring_supported
-                                    .store(true, Ordering::Relaxed);
-                            }
-
-                            // 设置 Bus Off 状态更新回调（同时标记设备支持检测）
-                            let stats_for_bus_off = Arc::clone(&stats);
-                            new_rx_adapter.set_bus_off_callback(move |is_bus_off| {
-                                let stats_guard = stats_for_bus_off.read().unwrap();
-                                let detailed = stats_guard.detailed.read().unwrap();
-                                // 检测到 Bus Off 回调，说明设备支持检测（已通过错误帧验证）
-                                detailed
-                                    .bus_off_monitoring_supported
-                                    .store(true, Ordering::Relaxed);
-                                detailed.update_bus_off_status(is_bus_off);
-                            });
-
-                            // 设置 Error Passive 状态更新回调（同时标记设备支持检测）
-                            let stats_for_error_passive = Arc::clone(&stats);
-                            new_rx_adapter.set_error_passive_callback(move |is_error_passive| {
-                                let stats_guard = stats_for_error_passive.read().unwrap();
-                                let detailed = stats_guard.detailed.read().unwrap();
-                                // 检测到 Error Passive 回调，说明设备支持错误帧上报（进而支持 Bus Off 检测）
-                                detailed
-                                    .bus_off_monitoring_supported
-                                    .store(true, Ordering::Relaxed);
-                                detailed.update_error_passive_status(is_error_passive);
-                            });
-
-                            // 乐观策略：默认假设设备支持 Bus Off 检测（现代 GS-USB 设备普遍支持）
-                            // 只有在明确检测到不支持时才降级
-
-                            {
-                                let mut rx_guard = rx_adapter.lock().unwrap();
-                                let mut tx_guard = tx_adapter.lock().unwrap();
-
-                                *rx_guard = Some(new_rx_adapter);
-                                *tx_guard = Some(new_tx_adapter);
-
-                                eprintln!("[DeviceManager] Updated RX and TX adapters");
-                            }
-
+                        Ok((new_rx, new_tx)) => {
+                            *rx_adapter.lock().unwrap() = Some(new_rx);
+                            *tx_adapter.lock().unwrap() = Some(new_tx);
                             device_state.store(DeviceState::Connected);
-                            eprintln!("[DeviceManager] Device reconnected successfully");
-                            last_disconnect_time = None; // 重置去抖动计时器
+                            info!("bridge daemon connected to GS-USB device");
                         },
-                        Err(e) => {
-                            eprintln!(
-                                "[DeviceManager] Failed to connect device: {}. Retrying in {:?}...",
-                                e, config.reconnect_interval
-                            );
+                        Err(err) => {
+                            warn!("failed to connect GS-USB device: {err}");
                             thread::sleep(config.reconnect_interval);
-                            // 保持 Reconnecting 状态，继续重试
                         },
                     }
                 },
@@ -1134,2754 +499,860 @@ impl Daemon {
         }
     }
 
-    /// USB 接收循环（高优先级线程，阻塞 IO）
-    ///
-    /// **关键**：使用阻塞 IO，数据到达时内核立即唤醒线程（微秒级）
-    /// **严禁**：不要使用 sleep 或轮询
-    ///
-    /// 使用 RX adapter，锁粒度最小化
     fn usb_receive_loop(
         rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
         device_state: Arc<DeviceStateCell>,
-        clients: Arc<RwLock<ClientManager>>,
-        #[cfg(unix)] socket_uds: Option<std::os::unix::net::UnixDatagram>,
-        #[cfg(not(unix))] _socket_uds: Option<()>,
-        socket_udp: Option<std::net::UdpSocket>,
-        stats: Arc<RwLock<DaemonStats>>,
+        sessions: Arc<SessionManager>,
+        stats: Arc<DaemonStats>,
     ) {
+        crate::macos_qos::set_high_priority();
         loop {
-            // 1. 检查设备状态（快速检查，不要阻塞）
             if device_state.load() != DeviceState::Connected {
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
 
-            // 2. 从 USB 设备读取 CAN 帧（锁粒度最小化）
             let frame = {
-                let mut adapter_guard = rx_adapter.lock().unwrap();
-                match adapter_guard.as_mut() {
-                    Some(adapter) => match adapter.receive() {
-                        Ok(f) => {
-                            // 更新统计信息
-                            stats.read().unwrap().increment_rx();
-                            f
-                        },
-                        Err(piper_sdk::can::CanError::Timeout) => {
-                            // 超时是正常的（receive 内部有超时设置），继续循环
-                            continue;
-                        },
-                        Err(e) => {
-                            // 记录 USB 错误统计
-                            {
-                                let stats_guard = stats.read().unwrap();
-                                let detailed = stats_guard.detailed.read().unwrap();
-                                detailed.usb_transfer_errors.fetch_add(1, Ordering::Relaxed);
-
-                                match &e {
-                                    piper_sdk::can::CanError::Timeout => {
-                                        detailed.usb_timeout_count.fetch_add(1, Ordering::Relaxed);
-                                    },
-                                    piper_sdk::can::CanError::Device(dev) => {
-                                        if dev.kind == piper_sdk::can::CanDeviceErrorKind::NoDevice
-                                        {
-                                            detailed
-                                                .usb_no_device_count
-                                                .fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    },
-                                    _ => {},
-                                }
-                            }
-
-                            // 其他错误：根据错误类型决定是否立即进入断开/重连
-                            eprintln!("[Daemon] USB receive error: {:?}", e);
-
-                            let should_disconnect = match &e {
-                                piper_sdk::can::CanError::Device(dev) => matches!(
-                                    dev.kind,
-                                    piper_sdk::can::CanDeviceErrorKind::NoDevice
-                                        | piper_sdk::can::CanDeviceErrorKind::NotFound
-                                        | piper_sdk::can::CanDeviceErrorKind::AccessDenied
-                                ),
-                                // IO 错误通常也意味着链路不可靠，进入重连更安全
-                                piper_sdk::can::CanError::Io(_) => true,
-                                _ => true,
-                            };
-
-                            if should_disconnect {
-                                device_state.store(DeviceState::Disconnected);
-                            }
-
-                            // 短暂等待后重试，避免死循环
-                            thread::sleep(Duration::from_millis(100));
-                            continue;
-                        },
-                    },
-                    None => {
-                        // 设备未连接，短暂等待后重试
+                let mut guard = rx_adapter.lock().unwrap();
+                let Some(adapter) = guard.as_mut() else {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+                match adapter.receive() {
+                    Ok(frame) => frame,
+                    Err(CanError::Timeout) => continue,
+                    Err(err) => {
+                        warn!("bridge daemon RX error: {err}");
+                        device_state.store(DeviceState::Disconnected);
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     },
                 }
-            }; // ✅ 锁在这里释放（只在 receive() 期间持有）
+            };
 
-            // 3. 向符合条件的客户端发送（使用读取锁，支持并发）
-            let mut failed_clients = Vec::new();
-            {
-                let clients_guard = clients.read().unwrap();
-                for client in clients_guard.iter() {
-                    // 检查过滤规则
-                    if !client.matches_filter(frame.id) {
-                        continue;
-                    }
-
-                    // 零拷贝编码（使用栈上缓冲区）
-                    let mut buf = [0u8; 64];
-                    let encoded =
-                        match piper_can::gs_usb_udp::protocol::encode_receive_frame_zero_copy(
-                            &frame, &mut buf,
-                        ) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                eprintln!("Failed to encode frame: {}", e);
-                                continue;
-                            },
-                        };
-
-                    // 根据客户端地址类型发送，处理 WouldBlock/ENOBUFS/EPIPE 等错误
-                    // 自适应降级机制
-                    let send_failed = match &client.addr {
-                        #[cfg(unix)]
-                        ClientAddr::Unix(uds_path) => {
-                            if let Some(ref socket) = socket_uds {
-                                // 检查是否需要降级发送（跳过某些帧）
-                                let frequency_level =
-                                    client.send_frequency_level.load(Ordering::Relaxed);
-                                if frequency_level > 0 {
-                                    // 降级发送：根据级别跳过帧
-                                    // level 1: 每 10 帧发送 1 帧（100Hz）
-                                    // level 2: 每 100 帧发送 1 帧（10Hz）
-                                    let skip_factor = match frequency_level {
-                                        1 => 10,
-                                        2 => 100,
-                                        _ => 1,
-                                    };
-                                    let should_skip = {
-                                        // 使用 consecutive_errors 作为计数器（临时）
-                                        let counter =
-                                            client.consecutive_errors.load(Ordering::Relaxed);
-                                        counter % skip_factor != 0
-                                    };
-                                    if should_skip {
-                                        // 跳过此帧（降级发送）
-                                        continue;
-                                    }
-                                }
-
-                                match socket.send_to(encoded, uds_path) {
-                                    Ok(_) => {
-                                        // ✅ 发送成功，重置错误计数和降级级别
-                                        stats.read().unwrap().increment_ipc_sent();
-                                        client.consecutive_errors.store(0, Ordering::Relaxed);
-                                        client.send_frequency_level.store(0, Ordering::Relaxed); // 恢复正常频率
-                                        false
-                                    },
-                                    Err(e)
-                                        if e.kind() == std::io::ErrorKind::NotFound
-                                            || e.kind()
-                                                == std::io::ErrorKind::ConnectionRefused =>
-                                    {
-                                        // ✅ 客户端 socket 文件不存在或连接被拒绝（进程已退出）
-                                        eprintln!(
-                                            "[Client {}] Socket not found or refused, removing immediately",
-                                            client.id
-                                        );
-                                        stats
-                                            .read()
-                                            .unwrap()
-                                            .client_disconnected
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        true // 立即清理
-                                    },
-                                    Err(e)
-                                        if {
-                                            #[cfg(unix)]
-                                            {
-                                                matches!(e.raw_os_error(), Some(libc::EPIPE))
-                                            }
-                                            #[cfg(not(unix))]
-                                            {
-                                                false
-                                            }
-                                        } =>
-                                    {
-                                        // ✅ Broken pipe：客户端进程已退出
-                                        eprintln!(
-                                            "[Client {}] Pipe broken (process exited), removing immediately",
-                                            client.id
-                                        );
-                                        stats
-                                            .read()
-                                            .unwrap()
-                                            .client_disconnected
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        true // 立即清理
-                                    },
-                                    Err(e)
-                                        if e.kind() == std::io::ErrorKind::WouldBlock || {
-                                            #[cfg(unix)]
-                                            {
-                                                matches!(e.raw_os_error(), Some(libc::ENOBUFS))
-                                            }
-                                            #[cfg(not(unix))]
-                                            {
-                                                false
-                                            }
-                                        } =>
-                                    {
-                                        // WouldBlock 或 ENOBUFS（缓冲区满）
-                                        let error_count = client
-                                            .consecutive_errors
-                                            .fetch_add(1, Ordering::Relaxed)
-                                            + 1;
-                                        stats
-                                            .read()
-                                            .unwrap()
-                                            .client_send_blocked
-                                            .fetch_add(1, Ordering::Relaxed);
-
-                                        // 自适应降级
-                                        let current_level =
-                                            client.send_frequency_level.load(Ordering::Relaxed);
-                                        let new_level = if error_count >= 1000 {
-                                            // 1000 次错误（1 秒，1kHz）→ 降级到 10Hz
-                                            2
-                                        } else if error_count >= 100 {
-                                            // 100 次错误（100ms）→ 降级到 100Hz
-                                            1
-                                        } else {
-                                            current_level // 保持当前级别
-                                        };
-
-                                        if new_level != current_level {
-                                            client
-                                                .send_frequency_level
-                                                .store(new_level, Ordering::Relaxed);
-                                            let level_str = match new_level {
-                                                1 => "100Hz",
-                                                2 => "10Hz",
-                                                _ => "1kHz",
-                                            };
-                                            eprintln!(
-                                                "[Client {}] Degraded to {} ({} errors)",
-                                                client.id, level_str, error_count
-                                            );
-                                            {
-                                                let stats_guard = stats.read().unwrap();
-                                                let detailed = stats_guard.detailed.read().unwrap();
-                                                detailed
-                                                    .client_degraded
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                            }
-                                        }
-
-                                        // ✅ 日志限频：只在第一次和每 1000 次打印
-                                        if error_count == 1 || error_count % 1000 == 0 {
-                                            eprintln!(
-                                                "[Client {}] Buffer full, dropped {} frames total",
-                                                client.id, error_count
-                                            );
-                                        }
-
-                                        // ✅ 死客户端检测：连续丢包 2000 次（2 秒，1kHz）视为已死
-                                        // 注意：降级后实际丢包会更少，所以阈值提高
-                                        if error_count >= 2000 {
-                                            eprintln!(
-                                                "[Client {}] Buffer full for 2s, disconnecting (considered dead)",
-                                                client.id
-                                            );
-                                            stats
-                                                .read()
-                                                .unwrap()
-                                                .client_disconnected
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            true // 标记为失败，需要清理
-                                        } else {
-                                            false // 继续尝试
-                                        }
-                                    },
-                                    Err(e) => {
-                                        // 其他错误，记录但不立即清理
-                                        eprintln!("[Client {}] Send error: {}", client.id, e);
-                                        false
-                                    },
-                                }
-                            } else {
-                                false
-                            }
-                        },
-                        ClientAddr::Udp(addr) => {
-                            if let Some(ref socket) = socket_udp {
-                                match socket.send_to(encoded, *addr) {
-                                    Ok(_) => {
-                                        stats.read().unwrap().increment_ipc_sent();
-                                        client.consecutive_errors.store(0, Ordering::Relaxed);
-                                        false
-                                    },
-                                    Err(e) => {
-                                        eprintln!("[Client {}] UDP send error: {}", client.id, e);
-                                        false
-                                    },
-                                }
-                            } else {
-                                false
-                            }
-                        },
-                    };
-
-                    // 如果发送失败，记录需要清理的客户端
-                    if send_failed {
-                        failed_clients.push(client.id);
-                    }
-                }
-            }
-
-            // ✅ 清理发送失败的客户端（在释放读取锁后）
-            if !failed_clients.is_empty() {
-                let mut clients_guard = clients.write().unwrap();
-                for client_id in failed_clients {
-                    eprintln!("[Client {}] Removing disconnected client", client_id);
-                    clients_guard.unregister(client_id);
-                }
+            stats.inc_rx();
+            let dropped = sessions.broadcast_frame(frame);
+            if dropped > 0 {
+                stats.inc_queue_drops(dropped);
             }
         }
     }
 
-    /// IPC 接收循环（高优先级线程，阻塞 IO）
-    ///
-    /// **关键**：使用阻塞 IO，数据到达时内核立即唤醒线程（微秒级）
-    /// **严禁**：不要使用 sleep 或轮询
-    ///
-    /// 使用 TX adapter，与 RX 完全隔离
-    #[cfg(unix)]
-    fn ipc_receive_loop(
-        socket: std::os::unix::net::UnixDatagram,
-        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-        device_state: Arc<DeviceStateCell>,
-        clients: Arc<RwLock<ClientManager>>,
-        stats: Arc<RwLock<DaemonStats>>,
-        auth_log_limiter: Arc<AuthLogLimiter>,
-    ) {
-        // 设置高优先级（macOS QoS）
-        // 注意：在非 macOS 平台上这是空操作，可以安全调用
-        crate::macos_qos::set_high_priority();
-
-        let mut buf = [0u8; 1024];
-
-        loop {
-            // **关键**：阻塞接收，没有数据时线程挂起
-            match socket.recv_from(&mut buf) {
-                Ok((len, client_addr)) => {
-                    // 解析消息
-                    if let Ok(msg) = piper_can::gs_usb_udp::protocol::decode_message(&buf[..len]) {
-                        // 更新统计（接收 IPC 消息）
-                        stats.read().unwrap().increment_ipc_received();
-                        Self::handle_ipc_message(
-                            msg,
-                            client_addr,
-                            IpcHandlerContext {
-                                tx_adapter: &tx_adapter,
-                                device_state: &device_state,
-                                clients: &clients,
-                                stats: &stats,
-                                auth_log_limiter: &auth_log_limiter,
-                            },
-                            &socket,
-                        );
-                    }
-                },
-                Err(e) => {
-                    // ✅ 非阻塞socket：WouldBlock/EAGAIN 是正常情况，不应该作为错误
-                    let e: std::io::Error = e;
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        // 没有数据可读，继续循环（不打印、不sleep，避免日志刷屏）
-                        continue;
-                    }
-                    // 其他错误才打印并sleep
-                    eprintln!("IPC Recv Error: {}", e);
-                    thread::sleep(Duration::from_millis(100));
-                },
-            }
-        }
-    }
-
-    /// UDP IPC 接收循环（高优先级线程）
-    ///
-    /// 与 `ipc_receive_loop` 类似，但处理 UDP Socket
-    /// 注意：UDP 的 `recv_from` 返回 `SocketAddr`（IP 地址），而不是 `UnixSocketAddr`
-    fn ipc_receive_loop_udp(
-        socket: std::net::UdpSocket,
-        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-        device_state: Arc<DeviceStateCell>,
-        clients: Arc<RwLock<ClientManager>>,
-        stats: Arc<RwLock<DaemonStats>>,
-        auth_log_limiter: Arc<AuthLogLimiter>,
-    ) {
-        // 设置高优先级（macOS QoS）
-        // 注意：在非 macOS 平台上这是空操作，可以安全调用
-        crate::macos_qos::set_high_priority();
-
-        let mut buf = [0u8; 1024];
-
-        loop {
-            // **关键**：阻塞接收，没有数据时线程挂起
-            match socket.recv_from(&mut buf) {
-                Ok((len, client_addr)) => {
-                    // 解析消息
-                    if let Ok(msg) = piper_can::gs_usb_udp::protocol::decode_message(&buf[..len]) {
-                        // 更新统计（接收 IPC 消息）
-                        stats.read().unwrap().increment_ipc_received();
-
-                        // ✅ 关键：传递 SocketAddr（UDP 地址）而不是 UnixSocketAddr
-                        Self::handle_ipc_message_udp(
-                            msg,
-                            client_addr, // ← SocketAddr（UDP 地址）
-                            IpcHandlerContext {
-                                tx_adapter: &tx_adapter,
-                                device_state: &device_state,
-                                clients: &clients,
-                                stats: &stats,
-                                auth_log_limiter: &auth_log_limiter,
-                            },
-                            &socket, // ← UdpSocket
-                        );
-                    }
-                },
-                Err(e) => {
-                    // ✅ 非阻塞socket：WouldBlock/EAGAIN 是正常情况
-                    let e: std::io::Error = e;
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        continue;
-                    }
-                    // 其他错误才打印并sleep
-                    eprintln!("UDP IPC Recv Error: {}", e);
-                    thread::sleep(Duration::from_millis(100));
-                },
-            }
-        }
-    }
-
-    /// 处理 IPC 消息
-    ///
-    /// 使用 TX adapter，与 RX 完全隔离
-    #[cfg(unix)]
-    fn handle_ipc_message(
-        msg: piper_can::gs_usb_udp::protocol::Message,
-        client_addr: std::os::unix::net::SocketAddr,
-        ctx: IpcHandlerContext<'_>,
-        socket: &std::os::unix::net::UnixDatagram,
-    ) {
-        let IpcHandlerContext {
-            tx_adapter,
-            device_state,
-            clients,
-            stats,
-            auth_log_limiter,
-        } = ctx;
-        let peer = match resolve_supported_unix_peer(&client_addr) {
-            Ok(peer) => peer,
-            Err(reason) => {
-                eprintln!(
-                    "[Unix IPC] Dropping message from unsupported unix peer {:?}: {}",
-                    client_addr, reason
-                );
-                return;
-            },
-        };
-        match msg {
-            piper_can::gs_usb_udp::protocol::Message::Heartbeat {
-                client_id,
-                session_token,
-            } => {
-                let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_session(
-                    session_token,
-                    &peer.addr,
-                    Some(client_id),
-                ) {
-                    BridgePeerAuth::Authorized { active_id } => {
-                        if let Err(e) = clients_guard.update_activity(active_id) {
-                            eprintln!("[Client {}] Failed to update activity: {}", active_id, e);
-                        }
-                    },
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::Heartbeat,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "ignoring heartbeat from unregistered peer {}",
-                                    peer.reply_path
-                                )
-                            },
-                        );
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => auth_log_limiter.warn(
-                        AuthTransport::Unix,
-                        peer.addr.clone(),
-                        AuthMessageType::Heartbeat,
-                        AuthFailureKind::PeerMismatch,
-                        || {
-                            format!(
-                                "ignoring heartbeat for token owned by active client {} from peer {}",
-                                active_id, peer.reply_path
-                            )
-                        },
-                    ),
-                    BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::Heartbeat,
-                            AuthFailureKind::ClientIdMismatch,
-                            || {
-                                format!(
-                                    "ignoring heartbeat for client {} from peer {} (active client {})",
-                                    client_id, peer.reply_path, active_id
-                                )
-                            },
-                        );
-                    },
-                }
-            },
-            piper_can::gs_usb_udp::protocol::Message::Connect {
-                client_id,
-                session_token,
-                filters,
-                seq,
-            } => {
-                let prepared_result = {
-                    let mut clients_guard = clients.write().unwrap();
-                    if client_id == 0 {
-                        clients_guard.prepare_registration_auto(
-                            peer.addr.clone(),
-                            session_token,
-                            filters,
-                            Some(client_addr),
-                        )
-                    } else {
-                        clients_guard.prepare_registration_manual(
-                            client_id,
-                            peer.addr.clone(),
-                            session_token,
-                            filters,
-                            Some(client_addr),
-                        )
-                    }
-                };
-                let actual_id =
-                    prepared_result.as_ref().map_or(client_id, |prepared| prepared.id());
-                let status = if prepared_result.is_ok() { 0 } else { 1 };
-                let prepare_error = prepared_result.as_ref().err().cloned();
-                let mut prepared_registration = prepared_result.ok();
-
-                // 发送 ConnectAck 消息（包含实际使用的 ID）
-                let mut ack_buf = [0u8; 13];
-                let encoded_ack = piper_can::gs_usb_udp::protocol::encode_connect_ack(
-                    actual_id, // 使用实际 ID（自动分配或手动指定）
-                    status,
-                    seq,
-                    &mut ack_buf,
-                );
-
-                // 发送 ConnectAck 到客户端
-                if let Err(e) = socket.send_to(encoded_ack, peer.reply_path.as_str()) {
-                    eprintln!("Failed to send ConnectAck to client {}: {}", actual_id, e);
-                    if let Some(prepared) = prepared_registration.take() {
-                        clients.write().unwrap().abort_prepared_registration(prepared);
-                    }
-                } else {
-                    if let Some(prepared) = prepared_registration.take() {
-                        clients.write().unwrap().commit_prepared_registration(prepared);
-                    }
-                    eprintln!(
-                        "Sent ConnectAck to client {} (status: {}) [auto: {}]",
-                        actual_id,
-                        status,
-                        client_id == 0
-                    );
-                    if status == 0 {
-                        if client_id == 0 {
-                            eprintln!(
-                                "Client {} auto-assigned and connected from {} (path: {})",
-                                actual_id, peer.debug_addr, peer.reply_path
-                            );
-                        } else {
-                            eprintln!(
-                                "Client {} connected from {} (path: {})",
-                                actual_id, peer.debug_addr, peer.reply_path
-                            );
-                        }
-                    }
-                }
-
-                if let Some(e) = prepare_error {
-                    eprintln!("Failed to register client {}: {}", actual_id, e);
-                }
-            },
-            piper_can::gs_usb_udp::protocol::Message::Disconnect {
-                client_id,
-                session_token,
-                seq,
-            } => {
-                let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_session(session_token, &peer.addr, Some(client_id)) {
-                    BridgePeerAuth::Authorized { active_id } => {
-                        clients_guard.unregister(active_id);
-                    },
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::Disconnect,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "rejecting disconnect from unregistered peer {}",
-                                    peer.reply_path
-                                )
-                            },
-                        );
-                        drop(clients_guard);
-                        send_unix_error_response(
-                            socket,
-                            peer.reply_path.as_str(),
-                            ErrorCode::NotConnected,
-                            "Peer is not connected",
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::Disconnect,
-                            AuthFailureKind::PeerMismatch,
-                            || {
-                                format!(
-                                    "rejecting disconnect for token owned by active client {} from peer {}",
-                                    active_id, peer.reply_path
-                                )
-                            },
-                        );
-                        drop(clients_guard);
-                        send_unix_error_response(
-                            socket,
-                            peer.reply_path.as_str(),
-                            ErrorCode::InvalidMessage,
-                            &format!(
-                                "Peer {} does not own the active session {} for this token",
-                                peer.reply_path, active_id
-                            ),
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::Disconnect,
-                            AuthFailureKind::ClientIdMismatch,
-                            || {
-                                format!(
-                                    "rejecting disconnect for client {} from peer {} (active client {})",
-                                    client_id, peer.reply_path, active_id
-                                )
-                            },
-                        );
-                        drop(clients_guard);
-                        send_unix_error_response(
-                            socket,
-                            peer.reply_path.as_str(),
-                            ErrorCode::InvalidMessage,
-                            &format!(
-                                "Client {} does not match active session {} for peer",
-                                client_id, active_id
-                            ),
-                            seq,
-                        );
-                        return;
-                    },
-                }
-                drop(clients_guard);
-
-                let mut ack_buf = [0u8; 8];
-                let encoded =
-                    piper_can::gs_usb_udp::protocol::encode_disconnect_ack(seq, &mut ack_buf);
-
-                if let Err(error) = socket.send_to(encoded, peer.reply_path.as_str()) {
-                    eprintln!("[Client] Failed to send DisconnectAck: {}", error);
-                }
-            },
-            Message::SendFrame {
-                session_token,
-                frame,
-                seq,
-            } => {
-                match clients.read().unwrap().authorize_session(session_token, &peer.addr, None) {
-                    BridgePeerAuth::Authorized { .. } => {},
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::SendFrame,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "rejecting send-frame from unregistered peer {}",
-                                    peer.reply_path
-                                )
-                            },
-                        );
-                        send_unix_error_response(
-                            socket,
-                            peer.reply_path.as_str(),
-                            ErrorCode::NotConnected,
-                            "Peer is not connected",
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::SendFrame,
-                            AuthFailureKind::PeerMismatch,
-                            || {
-                                format!(
-                                    "rejecting send-frame for token owned by active client {} from peer {}",
-                                    active_id, peer.reply_path
-                                )
-                            },
-                        );
-                        send_unix_error_response(
-                            socket,
-                            peer.reply_path.as_str(),
-                            ErrorCode::InvalidMessage,
-                            &format!(
-                                "Peer {} does not own the active session {} for this token",
-                                peer.reply_path, active_id
-                            ),
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::ClientIdMismatch { .. } => {
-                        unreachable!("send-frame authorization does not compare client ids")
-                    },
-                }
-
-                // 发送 CAN 帧到 USB 设备（使用 TX adapter）
-                let mut adapter_guard = tx_adapter.lock().unwrap();
-                if let Some(ref mut adapter_ref) = *adapter_guard {
-                    match adapter_ref.send_bridge(frame) {
-                        Ok(_) => {
-                            // 更新统计（USB 发送成功）
-                            stats.read().unwrap().increment_tx();
-                            let mut ack_buf = [0u8; 12];
-                            let encoded = protocol::encode_send_ack(seq, 0, &mut ack_buf);
-                            if let Err(error) = socket.send_to(encoded, peer.reply_path.as_str()) {
-                                eprintln!("[Client] Failed to send SendAck: {}", error);
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("[Client] Failed to send frame: {}", e);
-                            record_bridge_tx_error(stats, &e);
-                            drop(adapter_guard);
-                            mark_bridge_device_disconnected(device_state, tx_adapter);
-
-                            send_unix_error_response(
-                                socket,
-                                peer.reply_path.as_str(),
-                                bridge_error_code(&e),
-                                &e.to_string(),
-                                seq,
-                            );
-                        },
-                    }
-                } else {
-                    eprintln!("[Client] TX adapter not available, frame dropped");
-                    drop(adapter_guard);
-                    send_unix_error_response(
-                        socket,
-                        peer.reply_path.as_str(),
-                        ErrorCode::NotConnected,
-                        "TX adapter not available",
-                        seq,
-                    );
-                }
-            },
-            piper_can::gs_usb_udp::protocol::Message::SetFilter {
-                client_id,
-                session_token,
-                filters,
-                seq: _,
-            } => {
-                let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_session(
-                    session_token,
-                    &peer.addr,
-                    Some(client_id),
-                ) {
-                    BridgePeerAuth::Authorized { active_id } => {
-                        if let Err(e) = clients_guard.set_filters(active_id, filters.clone()) {
-                            eprintln!("[Client {}] Failed to set filters: {}", active_id, e);
-                        } else {
-                            eprintln!(
-                                "[Client {}] Filters updated: {} rules",
-                                active_id,
-                                filters.len()
-                            );
-                        }
-                    },
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::SetFilter,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "ignoring SetFilter from unregistered peer {}",
-                                    peer.reply_path
-                                )
-                            },
-                        );
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => auth_log_limiter.warn(
-                        AuthTransport::Unix,
-                        peer.addr.clone(),
-                        AuthMessageType::SetFilter,
-                        AuthFailureKind::PeerMismatch,
-                        || {
-                            format!(
-                                "ignoring SetFilter for token owned by active client {} from peer {}",
-                                active_id, peer.reply_path
-                            )
-                        },
-                    ),
-                    BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::SetFilter,
-                            AuthFailureKind::ClientIdMismatch,
-                            || {
-                                format!(
-                                    "ignoring SetFilter for client {} from peer {} (active client {})",
-                                    client_id, peer.reply_path, active_id
-                                )
-                            },
-                        );
-                    },
-                }
-            },
-            piper_can::gs_usb_udp::protocol::Message::GetStatus { session_token, seq } => {
-                match clients.read().unwrap().authorize_session(session_token, &peer.addr, None) {
-                    BridgePeerAuth::Authorized { .. } => {},
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::GetStatus,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "rejecting GetStatus from unregistered peer {}",
-                                    peer.reply_path
-                                )
-                            },
-                        );
-                        send_unix_error_response(
-                            socket,
-                            peer.reply_path.as_str(),
-                            ErrorCode::NotConnected,
-                            "Peer is not connected",
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Unix,
-                            peer.addr.clone(),
-                            AuthMessageType::GetStatus,
-                            AuthFailureKind::PeerMismatch,
-                            || {
-                                format!(
-                                    "rejecting GetStatus for token owned by active client {} from peer {}",
-                                    active_id, peer.reply_path
-                                )
-                            },
-                        );
-                        send_unix_error_response(
-                            socket,
-                            peer.reply_path.as_str(),
-                            ErrorCode::InvalidMessage,
-                            &format!(
-                                "Peer {} does not own the active session {} for this token",
-                                peer.reply_path, active_id
-                            ),
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::ClientIdMismatch { .. } => {
-                        unreachable!("get-status authorization does not compare client ids")
-                    },
-                }
-
-                let clients_guard = clients.read().unwrap();
-                let stats_guard = stats.read().unwrap();
-                let detailed_guard = stats_guard.detailed.read().unwrap();
-
-                let rx_fps = stats_guard.get_rx_fps();
-                let tx_fps = stats_guard.get_tx_fps();
-
-                // 构建 StatusResponse
-                let status = StatusResponse {
-                    device_state: match device_state.load() {
-                        DeviceState::Connected => 1,
-                        DeviceState::Disconnected => 0,
-                        DeviceState::Reconnecting => 2,
-                    },
-                    rx_fps_x1000: (rx_fps * 1000.0) as u32,
-                    tx_fps_x1000: (tx_fps * 1000.0) as u32,
-                    ipc_sent_fps_x1000: (stats_guard.get_ipc_sent_fps() * 1000.0) as u32,
-                    ipc_received_fps_x1000: (stats_guard.get_ipc_received_fps() * 1000.0) as u32,
-                    health_score: stats_guard.health_score(rx_fps, tx_fps),
-                    usb_stall_count: detailed_guard.usb_stall_count.load(Ordering::Relaxed),
-                    can_bus_off_count: detailed_guard.can_bus_off_count.load(Ordering::Relaxed),
-                    can_error_passive_count: detailed_guard
-                        .can_error_passive_count
-                        .load(Ordering::Relaxed),
-                    cpu_usage_percent: detailed_guard.cpu_usage_percent.load(Ordering::Relaxed)
-                        as u8,
-                    client_count: clients_guard.count() as u32, // ← 使用 count() 方法
-                    client_send_blocked: stats_guard.client_send_blocked.load(Ordering::Relaxed),
-                };
-
-                // 编码并发送 StatusResponse 回请求者
-                let mut status_buf = [0u8; 64];
-                if let Ok(encoded) = piper_can::gs_usb_udp::protocol::encode_status_response(
-                    &status,
-                    seq,
-                    &mut status_buf,
-                ) {
-                    // ✅ 关键：发送到请求者（而不是广播给所有客户端）
-                    // ✅ 注意：GetStatus 的请求者可能尚未注册，所以必须使用已验证的真实 peer 地址
-                    if let Err(e) = socket.send_to(encoded, peer.reply_path.as_str()) {
-                        eprintln!("Failed to send StatusResponse: {}", e);
-                    } else {
-                        eprintln!("[GetStatus] Sent StatusResponse to {}", peer.reply_path);
-                    }
-                }
-            },
-            _ => {
-                // ✅ 未知消息类型必须记录（用于调试）
-                eprintln!("⚠️  [Unix] Received unsupported message type: {:?}", msg);
-            },
-        }
-    }
-
-    /// 处理 UDP IPC 消息
-    ///
-    /// 与 `handle_ipc_message` 类似，但：
-    /// 1. `client_addr` 是 `SocketAddr`（UDP 地址）而不是 `UnixSocketAddr`
-    /// 2. `socket` 是 `UdpSocket` 而不是 `UnixDatagram`
-    /// 3. UDP Connect 消息走 `prepare -> ack -> commit` 握手
-    fn handle_ipc_message_udp(
-        msg: piper_can::gs_usb_udp::protocol::Message,
-        client_addr: std::net::SocketAddr, // ← UDP 地址（SocketAddr）
-        ctx: IpcHandlerContext<'_>,
-        socket: &std::net::UdpSocket, // ← UdpSocket
-    ) {
-        let IpcHandlerContext {
-            tx_adapter,
-            device_state,
-            clients,
-            stats,
-            auth_log_limiter,
-        } = ctx;
-        match msg {
-            piper_can::gs_usb_udp::protocol::Message::Heartbeat {
-                client_id,
-                session_token,
-            } => {
-                let peer_addr = ClientAddr::Udp(client_addr);
-                let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_session(
-                    session_token,
-                    &peer_addr,
-                    Some(client_id),
-                ) {
-                    BridgePeerAuth::Authorized { active_id } => {
-                        if let Err(e) = clients_guard.update_activity(active_id) {
-                            eprintln!(
-                                "[UDP Client {}] Failed to update activity: {}",
-                                active_id, e
-                            );
-                        }
-                    },
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::Heartbeat,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "ignoring heartbeat from unregistered peer {}",
-                                    client_addr
-                                )
-                            },
-                        );
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => auth_log_limiter.warn(
-                        AuthTransport::Udp,
-                        peer_addr.clone(),
-                        AuthMessageType::Heartbeat,
-                        AuthFailureKind::PeerMismatch,
-                        || {
-                            format!(
-                                "ignoring heartbeat for token owned by active client {} from peer {}",
-                                active_id, client_addr
-                            )
-                        },
-                    ),
-                    BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::Heartbeat,
-                            AuthFailureKind::ClientIdMismatch,
-                            || {
-                                format!(
-                                    "ignoring heartbeat for client {} from peer {} (active client {})",
-                                    client_id, client_addr, active_id
-                                )
-                            },
-                        );
-                    },
-                }
-            },
-            piper_can::gs_usb_udp::protocol::Message::Connect {
-                client_id,
-                session_token,
-                filters,
-                seq,
-            } => {
-                let addr = ClientAddr::Udp(client_addr); // ← 使用 UDP 地址
-                let prepared_result = {
-                    let mut clients_guard = clients.write().unwrap();
-                    if client_id == 0 {
-                        clients_guard.prepare_registration_auto(
-                            addr,
-                            session_token,
-                            filters,
-                            #[cfg(unix)]
-                            None,
-                        )
-                    } else {
-                        clients_guard.prepare_registration_manual(
-                            client_id,
-                            addr,
-                            session_token,
-                            filters,
-                            #[cfg(unix)]
-                            None,
-                        )
-                    }
-                };
-                let actual_id =
-                    prepared_result.as_ref().map_or(client_id, |prepared| prepared.id());
-                let status = if prepared_result.is_ok() { 0 } else { 1 };
-                let prepare_error = prepared_result.as_ref().err().cloned();
-                let mut prepared_registration = prepared_result.ok();
-
-                // 发送 ConnectAck 消息（包含实际使用的 ID）
-                let mut ack_buf = [0u8; 13];
-                let encoded_ack = piper_can::gs_usb_udp::protocol::encode_connect_ack(
-                    actual_id, // 使用实际 ID（自动分配或手动指定）
-                    status,
-                    seq,
-                    &mut ack_buf,
-                );
-
-                // 发送 ConnectAck 到客户端（使用 UDP 地址）
-                if let Err(e) = socket.send_to(encoded_ack, client_addr) {
-                    eprintln!(
-                        "Failed to send ConnectAck to UDP client {}: {}",
-                        actual_id, e
-                    );
-                    if let Some(prepared) = prepared_registration.take() {
-                        clients.write().unwrap().abort_prepared_registration(prepared);
-                    }
-                } else {
-                    if let Some(prepared) = prepared_registration.take() {
-                        clients.write().unwrap().commit_prepared_registration(prepared);
-                    }
-                    eprintln!(
-                        "Sent ConnectAck to UDP client {} (status: {}) [auto: {}]",
-                        actual_id,
-                        status,
-                        client_id == 0
-                    );
-                    if status == 0 {
-                        if client_id == 0 {
-                            eprintln!(
-                                "Client {} connected via UDP from {} (auto-assigned)",
-                                actual_id, client_addr
-                            );
-                        } else {
-                            eprintln!(
-                                "Client {} connected via UDP from {} (manual ID)",
-                                actual_id, client_addr
-                            );
-                        }
-                    }
-                }
-
-                if let Some(e) = prepare_error {
-                    eprintln!("Failed to register UDP client {}: {}", actual_id, e);
-                }
-            },
-            piper_can::gs_usb_udp::protocol::Message::Disconnect {
-                client_id,
-                session_token,
-                seq,
-            } => {
-                let peer_addr = ClientAddr::Udp(client_addr);
-                let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_session(session_token, &peer_addr, Some(client_id)) {
-                    BridgePeerAuth::Authorized { active_id } => {
-                        clients_guard.unregister(active_id);
-                    },
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::Disconnect,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "rejecting disconnect from unregistered peer {}",
-                                    client_addr
-                                )
-                            },
-                        );
-                        drop(clients_guard);
-                        send_udp_error_response(
-                            socket,
-                            client_addr,
-                            ErrorCode::NotConnected,
-                            "Peer is not connected",
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::Disconnect,
-                            AuthFailureKind::PeerMismatch,
-                            || {
-                                format!(
-                                    "rejecting disconnect for token owned by active client {} from peer {}",
-                                    active_id, client_addr
-                                )
-                            },
-                        );
-                        drop(clients_guard);
-                        send_udp_error_response(
-                            socket,
-                            client_addr,
-                            ErrorCode::InvalidMessage,
-                            &format!(
-                                "Peer {} does not own the active session {} for this token",
-                                client_addr, active_id
-                            ),
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::Disconnect,
-                            AuthFailureKind::ClientIdMismatch,
-                            || {
-                                format!(
-                                    "rejecting disconnect for client {} from peer {} (active client {})",
-                                    client_id, client_addr, active_id
-                                )
-                            },
-                        );
-                        drop(clients_guard);
-                        send_udp_error_response(
-                            socket,
-                            client_addr,
-                            ErrorCode::InvalidMessage,
-                            &format!(
-                                "Client {} does not match active session {} for peer",
-                                client_id, active_id
-                            ),
-                            seq,
-                        );
-                        return;
-                    },
-                }
-                drop(clients_guard);
-
-                let mut ack_buf = [0u8; 8];
-                let encoded =
-                    piper_can::gs_usb_udp::protocol::encode_disconnect_ack(seq, &mut ack_buf);
-
-                if let Err(error) = socket.send_to(encoded, client_addr) {
-                    eprintln!("[UDP Client] Failed to send DisconnectAck: {}", error);
-                }
-            },
-            Message::SendFrame {
-                session_token,
-                frame,
-                seq,
-            } => {
-                let peer_addr = ClientAddr::Udp(client_addr);
-                match clients.read().unwrap().authorize_session(session_token, &peer_addr, None) {
-                    BridgePeerAuth::Authorized { .. } => {},
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::SendFrame,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "rejecting send-frame from unregistered peer {}",
-                                    client_addr
-                                )
-                            },
-                        );
-                        send_udp_error_response(
-                            socket,
-                            client_addr,
-                            ErrorCode::NotConnected,
-                            "Peer is not connected",
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::SendFrame,
-                            AuthFailureKind::PeerMismatch,
-                            || {
-                                format!(
-                                    "rejecting send-frame for token owned by active client {} from peer {}",
-                                    active_id, client_addr
-                                )
-                            },
-                        );
-                        send_udp_error_response(
-                            socket,
-                            client_addr,
-                            ErrorCode::InvalidMessage,
-                            &format!(
-                                "Peer {} does not own the active session {} for this token",
-                                client_addr, active_id
-                            ),
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::ClientIdMismatch { .. } => {
-                        unreachable!("send-frame authorization does not compare client ids")
-                    },
-                }
-
-                // ✅ 发送 CAN 帧到 USB 设备（使用 TX adapter）
-                let mut adapter_guard = tx_adapter.lock().unwrap();
-                if let Some(ref mut adapter_ref) = *adapter_guard {
-                    match adapter_ref.send_bridge(frame) {
-                        Ok(_) => {
-                            stats.read().unwrap().increment_tx();
-                            let mut ack_buf = [0u8; 12];
-                            let encoded = protocol::encode_send_ack(seq, 0, &mut ack_buf);
-                            if let Err(error) = socket.send_to(encoded, client_addr) {
-                                eprintln!("[UDP Client] Failed to send SendAck: {}", error);
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("[UDP Client] Failed to send frame: {}", e);
-                            record_bridge_tx_error(stats, &e);
-                            drop(adapter_guard);
-                            mark_bridge_device_disconnected(device_state, tx_adapter);
-
-                            send_udp_error_response(
-                                socket,
-                                client_addr,
-                                bridge_error_code(&e),
-                                &e.to_string(),
-                                seq,
-                            );
-                        },
-                    }
-                } else {
-                    eprintln!("[UDP Client] TX adapter not available, frame dropped");
-                    drop(adapter_guard);
-                    send_udp_error_response(
-                        socket,
-                        client_addr,
-                        ErrorCode::NotConnected,
-                        "TX adapter not available",
-                        seq,
-                    );
-                }
-            },
-            piper_can::gs_usb_udp::protocol::Message::SetFilter {
-                client_id,
-                session_token,
-                filters,
-                seq: _,
-            } => {
-                let peer_addr = ClientAddr::Udp(client_addr);
-                let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_session(
-                    session_token,
-                    &peer_addr,
-                    Some(client_id),
-                ) {
-                    BridgePeerAuth::Authorized { active_id } => {
-                        if let Err(e) = clients_guard.set_filters(active_id, filters.clone()) {
-                            eprintln!("[UDP Client {}] Failed to set filters: {}", active_id, e);
-                        } else {
-                            eprintln!(
-                                "[UDP Client {}] Filters updated: {} rules",
-                                active_id,
-                                filters.len()
-                            );
-                        }
-                    },
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::SetFilter,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "ignoring SetFilter from unregistered peer {}",
-                                    client_addr
-                                )
-                            },
-                        );
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => auth_log_limiter.warn(
-                        AuthTransport::Udp,
-                        peer_addr.clone(),
-                        AuthMessageType::SetFilter,
-                        AuthFailureKind::PeerMismatch,
-                        || {
-                            format!(
-                                "ignoring SetFilter for token owned by active client {} from peer {}",
-                                active_id, client_addr
-                            )
-                        },
-                    ),
-                    BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::SetFilter,
-                            AuthFailureKind::ClientIdMismatch,
-                            || {
-                                format!(
-                                    "ignoring SetFilter for client {} from peer {} (active client {})",
-                                    client_id, client_addr, active_id
-                                )
-                            },
-                        );
-                    },
-                }
-            },
-            piper_can::gs_usb_udp::protocol::Message::GetStatus { session_token, seq } => {
-                let peer_addr = ClientAddr::Udp(client_addr);
-                match clients.read().unwrap().authorize_session(session_token, &peer_addr, None) {
-                    BridgePeerAuth::Authorized { .. } => {},
-                    BridgePeerAuth::NotConnected => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::GetStatus,
-                            AuthFailureKind::NotConnected,
-                            || {
-                                format!(
-                                    "rejecting GetStatus from unregistered peer {}",
-                                    client_addr
-                                )
-                            },
-                        );
-                        send_udp_error_response(
-                            socket,
-                            client_addr,
-                            ErrorCode::NotConnected,
-                            "Peer is not connected",
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::PeerMismatch { active_id } => {
-                        auth_log_limiter.warn(
-                            AuthTransport::Udp,
-                            peer_addr.clone(),
-                            AuthMessageType::GetStatus,
-                            AuthFailureKind::PeerMismatch,
-                            || {
-                                format!(
-                                    "rejecting GetStatus for token owned by active client {} from peer {}",
-                                    active_id, client_addr
-                                )
-                            },
-                        );
-                        send_udp_error_response(
-                            socket,
-                            client_addr,
-                            ErrorCode::InvalidMessage,
-                            &format!(
-                                "Peer {} does not own the active session {} for this token",
-                                client_addr, active_id
-                            ),
-                            seq,
-                        );
-                        return;
-                    },
-                    BridgePeerAuth::ClientIdMismatch { .. } => {
-                        unreachable!("get-status authorization does not compare client ids")
-                    },
-                }
-
-                // ✅ GetStatus 消息处理（UDP）
-                // UDP 地址可以直接使用 SocketAddr，无需转换字符串
-
-                let clients_guard = clients.read().unwrap();
-                let stats_guard = stats.read().unwrap();
-                let detailed_guard = stats_guard.detailed.read().unwrap();
-
-                let rx_fps = stats_guard.get_rx_fps();
-                let tx_fps = stats_guard.get_tx_fps();
-
-                // 构建 StatusResponse
-                let status = StatusResponse {
-                    device_state: match device_state.load() {
-                        DeviceState::Connected => 1,
-                        DeviceState::Disconnected => 0,
-                        DeviceState::Reconnecting => 2,
-                    },
-                    rx_fps_x1000: (rx_fps * 1000.0) as u32,
-                    tx_fps_x1000: (tx_fps * 1000.0) as u32,
-                    ipc_sent_fps_x1000: (stats_guard.get_ipc_sent_fps() * 1000.0) as u32,
-                    ipc_received_fps_x1000: (stats_guard.get_ipc_received_fps() * 1000.0) as u32,
-                    health_score: stats_guard.health_score(rx_fps, tx_fps),
-                    usb_stall_count: detailed_guard.usb_stall_count.load(Ordering::Relaxed),
-                    can_bus_off_count: detailed_guard.can_bus_off_count.load(Ordering::Relaxed),
-                    can_error_passive_count: detailed_guard
-                        .can_error_passive_count
-                        .load(Ordering::Relaxed),
-                    cpu_usage_percent: detailed_guard.cpu_usage_percent.load(Ordering::Relaxed)
-                        as u8,
-                    client_count: clients_guard.count() as u32,
-                    client_send_blocked: stats_guard.client_send_blocked.load(Ordering::Relaxed),
-                };
-
-                // 编码并发送 StatusResponse 回请求者
-                let mut status_buf = [0u8; 64];
-                if let Ok(encoded) = piper_can::gs_usb_udp::protocol::encode_status_response(
-                    &status,
-                    seq,
-                    &mut status_buf,
-                ) {
-                    // ✅ 关键：发送到 UDP 请求者（使用 SocketAddr）
-                    if let Err(e) = socket.send_to(encoded, client_addr) {
-                        eprintln!("Failed to send StatusResponse to UDP client: {}", e);
-                    } else {
-                        eprintln!(
-                            "[GetStatus] Sent StatusResponse to UDP client {}",
-                            client_addr
-                        );
-                    }
-                }
-            },
-            _ => {
-                // ✅ 未知消息类型必须记录（用于调试）
-                eprintln!("⚠️  [UDP] Received unsupported message type: {:?}", msg);
-            },
-        }
-    }
-
-    /// 客户端清理循环（低优先级线程）
-    ///
-    /// 定期清理超时客户端，避免客户端列表无限增长
-    fn client_cleanup_loop(clients: Arc<RwLock<ClientManager>>) {
-        // 设置低优先级（设备管理线程）
-        // 注意：在非 macOS 平台上这是空操作，可以安全调用
-        crate::macos_qos::set_low_priority();
-
-        loop {
-            // ✅ 优化：先执行清理，再休眠
-            // 这样可以立即清理启动时残留的客户端，而不是等待 5 秒
-            clients.write().unwrap().cleanup_timeout();
-            // 每 5 秒清理一次超时客户端
-            thread::sleep(Duration::from_secs(5));
-        }
-    }
-
-    /// CPU 监控循环（低优先级线程）
-    ///
-    /// 定期监控 CPU 使用率，用于健康度评分
-    ///
-    /// ✅ 使用 `sysinfo` crate 实现跨平台 CPU 使用率监控
-    fn cpu_monitor_loop(stats: Arc<RwLock<DaemonStats>>) {
+    fn cpu_monitor_loop(stats: Arc<DaemonStats>) {
         use sysinfo::{CpuRefreshKind, RefreshKind, System};
 
-        // 设置低优先级
         crate::macos_qos::set_low_priority();
-
-        // ✅ 初始化系统信息（仅 CPU）
         let mut sys = System::new_with_specifics(
             RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
         );
 
         loop {
-            thread::sleep(Duration::from_secs(1));
-
-            // ✅ 刷新 CPU 使用率
+            thread::sleep(CPU_MONITOR_INTERVAL);
             sys.refresh_cpu_all();
-            let cpu_usage = sys.global_cpu_usage(); // f64 (0-100)
-
-            // 存储到统计中
-            stats
-                .read()
-                .unwrap()
-                .detailed
-                .read()
-                .unwrap()
-                .cpu_usage_percent
-                .store(cpu_usage as u32, Ordering::Relaxed);
+            stats.cpu_usage_percent.store(sys.global_cpu_usage() as u32, Ordering::Relaxed);
         }
     }
 
-    /// 状态打印循环（低优先级线程）
-    ///
-    /// 定期打印守护进程状态信息，包括客户端数量、CAN 帧 FPS 等
-    /// 每次打印后重置统计信息，使 FPS 显示最近一段时间的平均值
     fn status_print_loop(
-        clients: Arc<RwLock<ClientManager>>,
+        sessions: Arc<SessionManager>,
         device_state: Arc<DeviceStateCell>,
-        stats: Arc<RwLock<DaemonStats>>,
-        interval: Duration,
+        stats: Arc<DaemonStats>,
     ) {
-        // 设置低优先级（状态打印线程）
-        // 注意：在非 macOS 平台上这是空操作，可以安全调用
         crate::macos_qos::set_low_priority();
-
         loop {
-            thread::sleep(interval);
+            thread::sleep(STATUS_PRINT_INTERVAL);
+            info!(
+                "state={:?} sessions={} rx_fps={:.1} tx_fps={:.1} ipc_in_fps={:.1} ipc_out_fps={:.1} queue_drops={} cpu={}%",
+                device_state.load(),
+                sessions.count(),
+                stats.rx_fps(),
+                stats.tx_fps(),
+                stats.ipc_in_fps(),
+                stats.ipc_out_fps(),
+                stats.queue_drop_total.load(Ordering::Relaxed),
+                stats.cpu_usage_percent.load(Ordering::Relaxed),
+            );
+        }
+    }
 
-            let (client_count, client_ids) = {
-                let clients_guard = clients.read().unwrap();
-                let ids: Vec<u32> = clients_guard.iter().map(|client| client.id).collect();
-                (clients_guard.count(), ids) // ← 使用 count() 方法，更语义化
-            };
-            let state = device_state.load();
+    fn build_status(
+        device_state: DeviceState,
+        sessions: &SessionManager,
+        stats: &DaemonStats,
+    ) -> BridgeStatus {
+        BridgeStatus {
+            device_state: device_state.as_bridge_state(),
+            rx_fps_x1000: (stats.rx_fps() * 1000.0) as u32,
+            tx_fps_x1000: (stats.tx_fps() * 1000.0) as u32,
+            ipc_out_fps_x1000: (stats.ipc_out_fps() * 1000.0) as u32,
+            ipc_in_fps_x1000: (stats.ipc_in_fps() * 1000.0) as u32,
+            health_score: stats.health_score(device_state),
+            usb_stall_count: stats.usb_stall_count.load(Ordering::Relaxed),
+            can_bus_off_count: stats.can_bus_off_count.load(Ordering::Relaxed),
+            can_error_passive_count: stats.can_error_passive_count.load(Ordering::Relaxed),
+            cpu_usage_percent: stats.cpu_usage_percent.load(Ordering::Relaxed) as u8,
+            session_count: sessions.count(),
+            queue_drop_count: stats.queue_drop_total.load(Ordering::Relaxed),
+        }
+    }
 
-            // 读取统计信息并计算 FPS + 健康度
-            // 更新性能基线（必须由定时器触发，确保固定时间间隔）
-            let (
-                rx_fps,
-                tx_fps,
-                ipc_sent_fps,
-                ipc_received_fps,
-                blocked_count,
-                disconnected_count,
-                health_score,
-                usb_errors,
-                can_errors,
-                cpu_usage,
-                bus_off_count,
-            ) = {
-                let stats_guard = stats.read().unwrap();
-                let elapsed = stats_guard.start_time.elapsed();
-                let rx_fps = stats_guard.get_rx_fps();
-                let tx_fps = stats_guard.get_tx_fps();
-
-                // 更新性能基线（必须在固定时间间隔调用，例如每秒一次）
-                {
-                    let detailed = stats_guard.detailed.read().unwrap();
-                    detailed.update_baseline(rx_fps, tx_fps, elapsed);
-
-                    // 检测性能异常
-                    if detailed.is_performance_degraded(rx_fps, tx_fps) {
-                        tracing::warn!(
-                            "Performance degraded: RX {:.1} fps (baseline: {:.1}), TX {:.1} fps (baseline: {:.1})",
-                            rx_fps,
-                            detailed.baseline_rx_fps(),
-                            tx_fps,
-                            detailed.baseline_tx_fps()
-                        );
+    fn spawn_writer_thread(
+        writer: Arc<Mutex<ServerStream>>,
+        rx: crossbeam_channel::Receiver<ConnectionOutput>,
+        stats: Arc<DaemonStats>,
+    ) -> Result<(), DaemonError> {
+        thread::Builder::new()
+            .name("bridge_writer".into())
+            .spawn(move || {
+                while let Ok(output) = rx.recv() {
+                    match output {
+                        ConnectionOutput::Event(event) => {
+                            if Self::write_server_message(
+                                &writer,
+                                &ServerMessage::Event(event),
+                                &stats,
+                            )
+                            .is_err()
+                            {
+                                break;
+                            }
+                        },
+                        ConnectionOutput::CloseAfterEvent(event) => {
+                            let _ = Self::write_server_message(
+                                &writer,
+                                &ServerMessage::Event(event),
+                                &stats,
+                            );
+                            break;
+                        },
+                        ConnectionOutput::Shutdown => break,
                     }
                 }
+                writer.lock().unwrap().shutdown();
+            })
+            .map(|_| ())
+            .map_err(|err| DaemonError::Io(format!("failed to spawn bridge writer thread: {err}")))
+    }
 
-                let detailed = stats_guard.detailed.read().unwrap();
-                (
-                    rx_fps,
-                    tx_fps,
-                    stats_guard.get_ipc_sent_fps(),
-                    stats_guard.get_ipc_received_fps(),
-                    stats_guard.client_send_blocked.load(Ordering::Relaxed),
-                    stats_guard.client_disconnected.load(Ordering::Relaxed),
-                    stats_guard.health_score(rx_fps, tx_fps),
-                    detailed.usb_transfer_errors.load(Ordering::Relaxed),
-                    detailed.can_error_frames.load(Ordering::Relaxed),
-                    detailed.cpu_usage_percent.load(Ordering::Relaxed),
-                    detailed.can_bus_off_count.load(Ordering::Relaxed), // Bus Off 计数
-                )
+    fn write_server_message(
+        writer: &Arc<Mutex<ServerStream>>,
+        message: &ServerMessage,
+        stats: &DaemonStats,
+    ) -> Result<(), DaemonError> {
+        let encoded = protocol::encode_server_message(message)
+            .map_err(|err| DaemonError::Io(format!("failed to encode server message: {err}")))?;
+        let mut guard = writer.lock().unwrap();
+        protocol::write_framed(&mut *guard, &encoded)
+            .map_err(|err| DaemonError::Io(format!("failed to write server message: {err}")))?;
+        stats.inc_ipc_out();
+        Ok(())
+    }
+
+    fn send_error(
+        writer: &Arc<Mutex<ServerStream>>,
+        stats: &DaemonStats,
+        request_id: u32,
+        code: ErrorCode,
+        message: impl Into<String>,
+    ) -> Result<(), DaemonError> {
+        Self::write_server_message(
+            writer,
+            &ServerMessage::Response(ServerResponse::Error {
+                request_id,
+                code,
+                message: message.into(),
+            }),
+            stats,
+        )
+    }
+
+    fn handle_connection(
+        mut reader: ServerStream,
+        writer: Arc<Mutex<ServerStream>>,
+        ctx: ConnectionContext<'_>,
+    ) {
+        let peer_label = reader.peer_label();
+        let control = Arc::new(StreamControl {
+            writer: Arc::clone(&writer),
+        });
+        let mut session_id = None;
+
+        loop {
+            let payload = match protocol::read_framed(&mut reader) {
+                Ok(payload) => payload,
+                Err(protocol::ProtocolError::Io(_)) => break,
+                Err(err) => {
+                    ctx.warn_limiter.warn("protocol-read-error", || {
+                        format!("bridge protocol read error from {peer_label}: {err}")
+                    });
+                    break;
+                },
             };
 
-            let state_str = match state {
-                DeviceState::Connected => "Connected",
-                DeviceState::Disconnected => "Disconnected",
-                DeviceState::Reconnecting => "Reconnecting",
+            let request = match protocol::decode_client_request(&payload) {
+                Ok(request) => request,
+                Err(err) => {
+                    ctx.warn_limiter.warn("protocol-decode-error", || {
+                        format!("bridge protocol decode error from {peer_label}: {err}")
+                    });
+                    break;
+                },
             };
+            ctx.stats.inc_ipc_in();
 
-            // 格式化客户端 ID 列表
-            let client_ids_str = if client_ids.is_empty() {
-                "[]".to_string()
-            } else {
-                format!("{:?}", client_ids)
-            };
+            match request {
+                ClientRequest::Hello {
+                    request_id,
+                    session_token,
+                    role_request,
+                    filters,
+                } => {
+                    if session_id.is_some() {
+                        let _ = Self::send_error(
+                            &writer,
+                            ctx.stats,
+                            request_id,
+                            ErrorCode::InvalidMessage,
+                            "hello already completed for this connection",
+                        );
+                        continue;
+                    }
 
-            // 读取基线信息用于显示
-            let (baseline_rx, baseline_tx) = {
-                let stats_guard = stats.read().unwrap();
-                let detailed = stats_guard.detailed.read().unwrap();
-                (detailed.baseline_rx_fps(), detailed.baseline_tx_fps())
-            };
+                    let (event_tx, event_rx) = SessionManager::new_connection_queue();
+                    let control_for_session: Arc<dyn SessionControl> = control.clone();
+                    let prepared = ctx.sessions.prepare_session(
+                        session_token,
+                        role_request,
+                        filters,
+                        event_tx,
+                        control_for_session,
+                    );
 
-            eprintln!(
-                "[Status] State: {}, Clients: {} {}, RX: {:.1} fps (baseline: {:.1}), TX: {:.1} fps (baseline: {:.1}), IPC→Client: {:.1} fps, IPC←Client: {:.1} fps, Blocked: {}, Disconnected: {}, Health: {}/100, USB Errors: {}, CAN Errors: {}, Bus Off: {}, CPU: {}%",
-                state_str,
-                client_count,
-                client_ids_str,
-                rx_fps,
-                baseline_rx, // 显示 RX 基线
-                tx_fps,
-                baseline_tx, // 显示 TX 基线
-                ipc_sent_fps,
-                ipc_received_fps,
-                blocked_count,
-                disconnected_count,
-                health_score,
-                usb_errors,
-                can_errors,
-                bus_off_count, // Bus Off 计数
-                cpu_usage
-            );
+                    let hello_ack = ServerMessage::Response(ServerResponse::HelloAck {
+                        request_id,
+                        session_id: prepared.session_id(),
+                        role_granted: prepared.role_granted(),
+                    });
+                    if Self::write_server_message(&writer, &hello_ack, ctx.stats).is_err() {
+                        break;
+                    }
 
-            // 健康度告警（< 60 分）
-            if health_score < 60 {
-                eprintln!(
-                    "⚠️  [Health Alert] Daemon health critical: {}/100",
-                    health_score
-                );
+                    let register = ctx.sessions.commit_prepared(prepared);
+                    session_id = Some(register.session_id);
+                    if let Err(err) = Self::spawn_writer_thread(
+                        Arc::clone(&writer),
+                        event_rx,
+                        Arc::clone(ctx.stats),
+                    ) {
+                        error!("failed to start bridge writer thread: {err}");
+                        let removed = ctx.sessions.unregister_session(register.session_id);
+                        if let Some(session) = removed {
+                            session.shutdown();
+                        }
+                        break;
+                    }
+                    if let Some(replaced) = register.replaced {
+                        replaced.replace_and_close();
+                    }
+                },
+                other => {
+                    let Some(active_session_id) = session_id else {
+                        let request_id = request_id_of(&other);
+                        ctx.warn_limiter.warn("request-before-hello", || {
+                            format!(
+                                "rejecting {} from unauthenticated bridge connection {}",
+                                message_kind(&other),
+                                peer_label
+                            )
+                        });
+                        let _ = Self::send_error(
+                            &writer,
+                            ctx.stats,
+                            request_id,
+                            ErrorCode::NotConnected,
+                            "hello handshake required before requests",
+                        );
+                        continue;
+                    };
+
+                    match other {
+                        ClientRequest::GetStatus { request_id } => {
+                            let status = Self::build_status(
+                                ctx.device_state.load(),
+                                ctx.sessions,
+                                ctx.stats,
+                            );
+                            let _ = Self::write_server_message(
+                                &writer,
+                                &ServerMessage::Response(ServerResponse::StatusResponse {
+                                    request_id,
+                                    status,
+                                }),
+                                ctx.stats,
+                            );
+                        },
+                        ClientRequest::SetFilters {
+                            request_id,
+                            filters,
+                        } => {
+                            ctx.sessions.set_filters(active_session_id, filters);
+                            let _ = Self::write_server_message(
+                                &writer,
+                                &ServerMessage::Response(ServerResponse::Ok { request_id }),
+                                ctx.stats,
+                            );
+                        },
+                        ClientRequest::AcquireWriterLease {
+                            request_id,
+                            timeout_ms,
+                        } => {
+                            match ctx.sessions.acquire_writer_lease(
+                                active_session_id,
+                                Duration::from_millis(timeout_ms as u64),
+                            ) {
+                                LeaseAcquireResult::Granted => {
+                                    let _ = Self::write_server_message(
+                                        &writer,
+                                        &ServerMessage::Response(ServerResponse::LeaseGranted {
+                                            request_id,
+                                            session_id: active_session_id,
+                                        }),
+                                        ctx.stats,
+                                    );
+                                },
+                                LeaseAcquireResult::Denied { holder_session_id } => {
+                                    let _ = Self::write_server_message(
+                                        &writer,
+                                        &ServerMessage::Response(ServerResponse::LeaseDenied {
+                                            request_id,
+                                            holder_session_id,
+                                        }),
+                                        ctx.stats,
+                                    );
+                                },
+                            }
+                        },
+                        ClientRequest::ReleaseWriterLease { request_id } => {
+                            ctx.sessions.release_writer_lease(active_session_id);
+                            let _ = Self::write_server_message(
+                                &writer,
+                                &ServerMessage::Response(ServerResponse::Ok { request_id }),
+                                ctx.stats,
+                            );
+                        },
+                        ClientRequest::SendFrame { request_id, frame } => {
+                            if !ctx.sessions.has_writer_lease(active_session_id) {
+                                ctx.warn_limiter.warn("send-without-lease", || {
+                                    format!(
+                                        "rejecting send-frame without writer lease from session {} ({peer_label})",
+                                        active_session_id
+                                    )
+                                });
+                                let _ = Self::send_error(
+                                    &writer,
+                                    ctx.stats,
+                                    request_id,
+                                    ErrorCode::PermissionDenied,
+                                    "writer lease required",
+                                );
+                                continue;
+                            }
+
+                            let mut tx_guard = ctx.tx_adapter.lock().unwrap();
+                            if let Some(adapter) = tx_guard.as_mut() {
+                                match adapter.send_bridge(frame) {
+                                    Ok(()) => {
+                                        ctx.stats.inc_tx();
+                                        let _ = Self::write_server_message(
+                                            &writer,
+                                            &ServerMessage::Response(ServerResponse::Ok {
+                                                request_id,
+                                            }),
+                                            ctx.stats,
+                                        );
+                                    },
+                                    Err(err) => {
+                                        drop(tx_guard);
+                                        ctx.device_state.store(DeviceState::Disconnected);
+                                        let _ = Self::send_error(
+                                            &writer,
+                                            ctx.stats,
+                                            request_id,
+                                            bridge_error_code(&err),
+                                            err.to_string(),
+                                        );
+                                    },
+                                }
+                            } else {
+                                drop(tx_guard);
+                                let _ = Self::send_error(
+                                    &writer,
+                                    ctx.stats,
+                                    request_id,
+                                    ErrorCode::NotConnected,
+                                    "bridge TX adapter not available",
+                                );
+                            }
+                        },
+                        ClientRequest::Ping { request_id } => {
+                            let _ = Self::write_server_message(
+                                &writer,
+                                &ServerMessage::Response(ServerResponse::Ok { request_id }),
+                                ctx.stats,
+                            );
+                        },
+                        ClientRequest::Hello { .. } => unreachable!(),
+                    }
+                },
             }
+        }
 
-            // 重置统计信息，使下次 FPS 计算基于新的时间段
-            stats.write().unwrap().reset();
+        if let Some(active_session_id) = session_id
+            && let Some(session) = ctx.sessions.unregister_session(active_session_id)
+        {
+            session.shutdown();
+        }
+        control.shutdown();
+    }
+
+    #[cfg(unix)]
+    fn unix_accept_loop(
+        listener: UnixListener,
+        sessions: Arc<SessionManager>,
+        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
+        device_state: Arc<DeviceStateCell>,
+        stats: Arc<DaemonStats>,
+        warn_limiter: Arc<WarnRateLimiter>,
+    ) {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let writer = match stream.try_clone() {
+                        Ok(writer) => Arc::new(Mutex::new(ServerStream::Unix(writer))),
+                        Err(err) => {
+                            error!("failed to clone unix stream: {err}");
+                            continue;
+                        },
+                    };
+                    let sessions = Arc::clone(&sessions);
+                    let tx_adapter = Arc::clone(&tx_adapter);
+                    let device_state = Arc::clone(&device_state);
+                    let stats = Arc::clone(&stats);
+                    let warn_limiter = Arc::clone(&warn_limiter);
+                    thread::Builder::new()
+                        .name("bridge_conn_uds".into())
+                        .spawn(move || {
+                            Daemon::handle_connection(
+                                ServerStream::Unix(stream),
+                                writer,
+                                ConnectionContext {
+                                    sessions: &sessions,
+                                    tx_adapter: &tx_adapter,
+                                    device_state: &device_state,
+                                    stats: &stats,
+                                    warn_limiter: &warn_limiter,
+                                },
+                            );
+                        })
+                        .ok();
+                },
+                Err(err) => warn!("failed to accept unix bridge connection: {err}"),
+            }
         }
     }
 
-    /// 启动守护进程
-    ///
-    /// 启动所有工作线程并进入主循环
+    fn tcp_accept_loop(
+        listener: TcpListener,
+        sessions: Arc<SessionManager>,
+        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
+        device_state: Arc<DeviceStateCell>,
+        stats: Arc<DaemonStats>,
+        warn_limiter: Arc<WarnRateLimiter>,
+    ) {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    if let Err(err) = stream.set_nodelay(true) {
+                        warn!("failed to enable tcp_nodelay: {err}");
+                    }
+                    let writer = match stream.try_clone() {
+                        Ok(writer) => Arc::new(Mutex::new(ServerStream::Tcp(writer))),
+                        Err(err) => {
+                            error!("failed to clone tcp stream: {err}");
+                            continue;
+                        },
+                    };
+                    let sessions = Arc::clone(&sessions);
+                    let tx_adapter = Arc::clone(&tx_adapter);
+                    let device_state = Arc::clone(&device_state);
+                    let stats = Arc::clone(&stats);
+                    let warn_limiter = Arc::clone(&warn_limiter);
+                    thread::Builder::new()
+                        .name("bridge_conn_tcp".into())
+                        .spawn(move || {
+                            Daemon::handle_connection(
+                                ServerStream::Tcp(stream),
+                                writer,
+                                ConnectionContext {
+                                    sessions: &sessions,
+                                    tx_adapter: &tx_adapter,
+                                    device_state: &device_state,
+                                    stats: &stats,
+                                    warn_limiter: &warn_limiter,
+                                },
+                            );
+                        })
+                        .ok();
+                },
+                Err(err) => warn!("failed to accept tcp bridge connection: {err}"),
+            }
+        }
+    }
+
     pub fn run(&mut self) -> Result<(), DaemonError> {
-        // 1. 初始化 Socket（UDS 优先，UDP 可选）
-        self.init_sockets()?;
+        #[cfg(unix)]
+        let unix_listener = self.init_unix_listener()?;
+        let tcp_listener = self.init_tcp_listener()?;
 
-        // 启动设备管理线程（状态机 + 热拔插恢复）
-        let rx_adapter_clone = Arc::clone(&self.rx_adapter);
-        let tx_adapter_clone = Arc::clone(&self.tx_adapter);
-        let device_state_clone = Arc::clone(&self.device_state);
-        let stats_clone = Arc::clone(&self.stats);
-        let config_clone = self.config.clone();
-
+        let rx_adapter = Arc::clone(&self.rx_adapter);
+        let tx_adapter = Arc::clone(&self.tx_adapter);
+        let device_state = Arc::clone(&self.device_state);
+        let stats = Arc::clone(&self.stats);
+        let config = self.config.clone();
         thread::Builder::new()
             .name("device_manager".into())
             .spawn(move || {
-                Self::device_manager_loop(
-                    rx_adapter_clone,
-                    tx_adapter_clone,
-                    device_state_clone,
-                    stats_clone,
-                    config_clone,
-                );
+                Self::device_manager_loop(rx_adapter, tx_adapter, device_state, stats, config);
             })
-            .map_err(|e| {
-                DaemonError::Io(format!("Failed to spawn device manager thread: {}", e))
-            })?;
+            .map_err(|err| DaemonError::Io(format!("failed to spawn device manager: {err}")))?;
 
-        // 启动 USB 接收线程（从 USB 设备读取 CAN 帧）
-        let rx_adapter_clone = Arc::clone(&self.rx_adapter);
-        let device_state_clone = Arc::clone(&self.device_state);
-        let clients_clone = Arc::clone(&self.clients);
-        #[cfg(unix)]
-        let socket_uds_clone = self
-            .socket_uds
-            .as_ref()
-            .and_then(|s: &std::os::unix::net::UnixDatagram| s.try_clone().ok());
-        #[cfg(not(unix))]
-        let socket_uds_clone = None;
-        let socket_udp_clone = self.socket_udp.as_ref().and_then(|s| s.try_clone().ok());
-        let stats_clone = Arc::clone(&self.stats);
-
+        let rx_adapter = Arc::clone(&self.rx_adapter);
+        let device_state = Arc::clone(&self.device_state);
+        let sessions = Arc::clone(&self.sessions);
+        let stats = Arc::clone(&self.stats);
         thread::Builder::new()
-            .name("usb_receive".into())
+            .name("bridge_rx_fanout".into())
             .spawn(move || {
-                Self::usb_receive_loop(
-                    rx_adapter_clone,
-                    device_state_clone,
-                    clients_clone,
-                    socket_uds_clone,
-                    socket_udp_clone,
-                    stats_clone,
-                );
+                Self::usb_receive_loop(rx_adapter, device_state, sessions, stats);
             })
-            .map_err(|e| DaemonError::Io(format!("Failed to spawn USB receive thread: {}", e)))?;
+            .map_err(|err| DaemonError::Io(format!("failed to spawn usb receive loop: {err}")))?;
 
-        // 4. 启动客户端清理线程（定期清理超时客户端）
-        let clients_clone = Arc::clone(&self.clients);
+        let stats = Arc::clone(&self.stats);
         thread::Builder::new()
-            .name("client_cleanup".into())
+            .name("bridge_cpu_monitor".into())
             .spawn(move || {
-                Self::client_cleanup_loop(clients_clone);
+                Self::cpu_monitor_loop(stats);
             })
-            .map_err(|e| {
-                DaemonError::Io(format!("Failed to spawn client cleanup thread: {}", e))
-            })?;
+            .map_err(|err| DaemonError::Io(format!("failed to spawn cpu monitor: {err}")))?;
 
-        // 启动 IPC 接收线程（处理客户端消息）
+        let sessions = Arc::clone(&self.sessions);
+        let device_state = Arc::clone(&self.device_state);
+        let stats = Arc::clone(&self.stats);
+        thread::Builder::new()
+            .name("bridge_status_print".into())
+            .spawn(move || {
+                Self::status_print_loop(sessions, device_state, stats);
+            })
+            .map_err(|err| DaemonError::Io(format!("failed to spawn status printer: {err}")))?;
+
         #[cfg(unix)]
-        if let Some(socket_uds) = self.socket_uds.take() {
-            let tx_adapter_clone = Arc::clone(&self.tx_adapter);
-            let device_state_clone = Arc::clone(&self.device_state);
-            let clients_clone = Arc::clone(&self.clients);
-            let stats_clone = Arc::clone(&self.stats);
-            let auth_log_limiter_clone = Arc::clone(&self.auth_log_limiter);
-
+        if let Some(listener) = unix_listener {
+            let sessions = Arc::clone(&self.sessions);
+            let tx_adapter = Arc::clone(&self.tx_adapter);
+            let device_state = Arc::clone(&self.device_state);
+            let stats = Arc::clone(&self.stats);
+            let warn_limiter = Arc::clone(&self.warn_limiter);
             thread::Builder::new()
-                .name("ipc_receive_uds".into())
+                .name("bridge_accept_uds".into())
                 .spawn(move || {
-                    Self::ipc_receive_loop(
-                        socket_uds,
-                        tx_adapter_clone,
-                        device_state_clone,
-                        clients_clone,
-                        stats_clone,
-                        auth_log_limiter_clone,
+                    Self::unix_accept_loop(
+                        listener,
+                        sessions,
+                        tx_adapter,
+                        device_state,
+                        stats,
+                        warn_limiter,
                     );
                 })
-                .map_err(|e| {
-                    DaemonError::Io(format!("Failed to spawn IPC receive thread: {}", e))
+                .map_err(|err| {
+                    DaemonError::Io(format!("failed to spawn unix accept loop: {err}"))
                 })?;
         }
 
-        // 6. 如果配置了 UDP，启动 UDP 接收线程
-        if let Some(socket_udp) = self.socket_udp.take() {
-            let tx_adapter_clone = Arc::clone(&self.tx_adapter);
-            let device_state_clone = Arc::clone(&self.device_state);
-            let clients_clone = Arc::clone(&self.clients);
-            let stats_clone = Arc::clone(&self.stats);
-            let auth_log_limiter_clone = Arc::clone(&self.auth_log_limiter);
-
+        if let Some(listener) = tcp_listener {
+            let sessions = Arc::clone(&self.sessions);
+            let tx_adapter = Arc::clone(&self.tx_adapter);
+            let device_state = Arc::clone(&self.device_state);
+            let stats = Arc::clone(&self.stats);
+            let warn_limiter = Arc::clone(&self.warn_limiter);
             thread::Builder::new()
-                .name("ipc_receive_udp".into())
+                .name("bridge_accept_tcp".into())
                 .spawn(move || {
-                    Self::ipc_receive_loop_udp(
-                        socket_udp,
-                        tx_adapter_clone,
-                        device_state_clone,
-                        clients_clone,
-                        stats_clone,
-                        auth_log_limiter_clone,
+                    Self::tcp_accept_loop(
+                        listener,
+                        sessions,
+                        tx_adapter,
+                        device_state,
+                        stats,
+                        warn_limiter,
                     );
                 })
-                .map_err(|e| {
-                    DaemonError::Io(format!("Failed to spawn UDP IPC receive thread: {}", e))
+                .map_err(|err| {
+                    DaemonError::Io(format!("failed to spawn tcp accept loop: {err}"))
                 })?;
-
-            eprintln!("UDP IPC receive thread started");
         }
 
-        // 启动 CPU 监控线程
-        let stats_clone_for_cpu = Arc::clone(&self.stats);
-        thread::Builder::new()
-            .name("cpu_monitor".into())
-            .spawn(move || {
-                Self::cpu_monitor_loop(stats_clone_for_cpu);
-            })
-            .map_err(|e| DaemonError::Io(format!("Failed to spawn CPU monitor thread: {}", e)))?;
-
-        // 7. 启动状态打印线程（定期打印统计信息）
-        let clients_clone = Arc::clone(&self.clients);
-        let device_state_clone = Arc::clone(&self.device_state);
-        let stats_clone = Arc::clone(&self.stats);
-
-        thread::Builder::new()
-            .name("status_print".into())
-            .spawn(move || {
-                Self::status_print_loop(
-                    clients_clone,
-                    device_state_clone,
-                    stats_clone,
-                    Duration::from_secs(5), // 每 5 秒打印一次
-                );
-            })
-            .map_err(|e| DaemonError::Io(format!("Failed to spawn status print thread: {}", e)))?;
-
-        // 8. 主线程等待（所有工作都在后台线程中）
-        eprintln!("GS-USB Daemon started. Press Ctrl+C to stop.");
+        info!("GS-USB bridge daemon started");
         loop {
-            thread::park(); // 主线程挂起，等待信号
+            thread::park();
         }
     }
 }
 
 impl Drop for Daemon {
-    /// 守护进程退出时自动清理 UDS socket 文件
     fn drop(&mut self) {
-        self.cleanup_uds_socket();
+        #[cfg(unix)]
+        if let Some(path) = self.config.uds_path.as_ref()
+            && std::path::Path::new(path).exists()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn request_id_of(request: &ClientRequest) -> u32 {
+    match request {
+        ClientRequest::Hello { request_id, .. }
+        | ClientRequest::GetStatus { request_id }
+        | ClientRequest::SetFilters { request_id, .. }
+        | ClientRequest::AcquireWriterLease { request_id, .. }
+        | ClientRequest::ReleaseWriterLease { request_id }
+        | ClientRequest::SendFrame { request_id, .. }
+        | ClientRequest::Ping { request_id } => *request_id,
+    }
+}
+
+fn message_kind(request: &ClientRequest) -> &'static str {
+    match request {
+        ClientRequest::Hello { .. } => "Hello",
+        ClientRequest::GetStatus { .. } => "GetStatus",
+        ClientRequest::SetFilters { .. } => "SetFilters",
+        ClientRequest::AcquireWriterLease { .. } => "AcquireWriterLease",
+        ClientRequest::ReleaseWriterLease { .. } => "ReleaseWriterLease",
+        ClientRequest::SendFrame { .. } => "SendFrame",
+        ClientRequest::Ping { .. } => "Ping",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::ffi::OsString;
-    #[cfg(unix)]
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    #[cfg(unix)]
-    use std::os::unix::net::UnixDatagram;
-    #[cfg(unix)]
-    use std::sync::Mutex as TestMutex;
-    #[cfg(unix)]
-    use std::sync::atomic::AtomicU32 as TestAtomicU32;
-    use std::sync::atomic::AtomicU64;
+    use piper_can::PiperFrame;
+    use piper_can::gs_usb_bridge::protocol::{BridgeEvent, BridgeRole};
+    use piper_can::gs_usb_bridge::protocol::{CanIdFilter, SessionToken};
+    use std::sync::Arc;
 
-    struct TestIpcContext {
-        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
-        device_state: Arc<DeviceStateCell>,
-        clients: Arc<RwLock<ClientManager>>,
-        stats: Arc<RwLock<DaemonStats>>,
-        auth_log_limiter: Arc<AuthLogLimiter>,
-    }
+    type ConnectedTestContext = (
+        Arc<SessionManager>,
+        Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
+        Arc<DeviceStateCell>,
+        Arc<DaemonStats>,
+        Arc<WarnRateLimiter>,
+    );
 
-    fn test_ipc_context() -> TestIpcContext {
-        TestIpcContext {
-            tx_adapter: Arc::new(Mutex::new(None)),
-            device_state: Arc::new(DeviceStateCell::new(DeviceState::Connected)),
-            clients: Arc::new(RwLock::new(ClientManager::new())),
-            stats: Arc::new(RwLock::new(DaemonStats::new())),
-            auth_log_limiter: Arc::new(AuthLogLimiter::new(AUTH_LOG_WINDOW)),
-        }
-    }
-
-    fn test_handler_ctx(test_ctx: &TestIpcContext) -> IpcHandlerContext<'_> {
-        IpcHandlerContext {
-            tx_adapter: &test_ctx.tx_adapter,
-            device_state: &test_ctx.device_state,
-            clients: &test_ctx.clients,
-            stats: &test_ctx.stats,
-            auth_log_limiter: &test_ctx.auth_log_limiter,
-        }
-    }
-
-    fn test_token(byte: u8) -> SessionToken {
-        SessionToken::new([byte; 16])
-    }
-
-    fn recv_udp_protocol_message(socket: &std::net::UdpSocket) -> Message {
-        let mut buf = [0u8; 256];
-        let (len, _) = socket.recv_from(&mut buf).unwrap();
-        protocol::decode_message(&buf[..len]).unwrap()
-    }
-
-    #[cfg(unix)]
-    fn recv_unix_protocol_message(socket: &UnixDatagram) -> Message {
-        let mut buf = [0u8; 256];
-        let len = socket.recv(&mut buf).unwrap();
-        protocol::decode_message(&buf[..len]).unwrap()
-    }
-
-    #[cfg(unix)]
-    fn unique_test_socket_path(label: &str) -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let label: String = label.chars().take(8).collect();
-        format!("/tmp/pd_{}_{}_{}.sock", label, std::process::id(), id)
-    }
-
-    #[cfg(unix)]
-    fn unique_invalid_utf8_socket_path(label: &str) -> std::path::PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let valid = format!("/tmp/pd_{}_{}_sock", label, id);
-        let mut bytes = std::ffi::OsStr::new(&valid).as_bytes().to_vec();
-        let insert_at = bytes.iter().rposition(|byte| *byte == b'.').unwrap_or(bytes.len());
-        bytes.insert(insert_at, 0xFF);
-        std::path::PathBuf::from(OsString::from_vec(bytes))
-    }
-
-    #[cfg(unix)]
-    static UNSUPPORTED_UNIX_PEER_TEST_LOCK: TestMutex<()> = TestMutex::new(());
-
-    #[cfg(unix)]
     struct CountingBridgeTxAdapter {
-        sends: Arc<TestAtomicU32>,
+        count: Arc<AtomicU64>,
     }
 
-    #[cfg(unix)]
     impl BridgeTxAdapter for CountingBridgeTxAdapter {
-        fn send_bridge(
-            &mut self,
-            _frame: piper_can::PiperFrame,
-        ) -> Result<(), piper_can::CanError> {
-            self.sends.fetch_add(1, Ordering::Relaxed);
+        fn send_bridge(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+            self.count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
 
+    fn connected_test_context(tx_count: Arc<AtomicU64>) -> ConnectedTestContext {
+        (
+            Arc::new(SessionManager::new()),
+            Arc::new(Mutex::new(Some(
+                Box::new(CountingBridgeTxAdapter { count: tx_count })
+                    as Box<dyn BridgeTxAdapter + Send>,
+            ))),
+            Arc::new(DeviceStateCell::new(DeviceState::Connected)),
+            Arc::new(DaemonStats::new()),
+            Arc::new(WarnRateLimiter::new(Duration::from_secs(1))),
+        )
+    }
+
     #[test]
-    fn test_auth_log_limiter_rate_limits_repeated_failures() {
-        let limiter = AuthLogLimiter::new(Duration::from_secs(1));
-        let peer = ClientAddr::Udp("127.0.0.1:9999".parse().unwrap());
+    fn get_status_requires_hello_handshake() {
+        let tx_count = Arc::new(AtomicU64::new(0));
+        let (sessions, tx_adapter, device_state, stats, warn_limiter) =
+            connected_test_context(Arc::clone(&tx_count));
 
-        limiter.warn(
-            AuthTransport::Udp,
-            peer.clone(),
-            AuthMessageType::Heartbeat,
-            AuthFailureKind::NotConnected,
-            || "first".to_string(),
-        );
-        limiter.warn(
-            AuthTransport::Udp,
-            peer.clone(),
-            AuthMessageType::Heartbeat,
-            AuthFailureKind::NotConnected,
-            || "second".to_string(),
-        );
-        limiter.warn(
-            AuthTransport::Udp,
-            peer.clone(),
-            AuthMessageType::Heartbeat,
-            AuthFailureKind::NotConnected,
-            || "third".to_string(),
-        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let writer = Arc::new(Mutex::new(ServerStream::Tcp(stream.try_clone().unwrap())));
+            Daemon::handle_connection(
+                ServerStream::Tcp(stream),
+                writer,
+                ConnectionContext {
+                    sessions: &sessions,
+                    tx_adapter: &tx_adapter,
+                    device_state: &device_state,
+                    stats: &stats,
+                    warn_limiter: &warn_limiter,
+                },
+            );
+        });
 
-        let key = AuthLogKey {
-            transport: AuthTransport::Udp,
-            peer: peer.clone(),
-            message_type: AuthMessageType::Heartbeat,
-            failure: AuthFailureKind::NotConnected,
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = ClientRequest::GetStatus { request_id: 1 };
+        let encoded = protocol::encode_client_request(&request).unwrap();
+        protocol::write_framed(&mut client, &encoded).unwrap();
+        let payload = protocol::read_framed(&mut client).unwrap();
+        let message = protocol::decode_server_message(&payload).unwrap();
+        match message {
+            ServerMessage::Response(ServerResponse::Error { code, .. }) => {
+                assert_eq!(code, ErrorCode::NotConnected)
+            },
+            other => panic!("unexpected response: {other:?}"),
+        }
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn hello_then_send_requires_writer_lease() {
+        let tx_count = Arc::new(AtomicU64::new(0));
+        let (sessions, tx_adapter, device_state, stats, warn_limiter) =
+            connected_test_context(Arc::clone(&tx_count));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let writer = Arc::new(Mutex::new(ServerStream::Tcp(stream.try_clone().unwrap())));
+            Daemon::handle_connection(
+                ServerStream::Tcp(stream),
+                writer,
+                ConnectionContext {
+                    sessions: &sessions,
+                    tx_adapter: &tx_adapter,
+                    device_state: &device_state,
+                    stats: &stats,
+                    warn_limiter: &warn_limiter,
+                },
+            );
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let hello = ClientRequest::Hello {
+            request_id: 1,
+            session_token: SessionToken::new([1; 16]),
+            role_request: BridgeRole::WriterCandidate,
+            filters: vec![CanIdFilter::new(0x100, 0x1FF)],
         };
-        {
-            let states = limiter.states.lock().unwrap();
-            let state = states.get(&key).unwrap();
-            assert_eq!(state.suppressed, 2);
+        protocol::write_framed(
+            &mut client,
+            &protocol::encode_client_request(&hello).unwrap(),
+        )
+        .unwrap();
+        let _ =
+            protocol::decode_server_message(&protocol::read_framed(&mut client).unwrap()).unwrap();
+
+        let send = ClientRequest::SendFrame {
+            request_id: 2,
+            frame: PiperFrame::new_standard(0x123, &[1, 2, 3, 4]),
+        };
+        protocol::write_framed(
+            &mut client,
+            &protocol::encode_client_request(&send).unwrap(),
+        )
+        .unwrap();
+        let message =
+            protocol::decode_server_message(&protocol::read_framed(&mut client).unwrap()).unwrap();
+        match message {
+            ServerMessage::Response(ServerResponse::Error { code, .. }) => {
+                assert_eq!(code, ErrorCode::PermissionDenied)
+            },
+            other => panic!("unexpected response: {other:?}"),
         }
-
-        {
-            let mut states = limiter.states.lock().unwrap();
-            let state = states.get_mut(&key).unwrap();
-            state.last_logged_at = Instant::now() - Duration::from_secs(2);
-        }
-
-        limiter.warn(
-            AuthTransport::Udp,
-            peer,
-            AuthMessageType::Heartbeat,
-            AuthFailureKind::NotConnected,
-            || "after-window".to_string(),
-        );
-
-        let states = limiter.states.lock().unwrap();
-        let state = states.get(&key).unwrap();
-        assert_eq!(state.suppressed, 0);
+        assert_eq!(tx_count.load(Ordering::Relaxed), 0);
+        drop(client);
+        handle.join().unwrap();
     }
 
     #[test]
-    fn test_device_state_transitions() {
-        let state = Arc::new(DeviceStateCell::new(DeviceState::Connected));
-        // 验证状态转换
-        state.store(DeviceState::Disconnected);
-        assert_eq!(state.load(), DeviceState::Disconnected);
+    fn same_token_reconnect_replaces_old_session() {
+        let tx_count = Arc::new(AtomicU64::new(0));
+        let (sessions, tx_adapter, device_state, stats, warn_limiter) =
+            connected_test_context(Arc::clone(&tx_count));
 
-        state.store(DeviceState::Reconnecting);
-        assert_eq!(state.load(), DeviceState::Reconnecting);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sessions_clone = Arc::clone(&sessions);
+        let tx_adapter_clone = Arc::clone(&tx_adapter);
+        let device_state_clone = Arc::clone(&device_state);
+        let stats_clone = Arc::clone(&stats);
+        let warn_limiter_clone = Arc::clone(&warn_limiter);
 
-        state.store(DeviceState::Connected);
-        assert_eq!(state.load(), DeviceState::Connected);
-    }
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let writer = Arc::new(Mutex::new(ServerStream::Tcp(stream.try_clone().unwrap())));
+                let sessions = Arc::clone(&sessions_clone);
+                let tx_adapter = Arc::clone(&tx_adapter_clone);
+                let device_state = Arc::clone(&device_state_clone);
+                let stats = Arc::clone(&stats_clone);
+                let warn_limiter = Arc::clone(&warn_limiter_clone);
+                thread::spawn(move || {
+                    Daemon::handle_connection(
+                        ServerStream::Tcp(stream),
+                        writer,
+                        ConnectionContext {
+                            sessions: &sessions,
+                            tx_adapter: &tx_adapter,
+                            device_state: &device_state,
+                            stats: &stats,
+                            warn_limiter: &warn_limiter,
+                        },
+                    );
+                });
+            }
+        });
 
-    #[test]
-    fn test_daemon_config_default() {
-        let config = DaemonConfig::default();
-        assert_eq!(config.bitrate, 1_000_000);
-        assert_eq!(config.reconnect_interval, Duration::from_secs(1));
-        assert_eq!(config.reconnect_debounce, Duration::from_millis(500));
-        assert_eq!(config.client_timeout, Duration::from_secs(30));
-        assert_eq!(config.bridge_tx_timeout, Duration::from_millis(100));
-    }
-
-    #[test]
-    fn test_daemon_new() {
-        let config = DaemonConfig::default();
-        let daemon = Daemon::new(config).unwrap();
-
-        // 验证初始状态
-        assert_eq!(daemon.device_state.load(), DeviceState::Disconnected);
-        // 验证 RX 和 TX adapter 初始为 None
-        assert!(daemon.rx_adapter.lock().unwrap().is_none());
-        assert!(daemon.tx_adapter.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_handle_ipc_message_udp_connect_commits_only_after_ack_send() {
-        let test_ctx = test_ipc_context();
-        let ctx = test_handler_ctx(&test_ctx);
-
-        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.connect(server.local_addr().unwrap()).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-
-        client.send(&[0xAA]).unwrap();
-        let mut probe = [0u8; 16];
-        let (_, client_addr) = server.recv_from(&mut probe).unwrap();
-
-        assert_eq!(test_ctx.clients.read().unwrap().count(), 0);
-
-        Daemon::handle_ipc_message_udp(
-            Message::Connect {
-                client_id: 0,
-                session_token: test_token(1),
+        let mut client_a = piper_can::gs_usb_bridge::GsUsbBridgeClient::connect(
+            piper_can::gs_usb_bridge::BridgeEndpoint::Tcp(addr),
+            piper_can::gs_usb_bridge::BridgeClientOptions {
+                session_token: SessionToken::new([9; 16]),
+                role_request: BridgeRole::Observer,
                 filters: vec![],
-                seq: 77,
+                connect_timeout: Duration::from_secs(1),
+                request_timeout: Duration::from_secs(1),
             },
-            client_addr,
-            ctx,
-            &server,
-        );
+        )
+        .unwrap();
+        let first_session = client_a.session_id();
 
-        let mut ack_buf = [0u8; 64];
-        let len = client.recv(&mut ack_buf).unwrap();
-        match protocol::decode_message(&ack_buf[..len]).unwrap() {
-            Message::ConnectAck { seq, status, .. } => {
-                assert_eq!(seq, 77);
-                assert_eq!(status, 0);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-
-        assert_eq!(test_ctx.clients.read().unwrap().count(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_handle_ipc_message_unix_connect_commits_only_after_ack_send() {
-        let test_ctx = test_ipc_context();
-        let ctx = test_handler_ctx(&test_ctx);
-
-        let server_path = unique_test_socket_path("server");
-        let client_path = unique_test_socket_path("client");
-        let _ = std::fs::remove_file(&server_path);
-        let _ = std::fs::remove_file(&client_path);
-
-        let server = UnixDatagram::bind(&server_path).unwrap();
-        let client = UnixDatagram::bind(&client_path).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        client.send_to(&[0xAA], &server_path).unwrap();
-
-        let mut probe = [0u8; 16];
-        let (_, client_addr) = server.recv_from(&mut probe).unwrap();
-
-        assert_eq!(test_ctx.clients.read().unwrap().count(), 0);
-
-        Daemon::handle_ipc_message(
-            Message::Connect {
-                client_id: 0,
-                session_token: test_token(2),
+        let client_b = piper_can::gs_usb_bridge::GsUsbBridgeClient::connect(
+            piper_can::gs_usb_bridge::BridgeEndpoint::Tcp(addr),
+            piper_can::gs_usb_bridge::BridgeClientOptions {
+                session_token: SessionToken::new([9; 16]),
+                role_request: BridgeRole::Observer,
                 filters: vec![],
-                seq: 88,
+                connect_timeout: Duration::from_secs(1),
+                request_timeout: Duration::from_secs(1),
             },
-            client_addr,
-            ctx,
-            &server,
-        );
-
-        let mut ack_buf = [0u8; 64];
-        let len = client.recv(&mut ack_buf).unwrap();
-        match protocol::decode_message(&ack_buf[..len]).unwrap() {
-            Message::ConnectAck { seq, status, .. } => {
-                assert_eq!(seq, 88);
-                assert_eq!(status, 0);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-
-        assert_eq!(test_ctx.clients.read().unwrap().count(), 1);
-
-        let _ = std::fs::remove_file(&server_path);
-        let _ = std::fs::remove_file(&client_path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_handle_ipc_message_unix_connect_rejects_unnamed_peer_without_fake_ack() {
-        let _guard = UNSUPPORTED_UNIX_PEER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let test_ctx = test_ipc_context();
-        let ctx = test_handler_ctx(&test_ctx);
-
-        let server_path = unique_test_socket_path("server_no_path_peer");
-        let _ = std::fs::remove_file(&server_path);
-
-        let server = UnixDatagram::bind(&server_path).unwrap();
-
-        let client = UnixDatagram::unbound().unwrap();
-        client.send_to(&[0xAA], &server_path).unwrap();
-
-        let mut probe = [0u8; 16];
-        let (_, client_addr) = server.recv_from(&mut probe).unwrap();
-        assert!(client_addr.as_pathname().is_none());
-
-        Daemon::handle_ipc_message(
-            Message::Connect {
-                client_id: 0,
-                session_token: test_token(3),
-                filters: vec![],
-                seq: 101,
-            },
-            client_addr,
-            ctx,
-            &server,
-        );
-
-        assert_eq!(test_ctx.clients.read().unwrap().count(), 0);
-
-        let _ = std::fs::remove_file(&server_path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_handle_ipc_message_unix_connect_rejects_invalid_utf8_peer_without_fake_ack() {
-        let _guard = UNSUPPORTED_UNIX_PEER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let test_ctx = test_ipc_context();
-        let ctx = test_handler_ctx(&test_ctx);
-
-        let server_path = unique_test_socket_path("server_invalid_utf8_peer");
-        let client_path = unique_invalid_utf8_socket_path("invalid_utf8_client");
-        let _ = std::fs::remove_file(&server_path);
-
-        let server = UnixDatagram::bind(&server_path).unwrap();
-        let client_addr = std::os::unix::net::SocketAddr::from_pathname(&client_path).unwrap();
-        assert!(client_addr.as_pathname().is_some());
-        assert!(client_addr.as_pathname().unwrap().to_str().is_none());
-
-        Daemon::handle_ipc_message(
-            Message::Connect {
-                client_id: 0,
-                session_token: test_token(4),
-                filters: vec![],
-                seq: 102,
-            },
-            client_addr,
-            ctx,
-            &server,
-        );
-
-        assert_eq!(test_ctx.clients.read().unwrap().count(), 0);
-
-        let _ = std::fs::remove_file(&server_path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_handle_ipc_message_unix_unsupported_peer_drops_status_send_and_disconnect() {
-        let _guard = UNSUPPORTED_UNIX_PEER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let test_ctx = test_ipc_context();
-        let existing_path = unique_test_socket_path("existing_client");
-        let existing_addr = ClientAddr::Unix(existing_path.clone());
-        test_ctx.clients.write().unwrap().register(7, existing_addr, vec![]).unwrap();
-
-        let send_count = Arc::new(TestAtomicU32::new(0));
-        *test_ctx.tx_adapter.lock().unwrap() = Some(Box::new(CountingBridgeTxAdapter {
-            sends: Arc::clone(&send_count),
-        }));
-
-        let server_path = unique_test_socket_path("server_unsupported_peer_ops");
-        let _ = std::fs::remove_file(&server_path);
-
-        let server = UnixDatagram::bind(&server_path).unwrap();
-
-        let client = UnixDatagram::unbound().unwrap();
-        client.send_to(&[0xCC], &server_path).unwrap();
-
-        let mut probe = [0u8; 16];
-        let (_, client_addr) = server.recv_from(&mut probe).unwrap();
-        assert!(client_addr.as_pathname().is_none());
-
-        Daemon::handle_ipc_message(
-            Message::GetStatus {
-                session_token: test_token(5),
-                seq: 11,
-            },
-            client_addr.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        Daemon::handle_ipc_message(
-            Message::SendFrame {
-                session_token: test_token(6),
-                frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
-                seq: 12,
-            },
-            client_addr.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        Daemon::handle_ipc_message(
-            Message::Disconnect {
-                client_id: 7,
-                session_token: test_token(7),
-                seq: 13,
-            },
-            client_addr,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-
-        assert_eq!(send_count.load(Ordering::Relaxed), 0);
-        assert!(test_ctx.clients.read().unwrap().contains(7));
-
-        let _ = std::fs::remove_file(&server_path);
-    }
-
-    #[test]
-    fn test_handle_ipc_message_udp_enforces_sender_auth_for_steady_state_messages() {
-        let test_ctx = test_ipc_context();
-
-        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let peer_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let peer_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let peer_c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        for socket in [&peer_a, &peer_b, &peer_c] {
-            socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        }
-
-        let addr_a = peer_a.local_addr().unwrap();
-        let addr_b = peer_b.local_addr().unwrap();
-        let addr_c = peer_c.local_addr().unwrap();
-        let token_peer_a_old = test_token(10);
-        let token_peer_b = test_token(11);
-        let token_peer_a_active = test_token(12);
-        let token_unregistered = test_token(13);
-
-        let filters = vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
-            0x100, 0x1ff,
-        )];
-        {
-            let mut clients = test_ctx.clients.write().unwrap();
-            clients
-                .register_with_token(
-                    7,
-                    ClientAddr::Udp(addr_a),
-                    token_peer_a_old,
-                    filters.clone(),
-                )
-                .unwrap();
-            clients
-                .register_with_token(8, ClientAddr::Udp(addr_b), token_peer_b, vec![])
-                .unwrap();
-
-            let prepared = clients
-                .prepare_registration_manual(
-                    17,
-                    ClientAddr::Udp(addr_a),
-                    token_peer_a_active,
-                    filters.clone(),
-                    #[cfg(unix)]
-                    None,
-                )
-                .unwrap();
-            clients.commit_prepared_registration(prepared);
-        }
-
-        let send_count = Arc::new(TestAtomicU32::new(0));
-        *test_ctx.tx_adapter.lock().unwrap() = Some(Box::new(CountingBridgeTxAdapter {
-            sends: Arc::clone(&send_count),
-        }));
-
-        std::thread::sleep(Duration::from_millis(5));
-        let last_active_before = test_ctx.clients.read().unwrap().last_active_for(17).unwrap();
-
-        Daemon::handle_ipc_message_udp(
-            Message::Heartbeat {
-                client_id: 17,
-                session_token: token_peer_a_active,
-            },
-            addr_b,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
+        )
+        .unwrap();
+        let second_session = client_b.session_id();
+        assert_ne!(first_session, second_session);
         assert_eq!(
-            test_ctx.clients.read().unwrap().last_active_for(17),
-            Some(last_active_before)
+            client_a.recv_event(Duration::from_secs(1)).unwrap(),
+            BridgeEvent::SessionReplaced
         );
-
-        Daemon::handle_ipc_message_udp(
-            Message::Heartbeat {
-                client_id: 7,
-                session_token: token_peer_a_active,
-            },
-            addr_a,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        assert_eq!(
-            test_ctx.clients.read().unwrap().last_active_for(17),
-            Some(last_active_before)
-        );
-
-        Daemon::handle_ipc_message_udp(
-            Message::SetFilter {
-                client_id: 17,
-                session_token: token_peer_a_active,
-                filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
-                    0x300, 0x3ff,
-                )],
-                seq: 0,
-            },
-            addr_b,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        assert_eq!(
-            test_ctx.clients.read().unwrap().filters_for(17),
-            Some(filters.clone())
-        );
-
-        Daemon::handle_ipc_message_udp(
-            Message::SetFilter {
-                client_id: 7,
-                session_token: token_peer_a_active,
-                filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
-                    0x400, 0x4ff,
-                )],
-                seq: 0,
-            },
-            addr_a,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        assert_eq!(
-            test_ctx.clients.read().unwrap().filters_for(17),
-            Some(filters.clone())
-        );
-
-        Daemon::handle_ipc_message_udp(
-            Message::Disconnect {
-                client_id: 17,
-                session_token: token_peer_a_active,
-                seq: 41,
-            },
-            addr_b,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_udp_protocol_message(&peer_b) {
-            Message::Error { seq, code, .. } => {
-                assert_eq!(seq, 41);
-                assert_eq!(code, ErrorCode::InvalidMessage);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-        assert!(test_ctx.clients.read().unwrap().contains(17));
-
-        Daemon::handle_ipc_message_udp(
-            Message::Disconnect {
-                client_id: 7,
-                session_token: token_peer_a_active,
-                seq: 42,
-            },
-            addr_a,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_udp_protocol_message(&peer_a) {
-            Message::Error { seq, code, .. } => {
-                assert_eq!(seq, 42);
-                assert_eq!(code, ErrorCode::InvalidMessage);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-        assert!(test_ctx.clients.read().unwrap().contains(17));
-        assert!(!test_ctx.clients.read().unwrap().contains(7));
-
-        Daemon::handle_ipc_message_udp(
-            Message::SendFrame {
-                session_token: token_unregistered,
-                frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
-                seq: 43,
-            },
-            addr_c,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_udp_protocol_message(&peer_c) {
-            Message::Error { seq, code, .. } => {
-                assert_eq!(seq, 43);
-                assert_eq!(code, ErrorCode::NotConnected);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-        assert_eq!(send_count.load(Ordering::Relaxed), 0);
-
-        Daemon::handle_ipc_message_udp(
-            Message::SendFrame {
-                session_token: token_peer_a_active,
-                frame: piper_can::PiperFrame::new_standard(0x124, &[4, 5, 6]),
-                seq: 44,
-            },
-            addr_a,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_udp_protocol_message(&peer_a) {
-            Message::SendAck { seq, status } => {
-                assert_eq!(seq, 44);
-                assert_eq!(status, 0);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-        assert_eq!(send_count.load(Ordering::Relaxed), 1);
-
-        Daemon::handle_ipc_message_udp(
-            Message::GetStatus {
-                session_token: token_unregistered,
-                seq: 45,
-            },
-            addr_c,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_udp_protocol_message(&peer_c) {
-            Message::Error { seq, code, .. } => {
-                assert_eq!(seq, 45);
-                assert_eq!(code, ErrorCode::NotConnected);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-
-        Daemon::handle_ipc_message_udp(
-            Message::GetStatus {
-                session_token: token_peer_a_active,
-                seq: 46,
-            },
-            addr_a,
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_udp_protocol_message(&peer_a) {
-            Message::StatusResponse { seq, .. } => assert_eq!(seq, 46),
-            other => panic!("unexpected message: {:?}", other),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_handle_ipc_message_unix_enforces_sender_auth_for_steady_state_messages() {
-        let test_ctx = test_ipc_context();
-
-        let server_path = unique_test_socket_path("auth_server");
-        let peer_a_path = unique_test_socket_path("auth_peer_a");
-        let peer_b_path = unique_test_socket_path("auth_peer_b");
-        let peer_c_path = unique_test_socket_path("auth_peer_c");
-        for path in [&server_path, &peer_a_path, &peer_b_path, &peer_c_path] {
-            let _ = std::fs::remove_file(path);
-        }
-
-        let server = UnixDatagram::bind(&server_path).unwrap();
-        let peer_a = UnixDatagram::bind(&peer_a_path).unwrap();
-        let peer_b = UnixDatagram::bind(&peer_b_path).unwrap();
-        let peer_c = UnixDatagram::bind(&peer_c_path).unwrap();
-        for socket in [&peer_a, &peer_b, &peer_c] {
-            socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        }
-
-        let addr_a = std::os::unix::net::SocketAddr::from_pathname(&peer_a_path).unwrap();
-        let addr_b = std::os::unix::net::SocketAddr::from_pathname(&peer_b_path).unwrap();
-        let addr_c = std::os::unix::net::SocketAddr::from_pathname(&peer_c_path).unwrap();
-
-        let peer_a_key = ClientAddr::Unix(peer_a_path.clone());
-        let peer_b_key = ClientAddr::Unix(peer_b_path.clone());
-        let token_peer_a_old = test_token(20);
-        let token_peer_b = test_token(21);
-        let token_peer_a_active = test_token(22);
-        let token_unregistered = test_token(23);
-        let filters = vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
-            0x100, 0x1ff,
-        )];
-        {
-            let mut clients = test_ctx.clients.write().unwrap();
-            let prepared = clients
-                .prepare_registration_manual(
-                    7,
-                    peer_a_key.clone(),
-                    token_peer_a_old,
-                    filters.clone(),
-                    Some(addr_a.clone()),
-                )
-                .unwrap();
-            clients.commit_prepared_registration(prepared);
-            let prepared = clients
-                .prepare_registration_manual(
-                    8,
-                    peer_b_key.clone(),
-                    token_peer_b,
-                    vec![],
-                    Some(addr_b.clone()),
-                )
-                .unwrap();
-            clients.commit_prepared_registration(prepared);
-
-            let prepared = clients
-                .prepare_registration_manual(
-                    17,
-                    peer_a_key.clone(),
-                    token_peer_a_active,
-                    filters.clone(),
-                    Some(addr_a.clone()),
-                )
-                .unwrap();
-            clients.commit_prepared_registration(prepared);
-        }
-
-        let send_count = Arc::new(TestAtomicU32::new(0));
-        *test_ctx.tx_adapter.lock().unwrap() = Some(Box::new(CountingBridgeTxAdapter {
-            sends: Arc::clone(&send_count),
-        }));
-
-        std::thread::sleep(Duration::from_millis(5));
-        let last_active_before = test_ctx.clients.read().unwrap().last_active_for(17).unwrap();
-
-        Daemon::handle_ipc_message(
-            Message::Heartbeat {
-                client_id: 17,
-                session_token: token_peer_a_active,
-            },
-            addr_b.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        assert_eq!(
-            test_ctx.clients.read().unwrap().last_active_for(17),
-            Some(last_active_before)
-        );
-
-        Daemon::handle_ipc_message(
-            Message::Heartbeat {
-                client_id: 7,
-                session_token: token_peer_a_active,
-            },
-            addr_a.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        assert_eq!(
-            test_ctx.clients.read().unwrap().last_active_for(17),
-            Some(last_active_before)
-        );
-
-        Daemon::handle_ipc_message(
-            Message::SetFilter {
-                client_id: 17,
-                session_token: token_peer_a_active,
-                filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
-                    0x300, 0x3ff,
-                )],
-                seq: 0,
-            },
-            addr_b.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        assert_eq!(
-            test_ctx.clients.read().unwrap().filters_for(17),
-            Some(filters.clone())
-        );
-
-        Daemon::handle_ipc_message(
-            Message::SetFilter {
-                client_id: 7,
-                session_token: token_peer_a_active,
-                filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
-                    0x400, 0x4ff,
-                )],
-                seq: 0,
-            },
-            addr_a.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        assert_eq!(
-            test_ctx.clients.read().unwrap().filters_for(17),
-            Some(filters.clone())
-        );
-
-        Daemon::handle_ipc_message(
-            Message::Disconnect {
-                client_id: 17,
-                session_token: token_peer_a_active,
-                seq: 51,
-            },
-            addr_b.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_unix_protocol_message(&peer_b) {
-            Message::Error { seq, code, .. } => {
-                assert_eq!(seq, 51);
-                assert_eq!(code, ErrorCode::InvalidMessage);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-        assert!(test_ctx.clients.read().unwrap().contains(17));
-
-        Daemon::handle_ipc_message(
-            Message::Disconnect {
-                client_id: 7,
-                session_token: token_peer_a_active,
-                seq: 52,
-            },
-            addr_a.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_unix_protocol_message(&peer_a) {
-            Message::Error { seq, code, .. } => {
-                assert_eq!(seq, 52);
-                assert_eq!(code, ErrorCode::InvalidMessage);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-        assert!(test_ctx.clients.read().unwrap().contains(17));
-        assert!(!test_ctx.clients.read().unwrap().contains(7));
-
-        Daemon::handle_ipc_message(
-            Message::SendFrame {
-                session_token: token_unregistered,
-                frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
-                seq: 53,
-            },
-            addr_c.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_unix_protocol_message(&peer_c) {
-            Message::Error { seq, code, .. } => {
-                assert_eq!(seq, 53);
-                assert_eq!(code, ErrorCode::NotConnected);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-        assert_eq!(send_count.load(Ordering::Relaxed), 0);
-
-        Daemon::handle_ipc_message(
-            Message::SendFrame {
-                session_token: token_peer_a_active,
-                frame: piper_can::PiperFrame::new_standard(0x124, &[4, 5, 6]),
-                seq: 54,
-            },
-            addr_a.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_unix_protocol_message(&peer_a) {
-            Message::SendAck { seq, status } => {
-                assert_eq!(seq, 54);
-                assert_eq!(status, 0);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-        assert_eq!(send_count.load(Ordering::Relaxed), 1);
-
-        Daemon::handle_ipc_message(
-            Message::GetStatus {
-                session_token: token_unregistered,
-                seq: 55,
-            },
-            addr_c.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_unix_protocol_message(&peer_c) {
-            Message::Error { seq, code, .. } => {
-                assert_eq!(seq, 55);
-                assert_eq!(code, ErrorCode::NotConnected);
-            },
-            other => panic!("unexpected message: {:?}", other),
-        }
-
-        Daemon::handle_ipc_message(
-            Message::GetStatus {
-                session_token: token_peer_a_active,
-                seq: 56,
-            },
-            addr_a.clone(),
-            test_handler_ctx(&test_ctx),
-            &server,
-        );
-        match recv_unix_protocol_message(&peer_a) {
-            Message::StatusResponse { seq, .. } => assert_eq!(seq, 56),
-            other => panic!("unexpected message: {:?}", other),
-        }
-
-        for path in [&server_path, &peer_a_path, &peer_b_path, &peer_c_path] {
-            let _ = std::fs::remove_file(path);
-        }
     }
 }
