@@ -25,8 +25,12 @@
 //!
 
 use clap::Parser;
-use piper_can::gs_usb_udp::GsUsbUdpAdapter;
+use piper_can::gs_usb_udp::{GsUsbUdpAdapter, protocol::SessionToken};
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame};
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -80,6 +84,67 @@ fn print_frame(label: &str, frame: &PiperFrame) {
     );
     if frame.timestamp_us > 0 {
         println!("  时间戳: {} us", frame.timestamp_us);
+    }
+}
+
+fn token_cache_dir() -> PathBuf {
+    if let Some(xdg_cache_home) = std::env::var_os("XDG_CACHE_HOME") {
+        PathBuf::from(xdg_cache_home).join("piper-sdk").join("bridge_tokens")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache").join("piper-sdk").join("bridge_tokens")
+    } else {
+        std::env::temp_dir().join("piper-sdk-bridge-tokens")
+    }
+}
+
+fn stable_session_token(endpoint: &str) -> std::result::Result<SessionToken, std::io::Error> {
+    let mut hasher = DefaultHasher::new();
+    endpoint.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+
+    let dir = token_cache_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.token", key));
+
+    match fs::read(&path) {
+        Ok(bytes) if bytes.len() == 16 => {
+            let mut token = [0u8; 16];
+            token.copy_from_slice(&bytes);
+            Ok(SessionToken::new(token))
+        },
+        _ => {
+            let token = SessionToken::random();
+            fs::write(&path, token.as_bytes())?;
+            Ok(token)
+        },
+    }
+}
+
+fn create_bridge_adapter(
+    endpoint: &str,
+) -> std::result::Result<GsUsbUdpAdapter, Box<dyn std::error::Error>> {
+    let token = stable_session_token(endpoint)?;
+
+    if endpoint.starts_with('/') || endpoint.starts_with("unix:") {
+        #[cfg(unix)]
+        {
+            let path = endpoint.strip_prefix("unix:").unwrap_or(endpoint);
+            Ok(GsUsbUdpAdapter::new_uds_with_timeout_and_token(
+                path,
+                Duration::from_millis(100),
+                token,
+            )?)
+        }
+        #[cfg(not(unix))]
+        {
+            Err("Unix Domain Sockets are not supported on this platform. Please use UDP address format (e.g., 127.0.0.1:18888)".into())
+        }
+    } else {
+        Ok(GsUsbUdpAdapter::new_udp_with_timeout_and_token(
+            endpoint,
+            Duration::from_millis(100),
+            token,
+        )?)
     }
 }
 
@@ -406,22 +471,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // 1. 创建适配器（根据地址格式自动选择 UDS 或 UDP）
+    // 使用按 endpoint 持久化的 logical session token，便于跨进程重连立即替换旧 session。
     println!("正在创建适配器...");
-    let mut adapter = if args.uds.starts_with('/') || args.uds.starts_with("unix:") {
-        // UDS 模式
-        #[cfg(unix)]
-        {
-            let path = args.uds.strip_prefix("unix:").unwrap_or(&args.uds);
-            GsUsbUdpAdapter::new_uds(path).map_err(|e| format!("创建 UDS 适配器失败: {}", e))?
-        }
-        #[cfg(not(unix))]
-        {
-            return Err("Unix Domain Sockets are not supported on this platform. Please use UDP address format (e.g., 127.0.0.1:18888)".into());
-        }
-    } else {
-        // UDP 模式
-        GsUsbUdpAdapter::new_udp(&args.uds).map_err(|e| format!("创建 UDP 适配器失败: {}", e))?
-    };
+    let mut adapter =
+        create_bridge_adapter(&args.uds).map_err(|e| format!("创建 bridge 适配器失败: {}", e))?;
     println!("✓ 适配器创建成功");
 
     // 2. 连接到守护进程

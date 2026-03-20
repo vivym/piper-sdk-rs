@@ -9,8 +9,12 @@
 //! 该链路是非实时 bridge/debug 路径。bridge send 使用固定 round-trip timeout；
 //! 若发送超时或控制平面失同步，客户端会 fail-closed 并要求显式 reconnect。
 
-use piper_can::gs_usb_udp::GsUsbUdpAdapter;
+use piper_can::gs_usb_udp::{GsUsbUdpAdapter, protocol::SessionToken};
 use piper_sdk::can::{CanAdapter, PiperFrame};
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -71,14 +75,70 @@ impl LatencyStats {
     }
 }
 
+fn token_cache_dir() -> PathBuf {
+    if let Some(xdg_cache_home) = std::env::var_os("XDG_CACHE_HOME") {
+        PathBuf::from(xdg_cache_home).join("piper-sdk").join("bridge_tokens")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache").join("piper-sdk").join("bridge_tokens")
+    } else {
+        std::env::temp_dir().join("piper-sdk-bridge-tokens")
+    }
+}
+
+fn stable_session_token(endpoint: &str) -> std::result::Result<SessionToken, std::io::Error> {
+    let mut hasher = DefaultHasher::new();
+    endpoint.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+
+    let dir = token_cache_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.token", key));
+
+    match fs::read(&path) {
+        Ok(bytes) if bytes.len() == 16 => {
+            let mut token = [0u8; 16];
+            token.copy_from_slice(&bytes);
+            Ok(SessionToken::new(token))
+        },
+        _ => {
+            let token = SessionToken::random();
+            fs::write(&path, token.as_bytes())?;
+            Ok(token)
+        },
+    }
+}
+
+fn benchmark_adapter() -> std::result::Result<GsUsbUdpAdapter, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    let endpoint = "/tmp/gs_usb_daemon.sock";
+    #[cfg(not(unix))]
+    let endpoint = "127.0.0.1:18888";
+
+    let token = stable_session_token(endpoint)?;
+
+    #[cfg(unix)]
+    {
+        Ok(GsUsbUdpAdapter::new_uds_with_timeout_and_token(
+            endpoint,
+            Duration::from_millis(100),
+            token,
+        )?)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(GsUsbUdpAdapter::new_udp_with_timeout_and_token(
+            endpoint,
+            Duration::from_millis(100),
+            token,
+        )?)
+    }
+}
+
 /// 测试场景 2: 发送延迟（仅测试发送路径）
 fn test_send_latency() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 测试场景 2: 发送延迟（仅发送路径）===");
 
-    #[cfg(unix)]
-    let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock")?;
-    #[cfg(not(unix))]
-    let mut adapter = GsUsbUdpAdapter::new_udp("127.0.0.1:18888")?;
+    let mut adapter = benchmark_adapter()?;
     adapter.connect(vec![])?;
 
     println!("已连接到 daemon，开始测试...");
@@ -131,10 +191,7 @@ fn test_receive_latency() -> std::result::Result<(), Box<dyn std::error::Error>>
     println!("注意：此测试需要 daemon 持续发送数据");
     println!("如果没有数据源，此测试会超时");
 
-    #[cfg(unix)]
-    let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock")?;
-    #[cfg(not(unix))]
-    let mut adapter = GsUsbUdpAdapter::new_udp("127.0.0.1:18888")?;
+    let mut adapter = benchmark_adapter()?;
     adapter.connect(vec![])?;
 
     println!("已连接到 daemon，等待接收数据...");
@@ -189,10 +246,7 @@ fn test_receive_latency() -> std::result::Result<(), Box<dyn std::error::Error>>
 fn test_throughput() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 测试场景 4: 吞吐量测试 ===");
 
-    #[cfg(unix)]
-    let mut adapter = GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock")?;
-    #[cfg(not(unix))]
-    let mut adapter = GsUsbUdpAdapter::new_udp("127.0.0.1:18888")?;
+    let mut adapter = benchmark_adapter()?;
     adapter.connect(vec![])?;
 
     println!("已连接到 daemon，开始测试...");
@@ -260,17 +314,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // 检查 daemon 是否运行
     println!("检查 daemon 连接...");
-    #[cfg(unix)]
-    let daemon_check = GsUsbUdpAdapter::new_uds("/tmp/gs_usb_daemon.sock");
-    #[cfg(not(unix))]
-    let daemon_check = GsUsbUdpAdapter::new_udp("127.0.0.1:18888");
+    let daemon_check = benchmark_adapter();
 
     match daemon_check {
         Ok(_) => println!("✅ Daemon socket 存在"),
         Err(e) => {
             eprintln!("❌ 无法连接到 daemon: {}", e);
             eprintln!("请先启动 daemon: cargo run --bin gs_usb_daemon");
-            return Err(e.into());
+            return Err(e);
         },
     }
 

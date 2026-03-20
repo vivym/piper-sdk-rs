@@ -5,14 +5,34 @@
 //! 参考：`daemon_implementation_plan.md` 第 3.2 节
 
 use crate::PiperFrame;
+use rand::random;
 
 /// Wire-level sequence numbers are encoded on 24 bits.
 pub const WIRE_SEQ_MASK: u32 = 0x00FF_FFFF;
 pub const WIRE_SEQ_MODULUS: u32 = 0x0100_0000;
+pub const SESSION_TOKEN_LEN: usize = 16;
 
 #[inline]
 pub const fn normalize_wire_seq(seq: u32) -> u32 {
     seq & WIRE_SEQ_MASK
+}
+
+/// Bridge logical session token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionToken(pub [u8; SESSION_TOKEN_LEN]);
+
+impl SessionToken {
+    pub const fn new(bytes: [u8; SESSION_TOKEN_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn random() -> Self {
+        Self(random())
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; SESSION_TOKEN_LEN] {
+        &self.0
+    }
 }
 
 // ============================================================================
@@ -215,17 +235,21 @@ impl std::error::Error for ProtocolError {}
 pub enum Message {
     Heartbeat {
         client_id: u32,
+        session_token: SessionToken,
     },
     Connect {
         client_id: u32,
+        session_token: SessionToken,
         filters: Vec<CanIdFilter>,
         seq: u32,
     },
     Disconnect {
         client_id: u32,
+        session_token: SessionToken,
         seq: u32,
     },
     SendFrame {
+        session_token: SessionToken,
         frame: PiperFrame,
         seq: u32,
     },
@@ -239,6 +263,7 @@ pub enum Message {
         seq: u32,
     },
     GetStatus {
+        session_token: SessionToken,
         seq: u32,
     },
     StatusResponse {
@@ -279,7 +304,9 @@ pub enum Message {
     },
     SetFilter {
         client_id: u32,
+        session_token: SessionToken,
         filters: Vec<CanIdFilter>,
+        seq: u32,
     },
 }
 
@@ -287,25 +314,46 @@ pub enum Message {
 // Encoding Functions (Zero-Copy)
 // ============================================================================
 
-/// 编码心跳消息（最小消息，只有头部）
-pub fn encode_heartbeat(client_id: u32, seq: u32, buf: &mut [u8; 12]) -> &[u8] {
-    assert!(buf.len() >= 12);
-    let header = MessageHeader::new(MessageType::Heartbeat, 12, seq);
+fn encode_session_token(buf: &mut [u8], session_token: SessionToken) {
+    buf[..SESSION_TOKEN_LEN].copy_from_slice(session_token.as_bytes());
+}
+
+fn decode_session_token(buf: &[u8]) -> Result<SessionToken, ProtocolError> {
+    if buf.len() < SESSION_TOKEN_LEN {
+        return Err(ProtocolError::Incomplete);
+    }
+
+    let mut token = [0u8; SESSION_TOKEN_LEN];
+    token.copy_from_slice(&buf[..SESSION_TOKEN_LEN]);
+    Ok(SessionToken::new(token))
+}
+
+/// 编码心跳消息
+pub fn encode_heartbeat(
+    client_id: u32,
+    session_token: SessionToken,
+    seq: u32,
+    buf: &mut [u8; 28],
+) -> &[u8] {
+    assert!(buf.len() >= 28);
+    let header = MessageHeader::new(MessageType::Heartbeat, 28, seq);
     header.encode(&mut buf[..8]);
     buf[8..12].copy_from_slice(&client_id.to_le_bytes());
-    &buf[..12]
+    encode_session_token(&mut buf[12..28], session_token);
+    &buf[..28]
 }
 
 /// 编码 Connect 消息
 pub fn encode_connect<'a>(
     client_id: u32,
+    session_token: SessionToken,
     filters: &[CanIdFilter],
     seq: u32,
     buf: &'a mut [u8; 256],
 ) -> Result<&'a [u8], ProtocolError> {
-    // 计算消息长度：8 (header) + 4 (client_id) + 1 (filter_count) + filters.len() * 8
+    // 计算消息长度：8 (header) + 4 (client_id) + 16 (session_token) + 1 (filter_count) + filters.len() * 8
     let filter_count = filters.len().min(255);
-    let length = 8 + 4 + 1 + (filter_count * 8);
+    let length = 8 + 4 + SESSION_TOKEN_LEN + 1 + (filter_count * 8);
 
     if length > buf.len() {
         return Err(ProtocolError::InvalidData);
@@ -315,11 +363,12 @@ pub fn encode_connect<'a>(
     header.encode(&mut buf[..8]);
 
     buf[8..12].copy_from_slice(&client_id.to_le_bytes());
-    buf[12] = filter_count as u8;
+    encode_session_token(&mut buf[12..28], session_token);
+    buf[28] = filter_count as u8;
 
     // 编码过滤规则
     for (i, filter) in filters.iter().take(filter_count).enumerate() {
-        let offset = 13 + (i * 8);
+        let offset = 29 + (i * 8);
         buf[offset..offset + 4].copy_from_slice(&filter.min_id.to_le_bytes());
         buf[offset + 4..offset + 8].copy_from_slice(&filter.max_id.to_le_bytes());
     }
@@ -330,11 +379,12 @@ pub fn encode_connect<'a>(
 /// 编码 SendFrame 消息（零拷贝）
 pub fn encode_send_frame_with_seq<'a>(
     frame: &PiperFrame,
+    session_token: SessionToken,
     seq: u32,
     buf: &'a mut [u8; 64],
 ) -> Result<&'a [u8], ProtocolError> {
-    // 计算消息长度：8 (header) + 4 (can_id) + 1 (flags) + 1 (dlc) + frame.len
-    let length = 8 + 4 + 1 + 1 + frame.len as usize;
+    // 计算消息长度：8 (header) + 16 (session_token) + 4 (can_id) + 1 (flags) + 1 (dlc) + frame.len
+    let length = 8 + SESSION_TOKEN_LEN + 4 + 1 + 1 + frame.len as usize;
 
     if length > buf.len() {
         return Err(ProtocolError::InvalidData);
@@ -343,10 +393,11 @@ pub fn encode_send_frame_with_seq<'a>(
     let header = MessageHeader::new(MessageType::SendFrame, length as u16, seq);
     header.encode(&mut buf[..8]);
 
-    buf[8..12].copy_from_slice(&frame.id.to_le_bytes());
-    buf[12] = if frame.is_extended { 0x01 } else { 0x00 };
-    buf[13] = frame.len;
-    buf[14..14 + frame.len as usize].copy_from_slice(&frame.data[..frame.len as usize]);
+    encode_session_token(&mut buf[8..24], session_token);
+    buf[24..28].copy_from_slice(&frame.id.to_le_bytes());
+    buf[28] = if frame.is_extended { 0x01 } else { 0x00 };
+    buf[29] = frame.len;
+    buf[30..30 + frame.len as usize].copy_from_slice(&frame.data[..frame.len as usize]);
 
     Ok(&buf[..length])
 }
@@ -407,11 +458,17 @@ pub fn encode_error<'a>(
 }
 
 /// 编码 Disconnect 消息
-pub fn encode_disconnect(client_id: u32, seq: u32, buf: &mut [u8; 12]) -> &[u8] {
-    let header = MessageHeader::new(MessageType::Disconnect, 12, seq);
+pub fn encode_disconnect(
+    client_id: u32,
+    session_token: SessionToken,
+    seq: u32,
+    buf: &mut [u8; 28],
+) -> &[u8] {
+    let header = MessageHeader::new(MessageType::Disconnect, 28, seq);
     header.encode(&mut buf[..8]);
     buf[8..12].copy_from_slice(&client_id.to_le_bytes());
-    &buf[..12]
+    encode_session_token(&mut buf[12..28], session_token);
+    &buf[..28]
 }
 
 /// 编码 DisconnectAck 消息
@@ -433,13 +490,14 @@ pub fn encode_connect_ack(client_id: u32, status: u8, seq: u32, buf: &mut [u8; 1
 /// 编码 SetFilter 消息
 pub fn encode_set_filter<'a>(
     client_id: u32,
+    session_token: SessionToken,
     filters: &[CanIdFilter],
     seq: u32,
     buf: &'a mut [u8; 256],
 ) -> Result<&'a [u8], ProtocolError> {
-    // 计算消息长度：8 (header) + 4 (client_id) + 1 (filter_count) + filters.len() * 8
+    // 计算消息长度：8 (header) + 4 (client_id) + 16 (session_token) + 1 (filter_count) + filters.len() * 8
     let filter_count = filters.len().min(255);
-    let length = 8 + 4 + 1 + (filter_count * 8);
+    let length = 8 + 4 + SESSION_TOKEN_LEN + 1 + (filter_count * 8);
 
     if length > buf.len() {
         return Err(ProtocolError::InvalidData);
@@ -449,11 +507,12 @@ pub fn encode_set_filter<'a>(
     header.encode(&mut buf[..8]);
 
     buf[8..12].copy_from_slice(&client_id.to_le_bytes());
-    buf[12] = filter_count as u8;
+    encode_session_token(&mut buf[12..28], session_token);
+    buf[28] = filter_count as u8;
 
     // 编码过滤规则
     for (i, filter) in filters.iter().take(filter_count).enumerate() {
-        let offset = 13 + (i * 8);
+        let offset = 29 + (i * 8);
         buf[offset..offset + 4].copy_from_slice(&filter.min_id.to_le_bytes());
         buf[offset + 4..offset + 8].copy_from_slice(&filter.max_id.to_le_bytes());
     }
@@ -462,10 +521,11 @@ pub fn encode_set_filter<'a>(
 }
 
 /// 编码 GetStatus 消息
-pub fn encode_get_status(seq: u32, buf: &mut [u8; 8]) -> &[u8] {
-    let header = MessageHeader::new(MessageType::GetStatus, 8, seq);
+pub fn encode_get_status(session_token: SessionToken, seq: u32, buf: &mut [u8; 24]) -> &[u8] {
+    let header = MessageHeader::new(MessageType::GetStatus, 24, seq);
     header.encode(&mut buf[..8]);
-    &buf[..8]
+    encode_session_token(&mut buf[8..24], session_token);
+    &buf[..24]
 }
 
 /// 编码 StatusResponse 消息
@@ -475,8 +535,9 @@ pub fn encode_status_response<'a>(
     buf: &'a mut [u8; 64],
 ) -> Result<&'a [u8], ProtocolError> {
     // 计算消息长度：8 (header) + 状态字段
-    // 状态字段：1 (device_state) + 4*4 (4个fps_x1000) + 1 (health_score) + 8*3 (3个u64计数) + 1 (cpu_usage) + 4 (client_count) + 8 (client_send_blocked) = 51
-    let length = 8 + 51;
+    // 状态字段：1 (device_state) + 4*4 (4个fps_x1000) + 1 (health_score) + 8*3 (3个u64计数)
+    // + 1 (cpu_usage) + 4 (client_count) + 8 (client_send_blocked) = 55
+    let length = 8 + 55;
 
     if length > buf.len() {
         return Err(ProtocolError::InvalidData);
@@ -573,22 +634,27 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
 
     match header.msg_type {
         MessageType::Heartbeat => {
-            if data.len() < 12 {
+            if data.len() < 28 {
                 return Err(ProtocolError::Incomplete);
             }
             let client_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            Ok(Message::Heartbeat { client_id })
+            let session_token = decode_session_token(&data[12..28])?;
+            Ok(Message::Heartbeat {
+                client_id,
+                session_token,
+            })
         },
         MessageType::Connect => {
-            if data.len() < 13 {
+            if data.len() < 29 {
                 return Err(ProtocolError::Incomplete);
             }
             let client_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let filter_count = data[12] as usize;
+            let session_token = decode_session_token(&data[12..28])?;
+            let filter_count = data[28] as usize;
 
             let mut filters = Vec::new();
             for i in 0..filter_count {
-                let offset = 13 + (i * 8);
+                let offset = 29 + (i * 8);
                 if data.len() < offset + 8 {
                     return Err(ProtocolError::Incomplete);
                 }
@@ -609,26 +675,29 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
 
             Ok(Message::Connect {
                 client_id,
+                session_token,
                 filters,
                 seq: header.seq,
             })
         },
         MessageType::SendFrame => {
-            if data.len() < 14 {
+            if data.len() < 30 {
                 return Err(ProtocolError::Incomplete);
             }
-            let id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let is_extended = (data[12] & 0x01) != 0;
-            let len = data[13].min(8);
+            let session_token = decode_session_token(&data[8..24])?;
+            let id = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+            let is_extended = (data[28] & 0x01) != 0;
+            let len = data[29].min(8);
 
-            if data.len() < 14 + len as usize {
+            if data.len() < 30 + len as usize {
                 return Err(ProtocolError::Incomplete);
             }
 
             let mut frame_data = [0u8; 8];
-            frame_data[..len as usize].copy_from_slice(&data[14..14 + len as usize]);
+            frame_data[..len as usize].copy_from_slice(&data[30..30 + len as usize]);
 
             Ok(Message::SendFrame {
+                session_token,
                 frame: PiperFrame {
                     id,
                     data: frame_data,
@@ -700,26 +769,29 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
             })
         },
         MessageType::Disconnect => {
-            if data.len() < 12 {
+            if data.len() < 28 {
                 return Err(ProtocolError::Incomplete);
             }
             let client_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+            let session_token = decode_session_token(&data[12..28])?;
             Ok(Message::Disconnect {
                 client_id,
+                session_token,
                 seq: header.seq,
             })
         },
         MessageType::DisconnectAck => Ok(Message::DisconnectAck { seq: header.seq }),
         MessageType::SetFilter => {
-            if data.len() < 13 {
+            if data.len() < 29 {
                 return Err(ProtocolError::Incomplete);
             }
             let client_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let filter_count = data[12] as usize;
+            let session_token = decode_session_token(&data[12..28])?;
+            let filter_count = data[28] as usize;
 
             let mut filters = Vec::new();
             for i in 0..filter_count {
-                let offset = 13 + (i * 8);
+                let offset = 29 + (i * 8);
                 if data.len() < offset + 8 {
                     return Err(ProtocolError::Incomplete);
                 }
@@ -738,11 +810,25 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
                 filters.push(CanIdFilter::new(min_id, max_id));
             }
 
-            Ok(Message::SetFilter { client_id, filters })
+            Ok(Message::SetFilter {
+                client_id,
+                session_token,
+                filters,
+                seq: header.seq,
+            })
         },
-        MessageType::GetStatus => Ok(Message::GetStatus { seq: header.seq }),
+        MessageType::GetStatus => {
+            if data.len() < 24 {
+                return Err(ProtocolError::Incomplete);
+            }
+            let session_token = decode_session_token(&data[8..24])?;
+            Ok(Message::GetStatus {
+                session_token,
+                seq: header.seq,
+            })
+        },
         MessageType::StatusResponse => {
-            if data.len() < 59 {
+            if data.len() < 63 {
                 return Err(ProtocolError::Incomplete);
             }
             let mut offset = 8;
@@ -867,6 +953,8 @@ mod tests {
     use super::*;
     use crate::PiperFrame;
 
+    const TEST_SESSION_TOKEN: SessionToken = SessionToken::new([0xAB; SESSION_TOKEN_LEN]);
+
     #[test]
     fn test_message_type_values() {
         assert_eq!(MessageType::Heartbeat as u8, 0x00);
@@ -898,13 +986,17 @@ mod tests {
 
     #[test]
     fn test_heartbeat_encode_decode() {
-        let mut buf = [0u8; 12];
-        let encoded = encode_heartbeat(12345, 0, &mut buf);
+        let mut buf = [0u8; 28];
+        let encoded = encode_heartbeat(12345, TEST_SESSION_TOKEN, 0, &mut buf);
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
-            Message::Heartbeat { client_id } => {
+            Message::Heartbeat {
+                client_id,
+                session_token,
+            } => {
                 assert_eq!(client_id, 12345);
+                assert_eq!(session_token, TEST_SESSION_TOKEN);
             },
             _ => panic!("Expected Heartbeat message"),
         }
@@ -917,16 +1009,18 @@ mod tests {
             CanIdFilter::new(0x300, 0x400),
         ];
         let mut buf = [0u8; 256];
-        let encoded = encode_connect(12345, &filters, 0, &mut buf).unwrap();
+        let encoded = encode_connect(12345, TEST_SESSION_TOKEN, &filters, 0, &mut buf).unwrap();
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
             Message::Connect {
                 client_id,
+                session_token,
                 filters: decoded_filters,
                 seq,
             } => {
                 assert_eq!(client_id, 12345);
+                assert_eq!(session_token, TEST_SESSION_TOKEN);
                 assert_eq!(decoded_filters.len(), 2);
                 assert_eq!(decoded_filters[0].min_id, 0x100);
                 assert_eq!(decoded_filters[0].max_id, 0x200);
@@ -940,14 +1034,17 @@ mod tests {
     fn test_send_frame_encode_decode() {
         let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
         let mut buf = [0u8; 64];
-        let encoded = encode_send_frame_with_seq(&frame, 12345, &mut buf).unwrap();
+        let encoded =
+            encode_send_frame_with_seq(&frame, TEST_SESSION_TOKEN, 12345, &mut buf).unwrap();
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
             Message::SendFrame {
                 frame: decoded_frame,
+                session_token,
                 seq,
             } => {
+                assert_eq!(session_token, TEST_SESSION_TOKEN);
                 assert_eq!(decoded_frame.id, 0x123);
                 assert_eq!(decoded_frame.len, 4);
                 assert_eq!(decoded_frame.data[..4], [0x01, 0x02, 0x03, 0x04]);
@@ -1027,13 +1124,18 @@ mod tests {
 
     #[test]
     fn test_disconnect_encode_decode() {
-        let mut buf = [0u8; 12];
-        let encoded = encode_disconnect(12345, 0, &mut buf);
+        let mut buf = [0u8; 28];
+        let encoded = encode_disconnect(12345, TEST_SESSION_TOKEN, 0, &mut buf);
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
-            Message::Disconnect { client_id, seq } => {
+            Message::Disconnect {
+                client_id,
+                session_token,
+                seq,
+            } => {
                 assert_eq!(client_id, 12345);
+                assert_eq!(session_token, TEST_SESSION_TOKEN);
                 assert_eq!(seq, 0);
             },
             _ => panic!("Expected Disconnect message"),
@@ -1059,16 +1161,20 @@ mod tests {
             CanIdFilter::new(0x300, 0x400),
         ];
         let mut buf = [0u8; 256];
-        let encoded = encode_set_filter(12345, &filters, 0, &mut buf).unwrap();
+        let encoded = encode_set_filter(12345, TEST_SESSION_TOKEN, &filters, 0, &mut buf).unwrap();
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
             Message::SetFilter {
                 client_id,
+                session_token,
                 filters: decoded_filters,
+                seq,
             } => {
                 assert_eq!(client_id, 12345);
+                assert_eq!(session_token, TEST_SESSION_TOKEN);
                 assert_eq!(decoded_filters.len(), 2);
+                assert_eq!(seq, 0);
             },
             _ => panic!("Expected SetFilter message"),
         }
@@ -1108,12 +1214,15 @@ mod tests {
 
     #[test]
     fn test_get_status_encode_decode() {
-        let mut buf = [0u8; 8];
-        let encoded = encode_get_status(0, &mut buf);
+        let mut buf = [0u8; 24];
+        let encoded = encode_get_status(TEST_SESSION_TOKEN, 0, &mut buf);
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
-            Message::GetStatus { seq } => assert_eq!(seq, 0),
+            Message::GetStatus { session_token, seq } => {
+                assert_eq!(session_token, TEST_SESSION_TOKEN);
+                assert_eq!(seq, 0);
+            },
             _ => panic!("Expected GetStatus message"),
         }
     }
@@ -1127,16 +1236,18 @@ mod tests {
         // 测试 0 个过滤规则（接收所有帧）
         let filters = vec![];
         let mut buf = [0u8; 256];
-        let encoded = encode_connect(12345, &filters, 0, &mut buf).unwrap();
+        let encoded = encode_connect(12345, TEST_SESSION_TOKEN, &filters, 0, &mut buf).unwrap();
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
             Message::Connect {
                 client_id,
+                session_token,
                 filters: decoded_filters,
                 seq,
             } => {
                 assert_eq!(client_id, 12345);
+                assert_eq!(session_token, TEST_SESSION_TOKEN);
                 assert_eq!(decoded_filters.len(), 0);
                 assert_eq!(seq, 0);
             },
@@ -1153,7 +1264,7 @@ mod tests {
         let mut buf = [0u8; 256];
         // 注意：255 个过滤规则需要 8 + 4 + 1 + 255*8 = 2053 字节，超过缓冲区
         // 应该被截断到 255 个
-        let encoded = encode_connect(12345, &filters, 0, &mut buf);
+        let encoded = encode_connect(12345, TEST_SESSION_TOKEN, &filters, 0, &mut buf);
         // 由于缓冲区太小，应该返回错误或截断
         // 这里我们测试截断的情况
         if let Ok(encoded) = encoded {
@@ -1178,7 +1289,7 @@ mod tests {
         // 测试 0 字节数据
         let frame = PiperFrame::new_standard(0x123, &[]);
         let mut buf = [0u8; 64];
-        let encoded = encode_send_frame_with_seq(&frame, 0, &mut buf).unwrap();
+        let encoded = encode_send_frame_with_seq(&frame, TEST_SESSION_TOKEN, 0, &mut buf).unwrap();
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
@@ -1199,7 +1310,7 @@ mod tests {
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         let frame = PiperFrame::new_standard(0x123, &data);
         let mut buf = [0u8; 64];
-        let encoded = encode_send_frame_with_seq(&frame, 0, &mut buf).unwrap();
+        let encoded = encode_send_frame_with_seq(&frame, TEST_SESSION_TOKEN, 0, &mut buf).unwrap();
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
@@ -1354,7 +1465,7 @@ mod tests {
         let mut buf = [0u8; 256];
         // 由于函数内部会截断到 255 个，但 31 个过滤规则需要 261 字节，超过 256
         // 所以应该返回错误
-        let result = encode_connect(12345, &filters, 0, &mut buf);
+        let result = encode_connect(12345, TEST_SESSION_TOKEN, &filters, 0, &mut buf);
         // 实际上，函数会先截断到 255 个，但 255 个需要 8+4+1+255*8 = 2053 字节
         // 所以应该返回错误
         assert!(result.is_err());
@@ -1417,9 +1528,10 @@ mod tests {
         let mut buf3 = [0u8; 256];
 
         // 所有编码函数都使用栈上缓冲区
-        let _encoded1 = encode_send_frame_with_seq(&frame, 0, &mut buf1).unwrap();
+        let _encoded1 =
+            encode_send_frame_with_seq(&frame, TEST_SESSION_TOKEN, 0, &mut buf1).unwrap();
         let _encoded2 = encode_receive_frame_zero_copy(&frame, &mut buf2).unwrap();
-        let _encoded3 = encode_connect(12345, &[], 0, &mut buf3).unwrap();
+        let _encoded3 = encode_connect(12345, TEST_SESSION_TOKEN, &[], 0, &mut buf3).unwrap();
 
         // 如果编译通过，说明没有使用 Vec 等堆分配类型
     }
@@ -1431,7 +1543,8 @@ mod tests {
         let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
         let mut buf = [0u8; 64];
         let seq = 0x123456; // 24 位范围内的值（最大 0xFFFFFF）
-        let encoded = encode_send_frame_with_seq(&frame, seq, &mut buf).unwrap();
+        let encoded =
+            encode_send_frame_with_seq(&frame, TEST_SESSION_TOKEN, seq, &mut buf).unwrap();
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
@@ -1452,7 +1565,8 @@ mod tests {
         let mut buf = [0u8; 64];
         let seq_full = 0x12345678; // 32 位值
         let seq_expected = 0x345678; // 只保留低 24 位
-        let encoded = encode_send_frame_with_seq(&frame, seq_full, &mut buf).unwrap();
+        let encoded =
+            encode_send_frame_with_seq(&frame, TEST_SESSION_TOKEN, seq_full, &mut buf).unwrap();
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
@@ -1472,24 +1586,27 @@ mod tests {
         let mut buf_64 = [0u8; 64];
         let mut buf_13 = [0u8; 13];
         let mut buf_12 = [0u8; 12];
+        let mut buf_28 = [0u8; 28];
         let mut buf_8 = [0u8; 8];
+        let mut buf_24 = [0u8; 24];
 
         // Heartbeat
-        let mut buf_heartbeat = [0u8; 12];
-        let encoded = encode_heartbeat(12345, 0, &mut buf_heartbeat);
+        let mut buf_heartbeat = [0u8; 28];
+        let encoded = encode_heartbeat(12345, TEST_SESSION_TOKEN, 0, &mut buf_heartbeat);
         assert!(decode_message(encoded).is_ok());
 
         // Connect
-        let encoded = encode_connect(12345, &[], 0, &mut buf_256).unwrap();
+        let encoded = encode_connect(12345, TEST_SESSION_TOKEN, &[], 0, &mut buf_256).unwrap();
         assert!(decode_message(encoded).is_ok());
 
         // Disconnect
-        let encoded = encode_disconnect(12345, 0, &mut buf_12);
+        let encoded = encode_disconnect(12345, TEST_SESSION_TOKEN, 0, &mut buf_28);
         assert!(decode_message(encoded).is_ok());
 
         // SendFrame
         let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
-        let encoded = encode_send_frame_with_seq(&frame, 0, &mut buf_64).unwrap();
+        let encoded =
+            encode_send_frame_with_seq(&frame, TEST_SESSION_TOKEN, 0, &mut buf_64).unwrap();
         assert!(decode_message(encoded).is_ok());
 
         // ReceiveFrame
@@ -1513,11 +1630,11 @@ mod tests {
         assert!(decode_message(encoded).is_ok());
 
         // SetFilter
-        let encoded = encode_set_filter(12345, &[], 0, &mut buf_256).unwrap();
+        let encoded = encode_set_filter(12345, TEST_SESSION_TOKEN, &[], 0, &mut buf_256).unwrap();
         assert!(decode_message(encoded).is_ok());
 
         // GetStatus
-        let encoded = encode_get_status(0, &mut buf_8);
+        let encoded = encode_get_status(TEST_SESSION_TOKEN, 0, &mut buf_24);
         assert!(decode_message(encoded).is_ok());
     }
 }

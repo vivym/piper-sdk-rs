@@ -7,7 +7,10 @@
 use crate::client_manager::{BridgePeerAuth, ClientAddr, ClientManager};
 use piper_can::BridgeTxAdapter;
 use piper_can::gs_usb::{GsUsbCanAdapter, split::GsUsbRxAdapter};
+#[cfg(test)]
+use piper_can::gs_usb_udp::protocol::SessionToken;
 use piper_can::gs_usb_udp::protocol::{self, ErrorCode, Message, StatusResponse};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -285,6 +288,114 @@ struct IpcHandlerContext<'a> {
     device_state: &'a Arc<DeviceStateCell>,
     clients: &'a Arc<RwLock<ClientManager>>,
     stats: &'a Arc<RwLock<DaemonStats>>,
+    auth_log_limiter: &'a Arc<AuthLogLimiter>,
+}
+
+const AUTH_LOG_WINDOW: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AuthTransport {
+    Unix,
+    Udp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AuthMessageType {
+    GetStatus,
+    Heartbeat,
+    Disconnect,
+    SetFilter,
+    SendFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AuthFailureKind {
+    NotConnected,
+    PeerMismatch,
+    ClientIdMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AuthLogKey {
+    transport: AuthTransport,
+    peer: ClientAddr,
+    message_type: AuthMessageType,
+    failure: AuthFailureKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthLogState {
+    last_logged_at: Instant,
+    suppressed: u64,
+}
+
+#[derive(Debug)]
+struct AuthLogLimiter {
+    window: Duration,
+    states: Mutex<HashMap<AuthLogKey, AuthLogState>>,
+}
+
+impl AuthLogLimiter {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            states: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn warn(
+        &self,
+        transport: AuthTransport,
+        peer: ClientAddr,
+        message_type: AuthMessageType,
+        failure: AuthFailureKind,
+        message: impl FnOnce() -> String,
+    ) {
+        let now = Instant::now();
+        let key = AuthLogKey {
+            transport,
+            peer: peer.clone(),
+            message_type,
+            failure,
+        };
+
+        let mut states = self.states.lock().unwrap();
+        if let Some(state) = states.get_mut(&key) {
+            if now.duration_since(state.last_logged_at) < self.window {
+                state.suppressed = state.suppressed.saturating_add(1);
+                return;
+            }
+
+            let suppressed = state.suppressed;
+            state.last_logged_at = now;
+            state.suppressed = 0;
+            drop(states);
+
+            if suppressed > 0 {
+                tracing::warn!(
+                    ?transport,
+                    ?peer,
+                    ?message_type,
+                    ?failure,
+                    suppressed,
+                    "suppressed similar auth failures"
+                );
+            }
+            tracing::warn!(?transport, ?peer, ?message_type, ?failure, "{}", message());
+            return;
+        }
+
+        states.insert(
+            key,
+            AuthLogState {
+                last_logged_at: now,
+                suppressed: 0,
+            },
+        );
+        drop(states);
+
+        tracing::warn!(?transport, ?peer, ?message_type, ?failure, "{}", message());
+    }
 }
 
 /// 详细统计信息（健康度监控）
@@ -724,6 +835,9 @@ pub struct Daemon {
 
     /// 统计信息
     stats: Arc<RwLock<DaemonStats>>,
+
+    /// unauthorized steady-state auth 日志节流器
+    auth_log_limiter: Arc<AuthLogLimiter>,
 }
 
 impl Daemon {
@@ -743,6 +857,7 @@ impl Daemon {
             ))),
             config,
             stats: Arc::new(RwLock::new(DaemonStats::new())),
+            auth_log_limiter: Arc::new(AuthLogLimiter::new(AUTH_LOG_WINDOW)),
         })
     }
 
@@ -1355,6 +1470,7 @@ impl Daemon {
         device_state: Arc<DeviceStateCell>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
+        auth_log_limiter: Arc<AuthLogLimiter>,
     ) {
         // 设置高优先级（macOS QoS）
         // 注意：在非 macOS 平台上这是空操作，可以安全调用
@@ -1378,6 +1494,7 @@ impl Daemon {
                                 device_state: &device_state,
                                 clients: &clients,
                                 stats: &stats,
+                                auth_log_limiter: &auth_log_limiter,
                             },
                             &socket,
                         );
@@ -1408,6 +1525,7 @@ impl Daemon {
         device_state: Arc<DeviceStateCell>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
+        auth_log_limiter: Arc<AuthLogLimiter>,
     ) {
         // 设置高优先级（macOS QoS）
         // 注意：在非 macOS 平台上这是空操作，可以安全调用
@@ -1433,6 +1551,7 @@ impl Daemon {
                                 device_state: &device_state,
                                 clients: &clients,
                                 stats: &stats,
+                                auth_log_limiter: &auth_log_limiter,
                             },
                             &socket, // ← UdpSocket
                         );
@@ -1467,6 +1586,7 @@ impl Daemon {
             device_state,
             clients,
             stats,
+            auth_log_limiter,
         } = ctx;
         let peer = match resolve_supported_unix_peer(&client_addr) {
             Ok(peer) => peer,
@@ -1479,30 +1599,66 @@ impl Daemon {
             },
         };
         match msg {
-            piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
+            piper_can::gs_usb_udp::protocol::Message::Heartbeat {
+                client_id,
+                session_token,
+            } => {
                 let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_peer(&peer.addr, Some(client_id)) {
+                match clients_guard.authorize_session(
+                    session_token,
+                    &peer.addr,
+                    Some(client_id),
+                ) {
                     BridgePeerAuth::Authorized { active_id } => {
                         if let Err(e) = clients_guard.update_activity(active_id) {
                             eprintln!("[Client {}] Failed to update activity: {}", active_id, e);
                         }
                     },
                     BridgePeerAuth::NotConnected => {
-                        eprintln!(
-                            "[Unix IPC] Ignoring heartbeat from unregistered peer {}",
-                            peer.reply_path
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::Heartbeat,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "ignoring heartbeat from unregistered peer {}",
+                                    peer.reply_path
+                                )
+                            },
                         );
                     },
+                    BridgePeerAuth::PeerMismatch { active_id } => auth_log_limiter.warn(
+                        AuthTransport::Unix,
+                        peer.addr.clone(),
+                        AuthMessageType::Heartbeat,
+                        AuthFailureKind::PeerMismatch,
+                        || {
+                            format!(
+                                "ignoring heartbeat for token owned by active client {} from peer {}",
+                                active_id, peer.reply_path
+                            )
+                        },
+                    ),
                     BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        eprintln!(
-                            "[Unix IPC] Ignoring heartbeat for client {} from peer {} (active client {})",
-                            client_id, peer.reply_path, active_id
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::Heartbeat,
+                            AuthFailureKind::ClientIdMismatch,
+                            || {
+                                format!(
+                                    "ignoring heartbeat for client {} from peer {} (active client {})",
+                                    client_id, peer.reply_path, active_id
+                                )
+                            },
                         );
                     },
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::Connect {
                 client_id,
+                session_token,
                 filters,
                 seq,
             } => {
@@ -1511,6 +1667,7 @@ impl Daemon {
                     if client_id == 0 {
                         clients_guard.prepare_registration_auto(
                             peer.addr.clone(),
+                            session_token,
                             filters,
                             Some(client_addr),
                         )
@@ -1518,6 +1675,7 @@ impl Daemon {
                         clients_guard.prepare_registration_manual(
                             client_id,
                             peer.addr.clone(),
+                            session_token,
                             filters,
                             Some(client_addr),
                         )
@@ -1573,13 +1731,29 @@ impl Daemon {
                     eprintln!("Failed to register client {}: {}", actual_id, e);
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id, seq } => {
+            piper_can::gs_usb_udp::protocol::Message::Disconnect {
+                client_id,
+                session_token,
+                seq,
+            } => {
                 let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_peer(&peer.addr, Some(client_id)) {
+                match clients_guard.authorize_session(session_token, &peer.addr, Some(client_id)) {
                     BridgePeerAuth::Authorized { active_id } => {
                         clients_guard.unregister(active_id);
                     },
                     BridgePeerAuth::NotConnected => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::Disconnect,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "rejecting disconnect from unregistered peer {}",
+                                    peer.reply_path
+                                )
+                            },
+                        );
                         drop(clients_guard);
                         send_unix_error_response(
                             socket,
@@ -1590,7 +1764,45 @@ impl Daemon {
                         );
                         return;
                     },
+                    BridgePeerAuth::PeerMismatch { active_id } => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::Disconnect,
+                            AuthFailureKind::PeerMismatch,
+                            || {
+                                format!(
+                                    "rejecting disconnect for token owned by active client {} from peer {}",
+                                    active_id, peer.reply_path
+                                )
+                            },
+                        );
+                        drop(clients_guard);
+                        send_unix_error_response(
+                            socket,
+                            peer.reply_path.as_str(),
+                            ErrorCode::InvalidMessage,
+                            &format!(
+                                "Peer {} does not own the active session {} for this token",
+                                peer.reply_path, active_id
+                            ),
+                            seq,
+                        );
+                        return;
+                    },
                     BridgePeerAuth::ClientIdMismatch { active_id } => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::Disconnect,
+                            AuthFailureKind::ClientIdMismatch,
+                            || {
+                                format!(
+                                    "rejecting disconnect for client {} from peer {} (active client {})",
+                                    client_id, peer.reply_path, active_id
+                                )
+                            },
+                        );
                         drop(clients_guard);
                         send_unix_error_response(
                             socket,
@@ -1615,15 +1827,56 @@ impl Daemon {
                     eprintln!("[Client] Failed to send DisconnectAck: {}", error);
                 }
             },
-            Message::SendFrame { frame, seq } => {
-                match clients.read().unwrap().authorize_peer(&peer.addr, None) {
+            Message::SendFrame {
+                session_token,
+                frame,
+                seq,
+            } => {
+                match clients.read().unwrap().authorize_session(session_token, &peer.addr, None) {
                     BridgePeerAuth::Authorized { .. } => {},
                     BridgePeerAuth::NotConnected => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::SendFrame,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "rejecting send-frame from unregistered peer {}",
+                                    peer.reply_path
+                                )
+                            },
+                        );
                         send_unix_error_response(
                             socket,
                             peer.reply_path.as_str(),
                             ErrorCode::NotConnected,
                             "Peer is not connected",
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::PeerMismatch { active_id } => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::SendFrame,
+                            AuthFailureKind::PeerMismatch,
+                            || {
+                                format!(
+                                    "rejecting send-frame for token owned by active client {} from peer {}",
+                                    active_id, peer.reply_path
+                                )
+                            },
+                        );
+                        send_unix_error_response(
+                            socket,
+                            peer.reply_path.as_str(),
+                            ErrorCode::InvalidMessage,
+                            &format!(
+                                "Peer {} does not own the active session {} for this token",
+                                peer.reply_path, active_id
+                            ),
                             seq,
                         );
                         return;
@@ -1673,9 +1926,18 @@ impl Daemon {
                     );
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
+            piper_can::gs_usb_udp::protocol::Message::SetFilter {
+                client_id,
+                session_token,
+                filters,
+                seq: _,
+            } => {
                 let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_peer(&peer.addr, Some(client_id)) {
+                match clients_guard.authorize_session(
+                    session_token,
+                    &peer.addr,
+                    Some(client_id),
+                ) {
                     BridgePeerAuth::Authorized { active_id } => {
                         if let Err(e) = clients_guard.set_filters(active_id, filters.clone()) {
                             eprintln!("[Client {}] Failed to set filters: {}", active_id, e);
@@ -1688,20 +1950,102 @@ impl Daemon {
                         }
                     },
                     BridgePeerAuth::NotConnected => {
-                        eprintln!(
-                            "[Unix IPC] Ignoring SetFilter from unregistered peer {}",
-                            peer.reply_path
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::SetFilter,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "ignoring SetFilter from unregistered peer {}",
+                                    peer.reply_path
+                                )
+                            },
                         );
                     },
+                    BridgePeerAuth::PeerMismatch { active_id } => auth_log_limiter.warn(
+                        AuthTransport::Unix,
+                        peer.addr.clone(),
+                        AuthMessageType::SetFilter,
+                        AuthFailureKind::PeerMismatch,
+                        || {
+                            format!(
+                                "ignoring SetFilter for token owned by active client {} from peer {}",
+                                active_id, peer.reply_path
+                            )
+                        },
+                    ),
                     BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        eprintln!(
-                            "[Unix IPC] Ignoring SetFilter for client {} from peer {} (active client {})",
-                            client_id, peer.reply_path, active_id
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::SetFilter,
+                            AuthFailureKind::ClientIdMismatch,
+                            || {
+                                format!(
+                                    "ignoring SetFilter for client {} from peer {} (active client {})",
+                                    client_id, peer.reply_path, active_id
+                                )
+                            },
                         );
                     },
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::GetStatus { seq } => {
+            piper_can::gs_usb_udp::protocol::Message::GetStatus { session_token, seq } => {
+                match clients.read().unwrap().authorize_session(session_token, &peer.addr, None) {
+                    BridgePeerAuth::Authorized { .. } => {},
+                    BridgePeerAuth::NotConnected => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::GetStatus,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "rejecting GetStatus from unregistered peer {}",
+                                    peer.reply_path
+                                )
+                            },
+                        );
+                        send_unix_error_response(
+                            socket,
+                            peer.reply_path.as_str(),
+                            ErrorCode::NotConnected,
+                            "Peer is not connected",
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::PeerMismatch { active_id } => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Unix,
+                            peer.addr.clone(),
+                            AuthMessageType::GetStatus,
+                            AuthFailureKind::PeerMismatch,
+                            || {
+                                format!(
+                                    "rejecting GetStatus for token owned by active client {} from peer {}",
+                                    active_id, peer.reply_path
+                                )
+                            },
+                        );
+                        send_unix_error_response(
+                            socket,
+                            peer.reply_path.as_str(),
+                            ErrorCode::InvalidMessage,
+                            &format!(
+                                "Peer {} does not own the active session {} for this token",
+                                peer.reply_path, active_id
+                            ),
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::ClientIdMismatch { .. } => {
+                        unreachable!("get-status authorization does not compare client ids")
+                    },
+                }
+
                 let clients_guard = clients.read().unwrap();
                 let stats_guard = stats.read().unwrap();
                 let detailed_guard = stats_guard.detailed.read().unwrap();
@@ -1772,12 +2116,20 @@ impl Daemon {
             device_state,
             clients,
             stats,
+            auth_log_limiter,
         } = ctx;
         match msg {
-            piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
+            piper_can::gs_usb_udp::protocol::Message::Heartbeat {
+                client_id,
+                session_token,
+            } => {
                 let peer_addr = ClientAddr::Udp(client_addr);
                 let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_peer(&peer_addr, Some(client_id)) {
+                match clients_guard.authorize_session(
+                    session_token,
+                    &peer_addr,
+                    Some(client_id),
+                ) {
                     BridgePeerAuth::Authorized { active_id } => {
                         if let Err(e) = clients_guard.update_activity(active_id) {
                             eprintln!(
@@ -1787,21 +2139,50 @@ impl Daemon {
                         }
                     },
                     BridgePeerAuth::NotConnected => {
-                        eprintln!(
-                            "[UDP IPC] Ignoring heartbeat from unregistered peer {}",
-                            client_addr
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::Heartbeat,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "ignoring heartbeat from unregistered peer {}",
+                                    client_addr
+                                )
+                            },
                         );
                     },
+                    BridgePeerAuth::PeerMismatch { active_id } => auth_log_limiter.warn(
+                        AuthTransport::Udp,
+                        peer_addr.clone(),
+                        AuthMessageType::Heartbeat,
+                        AuthFailureKind::PeerMismatch,
+                        || {
+                            format!(
+                                "ignoring heartbeat for token owned by active client {} from peer {}",
+                                active_id, client_addr
+                            )
+                        },
+                    ),
                     BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        eprintln!(
-                            "[UDP IPC] Ignoring heartbeat for client {} from peer {} (active client {})",
-                            client_id, client_addr, active_id
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::Heartbeat,
+                            AuthFailureKind::ClientIdMismatch,
+                            || {
+                                format!(
+                                    "ignoring heartbeat for client {} from peer {} (active client {})",
+                                    client_id, client_addr, active_id
+                                )
+                            },
                         );
                     },
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::Connect {
                 client_id,
+                session_token,
                 filters,
                 seq,
             } => {
@@ -1811,6 +2192,7 @@ impl Daemon {
                     if client_id == 0 {
                         clients_guard.prepare_registration_auto(
                             addr,
+                            session_token,
                             filters,
                             #[cfg(unix)]
                             None,
@@ -1819,6 +2201,7 @@ impl Daemon {
                         clients_guard.prepare_registration_manual(
                             client_id,
                             addr,
+                            session_token,
                             filters,
                             #[cfg(unix)]
                             None,
@@ -1878,14 +2261,30 @@ impl Daemon {
                     eprintln!("Failed to register UDP client {}: {}", actual_id, e);
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id, seq } => {
+            piper_can::gs_usb_udp::protocol::Message::Disconnect {
+                client_id,
+                session_token,
+                seq,
+            } => {
                 let peer_addr = ClientAddr::Udp(client_addr);
                 let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_peer(&peer_addr, Some(client_id)) {
+                match clients_guard.authorize_session(session_token, &peer_addr, Some(client_id)) {
                     BridgePeerAuth::Authorized { active_id } => {
                         clients_guard.unregister(active_id);
                     },
                     BridgePeerAuth::NotConnected => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::Disconnect,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "rejecting disconnect from unregistered peer {}",
+                                    client_addr
+                                )
+                            },
+                        );
                         drop(clients_guard);
                         send_udp_error_response(
                             socket,
@@ -1896,7 +2295,45 @@ impl Daemon {
                         );
                         return;
                     },
+                    BridgePeerAuth::PeerMismatch { active_id } => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::Disconnect,
+                            AuthFailureKind::PeerMismatch,
+                            || {
+                                format!(
+                                    "rejecting disconnect for token owned by active client {} from peer {}",
+                                    active_id, client_addr
+                                )
+                            },
+                        );
+                        drop(clients_guard);
+                        send_udp_error_response(
+                            socket,
+                            client_addr,
+                            ErrorCode::InvalidMessage,
+                            &format!(
+                                "Peer {} does not own the active session {} for this token",
+                                client_addr, active_id
+                            ),
+                            seq,
+                        );
+                        return;
+                    },
                     BridgePeerAuth::ClientIdMismatch { active_id } => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::Disconnect,
+                            AuthFailureKind::ClientIdMismatch,
+                            || {
+                                format!(
+                                    "rejecting disconnect for client {} from peer {} (active client {})",
+                                    client_id, client_addr, active_id
+                                )
+                            },
+                        );
                         drop(clients_guard);
                         send_udp_error_response(
                             socket,
@@ -1921,16 +2358,57 @@ impl Daemon {
                     eprintln!("[UDP Client] Failed to send DisconnectAck: {}", error);
                 }
             },
-            Message::SendFrame { frame, seq } => {
+            Message::SendFrame {
+                session_token,
+                frame,
+                seq,
+            } => {
                 let peer_addr = ClientAddr::Udp(client_addr);
-                match clients.read().unwrap().authorize_peer(&peer_addr, None) {
+                match clients.read().unwrap().authorize_session(session_token, &peer_addr, None) {
                     BridgePeerAuth::Authorized { .. } => {},
                     BridgePeerAuth::NotConnected => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::SendFrame,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "rejecting send-frame from unregistered peer {}",
+                                    client_addr
+                                )
+                            },
+                        );
                         send_udp_error_response(
                             socket,
                             client_addr,
                             ErrorCode::NotConnected,
                             "Peer is not connected",
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::PeerMismatch { active_id } => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::SendFrame,
+                            AuthFailureKind::PeerMismatch,
+                            || {
+                                format!(
+                                    "rejecting send-frame for token owned by active client {} from peer {}",
+                                    active_id, client_addr
+                                )
+                            },
+                        );
+                        send_udp_error_response(
+                            socket,
+                            client_addr,
+                            ErrorCode::InvalidMessage,
+                            &format!(
+                                "Peer {} does not own the active session {} for this token",
+                                client_addr, active_id
+                            ),
                             seq,
                         );
                         return;
@@ -1979,10 +2457,19 @@ impl Daemon {
                     );
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
+            piper_can::gs_usb_udp::protocol::Message::SetFilter {
+                client_id,
+                session_token,
+                filters,
+                seq: _,
+            } => {
                 let peer_addr = ClientAddr::Udp(client_addr);
                 let mut clients_guard = clients.write().unwrap();
-                match clients_guard.authorize_peer(&peer_addr, Some(client_id)) {
+                match clients_guard.authorize_session(
+                    session_token,
+                    &peer_addr,
+                    Some(client_id),
+                ) {
                     BridgePeerAuth::Authorized { active_id } => {
                         if let Err(e) = clients_guard.set_filters(active_id, filters.clone()) {
                             eprintln!("[UDP Client {}] Failed to set filters: {}", active_id, e);
@@ -1995,20 +2482,103 @@ impl Daemon {
                         }
                     },
                     BridgePeerAuth::NotConnected => {
-                        eprintln!(
-                            "[UDP IPC] Ignoring SetFilter from unregistered peer {}",
-                            client_addr
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::SetFilter,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "ignoring SetFilter from unregistered peer {}",
+                                    client_addr
+                                )
+                            },
                         );
                     },
+                    BridgePeerAuth::PeerMismatch { active_id } => auth_log_limiter.warn(
+                        AuthTransport::Udp,
+                        peer_addr.clone(),
+                        AuthMessageType::SetFilter,
+                        AuthFailureKind::PeerMismatch,
+                        || {
+                            format!(
+                                "ignoring SetFilter for token owned by active client {} from peer {}",
+                                active_id, client_addr
+                            )
+                        },
+                    ),
                     BridgePeerAuth::ClientIdMismatch { active_id } => {
-                        eprintln!(
-                            "[UDP IPC] Ignoring SetFilter for client {} from peer {} (active client {})",
-                            client_id, client_addr, active_id
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::SetFilter,
+                            AuthFailureKind::ClientIdMismatch,
+                            || {
+                                format!(
+                                    "ignoring SetFilter for client {} from peer {} (active client {})",
+                                    client_id, client_addr, active_id
+                                )
+                            },
                         );
                     },
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::GetStatus { seq } => {
+            piper_can::gs_usb_udp::protocol::Message::GetStatus { session_token, seq } => {
+                let peer_addr = ClientAddr::Udp(client_addr);
+                match clients.read().unwrap().authorize_session(session_token, &peer_addr, None) {
+                    BridgePeerAuth::Authorized { .. } => {},
+                    BridgePeerAuth::NotConnected => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::GetStatus,
+                            AuthFailureKind::NotConnected,
+                            || {
+                                format!(
+                                    "rejecting GetStatus from unregistered peer {}",
+                                    client_addr
+                                )
+                            },
+                        );
+                        send_udp_error_response(
+                            socket,
+                            client_addr,
+                            ErrorCode::NotConnected,
+                            "Peer is not connected",
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::PeerMismatch { active_id } => {
+                        auth_log_limiter.warn(
+                            AuthTransport::Udp,
+                            peer_addr.clone(),
+                            AuthMessageType::GetStatus,
+                            AuthFailureKind::PeerMismatch,
+                            || {
+                                format!(
+                                    "rejecting GetStatus for token owned by active client {} from peer {}",
+                                    active_id, client_addr
+                                )
+                            },
+                        );
+                        send_udp_error_response(
+                            socket,
+                            client_addr,
+                            ErrorCode::InvalidMessage,
+                            &format!(
+                                "Peer {} does not own the active session {} for this token",
+                                client_addr, active_id
+                            ),
+                            seq,
+                        );
+                        return;
+                    },
+                    BridgePeerAuth::ClientIdMismatch { .. } => {
+                        unreachable!("get-status authorization does not compare client ids")
+                    },
+                }
+
                 // ✅ GetStatus 消息处理（UDP）
                 // UDP 地址可以直接使用 SocketAddr，无需转换字符串
 
@@ -2324,6 +2894,7 @@ impl Daemon {
             let device_state_clone = Arc::clone(&self.device_state);
             let clients_clone = Arc::clone(&self.clients);
             let stats_clone = Arc::clone(&self.stats);
+            let auth_log_limiter_clone = Arc::clone(&self.auth_log_limiter);
 
             thread::Builder::new()
                 .name("ipc_receive_uds".into())
@@ -2334,6 +2905,7 @@ impl Daemon {
                         device_state_clone,
                         clients_clone,
                         stats_clone,
+                        auth_log_limiter_clone,
                     );
                 })
                 .map_err(|e| {
@@ -2347,6 +2919,7 @@ impl Daemon {
             let device_state_clone = Arc::clone(&self.device_state);
             let clients_clone = Arc::clone(&self.clients);
             let stats_clone = Arc::clone(&self.stats);
+            let auth_log_limiter_clone = Arc::clone(&self.auth_log_limiter);
 
             thread::Builder::new()
                 .name("ipc_receive_udp".into())
@@ -2357,6 +2930,7 @@ impl Daemon {
                         device_state_clone,
                         clients_clone,
                         stats_clone,
+                        auth_log_limiter_clone,
                     );
                 })
                 .map_err(|e| {
@@ -2427,6 +3001,7 @@ mod tests {
         device_state: Arc<DeviceStateCell>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
+        auth_log_limiter: Arc<AuthLogLimiter>,
     }
 
     fn test_ipc_context() -> TestIpcContext {
@@ -2435,6 +3010,7 @@ mod tests {
             device_state: Arc::new(DeviceStateCell::new(DeviceState::Connected)),
             clients: Arc::new(RwLock::new(ClientManager::new())),
             stats: Arc::new(RwLock::new(DaemonStats::new())),
+            auth_log_limiter: Arc::new(AuthLogLimiter::new(AUTH_LOG_WINDOW)),
         }
     }
 
@@ -2444,7 +3020,12 @@ mod tests {
             device_state: &test_ctx.device_state,
             clients: &test_ctx.clients,
             stats: &test_ctx.stats,
+            auth_log_limiter: &test_ctx.auth_log_limiter,
         }
+    }
+
+    fn test_token(byte: u8) -> SessionToken {
+        SessionToken::new([byte; 16])
     }
 
     fn recv_udp_protocol_message(socket: &std::net::UdpSocket) -> Message {
@@ -2496,6 +3077,64 @@ mod tests {
             self.sends.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_auth_log_limiter_rate_limits_repeated_failures() {
+        let limiter = AuthLogLimiter::new(Duration::from_secs(1));
+        let peer = ClientAddr::Udp("127.0.0.1:9999".parse().unwrap());
+
+        limiter.warn(
+            AuthTransport::Udp,
+            peer.clone(),
+            AuthMessageType::Heartbeat,
+            AuthFailureKind::NotConnected,
+            || "first".to_string(),
+        );
+        limiter.warn(
+            AuthTransport::Udp,
+            peer.clone(),
+            AuthMessageType::Heartbeat,
+            AuthFailureKind::NotConnected,
+            || "second".to_string(),
+        );
+        limiter.warn(
+            AuthTransport::Udp,
+            peer.clone(),
+            AuthMessageType::Heartbeat,
+            AuthFailureKind::NotConnected,
+            || "third".to_string(),
+        );
+
+        let key = AuthLogKey {
+            transport: AuthTransport::Udp,
+            peer: peer.clone(),
+            message_type: AuthMessageType::Heartbeat,
+            failure: AuthFailureKind::NotConnected,
+        };
+        {
+            let states = limiter.states.lock().unwrap();
+            let state = states.get(&key).unwrap();
+            assert_eq!(state.suppressed, 2);
+        }
+
+        {
+            let mut states = limiter.states.lock().unwrap();
+            let state = states.get_mut(&key).unwrap();
+            state.last_logged_at = Instant::now() - Duration::from_secs(2);
+        }
+
+        limiter.warn(
+            AuthTransport::Udp,
+            peer,
+            AuthMessageType::Heartbeat,
+            AuthFailureKind::NotConnected,
+            || "after-window".to_string(),
+        );
+
+        let states = limiter.states.lock().unwrap();
+        let state = states.get(&key).unwrap();
+        assert_eq!(state.suppressed, 0);
     }
 
     #[test]
@@ -2553,6 +3192,7 @@ mod tests {
         Daemon::handle_ipc_message_udp(
             Message::Connect {
                 client_id: 0,
+                session_token: test_token(1),
                 filters: vec![],
                 seq: 77,
             },
@@ -2598,6 +3238,7 @@ mod tests {
         Daemon::handle_ipc_message(
             Message::Connect {
                 client_id: 0,
+                session_token: test_token(2),
                 filters: vec![],
                 seq: 88,
             },
@@ -2646,6 +3287,7 @@ mod tests {
         Daemon::handle_ipc_message(
             Message::Connect {
                 client_id: 0,
+                session_token: test_token(3),
                 filters: vec![],
                 seq: 101,
             },
@@ -2680,6 +3322,7 @@ mod tests {
         Daemon::handle_ipc_message(
             Message::Connect {
                 client_id: 0,
+                session_token: test_token(4),
                 filters: vec![],
                 seq: 102,
             },
@@ -2722,42 +3365,32 @@ mod tests {
         assert!(client_addr.as_pathname().is_none());
 
         Daemon::handle_ipc_message(
-            Message::GetStatus { seq: 11 },
-            client_addr.clone(),
-            IpcHandlerContext {
-                tx_adapter: &test_ctx.tx_adapter,
-                device_state: &test_ctx.device_state,
-                clients: &test_ctx.clients,
-                stats: &test_ctx.stats,
+            Message::GetStatus {
+                session_token: test_token(5),
+                seq: 11,
             },
+            client_addr.clone(),
+            test_handler_ctx(&test_ctx),
             &server,
         );
         Daemon::handle_ipc_message(
             Message::SendFrame {
+                session_token: test_token(6),
                 frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
                 seq: 12,
             },
             client_addr.clone(),
-            IpcHandlerContext {
-                tx_adapter: &test_ctx.tx_adapter,
-                device_state: &test_ctx.device_state,
-                clients: &test_ctx.clients,
-                stats: &test_ctx.stats,
-            },
+            test_handler_ctx(&test_ctx),
             &server,
         );
         Daemon::handle_ipc_message(
             Message::Disconnect {
                 client_id: 7,
+                session_token: test_token(7),
                 seq: 13,
             },
             client_addr,
-            IpcHandlerContext {
-                tx_adapter: &test_ctx.tx_adapter,
-                device_state: &test_ctx.device_state,
-                clients: &test_ctx.clients,
-                stats: &test_ctx.stats,
-            },
+            test_handler_ctx(&test_ctx),
             &server,
         );
 
@@ -2782,19 +3415,33 @@ mod tests {
         let addr_a = peer_a.local_addr().unwrap();
         let addr_b = peer_b.local_addr().unwrap();
         let addr_c = peer_c.local_addr().unwrap();
+        let token_peer_a_old = test_token(10);
+        let token_peer_b = test_token(11);
+        let token_peer_a_active = test_token(12);
+        let token_unregistered = test_token(13);
 
         let filters = vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
             0x100, 0x1ff,
         )];
         {
             let mut clients = test_ctx.clients.write().unwrap();
-            clients.register(7, ClientAddr::Udp(addr_a), filters.clone()).unwrap();
-            clients.register(8, ClientAddr::Udp(addr_b), vec![]).unwrap();
+            clients
+                .register_with_token(
+                    7,
+                    ClientAddr::Udp(addr_a),
+                    token_peer_a_old,
+                    filters.clone(),
+                )
+                .unwrap();
+            clients
+                .register_with_token(8, ClientAddr::Udp(addr_b), token_peer_b, vec![])
+                .unwrap();
 
             let prepared = clients
                 .prepare_registration_manual(
                     17,
                     ClientAddr::Udp(addr_a),
+                    token_peer_a_active,
                     filters.clone(),
                     #[cfg(unix)]
                     None,
@@ -2812,7 +3459,10 @@ mod tests {
         let last_active_before = test_ctx.clients.read().unwrap().last_active_for(17).unwrap();
 
         Daemon::handle_ipc_message_udp(
-            Message::Heartbeat { client_id: 17 },
+            Message::Heartbeat {
+                client_id: 17,
+                session_token: token_peer_a_active,
+            },
             addr_b,
             test_handler_ctx(&test_ctx),
             &server,
@@ -2823,7 +3473,10 @@ mod tests {
         );
 
         Daemon::handle_ipc_message_udp(
-            Message::Heartbeat { client_id: 7 },
+            Message::Heartbeat {
+                client_id: 7,
+                session_token: token_peer_a_active,
+            },
             addr_a,
             test_handler_ctx(&test_ctx),
             &server,
@@ -2836,9 +3489,11 @@ mod tests {
         Daemon::handle_ipc_message_udp(
             Message::SetFilter {
                 client_id: 17,
+                session_token: token_peer_a_active,
                 filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
                     0x300, 0x3ff,
                 )],
+                seq: 0,
             },
             addr_b,
             test_handler_ctx(&test_ctx),
@@ -2852,9 +3507,11 @@ mod tests {
         Daemon::handle_ipc_message_udp(
             Message::SetFilter {
                 client_id: 7,
+                session_token: token_peer_a_active,
                 filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
                     0x400, 0x4ff,
                 )],
+                seq: 0,
             },
             addr_a,
             test_handler_ctx(&test_ctx),
@@ -2868,6 +3525,7 @@ mod tests {
         Daemon::handle_ipc_message_udp(
             Message::Disconnect {
                 client_id: 17,
+                session_token: token_peer_a_active,
                 seq: 41,
             },
             addr_b,
@@ -2886,6 +3544,7 @@ mod tests {
         Daemon::handle_ipc_message_udp(
             Message::Disconnect {
                 client_id: 7,
+                session_token: token_peer_a_active,
                 seq: 42,
             },
             addr_a,
@@ -2904,6 +3563,7 @@ mod tests {
 
         Daemon::handle_ipc_message_udp(
             Message::SendFrame {
+                session_token: token_unregistered,
                 frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
                 seq: 43,
             },
@@ -2922,6 +3582,7 @@ mod tests {
 
         Daemon::handle_ipc_message_udp(
             Message::SendFrame {
+                session_token: token_peer_a_active,
                 frame: piper_can::PiperFrame::new_standard(0x124, &[4, 5, 6]),
                 seq: 44,
             },
@@ -2937,6 +3598,37 @@ mod tests {
             other => panic!("unexpected message: {:?}", other),
         }
         assert_eq!(send_count.load(Ordering::Relaxed), 1);
+
+        Daemon::handle_ipc_message_udp(
+            Message::GetStatus {
+                session_token: token_unregistered,
+                seq: 45,
+            },
+            addr_c,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_udp_protocol_message(&peer_c) {
+            Message::Error { seq, code, .. } => {
+                assert_eq!(seq, 45);
+                assert_eq!(code, ErrorCode::NotConnected);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+
+        Daemon::handle_ipc_message_udp(
+            Message::GetStatus {
+                session_token: token_peer_a_active,
+                seq: 46,
+            },
+            addr_a,
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_udp_protocol_message(&peer_a) {
+            Message::StatusResponse { seq, .. } => assert_eq!(seq, 46),
+            other => panic!("unexpected message: {:?}", other),
+        }
     }
 
     #[cfg(unix)]
@@ -2966,6 +3658,10 @@ mod tests {
 
         let peer_a_key = ClientAddr::Unix(peer_a_path.clone());
         let peer_b_key = ClientAddr::Unix(peer_b_path.clone());
+        let token_peer_a_old = test_token(20);
+        let token_peer_b = test_token(21);
+        let token_peer_a_active = test_token(22);
+        let token_unregistered = test_token(23);
         let filters = vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
             0x100, 0x1ff,
         )];
@@ -2975,13 +3671,20 @@ mod tests {
                 .prepare_registration_manual(
                     7,
                     peer_a_key.clone(),
+                    token_peer_a_old,
                     filters.clone(),
                     Some(addr_a.clone()),
                 )
                 .unwrap();
             clients.commit_prepared_registration(prepared);
             let prepared = clients
-                .prepare_registration_manual(8, peer_b_key.clone(), vec![], Some(addr_b.clone()))
+                .prepare_registration_manual(
+                    8,
+                    peer_b_key.clone(),
+                    token_peer_b,
+                    vec![],
+                    Some(addr_b.clone()),
+                )
                 .unwrap();
             clients.commit_prepared_registration(prepared);
 
@@ -2989,6 +3692,7 @@ mod tests {
                 .prepare_registration_manual(
                     17,
                     peer_a_key.clone(),
+                    token_peer_a_active,
                     filters.clone(),
                     Some(addr_a.clone()),
                 )
@@ -3005,7 +3709,10 @@ mod tests {
         let last_active_before = test_ctx.clients.read().unwrap().last_active_for(17).unwrap();
 
         Daemon::handle_ipc_message(
-            Message::Heartbeat { client_id: 17 },
+            Message::Heartbeat {
+                client_id: 17,
+                session_token: token_peer_a_active,
+            },
             addr_b.clone(),
             test_handler_ctx(&test_ctx),
             &server,
@@ -3016,7 +3723,10 @@ mod tests {
         );
 
         Daemon::handle_ipc_message(
-            Message::Heartbeat { client_id: 7 },
+            Message::Heartbeat {
+                client_id: 7,
+                session_token: token_peer_a_active,
+            },
             addr_a.clone(),
             test_handler_ctx(&test_ctx),
             &server,
@@ -3029,9 +3739,11 @@ mod tests {
         Daemon::handle_ipc_message(
             Message::SetFilter {
                 client_id: 17,
+                session_token: token_peer_a_active,
                 filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
                     0x300, 0x3ff,
                 )],
+                seq: 0,
             },
             addr_b.clone(),
             test_handler_ctx(&test_ctx),
@@ -3045,9 +3757,11 @@ mod tests {
         Daemon::handle_ipc_message(
             Message::SetFilter {
                 client_id: 7,
+                session_token: token_peer_a_active,
                 filters: vec![piper_can::gs_usb_udp::protocol::CanIdFilter::new(
                     0x400, 0x4ff,
                 )],
+                seq: 0,
             },
             addr_a.clone(),
             test_handler_ctx(&test_ctx),
@@ -3061,6 +3775,7 @@ mod tests {
         Daemon::handle_ipc_message(
             Message::Disconnect {
                 client_id: 17,
+                session_token: token_peer_a_active,
                 seq: 51,
             },
             addr_b.clone(),
@@ -3079,6 +3794,7 @@ mod tests {
         Daemon::handle_ipc_message(
             Message::Disconnect {
                 client_id: 7,
+                session_token: token_peer_a_active,
                 seq: 52,
             },
             addr_a.clone(),
@@ -3097,6 +3813,7 @@ mod tests {
 
         Daemon::handle_ipc_message(
             Message::SendFrame {
+                session_token: token_unregistered,
                 frame: piper_can::PiperFrame::new_standard(0x123, &[1, 2, 3]),
                 seq: 53,
             },
@@ -3115,10 +3832,11 @@ mod tests {
 
         Daemon::handle_ipc_message(
             Message::SendFrame {
+                session_token: token_peer_a_active,
                 frame: piper_can::PiperFrame::new_standard(0x124, &[4, 5, 6]),
                 seq: 54,
             },
-            addr_a,
+            addr_a.clone(),
             test_handler_ctx(&test_ctx),
             &server,
         );
@@ -3130,6 +3848,37 @@ mod tests {
             other => panic!("unexpected message: {:?}", other),
         }
         assert_eq!(send_count.load(Ordering::Relaxed), 1);
+
+        Daemon::handle_ipc_message(
+            Message::GetStatus {
+                session_token: token_unregistered,
+                seq: 55,
+            },
+            addr_c.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_unix_protocol_message(&peer_c) {
+            Message::Error { seq, code, .. } => {
+                assert_eq!(seq, 55);
+                assert_eq!(code, ErrorCode::NotConnected);
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+
+        Daemon::handle_ipc_message(
+            Message::GetStatus {
+                session_token: token_peer_a_active,
+                seq: 56,
+            },
+            addr_a.clone(),
+            test_handler_ctx(&test_ctx),
+            &server,
+        );
+        match recv_unix_protocol_message(&peer_a) {
+            Message::StatusResponse { seq, .. } => assert_eq!(seq, 56),
+            other => panic!("unexpected message: {:?}", other),
+        }
 
         for path in [&server_path, &peer_a_path, &peer_b_path, &peer_c_path] {
             let _ = std::fs::remove_file(path);

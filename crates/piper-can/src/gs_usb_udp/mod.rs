@@ -11,7 +11,7 @@
 pub mod protocol;
 
 use crate::{CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame};
-use protocol::{CanIdFilter, Message, normalize_wire_seq};
+use protocol::{CanIdFilter, Message, SessionToken, normalize_wire_seq};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 #[cfg(unix)]
@@ -50,6 +50,7 @@ fn receive_step_timeout(remaining: Duration) -> Duration {
 /// daemon 会话的共享状态。
 struct DaemonSession {
     client_id: AtomicU32,
+    session_token: SessionToken,
     daemon_addr: DaemonAddr,
     socket: Arc<Socket>,
     bridge_timeout: Duration,
@@ -156,12 +157,14 @@ impl Socket {
 impl DaemonSession {
     fn new(
         daemon_addr: DaemonAddr,
+        session_token: SessionToken,
         socket: Arc<Socket>,
         bridge_timeout: Duration,
         #[cfg(unix)] client_socket_path: Option<PathBuf>,
     ) -> Self {
         Self {
             client_id: AtomicU32::new(0),
+            session_token,
             daemon_addr,
             socket,
             bridge_timeout,
@@ -209,6 +212,7 @@ impl DaemonSession {
         self.heartbeat_stop.store(false, Ordering::Release);
 
         let client_id = self.client_id.load(Ordering::Acquire);
+        let session_token = self.session_token;
         let bridge_timeout = self.bridge_timeout;
         let socket = Arc::clone(&self.socket);
         let stop_flag = Arc::clone(&self.heartbeat_stop);
@@ -217,7 +221,7 @@ impl DaemonSession {
         let handle = thread::Builder::new()
             .name("heartbeat".into())
             .spawn(move || {
-                let mut buf = [0u8; 12];
+                let mut buf = [0u8; 28];
                 let heartbeat_interval = Duration::from_secs(5);
                 let stop_poll_interval = if bridge_timeout.is_zero() {
                     Duration::from_millis(1)
@@ -229,7 +233,7 @@ impl DaemonSession {
                         return;
                     }
 
-                    let encoded = protocol::encode_heartbeat(client_id, 0, &mut buf);
+                    let encoded = protocol::encode_heartbeat(client_id, session_token, 0, &mut buf);
                     match socket.send_to_peer(encoded) {
                         Ok(()) => {},
                         Err(_) => {
@@ -277,10 +281,14 @@ impl DaemonSession {
             return Ok(());
         }
 
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 28];
         let seq = self.next_wire_seq();
-        let encoded =
-            protocol::encode_disconnect(self.client_id.load(Ordering::Acquire), seq, &mut buf);
+        let encoded = protocol::encode_disconnect(
+            self.client_id.load(Ordering::Acquire),
+            self.session_token,
+            seq,
+            &mut buf,
+        );
         self.send_to_peer(encoded)
     }
 }
@@ -350,8 +358,11 @@ fn send_frame_and_wait_ack(
 
     let seq = session.next_wire_seq();
     let mut buf = [0u8; 64];
-    let encoded = protocol::encode_send_frame_with_seq(&frame, seq, &mut buf)
-        .map_err(|err| CanError::Device(format!("Failed to encode send frame: {err:?}").into()))?;
+    let encoded =
+        protocol::encode_send_frame_with_seq(&frame, session.session_token, seq, &mut buf)
+            .map_err(|err| {
+                CanError::Device(format!("Failed to encode send frame: {err:?}").into())
+            })?;
 
     if let Err(error) = session.send_to_peer(encoded) {
         mark_session_lost(session, rx_buffer);
@@ -536,8 +547,11 @@ impl GsUsbUdpAdapter {
 
         let seq = self.session.next_wire_seq();
         let mut buf = [0u8; 256];
-        let encoded = protocol::encode_connect(0, &filters, seq, &mut buf)
-            .map_err(|err| CanError::Device(format!("Failed to encode connect: {err:?}").into()))?;
+        let encoded =
+            protocol::encode_connect(0, self.session.session_token, &filters, seq, &mut buf)
+                .map_err(|err| {
+                    CanError::Device(format!("Failed to encode connect: {err:?}").into())
+                })?;
         if let Err(error) = self.session.send_to_peer(encoded) {
             mark_session_lost(&self.session, &mut self.rx_buffer);
             return Err(error);
@@ -630,7 +644,11 @@ impl GsUsbUdpAdapter {
     /// 创建新的适配器（UDS）
     #[cfg(unix)]
     pub fn new_uds(uds_path: impl AsRef<str>) -> Result<Self, CanError> {
-        Self::new_uds_with_timeout(uds_path, DEFAULT_BRIDGE_TIMEOUT)
+        Self::new_uds_with_timeout_and_token(
+            uds_path,
+            DEFAULT_BRIDGE_TIMEOUT,
+            SessionToken::random(),
+        )
     }
 
     /// 创建新的适配器（UDS，自定义 bridge timeout）
@@ -638,6 +656,16 @@ impl GsUsbUdpAdapter {
     pub fn new_uds_with_timeout(
         uds_path: impl AsRef<str>,
         bridge_timeout: Duration,
+    ) -> Result<Self, CanError> {
+        Self::new_uds_with_timeout_and_token(uds_path, bridge_timeout, SessionToken::random())
+    }
+
+    /// 创建新的适配器（UDS，自定义 bridge timeout + 固定 logical session token）
+    #[cfg(unix)]
+    pub fn new_uds_with_timeout_and_token(
+        uds_path: impl AsRef<str>,
+        bridge_timeout: Duration,
+        session_token: SessionToken,
     ) -> Result<Self, CanError> {
         let receive_timeout = Duration::from_millis(2);
         let client_socket_path = unique_client_socket_path();
@@ -653,6 +681,7 @@ impl GsUsbUdpAdapter {
 
         let session = Arc::new(DaemonSession::new(
             DaemonAddr::Unix(uds_path.as_ref().to_string()),
+            session_token,
             socket,
             bridge_timeout,
             Some(client_socket_path),
@@ -667,13 +696,26 @@ impl GsUsbUdpAdapter {
 
     /// 创建新的适配器（UDP）
     pub fn new_udp(udp_addr: impl AsRef<str>) -> Result<Self, CanError> {
-        Self::new_udp_with_timeout(udp_addr, DEFAULT_BRIDGE_TIMEOUT)
+        Self::new_udp_with_timeout_and_token(
+            udp_addr,
+            DEFAULT_BRIDGE_TIMEOUT,
+            SessionToken::random(),
+        )
     }
 
     /// 创建新的适配器（UDP，自定义 bridge timeout）
     pub fn new_udp_with_timeout(
         udp_addr: impl AsRef<str>,
         bridge_timeout: Duration,
+    ) -> Result<Self, CanError> {
+        Self::new_udp_with_timeout_and_token(udp_addr, bridge_timeout, SessionToken::random())
+    }
+
+    /// 创建新的适配器（UDP，自定义 bridge timeout + 固定 logical session token）
+    pub fn new_udp_with_timeout_and_token(
+        udp_addr: impl AsRef<str>,
+        bridge_timeout: Duration,
+        session_token: SessionToken,
     ) -> Result<Self, CanError> {
         let receive_timeout = Duration::from_millis(2);
         let addr: SocketAddr = udp_addr
@@ -688,6 +730,7 @@ impl GsUsbUdpAdapter {
 
         let session = Arc::new(DaemonSession::new(
             DaemonAddr::Udp(addr),
+            session_token,
             socket,
             bridge_timeout,
             #[cfg(unix)]
@@ -769,6 +812,8 @@ impl CanAdapter for GsUsbUdpAdapter {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    const TEST_SESSION_TOKEN: SessionToken = SessionToken::new([0xCD; protocol::SESSION_TOKEN_LEN]);
 
     fn adapter_or_skip(
         result: Result<GsUsbUdpAdapter, CanError>,
@@ -965,6 +1010,7 @@ mod tests {
 
         let session = DaemonSession::new(
             DaemonAddr::Unix(missing_daemon_path.to_string_lossy().to_string()),
+            TEST_SESSION_TOKEN,
             socket,
             Duration::from_millis(20),
             Some(client_socket_path.clone()),
@@ -1006,7 +1052,7 @@ mod tests {
                         server.send_to(encoded, addr).unwrap();
                         ready_tx.send(()).unwrap();
                     },
-                    Message::SendFrame { seq, frame } => {
+                    Message::SendFrame { seq, frame, .. } => {
                         let mut ack_buf = [0u8; 12];
                         let encoded = protocol::encode_send_ack(seq, 0, &mut ack_buf);
                         server.send_to(encoded, addr).unwrap();
@@ -1090,7 +1136,7 @@ mod tests {
                             break;
                         }
                     },
-                    Message::Heartbeat { client_id } => {
+                    Message::Heartbeat { client_id, .. } => {
                         assert_eq!(client_id, 42);
                     },
                     other => panic!("unexpected message: {:?}", other),
@@ -1109,6 +1155,68 @@ mod tests {
         adapter.send(PiperFrame::new_standard(0x322, &[5, 6, 7, 8])).unwrap();
 
         assert_eq!(adapter.session.seq_counter.load(Ordering::Relaxed), 1);
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_gs_usb_udp_reconnect_reuses_same_logical_session_token_across_new_peer() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let session_token = TEST_SESSION_TOKEN;
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let mut first_peer = None;
+            let mut connects_seen = 0;
+
+            while let Ok((len, addr)) = server.recv_from(&mut buf) {
+                match protocol::decode_message(&buf[..len]).unwrap() {
+                    Message::Connect {
+                        session_token: token,
+                        seq,
+                        ..
+                    } => {
+                        assert_eq!(token, session_token);
+                        if let Some(first_peer) = first_peer {
+                            assert_ne!(addr, first_peer);
+                        } else {
+                            first_peer = Some(addr);
+                        }
+                        let mut ack_buf = [0u8; 13];
+                        let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
+                        server.send_to(encoded, addr).unwrap();
+                        connects_seen += 1;
+                        if connects_seen == 2 {
+                            break;
+                        }
+                    },
+                    Message::Disconnect { .. } | Message::Heartbeat { .. } => {},
+                    other => panic!("unexpected message: {:?}", other),
+                }
+            }
+        });
+
+        let mut adapter = GsUsbUdpAdapter::new_udp_with_timeout_and_token(
+            server_addr.to_string(),
+            Duration::from_millis(40),
+            session_token,
+        )
+        .unwrap();
+        adapter.connect(vec![]).unwrap();
+        let first_local_addr = udp_local_addr(&adapter);
+        drop(adapter);
+
+        let mut adapter = GsUsbUdpAdapter::new_udp_with_timeout_and_token(
+            server_addr.to_string(),
+            Duration::from_millis(40),
+            session_token,
+        )
+        .unwrap();
+        let second_local_addr = udp_local_addr(&adapter);
+        assert_ne!(first_local_addr, second_local_addr);
+        adapter.connect(vec![]).unwrap();
 
         server_handle.join().unwrap();
     }

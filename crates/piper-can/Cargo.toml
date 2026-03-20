@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true, optional = true }
+rand = { workspace = true }
 
 # ⚠️ 重要：平台特定依赖
 # Linux: socketcan 和 nix 始终可用（非 optional），由 cfg 控制是否编译模块

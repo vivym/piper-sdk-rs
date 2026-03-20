@@ -161,6 +161,9 @@ pub trait CanAdapter {
 `SendAck/Error(seq)`，session 会 fail-closed 并要求显式 `reconnect()`。
 UDS 模式仅支持 pathname Unix datagram client；abstract namespace 或 non-UTF8
 peer 会被 daemon 侧直接拒绝。
+bridge session 现在由显式 `SessionToken([u8; 16])` 标识；默认构造函数会自动生成随机
+token，而 `new_udp_with_timeout_and_token` / `new_uds_with_timeout_and_token` 允许调用方
+提供稳定 token，以便跨进程或地址变化时立即替换旧 logical session。
 
 ### 分离适配器（Splittable Adapter）
 

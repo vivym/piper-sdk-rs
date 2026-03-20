@@ -4,7 +4,7 @@
 //!
 //! 参考：`daemon_implementation_plan.md` 第 4.1.5 节
 
-use piper_can::gs_usb_udp::protocol::CanIdFilter;
+use piper_can::gs_usb_udp::protocol::{CanIdFilter, SessionToken};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -29,6 +29,9 @@ pub struct Client {
 
     /// 客户端地址（用于 UDS/UDP 回复，用于 Hash）
     pub addr: ClientAddr,
+
+    /// 逻辑 session token（wire-level identity）
+    pub session_token: SessionToken,
 
     /// 最后活动时间
     pub last_active: Instant,
@@ -83,8 +86,9 @@ impl Client {
 pub struct PreparedRegistration {
     id: u32,
     addr: ClientAddr,
+    session_token: SessionToken,
     filters: Vec<CanIdFilter>,
-    replaced_client_id: Option<u32>,
+    replaced_client_ids: Vec<u32>,
     #[cfg(unix)]
     unix_addr: Option<std::os::unix::net::SocketAddr>,
 }
@@ -118,6 +122,7 @@ impl std::error::Error for ClientError {}
 pub enum BridgePeerAuth {
     NotConnected,
     Authorized { active_id: u32 },
+    PeerMismatch { active_id: u32 },
     ClientIdMismatch { active_id: u32 },
 }
 
@@ -126,7 +131,9 @@ pub struct ClientManager {
     clients: HashMap<u32, Client>,
     pending_ids: HashSet<u32>,
     pending_addrs: HashSet<ClientAddr>,
+    pending_tokens: HashSet<SessionToken>,
     addr_to_id: HashMap<ClientAddr, u32>,
+    token_to_id: HashMap<SessionToken, u32>,
     /// 客户端 ID 生成器（线程安全，单调递增）
     /// 从 1 开始（0 保留为无效 ID），溢出后从 1 重新开始
     next_id: AtomicU32,
@@ -145,7 +152,9 @@ impl ClientManager {
             clients: HashMap::new(),
             pending_ids: HashSet::new(),
             pending_addrs: HashSet::new(),
+            pending_tokens: HashSet::new(),
             addr_to_id: HashMap::new(),
+            token_to_id: HashMap::new(),
             next_id: AtomicU32::new(1), // 从 1 开始（0 保留为无效 ID）
             timeout: Duration::from_secs(30),
             #[cfg(unix)]
@@ -159,7 +168,9 @@ impl ClientManager {
             clients: HashMap::new(),
             pending_ids: HashSet::new(),
             pending_addrs: HashSet::new(),
+            pending_tokens: HashSet::new(),
             addr_to_id: HashMap::new(),
+            token_to_id: HashMap::new(),
             next_id: AtomicU32::new(1), // 从 1 开始（0 保留为无效 ID）
             timeout,
             #[cfg(unix)]
@@ -189,10 +200,16 @@ impl ClientManager {
         }
     }
 
-    fn build_client(id: u32, addr: ClientAddr, filters: Vec<CanIdFilter>) -> Client {
+    fn build_client(
+        id: u32,
+        addr: ClientAddr,
+        session_token: SessionToken,
+        filters: Vec<CanIdFilter>,
+    ) -> Client {
         Client {
             id,
             addr,
+            session_token,
             last_active: Instant::now(),
             filters,
             consecutive_errors: AtomicU32::new(0),
@@ -210,6 +227,9 @@ impl ClientManager {
         if self.addr_to_id.get(&client.addr).copied() == Some(id) {
             self.addr_to_id.remove(&client.addr);
         }
+        if self.token_to_id.get(&client.session_token).copied() == Some(id) {
+            self.token_to_id.remove(&client.session_token);
+        }
         #[cfg(unix)]
         {
             self.unix_addr_map.remove(&id);
@@ -221,18 +241,31 @@ impl ClientManager {
         self.pending_addrs.contains(addr)
     }
 
+    fn pending_token_conflicts(&self, session_token: SessionToken) -> bool {
+        self.pending_tokens.contains(&session_token)
+    }
+
     /// 为自动分配 ID 的客户端保留注册槽位，但暂不加入广播列表。
     pub fn prepare_registration_auto(
         &mut self,
         addr: ClientAddr,
+        session_token: SessionToken,
         filters: Vec<CanIdFilter>,
         #[cfg(unix)] unix_addr: Option<std::os::unix::net::SocketAddr>,
     ) -> Result<PreparedRegistration, ClientError> {
-        if self.pending_addr_conflicts(&addr) {
+        if self.pending_addr_conflicts(&addr) || self.pending_token_conflicts(session_token) {
             return Err(ClientError::AlreadyExists);
         }
 
-        let replaced_client_id = self.addr_to_id.get(&addr).copied();
+        let mut replaced_client_ids = Vec::new();
+        if let Some(replaced_id) = self.addr_to_id.get(&addr).copied() {
+            replaced_client_ids.push(replaced_id);
+        }
+        if let Some(replaced_id) = self.token_to_id.get(&session_token).copied()
+            && !replaced_client_ids.contains(&replaced_id)
+        {
+            replaced_client_ids.push(replaced_id);
+        }
         let id = self.generate_client_id();
         let inserted = self.pending_ids.insert(id);
         debug_assert!(
@@ -244,12 +277,18 @@ impl ClientManager {
             inserted,
             "generated client addr should not already be pending"
         );
+        let inserted = self.pending_tokens.insert(session_token);
+        debug_assert!(
+            inserted,
+            "generated client token should not already be pending"
+        );
 
         Ok(PreparedRegistration {
             id,
             addr,
+            session_token,
             filters,
-            replaced_client_id,
+            replaced_client_ids,
             #[cfg(unix)]
             unix_addr,
         })
@@ -260,28 +299,43 @@ impl ClientManager {
         &mut self,
         id: u32,
         addr: ClientAddr,
+        session_token: SessionToken,
         filters: Vec<CanIdFilter>,
         #[cfg(unix)] unix_addr: Option<std::os::unix::net::SocketAddr>,
     ) -> Result<PreparedRegistration, ClientError> {
         if self.id_conflicts(id) {
             return Err(ClientError::AlreadyExists);
         }
-        if self.pending_addr_conflicts(&addr) {
+        if self.pending_addr_conflicts(&addr) || self.pending_token_conflicts(session_token) {
             return Err(ClientError::AlreadyExists);
         }
 
-        let replaced_client_id = self.addr_to_id.get(&addr).copied();
+        let mut replaced_client_ids = Vec::new();
+        if let Some(replaced_id) = self.addr_to_id.get(&addr).copied() {
+            replaced_client_ids.push(replaced_id);
+        }
+        if let Some(replaced_id) = self.token_to_id.get(&session_token).copied()
+            && !replaced_client_ids.contains(&replaced_id)
+        {
+            replaced_client_ids.push(replaced_id);
+        }
 
         let inserted = self.pending_ids.insert(id);
         debug_assert!(inserted, "manual client id should not already be pending");
         let inserted = self.pending_addrs.insert(addr.clone());
         debug_assert!(inserted, "manual client addr should not already be pending");
+        let inserted = self.pending_tokens.insert(session_token);
+        debug_assert!(
+            inserted,
+            "manual client token should not already be pending"
+        );
 
         Ok(PreparedRegistration {
             id,
             addr,
+            session_token,
             filters,
-            replaced_client_id,
+            replaced_client_ids,
             #[cfg(unix)]
             unix_addr,
         })
@@ -301,8 +355,13 @@ impl ClientManager {
             removed,
             "prepared registration must hold a pending address reservation before commit"
         );
+        let removed = self.pending_tokens.remove(&prepared.session_token);
+        debug_assert!(
+            removed,
+            "prepared registration must hold a pending token reservation before commit"
+        );
 
-        if let Some(replaced_id) = prepared.replaced_client_id {
+        for replaced_id in prepared.replaced_client_ids {
             self.remove_client_internal(replaced_id);
         }
 
@@ -312,9 +371,10 @@ impl ClientManager {
         }
 
         let addr = prepared.addr.clone();
+        let session_token = prepared.session_token;
         let replaced = self.clients.insert(
             prepared.id,
-            Self::build_client(prepared.id, prepared.addr, prepared.filters),
+            Self::build_client(prepared.id, prepared.addr, session_token, prepared.filters),
         );
         debug_assert!(
             replaced.is_none(),
@@ -325,12 +385,18 @@ impl ClientManager {
             previous.is_none(),
             "prepared registration should never leave duplicate active addrs"
         );
+        let previous = self.token_to_id.insert(session_token, prepared.id);
+        debug_assert!(
+            previous.is_none(),
+            "prepared registration should never leave duplicate active tokens"
+        );
     }
 
     /// 放弃已准备的客户端注册。
     pub fn abort_prepared_registration(&mut self, prepared: PreparedRegistration) {
         self.pending_ids.remove(&prepared.id);
         self.pending_addrs.remove(&prepared.addr);
+        self.pending_tokens.remove(&prepared.session_token);
     }
 
     /// 注册客户端（自动生成 ID）
@@ -342,8 +408,19 @@ impl ClientManager {
         addr: ClientAddr,
         filters: Vec<CanIdFilter>,
     ) -> Result<u32, ClientError> {
+        self.register_auto_with_token(addr, SessionToken::random(), filters)
+    }
+
+    #[cfg(test)]
+    pub fn register_auto_with_token(
+        &mut self,
+        addr: ClientAddr,
+        session_token: SessionToken,
+        filters: Vec<CanIdFilter>,
+    ) -> Result<u32, ClientError> {
         let prepared = self.prepare_registration_auto(
             addr,
+            session_token,
             filters,
             #[cfg(unix)]
             None,
@@ -361,9 +438,21 @@ impl ClientManager {
         addr: ClientAddr,
         filters: Vec<CanIdFilter>,
     ) -> Result<(), ClientError> {
+        self.register_with_token(id, addr, SessionToken::random(), filters)
+    }
+
+    #[cfg(test)]
+    pub fn register_with_token(
+        &mut self,
+        id: u32,
+        addr: ClientAddr,
+        session_token: SessionToken,
+        filters: Vec<CanIdFilter>,
+    ) -> Result<(), ClientError> {
         let prepared = self.prepare_registration_manual(
             id,
             addr,
+            session_token,
             filters,
             #[cfg(unix)]
             None,
@@ -378,14 +467,23 @@ impl ClientManager {
     }
 
     /// 按 active peer 地址校验 steady-state sender 身份
-    pub fn authorize_peer(
+    pub fn authorize_session(
         &self,
+        session_token: SessionToken,
         addr: &ClientAddr,
         claimed_client_id: Option<u32>,
     ) -> BridgePeerAuth {
-        let Some(active_id) = self.addr_to_id.get(addr).copied() else {
+        let Some(active_id) = self.token_to_id.get(&session_token).copied() else {
             return BridgePeerAuth::NotConnected;
         };
+
+        let Some(active_client) = self.clients.get(&active_id) else {
+            return BridgePeerAuth::NotConnected;
+        };
+
+        if &active_client.addr != addr {
+            return BridgePeerAuth::PeerMismatch { active_id };
+        }
 
         match claimed_client_id {
             Some(claimed_id) if claimed_id != active_id => {
@@ -468,8 +566,18 @@ impl ClientManager {
     }
 
     #[cfg(test)]
+    pub fn pending_token_contains(&self, session_token: SessionToken) -> bool {
+        self.pending_tokens.contains(&session_token)
+    }
+
+    #[cfg(test)]
     pub fn active_client_id_for_addr(&self, addr: &ClientAddr) -> Option<u32> {
         self.addr_to_id.get(addr).copied()
+    }
+
+    #[cfg(test)]
+    pub fn active_client_id_for_token(&self, session_token: SessionToken) -> Option<u32> {
+        self.token_to_id.get(&session_token).copied()
     }
 
     #[cfg(test)]
@@ -493,6 +601,10 @@ impl Default for ClientManager {
 mod tests {
     use super::*;
     use piper_can::gs_usb_udp::protocol::CanIdFilter;
+
+    fn test_token(byte: u8) -> SessionToken {
+        SessionToken::new([byte; 16])
+    }
 
     #[test]
     fn test_client_register() {
@@ -739,6 +851,7 @@ mod tests {
             .prepare_registration_manual(
                 7,
                 ClientAddr::Udp("127.0.0.1:9001".parse().unwrap()),
+                test_token(1),
                 vec![],
                 #[cfg(unix)]
                 None,
@@ -767,6 +880,7 @@ mod tests {
         let prepared = manager
             .prepare_registration_auto(
                 ClientAddr::Udp("127.0.0.1:9010".parse().unwrap()),
+                test_token(2),
                 vec![CanIdFilter::new(0x100, 0x1ff)],
                 #[cfg(unix)]
                 None,
@@ -790,6 +904,7 @@ mod tests {
         let first = manager
             .prepare_registration_auto(
                 ClientAddr::Udp("127.0.0.1:9020".parse().unwrap()),
+                test_token(3),
                 vec![],
                 #[cfg(unix)]
                 None,
@@ -798,6 +913,7 @@ mod tests {
         let second = manager
             .prepare_registration_auto(
                 ClientAddr::Udp("127.0.0.1:9021".parse().unwrap()),
+                test_token(4),
                 vec![],
                 #[cfg(unix)]
                 None,
@@ -817,6 +933,7 @@ mod tests {
         let prepared = manager
             .prepare_registration_auto(
                 addr.clone(),
+                test_token(5),
                 vec![],
                 #[cfg(unix)]
                 None,
@@ -828,6 +945,7 @@ mod tests {
             manager.prepare_registration_manual(
                 11,
                 addr.clone(),
+                test_token(6),
                 vec![],
                 #[cfg(unix)]
                 None,
@@ -840,24 +958,60 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_registration_rejects_pending_token_conflict() {
+        let mut manager = ClientManager::new();
+        let token = test_token(6);
+
+        let prepared = manager
+            .prepare_registration_auto(
+                ClientAddr::Udp("127.0.0.1:9031".parse().unwrap()),
+                token,
+                vec![],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
+
+        assert!(manager.pending_token_contains(token));
+        assert!(matches!(
+            manager.prepare_registration_auto(
+                ClientAddr::Udp("127.0.0.1:9032".parse().unwrap()),
+                token,
+                vec![],
+                #[cfg(unix)]
+                None,
+            ),
+            Err(ClientError::AlreadyExists)
+        ));
+
+        manager.abort_prepared_registration(prepared);
+        assert!(!manager.pending_token_contains(token));
+    }
+
+    #[test]
     fn test_commit_prepared_registration_replaces_existing_active_peer() {
         let mut manager = ClientManager::new();
         let addr = ClientAddr::Udp("127.0.0.1:9040".parse().unwrap());
 
-        let old_id = manager.register_auto(addr.clone(), vec![]).unwrap();
+        let old_id = manager.register_auto_with_token(addr.clone(), test_token(7), vec![]).unwrap();
         assert_eq!(manager.active_client_id_for_addr(&addr), Some(old_id));
+        assert_eq!(
+            manager.active_client_id_for_token(test_token(7)),
+            Some(old_id)
+        );
 
         let prepared = manager
             .prepare_registration_manual(
                 99,
                 addr.clone(),
+                test_token(8),
                 vec![CanIdFilter::new(0x100, 0x1ff)],
                 #[cfg(unix)]
                 None,
             )
             .unwrap();
 
-        assert_eq!(prepared.replaced_client_id, Some(old_id));
+        assert_eq!(prepared.replaced_client_ids, vec![old_id]);
 
         manager.commit_prepared_registration(prepared);
 
@@ -865,6 +1019,7 @@ mod tests {
         assert!(manager.contains(99));
         assert_eq!(manager.count(), 1);
         assert_eq!(manager.active_client_id_for_addr(&addr), Some(99));
+        assert_eq!(manager.active_client_id_for_token(test_token(8)), Some(99));
         assert_eq!(
             manager.iter().filter(|client| client.addr == addr).count(),
             1
@@ -876,11 +1031,12 @@ mod tests {
         let mut manager = ClientManager::new();
         let addr = ClientAddr::Udp("127.0.0.1:9050".parse().unwrap());
 
-        let old_id = manager.register_auto(addr.clone(), vec![]).unwrap();
+        let old_id = manager.register_auto_with_token(addr.clone(), test_token(9), vec![]).unwrap();
         let prepared = manager
             .prepare_registration_manual(
                 101,
                 addr.clone(),
+                test_token(10),
                 vec![],
                 #[cfg(unix)]
                 None,
@@ -895,13 +1051,45 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_prepared_registration_replaces_existing_active_token_on_new_peer() {
+        let mut manager = ClientManager::new();
+        let token = test_token(17);
+        let old_addr = ClientAddr::Udp("127.0.0.1:9051".parse().unwrap());
+        let new_addr = ClientAddr::Udp("127.0.0.1:9052".parse().unwrap());
+
+        let old_id = 7;
+        manager.register_with_token(old_id, old_addr.clone(), token, vec![]).unwrap();
+        assert_eq!(manager.active_client_id_for_token(token), Some(old_id));
+
+        let prepared = manager
+            .prepare_registration_manual(
+                8,
+                new_addr.clone(),
+                token,
+                vec![],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(prepared.replaced_client_ids, vec![old_id]);
+        manager.commit_prepared_registration(prepared);
+
+        assert!(!manager.contains(old_id));
+        assert_eq!(manager.active_client_id_for_token(token), Some(8));
+        assert_eq!(manager.active_client_id_for_addr(&new_addr), Some(8));
+        assert_eq!(manager.count(), 1);
+    }
+
+    #[test]
     fn test_authorize_peer_matching_id() {
         let mut manager = ClientManager::new();
         let addr = ClientAddr::Udp("127.0.0.1:9060".parse().unwrap());
-        manager.register(7, addr.clone(), vec![]).unwrap();
+        let token = test_token(11);
+        manager.register_with_token(7, addr.clone(), token, vec![]).unwrap();
 
         assert_eq!(
-            manager.authorize_peer(&addr, Some(7)),
+            manager.authorize_session(token, &addr, Some(7)),
             BridgePeerAuth::Authorized { active_id: 7 }
         );
     }
@@ -910,10 +1098,11 @@ mod tests {
     fn test_authorize_peer_mismatched_id() {
         let mut manager = ClientManager::new();
         let addr = ClientAddr::Udp("127.0.0.1:9061".parse().unwrap());
-        manager.register(7, addr.clone(), vec![]).unwrap();
+        let token = test_token(12);
+        manager.register_with_token(7, addr.clone(), token, vec![]).unwrap();
 
         assert_eq!(
-            manager.authorize_peer(&addr, Some(9)),
+            manager.authorize_session(token, &addr, Some(9)),
             BridgePeerAuth::ClientIdMismatch { active_id: 7 }
         );
     }
@@ -922,14 +1111,29 @@ mod tests {
     fn test_authorize_peer_not_connected() {
         let manager = ClientManager::new();
         let addr = ClientAddr::Udp("127.0.0.1:9062".parse().unwrap());
+        let token = test_token(13);
 
         assert_eq!(
-            manager.authorize_peer(&addr, Some(1)),
+            manager.authorize_session(token, &addr, Some(1)),
             BridgePeerAuth::NotConnected
         );
         assert_eq!(
-            manager.authorize_peer(&addr, None),
+            manager.authorize_session(token, &addr, None),
             BridgePeerAuth::NotConnected
+        );
+    }
+
+    #[test]
+    fn test_authorize_session_rejects_peer_mismatch() {
+        let mut manager = ClientManager::new();
+        let addr = ClientAddr::Udp("127.0.0.1:9064".parse().unwrap());
+        let other_addr = ClientAddr::Udp("127.0.0.1:9065".parse().unwrap());
+        let token = test_token(14);
+        manager.register_with_token(7, addr.clone(), token, vec![]).unwrap();
+
+        assert_eq!(
+            manager.authorize_session(token, &other_addr, Some(7)),
+            BridgePeerAuth::PeerMismatch { active_id: 7 }
         );
     }
 
@@ -938,11 +1142,14 @@ mod tests {
         let mut manager = ClientManager::new();
         let addr = ClientAddr::Udp("127.0.0.1:9063".parse().unwrap());
 
-        let old_id = manager.register_auto(addr.clone(), vec![]).unwrap();
+        let old_token = test_token(15);
+        let new_token = test_token(16);
+        let old_id = manager.register_auto_with_token(addr.clone(), old_token, vec![]).unwrap();
         let prepared = manager
             .prepare_registration_manual(
                 77,
                 addr.clone(),
+                new_token,
                 vec![],
                 #[cfg(unix)]
                 None,
@@ -950,23 +1157,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            manager.authorize_peer(&addr, Some(old_id)),
+            manager.authorize_session(old_token, &addr, Some(old_id)),
             BridgePeerAuth::Authorized { active_id: old_id }
         );
         assert_eq!(
-            manager.authorize_peer(&addr, Some(77)),
-            BridgePeerAuth::ClientIdMismatch { active_id: old_id }
+            manager.authorize_session(new_token, &addr, Some(77)),
+            BridgePeerAuth::NotConnected
         );
 
         manager.commit_prepared_registration(prepared);
 
         assert_eq!(
-            manager.authorize_peer(&addr, Some(77)),
+            manager.authorize_session(new_token, &addr, Some(77)),
             BridgePeerAuth::Authorized { active_id: 77 }
         );
         assert_eq!(
-            manager.authorize_peer(&addr, Some(old_id)),
-            BridgePeerAuth::ClientIdMismatch { active_id: 77 }
+            manager.authorize_session(old_token, &addr, Some(old_id)),
+            BridgePeerAuth::NotConnected
         );
     }
 }
