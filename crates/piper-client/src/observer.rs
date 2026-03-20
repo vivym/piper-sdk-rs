@@ -18,7 +18,7 @@
 //! # use piper_client::types::*;
 //! # fn example(observer: Observer) -> Result<()> {
 //! // 读取关节位置
-//! let positions = observer.joint_positions();
+//! let positions = observer.joint_positions()?;
 //! println!("J1 position: {}", positions[Joint::J1].to_deg());
 //!
 //! // 使用 control_snapshot 获取可直接用于闭环控制的数据
@@ -46,6 +46,9 @@ use piper_driver::{
     TimingCapability,
 };
 use piper_protocol::constants::*;
+
+const COMPLETE_COLD_GROUP_MASK: u8 = 0b111;
+const COMPLETE_DYNAMIC_GROUP_MASK: u8 = 0b11_1111;
 
 /// 状态观察器（只读接口，View 模式）
 ///
@@ -254,13 +257,16 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 默认只返回完整监控快照；如需查看半成品/诊断数据，请使用 `raw_joint_position_state()`。
+    /// 默认只返回完整监控快照；失败时只描述位置组自身的完整性。
+    /// 如需查看半成品/诊断数据，请使用 `raw_joint_position_state()`。
     pub fn joint_positions(&self) -> Result<JointArray<Rad>> {
         let joint_pos = self.driver.get_joint_position();
         if !joint_pos.is_fully_valid() {
-            return Err(RobotError::control_state_incomplete(
-                joint_pos.frame_valid_mask,
-                self.driver.get_joint_dynamic().valid_mask,
+            let raw_joint_pos = self.driver.get_raw_joint_position();
+            return Err(RobotError::monitor_state_incomplete(
+                MonitorStateSource::JointPosition,
+                raw_joint_pos.frame_valid_mask,
+                COMPLETE_COLD_GROUP_MASK,
             ));
         }
 
@@ -272,7 +278,8 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 该接口可能返回 timeout 提交的部分动态组，只适合监控/诊断。
+    /// 默认只返回完整监控快照；失败时只描述动态组自身的完整性。
+    /// 如需查看半成品/诊断数据，请使用 `raw_joint_dynamic_state()`。
     ///
     /// # 返回值
     ///
@@ -280,9 +287,11 @@ impl Observer {
     pub fn joint_velocities(&self) -> Result<JointArray<RadPerSecond>> {
         let dyn_state = self.driver.get_joint_dynamic();
         if !dyn_state.is_complete() {
-            return Err(RobotError::control_state_incomplete(
-                self.driver.get_joint_position().frame_valid_mask,
-                dyn_state.valid_mask,
+            let raw_dyn_state = self.driver.get_raw_joint_dynamic();
+            return Err(RobotError::monitor_state_incomplete(
+                MonitorStateSource::JointDynamic,
+                raw_dyn_state.valid_mask,
+                COMPLETE_DYNAMIC_GROUP_MASK,
             ));
         }
 
@@ -294,13 +303,16 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 默认只返回严格完整的动态组；如需查看半成品/诊断数据，请使用 `raw_joint_dynamic_state()`。
+    /// 默认只返回完整监控快照；失败时只描述动态组自身的完整性。
+    /// 如需查看半成品/诊断数据，请使用 `raw_joint_dynamic_state()`。
     pub fn joint_torques(&self) -> Result<JointArray<NewtonMeter>> {
         let dyn_state = self.driver.get_joint_dynamic();
         if !dyn_state.is_complete() {
-            return Err(RobotError::control_state_incomplete(
-                self.driver.get_joint_position().frame_valid_mask,
-                dyn_state.valid_mask,
+            let raw_dyn_state = self.driver.get_raw_joint_dynamic();
+            return Err(RobotError::monitor_state_incomplete(
+                MonitorStateSource::JointDynamic,
+                raw_dyn_state.valid_mask,
+                COMPLETE_DYNAMIC_GROUP_MASK,
             ));
         }
 
@@ -361,7 +373,9 @@ impl Observer {
         (driver_state.driver_enabled_mask & (1 << joint_index)) != 0
     }
 
-    /// 获取末端位姿（独立读取，可能与其他状态有时间偏斜）
+    /// 获取末端位姿（完整监控快照，可能与其他状态有时间偏斜）
+    ///
+    /// 失败时只描述末端位姿组自身是否完整；控制闭环不要使用此接口拼接多路状态。
     ///
     /// # 返回值
     ///
@@ -384,9 +398,11 @@ impl Observer {
     pub fn end_pose(&self) -> Result<piper_driver::state::EndPoseState> {
         let end_pose = self.driver.get_end_pose();
         if !end_pose.is_fully_valid() {
-            return Err(RobotError::control_state_incomplete(
-                self.driver.get_joint_position().frame_valid_mask,
-                self.driver.get_joint_dynamic().valid_mask,
+            let raw_end_pose = self.driver.get_raw_end_pose();
+            return Err(RobotError::monitor_state_incomplete(
+                MonitorStateSource::EndPose,
+                raw_end_pose.frame_valid_mask,
+                COMPLETE_COLD_GROUP_MASK,
             ));
         }
 
@@ -576,8 +592,8 @@ mod tests {
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_driver::TimingCapability;
     use piper_protocol::ids::{
-        ID_GRIPPER_FEEDBACK, ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12,
-        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
+        ID_END_POSE_1, ID_END_POSE_3, ID_GRIPPER_FEEDBACK, ID_JOINT_DRIVER_HIGH_SPEED_BASE,
+        ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
     };
     use std::collections::VecDeque;
     use std::thread;
@@ -762,6 +778,20 @@ mod tests {
         data[6] = 0b0100_0000;
 
         let mut frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn end_pose_frame(
+        can_id: u16,
+        first_raw: i32,
+        second_raw: i32,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&first_raw.to_be_bytes());
+        data[4..8].copy_from_slice(&second_raw.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(can_id, &data);
         frame.timestamp_us = timestamp_us;
         frame
     }
@@ -1057,6 +1087,129 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, RobotError::ControlStateIncomplete { .. }));
+    }
+
+    #[test]
+    fn test_joint_positions_report_monitor_state_incomplete() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let error = observer.joint_positions().expect_err("incomplete position group must fail");
+
+        assert!(matches!(
+            error,
+            RobotError::MonitorStateIncomplete {
+                source: MonitorStateSource::JointPosition,
+                valid_mask: 0b101,
+                required_mask: COMPLETE_COLD_GROUP_MASK,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_joint_velocities_report_monitor_state_incomplete() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 1000, timestamp_us),
+            joint_dynamic_frame(2, 0, 1000, timestamp_us),
+            joint_dynamic_frame(3, 0, 1000, timestamp_us),
+            joint_dynamic_frame(4, 0, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let error = observer.joint_velocities().expect_err("incomplete dynamic group must fail");
+
+        assert!(matches!(
+            error,
+            RobotError::MonitorStateIncomplete {
+                source: MonitorStateSource::JointDynamic,
+                valid_mask: 0b001111,
+                required_mask: COMPLETE_DYNAMIC_GROUP_MASK,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_joint_torques_report_monitor_state_incomplete() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 1000, timestamp_us),
+            joint_dynamic_frame(2, 0, 1000, timestamp_us),
+            joint_dynamic_frame(3, 0, 1000, timestamp_us),
+            joint_dynamic_frame(4, 0, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let error = observer.joint_torques().expect_err("incomplete dynamic group must fail");
+
+        assert!(matches!(
+            error,
+            RobotError::MonitorStateIncomplete {
+                source: MonitorStateSource::JointDynamic,
+                valid_mask: 0b001111,
+                required_mask: COMPLETE_DYNAMIC_GROUP_MASK,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_end_pose_reports_monitor_state_incomplete() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            end_pose_frame(ID_END_POSE_1 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_3 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 1000, timestamp_us),
+            joint_dynamic_frame(2, 0, 1000, timestamp_us),
+            joint_dynamic_frame(3, 0, 1000, timestamp_us),
+            joint_dynamic_frame(4, 0, 1000, timestamp_us),
+            joint_dynamic_frame(5, 0, 1000, timestamp_us),
+            joint_dynamic_frame(6, 0, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let error = observer.end_pose().expect_err("incomplete end-pose group must fail");
+
+        assert!(matches!(
+            error,
+            RobotError::MonitorStateIncomplete {
+                source: MonitorStateSource::EndPose,
+                valid_mask: 0b101,
+                required_mask: COMPLETE_COLD_GROUP_MASK,
+            }
+        ));
     }
 
     #[test]

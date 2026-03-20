@@ -34,6 +34,29 @@ use piper_protocol::{MitControlField, ProtocolError};
 use std::time::Duration;
 use thiserror::Error;
 
+/// 监控快照不完整的状态来源
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorStateSource {
+    /// 关节位置组（0x2A5-0x2A7）
+    JointPosition,
+    /// 末端位姿组（0x2A2-0x2A4）
+    EndPose,
+    /// 关节动态组（J1-J6 高速反馈）
+    JointDynamic,
+}
+
+impl std::fmt::Display for MonitorStateSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JointPosition => f.write_str("joint position"),
+            Self::EndPose => f.write_str("end pose"),
+            Self::JointDynamic => f.write_str("joint dynamic"),
+        }
+    }
+}
+
+impl std::error::Error for MonitorStateSource {}
+
 /// 机器人错误类型
 ///
 /// 分层错误类型，支持致命错误和可恢复错误的区分。
@@ -107,6 +130,19 @@ pub enum RobotError {
         position_frame_valid_mask: u8,
         /// 动态反馈组有效性掩码（J1-J6）
         dynamic_valid_mask: u8,
+    },
+
+    /// 监控/诊断读取到的不完整状态
+    #[error(
+        "Monitor state incomplete for {source}: valid mask {valid_mask:b}, required mask {required_mask:b}"
+    )]
+    MonitorStateIncomplete {
+        /// 不完整状态的来源
+        source: MonitorStateSource,
+        /// 当前有效掩码
+        valid_mask: u8,
+        /// 所需完整掩码
+        required_mask: u8,
     },
 
     /// 当前后端不支持主机侧实时闭环
@@ -287,6 +323,7 @@ impl RobotError {
                 | Self::FeedbackStale { .. }
                 | Self::StateMisaligned { .. }
                 | Self::ControlStateIncomplete { .. }
+                | Self::MonitorStateIncomplete { .. }
         )
     }
 
@@ -368,6 +405,19 @@ impl RobotError {
         Self::ControlStateIncomplete {
             position_frame_valid_mask,
             dynamic_valid_mask,
+        }
+    }
+
+    /// 创建监控状态不完整错误
+    pub fn monitor_state_incomplete(
+        source: MonitorStateSource,
+        valid_mask: u8,
+        required_mask: u8,
+    ) -> Self {
+        Self::MonitorStateIncomplete {
+            source,
+            valid_mask,
+            required_mask,
         }
     }
 
@@ -505,6 +555,11 @@ mod tests {
             RobotError::feedback_stale(Duration::from_millis(60), Duration::from_millis(50));
         assert!(!stale.is_fatal());
         assert!(stale.is_retryable());
+
+        let monitor_incomplete =
+            RobotError::monitor_state_incomplete(MonitorStateSource::EndPose, 0b101, 0b111);
+        assert!(!monitor_incomplete.is_fatal());
+        assert!(monitor_incomplete.is_retryable());
     }
 
     #[test]
@@ -553,6 +608,13 @@ mod tests {
         let msg = format!("{}", timeout_err);
         assert!(msg.contains("100"));
         assert!(msg.contains("timeout"));
+
+        let monitor_err =
+            RobotError::monitor_state_incomplete(MonitorStateSource::EndPose, 0b101, 0b111);
+        let msg = format!("{}", monitor_err);
+        assert!(msg.contains("end pose"));
+        assert!(msg.contains("101"));
+        assert!(msg.contains("111"));
     }
 
     #[test]
@@ -618,6 +680,24 @@ mod tests {
 
         let err: Result<i32> = Err(RobotError::EmergencyStop);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_monitor_state_incomplete_helper() {
+        let err = RobotError::monitor_state_incomplete(
+            MonitorStateSource::JointDynamic,
+            0b001111,
+            0b111111,
+        );
+
+        assert!(matches!(
+            err,
+            RobotError::MonitorStateIncomplete {
+                source: MonitorStateSource::JointDynamic,
+                valid_mask: 0b001111,
+                required_mask: 0b111111,
+            }
+        ));
     }
 
     #[test]
