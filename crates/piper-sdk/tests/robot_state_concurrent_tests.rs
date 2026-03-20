@@ -23,7 +23,7 @@ fn test_joint_position_state_concurrent_read() {
         for i in 0..reads_per_thread {
             let new_state = JointPositionState {
                 hardware_timestamp_us: i as u64 * 1000,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
@@ -71,7 +71,7 @@ fn test_end_pose_state_concurrent_read() {
         for i in 0..reads_per_thread {
             let new_state = EndPoseState {
                 hardware_timestamp_us: i as u64 * 1000,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 end_pose: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
@@ -113,7 +113,7 @@ fn test_joint_driver_low_speed_state_concurrent_read() {
         for i in 0..reads_per_thread {
             let new_state = JointDriverLowSpeedState {
                 hardware_timestamp_us: i as u64 * 1000,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 motor_temps: [i as f32; 6],
                 driver_temps: [i as f32 + 10.0; 6],
                 joint_voltage: [24.0 + i as f32 * 0.1; 6],
@@ -127,7 +127,7 @@ fn test_joint_driver_low_speed_state_concurrent_read() {
                 driver_enabled_mask: 0b111111,
                 driver_stall_protection_mask: 0,
                 hardware_timestamps: [i as u64 * 100; 6],
-                system_timestamps: [i as u64 * 200; 6],
+                host_rx_mono_timestamps: [i as u64 * 200; 6],
                 valid_mask: 0b111111,
             };
             ctx_writer.joint_driver_low_speed.store(Arc::new(new_state));
@@ -171,7 +171,7 @@ fn test_robot_control_state_concurrent_read() {
         for i in 0..reads_per_thread {
             let new_state = RobotControlState {
                 hardware_timestamp_us: i as u64 * 1000,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 control_mode: (i % 256) as u8,
                 robot_status: ((i + 1) % 256) as u8,
                 move_mode: ((i + 2) % 256) as u8,
@@ -222,7 +222,7 @@ fn test_gripper_state_concurrent_read() {
         for i in 0..reads_per_thread {
             let new_state = GripperState {
                 hardware_timestamp_us: i as u64 * 1000,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 travel: i as f64 * 0.1,
                 torque: i as f64 * 0.01,
                 status_code: (i % 256) as u8,
@@ -282,7 +282,7 @@ fn test_capture_motion_snapshot_concurrent() {
         for i in 0..calls_per_thread {
             let new_joint_pos = JointPositionState {
                 hardware_timestamp_us: i as u64 * 1000 + 1,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
@@ -290,7 +290,7 @@ fn test_capture_motion_snapshot_concurrent() {
 
             let new_end_pose = EndPoseState {
                 hardware_timestamp_us: i as u64 * 1000 + 2,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 end_pose: [10_000.0 + i as f64; 6],
                 frame_valid_mask: 0b111,
             };
@@ -342,7 +342,7 @@ fn test_collision_protection_state_concurrent_read() {
         for i in 0..reads_per_thread {
             if let Ok(mut state) = ctx_writer.collision_protection.write() {
                 state.hardware_timestamp_us = i as u64 * 1000;
-                state.system_timestamp_us = i as u64 * 2000;
+                state.host_rx_mono_us = i as u64 * 2000;
                 state.protection_levels = [(i % 9) as u8; 6];
                 state.protection_levels[0] = (i % 9) as u8;
             }
@@ -387,7 +387,7 @@ fn test_multiple_states_concurrent_read() {
             // 更新 joint_position
             let new_joint_pos = JointPositionState {
                 hardware_timestamp_us: i as u64 * 1000,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
@@ -396,7 +396,7 @@ fn test_multiple_states_concurrent_read() {
             // 更新 robot_control
             let new_robot_control = RobotControlState {
                 hardware_timestamp_us: i as u64 * 1000,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 control_mode: (i % 256) as u8,
                 robot_status: ((i + 1) % 256) as u8,
                 move_mode: ((i + 2) % 256) as u8,
@@ -413,7 +413,7 @@ fn test_multiple_states_concurrent_read() {
             // 更新 gripper
             let new_gripper = GripperState {
                 hardware_timestamp_us: i as u64 * 1000,
-                system_timestamp_us: i as u64 * 2000,
+                host_rx_mono_us: i as u64 * 2000,
                 travel: i as f64 * 0.1,
                 torque: i as f64 * 0.01,
                 status_code: (i % 256) as u8,
@@ -482,7 +482,7 @@ fn test_no_deadlock() {
                     // 写入操作
                     let new_state = JointPositionState {
                         hardware_timestamp_us: counter,
-                        system_timestamp_us: counter * 2,
+                        host_rx_mono_us: counter * 2,
                         joint_pos: [counter as f64; 6],
                         frame_valid_mask: 0b111,
                     };

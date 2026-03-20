@@ -63,16 +63,15 @@ pub struct CollisionProtectionSnapshot {
     /// 设备硬件时间戳（微秒）
     pub hardware_timestamp_us: u64,
     /// 主机接收时间戳（微秒）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
     /// `[J1, J2, J3, J4, J5, J6]` 的碰撞防护等级
     pub levels: [u8; 6],
 }
 
 impl CollisionProtectionSnapshot {
     /// 判断快照是否严格晚于给定时间基线。
-    pub fn is_newer_than(self, hardware_timestamp_us: u64, system_timestamp_us: u64) -> bool {
-        self.hardware_timestamp_us > hardware_timestamp_us
-            || self.system_timestamp_us > system_timestamp_us
+    pub fn is_newer_than(self, hardware_timestamp_us: u64, host_rx_mono_us: u64) -> bool {
+        self.hardware_timestamp_us > hardware_timestamp_us || self.host_rx_mono_us > host_rx_mono_us
     }
 }
 
@@ -80,7 +79,7 @@ impl From<piper_driver::CollisionProtectionState> for CollisionProtectionSnapsho
     fn from(value: piper_driver::CollisionProtectionState) -> Self {
         Self {
             hardware_timestamp_us: value.hardware_timestamp_us,
-            system_timestamp_us: value.system_timestamp_us,
+            host_rx_mono_us: value.host_rx_mono_us,
             levels: value.protection_levels,
         }
     }
@@ -203,8 +202,8 @@ impl Observer {
                 }
 
                 let age = control_feedback_age(
-                    state.position_system_timestamp_us,
-                    state.dynamic_system_timestamp_us,
+                    state.position_host_rx_mono_us,
+                    state.dynamic_host_rx_mono_us,
                 );
                 if age > policy.max_feedback_age {
                     return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
@@ -224,8 +223,8 @@ impl Observer {
                         dynamic_timestamp_us: state.dynamic_timestamp_us,
                         skew_us: state.skew_us,
                     },
-                    position_host_rx_mono_us: state.position_system_timestamp_us,
-                    dynamic_host_rx_mono_us: state.dynamic_system_timestamp_us,
+                    position_host_rx_mono_us: state.position_host_rx_mono_us,
+                    dynamic_host_rx_mono_us: state.dynamic_host_rx_mono_us,
                     feedback_age: age,
                 })
             },
@@ -235,8 +234,8 @@ impl Observer {
                 }
 
                 let age = control_feedback_age(
-                    state.position_system_timestamp_us,
-                    state.dynamic_system_timestamp_us,
+                    state.position_host_rx_mono_us,
+                    state.dynamic_host_rx_mono_us,
                 );
                 if age > policy.max_feedback_age {
                     return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
@@ -255,7 +254,7 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 默认只返回严格完整的快照；如需查看半成品/诊断数据，请使用 `raw_joint_position_state()`。
+    /// 默认只返回完整监控快照；如需查看半成品/诊断数据，请使用 `raw_joint_position_state()`。
     pub fn joint_positions(&self) -> Result<JointArray<Rad>> {
         let joint_pos = self.driver.get_joint_position();
         if !joint_pos.is_fully_valid() {
@@ -375,14 +374,23 @@ impl Observer {
     ///
     /// ```rust,no_run
     /// # use piper_client::observer::Observer;
-    /// # fn example(observer: Observer) {
-    /// let end_pose = observer.end_pose();
+    /// # fn example(observer: Observer) -> Result<()> {
+    /// let end_pose = observer.end_pose()?;
     /// println!("Position: X={:.4}, Y={:.4}, Z={:.4}",
     ///     end_pose.end_pose[0], end_pose.end_pose[1], end_pose.end_pose[2]);
+    /// # Ok(())
     /// # }
     /// ```
-    pub fn end_pose(&self) -> piper_driver::state::EndPoseState {
-        self.driver.get_end_pose()
+    pub fn end_pose(&self) -> Result<piper_driver::state::EndPoseState> {
+        let end_pose = self.driver.get_end_pose();
+        if !end_pose.is_fully_valid() {
+            return Err(RobotError::control_state_incomplete(
+                self.driver.get_joint_position().frame_valid_mask,
+                self.driver.get_joint_dynamic().valid_mask,
+            ));
+        }
+
+        Ok(end_pose)
     }
 
     /// 检查是否全部使能
@@ -517,16 +525,13 @@ impl Observer {
     }
 }
 
-fn control_feedback_age(
-    position_system_timestamp_us: u64,
-    dynamic_system_timestamp_us: u64,
-) -> Duration {
-    let position_age = system_timestamp_age(position_system_timestamp_us);
-    let dynamic_age = system_timestamp_age(dynamic_system_timestamp_us);
+fn control_feedback_age(position_host_rx_mono_us: u64, dynamic_host_rx_mono_us: u64) -> Duration {
+    let position_age = host_rx_mono_age(position_host_rx_mono_us);
+    let dynamic_age = host_rx_mono_age(dynamic_host_rx_mono_us);
     position_age.max(dynamic_age)
 }
 
-fn system_timestamp_age(timestamp_us: u64) -> Duration {
+fn host_rx_mono_age(timestamp_us: u64) -> Duration {
     if timestamp_us == 0 {
         return Duration::MAX;
     }

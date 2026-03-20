@@ -148,7 +148,7 @@ pub fn set_collision_protection_verified(
 
     let baseline = standby.collision_protection_cached().ok();
     let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
-    let baseline_sys = baseline.as_ref().map_or(0, |state| state.system_timestamp_us);
+    let baseline_sys = baseline.as_ref().map_or(0, |state| state.host_rx_mono_us);
 
     verify_collision_protection_after_write(
         baseline_hw,
@@ -371,7 +371,7 @@ mod tests {
         };
         let current = Arc::new(Mutex::new(CollisionProtectionSnapshot {
             hardware_timestamp_us: 10,
-            system_timestamp_us: 10,
+            host_rx_mono_us: 10,
             levels: [0; 6],
         }));
         let query_attempts = Arc::new(Mutex::new(0usize));
@@ -394,7 +394,7 @@ mod tests {
                     if *attempts == 1 {
                         *current.lock().unwrap() = CollisionProtectionSnapshot {
                             hardware_timestamp_us: 11,
-                            system_timestamp_us: 11,
+                            host_rx_mono_us: 11,
                             levels: [4_u8; 6],
                         };
                         Err(RobotError::Timeout { timeout_ms: 1 }.into())
@@ -432,13 +432,13 @@ mod tests {
                     if *read_count < 3 {
                         Ok(CollisionProtectionSnapshot {
                             hardware_timestamp_us: 20,
-                            system_timestamp_us: 20,
+                            host_rx_mono_us: 20,
                             levels: [5_u8; 6],
                         })
                     } else {
                         Ok(CollisionProtectionSnapshot {
                             hardware_timestamp_us: 21,
-                            system_timestamp_us: 21,
+                            host_rx_mono_us: 21,
                             levels: [5_u8; 6],
                         })
                     }

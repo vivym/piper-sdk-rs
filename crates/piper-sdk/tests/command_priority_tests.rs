@@ -6,9 +6,10 @@
 //! 3. 实时命令支持覆盖（Overwrite 策略）
 
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::command::{CommandPriority, PiperCommand, ReliableCommand, ShutdownCommand};
+use piper_sdk::driver::command::{CommandPriority, PiperCommand, ReliableCommand};
 use piper_sdk::driver::{
-    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, TimingCapability,
+    rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -123,7 +124,7 @@ fn test_priority_scheduling() {
 
     // 创建命令通道
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -138,6 +139,7 @@ fn test_priority_scheduling() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx_rx,
             config,
             is_running_rx,
@@ -157,7 +159,7 @@ fn test_priority_scheduling() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
@@ -288,7 +290,7 @@ fn test_reliable_command_not_dropped() {
 
     // 创建命令通道（可靠队列容量 10）
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -303,7 +305,7 @@ fn test_reliable_command_not_dropped() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
@@ -437,7 +439,7 @@ fn test_realtime_overwrite_strategy() {
 
     // 创建命令通道（实时队列容量 1）
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -453,7 +455,7 @@ fn test_realtime_overwrite_strategy() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,

@@ -375,7 +375,7 @@ where
     ReadCached: FnMut() -> Result<CollisionProtectionSnapshot>,
 {
     let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
-    let baseline_sys = baseline.as_ref().map_or(0, |state| state.system_timestamp_us);
+    let baseline_sys = baseline.as_ref().map_or(0, |state| state.host_rx_mono_us);
 
     send_query()?;
 
@@ -2983,7 +2983,7 @@ mod tests {
     fn fresh_collision_query_rejects_stale_cached_snapshot() {
         let baseline = CollisionProtectionSnapshot {
             hardware_timestamp_us: 10,
-            system_timestamp_us: 10,
+            host_rx_mono_us: 10,
             levels: [4; 6],
         };
         let reads = AtomicUsize::new(0);
@@ -3008,7 +3008,7 @@ mod tests {
     fn fresh_collision_query_accepts_newer_snapshot_after_query() {
         let baseline = CollisionProtectionSnapshot {
             hardware_timestamp_us: 10,
-            system_timestamp_us: 10,
+            host_rx_mono_us: 10,
             levels: [1; 6],
         };
         let reads = AtomicUsize::new(0);
@@ -3029,7 +3029,7 @@ mod tests {
                 } else {
                     Ok(CollisionProtectionSnapshot {
                         hardware_timestamp_us: 11,
-                        system_timestamp_us: 11,
+                        host_rx_mono_us: 11,
                         levels: [5; 6],
                     })
                 }
@@ -3049,14 +3049,14 @@ mod tests {
             Duration::from_millis(1),
             Some(CollisionProtectionSnapshot {
                 hardware_timestamp_us: 7,
-                system_timestamp_us: 7,
+                host_rx_mono_us: 7,
                 levels: [2; 6],
             }),
             || Ok(()),
             || {
                 Ok(CollisionProtectionSnapshot {
                     hardware_timestamp_us: 7,
-                    system_timestamp_us: 7,
+                    host_rx_mono_us: 7,
                     levels: [9; 6],
                 })
             },

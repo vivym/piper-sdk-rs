@@ -18,7 +18,7 @@ pub struct JointPositionState {
     /// 系统接收时间戳（微秒，系统接收到完整帧组的时间）
     ///
     /// **注意**：这是系统时间戳，用于计算接收延迟和系统处理时间。
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 关节位置（弧度）[J1, J2, J3, J4, J5, J6]
     pub joint_pos: [f64; 6],
@@ -57,7 +57,7 @@ pub struct EndPoseState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒，系统接收到完整帧组的时间）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 末端位姿 [X, Y, Z, Rx, Ry, Rz]
     /// - X, Y, Z: 位置（米）
@@ -116,7 +116,7 @@ pub struct JointDynamicState {
     /// 硬件时间戳是设备相对时间，用于帧间时间差计算，不能直接与系统时间戳比较。
     pub group_timestamp_us: u64,
     /// 整个组在主机侧提交时的系统时间戳（微秒）
-    pub group_system_timestamp_us: u64,
+    pub group_host_rx_mono_us: u64,
 
     // === 关节速度/电流（来自 0x251-0x256，独立帧） ===
     /// 关节速度（rad/s）[J1, J2, J3, J4, J5, J6]
@@ -248,7 +248,7 @@ pub struct RobotControlState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 控制模式
     pub control_mode: u8,
@@ -313,7 +313,7 @@ pub struct GripperState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 夹爪行程（mm）
     pub travel: f64,
@@ -394,7 +394,7 @@ pub struct JointDriverLowSpeedState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     // === 温度（来自 0x261-0x266） ===
     /// 电机温度（°C）[J1, J2, J3, J4, J5, J6]
@@ -430,7 +430,7 @@ pub struct JointDriverLowSpeedState {
     /// 每个关节的硬件时间戳（微秒）[J1, J2, J3, J4, J5, J6]
     pub hardware_timestamps: [u64; 6],
     /// 每个关节的系统接收时间戳（微秒）[J1, J2, J3, J4, J5, J6]
-    pub system_timestamps: [u64; 6],
+    pub host_rx_mono_timestamps: [u64; 6],
 
     // === 有效性掩码 ===
     /// 有效性掩码（Bit 0-5 对应 J1-J6）
@@ -528,7 +528,7 @@ pub struct CollisionProtectionState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 各关节碰撞保护等级（0-8）[J1, J2, J3, J4, J5, J6]
     ///
@@ -553,7 +553,7 @@ pub struct JointLimitConfigState {
     pub last_update_hardware_timestamp_us: u64,
 
     /// 最后更新时间戳（系统时间戳，微秒）
-    pub last_update_system_timestamp_us: u64,
+    pub last_update_host_rx_mono_us: u64,
 
     // === 关节限制配置（来自 0x473，需要查询6次） ===
     /// 关节角度上限（弧度）[J1, J2, J3, J4, J5, J6]
@@ -567,7 +567,7 @@ pub struct JointLimitConfigState {
     /// 每个关节的硬件时间戳（微秒）[J1, J2, J3, J4, J5, J6]
     pub joint_update_hardware_timestamps: [u64; 6],
     /// 每个关节的系统接收时间戳（微秒）[J1, J2, J3, J4, J5, J6]
-    pub joint_update_system_timestamps: [u64; 6],
+    pub joint_update_host_rx_mono_timestamps: [u64; 6],
 
     // === 有效性掩码 ===
     /// 有效性掩码（Bit 0-5 对应 J1-J6）
@@ -601,7 +601,7 @@ pub struct JointAccelConfigState {
     pub last_update_hardware_timestamp_us: u64,
 
     /// 最后更新时间戳（系统时间戳，微秒）
-    pub last_update_system_timestamp_us: u64,
+    pub last_update_host_rx_mono_us: u64,
 
     // === 关节加速度限制配置（来自 0x47C，需要查询6次） ===
     /// 各关节最大加速度（rad/s²）[J1, J2, J3, J4, J5, J6]
@@ -611,7 +611,7 @@ pub struct JointAccelConfigState {
     /// 每个关节的硬件时间戳（微秒）[J1, J2, J3, J4, J5, J6]
     pub joint_update_hardware_timestamps: [u64; 6],
     /// 每个关节的系统接收时间戳（微秒）[J1, J2, J3, J4, J5, J6]
-    pub joint_update_system_timestamps: [u64; 6],
+    pub joint_update_host_rx_mono_timestamps: [u64; 6],
 
     // === 有效性掩码 ===
     /// 有效性掩码（Bit 0-5 对应 J1-J6）
@@ -645,7 +645,7 @@ pub struct EndLimitConfigState {
     pub last_update_hardware_timestamp_us: u64,
 
     /// 最后更新时间戳（系统时间戳，微秒）
-    pub last_update_system_timestamp_us: u64,
+    pub last_update_host_rx_mono_us: u64,
 
     // === 末端限制配置（来自 0x478，单帧响应） ===
     /// 末端最大线速度（m/s）
@@ -677,7 +677,7 @@ pub struct FirmwareVersionState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 累积的固件数据（字节数组）
     /// 注意：版本字符串需要从累积数据中解析
@@ -701,7 +701,7 @@ impl FirmwareVersionState {
         self.version_string = None;
         self.is_complete = false;
         self.hardware_timestamp_us = 0;
-        self.system_timestamp_us = 0;
+        self.host_rx_mono_us = 0;
     }
 
     /// 检查数据是否完整（是否找到 S-V 标记且有足够数据）
@@ -766,7 +766,7 @@ pub struct MasterSlaveControlModeState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 控制模式指令（来自 0x151）
     pub control_mode: u8, // ControlModeCommand as u8
@@ -793,7 +793,7 @@ pub struct MasterSlaveJointControlState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒，系统接收到完整帧组的时间）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 关节目标角度（度，0.001°单位）[J1, J2, J3, J4, J5, J6]
     pub joint_target_deg: [i32; 6],
@@ -847,7 +847,7 @@ pub struct MasterSlaveGripperControlState {
     pub hardware_timestamp_us: u64,
 
     /// 系统接收时间戳（微秒）
-    pub system_timestamp_us: u64,
+    pub host_rx_mono_us: u64,
 
     /// 夹爪目标行程（mm，0.001mm单位）
     pub gripper_target_travel_mm: i32,
@@ -915,12 +915,18 @@ use crate::hooks::HookManager;
 pub struct PiperContext {
     // === 热数据（500Hz，高频运动数据）===
     // 使用 ArcSwap，无锁读取，适合高频控制循环
-    /// 严格关节位置状态（完整帧组同步：0x2A5-0x2A7）
+    /// 完整监控关节位置状态（完整帧组同步：0x2A5-0x2A7）
     pub joint_position: Arc<ArcSwap<JointPositionState>>,
-    /// 严格末端位姿状态（完整帧组同步：0x2A2-0x2A4）
+    /// 完整监控末端位姿状态（完整帧组同步：0x2A2-0x2A4）
     pub end_pose: Arc<ArcSwap<EndPoseState>>,
-    /// 严格运动状态快照（单次 load 保证逻辑原子）
+    /// 完整监控运动状态快照（单次 load 保证逻辑原子）
     pub motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
+    /// 控制级关节位置状态（完整帧组 + 对齐跨度约束）
+    pub control_joint_position: Arc<ArcSwap<JointPositionState>>,
+    /// 控制级末端位姿状态（完整帧组 + 对齐跨度约束）
+    pub control_end_pose: Arc<ArcSwap<EndPoseState>>,
+    /// 控制级运动状态快照（单次 load 保证逻辑原子）
+    pub control_motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
     /// 严格关节动态状态（完整动态组提交）
     pub joint_dynamic: Arc<ArcSwap<JointDynamicState>>,
     /// 原始关节位置状态（允许部分帧组）
@@ -1043,6 +1049,9 @@ impl PiperContext {
             joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
             end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
             motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
+            control_joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
+            control_end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
+            control_motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
             joint_dynamic: Arc::new(ArcSwap::from_pointee(JointDynamicState::default())),
             raw_joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
             raw_end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
@@ -1117,6 +1126,11 @@ impl PiperContext {
         self.raw_motion_snapshot.load().as_ref().clone()
     }
 
+    /// 捕获控制级运动状态快照（只用于闭环控制对齐读取）
+    pub fn capture_control_motion_snapshot(&self) -> MotionSnapshot {
+        self.control_motion_snapshot.load().as_ref().clone()
+    }
+
     /// 发布新的关节位置，并与当前末端位姿组合成逻辑原子快照。
     pub fn publish_joint_position(&self, joint_position: JointPositionState) {
         let end_pose = self.end_pose.load();
@@ -1142,6 +1156,26 @@ impl PiperContext {
         let joint_position = self.joint_position.load();
         self.end_pose.store(Arc::new(end_pose.clone()));
         self.motion_snapshot.store(Arc::new(MotionSnapshot {
+            joint_position: joint_position.as_ref().clone(),
+            end_pose,
+        }));
+    }
+
+    /// 发布新的控制级关节位置，并与当前控制级末端位姿组合成逻辑原子快照。
+    pub fn publish_control_joint_position(&self, joint_position: JointPositionState) {
+        let end_pose = self.control_end_pose.load();
+        self.control_joint_position.store(Arc::new(joint_position.clone()));
+        self.control_motion_snapshot.store(Arc::new(MotionSnapshot {
+            joint_position,
+            end_pose: end_pose.as_ref().clone(),
+        }));
+    }
+
+    /// 发布新的控制级末端位姿，并与当前控制级关节位置组合成逻辑原子快照。
+    pub fn publish_control_end_pose(&self, end_pose: EndPoseState) {
+        let joint_position = self.control_joint_position.load();
+        self.control_end_pose.store(Arc::new(end_pose.clone()));
+        self.control_motion_snapshot.store(Arc::new(MotionSnapshot {
             joint_position: joint_position.as_ref().clone(),
             end_pose,
         }));
@@ -1182,8 +1216,8 @@ pub struct AlignedMotionState {
     pub end_pose: [f64; 6],
     pub position_timestamp_us: u64,
     pub dynamic_timestamp_us: u64,
-    pub position_system_timestamp_us: u64,
-    pub dynamic_system_timestamp_us: u64,
+    pub position_host_rx_mono_us: u64,
+    pub dynamic_host_rx_mono_us: u64,
     pub position_frame_valid_mask: u8,
     pub dynamic_valid_mask: u8,
     pub skew_us: i64,
@@ -1336,7 +1370,7 @@ mod tests {
     fn test_joint_dynamic_state_default() {
         let state = JointDynamicState::default();
         assert_eq!(state.group_timestamp_us, 0);
-        assert_eq!(state.group_system_timestamp_us, 0);
+        assert_eq!(state.group_host_rx_mono_us, 0);
         assert_eq!(state.joint_vel, [0.0; 6]);
         assert_eq!(state.joint_current, [0.0; 6]);
         assert_eq!(state.timestamps, [0; 6]);
@@ -1364,7 +1398,7 @@ mod tests {
 
         let joint_dynamic = ctx.joint_dynamic.load();
         assert_eq!(joint_dynamic.group_timestamp_us, 0);
-        assert_eq!(joint_dynamic.group_system_timestamp_us, 0);
+        assert_eq!(joint_dynamic.group_host_rx_mono_us, 0);
 
         let robot_control = ctx.robot_control.load();
         assert_eq!(robot_control.hardware_timestamp_us, 0);
@@ -1380,7 +1414,7 @@ mod tests {
     fn test_joint_dynamic_state_clone() {
         let state = JointDynamicState {
             group_timestamp_us: 1000,
-            group_system_timestamp_us: 2000,
+            group_host_rx_mono_us: 2000,
             joint_vel: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             joint_current: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
             timestamps: [100, 200, 300, 400, 500, 600],
@@ -1388,10 +1422,7 @@ mod tests {
         };
         let cloned = state.clone();
         assert_eq!(state.group_timestamp_us, cloned.group_timestamp_us);
-        assert_eq!(
-            state.group_system_timestamp_us,
-            cloned.group_system_timestamp_us
-        );
+        assert_eq!(state.group_host_rx_mono_us, cloned.group_host_rx_mono_us);
         assert_eq!(state.joint_vel, cloned.joint_vel);
         assert_eq!(state.joint_current, cloned.joint_current);
         assert_eq!(state.timestamps, cloned.timestamps);
@@ -1412,8 +1443,8 @@ mod tests {
             end_pose: [4.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
-            position_system_timestamp_us: 2000,
-            dynamic_system_timestamp_us: 2500,
+            position_host_rx_mono_us: 2000,
+            dynamic_host_rx_mono_us: 2500,
             position_frame_valid_mask: 0b111,
             dynamic_valid_mask: 0b111111,
             skew_us: 500,
@@ -1431,8 +1462,8 @@ mod tests {
             end_pose: [4.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
-            position_system_timestamp_us: 2000,
-            dynamic_system_timestamp_us: 2500,
+            position_host_rx_mono_us: 2000,
+            dynamic_host_rx_mono_us: 2500,
             position_frame_valid_mask: 0b111,
             dynamic_valid_mask: 0b111111,
             skew_us: 500,
@@ -1448,8 +1479,8 @@ mod tests {
             end_pose: [4.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
-            position_system_timestamp_us: 2000,
-            dynamic_system_timestamp_us: 2500,
+            position_host_rx_mono_us: 2000,
+            dynamic_host_rx_mono_us: 2500,
             position_frame_valid_mask: 0b111,
             dynamic_valid_mask: 0b111111,
             skew_us: 500,
@@ -1471,8 +1502,8 @@ mod tests {
             end_pose: [0.0; 6],
             position_timestamp_us: 0,
             dynamic_timestamp_us: 0,
-            position_system_timestamp_us: 0,
-            dynamic_system_timestamp_us: 0,
+            position_host_rx_mono_us: 0,
+            dynamic_host_rx_mono_us: 0,
             position_frame_valid_mask: 0b111,
             dynamic_valid_mask: 0b111111,
             skew_us: 0,
@@ -1499,7 +1530,7 @@ mod tests {
     fn test_joint_position_state_default() {
         let state = JointPositionState::default();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert_eq!(state.joint_pos, [0.0; 6]);
         assert_eq!(state.frame_valid_mask, 0);
     }
@@ -1509,7 +1540,7 @@ mod tests {
         // 完整帧组（所有3帧都收到）
         let state = JointPositionState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             frame_valid_mask: 0b0000_0111, // Bit 0-2 全部为 1
         };
@@ -1575,13 +1606,13 @@ mod tests {
     fn test_joint_position_state_clone() {
         let state = JointPositionState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             frame_valid_mask: 0b0000_0111,
         };
         let cloned = state.clone();
         assert_eq!(state.hardware_timestamp_us, cloned.hardware_timestamp_us);
-        assert_eq!(state.system_timestamp_us, cloned.system_timestamp_us);
+        assert_eq!(state.host_rx_mono_us, cloned.host_rx_mono_us);
         assert_eq!(state.joint_pos, cloned.joint_pos);
         assert_eq!(state.frame_valid_mask, cloned.frame_valid_mask);
         assert_eq!(state.is_fully_valid(), cloned.is_fully_valid());
@@ -1591,7 +1622,7 @@ mod tests {
     fn test_end_pose_state_default() {
         let state = EndPoseState::default();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert_eq!(state.end_pose, [0.0; 6]);
         assert_eq!(state.frame_valid_mask, 0);
     }
@@ -1601,7 +1632,7 @@ mod tests {
         // 完整帧组（所有3帧都收到）
         let state = EndPoseState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             end_pose: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
             frame_valid_mask: 0b0000_0111, // Bit 0-2 全部为 1
         };
@@ -1650,13 +1681,13 @@ mod tests {
     fn test_end_pose_state_clone() {
         let state = EndPoseState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             end_pose: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
             frame_valid_mask: 0b0000_0111,
         };
         let cloned = state.clone();
         assert_eq!(state.hardware_timestamp_us, cloned.hardware_timestamp_us);
-        assert_eq!(state.system_timestamp_us, cloned.system_timestamp_us);
+        assert_eq!(state.host_rx_mono_us, cloned.host_rx_mono_us);
         assert_eq!(state.end_pose, cloned.end_pose);
         assert_eq!(state.frame_valid_mask, cloned.frame_valid_mask);
         assert_eq!(state.is_fully_valid(), cloned.is_fully_valid());
@@ -1677,13 +1708,13 @@ mod tests {
         let snapshot = MotionSnapshot {
             joint_position: JointPositionState {
                 hardware_timestamp_us: 1000,
-                system_timestamp_us: 2000,
+                host_rx_mono_us: 2000,
                 joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 frame_valid_mask: 0b0000_0111,
             },
             end_pose: EndPoseState {
                 hardware_timestamp_us: 1500,
-                system_timestamp_us: 2500,
+                host_rx_mono_us: 2500,
                 end_pose: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
                 frame_valid_mask: 0b0000_0111,
             },
@@ -1714,7 +1745,7 @@ mod tests {
 
         let joint_position = JointPositionState {
             hardware_timestamp_us: 101,
-            system_timestamp_us: 202,
+            host_rx_mono_us: 202,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         };
@@ -1729,7 +1760,7 @@ mod tests {
 
         let end_pose = EndPoseState {
             hardware_timestamp_us: 303,
-            system_timestamp_us: 404,
+            host_rx_mono_us: 404,
             end_pose: [2.0; 6],
             frame_valid_mask: 0b111,
         };
@@ -1769,7 +1800,7 @@ mod tests {
     fn test_gripper_state_default() {
         let state = GripperState::default();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert_eq!(state.travel, 0.0);
         assert_eq!(state.torque, 0.0);
         assert_eq!(state.status_code, 0);
@@ -1872,7 +1903,7 @@ mod tests {
     fn test_gripper_state_clone() {
         let state = GripperState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             travel: 50.5,
             torque: 2.5,
             status_code: 0b1100_0011,
@@ -1880,7 +1911,7 @@ mod tests {
         };
         let cloned = state.clone();
         assert_eq!(state.hardware_timestamp_us, cloned.hardware_timestamp_us);
-        assert_eq!(state.system_timestamp_us, cloned.system_timestamp_us);
+        assert_eq!(state.host_rx_mono_us, cloned.host_rx_mono_us);
         assert_eq!(state.travel, cloned.travel);
         assert_eq!(state.torque, cloned.torque);
         assert_eq!(state.status_code, cloned.status_code);
@@ -1893,7 +1924,7 @@ mod tests {
     fn test_robot_control_state_default() {
         let state = RobotControlState::default();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert_eq!(state.control_mode, 0);
         assert_eq!(state.robot_status, 0);
         assert_eq!(state.fault_angle_limit_mask, 0);
@@ -1961,7 +1992,7 @@ mod tests {
     fn test_robot_control_state_clone() {
         let state = RobotControlState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             control_mode: 1,
             robot_status: 2,
             move_mode: 3,
@@ -2009,7 +2040,7 @@ mod tests {
     fn test_joint_driver_low_speed_state_default() {
         let state = JointDriverLowSpeedState::default();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert_eq!(state.motor_temps, [0.0; 6]);
         assert_eq!(state.driver_temps, [0.0; 6]);
         assert_eq!(state.joint_voltage, [0.0; 6]);
@@ -2121,7 +2152,7 @@ mod tests {
     fn test_joint_driver_low_speed_state_clone() {
         let state = JointDriverLowSpeedState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             motor_temps: [25.0, 26.0, 27.0, 28.0, 29.0, 30.0],
             driver_temps: [35.0, 36.0, 37.0, 38.0, 39.0, 40.0],
             joint_voltage: [24.0, 24.1, 24.2, 24.3, 24.4, 24.5],
@@ -2135,7 +2166,7 @@ mod tests {
             driver_enabled_mask: 0b111111,
             driver_stall_protection_mask: 0b0000_0001,
             hardware_timestamps: [100, 200, 300, 400, 500, 600],
-            system_timestamps: [1100, 1200, 1300, 1400, 1500, 1600],
+            host_rx_mono_timestamps: [1100, 1200, 1300, 1400, 1500, 1600],
             valid_mask: 0b111111,
         };
         let cloned = state.clone();
@@ -2170,7 +2201,7 @@ mod tests {
     fn test_collision_protection_state_default() {
         let state = CollisionProtectionState::default();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert_eq!(state.protection_levels, [0; 6]);
     }
 
@@ -2178,12 +2209,12 @@ mod tests {
     fn test_collision_protection_state_clone() {
         let state = CollisionProtectionState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             protection_levels: [5, 5, 5, 4, 4, 4],
         };
         let cloned = state.clone();
         assert_eq!(state.hardware_timestamp_us, cloned.hardware_timestamp_us);
-        assert_eq!(state.system_timestamp_us, cloned.system_timestamp_us);
+        assert_eq!(state.host_rx_mono_us, cloned.host_rx_mono_us);
         assert_eq!(state.protection_levels, cloned.protection_levels);
     }
 
@@ -2211,7 +2242,7 @@ mod tests {
         // 验证 collision_protection 字段存在且为默认值
         let state = ctx.collision_protection.read().unwrap();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert_eq!(state.protection_levels, [0; 6]);
     }
 
@@ -2223,12 +2254,12 @@ mod tests {
     fn test_joint_limit_config_state_default() {
         let state = JointLimitConfigState::default();
         assert_eq!(state.last_update_hardware_timestamp_us, 0);
-        assert_eq!(state.last_update_system_timestamp_us, 0);
+        assert_eq!(state.last_update_host_rx_mono_us, 0);
         assert_eq!(state.joint_limits_max, [0.0; 6]);
         assert_eq!(state.joint_limits_min, [0.0; 6]);
         assert_eq!(state.joint_max_velocity, [0.0; 6]);
         assert_eq!(state.joint_update_hardware_timestamps, [0; 6]);
-        assert_eq!(state.joint_update_system_timestamps, [0; 6]);
+        assert_eq!(state.joint_update_host_rx_mono_timestamps, [0; 6]);
         assert_eq!(state.valid_mask, 0);
     }
 
@@ -2273,12 +2304,12 @@ mod tests {
     fn test_joint_limit_config_state_clone() {
         let state = JointLimitConfigState {
             last_update_hardware_timestamp_us: 1000,
-            last_update_system_timestamp_us: 2000,
+            last_update_host_rx_mono_us: 2000,
             joint_limits_max: [1.57, 1.57, 1.57, 1.57, 1.57, 1.57], // 90度 = π/2 弧度
             joint_limits_min: [-1.57, -1.57, -1.57, -1.57, -1.57, -1.57], // -90度
             joint_max_velocity: [PI, PI, PI, PI, PI, PI],           // 180度/s = π rad/s
             joint_update_hardware_timestamps: [100, 200, 300, 400, 500, 600],
-            joint_update_system_timestamps: [1100, 1200, 1300, 1400, 1500, 1600],
+            joint_update_host_rx_mono_timestamps: [1100, 1200, 1300, 1400, 1500, 1600],
             valid_mask: 0b111111,
         };
         let cloned = state.clone();
@@ -2314,10 +2345,10 @@ mod tests {
     fn test_joint_accel_config_state_default() {
         let state = JointAccelConfigState::default();
         assert_eq!(state.last_update_hardware_timestamp_us, 0);
-        assert_eq!(state.last_update_system_timestamp_us, 0);
+        assert_eq!(state.last_update_host_rx_mono_us, 0);
         assert_eq!(state.max_acc_limits, [0.0; 6]);
         assert_eq!(state.joint_update_hardware_timestamps, [0; 6]);
-        assert_eq!(state.joint_update_system_timestamps, [0; 6]);
+        assert_eq!(state.joint_update_host_rx_mono_timestamps, [0; 6]);
         assert_eq!(state.valid_mask, 0);
     }
 
@@ -2362,10 +2393,10 @@ mod tests {
     fn test_joint_accel_config_state_clone() {
         let state = JointAccelConfigState {
             last_update_hardware_timestamp_us: 1000,
-            last_update_system_timestamp_us: 2000,
+            last_update_host_rx_mono_us: 2000,
             max_acc_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0], // 10 rad/s²
             joint_update_hardware_timestamps: [100, 200, 300, 400, 500, 600],
-            joint_update_system_timestamps: [1100, 1200, 1300, 1400, 1500, 1600],
+            joint_update_host_rx_mono_timestamps: [1100, 1200, 1300, 1400, 1500, 1600],
             valid_mask: 0b111111,
         };
         let cloned = state.clone();
@@ -2397,7 +2428,7 @@ mod tests {
     fn test_end_limit_config_state_default() {
         let state = EndLimitConfigState::default();
         assert_eq!(state.last_update_hardware_timestamp_us, 0);
-        assert_eq!(state.last_update_system_timestamp_us, 0);
+        assert_eq!(state.last_update_host_rx_mono_us, 0);
         assert_eq!(state.max_end_linear_velocity, 0.0);
         assert_eq!(state.max_end_angular_velocity, 0.0);
         assert_eq!(state.max_end_linear_accel, 0.0);
@@ -2409,7 +2440,7 @@ mod tests {
     fn test_end_limit_config_state_clone() {
         let state = EndLimitConfigState {
             last_update_hardware_timestamp_us: 1000,
-            last_update_system_timestamp_us: 2000,
+            last_update_host_rx_mono_us: 2000,
             max_end_linear_velocity: 1.0,  // 1 m/s
             max_end_angular_velocity: 2.0, // 2 rad/s
             max_end_linear_accel: 0.5,     // 0.5 m/s²
@@ -2456,7 +2487,7 @@ mod tests {
     fn test_firmware_version_state_default() {
         let state = FirmwareVersionState::default();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert!(state.firmware_data.is_empty());
         assert!(!state.is_complete);
         assert!(state.version_string.is_none());
@@ -2466,7 +2497,7 @@ mod tests {
     fn test_firmware_version_state_clear() {
         let mut state = FirmwareVersionState {
             hardware_timestamp_us: 1000,
-            system_timestamp_us: 2000,
+            host_rx_mono_us: 2000,
             firmware_data: vec![b'S', b'-', b'V', b'1', b'.', b'6', b'-', b'3'],
             is_complete: true,
             version_string: Some("S-V1.6-3".to_string()),
@@ -2475,7 +2506,7 @@ mod tests {
         state.clear();
 
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert!(state.firmware_data.is_empty());
         assert!(!state.is_complete);
         assert!(state.version_string.is_none());
@@ -2560,7 +2591,7 @@ mod tests {
         // 验证 firmware_version 字段存在且为默认值
         let state = ctx.firmware_version.read().unwrap();
         assert_eq!(state.hardware_timestamp_us, 0);
-        assert_eq!(state.system_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
         assert!(state.firmware_data.is_empty());
         assert!(!state.is_complete);
         assert!(state.version_string.is_none());

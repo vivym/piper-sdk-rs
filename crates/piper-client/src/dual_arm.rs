@@ -1185,7 +1185,7 @@ struct FaultShutdown {
     right_stop_attempt: StopAttemptResult,
 }
 
-const FAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(10);
+const FAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(20);
 
 fn compute_inter_arm_skew(left: &ControlSnapshotFull, right: &ControlSnapshotFull) -> InterArmSkew {
     let signed_position_skew_us = signed_us_diff(
@@ -2580,13 +2580,25 @@ mod tests {
         assert!(matches!(stale_error, RobotError::FeedbackStale { .. }));
 
         let left = build_standby_piper(1_000, Arc::new(Mutex::new(Vec::new())), Duration::ZERO);
-        thread::sleep(Duration::from_millis(40));
+        thread::sleep(Duration::from_millis(60));
         let right = build_standby_piper(1_000, Arc::new(Mutex::new(Vec::new())), Duration::ZERO);
         let skewed = DualArmStandby { left, right };
         let skew_error = skewed
-            .capture_calibration(JointMirrorMap::left_right_mirror())
+            .capture_calibration_with_policy(
+                JointMirrorMap::left_right_mirror(),
+                DualArmReadPolicy {
+                    per_arm: ControlReadPolicy {
+                        max_state_skew_us: DualArmReadPolicy::default().per_arm.max_state_skew_us,
+                        max_feedback_age: Duration::from_secs(1),
+                    },
+                    max_inter_arm_skew: Duration::from_millis(50),
+                },
+            )
             .expect_err("misaligned calibration snapshot should fail");
-        assert!(matches!(skew_error, RobotError::StateMisaligned { .. }));
+        assert!(
+            matches!(skew_error, RobotError::StateMisaligned { .. }),
+            "expected state misalignment, got {skew_error:?}"
+        );
     }
 
     #[test]

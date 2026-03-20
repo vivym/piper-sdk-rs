@@ -4,10 +4,13 @@
 
 use crate::heartbeat::monotonic_micros;
 use crate::metrics::PiperMetrics;
-use crate::piper::{NORMAL_FRAME_SEND_BUDGET, NormalSendGate, RuntimeFaultKind, RuntimePhase};
+use crate::piper::{
+    NORMAL_FRAME_SEND_BUDGET, NormalSendGate, RuntimeFaultKind, RuntimePhase, ShutdownDispatch,
+    ShutdownLane,
+};
 use crate::state::*;
 use crossbeam_channel::Receiver;
-use piper_can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
+use piper_can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, TimingCapability};
 use piper_protocol::config::*;
 use piper_protocol::feedback::*;
 use piper_protocol::ids::*;
@@ -231,8 +234,17 @@ fn reset_pending_joint_control(state: &mut ParserState) {
     state.joint_control_frame_timestamps = [0; 3];
 }
 
-fn strict_group_complete(mask: u8, timestamps: &[u64; 3]) -> bool {
-    if mask != 0b0000_0111 {
+fn complete_group_ready(mask: u8) -> bool {
+    mask == 0b0000_0111
+}
+
+#[inline]
+fn control_grade_group_ready(
+    mask: u8,
+    timestamps: &[u64; 3],
+    timing_capability: TimingCapability,
+) -> bool {
+    if timing_capability != TimingCapability::RealtimeCapable || !complete_group_ready(mask) {
         return false;
     }
 
@@ -250,8 +262,12 @@ fn strict_group_complete(mask: u8, timestamps: &[u64; 3]) -> bool {
 }
 
 #[inline]
-fn group_alignment_timestamp(frame: &PiperFrame, host_rx_mono_us: u64) -> u64 {
-    if frame.timestamp_us != 0 {
+fn group_alignment_timestamp(
+    frame: &PiperFrame,
+    host_rx_mono_us: u64,
+    timing_capability: TimingCapability,
+) -> u64 {
+    if timing_capability == TimingCapability::RealtimeCapable {
         frame.timestamp_us
     } else {
         host_rx_mono_us
@@ -371,11 +387,13 @@ pub fn io_loop(
                     );
                     if state.joint_pos_frame_mask != 0 {
                         metrics
-                            .rx_joint_position_groups_dropped_total
+                            .rx_joint_position_incomplete_groups_dropped_total
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     if state.end_pose_frame_mask != 0 {
-                        metrics.rx_end_pose_groups_dropped_total.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .rx_end_pose_incomplete_groups_dropped_total
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     reset_pending_joint_position(&mut state);
                     reset_pending_end_pose(&mut state);
@@ -402,7 +420,14 @@ pub fn io_loop(
         // ============================================================
         // 2. 根据 CAN ID 解析帧并更新状态
         // ============================================================
-        parse_and_update_state(&frame, &ctx, &config, &mut state, &metrics);
+        parse_and_update_state(
+            &frame,
+            TimingCapability::RealtimeCapable,
+            &ctx,
+            &config,
+            &mut state,
+            &metrics,
+        );
 
         // ============================================================
         // 连接监控：注册反馈（每帧处理后更新最后反馈时间）
@@ -482,8 +507,10 @@ fn drain_tx_queue(can: &mut impl CanAdapter, cmd_rx: &Receiver<PiperFrame>) -> b
 /// - `workers_running`: worker 生命周期标志
 /// - `runtime_phase`: 运行时阶段（用于 fault latch）
 /// - `metrics`: 性能指标
+#[allow(clippy::too_many_arguments)]
 pub fn rx_loop(
     mut rx: impl RxAdapter,
+    timing_capability: TimingCapability,
     ctx: Arc<PiperContext>,
     config: PipelineConfig,
     workers_running: Arc<AtomicBool>,
@@ -544,11 +571,13 @@ pub fn rx_loop(
                     // 重置 pending 缓存（避免数据过期）
                     if state.joint_pos_frame_mask != 0 {
                         metrics
-                            .rx_joint_position_groups_dropped_total
+                            .rx_joint_position_incomplete_groups_dropped_total
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     if state.end_pose_frame_mask != 0 {
-                        metrics.rx_end_pose_groups_dropped_total.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .rx_end_pose_incomplete_groups_dropped_total
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     reset_pending_joint_position(&mut state);
                     reset_pending_end_pose(&mut state);
@@ -596,7 +625,14 @@ pub fn rx_loop(
         // 3. 根据 CAN ID 解析帧并更新状态
         // ============================================================
         // 复用 io_loop 中的解析逻辑（通过调用辅助函数）
-        parse_and_update_state(&frame, &ctx, &config, &mut state, &metrics);
+        parse_and_update_state(
+            &frame,
+            timing_capability,
+            &ctx,
+            &config,
+            &mut state,
+            &metrics,
+        );
 
         // 双线程 runtime 也必须刷新连接监控，否则 health()/wait_for_feedback()
         // 会永远基于初始状态判断。
@@ -619,7 +655,7 @@ pub fn rx_loop(
 /// # 参数
 /// - `tx`: TX 适配器（只写）
 /// - `realtime_slot`: 实时命令邮箱（共享插槽）
-/// - `shutdown_rx`: 停机专用命令队列（最高优先级）
+/// - `shutdown_lane`: 单飞急停通道（最高优先级）
 /// - `reliable_rx`: 可靠命令队列接收端（容量 10）
 /// - `workers_running`: worker 生命周期标志
 /// - `runtime_phase`: 运行时阶段（用于关闭正常控制路径）
@@ -629,7 +665,7 @@ pub fn rx_loop(
 pub fn tx_loop_mailbox(
     mut tx: impl RealtimeTxAdapter,
     realtime_slot: Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
-    shutdown_rx: Receiver<crate::command::ShutdownCommand>,
+    shutdown_lane: Arc<ShutdownLane>,
     reliable_rx: Receiver<crate::command::ReliableCommand>,
     workers_running: Arc<AtomicBool>,
     runtime_phase: Arc<AtomicU8>,
@@ -645,39 +681,17 @@ pub fn tx_loop_mailbox(
             break;
         }
 
-        if let Ok(command) = shutdown_rx.try_recv() {
-            let frame = command.frame();
-            let send_result = match tx.send_shutdown_until(frame, command.deadline()) {
-                Ok(_) => {
-                    metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-                    metrics.tx_shutdown_sent_total.fetch_add(1, Ordering::Relaxed);
-                    if let Ok(hooks) = ctx.hooks.try_read() {
-                        hooks.trigger_all_sent(&frame);
-                    }
-                    Ok(())
-                },
-                Err(e) => {
-                    error!("TX thread: Failed to send shutdown frame: {}", e);
-                    if matches!(e, CanError::Timeout) {
-                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        Err(crate::DriverError::Timeout)
-                    } else {
-                        metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        Err(crate::DriverError::ReliableDeliveryFailed { source: e })
-                    }
-                },
-            };
-
-            let should_break = matches!(
-                send_result,
-                Err(crate::DriverError::ReliableDeliveryFailed { .. })
-                    | Err(crate::DriverError::ChannelClosed)
+        if let Some(dispatch) = shutdown_lane.take_pending() {
+            let should_break = send_shutdown_dispatch(
+                &mut tx,
+                dispatch,
+                &shutdown_lane,
+                &runtime_phase,
+                &metrics,
+                &ctx,
+                &last_fault,
+                "TX thread: Failed to send shutdown frame",
             );
-            command.complete(send_result);
-
             if should_break {
                 break;
             }
@@ -731,48 +745,17 @@ pub fn tx_loop_mailbox(
                             hooks.trigger_all_sent(&frame);
                         }
 
-                        if let Ok(command) = shutdown_rx.try_recv() {
-                            let frame = command.frame();
-                            let send_result = match tx
-                                .send_shutdown_until(frame, command.deadline())
-                            {
-                                Ok(_) => {
-                                    metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-                                    metrics.tx_shutdown_sent_total.fetch_add(1, Ordering::Relaxed);
-                                    if let Ok(hooks) = ctx.hooks.try_read() {
-                                        hooks.trigger_all_sent(&frame);
-                                    }
-                                    Ok(())
-                                },
-                                Err(e) => {
-                                    error!(
-                                        "TX thread: Failed to send shutdown frame while preempting realtime package: {}",
-                                        e
-                                    );
-                                    if matches!(e, CanError::Timeout) {
-                                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                                        Err(crate::DriverError::Timeout)
-                                    } else {
-                                        metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                                        store_runtime_phase(
-                                            &runtime_phase,
-                                            RuntimePhase::FaultLatched,
-                                        );
-                                        Err(crate::DriverError::ReliableDeliveryFailed {
-                                            source: e,
-                                        })
-                                    }
-                                },
-                            };
-
-                            let should_break = matches!(
-                                send_result,
-                                Err(crate::DriverError::ReliableDeliveryFailed { .. })
-                                    | Err(crate::DriverError::ChannelClosed)
+                        if let Some(dispatch) = shutdown_lane.take_pending() {
+                            let should_break = send_shutdown_dispatch(
+                                &mut tx,
+                                dispatch,
+                                &shutdown_lane,
+                                &runtime_phase,
+                                &metrics,
+                                &ctx,
+                                &last_fault,
+                                "TX thread: Failed to send shutdown frame while preempting realtime package",
                             );
-                            command.complete(send_result);
                             count_fault_abort(&metrics);
                             delivery_error = Some(realtime_abort_error(sent_count, total_frames));
                             transport_error = should_break;
@@ -895,7 +878,7 @@ pub fn tx_loop_mailbox(
     {
         record_fault(&last_fault, RuntimeFaultKind::TxExited);
     }
-    drain_shutdown_queue(&shutdown_rx);
+    shutdown_lane.close_with(Err(crate::DriverError::ChannelClosed));
     drain_reliable_queue(&reliable_rx, &metrics, false, false);
     abort_realtime_slot_with(
         &realtime_slot,
@@ -951,10 +934,49 @@ fn drain_reliable_queue(
     }
 }
 
-fn drain_shutdown_queue(shutdown_rx: &Receiver<crate::command::ShutdownCommand>) {
-    while let Ok(command) = shutdown_rx.try_recv() {
-        command.complete(Err(crate::DriverError::ChannelClosed));
-    }
+#[allow(clippy::too_many_arguments)]
+fn send_shutdown_dispatch(
+    tx: &mut impl RealtimeTxAdapter,
+    dispatch: ShutdownDispatch,
+    shutdown_lane: &Arc<ShutdownLane>,
+    runtime_phase: &Arc<AtomicU8>,
+    metrics: &Arc<PiperMetrics>,
+    ctx: &Arc<PiperContext>,
+    last_fault: &Arc<AtomicU8>,
+    error_prefix: &str,
+) -> bool {
+    let frame = dispatch.frame;
+    let send_result = match tx.send_shutdown_until(frame, dispatch.deadline) {
+        Ok(_) => {
+            metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+            metrics.tx_shutdown_sent_total.fetch_add(1, Ordering::Relaxed);
+            if let Ok(hooks) = ctx.hooks.try_read() {
+                hooks.trigger_all_sent(&frame);
+            }
+            Ok(())
+        },
+        Err(e) => {
+            error!("{}: {}", error_prefix, e);
+            if matches!(e, CanError::Timeout) {
+                metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                record_fault(last_fault, RuntimeFaultKind::TransportError);
+                Err(crate::DriverError::Timeout)
+            } else {
+                metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                record_fault(last_fault, RuntimeFaultKind::TransportError);
+                store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
+                Err(crate::DriverError::ReliableDeliveryFailed { source: e })
+            }
+        },
+    };
+
+    let should_break = matches!(
+        send_result,
+        Err(crate::DriverError::ReliableDeliveryFailed { .. })
+            | Err(crate::DriverError::ChannelClosed)
+    );
+    shutdown_lane.finish(send_result);
+    should_break
 }
 
 /// 辅助函数：解析帧并更新状态
@@ -975,6 +997,7 @@ fn drain_shutdown_queue(shutdown_rx: &Receiver<crate::command::ShutdownCommand>)
 /// 原本有 14 个参数，现在只有 4 个，代码可读性大幅提升。
 fn parse_and_update_state(
     frame: &PiperFrame,
+    timing_capability: TimingCapability,
     ctx: &Arc<PiperContext>,
     config: &PipelineConfig,
     state: &mut ParserState,
@@ -984,12 +1007,15 @@ fn parse_and_update_state(
         ID_JOINT_FEEDBACK_12 => {
             if let Ok(feedback) = JointFeedback12::try_from(*frame) {
                 if state.joint_pos_frame_mask != 0 {
-                    metrics.rx_joint_position_groups_dropped_total.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .rx_joint_position_incomplete_groups_dropped_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 reset_pending_joint_position(state);
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_joint_pos[0] = feedback.j1_rad();
                 state.pending_joint_pos[1] = feedback.j2_rad();
                 state.joint_pos_frame_mask |= 1 << 0;
@@ -997,7 +1023,7 @@ fn parse_and_update_state(
 
                 ctx.publish_raw_joint_position(JointPositionState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     joint_pos: state.pending_joint_pos,
                     frame_valid_mask: state.joint_pos_frame_mask,
                 });
@@ -1011,8 +1037,9 @@ fn parse_and_update_state(
                     reset_pending_joint_position(state);
                 }
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_joint_pos[2] = feedback.j3_rad();
                 state.pending_joint_pos[3] = feedback.j4_rad();
                 state.joint_pos_frame_mask |= 1 << 1;
@@ -1020,7 +1047,7 @@ fn parse_and_update_state(
 
                 ctx.publish_raw_joint_position(JointPositionState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     joint_pos: state.pending_joint_pos,
                     frame_valid_mask: state.joint_pos_frame_mask,
                 });
@@ -1034,8 +1061,9 @@ fn parse_and_update_state(
                     reset_pending_joint_position(state);
                 }
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_joint_pos[4] = feedback.j5_rad();
                 state.pending_joint_pos[5] = feedback.j6_rad();
                 state.joint_pos_frame_mask |= 1 << 2;
@@ -1043,23 +1071,33 @@ fn parse_and_update_state(
 
                 let new_joint_pos_state = JointPositionState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     joint_pos: state.pending_joint_pos,
                     frame_valid_mask: state.joint_pos_frame_mask,
                 };
                 ctx.publish_raw_joint_position(new_joint_pos_state.clone());
 
-                if strict_group_complete(
-                    state.joint_pos_frame_mask,
-                    &state.joint_pos_frame_timestamps,
-                ) {
-                    ctx.publish_joint_position(new_joint_pos_state);
+                if complete_group_ready(state.joint_pos_frame_mask) {
+                    ctx.publish_joint_position(new_joint_pos_state.clone());
                     ctx.fps_stats
                         .load()
                         .joint_position_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if control_grade_group_ready(
+                        state.joint_pos_frame_mask,
+                        &state.joint_pos_frame_timestamps,
+                        timing_capability,
+                    ) {
+                        ctx.publish_control_joint_position(new_joint_pos_state.clone());
+                    } else {
+                        metrics
+                            .rx_joint_position_control_grade_rejected_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 } else {
-                    metrics.rx_joint_position_groups_dropped_total.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .rx_joint_position_incomplete_groups_dropped_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
 
                 reset_pending_joint_position(state);
@@ -1070,12 +1108,15 @@ fn parse_and_update_state(
         ID_END_POSE_1 => {
             if let Ok(feedback) = EndPoseFeedback1::try_from(*frame) {
                 if state.end_pose_frame_mask != 0 {
-                    metrics.rx_end_pose_groups_dropped_total.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .rx_end_pose_incomplete_groups_dropped_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 reset_pending_end_pose(state);
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_end_pose[0] = feedback.x() / 1000.0;
                 state.pending_end_pose[1] = feedback.y() / 1000.0;
                 state.end_pose_frame_mask |= 1 << 0;
@@ -1083,7 +1124,7 @@ fn parse_and_update_state(
 
                 ctx.publish_raw_end_pose(EndPoseState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     end_pose: state.pending_end_pose,
                     frame_valid_mask: state.end_pose_frame_mask,
                 });
@@ -1095,8 +1136,9 @@ fn parse_and_update_state(
                     reset_pending_end_pose(state);
                 }
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_end_pose[2] = feedback.z() / 1000.0;
                 state.pending_end_pose[3] = feedback.rx_rad();
                 state.end_pose_frame_mask |= 1 << 1;
@@ -1104,7 +1146,7 @@ fn parse_and_update_state(
 
                 ctx.publish_raw_end_pose(EndPoseState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     end_pose: state.pending_end_pose,
                     frame_valid_mask: state.end_pose_frame_mask,
                 });
@@ -1116,8 +1158,9 @@ fn parse_and_update_state(
                     reset_pending_end_pose(state);
                 }
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_end_pose[4] = feedback.ry_rad();
                 state.pending_end_pose[5] = feedback.rz_rad();
                 state.end_pose_frame_mask |= 1 << 2;
@@ -1125,23 +1168,33 @@ fn parse_and_update_state(
 
                 let new_end_pose_state = EndPoseState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     end_pose: state.pending_end_pose,
                     frame_valid_mask: state.end_pose_frame_mask,
                 };
                 ctx.publish_raw_end_pose(new_end_pose_state.clone());
 
-                if strict_group_complete(
-                    state.end_pose_frame_mask,
-                    &state.end_pose_frame_timestamps,
-                ) {
-                    ctx.publish_end_pose(new_end_pose_state);
+                if complete_group_ready(state.end_pose_frame_mask) {
+                    ctx.publish_end_pose(new_end_pose_state.clone());
                     ctx.fps_stats
                         .load()
                         .end_pose_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if control_grade_group_ready(
+                        state.end_pose_frame_mask,
+                        &state.end_pose_frame_timestamps,
+                        timing_capability,
+                    ) {
+                        ctx.publish_control_end_pose(new_end_pose_state.clone());
+                    } else {
+                        metrics
+                            .rx_end_pose_control_grade_rejected_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 } else {
-                    metrics.rx_end_pose_groups_dropped_total.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .rx_end_pose_incomplete_groups_dropped_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
 
                 reset_pending_end_pose(state);
@@ -1183,11 +1236,11 @@ fn parse_and_update_state(
                     }
                 }
 
-                let system_timestamp_us = host_rx_mono_us();
+                let host_rx_mono_us = host_rx_mono_us();
                 state.pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                 state.pending_joint_dynamic.joint_current[joint_index] = feedback.current();
                 state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us;
-                state.pending_joint_dynamic.group_system_timestamp_us = system_timestamp_us;
+                state.pending_joint_dynamic.group_host_rx_mono_us = host_rx_mono_us;
                 state.pending_joint_dynamic.group_timestamp_us = frame.timestamp_us;
 
                 if state.vel_update_mask == 0 {
@@ -1205,7 +1258,7 @@ fn parse_and_update_state(
         },
         ID_ROBOT_STATUS => {
             if let Ok(feedback) = RobotStatusFeedback::try_from(*frame) {
-                let system_timestamp_us = host_rx_mono_us();
+                let host_rx_mono_us = host_rx_mono_us();
 
                 let fault_angle_limit_mask = feedback.fault_code_angle_limit.joint1_limit() as u8
                     | (feedback.fault_code_angle_limit.joint2_limit() as u8) << 1
@@ -1224,7 +1277,7 @@ fn parse_and_update_state(
 
                 let new_robot_control_state = RobotControlState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     control_mode: feedback.control_mode as u8,
                     robot_status: feedback.robot_status as u8,
                     move_mode: feedback.move_mode as u8,
@@ -1246,14 +1299,14 @@ fn parse_and_update_state(
         },
         ID_GRIPPER_FEEDBACK => {
             if let Ok(feedback) = GripperFeedback::try_from(*frame) {
-                let system_timestamp_us = host_rx_mono_us();
+                let host_rx_mono_us = host_rx_mono_us();
 
                 let current = ctx.gripper.load();
                 let last_travel = current.last_travel;
 
                 let new_gripper_state = GripperState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     travel: feedback.travel(),
                     torque: feedback.torque(),
                     status_code: u8::from(feedback.status),
@@ -1278,7 +1331,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = JointDriverLowSpeedFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
-                    let system_timestamp_us = host_rx_mono_us();
+                    let host_rx_mono_us = host_rx_mono_us();
 
                     ctx.joint_driver_low_speed.rcu(|old| {
                         let mut new = (**old).clone();
@@ -1287,9 +1340,9 @@ fn parse_and_update_state(
                         new.joint_voltage[joint_idx] = feedback.voltage() as f32;
                         new.joint_bus_current[joint_idx] = feedback.bus_current() as f32;
                         new.hardware_timestamps[joint_idx] = frame.timestamp_us;
-                        new.system_timestamps[joint_idx] = system_timestamp_us;
+                        new.host_rx_mono_timestamps[joint_idx] = host_rx_mono_us;
                         new.hardware_timestamp_us = frame.timestamp_us;
-                        new.system_timestamp_us = system_timestamp_us;
+                        new.host_rx_mono_us = host_rx_mono_us;
                         new.valid_mask |= 1 << joint_idx;
 
                         // 更新驱动器状态位掩码
@@ -1345,11 +1398,11 @@ fn parse_and_update_state(
         },
         ID_COLLISION_PROTECTION_LEVEL_FEEDBACK => {
             if let Ok(feedback) = CollisionProtectionLevelFeedback::try_from(*frame) {
-                let system_timestamp_us = host_rx_mono_us();
+                let host_rx_mono_us = host_rx_mono_us();
 
                 if let Ok(mut collision) = ctx.collision_protection.try_write() {
                     collision.hardware_timestamp_us = frame.timestamp_us;
-                    collision.system_timestamp_us = system_timestamp_us;
+                    collision.host_rx_mono_us = host_rx_mono_us;
                     collision.protection_levels = feedback.levels;
                 }
 
@@ -1363,7 +1416,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = MotorLimitFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
-                    let system_timestamp_us = host_rx_mono_us();
+                    let host_rx_mono_us = host_rx_mono_us();
 
                     if let Ok(mut joint_limit) = ctx.joint_limit_config.write() {
                         joint_limit.joint_limits_max[joint_idx] = feedback.max_angle().to_radians();
@@ -1371,9 +1424,10 @@ fn parse_and_update_state(
                         joint_limit.joint_max_velocity[joint_idx] = feedback.max_velocity();
                         joint_limit.joint_update_hardware_timestamps[joint_idx] =
                             frame.timestamp_us;
-                        joint_limit.joint_update_system_timestamps[joint_idx] = system_timestamp_us;
+                        joint_limit.joint_update_host_rx_mono_timestamps[joint_idx] =
+                            host_rx_mono_us;
                         joint_limit.last_update_hardware_timestamp_us = frame.timestamp_us;
-                        joint_limit.last_update_system_timestamp_us = system_timestamp_us;
+                        joint_limit.last_update_host_rx_mono_us = host_rx_mono_us;
                         joint_limit.valid_mask |= 1 << joint_idx;
                     }
 
@@ -1388,15 +1442,16 @@ fn parse_and_update_state(
             if let Ok(feedback) = MotorMaxAccelFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
-                    let system_timestamp_us = host_rx_mono_us();
+                    let host_rx_mono_us = host_rx_mono_us();
 
                     if let Ok(mut joint_accel) = ctx.joint_accel_config.write() {
                         joint_accel.max_acc_limits[joint_idx] = feedback.max_accel();
                         joint_accel.joint_update_hardware_timestamps[joint_idx] =
                             frame.timestamp_us;
-                        joint_accel.joint_update_system_timestamps[joint_idx] = system_timestamp_us;
+                        joint_accel.joint_update_host_rx_mono_timestamps[joint_idx] =
+                            host_rx_mono_us;
                         joint_accel.last_update_hardware_timestamp_us = frame.timestamp_us;
-                        joint_accel.last_update_system_timestamp_us = system_timestamp_us;
+                        joint_accel.last_update_host_rx_mono_us = host_rx_mono_us;
                         joint_accel.valid_mask |= 1 << joint_idx;
                     }
 
@@ -1409,7 +1464,7 @@ fn parse_and_update_state(
         },
         ID_END_VELOCITY_ACCEL_FEEDBACK => {
             if let Ok(feedback) = EndVelocityAccelFeedback::try_from(*frame) {
-                let system_timestamp_us = host_rx_mono_us();
+                let host_rx_mono_us = host_rx_mono_us();
 
                 if let Ok(mut end_limit) = ctx.end_limit_config.write() {
                     end_limit.max_end_linear_velocity = feedback.max_linear_velocity();
@@ -1417,7 +1472,7 @@ fn parse_and_update_state(
                     end_limit.max_end_linear_accel = feedback.max_linear_accel();
                     end_limit.max_end_angular_accel = feedback.max_angular_accel();
                     end_limit.last_update_hardware_timestamp_us = frame.timestamp_us;
-                    end_limit.last_update_system_timestamp_us = system_timestamp_us;
+                    end_limit.last_update_host_rx_mono_us = host_rx_mono_us;
                     end_limit.is_valid = true;
                 }
 
@@ -1429,14 +1484,14 @@ fn parse_and_update_state(
         },
         ID_FIRMWARE_READ => {
             if let Ok(feedback) = FirmwareReadFeedback::try_from(*frame) {
-                let system_timestamp_us = host_rx_mono_us();
+                let host_rx_mono_us = host_rx_mono_us();
 
                 if let Ok(mut firmware_state) = ctx.firmware_version.write() {
                     firmware_state
                         .firmware_data
                         .extend_from_slice(&feedback.firmware_data()[..frame.len as usize]);
                     firmware_state.hardware_timestamp_us = frame.timestamp_us;
-                    firmware_state.system_timestamp_us = system_timestamp_us;
+                    firmware_state.host_rx_mono_us = host_rx_mono_us;
                     firmware_state.parse_version();
                 }
 
@@ -1448,11 +1503,11 @@ fn parse_and_update_state(
         },
         ID_CONTROL_MODE => {
             if let Ok(feedback) = ControlModeCommandFeedback::try_from(*frame) {
-                let system_timestamp_us = host_rx_mono_us();
+                let host_rx_mono_us = host_rx_mono_us();
 
                 let new_state = MasterSlaveControlModeState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     control_mode: feedback.control_mode as u8,
                     move_mode: feedback.move_mode as u8,
                     speed_percent: feedback.speed_percent,
@@ -1475,8 +1530,9 @@ fn parse_and_update_state(
                     reset_pending_joint_control(state);
                 }
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_joint_target_deg[0] = feedback.j1_deg;
                 state.pending_joint_target_deg[1] = feedback.j2_deg;
                 state.joint_control_frame_mask |= 1 << 0;
@@ -1489,8 +1545,9 @@ fn parse_and_update_state(
                     reset_pending_joint_control(state);
                 }
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_joint_target_deg[2] = feedback.j3_deg;
                 state.pending_joint_target_deg[3] = feedback.j4_deg;
                 state.joint_control_frame_mask |= 1 << 1;
@@ -1503,20 +1560,18 @@ fn parse_and_update_state(
                     reset_pending_joint_control(state);
                 }
 
-                let system_timestamp_us = host_rx_mono_us();
-                let alignment_timestamp_us = group_alignment_timestamp(frame, system_timestamp_us);
+                let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_joint_target_deg[4] = feedback.j5_deg;
                 state.pending_joint_target_deg[5] = feedback.j6_deg;
                 state.joint_control_frame_mask |= 1 << 2;
                 state.joint_control_frame_timestamps[2] = alignment_timestamp_us;
 
-                if strict_group_complete(
-                    state.joint_control_frame_mask,
-                    &state.joint_control_frame_timestamps,
-                ) {
+                if complete_group_ready(state.joint_control_frame_mask) {
                     let new_state = MasterSlaveJointControlState {
                         hardware_timestamp_us: frame.timestamp_us,
-                        system_timestamp_us,
+                        host_rx_mono_us,
                         joint_target_deg: state.pending_joint_target_deg,
                         frame_valid_mask: state.joint_control_frame_mask,
                     };
@@ -1533,11 +1588,11 @@ fn parse_and_update_state(
         },
         ID_GRIPPER_CONTROL => {
             if let Ok(feedback) = GripperControlFeedback::try_from(*frame) {
-                let system_timestamp_us = host_rx_mono_us();
+                let host_rx_mono_us = host_rx_mono_us();
 
                 let new_state = MasterSlaveGripperControlState {
                     hardware_timestamp_us: frame.timestamp_us,
-                    system_timestamp_us,
+                    host_rx_mono_us,
                     gripper_target_travel_mm: feedback.travel_mm,
                     gripper_target_torque_nm: feedback.torque_nm,
                     gripper_status_code: feedback.status_code,

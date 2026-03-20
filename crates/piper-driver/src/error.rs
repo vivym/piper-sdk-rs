@@ -27,6 +27,10 @@ pub enum DriverError {
     #[error("Command channel full (buffer size: 10)")]
     ChannelFull,
 
+    /// 已有不同停机帧正在执行单飞急停
+    #[error("Shutdown lane already carries a different in-flight stop frame")]
+    ShutdownConflict,
+
     /// 未使用双线程模式
     ///
     /// 某些方法（如 `send_realtime()`）只能在双线程模式下使用。

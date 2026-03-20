@@ -8,9 +8,10 @@
 use piper_sdk::can::{
     CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
 };
-use piper_sdk::driver::command::{ReliableCommand, ShutdownCommand};
+use piper_sdk::driver::command::ReliableCommand;
 use piper_sdk::driver::{
-    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, TimingCapability,
+    rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -186,7 +187,7 @@ fn test_rx_unaffected_by_tx_timeout() {
 
     // 创建命令通道
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -199,6 +200,7 @@ fn test_rx_unaffected_by_tx_timeout() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx_rx,
             config,
             is_running_rx,
@@ -219,7 +221,7 @@ fn test_rx_unaffected_by_tx_timeout() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
@@ -305,7 +307,7 @@ fn test_tx_detects_rx_failure() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -318,6 +320,7 @@ fn test_tx_detects_rx_failure() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx_rx,
             config,
             is_running_rx,
@@ -338,7 +341,7 @@ fn test_tx_detects_rx_failure() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
@@ -421,7 +424,7 @@ fn test_thread_lifecycle_linkage() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -434,6 +437,7 @@ fn test_thread_lifecycle_linkage() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx_rx,
             config,
             is_running_rx,
@@ -454,7 +458,7 @@ fn test_thread_lifecycle_linkage() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,

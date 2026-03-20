@@ -8,9 +8,10 @@
 //! 5. 生成测试报告（Markdown）
 
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
+use piper_sdk::driver::TimingCapability;
 use piper_sdk::driver::{
-    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics,
-    command::{RealtimeCommand, ReliableCommand, ShutdownCommand},
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane,
+    command::{RealtimeCommand, ReliableCommand},
     rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
@@ -433,6 +434,7 @@ fn test_500hz_realtime_benchmark() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx_rx,
             config,
             is_running_rx,
@@ -531,6 +533,7 @@ fn test_1khz_realtime_benchmark() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx_rx,
             config,
             is_running_rx,
@@ -622,7 +625,7 @@ fn test_tx_latency_benchmark() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -638,7 +641,7 @@ fn test_tx_latency_benchmark() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot_tx,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
@@ -739,7 +742,7 @@ fn test_send_duration_benchmark() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -755,7 +758,7 @@ fn test_send_duration_benchmark() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot_tx,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
@@ -854,6 +857,7 @@ fn test_usb_fault_simulation() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx_rx,
             config,
             is_running_rx,

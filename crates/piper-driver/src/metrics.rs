@@ -55,8 +55,14 @@ pub struct PiperMetrics {
     /// TX 普通可靠队列满次数
     pub tx_reliable_queue_full_total: AtomicU64,
 
-    /// TX 停机命令成功进入 shutdown lane 的总次数
-    pub tx_shutdown_enqueued_total: AtomicU64,
+    /// TX 侧收到的急停请求总次数（包括 coalesced）
+    pub tx_shutdown_requests_total: AtomicU64,
+
+    /// TX 侧附着到当前单飞急停请求的次数
+    pub tx_shutdown_coalesced_total: AtomicU64,
+
+    /// TX 侧急停请求因不同停机帧冲突而被拒绝的次数
+    pub tx_shutdown_conflicts_total: AtomicU64,
 
     /// TX 停机命令成功发送到底层适配器的总次数
     pub tx_shutdown_sent_total: AtomicU64,
@@ -81,10 +87,14 @@ pub struct PiperMetrics {
     pub tx_packages_fault_aborted_total: AtomicU64,
     /// 实时帧包因底层 transport 错误而完全失败（0 帧成功发送）的次数
     pub tx_packages_transport_failed_total: AtomicU64,
-    /// 关节位置部分帧组被丢弃的次数
-    pub rx_joint_position_groups_dropped_total: AtomicU64,
-    /// 末端位姿部分帧组被丢弃的次数
-    pub rx_end_pose_groups_dropped_total: AtomicU64,
+    /// 关节位置完整组因缺帧/超时而被丢弃的次数
+    pub rx_joint_position_incomplete_groups_dropped_total: AtomicU64,
+    /// 关节位置完整组不满足控制级跨度约束而被拒绝的次数
+    pub rx_joint_position_control_grade_rejected_total: AtomicU64,
+    /// 末端位姿完整组因缺帧/超时而被丢弃的次数
+    pub rx_end_pose_incomplete_groups_dropped_total: AtomicU64,
+    /// 末端位姿完整组不满足控制级跨度约束而被拒绝的次数
+    pub rx_end_pose_control_grade_rejected_total: AtomicU64,
     /// 关节动态部分帧组被丢弃的次数
     pub rx_joint_dynamic_groups_dropped_total: AtomicU64,
 }
@@ -113,7 +123,9 @@ impl PiperMetrics {
             tx_realtime_overwrites_total: self.tx_realtime_overwrites_total.load(Ordering::Relaxed),
             tx_reliable_enqueued_total: self.tx_reliable_enqueued_total.load(Ordering::Relaxed),
             tx_reliable_queue_full_total: self.tx_reliable_queue_full_total.load(Ordering::Relaxed),
-            tx_shutdown_enqueued_total: self.tx_shutdown_enqueued_total.load(Ordering::Relaxed),
+            tx_shutdown_requests_total: self.tx_shutdown_requests_total.load(Ordering::Relaxed),
+            tx_shutdown_coalesced_total: self.tx_shutdown_coalesced_total.load(Ordering::Relaxed),
+            tx_shutdown_conflicts_total: self.tx_shutdown_conflicts_total.load(Ordering::Relaxed),
             tx_shutdown_sent_total: self.tx_shutdown_sent_total.load(Ordering::Relaxed),
             tx_fault_aborts_total: self.tx_fault_aborts_total.load(Ordering::Relaxed),
             device_errors: self.device_errors.load(Ordering::Relaxed),
@@ -127,11 +139,17 @@ impl PiperMetrics {
             tx_packages_transport_failed_total: self
                 .tx_packages_transport_failed_total
                 .load(Ordering::Relaxed),
-            rx_joint_position_groups_dropped_total: self
-                .rx_joint_position_groups_dropped_total
+            rx_joint_position_incomplete_groups_dropped_total: self
+                .rx_joint_position_incomplete_groups_dropped_total
                 .load(Ordering::Relaxed),
-            rx_end_pose_groups_dropped_total: self
-                .rx_end_pose_groups_dropped_total
+            rx_joint_position_control_grade_rejected_total: self
+                .rx_joint_position_control_grade_rejected_total
+                .load(Ordering::Relaxed),
+            rx_end_pose_incomplete_groups_dropped_total: self
+                .rx_end_pose_incomplete_groups_dropped_total
+                .load(Ordering::Relaxed),
+            rx_end_pose_control_grade_rejected_total: self
+                .rx_end_pose_control_grade_rejected_total
                 .load(Ordering::Relaxed),
             rx_joint_dynamic_groups_dropped_total: self
                 .rx_joint_dynamic_groups_dropped_total
@@ -151,7 +169,9 @@ impl PiperMetrics {
         self.tx_realtime_overwrites_total.store(0, Ordering::Relaxed);
         self.tx_reliable_enqueued_total.store(0, Ordering::Relaxed);
         self.tx_reliable_queue_full_total.store(0, Ordering::Relaxed);
-        self.tx_shutdown_enqueued_total.store(0, Ordering::Relaxed);
+        self.tx_shutdown_requests_total.store(0, Ordering::Relaxed);
+        self.tx_shutdown_coalesced_total.store(0, Ordering::Relaxed);
+        self.tx_shutdown_conflicts_total.store(0, Ordering::Relaxed);
         self.tx_shutdown_sent_total.store(0, Ordering::Relaxed);
         self.tx_fault_aborts_total.store(0, Ordering::Relaxed);
         self.device_errors.store(0, Ordering::Relaxed);
@@ -161,8 +181,11 @@ impl PiperMetrics {
         self.tx_packages_partial_total.store(0, Ordering::Relaxed);
         self.tx_packages_fault_aborted_total.store(0, Ordering::Relaxed);
         self.tx_packages_transport_failed_total.store(0, Ordering::Relaxed);
-        self.rx_joint_position_groups_dropped_total.store(0, Ordering::Relaxed);
-        self.rx_end_pose_groups_dropped_total.store(0, Ordering::Relaxed);
+        self.rx_joint_position_incomplete_groups_dropped_total
+            .store(0, Ordering::Relaxed);
+        self.rx_joint_position_control_grade_rejected_total.store(0, Ordering::Relaxed);
+        self.rx_end_pose_incomplete_groups_dropped_total.store(0, Ordering::Relaxed);
+        self.rx_end_pose_control_grade_rejected_total.store(0, Ordering::Relaxed);
         self.rx_joint_dynamic_groups_dropped_total.store(0, Ordering::Relaxed);
     }
 }
@@ -188,8 +211,12 @@ pub struct MetricsSnapshot {
     pub tx_reliable_enqueued_total: u64,
     /// TX 普通可靠队列满次数
     pub tx_reliable_queue_full_total: u64,
-    /// TX 停机命令入队总次数
-    pub tx_shutdown_enqueued_total: u64,
+    /// TX 急停请求总次数
+    pub tx_shutdown_requests_total: u64,
+    /// TX 急停 coalesced 次数
+    pub tx_shutdown_coalesced_total: u64,
+    /// TX 急停冲突拒绝次数
+    pub tx_shutdown_conflicts_total: u64,
     /// TX 停机命令发送总次数
     pub tx_shutdown_sent_total: u64,
     /// 因故障锁存或停止阶段被主动中止的普通控制命令总次数
@@ -208,10 +235,14 @@ pub struct MetricsSnapshot {
     pub tx_packages_fault_aborted_total: u64,
     /// 实时帧包因 transport 错误在 0 帧成功发送时失败的次数
     pub tx_packages_transport_failed_total: u64,
-    /// 关节位置部分帧组被丢弃的次数
-    pub rx_joint_position_groups_dropped_total: u64,
-    /// 末端位姿部分帧组被丢弃的次数
-    pub rx_end_pose_groups_dropped_total: u64,
+    /// 关节位置完整组因缺帧/超时而被丢弃的次数
+    pub rx_joint_position_incomplete_groups_dropped_total: u64,
+    /// 关节位置完整组不满足控制级跨度约束而被拒绝的次数
+    pub rx_joint_position_control_grade_rejected_total: u64,
+    /// 末端位姿完整组因缺帧/超时而被丢弃的次数
+    pub rx_end_pose_incomplete_groups_dropped_total: u64,
+    /// 末端位姿完整组不满足控制级跨度约束而被拒绝的次数
+    pub rx_end_pose_control_grade_rejected_total: u64,
     /// 关节动态部分帧组被丢弃的次数
     pub rx_joint_dynamic_groups_dropped_total: u64,
 }
@@ -370,7 +401,9 @@ mod tests {
             tx_realtime_overwrites_total: 5,
             tx_reliable_enqueued_total: 0,
             tx_reliable_queue_full_total: 0,
-            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_requests_total: 0,
+            tx_shutdown_coalesced_total: 0,
+            tx_shutdown_conflicts_total: 0,
             tx_shutdown_sent_total: 0,
             tx_fault_aborts_total: 0,
             device_errors: 0,
@@ -380,8 +413,10 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
-            rx_joint_position_groups_dropped_total: 0,
-            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_position_incomplete_groups_dropped_total: 0,
+            rx_joint_position_control_grade_rejected_total: 0,
+            rx_end_pose_incomplete_groups_dropped_total: 0,
+            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -401,7 +436,9 @@ mod tests {
             tx_realtime_overwrites_total: 0,
             tx_reliable_enqueued_total: 0,
             tx_reliable_queue_full_total: 0,
-            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_requests_total: 0,
+            tx_shutdown_coalesced_total: 0,
+            tx_shutdown_conflicts_total: 0,
             tx_shutdown_sent_total: 0,
             tx_fault_aborts_total: 0,
             device_errors: 0,
@@ -411,8 +448,10 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
-            rx_joint_position_groups_dropped_total: 0,
-            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_position_incomplete_groups_dropped_total: 0,
+            rx_joint_position_control_grade_rejected_total: 0,
+            rx_end_pose_incomplete_groups_dropped_total: 0,
+            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -432,7 +471,9 @@ mod tests {
             tx_realtime_overwrites_total: 200,
             tx_reliable_enqueued_total: 0,
             tx_reliable_queue_full_total: 0,
-            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_requests_total: 0,
+            tx_shutdown_coalesced_total: 0,
+            tx_shutdown_conflicts_total: 0,
             tx_shutdown_sent_total: 0,
             tx_fault_aborts_total: 0,
             device_errors: 0,
@@ -442,8 +483,10 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
-            rx_joint_position_groups_dropped_total: 0,
-            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_position_incomplete_groups_dropped_total: 0,
+            rx_joint_position_control_grade_rejected_total: 0,
+            rx_end_pose_incomplete_groups_dropped_total: 0,
+            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -472,7 +515,9 @@ mod tests {
             tx_realtime_overwrites_total: 0,
             tx_reliable_enqueued_total: 0,
             tx_reliable_queue_full_total: 0,
-            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_requests_total: 0,
+            tx_shutdown_coalesced_total: 0,
+            tx_shutdown_conflicts_total: 0,
             tx_shutdown_sent_total: 0,
             tx_fault_aborts_total: 0,
             device_errors: 0,
@@ -482,8 +527,10 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
-            rx_joint_position_groups_dropped_total: 0,
-            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_position_incomplete_groups_dropped_total: 0,
+            rx_joint_position_control_grade_rejected_total: 0,
+            rx_end_pose_incomplete_groups_dropped_total: 0,
+            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -503,7 +550,9 @@ mod tests {
             tx_realtime_overwrites_total: 25,
             tx_reliable_enqueued_total: 40,
             tx_reliable_queue_full_total: 3,
-            tx_shutdown_enqueued_total: 2,
+            tx_shutdown_requests_total: 2,
+            tx_shutdown_coalesced_total: 0,
+            tx_shutdown_conflicts_total: 0,
             tx_shutdown_sent_total: 2,
             tx_fault_aborts_total: 7,
             device_errors: 0,
@@ -513,8 +562,10 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
-            rx_joint_position_groups_dropped_total: 0,
-            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_position_incomplete_groups_dropped_total: 0,
+            rx_joint_position_control_grade_rejected_total: 0,
+            rx_end_pose_incomplete_groups_dropped_total: 0,
+            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -533,7 +584,9 @@ mod tests {
             tx_realtime_overwrites_total: 299, // 29.9% < 30%
             tx_reliable_enqueued_total: 0,
             tx_reliable_queue_full_total: 0,
-            tx_shutdown_enqueued_total: 0,
+            tx_shutdown_requests_total: 0,
+            tx_shutdown_coalesced_total: 0,
+            tx_shutdown_conflicts_total: 0,
             tx_shutdown_sent_total: 0,
             tx_fault_aborts_total: 0,
             device_errors: 0,
@@ -543,8 +596,10 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
-            rx_joint_position_groups_dropped_total: 0,
-            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_position_incomplete_groups_dropped_total: 0,
+            rx_joint_position_control_grade_rejected_total: 0,
+            rx_end_pose_incomplete_groups_dropped_total: 0,
+            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
         assert!(!normal.is_overwrite_rate_abnormal());

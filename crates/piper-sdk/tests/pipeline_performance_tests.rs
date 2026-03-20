@@ -4,9 +4,10 @@
 //! 不再依赖 wall-clock P95/P99 阈值。
 
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::command::{ReliableCommand, ShutdownCommand};
+use piper_sdk::driver::command::ReliableCommand;
 use piper_sdk::driver::{
-    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, TimingCapability,
+    rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -150,6 +151,7 @@ fn start_rx_loop(
     thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx,
             PipelineConfig::default(),
             is_running,
@@ -169,7 +171,7 @@ fn start_tx_loop(
     runtime_phase: Arc<AtomicU8>,
     fault: Arc<AtomicU8>,
     realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>>,
-    shutdown_rx: crossbeam_channel::Receiver<ShutdownCommand>,
+    shutdown_lane: Arc<ShutdownLane>,
     reliable_rx: crossbeam_channel::Receiver<ReliableCommand>,
 ) -> thread::JoinHandle<()> {
     let normal_send_gate = Arc::new(NormalSendGate::new());
@@ -177,7 +179,7 @@ fn start_tx_loop(
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running,
             runtime_phase,
@@ -229,7 +231,7 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
     let fault = Arc::new(AtomicU8::new(0));
     let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(2));
     let sent_frames = tx_adapter.sent_frames.clone();
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
 
@@ -241,7 +243,7 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
         runtime_phase,
         fault.clone(),
         realtime_slot,
-        shutdown_rx,
+        shutdown_lane,
         reliable_rx,
     );
 
@@ -278,7 +280,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
     let fault = Arc::new(AtomicU8::new(0));
     let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(1));
     let sent_frames = tx_adapter.sent_frames.clone();
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_writer = realtime_slot.clone();
@@ -291,7 +293,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
         runtime_phase,
         fault.clone(),
         realtime_slot,
-        shutdown_rx,
+        shutdown_lane,
         reliable_rx,
     );
 
@@ -354,7 +356,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
     );
 
     let tx_adapter = RecordingTxAdapter::new(Duration::ZERO);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let tx_handle = start_tx_loop(
@@ -365,7 +367,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
         runtime_phase,
         fault.clone(),
         realtime_slot,
-        shutdown_rx,
+        shutdown_lane,
         reliable_rx,
     );
 
@@ -404,7 +406,7 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
     let (release_first_tx, release_first_rx) = mpsc::channel();
     let tx_adapter = BlockingFirstTxAdapter::new(first_frame_tx, release_first_rx);
     let sent_frames = tx_adapter.sent_frames.clone();
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let realtime_slot = Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_writer = realtime_slot.clone();
@@ -417,7 +419,7 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
         runtime_phase,
         fault.clone(),
         realtime_slot,
-        shutdown_rx,
+        shutdown_lane,
         reliable_rx,
     );
 

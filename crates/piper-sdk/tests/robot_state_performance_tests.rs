@@ -142,7 +142,7 @@ fn test_arcswap_write_latency() {
     // 预热
     let initial_state = JointPositionState {
         hardware_timestamp_us: 0,
-        system_timestamp_us: 0,
+        host_rx_mono_us: 0,
         joint_pos: [0.0; 6],
         frame_valid_mask: 0b111,
     };
@@ -155,7 +155,7 @@ fn test_arcswap_write_latency() {
     for i in 0..iterations {
         let new_state = JointPositionState {
             hardware_timestamp_us: i as u64,
-            system_timestamp_us: i as u64 * 2,
+            host_rx_mono_us: i as u64 * 2,
             joint_pos: [i as f64; 6],
             frame_valid_mask: 0b111,
         };
@@ -239,7 +239,7 @@ fn test_rwlock_write_latency() {
     for i in 0..iterations {
         if let Ok(mut state) = ctx.collision_protection.write() {
             state.hardware_timestamp_us = i as u64;
-            state.system_timestamp_us = i as u64 * 2;
+            state.host_rx_mono_us = i as u64 * 2;
             state.protection_levels = [(i % 9) as u8; 6];
         }
     }
@@ -308,7 +308,7 @@ fn test_capture_motion_snapshot_latency() {
 fn test_bitmask_access_performance() {
     let state = RobotControlState {
         hardware_timestamp_us: 0,
-        system_timestamp_us: 0,
+        host_rx_mono_us: 0,
         control_mode: 0,
         robot_status: 0,
         move_mode: 0,
@@ -372,7 +372,7 @@ fn test_bitmask_access_performance() {
 fn test_state_clone_performance() {
     let joint_pos = JointPositionState {
         hardware_timestamp_us: 1234567890,
-        system_timestamp_us: 1234567890 * 2,
+        host_rx_mono_us: 1234567890 * 2,
         joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         frame_valid_mask: 0b111,
     };

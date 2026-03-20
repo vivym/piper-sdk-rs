@@ -39,7 +39,7 @@ impl PositionCommand {
             );
         }
 
-        let end_pose = observer.end_pose();
+        let end_pose = observer.end_pose()?;
         println!("\n📍 末端位姿:");
         println!("  位置 (m):");
         println!("    X: {:.4}", end_pose.end_pose[0]);

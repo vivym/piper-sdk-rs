@@ -2,9 +2,7 @@
 //!
 //! 提供对外的 `Piper` 结构体，封装底层 IO 线程和状态同步细节。
 
-use crate::command::{
-    CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand, ShutdownCommand,
-};
+use crate::command::{CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
 use crate::metrics::{MetricsSnapshot, PiperMetrics};
@@ -15,8 +13,8 @@ use piper_can::{
     CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter, TimingCapability,
 };
 use std::mem::ManuallyDrop;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{JoinHandle, spawn};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -175,6 +173,7 @@ impl NormalSendPermit<'_> {
 #[derive(Debug)]
 pub struct ShutdownReceipt {
     ack_rx: Receiver<Result<(), DriverError>>,
+    deadline: Instant,
 }
 
 impl ShutdownReceipt {
@@ -182,10 +181,247 @@ impl ShutdownReceipt {
     ///
     /// timeout 语义已经在 enqueue 时绑定到 shutdown command，本方法只等待 ack。
     pub fn wait(self) -> Result<(), DriverError> {
-        match self.ack_rx.recv() {
+        let wait_result = match self.deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => self.ack_rx.recv_timeout(remaining),
+            None => match self.ack_rx.try_recv() {
+                Ok(result) => return result,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    return Err(DriverError::Timeout);
+                },
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    return Err(DriverError::ChannelClosed);
+                },
+            },
+        };
+
+        match wait_result {
             Ok(result) => result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
             Err(_) => Err(DriverError::ChannelClosed),
         }
+    }
+}
+
+#[derive(Debug)]
+struct ShutdownRequest {
+    frame: PiperFrame,
+    deadline: Instant,
+    waiters: Vec<crossbeam_channel::Sender<Result<(), DriverError>>>,
+    sending: bool,
+}
+
+#[derive(Debug, Default)]
+struct ShutdownLaneState {
+    request: Option<ShutdownRequest>,
+    closed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShutdownDispatch {
+    pub frame: PiperFrame,
+    pub deadline: Instant,
+}
+
+#[derive(Debug, Default)]
+pub struct ShutdownLane {
+    has_pending: AtomicBool,
+    state: Mutex<ShutdownLaneState>,
+}
+
+impl ShutdownLane {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.has_pending.load(Ordering::Acquire)
+    }
+
+    pub fn enqueue(
+        &self,
+        frame: PiperFrame,
+        deadline: Instant,
+        metrics: &Arc<PiperMetrics>,
+    ) -> Result<ShutdownReceipt, DriverError> {
+        metrics.tx_shutdown_requests_total.fetch_add(1, Ordering::Relaxed);
+
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if state.closed {
+            return Err(DriverError::ChannelClosed);
+        }
+
+        match state.request.as_mut() {
+            None => {
+                state.request = Some(ShutdownRequest {
+                    frame,
+                    deadline,
+                    waiters: vec![ack_tx],
+                    sending: false,
+                });
+                self.has_pending.store(true, Ordering::Release);
+            },
+            Some(request) if request.frame == frame => {
+                request.deadline = request.deadline.min(deadline);
+                request.waiters.push(ack_tx);
+                metrics.tx_shutdown_coalesced_total.fetch_add(1, Ordering::Relaxed);
+            },
+            Some(_) => {
+                metrics.tx_shutdown_conflicts_total.fetch_add(1, Ordering::Relaxed);
+                return Err(DriverError::ShutdownConflict);
+            },
+        }
+
+        Ok(ShutdownReceipt { ack_rx, deadline })
+    }
+
+    pub(crate) fn take_pending(&self) -> Option<ShutdownDispatch> {
+        if !self.has_pending() {
+            return None;
+        }
+
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let request = state.request.as_mut()?;
+        if request.sending {
+            self.has_pending.store(false, Ordering::Release);
+            return None;
+        }
+
+        request.sending = true;
+        self.has_pending.store(false, Ordering::Release);
+        Some(ShutdownDispatch {
+            frame: request.frame,
+            deadline: request.deadline,
+        })
+    }
+
+    pub fn finish(&self, result: Result<(), DriverError>) {
+        let waiters = {
+            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.has_pending.store(false, Ordering::Release);
+            state.request.take().map(|request| request.waiters).unwrap_or_default()
+        };
+
+        if waiters.is_empty() {
+            return;
+        }
+
+        for waiter in waiters {
+            let _ = waiter.send(clone_shutdown_result(&result));
+        }
+    }
+
+    pub fn close_with(&self, result: Result<(), DriverError>) {
+        let waiters = {
+            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closed = true;
+            self.has_pending.store(false, Ordering::Release);
+            state.request.take().map(|request| request.waiters).unwrap_or_default()
+        };
+
+        for waiter in waiters {
+            let _ = waiter.send(clone_shutdown_result(&result));
+        }
+    }
+}
+
+fn clone_shutdown_result(result: &Result<(), DriverError>) -> Result<(), DriverError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => Err(clone_driver_error(error)),
+    }
+}
+
+fn clone_driver_error(error: &DriverError) -> DriverError {
+    match error {
+        DriverError::Can(source) => DriverError::Can(clone_can_error(source)),
+        DriverError::Protocol(source) => DriverError::Protocol(clone_protocol_error(source)),
+        DriverError::ChannelClosed => DriverError::ChannelClosed,
+        DriverError::ControlPathClosed => DriverError::ControlPathClosed,
+        DriverError::ChannelFull => DriverError::ChannelFull,
+        DriverError::ShutdownConflict => DriverError::ShutdownConflict,
+        DriverError::NotDualThread => DriverError::NotDualThread,
+        DriverError::PoisonedLock => DriverError::PoisonedLock,
+        DriverError::IoThread(message) => DriverError::IoThread(message.clone()),
+        DriverError::NotImplemented(message) => DriverError::NotImplemented(message.clone()),
+        DriverError::Timeout => DriverError::Timeout,
+        DriverError::InvalidInput(message) => DriverError::InvalidInput(message.clone()),
+        DriverError::RealtimeDeliveryOverwritten => DriverError::RealtimeDeliveryOverwritten,
+        DriverError::RealtimeDeliveryFailed {
+            sent,
+            total,
+            source,
+        } => DriverError::RealtimeDeliveryFailed {
+            sent: *sent,
+            total: *total,
+            source: clone_can_error(source),
+        },
+        DriverError::RealtimeDeliveryAbortedByFault { sent, total } => {
+            DriverError::RealtimeDeliveryAbortedByFault {
+                sent: *sent,
+                total: *total,
+            }
+        },
+        DriverError::ReliableDeliveryFailed { source } => DriverError::ReliableDeliveryFailed {
+            source: clone_can_error(source),
+        },
+        DriverError::CommandAbortedByFault => DriverError::CommandAbortedByFault,
+        DriverError::RealtimeDeliveryTimeout => DriverError::RealtimeDeliveryTimeout,
+    }
+}
+
+fn clone_can_error(error: &CanError) -> CanError {
+    match error {
+        CanError::Io(source) => {
+            CanError::Io(std::io::Error::new(source.kind(), source.to_string()))
+        },
+        CanError::Device(source) => CanError::Device(source.clone()),
+        CanError::Timeout => CanError::Timeout,
+        CanError::BufferOverflow => CanError::BufferOverflow,
+        CanError::BusOff => CanError::BusOff,
+        CanError::NotStarted => CanError::NotStarted,
+    }
+}
+
+fn clone_protocol_error(error: &piper_protocol::ProtocolError) -> piper_protocol::ProtocolError {
+    match error {
+        piper_protocol::ProtocolError::InvalidLength { expected, actual } => {
+            piper_protocol::ProtocolError::InvalidLength {
+                expected: *expected,
+                actual: *actual,
+            }
+        },
+        piper_protocol::ProtocolError::InvalidCanId { id } => {
+            piper_protocol::ProtocolError::InvalidCanId { id: *id }
+        },
+        piper_protocol::ProtocolError::InvalidJointIndex { joint_index } => {
+            piper_protocol::ProtocolError::InvalidJointIndex {
+                joint_index: *joint_index,
+            }
+        },
+        piper_protocol::ProtocolError::MitInputOutOfRange {
+            joint_index,
+            field,
+            value,
+            min,
+            max,
+        } => piper_protocol::ProtocolError::MitInputOutOfRange {
+            joint_index: *joint_index,
+            field: *field,
+            value: *value,
+            min: *min,
+            max: *max,
+        },
+        piper_protocol::ProtocolError::ParseError(message) => {
+            piper_protocol::ProtocolError::ParseError(message.clone())
+        },
+        piper_protocol::ProtocolError::InvalidValue { field, value } => {
+            piper_protocol::ProtocolError::InvalidValue {
+                field: field.clone(),
+                value: *value,
+            }
+        },
     }
 }
 
@@ -203,8 +439,8 @@ impl RuntimePhase {
 pub struct Piper {
     /// 普通可靠命令发送通道。
     reliable_tx: ManuallyDrop<Sender<ReliableCommand>>,
-    /// 停机专用命令发送通道。
-    shutdown_tx: ManuallyDrop<Sender<ShutdownCommand>>,
+    /// 单飞急停通道。
+    shutdown_lane: Arc<ShutdownLane>,
     /// 实时命令插槽（邮箱模式，Overwrite）
     realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>>,
     /// 共享状态上下文
@@ -332,7 +568,7 @@ impl Piper {
         let timing_capability = rx_adapter.timing_capability();
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+        let shutdown_lane = Arc::new(ShutdownLane::new());
         let ctx = Arc::new(PiperContext::new());
         let workers_running = Arc::new(AtomicBool::new(true));
         let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
@@ -346,10 +582,12 @@ impl Piper {
         let metrics_clone = metrics.clone();
         let runtime_fault_rx = runtime_fault.clone();
         let config_clone = config.clone().unwrap_or_default();
+        let timing_capability_rx = timing_capability;
 
         let rx_thread = spawn(move || {
             crate::pipeline::rx_loop(
                 rx_adapter,
+                timing_capability_rx,
                 ctx_clone,
                 config_clone,
                 workers_running_clone,
@@ -366,12 +604,13 @@ impl Piper {
         let metrics_tx = metrics.clone();
         let realtime_slot_tx = realtime_slot.clone();
         let runtime_fault_tx = runtime_fault.clone();
+        let shutdown_lane_tx = shutdown_lane.clone();
 
         let tx_thread = spawn(move || {
             crate::pipeline::tx_loop_mailbox(
                 tx_adapter,
                 realtime_slot_tx,
-                shutdown_rx,
+                shutdown_lane_tx,
                 reliable_rx,
                 workers_running_tx,
                 runtime_phase_tx,
@@ -386,7 +625,7 @@ impl Piper {
 
         Ok(Self {
             reliable_tx: ManuallyDrop::new(reliable_tx),
-            shutdown_tx: ManuallyDrop::new(shutdown_tx),
+            shutdown_lane,
             realtime_slot,
             ctx,
             workers: RuntimeWorkers {
@@ -458,6 +697,7 @@ impl Piper {
         self.runtime_phase.store(RuntimePhase::Stopping as u8, Ordering::Release);
         self.normal_send_gate.close();
         self.workers_running.store(false, Ordering::Release);
+        self.shutdown_lane.close_with(Err(DriverError::ChannelClosed));
         self.clear_realtime_slot(DriverError::ChannelClosed, false);
     }
 
@@ -547,6 +787,10 @@ impl Piper {
     /// ```
     pub fn capture_motion_snapshot(&self) -> MotionSnapshot {
         self.ctx.capture_motion_snapshot()
+    }
+
+    fn capture_control_motion_snapshot(&self) -> MotionSnapshot {
+        self.ctx.capture_control_motion_snapshot()
     }
 
     /// 获取原始运动快照（允许部分帧组，仅供诊断）
@@ -748,7 +992,7 @@ impl Piper {
     /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内
     /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回状态数据
     pub fn get_aligned_motion(&self, max_time_diff_us: u64) -> AlignmentResult {
-        let snapshot = self.capture_motion_snapshot();
+        let snapshot = self.capture_control_motion_snapshot();
         let joint_dynamic = self.get_joint_dynamic();
 
         let time_diff = snapshot
@@ -763,8 +1007,8 @@ impl Piper {
             end_pose: snapshot.end_pose.end_pose,
             position_timestamp_us: snapshot.joint_position.hardware_timestamp_us,
             dynamic_timestamp_us: joint_dynamic.group_timestamp_us,
-            position_system_timestamp_us: snapshot.joint_position.system_timestamp_us,
-            dynamic_system_timestamp_us: joint_dynamic.group_system_timestamp_us,
+            position_host_rx_mono_us: snapshot.joint_position.host_rx_mono_us,
+            dynamic_host_rx_mono_us: joint_dynamic.group_host_rx_mono_us,
             position_frame_valid_mask: snapshot.joint_position.frame_valid_mask,
             dynamic_valid_mask: joint_dynamic.valid_mask,
             skew_us: (joint_dynamic.group_timestamp_us as i64)
@@ -1345,10 +1589,7 @@ impl Piper {
             return Err(DriverError::ChannelClosed);
         }
 
-        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        let command = ShutdownCommand::confirmed(frame, deadline, ack_tx);
-        self.enqueue_shutdown_command(command)?;
-        Ok(ShutdownReceipt { ack_rx })
+        self.shutdown_lane.enqueue(frame, deadline, &self.metrics)
     }
 
     fn enqueue_reliable(&self, command: ReliableCommand) -> Result<(), DriverError> {
@@ -1402,27 +1643,6 @@ impl Piper {
             },
         }
     }
-
-    fn enqueue_shutdown_command(&self, command: ShutdownCommand) -> Result<(), DriverError> {
-        if !self.tx_thread_alive() || !self.shutdown_lane_open() {
-            command.complete(Err(DriverError::ChannelClosed));
-            return Err(DriverError::ChannelClosed);
-        }
-        match self.shutdown_tx.try_send(command) {
-            Ok(_) => {
-                self.metrics.tx_shutdown_enqueued_total.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            },
-            Err(crossbeam_channel::TrySendError::Full(command)) => {
-                command.complete(Err(DriverError::ChannelFull));
-                Err(DriverError::ChannelFull)
-            },
-            Err(crossbeam_channel::TrySendError::Disconnected(command)) => {
-                command.complete(Err(DriverError::ChannelClosed));
-                Err(DriverError::ChannelClosed)
-            },
-        }
-    }
 }
 
 impl Drop for Piper {
@@ -1430,10 +1650,10 @@ impl Drop for Piper {
         self.runtime_phase.store(RuntimePhase::Stopping as u8, Ordering::Release);
         self.normal_send_gate.close();
         self.workers_running.store(false, Ordering::Release);
+        self.shutdown_lane.close_with(Err(DriverError::ChannelClosed));
 
         unsafe {
             ManuallyDrop::drop(&mut self.reliable_tx);
-            ManuallyDrop::drop(&mut self.shutdown_tx);
         }
 
         self.clear_realtime_slot(DriverError::ChannelClosed, false);
@@ -1995,15 +2215,15 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        piper.ctx.publish_joint_position(JointPositionState {
+        piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
-            system_timestamp_us: 2_000,
+            host_rx_mono_us: 2_000,
             joint_pos: [0.0; 6],
             frame_valid_mask: 0b101,
         });
         piper.ctx.joint_dynamic.store(Arc::new(JointDynamicState {
             group_timestamp_us: 1_000,
-            group_system_timestamp_us: 2_000,
+            group_host_rx_mono_us: 2_000,
             joint_vel: [0.0; 6],
             joint_current: [0.0; 6],
             timestamps: [1_000; 6],
@@ -2190,7 +2410,7 @@ mod tests {
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[stop_frame]);
         let metrics = piper.get_metrics();
-        assert_eq!(metrics.tx_shutdown_enqueued_total, 1);
+        assert_eq!(metrics.tx_shutdown_requests_total, 1);
         assert_eq!(metrics.tx_shutdown_sent_total, 1);
         assert_eq!(metrics.tx_frames_sent_total, 1);
     }

@@ -7,9 +7,11 @@
 //! 4. 可集成到 CI，作为性能门禁
 
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::command::{PiperCommand, ReliableCommand, ShutdownCommand};
+use piper_sdk::driver::TimingCapability;
+use piper_sdk::driver::command::{PiperCommand, ReliableCommand};
 use piper_sdk::driver::{
-    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, rx_loop, tx_loop_mailbox,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop,
+    tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -376,7 +378,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_tx = Arc::clone(&realtime_slot);
@@ -390,6 +392,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
+            TimingCapability::RealtimeCapable,
             ctx_rx,
             config,
             is_running_rx,
@@ -410,7 +413,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
@@ -583,7 +586,7 @@ fn test_command_priority_performance() {
 
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane = Arc::new(ShutdownLane::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_tx = Arc::clone(&realtime_slot);
@@ -599,7 +602,7 @@ fn test_command_priority_performance() {
         tx_loop_mailbox(
             tx_adapter,
             realtime_slot,
-            shutdown_rx,
+            shutdown_lane,
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
@@ -641,7 +644,7 @@ fn test_command_priority_performance() {
     let metrics2 = Arc::new(PiperMetrics::new());
     let tx_adapter2 = SimpleTxAdapter::new(Duration::from_micros(100));
     let (_reliable_tx2, reliable_rx2) = crossbeam_channel::bounded::<ReliableCommand>(10);
-    let (_shutdown_tx2, shutdown_rx2) = crossbeam_channel::bounded::<ShutdownCommand>(4);
+    let shutdown_lane2 = Arc::new(ShutdownLane::new());
     let realtime_slot2: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot2_tx = Arc::clone(&realtime_slot2);
@@ -656,7 +659,7 @@ fn test_command_priority_performance() {
         tx_loop_mailbox(
             tx_adapter2,
             realtime_slot2,
-            shutdown_rx2,
+            shutdown_lane2,
             reliable_rx2,
             is_running_tx2,
             runtime_phase_tx2,
