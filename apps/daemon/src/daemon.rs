@@ -1487,11 +1487,7 @@ impl Daemon {
                 let prepared_result = {
                     let mut clients_guard = clients.write().unwrap();
                     if client_id == 0 {
-                        Ok(clients_guard.prepare_registration_auto(
-                            addr,
-                            filters,
-                            Some(client_addr),
-                        ))
+                        clients_guard.prepare_registration_auto(addr, filters, Some(client_addr))
                     } else {
                         clients_guard.prepare_registration_manual(
                             client_id,
@@ -1725,12 +1721,12 @@ impl Daemon {
                 let prepared_result = {
                     let mut clients_guard = clients.write().unwrap();
                     if client_id == 0 {
-                        Ok(clients_guard.prepare_registration_auto(
+                        clients_guard.prepare_registration_auto(
                             addr,
                             filters,
                             #[cfg(unix)]
                             None,
-                        ))
+                        )
                     } else {
                         clients_guard.prepare_registration_manual(
                             client_id,

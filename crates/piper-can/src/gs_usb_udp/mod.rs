@@ -9,7 +9,7 @@
 pub mod protocol;
 
 use crate::{CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame};
-use protocol::{CanIdFilter, Message};
+use protocol::{CanIdFilter, Message, normalize_wire_seq};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 #[cfg(unix)]
@@ -188,6 +188,14 @@ impl DaemonSession {
         self.socket.recv_from_peer(buf)
     }
 
+    fn next_wire_seq(&self) -> u32 {
+        self.seq_counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(normalize_wire_seq(current.wrapping_add(1)))
+            })
+            .expect("seq update should be infallible")
+    }
+
     fn mark_transport_lost_local(&self) {
         self.connected.store(false, Ordering::Release);
         self.heartbeat_stop.store(true, Ordering::Release);
@@ -267,7 +275,7 @@ impl DaemonSession {
         }
 
         let mut buf = [0u8; 12];
-        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed);
+        let seq = self.next_wire_seq();
         let encoded =
             protocol::encode_disconnect(self.client_id.load(Ordering::Acquire), seq, &mut buf);
         self.send_to_peer(encoded)
@@ -337,7 +345,7 @@ fn send_frame_and_wait_ack(
         return Err(CanError::Device("Not connected to daemon".into()));
     }
 
-    let seq = session.seq_counter.fetch_add(1, Ordering::Relaxed);
+    let seq = session.next_wire_seq();
     let mut buf = [0u8; 64];
     let encoded = protocol::encode_send_frame_with_seq(&frame, seq, &mut buf)
         .map_err(|err| CanError::Device(format!("Failed to encode send frame: {err:?}").into()))?;
@@ -523,7 +531,7 @@ impl GsUsbUdpAdapter {
             return Err(error);
         }
 
-        let seq = self.session.seq_counter.fetch_add(1, Ordering::Relaxed);
+        let seq = self.session.next_wire_seq();
         let mut buf = [0u8; 256];
         let encoded = protocol::encode_connect(0, &filters, seq, &mut buf)
             .map_err(|err| CanError::Device(format!("Failed to encode connect: {err:?}").into()))?;
@@ -874,6 +882,20 @@ mod tests {
         assert_eq!(seq2, 0);
     }
 
+    #[test]
+    fn test_daemon_session_next_wire_seq_wraps_24bit_ring() {
+        let adapter = GsUsbUdpAdapter::new_udp("127.0.0.1:8888").unwrap();
+        adapter
+            .session
+            .seq_counter
+            .store(protocol::WIRE_SEQ_MASK - 1, Ordering::Relaxed);
+
+        assert_eq!(adapter.session.next_wire_seq(), protocol::WIRE_SEQ_MASK - 1);
+        assert_eq!(adapter.session.next_wire_seq(), protocol::WIRE_SEQ_MASK);
+        assert_eq!(adapter.session.next_wire_seq(), 0);
+        assert_eq!(adapter.session.seq_counter.load(Ordering::Relaxed), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_gs_usb_udp_adapter_reconnect_logic() {
@@ -1022,6 +1044,68 @@ mod tests {
             inbound.data[..inbound.len as usize],
             outbound.data[..outbound.len as usize]
         );
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_gs_usb_udp_roundtrip_matches_acks_across_24bit_seq_wrap() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let mut expected_seq = protocol::WIRE_SEQ_MASK - 1;
+            let mut sends_seen = 0;
+
+            while let Ok((len, addr)) = server.recv_from(&mut buf) {
+                let msg = protocol::decode_message(&buf[..len]).unwrap();
+                match msg {
+                    Message::Connect { seq, .. } => {
+                        assert_eq!(seq, expected_seq);
+                        expected_seq = protocol::WIRE_SEQ_MASK;
+
+                        let mut ack_buf = [0u8; 13];
+                        let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
+                        server.send_to(encoded, addr).unwrap();
+                    },
+                    Message::SendFrame { seq, .. } => {
+                        assert_eq!(seq, expected_seq);
+                        expected_seq = if expected_seq == protocol::WIRE_SEQ_MASK {
+                            0
+                        } else {
+                            expected_seq + 1
+                        };
+
+                        let mut ack_buf = [0u8; 12];
+                        let encoded = protocol::encode_send_ack(seq, 0, &mut ack_buf);
+                        server.send_to(encoded, addr).unwrap();
+
+                        sends_seen += 1;
+                        if sends_seen == 2 {
+                            break;
+                        }
+                    },
+                    Message::Heartbeat { client_id } => {
+                        assert_eq!(client_id, 42);
+                    },
+                    other => panic!("unexpected message: {:?}", other),
+                }
+            }
+        });
+
+        let mut adapter = GsUsbUdpAdapter::new_udp(server_addr.to_string()).unwrap();
+        adapter
+            .session
+            .seq_counter
+            .store(protocol::WIRE_SEQ_MASK - 1, Ordering::Relaxed);
+
+        adapter.connect(vec![]).unwrap();
+        adapter.send(PiperFrame::new_standard(0x321, &[1, 2, 3, 4])).unwrap();
+        adapter.send(PiperFrame::new_standard(0x322, &[5, 6, 7, 8])).unwrap();
+
+        assert_eq!(adapter.session.seq_counter.load(Ordering::Relaxed), 1);
 
         server_handle.join().unwrap();
     }

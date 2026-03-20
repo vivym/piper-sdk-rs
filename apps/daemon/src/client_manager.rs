@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 /// 客户端地址（支持 UDS 和 UDP）
 ///
 /// 注意：UnixSocketAddr 不实现 Hash，所以我们使用 String 表示 UDS 路径
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientAddr {
     #[cfg(unix)]
     Unix(String), // UDS 路径（如 "/tmp/gs_usb_daemon.sock"）
@@ -83,6 +83,7 @@ pub struct PreparedRegistration {
     id: u32,
     addr: ClientAddr,
     filters: Vec<CanIdFilter>,
+    replaced_client_id: Option<u32>,
     #[cfg(unix)]
     unix_addr: Option<std::os::unix::net::SocketAddr>,
 }
@@ -115,6 +116,8 @@ impl std::error::Error for ClientError {}
 pub struct ClientManager {
     clients: HashMap<u32, Client>,
     pending_ids: HashSet<u32>,
+    pending_addrs: HashSet<ClientAddr>,
+    addr_to_id: HashMap<ClientAddr, u32>,
     /// 客户端 ID 生成器（线程安全，单调递增）
     /// 从 1 开始（0 保留为无效 ID），溢出后从 1 重新开始
     next_id: AtomicU32,
@@ -132,6 +135,8 @@ impl ClientManager {
         Self {
             clients: HashMap::new(),
             pending_ids: HashSet::new(),
+            pending_addrs: HashSet::new(),
+            addr_to_id: HashMap::new(),
             next_id: AtomicU32::new(1), // 从 1 开始（0 保留为无效 ID）
             timeout: Duration::from_secs(30),
             #[cfg(unix)]
@@ -144,6 +149,8 @@ impl ClientManager {
         Self {
             clients: HashMap::new(),
             pending_ids: HashSet::new(),
+            pending_addrs: HashSet::new(),
+            addr_to_id: HashMap::new(),
             next_id: AtomicU32::new(1), // 从 1 开始（0 保留为无效 ID）
             timeout,
             #[cfg(unix)]
@@ -189,27 +196,54 @@ impl ClientManager {
         self.clients.contains_key(&id) || self.pending_ids.contains(&id)
     }
 
+    fn remove_client_internal(&mut self, id: u32) -> Option<Client> {
+        let client = self.clients.remove(&id)?;
+        if self.addr_to_id.get(&client.addr).copied() == Some(id) {
+            self.addr_to_id.remove(&client.addr);
+        }
+        #[cfg(unix)]
+        {
+            self.unix_addr_map.remove(&id);
+        }
+        Some(client)
+    }
+
+    fn pending_addr_conflicts(&self, addr: &ClientAddr) -> bool {
+        self.pending_addrs.contains(addr)
+    }
+
     /// 为自动分配 ID 的客户端保留注册槽位，但暂不加入广播列表。
     pub fn prepare_registration_auto(
         &mut self,
         addr: ClientAddr,
         filters: Vec<CanIdFilter>,
         #[cfg(unix)] unix_addr: Option<std::os::unix::net::SocketAddr>,
-    ) -> PreparedRegistration {
+    ) -> Result<PreparedRegistration, ClientError> {
+        if self.pending_addr_conflicts(&addr) {
+            return Err(ClientError::AlreadyExists);
+        }
+
+        let replaced_client_id = self.addr_to_id.get(&addr).copied();
         let id = self.generate_client_id();
         let inserted = self.pending_ids.insert(id);
         debug_assert!(
             inserted,
             "generated client id should not already be pending"
         );
+        let inserted = self.pending_addrs.insert(addr.clone());
+        debug_assert!(
+            inserted,
+            "generated client addr should not already be pending"
+        );
 
-        PreparedRegistration {
+        Ok(PreparedRegistration {
             id,
             addr,
             filters,
+            replaced_client_id,
             #[cfg(unix)]
             unix_addr,
-        }
+        })
     }
 
     /// 为手动指定 ID 的客户端保留注册槽位，但暂不加入广播列表。
@@ -223,14 +257,22 @@ impl ClientManager {
         if self.id_conflicts(id) {
             return Err(ClientError::AlreadyExists);
         }
+        if self.pending_addr_conflicts(&addr) {
+            return Err(ClientError::AlreadyExists);
+        }
+
+        let replaced_client_id = self.addr_to_id.get(&addr).copied();
 
         let inserted = self.pending_ids.insert(id);
         debug_assert!(inserted, "manual client id should not already be pending");
+        let inserted = self.pending_addrs.insert(addr.clone());
+        debug_assert!(inserted, "manual client addr should not already be pending");
 
         Ok(PreparedRegistration {
             id,
             addr,
             filters,
+            replaced_client_id,
             #[cfg(unix)]
             unix_addr,
         })
@@ -245,12 +287,22 @@ impl ClientManager {
             removed,
             "prepared registration must hold a pending reservation before commit"
         );
+        let removed = self.pending_addrs.remove(&prepared.addr);
+        debug_assert!(
+            removed,
+            "prepared registration must hold a pending address reservation before commit"
+        );
+
+        if let Some(replaced_id) = prepared.replaced_client_id {
+            self.remove_client_internal(replaced_id);
+        }
 
         #[cfg(unix)]
         if let Some(unix_addr) = prepared.unix_addr {
             self.unix_addr_map.insert(prepared.id, unix_addr);
         }
 
+        let addr = prepared.addr.clone();
         let replaced = self.clients.insert(
             prepared.id,
             Self::build_client(prepared.id, prepared.addr, prepared.filters),
@@ -259,11 +311,17 @@ impl ClientManager {
             replaced.is_none(),
             "prepared registration should never overwrite an active client"
         );
+        let previous = self.addr_to_id.insert(addr, prepared.id);
+        debug_assert!(
+            previous.is_none(),
+            "prepared registration should never leave duplicate active addrs"
+        );
     }
 
     /// 放弃已准备的客户端注册。
     pub fn abort_prepared_registration(&mut self, prepared: PreparedRegistration) {
         self.pending_ids.remove(&prepared.id);
+        self.pending_addrs.remove(&prepared.addr);
     }
 
     /// 注册客户端（自动生成 ID）
@@ -275,10 +333,14 @@ impl ClientManager {
         addr: ClientAddr,
         filters: Vec<CanIdFilter>,
     ) -> Result<u32, ClientError> {
-        let id = self.generate_client_id();
-
-        self.clients.insert(id, Self::build_client(id, addr, filters));
-
+        let prepared = self.prepare_registration_auto(
+            addr,
+            filters,
+            #[cfg(unix)]
+            None,
+        )?;
+        let id = prepared.id();
+        self.commit_prepared_registration(prepared);
         Ok(id)
     }
 
@@ -290,22 +352,20 @@ impl ClientManager {
         addr: ClientAddr,
         filters: Vec<CanIdFilter>,
     ) -> Result<(), ClientError> {
-        if self.id_conflicts(id) {
-            return Err(ClientError::AlreadyExists);
-        }
-
-        self.clients.insert(id, Self::build_client(id, addr, filters));
-
+        let prepared = self.prepare_registration_manual(
+            id,
+            addr,
+            filters,
+            #[cfg(unix)]
+            None,
+        )?;
+        self.commit_prepared_registration(prepared);
         Ok(())
     }
 
     /// 注销客户端
     pub fn unregister(&mut self, id: u32) {
-        self.clients.remove(&id);
-        #[cfg(unix)]
-        {
-            self.unix_addr_map.remove(&id);
-        }
+        self.remove_client_internal(id);
     }
 
     /// 更新客户端活动时间（用于心跳）
@@ -350,11 +410,7 @@ impl ClientManager {
 
         // 移除超时的客户端
         for id in timeout_ids {
-            self.clients.remove(&id);
-            #[cfg(unix)]
-            {
-                self.unix_addr_map.remove(&id);
-            }
+            self.remove_client_internal(id);
         }
     }
 
@@ -377,6 +433,16 @@ impl ClientManager {
     #[cfg(test)]
     pub fn pending_contains(&self, id: u32) -> bool {
         self.pending_ids.contains(&id)
+    }
+
+    #[cfg(test)]
+    pub fn pending_addr_contains(&self, addr: &ClientAddr) -> bool {
+        self.pending_addrs.contains(addr)
+    }
+
+    #[cfg(test)]
+    pub fn active_client_id_for_addr(&self, addr: &ClientAddr) -> Option<u32> {
+        self.addr_to_id.get(addr).copied()
     }
 }
 
@@ -661,12 +727,14 @@ mod tests {
     #[test]
     fn test_prepare_registration_commit_only_exposes_client_after_commit() {
         let mut manager = ClientManager::new();
-        let prepared = manager.prepare_registration_auto(
-            ClientAddr::Udp("127.0.0.1:9010".parse().unwrap()),
-            vec![CanIdFilter::new(0x100, 0x1ff)],
-            #[cfg(unix)]
-            None,
-        );
+        let prepared = manager
+            .prepare_registration_auto(
+                ClientAddr::Udp("127.0.0.1:9010".parse().unwrap()),
+                vec![CanIdFilter::new(0x100, 0x1ff)],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
         let id = prepared.id();
 
         assert!(manager.pending_contains(id));
@@ -682,21 +750,110 @@ mod tests {
     #[test]
     fn test_prepare_registration_auto_skips_pending_ids() {
         let mut manager = ClientManager::new();
-        let first = manager.prepare_registration_auto(
-            ClientAddr::Udp("127.0.0.1:9020".parse().unwrap()),
-            vec![],
-            #[cfg(unix)]
-            None,
-        );
-        let second = manager.prepare_registration_auto(
-            ClientAddr::Udp("127.0.0.1:9021".parse().unwrap()),
-            vec![],
-            #[cfg(unix)]
-            None,
-        );
+        let first = manager
+            .prepare_registration_auto(
+                ClientAddr::Udp("127.0.0.1:9020".parse().unwrap()),
+                vec![],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
+        let second = manager
+            .prepare_registration_auto(
+                ClientAddr::Udp("127.0.0.1:9021".parse().unwrap()),
+                vec![],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
 
         assert_ne!(first.id(), second.id());
         assert!(manager.pending_contains(first.id()));
         assert!(manager.pending_contains(second.id()));
+    }
+
+    #[test]
+    fn test_prepare_registration_rejects_pending_address_conflict() {
+        let mut manager = ClientManager::new();
+        let addr = ClientAddr::Udp("127.0.0.1:9030".parse().unwrap());
+
+        let prepared = manager
+            .prepare_registration_auto(
+                addr.clone(),
+                vec![],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
+
+        assert!(manager.pending_addr_contains(&addr));
+        assert!(matches!(
+            manager.prepare_registration_manual(
+                11,
+                addr.clone(),
+                vec![],
+                #[cfg(unix)]
+                None,
+            ),
+            Err(ClientError::AlreadyExists)
+        ));
+
+        manager.abort_prepared_registration(prepared);
+        assert!(!manager.pending_addr_contains(&addr));
+    }
+
+    #[test]
+    fn test_commit_prepared_registration_replaces_existing_active_peer() {
+        let mut manager = ClientManager::new();
+        let addr = ClientAddr::Udp("127.0.0.1:9040".parse().unwrap());
+
+        let old_id = manager.register_auto(addr.clone(), vec![]).unwrap();
+        assert_eq!(manager.active_client_id_for_addr(&addr), Some(old_id));
+
+        let prepared = manager
+            .prepare_registration_manual(
+                99,
+                addr.clone(),
+                vec![CanIdFilter::new(0x100, 0x1ff)],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(prepared.replaced_client_id, Some(old_id));
+
+        manager.commit_prepared_registration(prepared);
+
+        assert!(!manager.contains(old_id));
+        assert!(manager.contains(99));
+        assert_eq!(manager.count(), 1);
+        assert_eq!(manager.active_client_id_for_addr(&addr), Some(99));
+        assert_eq!(
+            manager.iter().filter(|client| client.addr == addr).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_abort_prepared_registration_keeps_existing_active_peer() {
+        let mut manager = ClientManager::new();
+        let addr = ClientAddr::Udp("127.0.0.1:9050".parse().unwrap());
+
+        let old_id = manager.register_auto(addr.clone(), vec![]).unwrap();
+        let prepared = manager
+            .prepare_registration_manual(
+                101,
+                addr.clone(),
+                vec![],
+                #[cfg(unix)]
+                None,
+            )
+            .unwrap();
+
+        manager.abort_prepared_registration(prepared);
+
+        assert!(manager.contains(old_id));
+        assert_eq!(manager.count(), 1);
+        assert_eq!(manager.active_client_id_for_addr(&addr), Some(old_id));
     }
 }

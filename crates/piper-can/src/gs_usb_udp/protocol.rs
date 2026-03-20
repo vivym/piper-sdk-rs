@@ -6,6 +6,15 @@
 
 use crate::PiperFrame;
 
+/// Wire-level sequence numbers are encoded on 24 bits.
+pub const WIRE_SEQ_MASK: u32 = 0x00FF_FFFF;
+pub const WIRE_SEQ_MODULUS: u32 = 0x0100_0000;
+
+#[inline]
+pub const fn normalize_wire_seq(seq: u32) -> u32 {
+    seq & WIRE_SEQ_MASK
+}
+
 // ============================================================================
 // Message Types
 // ============================================================================
@@ -131,7 +140,7 @@ impl MessageHeader {
             flags: 0,
             length,
             reserved: 0,
-            seq,
+            seq: normalize_wire_seq(seq),
         }
     }
 
