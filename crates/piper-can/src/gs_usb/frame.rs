@@ -44,30 +44,46 @@ impl GsUsbFrame {
         }
     }
 
+    /// Pack frame into a fixed 24-byte stack buffer.
+    ///
+    /// The returned slice is either 20 bytes (without hardware timestamp)
+    /// or 24 bytes (with hardware timestamp).
+    pub fn pack_into_array<'a>(
+        &self,
+        buf: &'a mut [u8; GS_USB_FRAME_SIZE_HW_TIMESTAMP],
+        hw_timestamp: bool,
+    ) -> &'a [u8] {
+        let frame_size = if hw_timestamp {
+            GS_USB_FRAME_SIZE_HW_TIMESTAMP
+        } else {
+            GS_USB_FRAME_SIZE
+        };
+
+        buf[..4].copy_from_slice(&self.echo_id.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.can_id.to_le_bytes());
+        buf[8] = self.can_dlc;
+        buf[9] = self.channel;
+        buf[10] = self.flags;
+        buf[11] = self.reserved;
+        buf[12..20].copy_from_slice(&self.data);
+
+        if hw_timestamp {
+            buf[20..24].copy_from_slice(&self.timestamp_us.to_le_bytes());
+        }
+
+        &buf[..frame_size]
+    }
+
     /// Pack frame into BytesMut
     ///
     /// # Arguments
     /// * `buf` - Buffer to pack into
     /// * `hw_timestamp` - If true, include hardware timestamp field (frame size = 24 bytes, otherwise 20 bytes)
     pub fn pack_to(&self, buf: &mut BytesMut, hw_timestamp: bool) {
-        let frame_size = if hw_timestamp {
-            GS_USB_FRAME_SIZE_HW_TIMESTAMP
-        } else {
-            GS_USB_FRAME_SIZE
-        };
-        buf.reserve(frame_size);
-        buf.put_u32_le(self.echo_id);
-        buf.put_u32_le(self.can_id);
-        buf.put_u8(self.can_dlc);
-        buf.put_u8(self.channel);
-        buf.put_u8(self.flags);
-        buf.put_u8(self.reserved);
-        buf.put_slice(&self.data);
-
-        // Optional hardware timestamp
-        if hw_timestamp {
-            buf.put_u32_le(self.timestamp_us);
-        }
+        let mut raw = [0u8; GS_USB_FRAME_SIZE_HW_TIMESTAMP];
+        let packed = self.pack_into_array(&mut raw, hw_timestamp);
+        buf.reserve(packed.len());
+        buf.put_slice(packed);
     }
 
     /// Unpack from Bytes
@@ -165,6 +181,52 @@ mod tests {
 
         // 验证 Data
         assert_eq!(buf[12..16], [0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn test_frame_pack_into_array_without_timestamp() {
+        let frame = GsUsbFrame {
+            echo_id: GS_USB_ECHO_ID,
+            can_id: 0x123,
+            can_dlc: 4,
+            channel: 1,
+            flags: 2,
+            reserved: 3,
+            data: [0xAA, 0xBB, 0xCC, 0xDD, 0, 0, 0, 0],
+            timestamp_us: 0x1122_3344,
+        };
+
+        let mut raw = [0u8; GS_USB_FRAME_SIZE_HW_TIMESTAMP];
+        let packed = frame.pack_into_array(&mut raw, false);
+
+        assert_eq!(packed.len(), GS_USB_FRAME_SIZE);
+        assert_eq!(&packed[0..4], &GS_USB_ECHO_ID.to_le_bytes());
+        assert_eq!(&packed[4..8], &0x123u32.to_le_bytes());
+        assert_eq!(packed[8], 4);
+        assert_eq!(packed[9], 1);
+        assert_eq!(packed[10], 2);
+        assert_eq!(packed[11], 3);
+        assert_eq!(&packed[12..16], &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn test_frame_pack_into_array_with_timestamp() {
+        let frame = GsUsbFrame {
+            echo_id: GS_USB_ECHO_ID,
+            can_id: 0x456,
+            can_dlc: 8,
+            channel: 0,
+            flags: 0,
+            reserved: 0,
+            data: [1, 2, 3, 4, 5, 6, 7, 8],
+            timestamp_us: 0xAABB_CCDD,
+        };
+
+        let mut raw = [0u8; GS_USB_FRAME_SIZE_HW_TIMESTAMP];
+        let packed = frame.pack_into_array(&mut raw, true);
+
+        assert_eq!(packed.len(), GS_USB_FRAME_SIZE_HW_TIMESTAMP);
+        assert_eq!(&packed[20..24], &0xAABB_CCDDu32.to_le_bytes());
     }
 
     #[test]

@@ -30,7 +30,7 @@
   - **Hardware timestamps**: Direct use of kernel/driver interrupt timestamps
   - **TX safety**: Only records frames after successful `send()`
   - **Drop monitoring**: Built-in `dropped_frames` counter for loss tracking
-- 📊 **Advanced Health Monitoring** (gs_usb_daemon):
+- 📊 **Advanced Health Monitoring** (`gs_usb_daemon`, non-realtime bridge/debug path):
   - **CAN Bus Off Detection**: Detects CAN Bus Off events (critical system failure) with debounce mechanism
   - **Error Passive Monitoring**: Monitors Error Passive state (pre-Bus Off warning) for early detection
   - **USB STALL Tracking**: Tracks USB endpoint STALL errors for USB communication health

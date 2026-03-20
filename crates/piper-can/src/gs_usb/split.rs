@@ -335,10 +335,72 @@ pub struct GsUsbTxAdapter {
     device: Arc<GsUsbDevice>,
 }
 
+#[doc(hidden)]
+pub struct GsUsbBridgeTxAdapter {
+    device: Arc<GsUsbDevice>,
+    bridge_timeout: Duration,
+}
+
+fn encode_tx_frame(frame: PiperFrame) -> GsUsbFrame {
+    GsUsbFrame {
+        echo_id: GS_USB_ECHO_ID,
+        can_id: if frame.is_extended {
+            frame.id | CAN_EFF_FLAG
+        } else {
+            frame.id
+        },
+        can_dlc: frame.len,
+        channel: 0,
+        flags: 0,
+        reserved: 0,
+        data: frame.data,
+        timestamp_us: 0,
+    }
+}
+
+fn map_usb_send_error(error: crate::gs_usb::error::GsUsbError) -> CanError {
+    let kind = match error {
+        crate::gs_usb::error::GsUsbError::WriteTimeout => {
+            return CanError::Timeout;
+        },
+        crate::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
+            CanDeviceErrorKind::NoDevice
+        },
+        crate::gs_usb::error::GsUsbError::Usb(rusb::Error::Access) => {
+            CanDeviceErrorKind::AccessDenied
+        },
+        crate::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
+            CanDeviceErrorKind::NotFound
+        },
+        crate::gs_usb::error::GsUsbError::PartialWrite { .. } => CanDeviceErrorKind::Backend,
+        _ => CanDeviceErrorKind::Backend,
+    };
+    CanError::Device(CanDeviceError::new(
+        kind,
+        format!("USB send failed: {}", error),
+    ))
+}
+
+fn send_frame_until(
+    device: &GsUsbDevice,
+    frame: PiperFrame,
+    deadline: Instant,
+) -> Result<(), CanError> {
+    let gs_frame = encode_tx_frame(frame);
+    device.send_raw_until(&gs_frame, deadline).map_err(map_usb_send_error)
+}
+
 impl GsUsbTxAdapter {
     /// 创建新的 TX 适配器
     pub fn new(device: Arc<GsUsbDevice>) -> Self {
         Self { device }
+    }
+
+    pub fn into_bridge(self, bridge_timeout: Duration) -> GsUsbBridgeTxAdapter {
+        GsUsbBridgeTxAdapter {
+            device: self.device,
+            bridge_timeout,
+        }
     }
 
     /// 在固定 budget 内发送普通控制帧。
@@ -359,44 +421,20 @@ impl GsUsbTxAdapter {
         frame: PiperFrame,
         deadline: Instant,
     ) -> Result<(), CanError> {
-        // 转换 PiperFrame -> GsUsbFrame
-        let gs_frame = GsUsbFrame {
-            echo_id: GS_USB_ECHO_ID,
-            can_id: if frame.is_extended {
-                frame.id | CAN_EFF_FLAG
-            } else {
-                frame.id
-            },
-            can_dlc: frame.len,
-            channel: 0,
-            flags: 0,
-            reserved: 0,
-            data: frame.data,
-            timestamp_us: 0,
-        };
+        send_frame_until(self.device.as_ref(), frame, deadline)
+    }
+}
 
-        // 发送到 USB Endpoint OUT
-        self.device.send_raw_until(&gs_frame, deadline).map_err(|e| {
-            let kind = match e {
-                crate::gs_usb::error::GsUsbError::WriteTimeout => {
-                    return CanError::Timeout;
-                },
-                crate::gs_usb::error::GsUsbError::Usb(rusb::Error::NoDevice) => {
-                    CanDeviceErrorKind::NoDevice
-                },
-                crate::gs_usb::error::GsUsbError::Usb(rusb::Error::Access) => {
-                    CanDeviceErrorKind::AccessDenied
-                },
-                crate::gs_usb::error::GsUsbError::Usb(rusb::Error::NotFound) => {
-                    CanDeviceErrorKind::NotFound
-                },
-                crate::gs_usb::error::GsUsbError::PartialWrite { .. } => {
-                    CanDeviceErrorKind::Backend
-                },
-                _ => CanDeviceErrorKind::Backend,
-            };
-            CanError::Device(CanDeviceError::new(kind, format!("USB send failed: {}", e)))
-        })
+impl GsUsbBridgeTxAdapter {
+    pub fn new(device: Arc<GsUsbDevice>, bridge_timeout: Duration) -> Self {
+        Self {
+            device,
+            bridge_timeout,
+        }
+    }
+
+    pub fn bridge_timeout(&self) -> Duration {
+        self.bridge_timeout
     }
 }
 
@@ -414,8 +452,15 @@ impl RealtimeTxAdapter for GsUsbTxAdapter {
     }
 }
 
-impl BridgeTxAdapter for GsUsbTxAdapter {
-    fn send_bridge(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
-        self.send_frame_with_budget(frame, timeout)
+impl BridgeTxAdapter for GsUsbBridgeTxAdapter {
+    fn send_bridge(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        if self.bridge_timeout.is_zero() {
+            return Err(CanError::Timeout);
+        }
+        send_frame_until(
+            self.device.as_ref(),
+            frame,
+            Instant::now() + self.bridge_timeout,
+        )
     }
 }

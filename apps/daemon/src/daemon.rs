@@ -6,10 +6,8 @@
 
 use crate::client_manager::{ClientAddr, ClientManager};
 use piper_can::BridgeTxAdapter;
-use piper_can::gs_usb::{
-    GsUsbCanAdapter,
-    split::{GsUsbRxAdapter, GsUsbTxAdapter},
-};
+use piper_can::gs_usb::{GsUsbCanAdapter, split::GsUsbRxAdapter};
+use piper_can::gs_usb_udp::protocol::{self, ErrorCode, Message, StatusResponse};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -35,6 +33,92 @@ fn get_temp_socket_path(socket_name: &str) -> String {
 
     // ✅ 其次使用系统临时目录（跨平台）
     std::env::temp_dir().join(socket_name).to_string_lossy().to_string()
+}
+
+fn bridge_error_code(error: &piper_can::CanError) -> ErrorCode {
+    match error {
+        piper_can::CanError::Timeout => ErrorCode::Timeout,
+        piper_can::CanError::Device(device) => match device.kind {
+            piper_can::CanDeviceErrorKind::NoDevice | piper_can::CanDeviceErrorKind::NotFound => {
+                ErrorCode::DeviceNotFound
+            },
+            piper_can::CanDeviceErrorKind::Busy => ErrorCode::DeviceBusy,
+            _ => ErrorCode::DeviceError,
+        },
+        _ => ErrorCode::DeviceError,
+    }
+}
+
+fn record_bridge_tx_error(stats: &Arc<RwLock<DaemonStats>>, error: &piper_can::CanError) {
+    let stats_guard = stats.read().unwrap();
+    let detailed = stats_guard.detailed.read().unwrap();
+    detailed.usb_transfer_errors.fetch_add(1, Ordering::Relaxed);
+
+    match error {
+        piper_can::CanError::Timeout => {
+            detailed.usb_timeout_count.fetch_add(1, Ordering::Relaxed);
+        },
+        piper_can::CanError::Device(device)
+            if device.kind == piper_can::CanDeviceErrorKind::NoDevice
+                || device.kind == piper_can::CanDeviceErrorKind::NotFound =>
+        {
+            detailed.usb_no_device_count.fetch_add(1, Ordering::Relaxed);
+        },
+        _ => {},
+    }
+}
+
+fn mark_bridge_device_disconnected(
+    device_state: &Arc<RwLock<DeviceState>>,
+    tx_adapter: &Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
+) {
+    {
+        let mut tx_guard = tx_adapter.lock().unwrap();
+        *tx_guard = None;
+    }
+    *device_state.write().unwrap() = DeviceState::Disconnected;
+}
+
+#[cfg(unix)]
+fn send_unix_error_response(
+    socket: &std::os::unix::net::UnixDatagram,
+    client_addr: &std::os::unix::net::SocketAddr,
+    code: ErrorCode,
+    message: &str,
+    seq: u32,
+) {
+    let Some(path) = client_addr.as_pathname() else {
+        eprintln!("[Client] Failed to send Error response: client address has no pathname");
+        return;
+    };
+
+    let mut error_buf = [0u8; 256];
+    let Ok(encoded) = protocol::encode_error(code, message, seq, &mut error_buf) else {
+        eprintln!("[Client] Failed to encode Error response");
+        return;
+    };
+
+    if let Err(error) = socket.send_to(encoded, path) {
+        eprintln!("[Client] Failed to send Error response: {}", error);
+    }
+}
+
+fn send_udp_error_response(
+    socket: &std::net::UdpSocket,
+    client_addr: std::net::SocketAddr,
+    code: ErrorCode,
+    message: &str,
+    seq: u32,
+) {
+    let mut error_buf = [0u8; 256];
+    let Ok(encoded) = protocol::encode_error(code, message, seq, &mut error_buf) else {
+        eprintln!("[UDP Client] Failed to encode Error response");
+        return;
+    };
+
+    if let Err(error) = socket.send_to(encoded, client_addr) {
+        eprintln!("[UDP Client] Failed to send Error response: {}", error);
+    }
 }
 
 /// 设备状态机
@@ -141,11 +225,10 @@ struct DaemonStats {
 }
 
 struct IpcHandlerContext<'a> {
-    tx_adapter: &'a Arc<Mutex<Option<GsUsbTxAdapter>>>,
+    tx_adapter: &'a Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
     device_state: &'a Arc<RwLock<DeviceState>>,
     clients: &'a Arc<RwLock<ClientManager>>,
     stats: &'a Arc<RwLock<DaemonStats>>,
-    bridge_tx_timeout: Duration,
 }
 
 /// 详细统计信息（健康度监控）
@@ -562,7 +645,7 @@ pub struct Daemon {
     rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
 
     /// TX 适配器（只写，用于 IPC 接收线程）
-    tx_adapter: Arc<Mutex<Option<GsUsbTxAdapter>>>,
+    tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
 
     /// 设备状态
     device_state: Arc<RwLock<DeviceState>>,
@@ -679,7 +762,7 @@ impl Daemon {
     fn try_connect_device(
         config: &DaemonConfig,
         stats: Arc<RwLock<DaemonStats>>,
-    ) -> Result<(GsUsbRxAdapter, GsUsbTxAdapter), DaemonError> {
+    ) -> Result<(GsUsbRxAdapter, Box<dyn BridgeTxAdapter + Send>), DaemonError> {
         // 1. 扫描设备
         eprintln!(
             "[Daemon] Scanning for GS-USB devices (serial: {:?})...",
@@ -747,13 +830,15 @@ impl Daemon {
         let (rx_adapter, tx_adapter) = adapter
             .split()
             .map_err(|e| DaemonError::DeviceInit(format!("Failed to split adapter: {}", e)))?;
+        let bridge_tx = Box::new(tx_adapter.into_bridge(config.bridge_tx_timeout))
+            as Box<dyn BridgeTxAdapter + Send>;
 
         // 注意：Bus Off 和 Error Passive 回调在 device_manager_loop 中设置
         // 因为在设备重连时需要重新设置回调，且需要访问 stats
         // 详见 device_manager_loop 中的回调设置代码
 
         eprintln!("[Daemon] Adapter split into RX and TX adapters");
-        Ok((rx_adapter, tx_adapter))
+        Ok((rx_adapter, bridge_tx))
     }
 
     /// 设备管理循环（状态机 + 热拔插恢复）
@@ -765,7 +850,7 @@ impl Daemon {
     /// 使用分离的 RX 和 TX adapter
     fn device_manager_loop(
         rx_adapter: Arc<Mutex<Option<GsUsbRxAdapter>>>,
-        tx_adapter: Arc<Mutex<Option<GsUsbTxAdapter>>>,
+        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
         device_state: Arc<RwLock<DeviceState>>,
         stats: Arc<RwLock<DaemonStats>>,
         config: DaemonConfig,
@@ -1216,11 +1301,10 @@ impl Daemon {
     #[cfg(unix)]
     fn ipc_receive_loop(
         socket: std::os::unix::net::UnixDatagram,
-        tx_adapter: Arc<Mutex<Option<GsUsbTxAdapter>>>,
+        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
         device_state: Arc<RwLock<DeviceState>>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
-        bridge_tx_timeout: Duration,
     ) {
         // 设置高优先级（macOS QoS）
         // 注意：在非 macOS 平台上这是空操作，可以安全调用
@@ -1244,7 +1328,6 @@ impl Daemon {
                                 device_state: &device_state,
                                 clients: &clients,
                                 stats: &stats,
-                                bridge_tx_timeout,
                             },
                             &socket,
                         );
@@ -1271,11 +1354,10 @@ impl Daemon {
     /// 注意：UDP 的 `recv_from` 返回 `SocketAddr`（IP 地址），而不是 `UnixSocketAddr`
     fn ipc_receive_loop_udp(
         socket: std::net::UdpSocket,
-        tx_adapter: Arc<Mutex<Option<GsUsbTxAdapter>>>,
+        tx_adapter: Arc<Mutex<Option<Box<dyn BridgeTxAdapter + Send>>>>,
         device_state: Arc<RwLock<DeviceState>>,
         clients: Arc<RwLock<ClientManager>>,
         stats: Arc<RwLock<DaemonStats>>,
-        bridge_tx_timeout: Duration,
     ) {
         // 设置高优先级（macOS QoS）
         // 注意：在非 macOS 平台上这是空操作，可以安全调用
@@ -1301,7 +1383,6 @@ impl Daemon {
                                 device_state: &device_state,
                                 clients: &clients,
                                 stats: &stats,
-                                bridge_tx_timeout,
                             },
                             &socket, // ← UdpSocket
                         );
@@ -1333,10 +1414,9 @@ impl Daemon {
     ) {
         let IpcHandlerContext {
             tx_adapter,
-            device_state: _device_state,
+            device_state,
             clients,
             stats,
-            bridge_tx_timeout,
         } = ctx;
         match msg {
             piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
@@ -1440,11 +1520,11 @@ impl Daemon {
             piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id } => {
                 clients.write().unwrap().unregister(client_id);
             },
-            piper_can::gs_usb_udp::protocol::Message::SendFrame { frame, seq: _seq } => {
+            Message::SendFrame { frame, seq } => {
                 // 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
-                    match adapter_ref.send_bridge(frame, bridge_tx_timeout) {
+                    match adapter_ref.send_bridge(frame) {
                         Ok(_) => {
                             // 更新统计（USB 发送成功）
                             stats.read().unwrap().increment_tx();
@@ -1452,11 +1532,29 @@ impl Daemon {
                         },
                         Err(e) => {
                             eprintln!("[Client] Failed to send frame: {}", e);
-                            // 可以发送 Error 消息回客户端（带 seq）
+                            record_bridge_tx_error(stats, &e);
+                            drop(adapter_guard);
+                            mark_bridge_device_disconnected(device_state, tx_adapter);
+
+                            send_unix_error_response(
+                                socket,
+                                &client_addr,
+                                bridge_error_code(&e),
+                                &e.to_string(),
+                                seq,
+                            );
                         },
                     }
                 } else {
                     eprintln!("[Client] TX adapter not available, frame dropped");
+                    drop(adapter_guard);
+                    send_unix_error_response(
+                        socket,
+                        &client_addr,
+                        ErrorCode::NotConnected,
+                        "TX adapter not available",
+                        seq,
+                    );
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
@@ -1489,14 +1587,14 @@ impl Daemon {
 
                 let clients_guard = clients.read().unwrap();
                 let stats_guard = stats.read().unwrap();
-                let device_state_guard = _device_state.read().unwrap();
+                let device_state_guard = device_state.read().unwrap();
                 let detailed_guard = stats_guard.detailed.read().unwrap();
 
                 let rx_fps = stats_guard.get_rx_fps();
                 let tx_fps = stats_guard.get_tx_fps();
 
                 // 构建 StatusResponse
-                let status = piper_can::gs_usb_udp::protocol::StatusResponse {
+                let status = StatusResponse {
                     device_state: match *device_state_guard {
                         DeviceState::Connected => 1,
                         DeviceState::Disconnected => 0,
@@ -1558,7 +1656,6 @@ impl Daemon {
             device_state,
             clients,
             stats,
-            bridge_tx_timeout,
         } = ctx;
         match msg {
             piper_can::gs_usb_udp::protocol::Message::Heartbeat { client_id } => {
@@ -1635,20 +1732,39 @@ impl Daemon {
             piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id } => {
                 clients.write().unwrap().unregister(client_id);
             },
-            piper_can::gs_usb_udp::protocol::Message::SendFrame { frame, seq: _seq } => {
+            Message::SendFrame { frame, seq } => {
                 // ✅ 发送 CAN 帧到 USB 设备（使用 TX adapter）
                 let mut adapter_guard = tx_adapter.lock().unwrap();
                 if let Some(ref mut adapter_ref) = *adapter_guard {
-                    match adapter_ref.send_bridge(frame, bridge_tx_timeout) {
+                    match adapter_ref.send_bridge(frame) {
                         Ok(_) => {
                             stats.read().unwrap().increment_tx();
                         },
                         Err(e) => {
                             eprintln!("[UDP Client] Failed to send frame: {}", e);
+                            record_bridge_tx_error(stats, &e);
+                            drop(adapter_guard);
+                            mark_bridge_device_disconnected(device_state, tx_adapter);
+
+                            send_udp_error_response(
+                                socket,
+                                client_addr,
+                                bridge_error_code(&e),
+                                &e.to_string(),
+                                seq,
+                            );
                         },
                     }
                 } else {
                     eprintln!("[UDP Client] TX adapter not available, frame dropped");
+                    drop(adapter_guard);
+                    send_udp_error_response(
+                        socket,
+                        client_addr,
+                        ErrorCode::NotConnected,
+                        "TX adapter not available",
+                        seq,
+                    );
                 }
             },
             piper_can::gs_usb_udp::protocol::Message::SetFilter { client_id, filters } => {
@@ -1680,7 +1796,7 @@ impl Daemon {
                 let tx_fps = stats_guard.get_tx_fps();
 
                 // 构建 StatusResponse
-                let status = piper_can::gs_usb_udp::protocol::StatusResponse {
+                let status = StatusResponse {
                     device_state: match *device_state_guard {
                         DeviceState::Connected => 1,
                         DeviceState::Disconnected => 0,
@@ -1984,7 +2100,6 @@ impl Daemon {
             let device_state_clone = Arc::clone(&self.device_state);
             let clients_clone = Arc::clone(&self.clients);
             let stats_clone = Arc::clone(&self.stats);
-            let bridge_tx_timeout = self.config.bridge_tx_timeout;
 
             thread::Builder::new()
                 .name("ipc_receive_uds".into())
@@ -1995,7 +2110,6 @@ impl Daemon {
                         device_state_clone,
                         clients_clone,
                         stats_clone,
-                        bridge_tx_timeout,
                     );
                 })
                 .map_err(|e| {
@@ -2009,7 +2123,6 @@ impl Daemon {
             let device_state_clone = Arc::clone(&self.device_state);
             let clients_clone = Arc::clone(&self.clients);
             let stats_clone = Arc::clone(&self.stats);
-            let bridge_tx_timeout = self.config.bridge_tx_timeout;
 
             thread::Builder::new()
                 .name("ipc_receive_udp".into())
@@ -2020,7 +2133,6 @@ impl Daemon {
                         device_state_clone,
                         clients_clone,
                         stats_clone,
-                        bridge_tx_timeout,
                     );
                 })
                 .map_err(|e| {

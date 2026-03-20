@@ -17,10 +17,14 @@ use tracing_subscriber::prelude::*;
 
 /// GS-USB 守护进程
 ///
-/// 用户态守护进程，始终保持与 GS-USB 设备的连接，通过 UDS/UDP 向客户端提供 CAN 总线访问
+/// 用户态 bridge/debug 守护进程，通过 UDS/UDP 向客户端提供 best-effort CAN 总线访问。
+/// 该链路不是 MIT / 双臂 / fault-stop 的实时控制路径。
 #[derive(Parser, Debug)]
 #[command(name = "gs_usb_daemon")]
-#[command(about = "GS-USB Daemon - Persistent CAN bus access via UDS/UDP", long_about = None)]
+#[command(
+    about = "GS-USB daemon for non-realtime bridge/debug access via UDS/UDP",
+    long_about = None
+)]
 struct Args {
     /// UDP 监听地址（默认传输方式）
     ///
@@ -72,7 +76,7 @@ struct Args {
     #[arg(long, default_value = "30")]
     client_timeout: u64,
 
-    /// bridge/debug 链路发送超时（毫秒）
+    /// bridge/debug 链路发送超时（毫秒，非实时）
     ///
     /// 默认: 100
     #[arg(long, default_value = "100")]

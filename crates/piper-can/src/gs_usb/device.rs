@@ -606,13 +606,13 @@ impl GsUsbDevice {
     /// deadline 超过前仍未完成 USB Bulk OUT，则直接返回 `WriteTimeout`。
     /// 实时控制路径不在热路径内做 endpoint 恢复，后续恢复应由显式 reopen/recover 流程处理。
     pub fn send_raw_until(&self, frame: &GsUsbFrame, deadline: Instant) -> Result<(), GsUsbError> {
-        let mut buf = bytes::BytesMut::new();
-        frame.pack_to(&mut buf, self.hw_timestamp);
+        let mut buf = [0u8; GS_USB_FRAME_SIZE_HW_TIMESTAMP];
+        let packed = frame.pack_into_array(&mut buf, self.hw_timestamp);
 
         let timeout = Self::usb_timeout_from_deadline(deadline, Instant::now())?;
 
-        match self.handle.write_bulk(self.endpoint_out, &buf, timeout) {
-            Ok(transferred) => Self::validate_bulk_write(transferred, buf.len()),
+        match self.handle.write_bulk(self.endpoint_out, packed, timeout) {
+            Ok(transferred) => Self::validate_bulk_write(transferred, packed.len()),
             Err(rusb::Error::Timeout) => Err(GsUsbError::WriteTimeout),
             Err(e) => Err(GsUsbError::Usb(e)),
         }

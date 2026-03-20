@@ -29,6 +29,8 @@ pub struct GsUsbUdpAdapter {
     receive_timeout: Duration,
 }
 
+const DEFAULT_BRIDGE_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// daemon 会话的共享状态。
 struct DaemonSession {
     client_id: AtomicU32,
@@ -70,23 +72,12 @@ pub struct GsUsbUdpTxAdapter {
 
 impl Socket {
     fn send_to_daemon(&self, data: &[u8], daemon_addr: &DaemonAddr) -> Result<(), CanError> {
-        self.send_to_daemon_with_timeout(data, daemon_addr, None)
-    }
-
-    fn send_to_daemon_with_timeout(
-        &self,
-        data: &[u8],
-        daemon_addr: &DaemonAddr,
-        timeout: Option<Duration>,
-    ) -> Result<(), CanError> {
         match (self, daemon_addr) {
             #[cfg(unix)]
             (Socket::Unix(socket), DaemonAddr::Unix(path)) => {
-                socket.set_write_timeout(timeout).map_err(CanError::Io)?;
                 socket.send_to(data, path).map_err(CanError::Io)?;
             },
             (Socket::Udp(socket), DaemonAddr::Udp(addr)) => {
-                socket.set_write_timeout(timeout).map_err(CanError::Io)?;
                 socket.send_to(data, *addr).map_err(CanError::Io)?;
             },
             #[cfg(unix)]
@@ -131,6 +122,14 @@ impl Socket {
             Socket::Udp(socket) => socket.set_read_timeout(timeout).map_err(CanError::Io),
         }
     }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), CanError> {
+        match self {
+            #[cfg(unix)]
+            Socket::Unix(socket) => socket.set_write_timeout(timeout).map_err(CanError::Io),
+            Socket::Udp(socket) => socket.set_write_timeout(timeout).map_err(CanError::Io),
+        }
+    }
 }
 
 impl DaemonSession {
@@ -162,10 +161,6 @@ impl DaemonSession {
 
     fn send_to_daemon(&self, data: &[u8]) -> Result<(), CanError> {
         self.socket.send_to_daemon(data, &self.daemon_addr)
-    }
-
-    fn send_to_daemon_with_timeout(&self, data: &[u8], timeout: Duration) -> Result<(), CanError> {
-        self.socket.send_to_daemon_with_timeout(data, &self.daemon_addr, Some(timeout))
     }
 
     fn recv_from_daemon(&self, buf: &mut [u8]) -> Result<usize, CanError> {
@@ -352,6 +347,15 @@ impl GsUsbUdpAdapter {
     /// 创建新的适配器（UDS）
     #[cfg(unix)]
     pub fn new_uds(uds_path: impl AsRef<str>) -> Result<Self, CanError> {
+        Self::new_uds_with_timeout(uds_path, DEFAULT_BRIDGE_TIMEOUT)
+    }
+
+    /// 创建新的适配器（UDS，自定义 bridge timeout）
+    #[cfg(unix)]
+    pub fn new_uds_with_timeout(
+        uds_path: impl AsRef<str>,
+        bridge_timeout: Duration,
+    ) -> Result<Self, CanError> {
         let receive_timeout = Duration::from_millis(2);
         let client_socket_path = unique_client_socket_path();
 
@@ -363,6 +367,7 @@ impl GsUsbUdpAdapter {
             UnixDatagram::bind(&client_socket_path).map_err(CanError::Io)?,
         ));
         socket.set_read_timeout(Some(receive_timeout))?;
+        socket.set_write_timeout(Some(bridge_timeout))?;
 
         let session = Arc::new(DaemonSession::new(
             DaemonAddr::Unix(uds_path.as_ref().to_string()),
@@ -379,6 +384,14 @@ impl GsUsbUdpAdapter {
 
     /// 创建新的适配器（UDP）
     pub fn new_udp(udp_addr: impl AsRef<str>) -> Result<Self, CanError> {
+        Self::new_udp_with_timeout(udp_addr, DEFAULT_BRIDGE_TIMEOUT)
+    }
+
+    /// 创建新的适配器（UDP，自定义 bridge timeout）
+    pub fn new_udp_with_timeout(
+        udp_addr: impl AsRef<str>,
+        bridge_timeout: Duration,
+    ) -> Result<Self, CanError> {
         let receive_timeout = Duration::from_millis(2);
         let addr: SocketAddr = udp_addr
             .as_ref()
@@ -389,6 +402,7 @@ impl GsUsbUdpAdapter {
             UdpSocket::bind("0.0.0.0:0").map_err(CanError::Io)?,
         ));
         socket.set_read_timeout(Some(receive_timeout))?;
+        socket.set_write_timeout(Some(bridge_timeout))?;
 
         let session = Arc::new(DaemonSession::new(
             DaemonAddr::Udp(addr),
@@ -543,10 +557,7 @@ impl RxAdapter for GsUsbUdpRxAdapter {
 }
 
 impl BridgeTxAdapter for GsUsbUdpTxAdapter {
-    fn send_bridge(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
-        if timeout.is_zero() {
-            return Err(CanError::Timeout);
-        }
+    fn send_bridge(&mut self, frame: PiperFrame) -> Result<(), CanError> {
         if !self.session.is_connected() {
             return Err(CanError::Device("Not connected to daemon".into()));
         }
@@ -558,7 +569,7 @@ impl BridgeTxAdapter for GsUsbUdpTxAdapter {
                 CanError::Device(format!("Failed to encode send frame: {err:?}").into())
             })?;
 
-        if let Err(error) = self.session.send_to_daemon_with_timeout(encoded, timeout) {
+        if let Err(error) = self.session.send_to_daemon(encoded) {
             self.session.mark_transport_lost();
             return Err(error);
         }
@@ -783,7 +794,7 @@ mod tests {
 
         let (mut rx, mut tx) = adapter.split_bridge().unwrap();
         let outbound = PiperFrame::new_standard(0x321, &[9, 8, 7, 6]);
-        tx.send_bridge(outbound, Duration::from_millis(50)).unwrap();
+        tx.send_bridge(outbound).unwrap();
 
         let inbound = rx.receive().unwrap();
         assert_eq!(inbound.id, outbound.id);

@@ -45,7 +45,7 @@ pub mod gs_usb_udp;
 
 // 导出 split 相关的类型（如果可用）
 #[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
-pub use gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
+pub use gs_usb::split::{GsUsbBridgeTxAdapter, GsUsbRxAdapter, GsUsbTxAdapter};
 
 // Mock Adapter (用于测试)
 #[cfg(feature = "mock")]
@@ -189,17 +189,17 @@ where
 /// 这条路径明确是 best-effort 非实时语义：
 /// - 不参与 realtime dual-thread driver
 /// - 不承诺 bounded shutdown
-/// - 调用方通过相对 timeout 指定 bridge 发送预算
+/// - bridge timeout 在 adapter/session 创建时绑定，不按调用动态指定
 pub trait BridgeTxAdapter {
-    fn send_bridge(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError>;
+    fn send_bridge(&mut self, frame: PiperFrame) -> Result<(), CanError>;
 }
 
 impl<T> BridgeTxAdapter for Box<T>
 where
     T: BridgeTxAdapter + ?Sized,
 {
-    fn send_bridge(&mut self, frame: PiperFrame, timeout: Duration) -> Result<(), CanError> {
-        (**self).send_bridge(frame, timeout)
+    fn send_bridge(&mut self, frame: PiperFrame) -> Result<(), CanError> {
+        (**self).send_bridge(frame)
     }
 }
 
