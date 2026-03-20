@@ -19,6 +19,8 @@
 //!
 //! 对于常规录制场景，参见 [`recording`] 模块。
 
+pub mod bridge;
+mod bridge_host;
 pub mod builder; // Client 层 Builder
 mod connection;
 pub mod control;
@@ -36,6 +38,12 @@ pub mod types;
 mod recording_tests;
 
 // 重新导出常用类型
+pub use bridge::{
+    BridgeClientOptions, BridgeDeviceState, BridgeEndpoint, BridgeError, BridgeEvent, BridgeResult,
+    BridgeRole, BridgeStatus, BridgeTlsClientConfig, CanIdFilter, ErrorCode, MaintenanceLease,
+    PiperBridgeClient, SessionToken,
+};
+pub use bridge_host::{BridgeHostConfig, BridgeHostError, BridgeTlsServerConfig, PiperBridgeHost};
 pub use builder::PiperBuilder;
 pub use diagnostics::PiperDiagnostics;
 pub use dual_arm::{

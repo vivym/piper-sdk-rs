@@ -10,7 +10,7 @@
 
 ```bash
 # 在终端 1 中启动 daemon
-cargo run --bin gs_usb_daemon
+cargo run --bin piper_bridge_host
 ```
 
 确保 daemon 成功启动并连接到 GS-USB 设备。
@@ -19,7 +19,7 @@ cargo run --bin gs_usb_daemon
 
 ```bash
 # 在终端 2 中运行性能测试
-cargo run --example daemon_latency_bench
+cargo run --example bridge_latency_bench
 ```
 
 ## 测试场景
@@ -76,8 +76,8 @@ cargo run --example daemon_latency_bench
 **错误**: `无法连接到 daemon: ...`
 
 **解决方案**:
-1. 确认 daemon 已启动: `ps aux | grep gs_usb_daemon`
-2. 检查 socket 文件: `ls -l /tmp/gs_usb_daemon.sock`
+1. 确认 bridge host 已启动: `ps aux | grep piper_bridge_host`
+2. 检查 socket 文件: `ls -l /tmp/piper_bridge.sock`
 3. 确认 daemon 日志显示设备已连接
 
 ### 问题 2: 接收测试超时
@@ -117,13 +117,13 @@ cargo run --example daemon_latency_bench
 
 ```bash
 # 终端 2
-cargo run --example daemon_latency_bench
+cargo run --example bridge_latency_bench
 
 # 终端 3
-cargo run --example daemon_latency_bench
+cargo run --example bridge_latency_bench
 
 # 终端 4
-cargo run --example daemon_latency_bench
+cargo run --example bridge_latency_bench
 ```
 
 观察 daemon 日志，验证：
@@ -153,4 +153,3 @@ cargo run --example daemon_latency_bench
 
 - 架构分析报告: `docs/v0/gs_usb_daemon_architecture_analysis.md`
 - 实施计划: `docs/v0/gs_usb_daemon_implementation_plan.md`
-

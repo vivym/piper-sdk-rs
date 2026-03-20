@@ -22,7 +22,7 @@ impl SingletonLock {
     /// 尝试获取单例锁
     ///
     /// # 参数
-    /// - `lock_path`: 锁文件路径（如 `/var/run/gs_usb_daemon.lock`）
+    /// - `lock_path`: 锁文件路径（如 `/var/run/piper_bridge_host.lock`）
     ///
     /// # 返回
     /// - `Ok(Self)`: 成功获取锁
@@ -82,7 +82,7 @@ mod tests {
     fn test_singleton_lock_exclusive() {
         // 创建临时锁文件路径
         let temp_dir = std::env::temp_dir();
-        let lock_path = temp_dir.join("test_gs_usb_daemon.lock");
+        let lock_path = temp_dir.join("test_piper_bridge_host.lock");
 
         // 清理可能存在的旧锁文件
         let _ = fs::remove_file(&lock_path);
@@ -108,7 +108,7 @@ mod tests {
     fn test_singleton_lock_file_creation() {
         // 测试锁文件创建
         let temp_dir = std::env::temp_dir();
-        let lock_path = temp_dir.join("test_gs_usb_daemon_create.lock");
+        let lock_path = temp_dir.join("test_piper_bridge_host_create.lock");
 
         // 清理可能存在的旧锁文件
         let _ = fs::remove_file(&lock_path);

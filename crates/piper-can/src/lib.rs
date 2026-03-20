@@ -39,14 +39,22 @@ pub mod gs_usb;
 #[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
 pub use gs_usb::GsUsbCanAdapter;
 
-// GS-USB bridge v2 client (UnixStream/TCP)
+// Controller-owned bridge client (UnixStream/TCP)
 // Non-realtime debug / record / replay path only.
-pub mod gs_usb_bridge;
-pub use gs_usb_bridge::protocol::{
+mod gs_usb_bridge;
+pub mod bridge {
+    pub use super::gs_usb_bridge::protocol;
+    pub use super::gs_usb_bridge::{
+        BridgeClientOptions, BridgeEndpoint, BridgeError, BridgeResult, BridgeTlsClientConfig,
+        GsUsbBridgeClient as BridgeClient, WriterLease as MaintenanceLease,
+    };
+}
+pub use bridge::protocol::{
     BridgeDeviceState, BridgeEvent, BridgeRole, BridgeStatus, CanIdFilter, ErrorCode, SessionToken,
 };
-pub use gs_usb_bridge::{
-    BridgeClientOptions, BridgeEndpoint, BridgeError, BridgeResult, GsUsbBridgeClient, WriterLease,
+pub use bridge::{
+    BridgeClient, BridgeClientOptions, BridgeEndpoint, BridgeError, BridgeResult,
+    BridgeTlsClientConfig, MaintenanceLease,
 };
 
 // 导出 split 相关的类型（如果可用）

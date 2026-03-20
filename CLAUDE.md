@@ -40,7 +40,7 @@ cargo run --example timestamp_verification    # Verify SocketCAN hardware timest
 
 ### Building Binaries
 ```bash
-cargo build --release --bin gs_usb_daemon     # Build the GS-USB daemon
+cargo build --release --bin piper_bridge_host # Build the controller-owned bridge host
 ```
 
 ## Architecture Overview
@@ -183,7 +183,7 @@ src/
 │   ├── state/          # Type state pattern markers
 │   └── types/          # Type system (units, joints, errors)
 └── bin/
-    └── gs_usb_daemon/  # GS-USB daemon binary
+    └── daemon/         # Controller-owned bridge host binary
 ```
 
 ## Protocol Notes

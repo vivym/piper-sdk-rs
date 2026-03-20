@@ -26,11 +26,15 @@
   - 验证 Linux SocketCAN 是否支持硬件时间戳（SO_TIMESTAMPING）
   - 运行：`cargo run --example timestamp_verification`
 
-- **`gs_usb_bridge_test`** - GS-USB bridge v2 调试工具
+- **`bridge_test`** - controller-owned bridge 调试工具
   - 用于 bridge/debug/replay 场景
-  - 基于 UDS/TCP stream，会话由 logical session token 管理
+  - 基于 UDS/TCP-TLS stream，会话由 logical session token 管理
   - 明确是非实时链路，不用于 MIT / 双臂 / fault-stop 主控制链
-  - 运行：`cargo run --example gs_usb_bridge_test`
+  - 运行：`cargo run --example bridge_test`
+
+- **`bridge_latency_bench`** - bridge 链路延迟基准
+  - 评估非实时 bridge/debug 链路的 host-side request/event 开销
+  - 运行：`cargo run --example bridge_latency_bench`
 
 ### 计划中的示例
 

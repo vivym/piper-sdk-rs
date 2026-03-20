@@ -10,22 +10,27 @@ use protocol::{
     ClientRequest, ServerMessage, ServerResponse, decode_server_message, encode_client_request,
     read_framed, write_framed,
 };
+use rustls::pki_types::{PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use std::collections::VecDeque;
+use std::fs;
+use std::io::Cursor;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-pub use protocol::{
-    BridgeDeviceState, BridgeEvent, BridgeRole, BridgeStatus, CanIdFilter, ErrorCode, SessionToken,
-};
+pub use protocol::{BridgeEvent, BridgeRole, BridgeStatus, ErrorCode, SessionToken};
 
 #[derive(Debug)]
 pub enum BridgeError {
     Io(std::io::Error),
     Protocol(protocol::ProtocolError),
+    Config(String),
+    Tls(String),
     Remote { code: ErrorCode, message: String },
     UnexpectedMessage(&'static str),
     NotConnected,
@@ -36,6 +41,8 @@ impl std::fmt::Display for BridgeError {
         match self {
             Self::Io(err) => write!(f, "{err}"),
             Self::Protocol(err) => write!(f, "{err}"),
+            Self::Config(message) => write!(f, "{message}"),
+            Self::Tls(message) => write!(f, "{message}"),
             Self::Remote { code, message } => write!(f, "remote {code:?}: {message}"),
             Self::UnexpectedMessage(message) => write!(f, "{message}"),
             Self::NotConnected => write!(f, "bridge client is not connected"),
@@ -57,6 +64,12 @@ impl From<protocol::ProtocolError> for BridgeError {
     }
 }
 
+impl From<rustls::Error> for BridgeError {
+    fn from(value: rustls::Error) -> Self {
+        Self::Tls(value.to_string())
+    }
+}
+
 impl BridgeError {
     pub fn as_can_device_error(&self) -> Option<CanDeviceError> {
         match self {
@@ -75,6 +88,10 @@ impl BridgeError {
                 };
                 Some(CanDeviceError::new(kind, message.clone()))
             },
+            Self::Config(message) | Self::Tls(message) => Some(CanDeviceError::new(
+                CanDeviceErrorKind::Backend,
+                message.clone(),
+            )),
             _ => None,
         }
     }
@@ -85,7 +102,15 @@ pub type BridgeResult<T> = Result<T, BridgeError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeEndpoint {
     Unix(PathBuf),
-    Tcp(SocketAddr),
+    TcpTls(SocketAddr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeTlsClientConfig {
+    pub ca_cert_pem: PathBuf,
+    pub client_cert_pem: PathBuf,
+    pub client_key_pem: PathBuf,
+    pub server_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +120,7 @@ pub struct BridgeClientOptions {
     pub filters: Vec<protocol::CanIdFilter>,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    pub tcp_tls: Option<BridgeTlsClientConfig>,
 }
 
 impl Default for BridgeClientOptions {
@@ -105,6 +131,7 @@ impl Default for BridgeClientOptions {
             filters: Vec::new(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_millis(100),
+            tcp_tls: None,
         }
     }
 }
@@ -112,19 +139,15 @@ impl Default for BridgeClientOptions {
 enum BridgeStream {
     #[cfg(unix)]
     Unix(UnixStream),
-    Tcp(TcpStream),
+    TcpTls(Box<StreamOwned<ClientConnection, TcpStream>>),
 }
 
 impl BridgeStream {
-    fn connect(endpoint: &BridgeEndpoint, connect_timeout: Duration) -> BridgeResult<Self> {
+    fn connect(endpoint: &BridgeEndpoint, options: &BridgeClientOptions) -> BridgeResult<Self> {
         match endpoint {
             #[cfg(unix)]
             BridgeEndpoint::Unix(path) => Ok(Self::Unix(UnixStream::connect(path)?)),
-            BridgeEndpoint::Tcp(addr) => {
-                let stream = TcpStream::connect_timeout(addr, connect_timeout)?;
-                stream.set_nodelay(true)?;
-                Ok(Self::Tcp(stream))
-            },
+            BridgeEndpoint::TcpTls(addr) => Self::connect_tcp_tls(*addr, options),
             #[cfg(not(unix))]
             BridgeEndpoint::Unix(_) => Err(BridgeError::UnexpectedMessage(
                 "unix bridge endpoints are not supported on this platform",
@@ -132,11 +155,55 @@ impl BridgeStream {
         }
     }
 
+    fn connect_tcp_tls(addr: SocketAddr, options: &BridgeClientOptions) -> BridgeResult<Self> {
+        let tls = options.tcp_tls.as_ref().ok_or_else(|| {
+            BridgeError::Config(
+                "tcp tls endpoint requires BridgeClientOptions::tcp_tls client credentials"
+                    .to_string(),
+            )
+        })?;
+
+        let tcp_stream = TcpStream::connect_timeout(&addr, options.connect_timeout)?;
+        tcp_stream.set_nodelay(true)?;
+        tcp_stream.set_read_timeout(Some(options.connect_timeout))?;
+        tcp_stream.set_write_timeout(Some(options.connect_timeout))?;
+
+        let mut roots = RootCertStore::empty();
+        let root_certs = load_cert_chain(&tls.ca_cert_pem)?;
+        let (added, _) = roots.add_parsable_certificates(root_certs);
+        if added == 0 {
+            return Err(BridgeError::Config(format!(
+                "no valid CA certificates found in {}",
+                tls.ca_cert_pem.display()
+            )));
+        }
+
+        let client_certs = load_cert_chain(&tls.client_cert_pem)?;
+        let client_key = load_private_key(&tls.client_key_pem)?;
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(client_certs, client_key)
+            .map_err(|err| BridgeError::Tls(format!("failed to configure client TLS: {err}")))?;
+        let server_name = ServerName::try_from(tls.server_name.clone()).map_err(|_| {
+            BridgeError::Config(format!("invalid TLS server name: {}", tls.server_name))
+        })?;
+        let connection = ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|err| BridgeError::Tls(format!("failed to create TLS connection: {err}")))?;
+        let mut tls_stream = StreamOwned::new(connection, tcp_stream);
+        while tls_stream.conn.is_handshaking() {
+            tls_stream
+                .conn
+                .complete_io(&mut tls_stream.sock)
+                .map_err(|err| BridgeError::Tls(format!("TLS handshake failed: {err}")))?;
+        }
+        Ok(Self::TcpTls(Box::new(tls_stream)))
+    }
+
     fn set_read_timeout(&self, timeout: Option<Duration>) -> BridgeResult<()> {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => stream.set_read_timeout(timeout)?,
-            Self::Tcp(stream) => stream.set_read_timeout(timeout)?,
+            Self::TcpTls(stream) => stream.sock.set_read_timeout(timeout)?,
         }
         Ok(())
     }
@@ -145,7 +212,7 @@ impl BridgeStream {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => stream.set_write_timeout(timeout)?,
-            Self::Tcp(stream) => stream.set_write_timeout(timeout)?,
+            Self::TcpTls(stream) => stream.sock.set_write_timeout(timeout)?,
         }
         Ok(())
     }
@@ -156,8 +223,8 @@ impl BridgeStream {
             Self::Unix(stream) => {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             },
-            Self::Tcp(stream) => {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+            Self::TcpTls(stream) => {
+                let _ = stream.sock.shutdown(std::net::Shutdown::Both);
             },
         }
     }
@@ -168,7 +235,7 @@ impl Read for BridgeStream {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => stream.read(buf),
-            Self::Tcp(stream) => stream.read(buf),
+            Self::TcpTls(stream) => stream.read(buf),
         }
     }
 }
@@ -178,7 +245,7 @@ impl Write for BridgeStream {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => stream.write(buf),
-            Self::Tcp(stream) => stream.write(buf),
+            Self::TcpTls(stream) => stream.write(buf),
         }
     }
 
@@ -186,7 +253,7 @@ impl Write for BridgeStream {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => stream.flush(),
-            Self::Tcp(stream) => stream.flush(),
+            Self::TcpTls(stream) => stream.flush(),
         }
     }
 }
@@ -206,7 +273,7 @@ pub struct GsUsbBridgeClient {
 
 impl GsUsbBridgeClient {
     pub fn connect(endpoint: BridgeEndpoint, options: BridgeClientOptions) -> BridgeResult<Self> {
-        let mut stream = BridgeStream::connect(&endpoint, options.connect_timeout)?;
+        let mut stream = BridgeStream::connect(&endpoint, &options)?;
         stream.set_read_timeout(Some(options.request_timeout))?;
         stream.set_write_timeout(Some(options.request_timeout))?;
 
@@ -528,21 +595,147 @@ fn response_request_id(response: &ServerResponse) -> u32 {
     }
 }
 
+fn load_cert_chain(
+    path: &std::path::Path,
+) -> BridgeResult<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let bytes = fs::read(path).map_err(BridgeError::Io)?;
+    let mut cursor = Cursor::new(bytes);
+    rustls_pemfile::certs(&mut cursor)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(BridgeError::Io)
+}
+
+fn load_private_key(path: &std::path::Path) -> BridgeResult<PrivateKeyDer<'static>> {
+    let bytes = fs::read(path).map_err(BridgeError::Io)?;
+    let mut cursor = Cursor::new(bytes);
+    rustls_pemfile::private_key(&mut cursor)
+        .map_err(BridgeError::Io)?
+        .ok_or_else(|| BridgeError::Config(format!("no private key found in {}", path.display())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::PiperFrame;
     use protocol::{CanIdFilter, SESSION_TOKEN_LEN, decode_client_request, encode_server_message};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rustls::server::{ServerConfig, ServerConnection, WebPkiClientVerifier};
+    use std::fs;
     use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    #[test]
-    fn test_connect_roundtrip_tcp() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+    static NEXT_TLS_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+    struct TestTlsFixture {
+        dir: PathBuf,
+        server_config: Arc<ServerConfig>,
+        ca_cert_pem: PathBuf,
+        client_cert_pem: PathBuf,
+        client_key_pem: PathBuf,
+    }
+
+    impl TestTlsFixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "piper-bridge-client-tls-test-{}-{}",
+                std::process::id(),
+                NEXT_TLS_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+
+            let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_key = KeyPair::generate().unwrap();
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+            let server_key = KeyPair::generate().unwrap();
+            let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+
+            let client_key = KeyPair::generate().unwrap();
+            let client_params = CertificateParams::new(vec!["bridge-client".to_string()]).unwrap();
+            let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+
+            let ca_cert_pem = dir.join("ca.pem");
+            let server_cert_pem = dir.join("server-cert.pem");
+            let server_key_pem = dir.join("server-key.pem");
+            let client_cert_pem = dir.join("client-cert.pem");
+            let client_key_pem = dir.join("client-key.pem");
+
+            fs::write(&ca_cert_pem, ca_cert.pem()).unwrap();
+            fs::write(&server_cert_pem, server_cert.pem()).unwrap();
+            fs::write(&server_key_pem, server_key.serialize_pem()).unwrap();
+            fs::write(&client_cert_pem, client_cert.pem()).unwrap();
+            fs::write(&client_key_pem, client_key.serialize_pem()).unwrap();
+
+            let mut roots = RootCertStore::empty();
+            let (added, _) =
+                roots.add_parsable_certificates(load_cert_chain(&ca_cert_pem).unwrap());
+            assert!(added > 0);
+
+            let verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build().unwrap();
+            let server_config = ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    load_cert_chain(&server_cert_pem).unwrap(),
+                    load_private_key(&server_key_pem).unwrap(),
+                )
+                .unwrap();
+
+            Self {
+                dir,
+                server_config: Arc::new(server_config),
+                ca_cert_pem,
+                client_cert_pem,
+                client_key_pem,
+            }
+        }
+
+        fn client_tls_config(&self) -> BridgeTlsClientConfig {
+            BridgeTlsClientConfig {
+                ca_cert_pem: self.ca_cert_pem.clone(),
+                client_cert_pem: self.client_cert_pem.clone(),
+                client_key_pem: self.client_key_pem.clone(),
+                server_name: "localhost".to_string(),
+            }
+        }
+
+        fn spawn_server<F>(&self, handler: F) -> std::net::SocketAddr
+        where
+            F: FnOnce(StreamOwned<ServerConnection, TcpStream>) + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_config = self.server_config.clone();
+            thread::spawn(move || {
+                let (tcp_stream, _) = listener.accept().unwrap();
+                tcp_stream.set_nodelay(true).unwrap();
+                tcp_stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                tcp_stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                let connection = ServerConnection::new(server_config).unwrap();
+                let mut stream = StreamOwned::new(connection, tcp_stream);
+                while stream.conn.is_handshaking() {
+                    stream.conn.complete_io(&mut stream.sock).unwrap();
+                }
+                handler(stream);
+            });
+            addr
+        }
+    }
+
+    impl Drop for TestTlsFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn test_connect_roundtrip_tcp_tls() {
+        let tls = TestTlsFixture::new();
+        let addr = tls.spawn_server(move |mut stream| {
             let payload = read_framed(&mut stream).unwrap();
             let request = decode_client_request(&payload).unwrap();
             match request {
@@ -573,19 +766,17 @@ mod tests {
             filters: vec![CanIdFilter::new(0x100, 0x200)],
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
+            tcp_tls: Some(tls.client_tls_config()),
         };
-        let client = GsUsbBridgeClient::connect(BridgeEndpoint::Tcp(addr), options).unwrap();
+        let client = GsUsbBridgeClient::connect(BridgeEndpoint::TcpTls(addr), options).unwrap();
         assert_eq!(client.session_id(), 42);
         assert_eq!(client.role_granted(), BridgeRole::WriterCandidate);
     }
 
     #[test]
     fn test_recv_event_handles_session_replaced() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+        let tls = TestTlsFixture::new();
+        let addr = tls.spawn_server(move |mut stream| {
             let _ = read_framed(&mut stream).unwrap();
             let hello_ack = ServerMessage::Response(ServerResponse::HelloAck {
                 request_id: 1,
@@ -605,8 +796,9 @@ mod tests {
             filters: vec![],
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
+            tcp_tls: Some(tls.client_tls_config()),
         };
-        let mut client = GsUsbBridgeClient::connect(BridgeEndpoint::Tcp(addr), options).unwrap();
+        let mut client = GsUsbBridgeClient::connect(BridgeEndpoint::TcpTls(addr), options).unwrap();
         let event = client.recv_event(Duration::from_secs(1)).unwrap();
         assert_eq!(event, BridgeEvent::SessionReplaced);
         assert!(matches!(
@@ -617,10 +809,8 @@ mod tests {
 
     #[test]
     fn test_wait_response_buffers_event() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+        let tls = TestTlsFixture::new();
+        let addr = tls.spawn_server(move |mut stream| {
             let _ = read_framed(&mut stream).unwrap();
             let hello_ack = ServerMessage::Response(ServerResponse::HelloAck {
                 request_id: 1,
@@ -649,8 +839,9 @@ mod tests {
             filters: vec![],
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
+            tcp_tls: Some(tls.client_tls_config()),
         };
-        let mut client = GsUsbBridgeClient::connect(BridgeEndpoint::Tcp(addr), options).unwrap();
+        let mut client = GsUsbBridgeClient::connect(BridgeEndpoint::TcpTls(addr), options).unwrap();
         client.ping().unwrap();
         let event = client.recv_event(Duration::from_secs(1)).unwrap();
         assert!(matches!(event, BridgeEvent::ReceiveFrame(_)));

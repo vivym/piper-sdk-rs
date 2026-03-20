@@ -23,6 +23,11 @@ spin_sleep = { workspace = true }
 crossbeam-channel = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, optional = true }
+hex = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 serial_test = { workspace = true }

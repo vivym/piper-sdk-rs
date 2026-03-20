@@ -1,15 +1,15 @@
 [package]
-name = "gs_usb_daemon"
+name = "piper_bridge_host"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Background daemon for GS-USB CAN adapter management"
+description = "Controller-owned non-realtime bridge host for Piper"
 publish = false
 
 [[bin]]
-name = "gs_usb_daemon"
+name = "piper_bridge_host"
 path = "src/main.rs"
 
 [dependencies]

@@ -153,26 +153,32 @@ pub trait CanAdapter {
 **支持的适配器 / 客户端**：
 - `SocketCanAdapter`：Linux SocketCAN 接口
 - `GsUsbCanAdapter`：GS-USB 设备（跨平台）
-- `GsUsbBridgeClient`：GS-USB 守护进程 bridge/debug 客户端（非实时）
+- `BridgeClient`：controller-owned bridge/debug 客户端（非实时）
 
-`GsUsbBridgeClient` 使用 UDS/TCP stream 协议，只用于 bridge/debug/replay，
+`BridgeClient` 使用 UDS/TCP-TLS stream 协议，只用于 bridge/debug/replay，
 不参与 realtime driver，也不能进入 MIT / 双臂 / fault-stop 主控制链。
 bridge 会话在 `Hello` 握手阶段通过 `SessionToken([u8; 16])` 建立；steady-state
 阶段不再靠 peer 地址或 caller-supplied `client_id` 补丁式鉴权。
 
-默认角色是只读 observer。若需要写 CAN，必须显式获取独占 `WriterLease`：
+默认角色是只读 observer。若需要写 CAN，必须显式获取独占 `MaintenanceLease`：
 
 ```rust
 use piper_can::{
-    BridgeClientOptions, BridgeEndpoint, BridgeRole, GsUsbBridgeClient,
+    BridgeClient, BridgeClientOptions, BridgeEndpoint, BridgeRole, BridgeTlsClientConfig,
 };
 
 let options = BridgeClientOptions {
     role_request: BridgeRole::WriterCandidate,
+    tcp_tls: Some(BridgeTlsClientConfig {
+        ca_cert_pem: "/path/to/ca.pem".into(),
+        client_cert_pem: "/path/to/client.pem".into(),
+        client_key_pem: "/path/to/client-key.pem".into(),
+        server_name: "localhost".to_string(),
+    }),
     ..Default::default()
 };
-let mut client = GsUsbBridgeClient::connect(
-    BridgeEndpoint::Tcp("127.0.0.1:18888".parse()?),
+let mut client = BridgeClient::connect(
+    BridgeEndpoint::TcpTls("127.0.0.1:18888".parse()?),
     options,
 )?;
 let mut lease = client.acquire_writer_lease(std::time::Duration::from_millis(500))?;

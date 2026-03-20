@@ -1,4 +1,4 @@
-//! GS-USB bridge v2 延迟基准测试。
+//! Controller-owned bridge 延迟基准测试。
 //!
 //! 该程序评估非实时 bridge/debug 链路的 host-side 开销：
 //! - `get_status()` request/response 延迟
@@ -6,9 +6,9 @@
 //! - `ReceiveFrame/Gap` 事件等待延迟
 
 use clap::Parser;
-use piper_can::{
-    BridgeClientOptions, BridgeEndpoint, BridgeEvent, BridgeRole, GsUsbBridgeClient, PiperFrame,
-    SessionToken,
+use piper_sdk::{
+    BridgeClientOptions, BridgeEndpoint, BridgeEvent, BridgeRole, BridgeTlsClientConfig,
+    PiperBridgeClient, PiperFrame, SessionToken,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(name = "daemon_latency_bench")]
-#[command(about = "Benchmark the non-realtime GS-USB bridge v2")]
+#[command(name = "bridge_latency_bench")]
+#[command(about = "Benchmark the non-realtime controller-owned Piper bridge")]
 struct Args {
     /// Bridge endpoint.
     #[arg(long)]
@@ -39,6 +39,22 @@ struct Args {
     /// Per-request timeout in milliseconds.
     #[arg(long, default_value = "100")]
     timeout_ms: u64,
+
+    /// TLS CA certificate PEM path for TCP/TLS endpoints.
+    #[arg(long)]
+    tls_ca: Option<String>,
+
+    /// TLS client certificate PEM path for TCP/TLS endpoints.
+    #[arg(long)]
+    tls_client_cert: Option<String>,
+
+    /// TLS client private key PEM path for TCP/TLS endpoints.
+    #[arg(long)]
+    tls_client_key: Option<String>,
+
+    /// TLS server name used for certificate verification on TCP/TLS endpoints.
+    #[arg(long)]
+    tls_server_name: Option<String>,
 }
 
 struct LatencyStats {
@@ -89,7 +105,7 @@ impl LatencyStats {
 fn default_endpoint() -> String {
     #[cfg(unix)]
     {
-        "/tmp/gs_usb_daemon.sock".to_string()
+        "/tmp/piper_bridge.sock".to_string()
     }
     #[cfg(not(unix))]
     {
@@ -110,8 +126,36 @@ fn parse_endpoint(raw: &str) -> Result<BridgeEndpoint, String> {
         }
     } else {
         raw.parse()
-            .map(BridgeEndpoint::Tcp)
-            .map_err(|err| format!("invalid TCP endpoint: {err}"))
+            .map(BridgeEndpoint::TcpTls)
+            .map_err(|err| format!("invalid TCP/TLS endpoint: {err}"))
+    }
+}
+
+fn maybe_tls_config(
+    endpoint: &BridgeEndpoint,
+    args: &Args,
+) -> Result<Option<BridgeTlsClientConfig>, Box<dyn std::error::Error>> {
+    match endpoint {
+        BridgeEndpoint::Unix(_) => Ok(None),
+        BridgeEndpoint::TcpTls(_) => Ok(Some(BridgeTlsClientConfig {
+            ca_cert_pem: PathBuf::from(
+                args.tls_ca.clone().ok_or("--tls-ca is required for TCP/TLS bridge endpoints")?,
+            ),
+            client_cert_pem: PathBuf::from(
+                args.tls_client_cert
+                    .clone()
+                    .ok_or("--tls-client-cert is required for TCP/TLS bridge endpoints")?,
+            ),
+            client_key_pem: PathBuf::from(
+                args.tls_client_key
+                    .clone()
+                    .ok_or("--tls-client-key is required for TCP/TLS bridge endpoints")?,
+            ),
+            server_name: args
+                .tls_server_name
+                .clone()
+                .ok_or("--tls-server-name is required for TCP/TLS bridge endpoints")?,
+        })),
     }
 }
 
@@ -125,8 +169,9 @@ fn token_cache_dir() -> PathBuf {
     }
 }
 
-fn stable_session_token(endpoint: &str) -> Result<SessionToken, std::io::Error> {
+fn stable_session_token(endpoint: &str, tool_name: &str) -> Result<SessionToken, std::io::Error> {
     let mut hasher = DefaultHasher::new();
+    tool_name.hash(&mut hasher);
     endpoint.hash(&mut hasher);
     let key = format!("{:016x}", hasher.finish());
     let dir = token_cache_dir();
@@ -147,21 +192,21 @@ fn stable_session_token(endpoint: &str) -> Result<SessionToken, std::io::Error> 
 }
 
 fn connect_client(
-    endpoint: &str,
+    endpoint_raw: &str,
+    args: &Args,
     role: BridgeRole,
     timeout: Duration,
-) -> Result<GsUsbBridgeClient, Box<dyn std::error::Error>> {
+) -> Result<PiperBridgeClient, Box<dyn std::error::Error>> {
+    let endpoint = parse_endpoint(endpoint_raw)?;
     let options = BridgeClientOptions {
-        session_token: stable_session_token(endpoint)?,
+        session_token: stable_session_token(endpoint_raw, "bridge_latency_bench")?,
         role_request: role,
         filters: Vec::new(),
         connect_timeout: Duration::from_secs(5),
         request_timeout: timeout,
+        tcp_tls: maybe_tls_config(&endpoint, args)?,
     };
-    Ok(GsUsbBridgeClient::connect(
-        parse_endpoint(endpoint)?,
-        options,
-    )?)
+    Ok(PiperBridgeClient::connect(endpoint, options)?)
 }
 
 fn print_stats(label: &str, stats: &mut LatencyStats) {
@@ -183,10 +228,11 @@ fn print_stats(label: &str, stats: &mut LatencyStats) {
 
 fn run_status_bench(
     endpoint: &str,
+    args: &Args,
     count: u32,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = connect_client(endpoint, BridgeRole::Observer, timeout)?;
+    let mut client = connect_client(endpoint, args, BridgeRole::Observer, timeout)?;
     let mut stats = LatencyStats::new();
     for _ in 0..count {
         let start = Instant::now();
@@ -199,11 +245,12 @@ fn run_status_bench(
 
 fn run_send_bench(
     endpoint: &str,
+    args: &Args,
     count: u32,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = connect_client(endpoint, BridgeRole::WriterCandidate, timeout)?;
-    let mut lease = client.acquire_writer_lease(Duration::from_millis(500))?;
+    let mut client = connect_client(endpoint, args, BridgeRole::WriterCandidate, timeout)?;
+    let mut lease = client.acquire_maintenance_lease(Duration::from_millis(500))?;
     let mut stats = LatencyStats::new();
     for index in 0..count {
         let frame = PiperFrame::new_standard(
@@ -221,10 +268,11 @@ fn run_send_bench(
 
 fn run_receive_bench(
     endpoint: &str,
+    args: &Args,
     receive_count: u32,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = connect_client(endpoint, BridgeRole::Observer, timeout)?;
+    let mut client = connect_client(endpoint, args, BridgeRole::Observer, timeout)?;
     let mut stats = LatencyStats::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     while stats.samples.len() < receive_count as usize && Instant::now() < deadline {
@@ -237,7 +285,7 @@ fn run_receive_bench(
                 println!("receive benchmark interrupted: session replaced");
                 break;
             },
-            Ok(BridgeEvent::LeaseRevoked) => {},
+            Ok(BridgeEvent::MaintenanceLeaseRevoked) => {},
             Err(err) => {
                 println!("receive benchmark stopped: {}", err);
                 break;
@@ -250,21 +298,21 @@ fn run_receive_bench(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let endpoint = args.endpoint.unwrap_or_else(default_endpoint);
+    let endpoint = args.endpoint.clone().unwrap_or_else(default_endpoint);
     let timeout = Duration::from_millis(args.timeout_ms);
 
-    println!("GS-USB bridge v2 latency benchmark");
+    println!("Piper bridge latency benchmark");
     println!("endpoint: {}", endpoint);
     println!("non-realtime bridge/debug path only");
 
     match args.mode.as_str() {
-        "status" => run_status_bench(&endpoint, args.count, timeout)?,
-        "send" => run_send_bench(&endpoint, args.count, timeout)?,
-        "receive" => run_receive_bench(&endpoint, args.receive_count, timeout)?,
+        "status" => run_status_bench(&endpoint, &args, args.count, timeout)?,
+        "send" => run_send_bench(&endpoint, &args, args.count, timeout)?,
+        "receive" => run_receive_bench(&endpoint, &args, args.receive_count, timeout)?,
         "all" => {
-            run_status_bench(&endpoint, args.count, timeout)?;
-            run_send_bench(&endpoint, args.count, timeout)?;
-            run_receive_bench(&endpoint, args.receive_count, timeout)?;
+            run_status_bench(&endpoint, &args, args.count, timeout)?;
+            run_send_bench(&endpoint, &args, args.count, timeout)?;
+            run_receive_bench(&endpoint, &args, args.receive_count, timeout)?;
         },
         other => return Err(format!("unsupported mode: {}", other).into()),
     }

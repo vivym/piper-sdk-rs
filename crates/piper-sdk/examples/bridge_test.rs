@@ -1,12 +1,12 @@
-//! GS-USB bridge v2 调试示例。
+//! Controller-owned bridge 调试示例。
 //!
-//! 该示例通过 UDS/TCP stream 连接 `gs_usb_daemon`，用于 bridge/debug/replay。
+//! 该示例通过 UDS/TCP-TLS stream 连接 `piper_bridge_host`，用于 bridge/debug/replay。
 //! 它不是 MIT / 双臂 / fault-stop 的实时控制路径。
 
 use clap::Parser;
-use piper_can::{
-    BridgeClientOptions, BridgeEndpoint, BridgeEvent, BridgeRole, GsUsbBridgeClient, PiperFrame,
-    SessionToken,
+use piper_sdk::{
+    BridgeClientOptions, BridgeEndpoint, BridgeEvent, BridgeRole, BridgeTlsClientConfig,
+    PiperBridgeClient, PiperFrame, SessionToken,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -16,12 +16,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(name = "gs_usb_bridge_test")]
-#[command(about = "测试 GS-USB bridge v2 (UDS/TCP stream)")]
+#[command(name = "bridge_test")]
+#[command(about = "测试 controller-owned Piper bridge (UDS/TCP-TLS stream)")]
 struct Args {
     /// Bridge endpoint.
     ///
-    /// Unix: /tmp/gs_usb_daemon.sock
+    /// Unix: /tmp/piper_bridge.sock
     /// TCP: 127.0.0.1:18888
     #[arg(long)]
     endpoint: Option<String>,
@@ -41,12 +41,28 @@ struct Args {
     /// Bridge request timeout in milliseconds.
     #[arg(long, default_value = "100")]
     timeout_ms: u64,
+
+    /// TLS CA certificate PEM path for TCP/TLS endpoints.
+    #[arg(long)]
+    tls_ca: Option<String>,
+
+    /// TLS client certificate PEM path for TCP/TLS endpoints.
+    #[arg(long)]
+    tls_client_cert: Option<String>,
+
+    /// TLS client private key PEM path for TCP/TLS endpoints.
+    #[arg(long)]
+    tls_client_key: Option<String>,
+
+    /// TLS server name used for certificate verification on TCP/TLS endpoints.
+    #[arg(long)]
+    tls_server_name: Option<String>,
 }
 
 fn default_endpoint() -> String {
     #[cfg(unix)]
     {
-        "/tmp/gs_usb_daemon.sock".to_string()
+        "/tmp/piper_bridge.sock".to_string()
     }
     #[cfg(not(unix))]
     {
@@ -67,8 +83,36 @@ fn parse_endpoint(raw: &str) -> Result<BridgeEndpoint, String> {
         }
     } else {
         raw.parse()
-            .map(BridgeEndpoint::Tcp)
-            .map_err(|err| format!("invalid TCP endpoint: {err}"))
+            .map(BridgeEndpoint::TcpTls)
+            .map_err(|err| format!("invalid TCP/TLS endpoint: {err}"))
+    }
+}
+
+fn maybe_tls_config(
+    endpoint: &BridgeEndpoint,
+    args: &Args,
+) -> Result<Option<BridgeTlsClientConfig>, Box<dyn std::error::Error>> {
+    match endpoint {
+        BridgeEndpoint::Unix(_) => Ok(None),
+        BridgeEndpoint::TcpTls(_) => Ok(Some(BridgeTlsClientConfig {
+            ca_cert_pem: PathBuf::from(
+                args.tls_ca.clone().ok_or("--tls-ca is required for TCP/TLS bridge endpoints")?,
+            ),
+            client_cert_pem: PathBuf::from(
+                args.tls_client_cert
+                    .clone()
+                    .ok_or("--tls-client-cert is required for TCP/TLS bridge endpoints")?,
+            ),
+            client_key_pem: PathBuf::from(
+                args.tls_client_key
+                    .clone()
+                    .ok_or("--tls-client-key is required for TCP/TLS bridge endpoints")?,
+            ),
+            server_name: args
+                .tls_server_name
+                .clone()
+                .ok_or("--tls-server-name is required for TCP/TLS bridge endpoints")?,
+        })),
     }
 }
 
@@ -82,8 +126,9 @@ fn token_cache_dir() -> PathBuf {
     }
 }
 
-fn stable_session_token(endpoint: &str) -> Result<SessionToken, io::Error> {
+fn stable_session_token(endpoint: &str, tool_name: &str) -> Result<SessionToken, io::Error> {
     let mut hasher = DefaultHasher::new();
+    tool_name.hash(&mut hasher);
     endpoint.hash(&mut hasher);
     let key = format!("{:016x}", hasher.finish());
 
@@ -106,25 +151,25 @@ fn stable_session_token(endpoint: &str) -> Result<SessionToken, io::Error> {
 }
 
 fn connect_client(
-    endpoint: &str,
+    endpoint_raw: &str,
+    args: &Args,
     role: BridgeRole,
     timeout: Duration,
-) -> Result<GsUsbBridgeClient, Box<dyn std::error::Error>> {
-    let token = stable_session_token(endpoint)?;
+) -> Result<PiperBridgeClient, Box<dyn std::error::Error>> {
+    let endpoint = parse_endpoint(endpoint_raw)?;
+    let token = stable_session_token(endpoint_raw, "bridge_test")?;
     let options = BridgeClientOptions {
         session_token: token,
         role_request: role,
         filters: Vec::new(),
         connect_timeout: Duration::from_secs(5),
         request_timeout: timeout,
+        tcp_tls: maybe_tls_config(&endpoint, args)?,
     };
-    Ok(GsUsbBridgeClient::connect(
-        parse_endpoint(endpoint)?,
-        options,
-    )?)
+    Ok(PiperBridgeClient::connect(endpoint, options)?)
 }
 
-fn print_status(client: &mut GsUsbBridgeClient) -> Result<(), Box<dyn std::error::Error>> {
+fn print_status(client: &mut PiperBridgeClient) -> Result<(), Box<dyn std::error::Error>> {
     let status = client.get_status()?;
     println!("session_id={}", client.session_id());
     println!("role={:?}", client.role_granted());
@@ -143,11 +188,11 @@ fn print_status(client: &mut GsUsbBridgeClient) -> Result<(), Box<dyn std::error
 }
 
 fn run_send(
-    client: &mut GsUsbBridgeClient,
+    client: &mut PiperBridgeClient,
     count: u32,
     interval: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut lease = client.acquire_writer_lease(Duration::from_millis(500))?;
+    let mut lease = client.acquire_maintenance_lease(Duration::from_millis(500))?;
     for index in 0..count {
         let frame = PiperFrame::new_standard(
             0x120 + (index as u16 % 0x10),
@@ -178,7 +223,7 @@ fn run_send(
 }
 
 fn run_receive(
-    client: &mut GsUsbBridgeClient,
+    client: &mut PiperBridgeClient,
     count: u32,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -201,8 +246,8 @@ fn run_receive(
                 println!("session replaced by a newer connection");
                 break;
             },
-            BridgeEvent::LeaseRevoked => {
-                println!("writer lease revoked");
+            BridgeEvent::MaintenanceLeaseRevoked => {
+                println!("maintenance lease revoked");
             },
         }
     }
@@ -210,7 +255,7 @@ fn run_receive(
 }
 
 fn run_interactive(
-    client: &mut GsUsbBridgeClient,
+    client: &mut PiperBridgeClient,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Commands: status | send <id-hex> <b0> [b1..b7] | recv | quit");
@@ -250,7 +295,7 @@ fn run_interactive(
                     is_extended: false,
                     timestamp_us: 0,
                 };
-                let mut lease = client.acquire_writer_lease(Duration::from_millis(500))?;
+                let mut lease = client.acquire_maintenance_lease(Duration::from_millis(500))?;
                 lease.send_frame(frame)?;
                 lease.release()?;
                 println!("sent frame id=0x{:03X}", id);
@@ -264,10 +309,10 @@ fn run_interactive(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let endpoint = args.endpoint.unwrap_or_else(default_endpoint);
+    let endpoint = args.endpoint.clone().unwrap_or_else(default_endpoint);
     let timeout = Duration::from_millis(args.timeout_ms);
 
-    println!("GS-USB bridge v2 test client");
+    println!("Piper bridge test client");
     println!("endpoint: {}", endpoint);
     println!("non-realtime bridge/debug path only");
 
@@ -276,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         BridgeRole::Observer
     };
-    let mut client = connect_client(&endpoint, role, timeout)?;
+    let mut client = connect_client(&endpoint, &args, role, timeout)?;
 
     match args.mode.as_str() {
         "status" => print_status(&mut client)?,

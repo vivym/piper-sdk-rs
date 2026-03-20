@@ -225,7 +225,10 @@ pub enum ServerMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
-    Io(String),
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
     TooShort,
     FrameTooLarge(usize),
     InvalidTag(u8),
@@ -236,7 +239,7 @@ pub enum ProtocolError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(message) => write!(f, "io error: {message}"),
+            Self::Io { message, .. } => write!(f, "io error: {message}"),
             Self::TooShort => write!(f, "message too short"),
             Self::FrameTooLarge(size) => write!(f, "frame too large: {size}"),
             Self::InvalidTag(tag) => write!(f, "invalid tag: {tag:#x}"),
@@ -250,7 +253,10 @@ impl std::error::Error for ProtocolError {}
 
 impl From<io::Error> for ProtocolError {
     fn from(value: io::Error) -> Self {
-        Self::Io(value.to_string())
+        Self::Io {
+            kind: value.kind(),
+            message: value.to_string(),
+        }
     }
 }
 
