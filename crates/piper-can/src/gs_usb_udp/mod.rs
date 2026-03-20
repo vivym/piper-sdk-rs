@@ -33,9 +33,15 @@ pub struct GsUsbUdpAdapter {
 }
 
 const DEFAULT_BRIDGE_TIMEOUT: Duration = Duration::from_millis(100);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RECEIVE_STEP_TIMEOUT: Duration = Duration::from_millis(50);
 
-fn socket_poll_timeout(bridge_timeout: Duration) -> Duration {
+fn ack_poll_timeout(bridge_timeout: Duration) -> Duration {
     bridge_timeout.min(Duration::from_millis(2)).max(Duration::from_millis(1))
+}
+
+fn receive_step_timeout(remaining: Duration) -> Duration {
+    remaining.min(MAX_RECEIVE_STEP_TIMEOUT)
 }
 
 /// daemon 会话的共享状态。
@@ -44,7 +50,7 @@ struct DaemonSession {
     daemon_addr: DaemonAddr,
     socket: Arc<Socket>,
     bridge_timeout: Duration,
-    socket_poll_timeout: Duration,
+    ack_poll_timeout: Duration,
     seq_counter: AtomicU32,
     heartbeat_stop: Arc<AtomicBool>,
     heartbeat_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -69,14 +75,14 @@ enum Socket {
 }
 
 impl Socket {
-    fn send_to_daemon(&self, data: &[u8], daemon_addr: &DaemonAddr) -> Result<(), CanError> {
+    fn connect_peer(&self, daemon_addr: &DaemonAddr) -> Result<(), CanError> {
         match (self, daemon_addr) {
             #[cfg(unix)]
             (Socket::Unix(socket), DaemonAddr::Unix(path)) => {
-                socket.send_to(data, path).map_err(CanError::Io)?;
+                socket.connect(path).map_err(CanError::Io)?;
             },
             (Socket::Udp(socket), DaemonAddr::Udp(addr)) => {
-                socket.send_to(data, *addr).map_err(CanError::Io)?;
+                socket.connect(*addr).map_err(CanError::Io)?;
             },
             #[cfg(unix)]
             _ => {
@@ -87,7 +93,21 @@ impl Socket {
         Ok(())
     }
 
-    fn recv_from_daemon(&self, buf: &mut [u8]) -> Result<usize, CanError> {
+    fn send_to_peer(&self, data: &[u8]) -> Result<(), CanError> {
+        match self {
+            #[cfg(unix)]
+            Socket::Unix(socket) => {
+                socket.send(data).map_err(CanError::Io)?;
+            },
+            Socket::Udp(socket) => {
+                socket.send(data).map_err(CanError::Io)?;
+            },
+        }
+
+        Ok(())
+    }
+
+    fn recv_from_peer(&self, buf: &mut [u8]) -> Result<usize, CanError> {
         match self {
             #[cfg(unix)]
             Socket::Unix(socket) => socket.recv(buf).map_err(|err| {
@@ -142,7 +162,7 @@ impl DaemonSession {
             daemon_addr,
             socket,
             bridge_timeout,
-            socket_poll_timeout: socket_poll_timeout(bridge_timeout),
+            ack_poll_timeout: ack_poll_timeout(bridge_timeout),
             seq_counter: AtomicU32::new(0),
             heartbeat_stop: Arc::new(AtomicBool::new(false)),
             heartbeat_handle: Mutex::new(None),
@@ -156,12 +176,16 @@ impl DaemonSession {
         self.connected.load(Ordering::Acquire)
     }
 
-    fn send_to_daemon(&self, data: &[u8]) -> Result<(), CanError> {
-        self.socket.send_to_daemon(data, &self.daemon_addr)
+    fn connect_peer(&self) -> Result<(), CanError> {
+        self.socket.connect_peer(&self.daemon_addr)
     }
 
-    fn recv_from_daemon(&self, buf: &mut [u8]) -> Result<usize, CanError> {
-        self.socket.recv_from_daemon(buf)
+    fn send_to_peer(&self, data: &[u8]) -> Result<(), CanError> {
+        self.socket.send_to_peer(data)
+    }
+
+    fn recv_from_peer(&self, buf: &mut [u8]) -> Result<usize, CanError> {
+        self.socket.recv_from_peer(buf)
     }
 
     fn mark_transport_lost_local(&self) {
@@ -174,7 +198,6 @@ impl DaemonSession {
         self.heartbeat_stop.store(false, Ordering::Release);
 
         let client_id = self.client_id.load(Ordering::Acquire);
-        let daemon_addr = self.daemon_addr.clone();
         let bridge_timeout = self.bridge_timeout;
         let socket = Arc::clone(&self.socket);
         let stop_flag = Arc::clone(&self.heartbeat_stop);
@@ -196,7 +219,7 @@ impl DaemonSession {
                     }
 
                     let encoded = protocol::encode_heartbeat(client_id, 0, &mut buf);
-                    match socket.send_to_daemon(encoded, &daemon_addr) {
+                    match socket.send_to_peer(encoded) {
                         Ok(()) => {},
                         Err(_) => {
                             stop_flag.store(true, Ordering::Release);
@@ -244,9 +267,10 @@ impl DaemonSession {
         }
 
         let mut buf = [0u8; 12];
+        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed);
         let encoded =
-            protocol::encode_disconnect(self.client_id.load(Ordering::Acquire), 0, &mut buf);
-        self.send_to_daemon(encoded)
+            protocol::encode_disconnect(self.client_id.load(Ordering::Acquire), seq, &mut buf);
+        self.send_to_peer(encoded)
     }
 }
 
@@ -295,6 +319,27 @@ fn mark_session_lost(session: &DaemonSession, rx_buffer: &mut VecDeque<PiperFram
     session.mark_transport_lost_local();
 }
 
+fn recv_with_timeout(
+    session: &DaemonSession,
+    timeout: Duration,
+    buf: &mut [u8],
+) -> Result<usize, CanError> {
+    session.socket.set_read_timeout(Some(timeout))?;
+    session.recv_from_peer(buf)
+}
+
+fn drain_pending_peer_messages(session: &DaemonSession) -> Result<(), CanError> {
+    let mut buf = [0u8; 1024];
+
+    loop {
+        match recv_with_timeout(session, session.ack_poll_timeout, &mut buf) {
+            Ok(_) => continue,
+            Err(CanError::Timeout) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn send_frame_and_wait_ack(
     session: &DaemonSession,
     frame: PiperFrame,
@@ -309,7 +354,7 @@ fn send_frame_and_wait_ack(
     let encoded = protocol::encode_send_frame_with_seq(&frame, seq, &mut buf)
         .map_err(|err| CanError::Device(format!("Failed to encode send frame: {err:?}").into()))?;
 
-    if let Err(error) = session.send_to_daemon(encoded) {
+    if let Err(error) = session.send_to_peer(encoded) {
         mark_session_lost(session, rx_buffer);
         return Err(error);
     }
@@ -323,11 +368,21 @@ fn send_frame_and_wait_ack(
             return Err(CanError::Timeout);
         }
 
-        let len = match session.recv_from_daemon(&mut response_buf) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            mark_session_lost(session, rx_buffer);
+            return Err(CanError::Timeout);
+        }
+
+        let len = match recv_with_timeout(
+            session,
+            remaining.min(session.ack_poll_timeout),
+            &mut response_buf,
+        ) {
             Ok(len) => len,
             Err(CanError::Timeout) => continue,
             Err(error) => {
-                tracing::warn!("[GsUsbUdpAdapter] recv_from_daemon error: {:?}", error);
+                tracing::warn!("[GsUsbUdpAdapter] recv_from_peer error: {:?}", error);
                 mark_session_lost(session, rx_buffer);
                 return Err(error);
             },
@@ -408,11 +463,16 @@ fn receive_frame(
             return rx_buffer.pop_front().ok_or(CanError::Timeout);
         }
 
-        let len = match session.recv_from_daemon(&mut buf) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return rx_buffer.pop_front().ok_or(CanError::Timeout);
+        }
+
+        let len = match recv_with_timeout(session, receive_step_timeout(remaining), &mut buf) {
             Ok(len) => len,
             Err(CanError::Timeout) => continue,
             Err(error) => {
-                tracing::warn!("[GsUsbUdpAdapter] recv_from_daemon error: {:?}", error);
+                tracing::warn!("[GsUsbUdpAdapter] recv_from_peer error: {:?}", error);
                 mark_session_lost(session, rx_buffer);
                 return Err(error);
             },
@@ -441,7 +501,17 @@ fn receive_frame(
                 mark_session_lost(session, rx_buffer);
                 return Err(error);
             },
-            Message::ConnectAck { .. } | Message::Heartbeat { .. } => {},
+            unexpected @ (Message::ConnectAck { .. }
+            | Message::DisconnectAck { .. }
+            | Message::StatusResponse { .. }) => {
+                let error = protocol_error(format!(
+                    "Unexpected control-plane response in receive path: {:?}",
+                    unexpected
+                ));
+                mark_session_lost(session, rx_buffer);
+                return Err(error);
+            },
+            Message::Heartbeat { .. } => {},
             _ => {},
         }
         if let Some(frame) = rx_buffer.pop_front() {
@@ -451,6 +521,126 @@ fn receive_frame(
 }
 
 impl GsUsbUdpAdapter {
+    fn connect_with_timeout(
+        &mut self,
+        filters: Vec<CanIdFilter>,
+        timeout: Duration,
+    ) -> Result<(), CanError> {
+        self.session.stop_heartbeat_join();
+        self.session.connected.store(false, Ordering::Release);
+        self.rx_buffer.clear();
+
+        if let Err(error) = self.session.connect_peer() {
+            mark_session_lost(&self.session, &mut self.rx_buffer);
+            return Err(error);
+        }
+        if let Err(error) = drain_pending_peer_messages(&self.session) {
+            mark_session_lost(&self.session, &mut self.rx_buffer);
+            return Err(error);
+        }
+
+        let seq = self.session.seq_counter.fetch_add(1, Ordering::Relaxed);
+        let mut buf = [0u8; 256];
+        let encoded = protocol::encode_connect(0, &filters, seq, &mut buf)
+            .map_err(|err| CanError::Device(format!("Failed to encode connect: {err:?}").into()))?;
+        if let Err(error) = self.session.send_to_peer(encoded) {
+            mark_session_lost(&self.session, &mut self.rx_buffer);
+            return Err(error);
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut ack_buf = [0u8; 1024];
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                mark_session_lost(&self.session, &mut self.rx_buffer);
+                return Err(CanError::Device("Connection timeout".into()));
+            }
+
+            match recv_with_timeout(
+                &self.session,
+                remaining.min(self.session.ack_poll_timeout),
+                &mut ack_buf,
+            ) {
+                Ok(len) => {
+                    let msg = match protocol::decode_message(&ack_buf[..len]) {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            let error = protocol_error(format!(
+                                "Failed to decode connect response: {err:?}"
+                            ));
+                            mark_session_lost(&self.session, &mut self.rx_buffer);
+                            return Err(error);
+                        },
+                    };
+
+                    match msg {
+                        Message::ConnectAck {
+                            client_id,
+                            status,
+                            seq: ack_seq,
+                        } => {
+                            if ack_seq != seq {
+                                let error = protocol_error(format!(
+                                    "Unexpected ConnectAck seq {ack_seq}, expected {seq}"
+                                ));
+                                mark_session_lost(&self.session, &mut self.rx_buffer);
+                                return Err(error);
+                            }
+                            if status != 0 {
+                                let error = CanError::Device(
+                                    format!("Connect failed with status: {}", status).into(),
+                                );
+                                mark_session_lost(&self.session, &mut self.rx_buffer);
+                                return Err(error);
+                            }
+
+                            self.session.client_id.store(client_id, Ordering::Release);
+                            self.session.connected.store(true, Ordering::Release);
+                            if let Err(error) = self.session.start_heartbeat() {
+                                mark_session_lost(&self.session, &mut self.rx_buffer);
+                                return Err(error);
+                            }
+                            return Ok(());
+                        },
+                        Message::Error {
+                            seq: error_seq,
+                            code,
+                            message,
+                        } => {
+                            let error = if error_seq == seq {
+                                CanError::Device(
+                                    format!("Connect error {:?}: {}", code, message).into(),
+                                )
+                            } else {
+                                protocol_error(format!(
+                                    "Unexpected Error seq {error_seq}, expected {seq}: {:?}: {}",
+                                    code, message
+                                ))
+                            };
+                            mark_session_lost(&self.session, &mut self.rx_buffer);
+                            return Err(error);
+                        },
+                        unexpected => {
+                            let error = protocol_error(format!(
+                                "Unexpected daemon message while waiting for connect ack: {:?}",
+                                unexpected
+                            ));
+                            mark_session_lost(&self.session, &mut self.rx_buffer);
+                            return Err(error);
+                        },
+                    }
+                },
+                Err(CanError::Timeout) => continue,
+                Err(error) => {
+                    mark_session_lost(&self.session, &mut self.rx_buffer);
+                    return Err(error);
+                },
+            }
+        }
+    }
+
     /// 创建新的适配器（UDS）
     #[cfg(unix)]
     pub fn new_uds(uds_path: impl AsRef<str>) -> Result<Self, CanError> {
@@ -473,7 +663,6 @@ impl GsUsbUdpAdapter {
         let socket = Arc::new(Socket::Unix(
             UnixDatagram::bind(&client_socket_path).map_err(CanError::Io)?,
         ));
-        socket.set_read_timeout(Some(socket_poll_timeout(bridge_timeout)))?;
         socket.set_write_timeout(Some(bridge_timeout))?;
 
         let session = Arc::new(DaemonSession::new(
@@ -509,7 +698,6 @@ impl GsUsbUdpAdapter {
         let socket = Arc::new(Socket::Udp(
             UdpSocket::bind("0.0.0.0:0").map_err(CanError::Io)?,
         ));
-        socket.set_read_timeout(Some(socket_poll_timeout(bridge_timeout)))?;
         socket.set_write_timeout(Some(bridge_timeout))?;
 
         let session = Arc::new(DaemonSession::new(
@@ -532,62 +720,7 @@ impl GsUsbUdpAdapter {
         if self.session.is_connected() {
             let _ = self.session.disconnect();
         }
-
-        self.rx_buffer.clear();
-
-        let mut buf = [0u8; 256];
-        let encoded = protocol::encode_connect(0, &filters, 0, &mut buf)
-            .map_err(|err| CanError::Device(format!("Failed to encode connect: {err:?}").into()))?;
-
-        self.session.send_to_daemon(encoded)?;
-
-        let mut ack_buf = [0u8; 1024];
-        let start_time = std::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-        let poll_interval = self.session.socket_poll_timeout;
-
-        loop {
-            if start_time.elapsed() > timeout {
-                return Err(CanError::Device("Connection timeout".into()));
-            }
-
-            match self.session.recv_from_daemon(&mut ack_buf) {
-                Ok(len) => {
-                    let Ok(msg) = protocol::decode_message(&ack_buf[..len]) else {
-                        continue;
-                    };
-
-                    match msg {
-                        Message::ConnectAck { client_id, status } => {
-                            if status != 0 {
-                                return Err(CanError::Device(
-                                    format!("Connect failed with status: {}", status).into(),
-                                ));
-                            }
-
-                            self.session.client_id.store(client_id, Ordering::Release);
-                            self.session.connected.store(true, Ordering::Release);
-                            self.session.start_heartbeat()?;
-                            return Ok(());
-                        },
-                        Message::Error {
-                            seq: _,
-                            code,
-                            message,
-                        } => {
-                            return Err(CanError::Device(
-                                format!("Connect error {:?}: {}", code, message).into(),
-                            ));
-                        },
-                        _ => continue,
-                    }
-                },
-                Err(CanError::Timeout) => {
-                    thread::sleep(poll_interval);
-                },
-                Err(error) => return Err(error),
-            }
-        }
+        self.connect_with_timeout(filters, DEFAULT_CONNECT_TIMEOUT)
     }
 
     /// 断开连接
@@ -669,6 +802,14 @@ mod tests {
                 None
             },
             Err(err) => panic!("unexpected {transport} socket error: {err}"),
+        }
+    }
+
+    fn udp_local_addr(adapter: &GsUsbUdpAdapter) -> SocketAddr {
+        match &*adapter.session.socket {
+            Socket::Udp(socket) => socket.local_addr().unwrap(),
+            #[cfg(unix)]
+            Socket::Unix(_) => panic!("expected udp socket"),
         }
     }
 
@@ -858,10 +999,10 @@ mod tests {
             while let Ok((len, addr)) = server.recv_from(&mut buf) {
                 let msg = protocol::decode_message(&buf[..len]).unwrap();
                 match msg {
-                    Message::Connect { .. } => {
+                    Message::Connect { seq, .. } => {
                         client_addr = Some(addr);
                         let mut ack_buf = [0u8; 13];
-                        let encoded = protocol::encode_connect_ack(42, 0, 0, &mut ack_buf);
+                        let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
                         server.send_to(encoded, addr).unwrap();
                         ready_tx.send(()).unwrap();
                     },
@@ -911,6 +1052,60 @@ mod tests {
     }
 
     #[test]
+    fn test_gs_usb_udp_receive_step_timeout_caps_long_waits() {
+        assert_eq!(
+            receive_step_timeout(Duration::from_secs(1)),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            ack_poll_timeout(Duration::from_millis(100)),
+            Duration::from_millis(2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_gs_usb_udp_adapter_uds_peer_bound_connect() {
+        let server_path = unique_client_socket_path();
+        if server_path.exists() {
+            let _ = std::fs::remove_file(&server_path);
+        }
+
+        let server = UnixDatagram::bind(&server_path).unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_path_str = server_path.to_string_lossy().to_string();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let (len, addr) = server.recv_from(&mut buf).unwrap();
+            match protocol::decode_message(&buf[..len]).unwrap() {
+                Message::Connect { seq, .. } => {
+                    let mut ack_buf = [0u8; 13];
+                    let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
+                    if let Some(path) = addr.as_pathname() {
+                        server.send_to(encoded, path).unwrap();
+                    } else {
+                        panic!("expected pathname client");
+                    }
+                },
+                other => panic!("unexpected message: {:?}", other),
+            }
+        });
+
+        let Some(mut adapter) = adapter_or_skip(GsUsbUdpAdapter::new_uds(server_path_str), "uds")
+        else {
+            let _ = std::fs::remove_file(&server_path);
+            return;
+        };
+
+        adapter.connect(vec![]).unwrap();
+        assert!(adapter.is_connected());
+
+        server_handle.join().unwrap();
+        let _ = std::fs::remove_file(&server_path);
+    }
+
+    #[test]
     fn test_gs_usb_udp_adapter_send_error_returns_from_send() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -923,9 +1118,9 @@ mod tests {
             while let Ok((len, addr)) = server.recv_from(&mut buf) {
                 let msg = protocol::decode_message(&buf[..len]).unwrap();
                 match msg {
-                    Message::Connect { .. } => {
+                    Message::Connect { seq, .. } => {
                         let mut ack_buf = [0u8; 13];
-                        let encoded = protocol::encode_connect_ack(42, 0, 0, &mut ack_buf);
+                        let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
                         server.send_to(encoded, addr).unwrap();
                         ready_tx.send(()).unwrap();
                     },
@@ -969,9 +1164,9 @@ mod tests {
             while let Ok((len, addr)) = server.recv_from(&mut buf) {
                 let msg = protocol::decode_message(&buf[..len]).unwrap();
                 match msg {
-                    Message::Connect { .. } => {
+                    Message::Connect { seq, .. } => {
                         let mut ack_buf = [0u8; 13];
-                        let encoded = protocol::encode_connect_ack(42, 0, 0, &mut ack_buf);
+                        let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
                         server.send_to(encoded, addr).unwrap();
                     },
                     Message::SendFrame { seq, .. } => {
@@ -1014,6 +1209,100 @@ mod tests {
     }
 
     #[test]
+    fn test_gs_usb_udp_connect_timeout_rejects_stale_connect_ack() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let mut first_seq = None;
+
+            while let Ok((len, addr)) = server.recv_from(&mut buf) {
+                let msg = protocol::decode_message(&buf[..len]).unwrap();
+                match msg {
+                    Message::Connect { seq, .. } if first_seq.is_none() => {
+                        first_seq = Some(seq);
+                        thread::sleep(Duration::from_millis(50));
+                        let mut ack_buf = [0u8; 13];
+                        let encoded = protocol::encode_connect_ack(7, 0, seq, &mut ack_buf);
+                        let _ = server.send_to(encoded, addr);
+                    },
+                    Message::Connect { seq, .. } => {
+                        let stale_seq = first_seq.unwrap();
+                        let mut stale_ack_buf = [0u8; 13];
+                        let stale =
+                            protocol::encode_connect_ack(7, 0, stale_seq, &mut stale_ack_buf);
+                        let _ = server.send_to(stale, addr);
+
+                        let mut ack_buf = [0u8; 13];
+                        let encoded = protocol::encode_connect_ack(8, 0, seq, &mut ack_buf);
+                        let _ = server.send_to(encoded, addr);
+                        break;
+                    },
+                    _ => {},
+                }
+            }
+        });
+
+        let mut adapter = GsUsbUdpAdapter::new_udp_with_timeout(
+            server_addr.to_string(),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        let first_error = adapter.connect_with_timeout(vec![], Duration::from_millis(20));
+        assert!(first_error.is_err());
+        assert!(!adapter.is_connected());
+
+        let second_error = adapter.connect_with_timeout(vec![], Duration::from_millis(80));
+        assert!(second_error.is_err());
+        assert!(!adapter.is_connected());
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_gs_usb_udp_peer_bound_udp_ignores_foreign_datagrams() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let attacker = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, addr)) = server.recv_from(&mut buf) {
+                if let Message::Connect { seq, .. } = protocol::decode_message(&buf[..len]).unwrap()
+                {
+                    let mut ack_buf = [0u8; 13];
+                    let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
+                    server.send_to(encoded, addr).unwrap();
+                    ready_tx.send(addr).unwrap();
+                    thread::sleep(Duration::from_millis(100));
+                    break;
+                }
+            }
+        });
+
+        let mut adapter = GsUsbUdpAdapter::new_udp(server_addr.to_string()).unwrap();
+        adapter.connect(vec![]).unwrap();
+        let _server_observed_addr = ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let client_addr = udp_local_addr(&adapter);
+        let mut ack_buf = [0u8; 12];
+        let foreign = protocol::encode_send_ack(999, 0, &mut ack_buf);
+        attacker.send_to(foreign, client_addr).unwrap();
+
+        adapter.set_receive_timeout(Duration::from_millis(30));
+        let error = adapter.receive().unwrap_err();
+        assert!(matches!(error, CanError::Timeout));
+        assert!(adapter.is_connected());
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
     fn test_gs_usb_udp_send_ack_wait_buffers_receive_frame() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -1024,9 +1313,9 @@ mod tests {
             while let Ok((len, addr)) = server.recv_from(&mut buf) {
                 let msg = protocol::decode_message(&buf[..len]).unwrap();
                 match msg {
-                    Message::Connect { .. } => {
+                    Message::Connect { seq, .. } => {
                         let mut ack_buf = [0u8; 13];
-                        let encoded = protocol::encode_connect_ack(42, 0, 0, &mut ack_buf);
+                        let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
                         server.send_to(encoded, addr).unwrap();
                     },
                     Message::SendFrame { seq, .. } => {
@@ -1071,9 +1360,9 @@ mod tests {
             let mut buf = [0u8; 1024];
             while let Ok((len, addr)) = server.recv_from(&mut buf) {
                 let msg = protocol::decode_message(&buf[..len]).unwrap();
-                if let Message::Connect { .. } = msg {
+                if let Message::Connect { seq, .. } = msg {
                     let mut ack_buf = [0u8; 13];
-                    let encoded = protocol::encode_connect_ack(42, 0, 0, &mut ack_buf);
+                    let encoded = protocol::encode_connect_ack(42, 0, seq, &mut ack_buf);
                     server.send_to(encoded, addr).unwrap();
 
                     let mut send_ack_buf = [0u8; 12];

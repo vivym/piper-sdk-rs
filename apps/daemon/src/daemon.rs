@@ -1455,7 +1455,11 @@ impl Daemon {
                     eprintln!("[Client {}] Failed to update activity: {}", client_id, e);
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::Connect { client_id, filters } => {
+            piper_can::gs_usb_udp::protocol::Message::Connect {
+                client_id,
+                filters,
+                seq,
+            } => {
                 // 注册客户端（使用从 recv_from 获取的真实地址）
                 // 尝试从 UnixSocketAddr 获取路径（如果可用）
                 // 支持自动 ID 分配：client_id = 0 表示自动分配
@@ -1527,7 +1531,7 @@ impl Daemon {
                 let encoded_ack = piper_can::gs_usb_udp::protocol::encode_connect_ack(
                     actual_id, // 使用实际 ID（自动分配或手动指定）
                     status,
-                    0, // seq = 0 for ConnectAck
+                    seq,
                     &mut ack_buf,
                 );
 
@@ -1547,8 +1551,18 @@ impl Daemon {
                     eprintln!("Failed to register client {}: {}", actual_id, e);
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id } => {
+            piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id, seq } => {
                 clients.write().unwrap().unregister(client_id);
+
+                let mut ack_buf = [0u8; 8];
+                let encoded =
+                    piper_can::gs_usb_udp::protocol::encode_disconnect_ack(seq, &mut ack_buf);
+
+                if let Some(path) = client_addr.as_pathname()
+                    && let Err(error) = socket.send_to(encoded, path)
+                {
+                    eprintln!("[Client] Failed to send DisconnectAck: {}", error);
+                }
             },
             Message::SendFrame { frame, seq } => {
                 // 发送 CAN 帧到 USB 设备（使用 TX adapter）
@@ -1610,7 +1624,7 @@ impl Daemon {
                 }
                 // 可选：发送确认消息给客户端
             },
-            piper_can::gs_usb_udp::protocol::Message::GetStatus => {
+            piper_can::gs_usb_udp::protocol::Message::GetStatus { seq } => {
                 // ✅ 新增：GetStatus 消息处理
                 // 按需提取地址字符串（性能优化：仅在此分支内转换）
                 let addr_str = match client_addr.as_pathname() {
@@ -1655,7 +1669,7 @@ impl Daemon {
                 let mut status_buf = [0u8; 64];
                 if let Ok(encoded) = piper_can::gs_usb_udp::protocol::encode_status_response(
                     &status,
-                    0, // seq (GetStatus 不需要序列号，使用 0)
+                    seq,
                     &mut status_buf,
                 ) {
                     // ✅ 关键：发送到请求者（而不是广播给所有客户端）
@@ -1702,7 +1716,11 @@ impl Daemon {
                     );
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::Connect { client_id, filters } => {
+            piper_can::gs_usb_udp::protocol::Message::Connect {
+                client_id,
+                filters,
+                seq,
+            } => {
                 let addr = ClientAddr::Udp(client_addr); // ← 使用 UDP 地址
 
                 // 支持自动 ID 分配：client_id = 0 表示自动分配
@@ -1741,7 +1759,7 @@ impl Daemon {
                 let encoded_ack = piper_can::gs_usb_udp::protocol::encode_connect_ack(
                     actual_id, // 使用实际 ID（自动分配或手动指定）
                     status,
-                    0, // seq = 0 for ConnectAck
+                    seq,
                     &mut ack_buf,
                 );
 
@@ -1764,8 +1782,16 @@ impl Daemon {
                     eprintln!("Failed to register UDP client {}: {}", actual_id, e);
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id } => {
+            piper_can::gs_usb_udp::protocol::Message::Disconnect { client_id, seq } => {
                 clients.write().unwrap().unregister(client_id);
+
+                let mut ack_buf = [0u8; 8];
+                let encoded =
+                    piper_can::gs_usb_udp::protocol::encode_disconnect_ack(seq, &mut ack_buf);
+
+                if let Err(error) = socket.send_to(encoded, client_addr) {
+                    eprintln!("[UDP Client] Failed to send DisconnectAck: {}", error);
+                }
             },
             Message::SendFrame { frame, seq } => {
                 // ✅ 发送 CAN 帧到 USB 设备（使用 TX adapter）
@@ -1823,7 +1849,7 @@ impl Daemon {
                     },
                 }
             },
-            piper_can::gs_usb_udp::protocol::Message::GetStatus => {
+            piper_can::gs_usb_udp::protocol::Message::GetStatus { seq } => {
                 // ✅ GetStatus 消息处理（UDP）
                 // UDP 地址可以直接使用 SocketAddr，无需转换字符串
 
@@ -1861,7 +1887,7 @@ impl Daemon {
                 let mut status_buf = [0u8; 64];
                 if let Ok(encoded) = piper_can::gs_usb_udp::protocol::encode_status_response(
                     &status,
-                    0, // seq (GetStatus 不需要序列号，使用 0)
+                    seq,
                     &mut status_buf,
                 ) {
                     // ✅ 关键：发送到 UDP 请求者（使用 SocketAddr）

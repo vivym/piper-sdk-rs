@@ -210,9 +210,11 @@ pub enum Message {
     Connect {
         client_id: u32,
         filters: Vec<CanIdFilter>,
+        seq: u32,
     },
     Disconnect {
         client_id: u32,
+        seq: u32,
     },
     SendFrame {
         frame: PiperFrame,
@@ -222,10 +224,16 @@ pub enum Message {
     ConnectAck {
         client_id: u32,
         status: u8,
+        seq: u32,
     },
-    DisconnectAck,
-    GetStatus,
+    DisconnectAck {
+        seq: u32,
+    },
+    GetStatus {
+        seq: u32,
+    },
     StatusResponse {
+        seq: u32,
         /// 设备状态（0=Disconnected, 1=Connected, 2=Reconnecting）
         device_state: u8,
         /// RX 帧率（FPS，编码为 u32，实际值为 fps * 1000）
@@ -590,7 +598,11 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
                 filters.push(CanIdFilter::new(min_id, max_id));
             }
 
-            Ok(Message::Connect { client_id, filters })
+            Ok(Message::Connect {
+                client_id,
+                filters,
+                seq: header.seq,
+            })
         },
         MessageType::SendFrame => {
             if data.len() < 14 {
@@ -672,16 +684,23 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
             }
             let client_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
             let status = data[12];
-            Ok(Message::ConnectAck { client_id, status })
+            Ok(Message::ConnectAck {
+                client_id,
+                status,
+                seq: header.seq,
+            })
         },
         MessageType::Disconnect => {
             if data.len() < 12 {
                 return Err(ProtocolError::Incomplete);
             }
             let client_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            Ok(Message::Disconnect { client_id })
+            Ok(Message::Disconnect {
+                client_id,
+                seq: header.seq,
+            })
         },
-        MessageType::DisconnectAck => Ok(Message::DisconnectAck),
+        MessageType::DisconnectAck => Ok(Message::DisconnectAck { seq: header.seq }),
         MessageType::SetFilter => {
             if data.len() < 13 {
                 return Err(ProtocolError::Incomplete);
@@ -712,7 +731,7 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
 
             Ok(Message::SetFilter { client_id, filters })
         },
-        MessageType::GetStatus => Ok(Message::GetStatus),
+        MessageType::GetStatus => Ok(Message::GetStatus { seq: header.seq }),
         MessageType::StatusResponse => {
             if data.len() < 59 {
                 return Err(ProtocolError::Incomplete);
@@ -816,6 +835,7 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
             ]);
 
             Ok(Message::StatusResponse {
+                seq: header.seq,
                 device_state,
                 rx_fps_x1000,
                 tx_fps_x1000,
@@ -895,11 +915,13 @@ mod tests {
             Message::Connect {
                 client_id,
                 filters: decoded_filters,
+                seq,
             } => {
                 assert_eq!(client_id, 12345);
                 assert_eq!(decoded_filters.len(), 2);
                 assert_eq!(decoded_filters[0].min_id, 0x100);
                 assert_eq!(decoded_filters[0].max_id, 0x200);
+                assert_eq!(seq, 0);
             },
             _ => panic!("Expected Connect message"),
         }
@@ -981,9 +1003,14 @@ mod tests {
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
-            Message::ConnectAck { client_id, status } => {
+            Message::ConnectAck {
+                client_id,
+                status,
+                seq,
+            } => {
                 assert_eq!(client_id, 12345);
                 assert_eq!(status, 0);
+                assert_eq!(seq, 0);
             },
             _ => panic!("Expected ConnectAck message"),
         }
@@ -996,8 +1023,9 @@ mod tests {
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
-            Message::Disconnect { client_id } => {
+            Message::Disconnect { client_id, seq } => {
                 assert_eq!(client_id, 12345);
+                assert_eq!(seq, 0);
             },
             _ => panic!("Expected Disconnect message"),
         }
@@ -1010,7 +1038,7 @@ mod tests {
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
-            Message::DisconnectAck => {},
+            Message::DisconnectAck { seq } => assert_eq!(seq, 0),
             _ => panic!("Expected DisconnectAck message"),
         }
     }
@@ -1076,7 +1104,7 @@ mod tests {
 
         let decoded = decode_message(encoded).unwrap();
         match decoded {
-            Message::GetStatus => {},
+            Message::GetStatus { seq } => assert_eq!(seq, 0),
             _ => panic!("Expected GetStatus message"),
         }
     }
@@ -1097,9 +1125,11 @@ mod tests {
             Message::Connect {
                 client_id,
                 filters: decoded_filters,
+                seq,
             } => {
                 assert_eq!(client_id, 12345);
                 assert_eq!(decoded_filters.len(), 0);
+                assert_eq!(seq, 0);
             },
             _ => panic!("Expected Connect message"),
         }
@@ -1122,10 +1152,12 @@ mod tests {
             match decoded {
                 Message::Connect {
                     filters: decoded_filters,
+                    seq,
                     ..
                 } => {
                     // 应该被截断到适合缓冲区的数量
                     assert!(decoded_filters.len() <= 30); // 30 * 8 + 13 = 253 < 256
+                    assert_eq!(seq, 0);
                 },
                 _ => panic!("Expected Connect message"),
             }
