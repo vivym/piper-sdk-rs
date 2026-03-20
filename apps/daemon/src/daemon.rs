@@ -1483,51 +1483,32 @@ impl Daemon {
                 };
 
                 let addr = ClientAddr::Unix(addr_str.clone());
-
-                // 支持自动 ID 分配：client_id = 0 表示自动分配
-                let (actual_id, register_result) = if client_id == 0 {
-                    // 自动分配 ID
+                let unix_addr_debug = format!("{:?}", client_addr);
+                let prepared_result = {
                     let mut clients_guard = clients.write().unwrap();
-                    // 先保存 client_addr 的调试信息，因为后续需要移动它
-                    let unix_addr_debug = format!("{:?}", client_addr);
-                    let unix_addr = client_addr;
-                    match clients_guard.register_auto(addr.clone(), filters.clone()) {
-                        Ok(id) => {
-                            // 对于自动分配的 UDS 客户端，需要存储 unix_addr
-                            clients_guard.set_unix_addr(id, unix_addr);
-                            eprintln!(
-                                "Client {} auto-assigned and connected from {} (path: {})",
-                                id, unix_addr_debug, addr_str
-                            );
-                            (id, Ok(()))
-                        },
-                        Err(e) => {
-                            eprintln!("[Client] Failed to register (auto): {}", e);
-                            (0, Err(e))
-                        },
+                    if client_id == 0 {
+                        Ok(clients_guard.prepare_registration_auto(
+                            addr,
+                            filters,
+                            Some(client_addr),
+                        ))
+                    } else {
+                        clients_guard.prepare_registration_manual(
+                            client_id,
+                            addr,
+                            filters,
+                            Some(client_addr),
+                        )
                     }
-                } else {
-                    // 手动指定 ID（向后兼容）
-                    eprintln!(
-                        "Client {} connected from {:?} (path: {})",
-                        client_id, client_addr, addr_str
-                    );
-                    let result = clients.write().unwrap().register_with_unix_addr(
-                        client_id,
-                        addr,
-                        client_addr, // 传递所有权（因为 SocketAddr 不实现 Copy/Clone）
-                        filters,
-                    );
-                    (client_id, result)
                 };
+                let actual_id =
+                    prepared_result.as_ref().map_or(client_id, |prepared| prepared.id());
+                let status = if prepared_result.is_ok() { 0 } else { 1 };
+                let prepare_error = prepared_result.as_ref().err().cloned();
+                let mut prepared_registration = prepared_result.ok();
 
                 // 发送 ConnectAck 消息（包含实际使用的 ID）
                 let mut ack_buf = [0u8; 13];
-                let status = if register_result.is_ok() {
-                    0 // 成功
-                } else {
-                    1 // 失败（通常是客户端 ID 已存在）
-                };
                 let encoded_ack = piper_can::gs_usb_udp::protocol::encode_connect_ack(
                     actual_id, // 使用实际 ID（自动分配或手动指定）
                     status,
@@ -1538,16 +1519,35 @@ impl Daemon {
                 // 发送 ConnectAck 到客户端
                 if let Err(e) = socket.send_to(encoded_ack, &addr_str) {
                     eprintln!("Failed to send ConnectAck to client {}: {}", actual_id, e);
+                    if let Some(prepared) = prepared_registration.take() {
+                        clients.write().unwrap().abort_prepared_registration(prepared);
+                    }
                 } else {
+                    if let Some(prepared) = prepared_registration.take() {
+                        clients.write().unwrap().commit_prepared_registration(prepared);
+                    }
                     eprintln!(
                         "Sent ConnectAck to client {} (status: {}) [auto: {}]",
                         actual_id,
                         status,
                         client_id == 0
                     );
+                    if status == 0 {
+                        if client_id == 0 {
+                            eprintln!(
+                                "Client {} auto-assigned and connected from {} (path: {})",
+                                actual_id, unix_addr_debug, addr_str
+                            );
+                        } else {
+                            eprintln!(
+                                "Client {} connected from {} (path: {})",
+                                actual_id, unix_addr_debug, addr_str
+                            );
+                        }
+                    }
                 }
 
-                if let Err(e) = register_result {
+                if let Some(e) = prepare_error {
                     eprintln!("Failed to register client {}: {}", actual_id, e);
                 }
             },
@@ -1693,7 +1693,7 @@ impl Daemon {
     /// 与 `handle_ipc_message` 类似，但：
     /// 1. `client_addr` 是 `SocketAddr`（UDP 地址）而不是 `UnixSocketAddr`
     /// 2. `socket` 是 `UdpSocket` 而不是 `UnixDatagram`
-    /// 3. UDP Connect 消息使用 `register()` 而不是 `register_with_unix_addr()`
+    /// 3. UDP Connect 消息走 `prepare -> ack -> commit` 握手
     fn handle_ipc_message_udp(
         msg: piper_can::gs_usb_udp::protocol::Message,
         client_addr: std::net::SocketAddr, // ← UDP 地址（SocketAddr）
@@ -1722,40 +1722,33 @@ impl Daemon {
                 seq,
             } => {
                 let addr = ClientAddr::Udp(client_addr); // ← 使用 UDP 地址
-
-                // 支持自动 ID 分配：client_id = 0 表示自动分配
-                let (actual_id, register_result) = if client_id == 0 {
-                    // 自动分配 ID（UDP 推荐模式）
-                    match clients.write().unwrap().register_auto(addr, filters.clone()) {
-                        Ok(id) => {
-                            eprintln!(
-                                "Client {} connected via UDP from {} (auto-assigned)",
-                                id, client_addr
-                            );
-                            (id, Ok(()))
-                        },
-                        Err(e) => {
-                            eprintln!("[UDP Client] Failed to register (auto): {}", e);
-                            (0, Err(e))
-                        },
+                let prepared_result = {
+                    let mut clients_guard = clients.write().unwrap();
+                    if client_id == 0 {
+                        Ok(clients_guard.prepare_registration_auto(
+                            addr,
+                            filters,
+                            #[cfg(unix)]
+                            None,
+                        ))
+                    } else {
+                        clients_guard.prepare_registration_manual(
+                            client_id,
+                            addr,
+                            filters,
+                            #[cfg(unix)]
+                            None,
+                        )
                     }
-                } else {
-                    // 手动指定 ID（向后兼容，但不推荐用于 UDP）
-                    eprintln!(
-                        "Client {} connected via UDP from {} (manual ID)",
-                        client_id, client_addr
-                    );
-                    let result = clients.write().unwrap().register(client_id, addr, filters);
-                    (client_id, result)
                 };
+                let actual_id =
+                    prepared_result.as_ref().map_or(client_id, |prepared| prepared.id());
+                let status = if prepared_result.is_ok() { 0 } else { 1 };
+                let prepare_error = prepared_result.as_ref().err().cloned();
+                let mut prepared_registration = prepared_result.ok();
 
                 // 发送 ConnectAck 消息（包含实际使用的 ID）
                 let mut ack_buf = [0u8; 13];
-                let status = if register_result.is_ok() {
-                    0 // 成功
-                } else {
-                    1 // 失败（通常是客户端 ID 已存在）
-                };
                 let encoded_ack = piper_can::gs_usb_udp::protocol::encode_connect_ack(
                     actual_id, // 使用实际 ID（自动分配或手动指定）
                     status,
@@ -1769,16 +1762,35 @@ impl Daemon {
                         "Failed to send ConnectAck to UDP client {}: {}",
                         actual_id, e
                     );
+                    if let Some(prepared) = prepared_registration.take() {
+                        clients.write().unwrap().abort_prepared_registration(prepared);
+                    }
                 } else {
+                    if let Some(prepared) = prepared_registration.take() {
+                        clients.write().unwrap().commit_prepared_registration(prepared);
+                    }
                     eprintln!(
                         "Sent ConnectAck to UDP client {} (status: {}) [auto: {}]",
                         actual_id,
                         status,
                         client_id == 0
                     );
+                    if status == 0 {
+                        if client_id == 0 {
+                            eprintln!(
+                                "Client {} connected via UDP from {} (auto-assigned)",
+                                actual_id, client_addr
+                            );
+                        } else {
+                            eprintln!(
+                                "Client {} connected via UDP from {} (manual ID)",
+                                actual_id, client_addr
+                            );
+                        }
+                    }
                 }
 
-                if let Err(e) = register_result {
+                if let Some(e) = prepare_error {
                     eprintln!("Failed to register UDP client {}: {}", actual_id, e);
                 }
             },

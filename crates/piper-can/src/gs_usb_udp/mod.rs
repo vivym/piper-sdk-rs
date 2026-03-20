@@ -328,18 +328,6 @@ fn recv_with_timeout(
     session.recv_from_peer(buf)
 }
 
-fn drain_pending_peer_messages(session: &DaemonSession) -> Result<(), CanError> {
-    let mut buf = [0u8; 1024];
-
-    loop {
-        match recv_with_timeout(session, session.ack_poll_timeout, &mut buf) {
-            Ok(_) => continue,
-            Err(CanError::Timeout) => return Ok(()),
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 fn send_frame_and_wait_ack(
     session: &DaemonSession,
     frame: PiperFrame,
@@ -534,10 +522,6 @@ impl GsUsbUdpAdapter {
             mark_session_lost(&self.session, &mut self.rx_buffer);
             return Err(error);
         }
-        if let Err(error) = drain_pending_peer_messages(&self.session) {
-            mark_session_lost(&self.session, &mut self.rx_buffer);
-            return Err(error);
-        }
 
         let seq = self.session.seq_counter.fetch_add(1, Ordering::Relaxed);
         let mut buf = [0u8; 256];
@@ -582,11 +566,7 @@ impl GsUsbUdpAdapter {
                             seq: ack_seq,
                         } => {
                             if ack_seq != seq {
-                                let error = protocol_error(format!(
-                                    "Unexpected ConnectAck seq {ack_seq}, expected {seq}"
-                                ));
-                                mark_session_lost(&self.session, &mut self.rx_buffer);
-                                return Err(error);
+                                continue;
                             }
                             if status != 0 {
                                 let error = CanError::Device(
@@ -609,27 +589,22 @@ impl GsUsbUdpAdapter {
                             code,
                             message,
                         } => {
-                            let error = if error_seq == seq {
-                                CanError::Device(
+                            if error_seq == seq {
+                                let error = CanError::Device(
                                     format!("Connect error {:?}: {}", code, message).into(),
-                                )
-                            } else {
-                                protocol_error(format!(
-                                    "Unexpected Error seq {error_seq}, expected {seq}: {:?}: {}",
-                                    code, message
-                                ))
-                            };
-                            mark_session_lost(&self.session, &mut self.rx_buffer);
-                            return Err(error);
+                                );
+                                mark_session_lost(&self.session, &mut self.rx_buffer);
+                                return Err(error);
+                            }
                         },
-                        unexpected => {
-                            let error = protocol_error(format!(
-                                "Unexpected daemon message while waiting for connect ack: {:?}",
-                                unexpected
-                            ));
-                            mark_session_lost(&self.session, &mut self.rx_buffer);
-                            return Err(error);
+                        Message::ReceiveFrame(_)
+                        | Message::Heartbeat { .. }
+                        | Message::SendAck { .. }
+                        | Message::DisconnectAck { .. }
+                        | Message::StatusResponse { .. } => {
+                            continue;
                         },
+                        _ => continue,
                     }
                 },
                 Err(CanError::Timeout) => continue,
@@ -1209,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gs_usb_udp_connect_timeout_rejects_stale_connect_ack() {
+    fn test_gs_usb_udp_connect_ignores_stale_connect_ack_and_receive_frame() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -1230,6 +1205,13 @@ mod tests {
                     },
                     Message::Connect { seq, .. } => {
                         let stale_seq = first_seq.unwrap();
+                        let stale_frame = PiperFrame::new_standard(0x555, &[1, 2, 3, 4]);
+                        let mut frame_buf = [0u8; 64];
+                        let encoded =
+                            protocol::encode_receive_frame_zero_copy(&stale_frame, &mut frame_buf)
+                                .unwrap();
+                        let _ = server.send_to(encoded, addr);
+
                         let mut stale_ack_buf = [0u8; 13];
                         let stale =
                             protocol::encode_connect_ack(7, 0, stale_seq, &mut stale_ack_buf);
@@ -1238,6 +1220,7 @@ mod tests {
                         let mut ack_buf = [0u8; 13];
                         let encoded = protocol::encode_connect_ack(8, 0, seq, &mut ack_buf);
                         let _ = server.send_to(encoded, addr);
+                        thread::sleep(Duration::from_millis(60));
                         break;
                     },
                     _ => {},
@@ -1255,8 +1238,104 @@ mod tests {
         assert!(first_error.is_err());
         assert!(!adapter.is_connected());
 
-        let second_error = adapter.connect_with_timeout(vec![], Duration::from_millis(80));
-        assert!(second_error.is_err());
+        adapter.connect_with_timeout(vec![], Duration::from_millis(80)).unwrap();
+        assert!(adapter.is_connected());
+
+        adapter.set_receive_timeout(Duration::from_millis(20));
+        let receive_error = adapter.receive().unwrap_err();
+        assert!(matches!(receive_error, CanError::Timeout));
+        assert!(adapter.is_connected());
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_gs_usb_udp_connect_times_out_under_continuous_stale_receive_frames() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, addr)) = server.recv_from(&mut buf) {
+                if let Message::Connect { .. } = protocol::decode_message(&buf[..len]).unwrap() {
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_millis(60) {
+                        let frame = PiperFrame::new_standard(0x444, &[9, 8, 7, 6]);
+                        let mut frame_buf = [0u8; 64];
+                        let encoded =
+                            protocol::encode_receive_frame_zero_copy(&frame, &mut frame_buf)
+                                .unwrap();
+                        let _ = server.send_to(encoded, addr);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    break;
+                }
+            }
+        });
+
+        let mut adapter = GsUsbUdpAdapter::new_udp_with_timeout(
+            server_addr.to_string(),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        let error = adapter.connect_with_timeout(vec![], Duration::from_millis(25)).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(error.to_string().contains("Connection timeout"));
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "connect should stay bounded under stale traffic, got {:?}",
+            elapsed
+        );
+        assert!(!adapter.is_connected());
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_gs_usb_udp_connect_times_out_under_stale_mismatched_control_plane_messages() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, addr)) = server.recv_from(&mut buf) {
+                if let Message::Connect { seq, .. } = protocol::decode_message(&buf[..len]).unwrap()
+                {
+                    let stale_seq = seq.wrapping_add(1);
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_millis(60) {
+                        let mut ack_buf = [0u8; 13];
+                        let ack = protocol::encode_connect_ack(7, 0, stale_seq, &mut ack_buf);
+                        let _ = server.send_to(ack, addr);
+
+                        let mut err_buf = [0u8; 256];
+                        let err = protocol::encode_error(
+                            protocol::ErrorCode::DeviceError,
+                            "stale error",
+                            stale_seq,
+                            &mut err_buf,
+                        )
+                        .unwrap();
+                        let _ = server.send_to(err, addr);
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    break;
+                }
+            }
+        });
+
+        let mut adapter = GsUsbUdpAdapter::new_udp_with_timeout(
+            server_addr.to_string(),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        let error = adapter.connect_with_timeout(vec![], Duration::from_millis(25)).unwrap_err();
+        assert!(error.to_string().contains("Connection timeout"));
         assert!(!adapter.is_connected());
 
         server_handle.join().unwrap();
