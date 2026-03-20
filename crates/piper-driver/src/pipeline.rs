@@ -290,10 +290,9 @@ fn commit_pending_velocity(
     let commit_mask = state.vel_update_mask;
     state.pending_joint_dynamic.group_timestamp_us = group_timestamp_us;
     state.pending_joint_dynamic.valid_mask = commit_mask;
-    ctx.raw_joint_dynamic.store(Arc::new(state.pending_joint_dynamic.clone()));
 
     if strict_only {
-        ctx.joint_dynamic.store(Arc::new(state.pending_joint_dynamic.clone()));
+        ctx.publish_joint_dynamic(state.pending_joint_dynamic.clone());
         ctx.fps_stats
             .load()
             .joint_dynamic_updates
@@ -1075,8 +1074,6 @@ fn parse_and_update_state(
                     joint_pos: state.pending_joint_pos,
                     frame_valid_mask: state.joint_pos_frame_mask,
                 };
-                ctx.publish_raw_joint_position(new_joint_pos_state.clone());
-
                 if complete_group_ready(state.joint_pos_frame_mask) {
                     ctx.publish_joint_position(new_joint_pos_state.clone());
                     ctx.fps_stats
@@ -1095,6 +1092,7 @@ fn parse_and_update_state(
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
+                    ctx.publish_raw_joint_position(new_joint_pos_state.clone());
                     metrics
                         .rx_joint_position_incomplete_groups_dropped_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -1172,8 +1170,6 @@ fn parse_and_update_state(
                     end_pose: state.pending_end_pose,
                     frame_valid_mask: state.end_pose_frame_mask,
                 };
-                ctx.publish_raw_end_pose(new_end_pose_state.clone());
-
                 if complete_group_ready(state.end_pose_frame_mask) {
                     ctx.publish_end_pose(new_end_pose_state.clone());
                     ctx.fps_stats
@@ -1192,6 +1188,7 @@ fn parse_and_update_state(
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
+                    ctx.publish_raw_end_pose(new_end_pose_state.clone());
                     metrics
                         .rx_end_pose_incomplete_groups_dropped_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -1249,10 +1246,11 @@ fn parse_and_update_state(
                 state.vel_update_mask |= 1 << joint_index;
                 state.last_vel_packet_time_us = frame.timestamp_us;
                 state.pending_joint_dynamic.valid_mask = state.vel_update_mask;
-                ctx.raw_joint_dynamic.store(Arc::new(state.pending_joint_dynamic.clone()));
 
                 if state.vel_update_mask == 0b111111 {
                     commit_pending_velocity(ctx, state, frame.timestamp_us, None, true, metrics);
+                } else {
+                    ctx.publish_raw_joint_dynamic(state.pending_joint_dynamic.clone());
                 }
             }
         },
@@ -1738,11 +1736,12 @@ mod tests {
 
         // 验证状态已更新（由于需要完整帧组，可能需要多次迭代）
         // 至少验证可以正常处理帧而不崩溃
-        let joint_pos = ctx.joint_position.load();
+        let joint_pos = ctx.joint_position_monitor.load();
         // 如果帧组完整，应该有时间戳更新
         // 但由于异步性，可能需要多次尝试或调整测试策略
         assert!(
-            joint_pos.joint_pos.iter().any(|&v| v != 0.0) || joint_pos.hardware_timestamp_us == 0
+            joint_pos.latest_complete.joint_pos.iter().any(|&v| v != 0.0)
+                || joint_pos.latest_complete.hardware_timestamp_us == 0
         );
     }
 

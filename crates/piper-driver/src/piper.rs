@@ -717,12 +717,17 @@ impl Piper {
     /// - 返回快照副本（Clone 开销低，< 150 字节）
     /// - 适合 500Hz 控制循环
     pub fn get_joint_dynamic(&self) -> JointDynamicState {
-        self.ctx.joint_dynamic.load().as_ref().clone()
+        self.get_joint_dynamic_monitor_snapshot().latest_complete
     }
 
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
     pub fn get_raw_joint_dynamic(&self) -> JointDynamicState {
-        self.ctx.raw_joint_dynamic.load().as_ref().clone()
+        self.get_joint_dynamic_monitor_snapshot().latest_raw
+    }
+
+    /// 获取关节动态监控快照（完整监控 + raw 诊断）
+    pub fn get_joint_dynamic_monitor_snapshot(&self) -> JointDynamicMonitorSnapshot {
+        self.ctx.capture_joint_dynamic_monitor_snapshot()
     }
 
     /// 获取关节位置状态（无锁，纳秒级返回）
@@ -737,12 +742,17 @@ impl Piper {
     /// # 注意
     /// - 此状态与 `EndPoseState` 不是原子更新的，如需同时获取，请使用 `capture_motion_snapshot()`
     pub fn get_joint_position(&self) -> JointPositionState {
-        self.ctx.joint_position.load().as_ref().clone()
+        self.get_joint_position_monitor_snapshot().latest_complete
     }
 
     /// 获取原始关节位置状态（允许部分帧组，仅供诊断）
     pub fn get_raw_joint_position(&self) -> JointPositionState {
-        self.ctx.raw_joint_position.load().as_ref().clone()
+        self.get_joint_position_monitor_snapshot().latest_raw
+    }
+
+    /// 获取关节位置监控快照（完整监控 + raw 诊断）
+    pub fn get_joint_position_monitor_snapshot(&self) -> JointPositionMonitorSnapshot {
+        self.ctx.capture_joint_position_monitor_snapshot()
     }
 
     /// 获取末端位姿状态（无锁，纳秒级返回）
@@ -757,12 +767,17 @@ impl Piper {
     /// # 注意
     /// - 此状态与 `JointPositionState` 不是原子更新的，如需同时获取，请使用 `capture_motion_snapshot()`
     pub fn get_end_pose(&self) -> EndPoseState {
-        self.ctx.end_pose.load().as_ref().clone()
+        self.get_end_pose_monitor_snapshot().latest_complete
     }
 
     /// 获取原始末端位姿状态（允许部分帧组，仅供诊断）
     pub fn get_raw_end_pose(&self) -> EndPoseState {
-        self.ctx.raw_end_pose.load().as_ref().clone()
+        self.get_end_pose_monitor_snapshot().latest_raw
+    }
+
+    /// 获取末端位姿监控快照（完整监控 + raw 诊断）
+    pub fn get_end_pose_monitor_snapshot(&self) -> EndPoseMonitorSnapshot {
+        self.ctx.capture_end_pose_monitor_snapshot()
     }
 
     /// 获取运动快照（无锁，纳秒级返回）
@@ -2221,14 +2236,16 @@ mod tests {
             joint_pos: [0.0; 6],
             frame_valid_mask: 0b101,
         });
-        piper.ctx.joint_dynamic.store(Arc::new(JointDynamicState {
-            group_timestamp_us: 1_000,
-            group_host_rx_mono_us: 2_000,
-            joint_vel: [0.0; 6],
-            joint_current: [0.0; 6],
-            timestamps: [1_000; 6],
-            valid_mask: 0b001111,
-        }));
+        piper.ctx.joint_dynamic_monitor.store(Arc::new(
+            JointDynamicMonitorSnapshot::from_complete(JointDynamicState {
+                group_timestamp_us: 1_000,
+                group_host_rx_mono_us: 2_000,
+                joint_vel: [0.0; 6],
+                joint_current: [0.0; 6],
+                timestamps: [1_000; 6],
+                valid_mask: 0b001111,
+            }),
+        ));
 
         let result = piper.get_aligned_motion(0);
         let state = match result {

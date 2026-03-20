@@ -87,6 +87,43 @@ impl EndPoseState {
     }
 }
 
+/// 单次原子可见的监控快照
+///
+/// 同时保存最近一份完整监控快照和当前 raw 诊断状态，
+/// 用于避免 monitor 读路径跨两份状态读取导致的竞态。
+#[derive(Debug, Clone, Default)]
+pub struct MonitorSnapshot<T: Clone + Default> {
+    /// 最近一份完整 monitor-complete 快照
+    pub latest_complete: T,
+    /// 当前 raw 状态（允许部分帧/部分关节）
+    pub latest_raw: T,
+}
+
+impl<T: Clone + Default> MonitorSnapshot<T> {
+    /// 构造同时更新 complete/raw 的监控快照
+    pub fn from_complete(complete: T) -> Self {
+        Self {
+            latest_complete: complete.clone(),
+            latest_raw: complete,
+        }
+    }
+
+    /// 构造保留上一份完整快照、仅更新 raw 的监控快照
+    pub fn with_raw(latest_complete: T, latest_raw: T) -> Self {
+        Self {
+            latest_complete,
+            latest_raw,
+        }
+    }
+}
+
+/// 关节位置监控快照
+pub type JointPositionMonitorSnapshot = MonitorSnapshot<JointPositionState>;
+/// 末端位姿监控快照
+pub type EndPoseMonitorSnapshot = MonitorSnapshot<EndPoseState>;
+/// 关节动态监控快照
+pub type JointDynamicMonitorSnapshot = MonitorSnapshot<JointDynamicState>;
+
 /// 运动状态快照（逻辑原子性）
 ///
 /// 用于在同一时刻捕获多个运动相关状态，保证逻辑上的原子性。
@@ -915,10 +952,10 @@ use crate::hooks::HookManager;
 pub struct PiperContext {
     // === 热数据（500Hz，高频运动数据）===
     // 使用 ArcSwap，无锁读取，适合高频控制循环
-    /// 完整监控关节位置状态（完整帧组同步：0x2A5-0x2A7）
-    pub joint_position: Arc<ArcSwap<JointPositionState>>,
-    /// 完整监控末端位姿状态（完整帧组同步：0x2A2-0x2A4）
-    pub end_pose: Arc<ArcSwap<EndPoseState>>,
+    /// 关节位置监控快照（完整监控 + raw 诊断，共享一次原子发布）
+    pub joint_position_monitor: Arc<ArcSwap<JointPositionMonitorSnapshot>>,
+    /// 末端位姿监控快照（完整监控 + raw 诊断，共享一次原子发布）
+    pub end_pose_monitor: Arc<ArcSwap<EndPoseMonitorSnapshot>>,
     /// 完整监控运动状态快照（单次 load 保证逻辑原子）
     pub motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
     /// 控制级关节位置状态（完整帧组 + 对齐跨度约束）
@@ -927,16 +964,10 @@ pub struct PiperContext {
     pub control_end_pose: Arc<ArcSwap<EndPoseState>>,
     /// 控制级运动状态快照（单次 load 保证逻辑原子）
     pub control_motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
-    /// 严格关节动态状态（完整动态组提交）
-    pub joint_dynamic: Arc<ArcSwap<JointDynamicState>>,
-    /// 原始关节位置状态（允许部分帧组）
-    pub raw_joint_position: Arc<ArcSwap<JointPositionState>>,
-    /// 原始末端位姿状态（允许部分帧组）
-    pub raw_end_pose: Arc<ArcSwap<EndPoseState>>,
+    /// 关节动态监控快照（完整监控 + raw 诊断，共享一次原子发布）
+    pub joint_dynamic_monitor: Arc<ArcSwap<JointDynamicMonitorSnapshot>>,
     /// 原始运动状态快照（单次 load 保证逻辑原子）
     pub raw_motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
-    /// 原始关节动态状态（允许部分动态组）
-    pub raw_joint_dynamic: Arc<ArcSwap<JointDynamicState>>,
 
     // === 温数据（200Hz，控制状态）===
     // 使用 ArcSwap，更新频率中等，但需要原子性
@@ -1029,7 +1060,7 @@ impl PiperContext {
     /// 创建新的上下文
     ///
     /// 初始化所有状态结构，包括：
-    /// - 热数据（ArcSwap）：`joint_position`, `end_pose`, `joint_dynamic`
+    /// - 热数据（ArcSwap）：`joint_position_monitor`, `end_pose_monitor`, `joint_dynamic_monitor`
     /// - 温数据（ArcSwap）：`robot_control`, `gripper`, `joint_driver_low_speed`
     /// - 冷数据（RwLock）：`collision_protection`, `joint_limit_config`, `joint_accel_config`, `end_limit_config`
     /// - FPS 统计：`fps_stats`
@@ -1040,23 +1071,24 @@ impl PiperContext {
     /// use piper_driver::PiperContext;
     ///
     /// let ctx = PiperContext::new();
-    /// let joint_pos = ctx.joint_position.load();
-    /// assert_eq!(joint_pos.hardware_timestamp_us, 0);
+    /// let joint_pos = ctx.joint_position_monitor.load();
+    /// assert_eq!(joint_pos.latest_complete.hardware_timestamp_us, 0);
     /// ```
     pub fn new() -> Self {
         Self {
             // 热数据：ArcSwap，无锁读取
-            joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
-            end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
+            joint_position_monitor: Arc::new(ArcSwap::from_pointee(
+                JointPositionMonitorSnapshot::default(),
+            )),
+            end_pose_monitor: Arc::new(ArcSwap::from_pointee(EndPoseMonitorSnapshot::default())),
             motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
             control_joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
             control_end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
             control_motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
-            joint_dynamic: Arc::new(ArcSwap::from_pointee(JointDynamicState::default())),
-            raw_joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
-            raw_end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
+            joint_dynamic_monitor: Arc::new(ArcSwap::from_pointee(
+                JointDynamicMonitorSnapshot::default(),
+            )),
             raw_motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
-            raw_joint_dynamic: Arc::new(ArcSwap::from_pointee(JointDynamicState::default())),
 
             // 温数据：ArcSwap
             robot_control: Arc::new(ArcSwap::from_pointee(RobotControlState::default())),
@@ -1121,6 +1153,21 @@ impl PiperContext {
         self.motion_snapshot.load().as_ref().clone()
     }
 
+    /// 捕获关节位置监控快照（完整监控 + raw 诊断）
+    pub fn capture_joint_position_monitor_snapshot(&self) -> JointPositionMonitorSnapshot {
+        self.joint_position_monitor.load().as_ref().clone()
+    }
+
+    /// 捕获末端位姿监控快照（完整监控 + raw 诊断）
+    pub fn capture_end_pose_monitor_snapshot(&self) -> EndPoseMonitorSnapshot {
+        self.end_pose_monitor.load().as_ref().clone()
+    }
+
+    /// 捕获关节动态监控快照（完整监控 + raw 诊断）
+    pub fn capture_joint_dynamic_monitor_snapshot(&self) -> JointDynamicMonitorSnapshot {
+        self.joint_dynamic_monitor.load().as_ref().clone()
+    }
+
     /// 捕获原始运动状态快照（允许部分帧组，仅供诊断）
     pub fn capture_raw_motion_snapshot(&self) -> MotionSnapshot {
         self.raw_motion_snapshot.load().as_ref().clone()
@@ -1131,32 +1178,50 @@ impl PiperContext {
         self.control_motion_snapshot.load().as_ref().clone()
     }
 
-    /// 发布新的关节位置，并与当前末端位姿组合成逻辑原子快照。
+    /// 发布新的关节位置完整监控快照，并与当前末端位姿组合成逻辑原子快照。
     pub fn publish_joint_position(&self, joint_position: JointPositionState) {
-        let end_pose = self.end_pose.load();
-        self.joint_position.store(Arc::new(joint_position.clone()));
+        let end_pose = self.end_pose_monitor.load();
+        self.joint_position_monitor
+            .store(Arc::new(JointPositionMonitorSnapshot::from_complete(
+                joint_position.clone(),
+            )));
         self.motion_snapshot.store(Arc::new(MotionSnapshot {
+            joint_position: joint_position.clone(),
+            end_pose: end_pose.latest_complete.clone(),
+        }));
+        self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
             joint_position,
-            end_pose: end_pose.as_ref().clone(),
+            end_pose: end_pose.latest_raw.clone(),
         }));
     }
 
     /// 发布新的原始关节位置，并与当前原始末端位姿组合成逻辑原子快照。
     pub fn publish_raw_joint_position(&self, joint_position: JointPositionState) {
-        let end_pose = self.raw_end_pose.load();
-        self.raw_joint_position.store(Arc::new(joint_position.clone()));
+        let current = self.joint_position_monitor.load();
+        let end_pose = self.end_pose_monitor.load();
+        self.joint_position_monitor
+            .store(Arc::new(JointPositionMonitorSnapshot::with_raw(
+                current.latest_complete.clone(),
+                joint_position.clone(),
+            )));
         self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
             joint_position,
-            end_pose: end_pose.as_ref().clone(),
+            end_pose: end_pose.latest_raw.clone(),
         }));
     }
 
-    /// 发布新的末端位姿，并与当前关节位置组合成逻辑原子快照。
+    /// 发布新的末端位姿完整监控快照，并与当前关节位置组合成逻辑原子快照。
     pub fn publish_end_pose(&self, end_pose: EndPoseState) {
-        let joint_position = self.joint_position.load();
-        self.end_pose.store(Arc::new(end_pose.clone()));
+        let joint_position = self.joint_position_monitor.load();
+        self.end_pose_monitor.store(Arc::new(EndPoseMonitorSnapshot::from_complete(
+            end_pose.clone(),
+        )));
         self.motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.as_ref().clone(),
+            joint_position: joint_position.latest_complete.clone(),
+            end_pose: end_pose.clone(),
+        }));
+        self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
+            joint_position: joint_position.latest_raw.clone(),
             end_pose,
         }));
     }
@@ -1183,12 +1248,33 @@ impl PiperContext {
 
     /// 发布新的原始末端位姿，并与当前原始关节位置组合成逻辑原子快照。
     pub fn publish_raw_end_pose(&self, end_pose: EndPoseState) {
-        let joint_position = self.raw_joint_position.load();
-        self.raw_end_pose.store(Arc::new(end_pose.clone()));
+        let current = self.end_pose_monitor.load();
+        let joint_position = self.joint_position_monitor.load();
+        self.end_pose_monitor.store(Arc::new(EndPoseMonitorSnapshot::with_raw(
+            current.latest_complete.clone(),
+            end_pose.clone(),
+        )));
         self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.as_ref().clone(),
+            joint_position: joint_position.latest_raw.clone(),
             end_pose,
         }));
+    }
+
+    /// 发布新的完整关节动态监控快照。
+    pub fn publish_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
+        self.joint_dynamic_monitor
+            .store(Arc::new(JointDynamicMonitorSnapshot::from_complete(
+                joint_dynamic,
+            )));
+    }
+
+    /// 发布新的原始关节动态状态。
+    pub fn publish_raw_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
+        let current = self.joint_dynamic_monitor.load();
+        self.joint_dynamic_monitor.store(Arc::new(JointDynamicMonitorSnapshot::with_raw(
+            current.latest_complete.clone(),
+            joint_dynamic,
+        )));
     }
 }
 
@@ -1388,17 +1474,20 @@ mod tests {
     fn test_piper_context_new() {
         let ctx = PiperContext::new();
         // 验证所有 Arc/ArcSwap 都已初始化
-        let joint_pos = ctx.joint_position.load();
-        assert_eq!(joint_pos.hardware_timestamp_us, 0);
-        assert_eq!(joint_pos.joint_pos, [0.0; 6]);
+        let joint_pos = ctx.joint_position_monitor.load();
+        assert_eq!(joint_pos.latest_complete.hardware_timestamp_us, 0);
+        assert_eq!(joint_pos.latest_complete.joint_pos, [0.0; 6]);
+        assert_eq!(joint_pos.latest_raw.hardware_timestamp_us, 0);
 
-        let end_pose = ctx.end_pose.load();
-        assert_eq!(end_pose.hardware_timestamp_us, 0);
-        assert_eq!(end_pose.end_pose, [0.0; 6]);
+        let end_pose = ctx.end_pose_monitor.load();
+        assert_eq!(end_pose.latest_complete.hardware_timestamp_us, 0);
+        assert_eq!(end_pose.latest_complete.end_pose, [0.0; 6]);
+        assert_eq!(end_pose.latest_raw.hardware_timestamp_us, 0);
 
-        let joint_dynamic = ctx.joint_dynamic.load();
-        assert_eq!(joint_dynamic.group_timestamp_us, 0);
-        assert_eq!(joint_dynamic.group_host_rx_mono_us, 0);
+        let joint_dynamic = ctx.joint_dynamic_monitor.load();
+        assert_eq!(joint_dynamic.latest_complete.group_timestamp_us, 0);
+        assert_eq!(joint_dynamic.latest_complete.group_host_rx_mono_us, 0);
+        assert_eq!(joint_dynamic.latest_raw.group_timestamp_us, 0);
 
         let robot_control = ctx.robot_control.load();
         assert_eq!(robot_control.hardware_timestamp_us, 0);
@@ -1783,13 +1872,15 @@ mod tests {
         let ctx = PiperContext::new();
 
         // 验证新状态字段存在且为默认值
-        let joint_pos = ctx.joint_position.load();
-        assert_eq!(joint_pos.hardware_timestamp_us, 0);
-        assert_eq!(joint_pos.joint_pos, [0.0; 6]);
+        let joint_pos = ctx.joint_position_monitor.load();
+        assert_eq!(joint_pos.latest_complete.hardware_timestamp_us, 0);
+        assert_eq!(joint_pos.latest_complete.joint_pos, [0.0; 6]);
+        assert_eq!(joint_pos.latest_raw.hardware_timestamp_us, 0);
 
-        let end_pose = ctx.end_pose.load();
-        assert_eq!(end_pose.hardware_timestamp_us, 0);
-        assert_eq!(end_pose.end_pose, [0.0; 6]);
+        let end_pose = ctx.end_pose_monitor.load();
+        assert_eq!(end_pose.latest_complete.hardware_timestamp_us, 0);
+        assert_eq!(end_pose.latest_complete.end_pose, [0.0; 6]);
+        assert_eq!(end_pose.latest_raw.hardware_timestamp_us, 0);
     }
 
     // ============================================================

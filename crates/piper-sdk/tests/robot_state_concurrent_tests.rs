@@ -27,7 +27,9 @@ fn test_joint_position_state_concurrent_read() {
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer.joint_position.store(Arc::new(new_state));
+            ctx_writer.joint_position_monitor.store(Arc::new(
+                JointPositionMonitorSnapshot::from_complete(new_state),
+            ));
             thread::yield_now();
         }
     });
@@ -39,13 +41,13 @@ fn test_joint_position_state_concurrent_read() {
         let handle = thread::spawn(move || {
             let mut last_timestamp = 0u64;
             for _ in 0..reads_per_thread {
-                let state = ctx_reader.joint_position.load();
+                let state = ctx_reader.joint_position_monitor.load();
                 // 验证状态是递增的（或至少不倒退太多）
-                if state.hardware_timestamp_us >= last_timestamp {
-                    last_timestamp = state.hardware_timestamp_us;
+                if state.latest_complete.hardware_timestamp_us >= last_timestamp {
+                    last_timestamp = state.latest_complete.hardware_timestamp_us;
                 }
                 // 验证状态完整性
-                assert!(state.joint_pos.len() == 6);
+                assert!(state.latest_complete.joint_pos.len() == 6);
                 thread::yield_now();
             }
         });
@@ -75,7 +77,9 @@ fn test_end_pose_state_concurrent_read() {
                 end_pose: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer.end_pose.store(Arc::new(new_state));
+            ctx_writer
+                .end_pose_monitor
+                .store(Arc::new(EndPoseMonitorSnapshot::from_complete(new_state)));
             thread::yield_now();
         }
     });
@@ -85,8 +89,8 @@ fn test_end_pose_state_concurrent_read() {
         let ctx_reader = ctx.clone();
         let handle = thread::spawn(move || {
             for _ in 0..reads_per_thread {
-                let state = ctx_reader.end_pose.load();
-                assert!(state.end_pose.len() == 6);
+                let state = ctx_reader.end_pose_monitor.load();
+                assert!(state.latest_complete.end_pose.len() == 6);
                 thread::yield_now();
             }
         });
@@ -391,7 +395,9 @@ fn test_multiple_states_concurrent_read() {
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer.joint_position.store(Arc::new(new_joint_pos));
+            ctx_writer.joint_position_monitor.store(Arc::new(
+                JointPositionMonitorSnapshot::from_complete(new_joint_pos),
+            ));
 
             // 更新 robot_control
             let new_robot_control = RobotControlState {
@@ -432,12 +438,12 @@ fn test_multiple_states_concurrent_read() {
         let handle = thread::spawn(move || {
             for _ in 0..reads_per_thread {
                 // 同时读取多个状态
-                let joint_pos = ctx_reader.joint_position.load();
+                let joint_pos = ctx_reader.joint_position_monitor.load();
                 let robot_control = ctx_reader.robot_control.load();
                 let gripper = ctx_reader.gripper.load();
 
                 // 验证状态完整性
-                assert!(joint_pos.joint_pos.len() == 6);
+                assert!(joint_pos.latest_complete.joint_pos.len() == 6);
                 // control_mode 是 u8，范围 0-255，无需额外验证
                 let _ = robot_control.control_mode;
                 assert!(gripper.travel >= 0.0);
@@ -475,7 +481,7 @@ fn test_no_deadlock() {
                 // 交替进行读写操作
                 if i % 2 == 0 {
                     // 读取操作
-                    let _ = ctx_clone.joint_position.load();
+                    let _ = ctx_clone.joint_position_monitor.load();
                     let _ = ctx_clone.robot_control.load();
                     let _ = ctx_clone.gripper.load();
                 } else {
@@ -486,7 +492,9 @@ fn test_no_deadlock() {
                         joint_pos: [counter as f64; 6],
                         frame_valid_mask: 0b111,
                     };
-                    ctx_clone.joint_position.store(Arc::new(new_state));
+                    ctx_clone.joint_position_monitor.store(Arc::new(
+                        JointPositionMonitorSnapshot::from_complete(new_state),
+                    ));
                     counter += 1;
                 }
                 thread::yield_now();

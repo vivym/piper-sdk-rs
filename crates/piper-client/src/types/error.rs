@@ -55,8 +55,6 @@ impl std::fmt::Display for MonitorStateSource {
     }
 }
 
-impl std::error::Error for MonitorStateSource {}
-
 /// 机器人错误类型
 ///
 /// 分层错误类型，支持致命错误和可恢复错误的区分。
@@ -134,11 +132,11 @@ pub enum RobotError {
 
     /// 监控/诊断读取到的不完整状态
     #[error(
-        "Monitor state incomplete for {source}: valid mask {valid_mask:b}, required mask {required_mask:b}"
+        "Monitor state incomplete for {state_source}: valid mask {valid_mask:b}, required mask {required_mask:b}"
     )]
     MonitorStateIncomplete {
         /// 不完整状态的来源
-        source: MonitorStateSource,
+        state_source: MonitorStateSource,
         /// 当前有效掩码
         valid_mask: u8,
         /// 所需完整掩码
@@ -410,12 +408,12 @@ impl RobotError {
 
     /// 创建监控状态不完整错误
     pub fn monitor_state_incomplete(
-        source: MonitorStateSource,
+        state_source: MonitorStateSource,
         valid_mask: u8,
         required_mask: u8,
     ) -> Self {
         Self::MonitorStateIncomplete {
-            source,
+            state_source,
             valid_mask,
             required_mask,
         }
@@ -693,11 +691,20 @@ mod tests {
         assert!(matches!(
             err,
             RobotError::MonitorStateIncomplete {
-                source: MonitorStateSource::JointDynamic,
+                state_source: MonitorStateSource::JointDynamic,
                 valid_mask: 0b001111,
                 required_mask: 0b111111,
             }
         ));
+    }
+
+    #[test]
+    fn test_monitor_state_incomplete_has_no_error_source() {
+        let err =
+            RobotError::monitor_state_incomplete(MonitorStateSource::JointPosition, 0b001, 0b111);
+
+        let source = std::error::Error::source(&err);
+        assert!(source.is_none());
     }
 
     #[test]

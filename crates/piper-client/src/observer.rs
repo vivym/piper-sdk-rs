@@ -260,17 +260,18 @@ impl Observer {
     /// 默认只返回完整监控快照；失败时只描述位置组自身的完整性。
     /// 如需查看半成品/诊断数据，请使用 `raw_joint_position_state()`。
     pub fn joint_positions(&self) -> Result<JointArray<Rad>> {
-        let joint_pos = self.driver.get_joint_position();
-        if !joint_pos.is_fully_valid() {
-            let raw_joint_pos = self.driver.get_raw_joint_position();
+        let joint_pos = self.driver.get_joint_position_monitor_snapshot();
+        if !joint_pos.latest_complete.is_fully_valid() {
             return Err(RobotError::monitor_state_incomplete(
                 MonitorStateSource::JointPosition,
-                raw_joint_pos.frame_valid_mask,
+                joint_pos.latest_raw.frame_valid_mask,
                 COMPLETE_COLD_GROUP_MASK,
             ));
         }
 
-        Ok(JointArray::new(joint_pos.joint_pos.map(Rad)))
+        Ok(JointArray::new(
+            joint_pos.latest_complete.joint_pos.map(Rad),
+        ))
     }
 
     /// 获取关节速度（监控/诊断接口）
@@ -285,17 +286,18 @@ impl Observer {
     ///
     /// 返回 `JointArray<RadPerSecond>`，保持类型安全。
     pub fn joint_velocities(&self) -> Result<JointArray<RadPerSecond>> {
-        let dyn_state = self.driver.get_joint_dynamic();
-        if !dyn_state.is_complete() {
-            let raw_dyn_state = self.driver.get_raw_joint_dynamic();
+        let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
+        if !dyn_state.latest_complete.is_complete() {
             return Err(RobotError::monitor_state_incomplete(
                 MonitorStateSource::JointDynamic,
-                raw_dyn_state.valid_mask,
+                dyn_state.latest_raw.valid_mask,
                 COMPLETE_DYNAMIC_GROUP_MASK,
             ));
         }
 
-        Ok(JointArray::new(dyn_state.joint_vel.map(RadPerSecond)))
+        Ok(JointArray::new(
+            dyn_state.latest_complete.joint_vel.map(RadPerSecond),
+        ))
     }
 
     /// 获取关节力矩（监控/诊断接口）
@@ -306,34 +308,33 @@ impl Observer {
     /// 默认只返回完整监控快照；失败时只描述动态组自身的完整性。
     /// 如需查看半成品/诊断数据，请使用 `raw_joint_dynamic_state()`。
     pub fn joint_torques(&self) -> Result<JointArray<NewtonMeter>> {
-        let dyn_state = self.driver.get_joint_dynamic();
-        if !dyn_state.is_complete() {
-            let raw_dyn_state = self.driver.get_raw_joint_dynamic();
+        let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
+        if !dyn_state.latest_complete.is_complete() {
             return Err(RobotError::monitor_state_incomplete(
                 MonitorStateSource::JointDynamic,
-                raw_dyn_state.valid_mask,
+                dyn_state.latest_raw.valid_mask,
                 COMPLETE_DYNAMIC_GROUP_MASK,
             ));
         }
 
         Ok(JointArray::new(
-            dyn_state.get_all_torques().map(NewtonMeter),
+            dyn_state.latest_complete.get_all_torques().map(NewtonMeter),
         ))
     }
 
     /// 获取原始关节位置状态（允许部分帧组，仅供诊断）
     pub fn raw_joint_position_state(&self) -> piper_driver::JointPositionState {
-        self.driver.get_raw_joint_position()
+        self.driver.get_joint_position_monitor_snapshot().latest_raw
     }
 
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
     pub fn raw_joint_dynamic_state(&self) -> piper_driver::JointDynamicState {
-        self.driver.get_raw_joint_dynamic()
+        self.driver.get_joint_dynamic_monitor_snapshot().latest_raw
     }
 
     /// 获取原始末端位姿状态（允许部分帧组，仅供诊断）
     pub fn raw_end_pose_state(&self) -> piper_driver::state::EndPoseState {
-        self.driver.get_raw_end_pose()
+        self.driver.get_end_pose_monitor_snapshot().latest_raw
     }
 
     /// 获取夹爪状态
@@ -396,17 +397,16 @@ impl Observer {
     /// # }
     /// ```
     pub fn end_pose(&self) -> Result<piper_driver::state::EndPoseState> {
-        let end_pose = self.driver.get_end_pose();
-        if !end_pose.is_fully_valid() {
-            let raw_end_pose = self.driver.get_raw_end_pose();
+        let end_pose = self.driver.get_end_pose_monitor_snapshot();
+        if !end_pose.latest_complete.is_fully_valid() {
             return Err(RobotError::monitor_state_incomplete(
                 MonitorStateSource::EndPose,
-                raw_end_pose.frame_valid_mask,
+                end_pose.latest_raw.frame_valid_mask,
                 COMPLETE_COLD_GROUP_MASK,
             ));
         }
 
-        Ok(end_pose)
+        Ok(end_pose.latest_complete)
     }
 
     /// 检查是否全部使能
@@ -592,8 +592,9 @@ mod tests {
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_driver::TimingCapability;
     use piper_protocol::ids::{
-        ID_END_POSE_1, ID_END_POSE_3, ID_GRIPPER_FEEDBACK, ID_JOINT_DRIVER_HIGH_SPEED_BASE,
-        ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
+        ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_GRIPPER_FEEDBACK,
+        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
+        ID_JOINT_FEEDBACK_56,
     };
     use std::collections::VecDeque;
     use std::thread;
@@ -1108,7 +1109,7 @@ mod tests {
         assert!(matches!(
             error,
             RobotError::MonitorStateIncomplete {
-                source: MonitorStateSource::JointPosition,
+                state_source: MonitorStateSource::JointPosition,
                 valid_mask: 0b101,
                 required_mask: COMPLETE_COLD_GROUP_MASK,
             }
@@ -1139,7 +1140,7 @@ mod tests {
         assert!(matches!(
             error,
             RobotError::MonitorStateIncomplete {
-                source: MonitorStateSource::JointDynamic,
+                state_source: MonitorStateSource::JointDynamic,
                 valid_mask: 0b001111,
                 required_mask: COMPLETE_DYNAMIC_GROUP_MASK,
             }
@@ -1170,7 +1171,7 @@ mod tests {
         assert!(matches!(
             error,
             RobotError::MonitorStateIncomplete {
-                source: MonitorStateSource::JointDynamic,
+                state_source: MonitorStateSource::JointDynamic,
                 valid_mask: 0b001111,
                 required_mask: COMPLETE_DYNAMIC_GROUP_MASK,
             }
@@ -1205,11 +1206,90 @@ mod tests {
         assert!(matches!(
             error,
             RobotError::MonitorStateIncomplete {
-                source: MonitorStateSource::EndPose,
+                state_source: MonitorStateSource::EndPose,
                 valid_mask: 0b101,
                 required_mask: COMPLETE_COLD_GROUP_MASK,
             }
         ));
+    }
+
+    #[test]
+    fn test_joint_positions_keep_latest_complete_when_new_raw_is_partial() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 1_000, 2_000, timestamp_us + 1),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let positions = observer
+            .joint_positions()
+            .expect("latest complete snapshot should stay readable");
+        let raw = observer.raw_joint_position_state();
+
+        assert_eq!(positions, JointArray::splat(Rad(0.0)));
+        assert_eq!(raw.frame_valid_mask, 0b001);
+        assert!(raw.joint_pos[0] > 0.0);
+    }
+
+    #[test]
+    fn test_joint_velocities_keep_latest_complete_when_new_raw_is_partial() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_dynamic_frame(1, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(2, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(3, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(4, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(5, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(6, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(1, 2000, 1000, timestamp_us + 1),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let velocities = observer
+            .joint_velocities()
+            .expect("latest complete snapshot should stay readable");
+        let raw = observer.raw_joint_dynamic_state();
+
+        assert_eq!(velocities, JointArray::splat(RadPerSecond(1.0)));
+        assert_eq!(raw.valid_mask, 0b000001);
+        assert_eq!(raw.joint_vel[0], 2.0);
+    }
+
+    #[test]
+    fn test_end_pose_keeps_latest_complete_when_new_raw_is_partial() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            end_pose_frame(ID_END_POSE_1 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_2 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_3 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_1 as u16, 1_000, 0, timestamp_us + 1),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let end_pose = observer.end_pose().expect("latest complete snapshot should stay readable");
+        let raw = observer.raw_end_pose_state();
+
+        assert_eq!(end_pose.end_pose, [0.0; 6]);
+        assert_eq!(raw.frame_valid_mask, 0b001);
+        assert!(raw.end_pose[0] > 0.0);
     }
 
     #[test]

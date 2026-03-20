@@ -103,13 +103,13 @@ fn test_arcswap_read_latency() {
 
     // 预热
     for _ in 0..1000 {
-        let _ = ctx.joint_position.load();
+        let _ = ctx.joint_position_monitor.load();
     }
 
     // 测试读取延迟
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = ctx.joint_position.load();
+        let _ = ctx.joint_position_monitor.load();
     }
     let elapsed = start.elapsed();
 
@@ -147,7 +147,10 @@ fn test_arcswap_write_latency() {
         frame_valid_mask: 0b111,
     };
     for _ in 0..1000 {
-        ctx.joint_position.store(Arc::new(initial_state.clone()));
+        ctx.joint_position_monitor
+            .store(Arc::new(JointPositionMonitorSnapshot::from_complete(
+                initial_state.clone(),
+            )));
     }
 
     // 测试写入延迟
@@ -159,7 +162,10 @@ fn test_arcswap_write_latency() {
             joint_pos: [i as f64; 6],
             frame_valid_mask: 0b111,
         };
-        ctx.joint_position.store(Arc::new(new_state));
+        ctx.joint_position_monitor
+            .store(Arc::new(JointPositionMonitorSnapshot::from_complete(
+                new_state,
+            )));
     }
     let elapsed = start.elapsed();
 
@@ -419,7 +425,7 @@ fn test_multiple_states_read_performance() {
 
     // 预热
     for _ in 0..1000 {
-        let _ = ctx.joint_position.load();
+        let _ = ctx.joint_position_monitor.load();
         let _ = ctx.robot_control.load();
         let _ = ctx.gripper.load();
         let _ = ctx.joint_driver_low_speed.load();
@@ -428,7 +434,7 @@ fn test_multiple_states_read_performance() {
     // 测试多个状态同时读取的性能
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = ctx.joint_position.load();
+        let _ = ctx.joint_position_monitor.load();
         let _ = ctx.robot_control.load();
         let _ = ctx.gripper.load();
         let _ = ctx.joint_driver_low_speed.load();
