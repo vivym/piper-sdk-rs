@@ -153,7 +153,12 @@ pub trait CanAdapter {
 **支持的适配器**：
 - `SocketCanAdapter`：Linux SocketCAN 接口
 - `GsUsbCanAdapter`：GS-USB 设备（跨平台）
-- `GsUsbUdpAdapter`：GS-USB 守护进程客户端（网络）
+- `GsUsbUdpAdapter`：GS-USB 守护进程 bridge/debug 客户端（非实时）
+
+`GsUsbUdpAdapter` 是 bridge/debug/replay 链路，不参与 realtime driver。
+`set_receive_timeout()` 只影响 receive path；`send()` 始终使用固定的 `bridge_timeout`
+作为 round-trip budget。若 send timeout、控制平面失同步，或 receive path 看见
+`SendAck/Error(seq)`，session 会 fail-closed 并要求显式 `reconnect()`。
 
 ### 分离适配器（Splittable Adapter）
 

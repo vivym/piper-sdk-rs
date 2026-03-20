@@ -2,6 +2,8 @@
 //!
 //! 此示例演示如何通过 UDP 或 UDS (Unix Domain Socket) 连接到 gs_usb_daemon 并测试 CAN 总线功能。
 //! 该链路仅用于 bridge/debug/replay，不属于 MIT / 双臂 / fault-stop 的实时控制路径。
+//! bridge send 使用固定的 round-trip timeout；若发送超时或控制平面失同步，客户端会
+//! fail-closed 并要求显式 reconnect。
 //!
 //! 使用前请确保：
 //! 1. gs_usb_daemon 已经启动（默认 UDP 地址: 127.0.0.1:18888）

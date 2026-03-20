@@ -5,6 +5,9 @@
 //! - CPU 占用率
 //! - 吞吐量（fps）
 //! - 客户端阻塞处理
+//!
+//! 该链路是非实时 bridge/debug 路径。bridge send 使用固定 round-trip timeout；
+//! 若发送超时或控制平面失同步，客户端会 fail-closed 并要求显式 reconnect。
 
 use piper_can::gs_usb_udp::GsUsbUdpAdapter;
 use piper_sdk::can::{CanAdapter, PiperFrame};
