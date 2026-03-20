@@ -54,6 +54,15 @@ pub mod mock;
 #[cfg(feature = "mock")]
 pub use mock::MockCanAdapter;
 
+/// Backend timing capability for host-side realtime control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingCapability {
+    /// Backend provides a monotonic device/transport time base suitable for host-side closed-loop control.
+    RealtimeCapable,
+    /// Backend can be used for monitoring / recording / open-loop commands only.
+    MonitorOnly,
+}
+
 /// CAN 适配层统一错误类型
 #[derive(Error, Debug)]
 pub enum CanError {
@@ -145,6 +154,10 @@ pub trait CanAdapter {
 
 pub trait RxAdapter {
     fn receive(&mut self) -> Result<PiperFrame, CanError>;
+
+    fn timing_capability(&self) -> TimingCapability {
+        TimingCapability::RealtimeCapable
+    }
 }
 
 impl<T> RxAdapter for Box<T>
@@ -153,6 +166,10 @@ where
 {
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
         (**self).receive()
+    }
+
+    fn timing_capability(&self) -> TimingCapability {
+        (**self).timing_capability()
     }
 }
 

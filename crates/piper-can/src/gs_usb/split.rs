@@ -12,7 +12,7 @@ use crate::gs_usb::protocol::{
 };
 use crate::{
     BridgeTxAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter,
-    RxAdapter,
+    RxAdapter, TimingCapability,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -27,6 +27,9 @@ pub struct GsUsbRxAdapter {
     device: Arc<GsUsbDevice>,
     rx_timeout: Duration,
     mode: u32,
+    hw_timestamp_enabled: bool,
+    timestamp_wraps: u64,
+    last_timestamp_low: Option<u32>,
     /// 接收队列：缓存从 USB 包中解包的多余帧
     ///
     /// **性能优化**：预分配容量以避免动态扩容的内存分配抖动（Allocator Jitter）。
@@ -47,11 +50,19 @@ impl GsUsbRxAdapter {
     const MAX_QUEUE_SIZE: usize = 256;
 
     /// 创建新的 RX 适配器
-    pub fn new(device: Arc<GsUsbDevice>, rx_timeout: Duration, mode: u32) -> Self {
+    pub fn new(
+        device: Arc<GsUsbDevice>,
+        rx_timeout: Duration,
+        mode: u32,
+        hw_timestamp_enabled: bool,
+    ) -> Self {
         Self {
             device,
             rx_timeout,
             mode,
+            hw_timestamp_enabled,
+            timestamp_wraps: 0,
+            last_timestamp_low: None,
             // 关键：预分配容量，避免运行时扩容
             // 64 是经验值：足够应对突发，但不会浪费过多内存
             rx_queue: VecDeque::with_capacity(64),
@@ -310,20 +321,49 @@ impl GsUsbRxAdapter {
     }
 
     /// 转换 GsUsbFrame 到 PiperFrame
-    fn convert_to_piper_frame(&self, gs_frame: &GsUsbFrame) -> Result<PiperFrame, CanError> {
+    fn convert_to_piper_frame(&mut self, gs_frame: &GsUsbFrame) -> Result<PiperFrame, CanError> {
+        let timestamp_us = if self.hw_timestamp_enabled {
+            self.extend_hw_timestamp(gs_frame.timestamp_us)
+        } else {
+            0
+        };
+
         Ok(PiperFrame {
             id: gs_frame.can_id & CAN_EFF_MASK,
             is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
             len: gs_frame.can_dlc,
             data: gs_frame.data,
-            timestamp_us: gs_frame.timestamp_us as u64, // 保留硬件时间戳（u32 -> u64）
+            timestamp_us,
         })
+    }
+
+    fn extend_hw_timestamp(&mut self, timestamp_low: u32) -> u64 {
+        if timestamp_low == 0 {
+            return 0;
+        }
+
+        if let Some(previous) = self.last_timestamp_low
+            && timestamp_low < previous
+        {
+            self.timestamp_wraps = self.timestamp_wraps.saturating_add(1);
+        }
+
+        self.last_timestamp_low = Some(timestamp_low);
+        (self.timestamp_wraps << 32) | (timestamp_low as u64)
     }
 }
 
 impl RxAdapter for GsUsbRxAdapter {
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
         self.receive()
+    }
+
+    fn timing_capability(&self) -> TimingCapability {
+        if self.hw_timestamp_enabled {
+            TimingCapability::RealtimeCapable
+        } else {
+            TimingCapability::MonitorOnly
+        }
     }
 }
 

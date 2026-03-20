@@ -144,19 +144,6 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
-    /// 急停（无锁）
-    pub(crate) fn emergency_stop(&self) -> Result<()> {
-        // 急停不检查状态（安全优先）
-        let cmd = EmergencyStopCommand::emergency_stop();
-        let frame = cmd.to_frame();
-
-        // ✅ 直接调用，无锁
-        self.driver.send_reliable(frame)?;
-        // ✅ 注意：RawCommander 是无状态的纯指令发送器，不负责更新软件状态。
-        // Poison / Error 状态由调用层（Type State 状态机）在调用后进行状态转换处理。
-        Ok(())
-    }
-
     /// 将急停命令加入 shutdown lane，并返回确认句柄。
     pub(crate) fn emergency_stop_enqueue(
         &self,

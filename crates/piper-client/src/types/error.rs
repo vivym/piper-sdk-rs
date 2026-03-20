@@ -109,6 +109,13 @@ pub enum RobotError {
         dynamic_valid_mask: u8,
     },
 
+    /// 当前后端不支持主机侧实时闭环
+    #[error("Realtime control unsupported on current backend: {reason}")]
+    RealtimeUnsupported {
+        /// 原因说明
+        reason: String,
+    },
+
     /// 运行时健康状态异常
     #[error("Runtime health unhealthy: rx_alive={rx_alive}, tx_alive={tx_alive}, fault={fault:?}")]
     RuntimeHealthUnhealthy {
@@ -285,7 +292,10 @@ impl RobotError {
 
     /// 是否为配置错误
     pub fn is_config_error(&self) -> bool {
-        matches!(self, Self::ConfigError(_) | Self::InvalidParameter { .. })
+        matches!(
+            self,
+            Self::ConfigError(_) | Self::InvalidParameter { .. } | Self::RealtimeUnsupported { .. }
+        )
     }
 
     /// 是否为限位错误
@@ -358,6 +368,13 @@ impl RobotError {
         Self::ControlStateIncomplete {
             position_frame_valid_mask,
             dynamic_valid_mask,
+        }
+    }
+
+    /// 创建实时闭环不支持错误
+    pub fn realtime_unsupported(reason: impl Into<String>) -> Self {
+        Self::RealtimeUnsupported {
+            reason: reason.into(),
         }
     }
 

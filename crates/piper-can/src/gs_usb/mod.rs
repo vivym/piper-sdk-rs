@@ -14,6 +14,7 @@ use crate::gs_usb::protocol::*;
 use crate::gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
 use crate::{
     CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, SplittableAdapter,
+    TimingCapability,
 };
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
@@ -241,7 +242,12 @@ impl GsUsbCanAdapter {
         let device_arc = Arc::new(device);
 
         Ok((
-            GsUsbRxAdapter::new(device_arc.clone(), rx_timeout, mode),
+            GsUsbRxAdapter::new(
+                device_arc.clone(),
+                rx_timeout,
+                mode,
+                device_arc.hw_timestamp_enabled(),
+            ),
             GsUsbTxAdapter::new(device_arc),
         ))
     }
@@ -462,6 +468,14 @@ impl GsUsbCanAdapter {
     /// 对于机械臂场景，硬件时间戳对于精确的时间测量和力控算法至关重要。
     pub fn configure_listen_only(&mut self, bitrate: u32) -> Result<(), CanError> {
         self.configure_with_mode(bitrate, GS_CAN_MODE_LISTEN_ONLY | GS_CAN_MODE_HW_TIMESTAMP)
+    }
+
+    pub fn timing_capability(&self) -> TimingCapability {
+        if self.device.hw_timestamp_enabled() {
+            TimingCapability::RealtimeCapable
+        } else {
+            TimingCapability::MonitorOnly
+        }
     }
 }
 

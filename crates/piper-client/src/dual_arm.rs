@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use piper_driver::{DriverError, RuntimeFaultKind};
+use piper_driver::{DriverError, RuntimeFaultKind, TimingCapability};
 use thiserror::Error;
 
 use crate::builder::PiperBuilder;
@@ -142,6 +142,16 @@ impl DualArmActiveMit {
     where
         C: BilateralController,
     {
+        if self.left.driver.timing_capability() == TimingCapability::MonitorOnly {
+            return Err(DualArmError::from(RobotError::realtime_unsupported(
+                "left arm backend is monitor-only; bilateral host-side closed-loop control is disabled",
+            )));
+        }
+        if self.right.driver.timing_capability() == TimingCapability::MonitorOnly {
+            return Err(DualArmError::from(RobotError::realtime_unsupported(
+                "right arm backend is monitor-only; bilateral host-side closed-loop control is disabled",
+            )));
+        }
         if cfg.frequency_hz <= 0.0 {
             return Err(DualArmError::Config("frequency_hz must be > 0".to_string()));
         }
@@ -1179,19 +1189,16 @@ const FAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(10);
 
 fn compute_inter_arm_skew(left: &ControlSnapshotFull, right: &ControlSnapshotFull) -> InterArmSkew {
     let signed_position_skew_us = signed_us_diff(
-        left.position_system_timestamp_us,
-        right.position_system_timestamp_us,
+        left.position_host_rx_mono_us,
+        right.position_host_rx_mono_us,
     );
-    let signed_dynamic_skew_us = signed_us_diff(
-        left.dynamic_system_timestamp_us,
-        right.dynamic_system_timestamp_us,
-    );
+    let signed_dynamic_skew_us =
+        signed_us_diff(left.dynamic_host_rx_mono_us, right.dynamic_host_rx_mono_us);
     let position = Duration::from_micros(
-        left.position_system_timestamp_us.abs_diff(right.position_system_timestamp_us),
+        left.position_host_rx_mono_us.abs_diff(right.position_host_rx_mono_us),
     );
-    let dynamic = Duration::from_micros(
-        left.dynamic_system_timestamp_us.abs_diff(right.dynamic_system_timestamp_us),
-    );
+    let dynamic =
+        Duration::from_micros(left.dynamic_host_rx_mono_us.abs_diff(right.dynamic_host_rx_mono_us));
 
     let (effective, signed_effective_skew_us) = if position >= dynamic {
         (position, signed_position_skew_us)
@@ -1213,7 +1220,7 @@ fn calibration_read_policy() -> DualArmReadPolicy {
             max_state_skew_us: DualArmReadPolicy::default().per_arm.max_state_skew_us,
             max_feedback_age: Duration::from_millis(100),
         },
-        max_inter_arm_skew: Duration::from_millis(25),
+        max_inter_arm_skew: Duration::from_millis(50),
     }
 }
 
@@ -1865,8 +1872,8 @@ mod tests {
                     dynamic_timestamp_us: 1,
                     skew_us: 0,
                 },
-                position_system_timestamp_us: 1,
-                dynamic_system_timestamp_us: 1,
+                position_host_rx_mono_us: 1,
+                dynamic_host_rx_mono_us: 1,
                 feedback_age: Duration::from_millis(1),
             },
             right: ControlSnapshotFull {
@@ -1878,8 +1885,8 @@ mod tests {
                     dynamic_timestamp_us: 1,
                     skew_us: 0,
                 },
-                position_system_timestamp_us: 1,
-                dynamic_system_timestamp_us: 1,
+                position_host_rx_mono_us: 1,
+                dynamic_host_rx_mono_us: 1,
                 feedback_age: Duration::from_millis(1),
             },
             inter_arm_skew: Duration::ZERO,
@@ -1888,20 +1895,20 @@ mod tests {
     }
 
     fn control_snapshot_full_with_timestamps(
-        position_system_timestamp_us: u64,
-        dynamic_system_timestamp_us: u64,
+        position_host_rx_mono_us: u64,
+        dynamic_host_rx_mono_us: u64,
     ) -> ControlSnapshotFull {
         ControlSnapshotFull {
             state: crate::observer::ControlSnapshot {
                 position: JointArray::splat(Rad(0.0)),
                 velocity: JointArray::splat(RadPerSecond(0.0)),
                 torque: JointArray::splat(NewtonMeter::ZERO),
-                position_timestamp_us: position_system_timestamp_us,
-                dynamic_timestamp_us: dynamic_system_timestamp_us,
-                skew_us: signed_us_diff(position_system_timestamp_us, dynamic_system_timestamp_us),
+                position_timestamp_us: position_host_rx_mono_us,
+                dynamic_timestamp_us: dynamic_host_rx_mono_us,
+                skew_us: signed_us_diff(position_host_rx_mono_us, dynamic_host_rx_mono_us),
             },
-            position_system_timestamp_us,
-            dynamic_system_timestamp_us,
+            position_host_rx_mono_us,
+            dynamic_host_rx_mono_us,
             feedback_age: Duration::from_millis(1),
         }
     }

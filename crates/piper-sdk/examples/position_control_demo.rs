@@ -82,7 +82,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // ==================== 步骤 3: 获取当前关节位置 ====================
     println!("📍 步骤 3: 获取当前关节位置...");
     let observer = robot.observer();
-    let current_positions = observer.joint_positions();
+    let current_positions = observer.joint_positions()?;
 
     println!("   当前关节位置:");
     for (i, pos) in current_positions.iter().enumerate() {
@@ -129,7 +129,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(Duration::from_secs(10));
 
     // 读取实际位置并验证
-    let actual_positions = observer.joint_positions();
+    let actual_positions = observer.joint_positions()?;
     println!("   ✅ 运动完成");
     println!("\n   📊 目标位置 vs 实际位置对比:");
     let mut max_error = 0.0;
@@ -171,7 +171,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // 验证保持后的位置
-    let hold_positions = observer.joint_positions();
+    let hold_positions = observer.joint_positions()?;
     println!("   ✅ 保持完成");
     println!("\n   📊 保持后位置验证:");
     for (i, (target, actual)) in target_positions.iter().zip(hold_positions.iter()).enumerate() {
@@ -199,7 +199,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("   ✅ 运动完成\n");
 
     // 验证是否回到原位置
-    let final_positions = observer.joint_positions();
+    let final_positions = observer.joint_positions()?;
     println!("   最终关节位置（与初始位置对比）:");
     let mut max_return_error = 0.0;
     let mut max_return_error_joint = 0;

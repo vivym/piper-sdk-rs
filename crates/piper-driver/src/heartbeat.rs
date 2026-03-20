@@ -21,7 +21,7 @@ static APP_START: OnceLock<Instant> = OnceLock::new();
 /// - Monotonic (always increases)
 /// - Unaffected by system clock changes
 /// - Safe to store in AtomicU64
-fn get_monotonic_micros() -> u64 {
+pub fn monotonic_micros() -> u64 {
     let start = APP_START.get_or_init(Instant::now);
     start.elapsed().as_micros() as u64
 }
@@ -64,7 +64,7 @@ impl ConnectionMonitor {
         }
 
         let last_us = self.last_feedback.load(Ordering::Relaxed);
-        let now_us = get_monotonic_micros();
+        let now_us = monotonic_micros();
 
         // Safe subtraction: now_us is always >= last_us (monotonic)
         let elapsed_us = now_us.saturating_sub(last_us);
@@ -77,7 +77,7 @@ impl ConnectionMonitor {
     ///
     /// Call this after processing each CAN frame to update the last feedback time.
     pub fn register_feedback(&self) {
-        let now = get_monotonic_micros();
+        let now = monotonic_micros();
         self.last_feedback.store(now, Ordering::Relaxed);
         self.seen_feedback.store(true, Ordering::Relaxed);
     }
@@ -89,7 +89,7 @@ impl ConnectionMonitor {
         }
 
         let last_us = self.last_feedback.load(Ordering::Relaxed);
-        let now_us = get_monotonic_micros();
+        let now_us = monotonic_micros();
         Duration::from_micros(now_us.saturating_sub(last_us))
     }
 }
@@ -101,9 +101,9 @@ mod tests {
 
     #[test]
     fn test_monotonic_time_always_increases() {
-        let t1 = get_monotonic_micros();
+        let t1 = monotonic_micros();
         thread::sleep(Duration::from_millis(10));
-        let t2 = get_monotonic_micros();
+        let t2 = monotonic_micros();
 
         assert!(t2 > t1, "Monotonic time should always increase");
     }
@@ -175,16 +175,16 @@ mod tests {
 
     #[test]
     fn test_monotonic_micros_no_panic_on_system_clock_change() {
-        // This test verifies that get_monotonic_micros doesn't panic
+        // This test verifies that monotonic_micros doesn't panic
         // and continues to work correctly (monotonically increasing)
         // even if system clock changes (we can't actually test NTP changes,
         // but we verify the function doesn't panic and returns increasing values)
 
-        let mut last = get_monotonic_micros();
+        let mut last = monotonic_micros();
 
         for _ in 0..100 {
             thread::sleep(Duration::from_micros(100));
-            let current = get_monotonic_micros();
+            let current = monotonic_micros();
             assert!(
                 current >= last,
                 "Monotonic time should never decrease (current={}, last={})",

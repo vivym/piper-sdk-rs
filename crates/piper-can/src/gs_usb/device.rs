@@ -89,6 +89,10 @@ pub struct GsUsbDevice {
 }
 
 impl GsUsbDevice {
+    pub fn hw_timestamp_enabled(&self) -> bool {
+        self.hw_timestamp
+    }
+
     fn usb_timeout_from_deadline(deadline: Instant, now: Instant) -> Result<Duration, GsUsbError> {
         let Some(remaining) = deadline.checked_duration_since(now) else {
             return Err(GsUsbError::WriteTimeout);

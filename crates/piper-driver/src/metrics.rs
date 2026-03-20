@@ -81,6 +81,12 @@ pub struct PiperMetrics {
     pub tx_packages_fault_aborted_total: AtomicU64,
     /// 实时帧包因底层 transport 错误而完全失败（0 帧成功发送）的次数
     pub tx_packages_transport_failed_total: AtomicU64,
+    /// 关节位置部分帧组被丢弃的次数
+    pub rx_joint_position_groups_dropped_total: AtomicU64,
+    /// 末端位姿部分帧组被丢弃的次数
+    pub rx_end_pose_groups_dropped_total: AtomicU64,
+    /// 关节动态部分帧组被丢弃的次数
+    pub rx_joint_dynamic_groups_dropped_total: AtomicU64,
 }
 
 impl PiperMetrics {
@@ -121,6 +127,15 @@ impl PiperMetrics {
             tx_packages_transport_failed_total: self
                 .tx_packages_transport_failed_total
                 .load(Ordering::Relaxed),
+            rx_joint_position_groups_dropped_total: self
+                .rx_joint_position_groups_dropped_total
+                .load(Ordering::Relaxed),
+            rx_end_pose_groups_dropped_total: self
+                .rx_end_pose_groups_dropped_total
+                .load(Ordering::Relaxed),
+            rx_joint_dynamic_groups_dropped_total: self
+                .rx_joint_dynamic_groups_dropped_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -146,6 +161,9 @@ impl PiperMetrics {
         self.tx_packages_partial_total.store(0, Ordering::Relaxed);
         self.tx_packages_fault_aborted_total.store(0, Ordering::Relaxed);
         self.tx_packages_transport_failed_total.store(0, Ordering::Relaxed);
+        self.rx_joint_position_groups_dropped_total.store(0, Ordering::Relaxed);
+        self.rx_end_pose_groups_dropped_total.store(0, Ordering::Relaxed);
+        self.rx_joint_dynamic_groups_dropped_total.store(0, Ordering::Relaxed);
     }
 }
 
@@ -190,6 +208,12 @@ pub struct MetricsSnapshot {
     pub tx_packages_fault_aborted_total: u64,
     /// 实时帧包因 transport 错误在 0 帧成功发送时失败的次数
     pub tx_packages_transport_failed_total: u64,
+    /// 关节位置部分帧组被丢弃的次数
+    pub rx_joint_position_groups_dropped_total: u64,
+    /// 末端位姿部分帧组被丢弃的次数
+    pub rx_end_pose_groups_dropped_total: u64,
+    /// 关节动态部分帧组被丢弃的次数
+    pub rx_joint_dynamic_groups_dropped_total: u64,
 }
 
 impl MetricsSnapshot {
@@ -356,6 +380,9 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
+            rx_joint_position_groups_dropped_total: 0,
+            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_dynamic_groups_dropped_total: 0,
         };
 
         assert_eq!(snapshot.echo_filter_rate(), 20.0);
@@ -384,6 +411,9 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
+            rx_joint_position_groups_dropped_total: 0,
+            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_dynamic_groups_dropped_total: 0,
         };
 
         assert_eq!(snapshot.echo_filter_rate(), 0.0);
@@ -412,6 +442,9 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
+            rx_joint_position_groups_dropped_total: 0,
+            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_dynamic_groups_dropped_total: 0,
         };
 
         // 20% 覆盖率（正常情况）
@@ -449,6 +482,9 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
+            rx_joint_position_groups_dropped_total: 0,
+            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_dynamic_groups_dropped_total: 0,
         };
 
         // 总数为 0 时，覆盖率应该为 0.0
@@ -477,6 +513,9 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
+            rx_joint_position_groups_dropped_total: 0,
+            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_dynamic_groups_dropped_total: 0,
         };
 
         assert_eq!(snapshot.overwrite_rate(), 25.0);
@@ -504,6 +543,9 @@ mod tests {
             tx_packages_partial_total: 0,
             tx_packages_fault_aborted_total: 0,
             tx_packages_transport_failed_total: 0,
+            rx_joint_position_groups_dropped_total: 0,
+            rx_end_pose_groups_dropped_total: 0,
+            rx_joint_dynamic_groups_dropped_total: 0,
         };
         assert!(!normal.is_overwrite_rate_abnormal());
 

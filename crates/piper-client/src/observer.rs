@@ -38,11 +38,12 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::types::*;
 use piper_driver::{
     AlignmentResult, DriverError, HealthStatus, Piper as RobotPiper, RuntimeFaultKind,
+    TimingCapability,
 };
 use piper_protocol::constants::*;
 
@@ -125,20 +126,20 @@ pub struct ControlSnapshot {
 pub struct ControlSnapshotFull {
     /// 对齐后的控制状态
     pub state: ControlSnapshot,
-    /// 位置反馈主机时间戳
-    pub position_system_timestamp_us: u64,
-    /// 动态反馈主机时间戳
-    pub dynamic_system_timestamp_us: u64,
+    /// 位置反馈主机单调接收时间戳
+    pub position_host_rx_mono_us: u64,
+    /// 动态反馈主机单调接收时间戳
+    pub dynamic_host_rx_mono_us: u64,
     /// 反馈年龄（取位置/动态中的较大值）
     pub feedback_age: Duration,
 }
 
 impl ControlSnapshotFull {
-    /// 获取该快照的最新主机时间戳（微秒）
+    /// 获取该快照的最新主机单调接收时间戳（微秒）
     ///
     /// 该值仅适用于诊断/监控场景，不应用于双臂跨设备对齐判定。
-    pub fn latest_system_timestamp_us(self) -> u64 {
-        self.position_system_timestamp_us.max(self.dynamic_system_timestamp_us)
+    pub fn latest_host_rx_mono_us(self) -> u64 {
+        self.position_host_rx_mono_us.max(self.dynamic_host_rx_mono_us)
     }
 }
 
@@ -193,13 +194,12 @@ impl Observer {
 
     /// 获取带主机时间戳和反馈年龄的完整控制快照
     pub fn control_snapshot_full(&self, policy: ControlReadPolicy) -> Result<ControlSnapshotFull> {
+        self.ensure_realtime_control_supported()?;
+
         match self.driver.get_aligned_motion(policy.max_state_skew_us) {
             AlignmentResult::Ok(state) => {
                 if !state.is_complete() {
-                    return Err(RobotError::control_state_incomplete(
-                        state.position_frame_valid_mask,
-                        state.dynamic_valid_mask,
-                    ));
+                    return Err(self.incomplete_control_state_error());
                 }
 
                 let age = control_feedback_age(
@@ -224,17 +224,14 @@ impl Observer {
                         dynamic_timestamp_us: state.dynamic_timestamp_us,
                         skew_us: state.skew_us,
                     },
-                    position_system_timestamp_us: state.position_system_timestamp_us,
-                    dynamic_system_timestamp_us: state.dynamic_system_timestamp_us,
+                    position_host_rx_mono_us: state.position_system_timestamp_us,
+                    dynamic_host_rx_mono_us: state.dynamic_system_timestamp_us,
                     feedback_age: age,
                 })
             },
             AlignmentResult::Misaligned { state, .. } => {
                 if !state.is_complete() {
-                    return Err(RobotError::control_state_incomplete(
-                        state.position_frame_valid_mask,
-                        state.dynamic_valid_mask,
-                    ));
+                    return Err(self.incomplete_control_state_error());
                 }
 
                 let age = control_feedback_age(
@@ -258,10 +255,17 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 该接口可能返回部分帧组提交后的状态，只适合监控/诊断。
-    pub fn joint_positions(&self) -> JointArray<Rad> {
-        let raw_pos = self.driver.get_joint_position();
-        JointArray::new(raw_pos.joint_pos.map(Rad))
+    /// 默认只返回严格完整的快照；如需查看半成品/诊断数据，请使用 `raw_joint_position_state()`。
+    pub fn joint_positions(&self) -> Result<JointArray<Rad>> {
+        let joint_pos = self.driver.get_joint_position();
+        if !joint_pos.is_fully_valid() {
+            return Err(RobotError::control_state_incomplete(
+                joint_pos.frame_valid_mask,
+                self.driver.get_joint_dynamic().valid_mask,
+            ));
+        }
+
+        Ok(JointArray::new(joint_pos.joint_pos.map(Rad)))
     }
 
     /// 获取关节速度（监控/诊断接口）
@@ -274,10 +278,16 @@ impl Observer {
     /// # 返回值
     ///
     /// 返回 `JointArray<RadPerSecond>`，保持类型安全。
-    pub fn joint_velocities(&self) -> JointArray<RadPerSecond> {
+    pub fn joint_velocities(&self) -> Result<JointArray<RadPerSecond>> {
         let dyn_state = self.driver.get_joint_dynamic();
-        // ✅ 使用类型安全的单位
-        JointArray::new(dyn_state.joint_vel.map(RadPerSecond))
+        if !dyn_state.is_complete() {
+            return Err(RobotError::control_state_incomplete(
+                self.driver.get_joint_position().frame_valid_mask,
+                dyn_state.valid_mask,
+            ));
+        }
+
+        Ok(JointArray::new(dyn_state.joint_vel.map(RadPerSecond)))
     }
 
     /// 获取关节力矩（监控/诊断接口）
@@ -285,10 +295,34 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 该接口可能返回 timeout 提交的部分动态组，只适合监控/诊断。
-    pub fn joint_torques(&self) -> JointArray<NewtonMeter> {
+    /// 默认只返回严格完整的动态组；如需查看半成品/诊断数据，请使用 `raw_joint_dynamic_state()`。
+    pub fn joint_torques(&self) -> Result<JointArray<NewtonMeter>> {
         let dyn_state = self.driver.get_joint_dynamic();
-        JointArray::new(dyn_state.get_all_torques().map(NewtonMeter))
+        if !dyn_state.is_complete() {
+            return Err(RobotError::control_state_incomplete(
+                self.driver.get_joint_position().frame_valid_mask,
+                dyn_state.valid_mask,
+            ));
+        }
+
+        Ok(JointArray::new(
+            dyn_state.get_all_torques().map(NewtonMeter),
+        ))
+    }
+
+    /// 获取原始关节位置状态（允许部分帧组，仅供诊断）
+    pub fn raw_joint_position_state(&self) -> piper_driver::JointPositionState {
+        self.driver.get_raw_joint_position()
+    }
+
+    /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
+    pub fn raw_joint_dynamic_state(&self) -> piper_driver::JointDynamicState {
+        self.driver.get_raw_joint_dynamic()
+    }
+
+    /// 获取原始末端位姿状态（允许部分帧组，仅供诊断）
+    pub fn raw_end_pose_state(&self) -> piper_driver::state::EndPoseState {
+        self.driver.get_raw_end_pose()
     }
 
     /// 获取夹爪状态
@@ -379,14 +413,11 @@ impl Observer {
     /// 返回 (position, velocity, torque) 元组。
     /// **注意**：此方法独立读取，可能与其他状态有时间偏斜。
     /// 如需控制闭环使用，请改用 `control_snapshot()`。
-    pub fn joint_state(&self, joint: Joint) -> (Rad, RadPerSecond, NewtonMeter) {
-        let pos = self.driver.get_joint_position();
-        let dyn_state = self.driver.get_joint_dynamic();
-        (
-            Rad(pos.joint_pos[joint.index()]),
-            RadPerSecond(dyn_state.joint_vel[joint.index()]),
-            NewtonMeter(dyn_state.get_torque(joint.index())),
-        )
+    pub fn joint_state(&self, joint: Joint) -> Result<(Rad, RadPerSecond, NewtonMeter)> {
+        let positions = self.joint_positions()?;
+        let velocities = self.joint_velocities()?;
+        let torques = self.joint_torques()?;
+        Ok((positions[joint], velocities[joint], torques[joint]))
     }
 
     // ============================================================
@@ -466,6 +497,24 @@ impl Observer {
     ) -> std::result::Result<CollisionProtectionSnapshot, DriverError> {
         self.driver.get_collision_protection().map(CollisionProtectionSnapshot::from)
     }
+
+    fn ensure_realtime_control_supported(&self) -> Result<()> {
+        match self.driver.timing_capability() {
+            TimingCapability::RealtimeCapable => Ok(()),
+            TimingCapability::MonitorOnly => Err(RobotError::realtime_unsupported(
+                "backend does not provide reliable hardware alignment timestamps; host-side closed-loop control is disabled",
+            )),
+        }
+    }
+
+    fn incomplete_control_state_error(&self) -> RobotError {
+        let raw_motion = self.driver.capture_raw_motion_snapshot();
+        let raw_dynamic = self.driver.get_raw_joint_dynamic();
+        RobotError::control_state_incomplete(
+            raw_motion.joint_position.frame_valid_mask,
+            raw_dynamic.valid_mask,
+        )
+    }
 }
 
 fn control_feedback_age(
@@ -482,10 +531,7 @@ fn system_timestamp_age(timestamp_us: u64) -> Duration {
         return Duration::MAX;
     }
 
-    let now_us = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_micros() as u64,
-        Err(_) => return Duration::MAX,
-    };
+    let now_us = piper_driver::heartbeat::monotonic_micros();
 
     if now_us < timestamp_us {
         return Duration::MAX;
@@ -523,6 +569,7 @@ unsafe impl Sync for Observer {}
 mod tests {
     use super::*;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
+    use piper_driver::TimingCapability;
     use piper_protocol::ids::{
         ID_GRIPPER_FEEDBACK, ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12,
         ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
@@ -546,6 +593,28 @@ mod tests {
     impl RxAdapter for ScriptedRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
             self.frames.pop_front().ok_or(CanError::Timeout)
+        }
+    }
+
+    struct MonitorOnlyRxAdapter {
+        inner: ScriptedRxAdapter,
+    }
+
+    impl MonitorOnlyRxAdapter {
+        fn new(frames: Vec<PiperFrame>) -> Self {
+            Self {
+                inner: ScriptedRxAdapter::new(frames),
+            }
+        }
+    }
+
+    impl RxAdapter for MonitorOnlyRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            self.inner.receive()
+        }
+
+        fn timing_capability(&self) -> TimingCapability {
+            TimingCapability::MonitorOnly
         }
     }
 
@@ -639,12 +708,12 @@ mod tests {
                 dynamic_timestamp_us: 100,
                 skew_us: 0,
             },
-            position_system_timestamp_us: 1_000,
-            dynamic_system_timestamp_us: 2_000,
+            position_host_rx_mono_us: 1_000,
+            dynamic_host_rx_mono_us: 2_000,
             feedback_age: Duration::from_millis(5),
         };
 
-        assert_eq!(snapshot.latest_system_timestamp_us(), 2_000);
+        assert_eq!(snapshot.latest_host_rx_mono_us(), 2_000);
     }
 
     fn joint_feedback_frame(
@@ -704,6 +773,15 @@ mod tests {
     fn start_observer_with_timed_frames(frames: Vec<TimedFrame>) -> (Arc<RobotPiper>, Observer) {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(PacedRxAdapter::new(frames), IdleTxAdapter, None)
+                .expect("driver should start"),
+        );
+        let observer = Observer::new(driver.clone());
+        (driver, observer)
+    }
+
+    fn start_monitor_only_observer(frames: Vec<PiperFrame>) -> (Arc<RobotPiper>, Observer) {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(MonitorOnlyRxAdapter::new(frames), IdleTxAdapter, None)
                 .expect("driver should start"),
         );
         let observer = Observer::new(driver.clone());
@@ -819,8 +897,8 @@ mod tests {
 
         assert_eq!(snapshot.state.position_timestamp_us, position_timestamp_us);
         assert_eq!(snapshot.state.dynamic_timestamp_us, dynamic_timestamp_us);
-        assert!(snapshot.position_system_timestamp_us > 0);
-        assert!(snapshot.dynamic_system_timestamp_us > 0);
+        assert!(snapshot.position_host_rx_mono_us > 0);
+        assert!(snapshot.dynamic_host_rx_mono_us > 0);
         assert!(snapshot.feedback_age < Duration::from_millis(200));
     }
 
@@ -853,6 +931,33 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, RobotError::FeedbackStale { .. }));
+    }
+
+    #[test]
+    fn test_control_snapshot_rejects_monitor_only_backend() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(2, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(3, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(4, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(5, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(6, 1000, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_monitor_only_observer(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+
+        let error = observer
+            .control_snapshot(ControlReadPolicy::default())
+            .expect_err("monitor-only backend must reject host-side closed-loop reads");
+
+        assert!(matches!(error, RobotError::RealtimeUnsupported { .. }));
     }
 
     #[test]

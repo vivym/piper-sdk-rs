@@ -144,7 +144,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             robot.observer().clone()
         };
 
-        let positions = observer.joint_positions();
+        let positions = observer.joint_positions()?;
         sample_count += 1;
 
         // 每秒输出一次状态

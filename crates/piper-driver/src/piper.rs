@@ -11,7 +11,9 @@ use crate::metrics::{MetricsSnapshot, PiperMetrics};
 use crate::pipeline::*;
 use crate::state::*;
 use crossbeam_channel::{Receiver, Sender};
-use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter};
+use piper_can::{
+    CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter, TimingCapability,
+};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -105,7 +107,7 @@ pub(crate) enum RuntimePhase {
     Stopping = 2,
 }
 
-pub(crate) const NORMAL_FRAME_SEND_BUDGET: Duration = Duration::from_millis(5);
+pub(crate) const NORMAL_FRAME_SEND_BUDGET: Duration = Duration::from_micros(500);
 
 #[doc(hidden)]
 #[derive(Debug, Default)]
@@ -225,6 +227,8 @@ pub struct Piper {
     bus_speed: u32,
     /// Driver 工作模式（用于回放模式控制）
     driver_mode: crate::mode::AtomicDriverMode,
+    /// Timing capability of the active backend.
+    timing_capability: TimingCapability,
 }
 
 impl Piper {
@@ -325,6 +329,7 @@ impl Piper {
         tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
     ) -> Result<Self, CanError> {
+        let timing_capability = rx_adapter.timing_capability();
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<ShutdownCommand>(4);
@@ -396,7 +401,12 @@ impl Piper {
             interface: "unknown".to_string(),
             bus_speed: 1_000_000,
             driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
+            timing_capability,
         })
+    }
+
+    pub fn timing_capability(&self) -> TimingCapability {
+        self.timing_capability
     }
 
     /// 获取运行时健康状态。
@@ -470,6 +480,11 @@ impl Piper {
         self.ctx.joint_dynamic.load().as_ref().clone()
     }
 
+    /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
+    pub fn get_raw_joint_dynamic(&self) -> JointDynamicState {
+        self.ctx.raw_joint_dynamic.load().as_ref().clone()
+    }
+
     /// 获取关节位置状态（无锁，纳秒级返回）
     ///
     /// 包含6个关节的位置信息（500Hz更新）。
@@ -485,6 +500,11 @@ impl Piper {
         self.ctx.joint_position.load().as_ref().clone()
     }
 
+    /// 获取原始关节位置状态（允许部分帧组，仅供诊断）
+    pub fn get_raw_joint_position(&self) -> JointPositionState {
+        self.ctx.raw_joint_position.load().as_ref().clone()
+    }
+
     /// 获取末端位姿状态（无锁，纳秒级返回）
     ///
     /// 包含末端执行器的位置和姿态信息（500Hz更新）。
@@ -498,6 +518,11 @@ impl Piper {
     /// - 此状态与 `JointPositionState` 不是原子更新的，如需同时获取，请使用 `capture_motion_snapshot()`
     pub fn get_end_pose(&self) -> EndPoseState {
         self.ctx.end_pose.load().as_ref().clone()
+    }
+
+    /// 获取原始末端位姿状态（允许部分帧组，仅供诊断）
+    pub fn get_raw_end_pose(&self) -> EndPoseState {
+        self.ctx.raw_end_pose.load().as_ref().clone()
     }
 
     /// 获取运动快照（无锁，纳秒级返回）
@@ -522,6 +547,11 @@ impl Piper {
     /// ```
     pub fn capture_motion_snapshot(&self) -> MotionSnapshot {
         self.ctx.capture_motion_snapshot()
+    }
+
+    /// 获取原始运动快照（允许部分帧组，仅供诊断）
+    pub fn capture_raw_motion_snapshot(&self) -> MotionSnapshot {
+        self.ctx.capture_raw_motion_snapshot()
     }
 
     /// 获取机器人控制状态（无锁）

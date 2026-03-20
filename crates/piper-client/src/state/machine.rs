@@ -1262,11 +1262,11 @@ impl<State> Piper<State> {
     /// // robot.command_torques(...); // ❌ 编译错误
     /// ```
     pub fn emergency_stop(self) -> Result<Piper<ErrorState>> {
-        // === PHASE 1: All operations that can panic ===
-
-        // 发送急停指令（可靠队列，安全优先）
+        self.driver.latch_fault();
         let raw_commander = RawCommander::new(&self.driver);
-        raw_commander.emergency_stop()?;
+        let receipt =
+            raw_commander.emergency_stop_enqueue(Instant::now() + Duration::from_millis(20))?;
+        receipt.wait()?;
 
         // === PHASE 2: No-panic zone - must not panic after this point ===
 
@@ -2081,14 +2081,14 @@ impl Piper<Active<PositionMode>> {
     /// robot.command_position(Joint::J1, Rad(1.57))?;
     ///
     /// // 更新多个关节，使用批量方法
-    /// let mut positions = robot.observer().joint_positions();
+    /// let mut positions = robot.observer().joint_positions()?;
     /// positions[Joint::J1] = Rad(1.0);
     /// positions[Joint::J2] = Rad(0.5);
     /// robot.motion_commander().send_position_command(&positions)?;
     /// ```
     pub fn command_position(&self, joint: Joint, position: Rad) -> Result<()> {
         // 读取当前所有关节位置
-        let mut positions = self.observer.joint_positions();
+        let mut positions = self.observer.joint_positions()?;
         // 只更新目标关节
         positions[joint] = position;
         // 批量发送所有关节（包括更新的和未更新的）

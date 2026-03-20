@@ -915,14 +915,22 @@ use crate::hooks::HookManager;
 pub struct PiperContext {
     // === 热数据（500Hz，高频运动数据）===
     // 使用 ArcSwap，无锁读取，适合高频控制循环
-    /// 关节位置状态（帧组同步：0x2A5-0x2A7）
+    /// 严格关节位置状态（完整帧组同步：0x2A5-0x2A7）
     pub joint_position: Arc<ArcSwap<JointPositionState>>,
-    /// 末端位姿状态（帧组同步：0x2A2-0x2A4）
+    /// 严格末端位姿状态（完整帧组同步：0x2A2-0x2A4）
     pub end_pose: Arc<ArcSwap<EndPoseState>>,
-    /// 运动状态快照（单次 load 保证逻辑原子）
+    /// 严格运动状态快照（单次 load 保证逻辑原子）
     pub motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
-    /// 关节动态状态（独立帧 + Buffered Commit：关节速度 + 电流）
+    /// 严格关节动态状态（完整动态组提交）
     pub joint_dynamic: Arc<ArcSwap<JointDynamicState>>,
+    /// 原始关节位置状态（允许部分帧组）
+    pub raw_joint_position: Arc<ArcSwap<JointPositionState>>,
+    /// 原始末端位姿状态（允许部分帧组）
+    pub raw_end_pose: Arc<ArcSwap<EndPoseState>>,
+    /// 原始运动状态快照（单次 load 保证逻辑原子）
+    pub raw_motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
+    /// 原始关节动态状态（允许部分动态组）
+    pub raw_joint_dynamic: Arc<ArcSwap<JointDynamicState>>,
 
     // === 温数据（200Hz，控制状态）===
     // 使用 ArcSwap，更新频率中等，但需要原子性
@@ -1036,6 +1044,10 @@ impl PiperContext {
             end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
             motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
             joint_dynamic: Arc::new(ArcSwap::from_pointee(JointDynamicState::default())),
+            raw_joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
+            raw_end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
+            raw_motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
+            raw_joint_dynamic: Arc::new(ArcSwap::from_pointee(JointDynamicState::default())),
 
             // 温数据：ArcSwap
             robot_control: Arc::new(ArcSwap::from_pointee(RobotControlState::default())),
@@ -1100,6 +1112,11 @@ impl PiperContext {
         self.motion_snapshot.load().as_ref().clone()
     }
 
+    /// 捕获原始运动状态快照（允许部分帧组，仅供诊断）
+    pub fn capture_raw_motion_snapshot(&self) -> MotionSnapshot {
+        self.raw_motion_snapshot.load().as_ref().clone()
+    }
+
     /// 发布新的关节位置，并与当前末端位姿组合成逻辑原子快照。
     pub fn publish_joint_position(&self, joint_position: JointPositionState) {
         let end_pose = self.end_pose.load();
@@ -1110,11 +1127,31 @@ impl PiperContext {
         }));
     }
 
+    /// 发布新的原始关节位置，并与当前原始末端位姿组合成逻辑原子快照。
+    pub fn publish_raw_joint_position(&self, joint_position: JointPositionState) {
+        let end_pose = self.raw_end_pose.load();
+        self.raw_joint_position.store(Arc::new(joint_position.clone()));
+        self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
+            joint_position,
+            end_pose: end_pose.as_ref().clone(),
+        }));
+    }
+
     /// 发布新的末端位姿，并与当前关节位置组合成逻辑原子快照。
     pub fn publish_end_pose(&self, end_pose: EndPoseState) {
         let joint_position = self.joint_position.load();
         self.end_pose.store(Arc::new(end_pose.clone()));
         self.motion_snapshot.store(Arc::new(MotionSnapshot {
+            joint_position: joint_position.as_ref().clone(),
+            end_pose,
+        }));
+    }
+
+    /// 发布新的原始末端位姿，并与当前原始关节位置组合成逻辑原子快照。
+    pub fn publish_raw_end_pose(&self, end_pose: EndPoseState) {
+        let joint_position = self.raw_joint_position.load();
+        self.raw_end_pose.store(Arc::new(end_pose.clone()));
+        self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
             joint_position: joint_position.as_ref().clone(),
             end_pose,
         }));

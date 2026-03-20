@@ -22,7 +22,7 @@
 //! - **线程安全**：RX 和 TX 适配器可以在不同线程中并发使用
 //! - **时间戳支持**：使用 `recvmsg` 和 CMSG 提取硬件/软件时间戳（与 `SocketCanAdapter` 一致）
 
-use crate::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
+use crate::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, TimingCapability};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socketcan::{
@@ -358,6 +358,10 @@ impl RxAdapter for SocketCanRxAdapter {
         // Hot path: removed trace! call (200Hz+)
 
         Ok(piper_frame)
+    }
+
+    fn timing_capability(&self) -> TimingCapability {
+        TimingCapability::RealtimeCapable
     }
 }
 

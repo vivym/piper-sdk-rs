@@ -62,6 +62,7 @@ use tracing::{error, warn};
 use crate::observer::{ControlReadPolicy, Observer};
 use crate::state::machine::{Active, DisableConfig, MitMode, Piper, Standby};
 use crate::types::*;
+use piper_driver::TimingCapability;
 
 /// MIT 控制器配置
 #[derive(Debug, Clone)]
@@ -166,18 +167,24 @@ impl MitController {
     /// # // let piper = ...;
     /// #
     /// let config = MitControllerConfig::default();
-    /// # // let controller = MitController::new(piper, config);
+    /// # // let controller = MitController::new(piper, config)?;
     /// # // 使用 controller 进行控制...
     /// ```
-    pub fn new(piper: Piper<Active<MitMode>>, config: MitControllerConfig) -> Self {
+    pub fn new(piper: Piper<Active<MitMode>>, config: MitControllerConfig) -> Result<Self> {
+        if piper.driver.timing_capability() == TimingCapability::MonitorOnly {
+            return Err(RobotError::realtime_unsupported(
+                "MIT controller requires a realtime-capable backend with reliable hardware alignment timestamps",
+            ));
+        }
+
         // 提取 observer（Clone 是轻量的，Arc 指针）
         let observer = piper.observer().clone();
 
-        Self {
+        Ok(Self {
             piper: Some(piper),
             observer,
             config,
-        }
+        })
     }
 
     /// 阻塞式运动到目标位置

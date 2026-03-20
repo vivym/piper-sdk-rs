@@ -34,6 +34,7 @@ use crate::Piper;
 use crate::observer::ControlReadPolicy;
 use crate::state::{Active, MitMode};
 use crate::types::RobotError;
+use piper_driver::TimingCapability;
 use std::time::Duration;
 
 /// 控制循环配置
@@ -125,6 +126,8 @@ where
     C: Controller,
     RobotError: From<C::Error>,
 {
+    ensure_realtime_control_supported(&piper)?;
+
     // ✅ 输入验证
     if config.frequency_hz <= 0.0 {
         return Err(RobotError::ConfigError(format!(
@@ -212,6 +215,8 @@ where
     C: Controller,
     RobotError: From<C::Error>,
 {
+    ensure_realtime_control_supported(&piper)?;
+
     // ✅ 输入验证
     if config.frequency_hz <= 0.0 {
         return Err(RobotError::ConfigError(format!(
@@ -269,6 +274,15 @@ where
         )?;
 
         iteration += 1;
+    }
+}
+
+fn ensure_realtime_control_supported(piper: &Piper<Active<MitMode>>) -> Result<(), RobotError> {
+    match piper.driver.timing_capability() {
+        TimingCapability::RealtimeCapable => Ok(()),
+        TimingCapability::MonitorOnly => Err(RobotError::realtime_unsupported(
+            "controller loop requires a realtime-capable backend with reliable hardware alignment timestamps",
+        )),
     }
 }
 
