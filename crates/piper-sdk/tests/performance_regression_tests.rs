@@ -10,8 +10,8 @@ use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::TimingCapability;
 use piper_sdk::driver::command::{PiperCommand, ReliableCommand};
 use piper_sdk::driver::{
-    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop,
-    tx_loop_mailbox,
+    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig, PiperContext,
+    PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -368,6 +368,8 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let last_fault = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
+    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
 
     // 创建 RX 适配器
     let rx_adapter = SimpleRxAdapter::new(frequency_hz, test_duration);
@@ -389,6 +391,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let runtime_phase_rx = runtime_phase.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
+    let maintenance_state_signal_rx = maintenance_state_signal.clone();
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
@@ -399,6 +402,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             runtime_phase_rx,
             metrics_rx,
             last_fault_rx,
+            maintenance_state_signal_rx,
         );
     });
 
@@ -408,6 +412,8 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let runtime_phase_tx = runtime_phase.clone();
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
+    let maintenance_state_signal_tx = maintenance_state_signal.clone();
+    let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
@@ -421,6 +427,8 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             metrics_tx,
             ctx_tx,
             last_fault_tx,
+            maintenance_state_signal_tx,
+            maintenance_lease_gate_tx,
         );
     });
 
@@ -580,6 +588,8 @@ fn test_command_priority_performance() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let last_fault = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
+    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
 
     // 创建 TX 适配器
     let tx_adapter = SimpleTxAdapter::new(Duration::from_micros(100));
@@ -597,6 +607,8 @@ fn test_command_priority_performance() {
     let runtime_phase_tx = runtime_phase.clone();
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
+    let maintenance_state_signal_tx = maintenance_state_signal.clone();
+    let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
@@ -610,6 +622,8 @@ fn test_command_priority_performance() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
+            maintenance_state_signal_tx,
+            maintenance_lease_gate_tx,
         );
     });
 
@@ -642,6 +656,8 @@ fn test_command_priority_performance() {
     let runtime_phase2 = Arc::new(AtomicU8::new(0));
     let last_fault2 = Arc::new(AtomicU8::new(0));
     let metrics2 = Arc::new(PiperMetrics::new());
+    let maintenance_state_signal2 = Arc::new(MaintenanceStateSignal::default());
+    let maintenance_lease_gate2 = Arc::new(MaintenanceLeaseGate::default());
     let tx_adapter2 = SimpleTxAdapter::new(Duration::from_micros(100));
     let (_reliable_tx2, reliable_rx2) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane2 = Arc::new(ShutdownLane::new());
@@ -654,6 +670,8 @@ fn test_command_priority_performance() {
     let runtime_phase_tx2 = runtime_phase2.clone();
     let metrics_tx2 = metrics2.clone();
     let last_fault_tx2 = last_fault2.clone();
+    let maintenance_state_signal_tx2 = maintenance_state_signal2.clone();
+    let maintenance_lease_gate_tx2 = maintenance_lease_gate2.clone();
     let tx_handle2 = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
@@ -667,6 +685,8 @@ fn test_command_priority_performance() {
             metrics_tx2,
             ctx_tx2,
             last_fault_tx2,
+            maintenance_state_signal_tx2,
+            maintenance_lease_gate_tx2,
         );
     });
 

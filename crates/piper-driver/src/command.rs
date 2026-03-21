@@ -58,6 +58,32 @@ pub enum ReliableCommandKind {
     Maintenance,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceCommandMeta {
+    session_id: u32,
+    lease_epoch: u64,
+}
+
+impl MaintenanceCommandMeta {
+    #[inline]
+    pub fn new(session_id: u32, lease_epoch: u64) -> Self {
+        Self {
+            session_id,
+            lease_epoch,
+        }
+    }
+
+    #[inline]
+    pub fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    #[inline]
+    pub fn lease_epoch(&self) -> u64 {
+        self.lease_epoch
+    }
+}
+
 #[derive(Debug)]
 pub struct RealtimeCommand {
     frames: FrameBuffer,
@@ -148,6 +174,7 @@ pub struct ReliableCommand {
     frame: PiperFrame,
     ack: Option<ReliableAck>,
     kind: ReliableCommandKind,
+    maintenance: Option<MaintenanceCommandMeta>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +217,7 @@ impl ReliableCommand {
             frame,
             ack: None,
             kind: ReliableCommandKind::Standard,
+            maintenance: None,
         }
     }
 
@@ -199,15 +227,22 @@ impl ReliableCommand {
             frame,
             ack: Some(ack),
             kind: ReliableCommandKind::Standard,
+            maintenance: None,
         }
     }
 
     #[inline]
-    pub fn maintenance_confirmed(frame: PiperFrame, ack: ReliableAck) -> Self {
+    pub fn maintenance_confirmed(
+        frame: PiperFrame,
+        session_id: u32,
+        lease_epoch: u64,
+        ack: ReliableAck,
+    ) -> Self {
         Self {
             frame,
             ack: Some(ack),
             kind: ReliableCommandKind::Maintenance,
+            maintenance: Some(MaintenanceCommandMeta::new(session_id, lease_epoch)),
         }
     }
 
@@ -219,6 +254,11 @@ impl ReliableCommand {
     #[inline]
     pub fn kind(&self) -> ReliableCommandKind {
         self.kind
+    }
+
+    #[inline]
+    pub fn maintenance(&self) -> Option<MaintenanceCommandMeta> {
+        self.maintenance
     }
 
     #[inline]

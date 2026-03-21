@@ -422,6 +422,7 @@ pub fn io_loop(
             &config,
             &mut state,
             &metrics,
+            None,
         );
 
         // ============================================================
@@ -512,6 +513,7 @@ pub fn rx_loop(
     runtime_phase: Arc<AtomicU8>,
     metrics: Arc<PiperMetrics>,
     last_fault: Arc<AtomicU8>,
+    maintenance_state_signal: Arc<crate::piper::MaintenanceStateSignal>,
 ) {
     // 设置线程优先级（可选 feature）
     #[cfg(feature = "realtime")]
@@ -596,6 +598,7 @@ pub fn rx_loop(
                     error!("RX thread: Fatal error detected, latching runtime fault");
                     record_fault(&last_fault, RuntimeFaultKind::TransportError);
                     store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                    maintenance_state_signal.note();
                     break;
                 }
 
@@ -627,6 +630,7 @@ pub fn rx_loop(
             &config,
             &mut state,
             &metrics,
+            Some(&maintenance_state_signal),
         );
 
         // 双线程 runtime 也必须刷新连接监控，否则 health()/wait_for_feedback()
@@ -638,6 +642,7 @@ pub fn rx_loop(
         && load_runtime_phase(&runtime_phase) == RuntimePhase::Running
     {
         record_fault(&last_fault, RuntimeFaultKind::RxExited);
+        maintenance_state_signal.note();
     }
     trace!("RX thread: loop exited");
 }
@@ -668,6 +673,8 @@ pub fn tx_loop_mailbox(
     metrics: Arc<PiperMetrics>,
     ctx: Arc<PiperContext>,
     last_fault: Arc<AtomicU8>,
+    maintenance_state_signal: Arc<crate::piper::MaintenanceStateSignal>,
+    maintenance_lease_gate: Arc<crate::piper::MaintenanceLeaseGate>,
 ) {
     loop {
         let phase = load_runtime_phase(&runtime_phase);
@@ -769,6 +776,7 @@ pub fn tx_loop_mailbox(
                         }
                         record_fault(&last_fault, RuntimeFaultKind::TransportError);
                         store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                        maintenance_state_signal.note();
                         delivery_error = Some(crate::DriverError::RealtimeDeliveryFailed {
                             sent: sent_count,
                             total: total_frames,
@@ -828,6 +836,7 @@ pub fn tx_loop_mailbox(
 
             let frame = command.frame();
             let ack = command.take_ack();
+            let maintenance_meta = command.maintenance();
             let is_maintenance = matches!(
                 command.kind(),
                 crate::command::ReliableCommandKind::Maintenance
@@ -835,28 +844,39 @@ pub fn tx_loop_mailbox(
             let send_result = if is_maintenance {
                 if let Some(denied) = maintenance_write_denial(&runtime_phase, &ctx, &last_fault) {
                     Err(denied)
-                } else {
-                    match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
-                        Ok(_) => {
-                            metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+                } else if let Some(meta) = maintenance_meta {
+                    if !maintenance_lease_gate.is_valid(meta.session_id(), meta.lease_epoch()) {
+                        Err(crate::DriverError::MaintenanceWriteDenied(
+                            "maintenance lease is no longer valid".to_string(),
+                        ))
+                    } else {
+                        match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
+                            Ok(_) => {
+                                metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 
-                            if let Ok(hooks) = ctx.hooks.try_read() {
-                                hooks.trigger_all_sent(&frame);
-                            }
-                            Ok(())
-                        },
-                        Err(e) => {
-                            error!("TX thread: Failed to send maintenance frame: {}", e);
-                            if matches!(e, CanError::Timeout) {
-                                metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                            Err(crate::DriverError::ReliableDeliveryFailed { source: e })
-                        },
+                                if let Ok(hooks) = ctx.hooks.try_read() {
+                                    hooks.trigger_all_sent(&frame);
+                                }
+                                Ok(())
+                            },
+                            Err(e) => {
+                                error!("TX thread: Failed to send maintenance frame: {}", e);
+                                if matches!(e, CanError::Timeout) {
+                                    metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                                record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                                store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                                maintenance_state_signal.note();
+                                Err(crate::DriverError::ReliableDeliveryFailed { source: e })
+                            },
+                        }
                     }
+                } else {
+                    Err(crate::DriverError::MaintenanceWriteDenied(
+                        "missing maintenance lease metadata".to_string(),
+                    ))
                 }
             } else {
                 match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
@@ -877,6 +897,7 @@ pub fn tx_loop_mailbox(
                         }
                         record_fault(&last_fault, RuntimeFaultKind::TransportError);
                         store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                        maintenance_state_signal.note();
                         Err(crate::DriverError::ReliableDeliveryFailed { source: e })
                     },
                 }
@@ -908,6 +929,7 @@ pub fn tx_loop_mailbox(
         && load_runtime_phase(&runtime_phase) == RuntimePhase::Running
     {
         record_fault(&last_fault, RuntimeFaultKind::TxExited);
+        maintenance_state_signal.note();
     }
     shutdown_lane.close_with(Err(crate::DriverError::ChannelClosed));
     drain_reliable_queue(&reliable_rx, &metrics, false, false);
@@ -1063,6 +1085,7 @@ fn parse_and_update_state(
     config: &PipelineConfig,
     state: &mut ParserState,
     metrics: &Arc<PiperMetrics>,
+    maintenance_state_signal: Option<&Arc<crate::piper::MaintenanceStateSignal>>,
 ) {
     match frame.id {
         ID_JOINT_FEEDBACK_12 => {
@@ -1330,7 +1353,14 @@ fn parse_and_update_state(
                     feedback_counter: 0,
                 };
 
-                ctx.robot_control.store(Arc::new(new_robot_control_state));
+                let previous = ctx.robot_control.load();
+                let previous_enabled = previous.is_enabled;
+                ctx.robot_control.store(Arc::new(new_robot_control_state.clone()));
+                if previous_enabled != new_robot_control_state.is_enabled
+                    && let Some(signal) = maintenance_state_signal
+                {
+                    signal.note();
+                }
                 ctx.fps_stats
                     .load()
                     .robot_control_updates

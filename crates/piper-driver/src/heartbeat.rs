@@ -92,6 +92,20 @@ impl ConnectionMonitor {
         let now_us = monotonic_micros();
         Duration::from_micros(now_us.saturating_sub(last_us))
     }
+
+    /// Remaining time until the connection would be considered lost.
+    pub fn remaining_until_timeout(&self) -> Option<Duration> {
+        if !self.seen_feedback.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let elapsed = self.time_since_last_feedback();
+        if elapsed >= self.timeout {
+            None
+        } else {
+            Some(self.timeout.saturating_sub(elapsed))
+        }
+    }
 }
 
 #[cfg(test)]

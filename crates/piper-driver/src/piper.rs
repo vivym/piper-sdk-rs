@@ -13,8 +13,8 @@ use piper_can::{
     CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter, TimingCapability,
 };
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{JoinHandle, spawn};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -164,6 +164,138 @@ impl NormalSendPermit<'_> {
     pub(crate) fn still_open(&self) -> bool {
         !self.gate.closed.load(Ordering::Acquire)
             && self.gate.epoch.load(Ordering::Acquire) == self.epoch
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct MaintenanceStateSignal {
+    epoch: AtomicU64,
+    wait_lock: Mutex<()>,
+    wait_cv: Condvar,
+}
+
+impl MaintenanceStateSignal {
+    pub fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    pub fn note(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.wait_cv.notify_all();
+    }
+
+    pub fn wait_for_change_after(&self, observed_epoch: u64, timeout: Option<Duration>) -> bool {
+        if self.current_epoch() != observed_epoch {
+            return true;
+        }
+
+        match timeout {
+            Some(timeout) => {
+                let start = Instant::now();
+                let mut remaining = timeout;
+                let mut guard = self.wait_lock.lock().unwrap();
+                loop {
+                    if self.current_epoch() != observed_epoch {
+                        return true;
+                    }
+
+                    let (next_guard, wait_result) =
+                        self.wait_cv.wait_timeout(guard, remaining).unwrap();
+                    guard = next_guard;
+                    if self.current_epoch() != observed_epoch {
+                        return true;
+                    }
+                    if wait_result.timed_out() {
+                        return false;
+                    }
+
+                    let elapsed = start.elapsed();
+                    if elapsed >= timeout {
+                        return false;
+                    }
+                    remaining = timeout.saturating_sub(elapsed);
+                }
+            },
+            None => {
+                let mut guard = self.wait_lock.lock().unwrap();
+                loop {
+                    if self.current_epoch() != observed_epoch {
+                        return true;
+                    }
+                    guard = self.wait_cv.wait(guard).unwrap();
+                }
+            },
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct MaintenanceLeaseGate {
+    holder_session_id: AtomicU32,
+    lease_epoch: AtomicU64,
+    admin_lock: Mutex<()>,
+}
+
+impl MaintenanceLeaseGate {
+    pub fn snapshot(&self) -> (Option<u32>, u64) {
+        (
+            match self.holder_session_id.load(Ordering::Acquire) {
+                0 => None,
+                holder => Some(holder),
+            },
+            self.lease_epoch.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn current_holder(&self) -> Option<u32> {
+        match self.holder_session_id.load(Ordering::Acquire) {
+            0 => None,
+            holder => Some(holder),
+        }
+    }
+
+    pub fn current_epoch(&self) -> u64 {
+        self.lease_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn grant(&self, session_id: u32) -> (bool, u64, Option<u32>) {
+        let _guard = self.admin_lock.lock().unwrap();
+        match self.holder_session_id.load(Ordering::Acquire) {
+            0 => {
+                self.holder_session_id.store(session_id, Ordering::Release);
+                let epoch = self.lease_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                (true, epoch, None)
+            },
+            holder if holder == session_id => (true, self.current_epoch(), None),
+            holder => (false, self.current_epoch(), Some(holder)),
+        }
+    }
+
+    pub fn release_if_holder(&self, session_id: u32) -> Option<u64> {
+        let _guard = self.admin_lock.lock().unwrap();
+        if self.holder_session_id.load(Ordering::Acquire) != session_id {
+            return None;
+        }
+        self.holder_session_id.store(0, Ordering::Release);
+        Some(self.lease_epoch.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    pub fn revoke_any(&self) -> Option<(u32, u64)> {
+        let _guard = self.admin_lock.lock().unwrap();
+        let holder = self.holder_session_id.load(Ordering::Acquire);
+        if holder == 0 {
+            return None;
+        }
+        self.holder_session_id.store(0, Ordering::Release);
+        let epoch = self.lease_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        Some((holder, epoch))
+    }
+
+    pub fn is_valid(&self, session_id: u32, lease_epoch: u64) -> bool {
+        self.holder_session_id.load(Ordering::Acquire) == session_id
+            && self.lease_epoch.load(Ordering::Acquire) == lease_epoch
     }
 }
 
@@ -460,6 +592,10 @@ pub struct Piper {
     metrics: Arc<PiperMetrics>,
     /// 最近一次运行时故障。
     runtime_fault: Arc<AtomicU8>,
+    /// Maintenance state-change notifier for controller-owned bridge integrations.
+    maintenance_state_signal: Arc<MaintenanceStateSignal>,
+    /// Maintenance lease gate used by bridge-maintenance send-point validation.
+    maintenance_lease_gate: Arc<MaintenanceLeaseGate>,
     /// CAN 接口名称（用于录制元数据）
     interface: String,
     /// CAN 总线速度（bps）（用于录制元数据）
@@ -578,6 +714,8 @@ impl Piper {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         let metrics = Arc::new(PiperMetrics::new());
         let runtime_fault = Arc::new(AtomicU8::new(0));
+        let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+        let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
 
         let ctx_clone = ctx.clone();
         let workers_running_clone = workers_running.clone();
@@ -586,6 +724,7 @@ impl Piper {
         let runtime_fault_rx = runtime_fault.clone();
         let config_clone = config.clone().unwrap_or_default();
         let timing_capability_rx = timing_capability;
+        let maintenance_state_signal_rx = maintenance_state_signal.clone();
 
         let rx_thread = spawn(move || {
             crate::pipeline::rx_loop(
@@ -597,6 +736,7 @@ impl Piper {
                 runtime_phase_rx,
                 metrics_clone,
                 runtime_fault_rx,
+                maintenance_state_signal_rx,
             );
         });
 
@@ -608,6 +748,8 @@ impl Piper {
         let realtime_slot_tx = realtime_slot.clone();
         let runtime_fault_tx = runtime_fault.clone();
         let shutdown_lane_tx = shutdown_lane.clone();
+        let maintenance_state_signal_tx = maintenance_state_signal.clone();
+        let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
 
         let tx_thread = spawn(move || {
             crate::pipeline::tx_loop_mailbox(
@@ -621,6 +763,8 @@ impl Piper {
                 metrics_tx,
                 ctx_tx,
                 runtime_fault_tx,
+                maintenance_state_signal_tx,
+                maintenance_lease_gate_tx,
             );
         });
 
@@ -640,6 +784,8 @@ impl Piper {
             normal_send_gate,
             metrics,
             runtime_fault,
+            maintenance_state_signal,
+            maintenance_lease_gate,
             interface: "unknown".to_string(),
             bus_speed: 1_000_000,
             driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
@@ -693,6 +839,7 @@ impl Piper {
         }
         self.normal_send_gate.close();
         self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
+        self.maintenance_state_signal.note();
     }
 
     /// 请求 worker 停止并关闭所有命令通路。
@@ -702,6 +849,7 @@ impl Piper {
         self.workers_running.store(false, Ordering::Release);
         self.shutdown_lane.close_with(Err(DriverError::ChannelClosed));
         self.clear_realtime_slot(DriverError::ChannelClosed, false);
+        self.maintenance_state_signal.note();
     }
 
     /// 获取性能指标快照
@@ -1559,6 +1707,8 @@ impl Piper {
     #[doc(hidden)]
     pub fn send_maintenance_frame_confirmed(
         &self,
+        session_id: u32,
+        lease_epoch: u64,
         frame: PiperFrame,
         timeout: Duration,
     ) -> Result<(), DriverError> {
@@ -1571,7 +1721,7 @@ impl Piper {
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.enqueue_reliable_timeout(
-            ReliableCommand::maintenance_confirmed(frame, ack_tx),
+            ReliableCommand::maintenance_confirmed(frame, session_id, lease_epoch, ack_tx),
             timeout,
         )?;
 
@@ -1582,6 +1732,72 @@ impl Piper {
                 Err(DriverError::ChannelClosed)
             },
         }
+    }
+
+    #[doc(hidden)]
+    pub fn maintenance_state_epoch(&self) -> u64 {
+        self.maintenance_state_signal.current_epoch()
+    }
+
+    #[doc(hidden)]
+    pub fn wait_for_maintenance_state_change_after(
+        &self,
+        observed_epoch: u64,
+        timeout: Option<Duration>,
+    ) -> bool {
+        self.maintenance_state_signal
+            .wait_for_change_after(observed_epoch, timeout)
+    }
+
+    #[doc(hidden)]
+    pub fn note_maintenance_state_hint(&self) {
+        self.maintenance_state_signal.note();
+    }
+
+    #[doc(hidden)]
+    pub fn current_maintenance_lease(&self) -> (Option<u32>, u64) {
+        self.maintenance_lease_gate.snapshot()
+    }
+
+    #[doc(hidden)]
+    pub fn acquire_maintenance_lease_gate(&self, session_id: u32) -> (bool, u64, Option<u32>) {
+        self.maintenance_lease_gate.grant(session_id)
+    }
+
+    #[doc(hidden)]
+    pub fn release_maintenance_lease_gate_if_holder(&self, session_id: u32) -> bool {
+        let released = self
+            .maintenance_lease_gate
+            .release_if_holder(session_id)
+            .is_some();
+        if released {
+            self.maintenance_state_signal.note();
+        }
+        released
+    }
+
+    #[doc(hidden)]
+    pub fn revoke_maintenance_lease_gate(&self) -> Option<u32> {
+        let revoked = self.maintenance_lease_gate.revoke_any().map(|(holder, _)| holder);
+        if revoked.is_some() {
+            self.maintenance_state_signal.note();
+        }
+        revoked
+    }
+
+    #[doc(hidden)]
+    pub fn maintenance_lease_is_valid(&self, session_id: u32, lease_epoch: u64) -> bool {
+        self.maintenance_lease_gate.is_valid(session_id, lease_epoch)
+    }
+
+    #[doc(hidden)]
+    pub fn connection_timeout_remaining(&self) -> Option<Duration> {
+        self.ctx.connection_monitor.remaining_until_timeout()
+    }
+
+    #[doc(hidden)]
+    pub fn maintenance_runtime_open(&self) -> bool {
+        self.runtime_phase() == RuntimePhase::Running
     }
 
     /// 发送命令（根据优先级自动选择队列）
@@ -2580,6 +2796,79 @@ mod tests {
         assert_eq!(metrics.tx_packages_fault_aborted_total, 1);
         assert_eq!(metrics.tx_packages_completed_total, 0);
         assert_eq!(metrics.tx_packages_partial_total, 0);
+    }
+
+    #[test]
+    fn test_maintenance_send_point_rejects_stale_lease_after_revocation() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let (granted, lease_epoch, holder) = piper.acquire_maintenance_lease_gate(7);
+        assert!(granted);
+        assert!(holder.is_none());
+        piper.ctx.connection_monitor.register_feedback();
+        piper.note_maintenance_state_hint();
+
+        let blocking_frame = PiperFrame::new_standard(0x201, &[0x01]);
+        let piper_blocking = Arc::clone(&piper);
+        let blocking_handle = std::thread::spawn(move || {
+            piper_blocking.send_maintenance_frame_confirmed(
+                7,
+                lease_epoch,
+                blocking_frame,
+                Duration::from_millis(500),
+            )
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first maintenance frame should begin sending");
+
+        let stale_frame = PiperFrame::new_standard(0x202, &[0x02]);
+        let piper_stale = Arc::clone(&piper);
+        let stale_handle = std::thread::spawn(move || {
+            piper_stale.send_maintenance_frame_confirmed(
+                7,
+                lease_epoch,
+                stale_frame,
+                Duration::from_millis(500),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(piper.revoke_maintenance_lease_gate(), Some(7));
+        let _ = release_tx.send(());
+
+        blocking_handle
+            .join()
+            .expect("blocking maintenance sender should finish")
+            .expect("frame already admitted before revocation should complete");
+
+        let stale_error = stale_handle
+            .join()
+            .expect("stale maintenance sender should finish")
+            .expect_err("revoked lease epoch must be rejected at send point");
+        assert!(matches!(
+            stale_error,
+            DriverError::MaintenanceWriteDenied(_)
+        ));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[blocking_frame]);
     }
 
     #[test]

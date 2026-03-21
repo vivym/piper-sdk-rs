@@ -26,7 +26,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
@@ -34,7 +34,6 @@ use tracing::{error, warn};
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const RAW_FRAME_TAP_QUEUE_CAPACITY: usize = 1024;
 const AUTH_LOG_WINDOW: Duration = Duration::from_secs(1);
-const LEASE_MONITOR_INTERVAL: Duration = Duration::from_millis(20);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -136,12 +135,11 @@ pub enum BridgeMaintenanceState {
     DeniedActiveControl,
     DeniedTransportDown,
     AllowedStandby,
-    AllowedMaintenanceMode,
 }
 
 impl BridgeMaintenanceState {
     fn allows_lease(self) -> bool {
-        matches!(self, Self::AllowedStandby | Self::AllowedMaintenanceMode)
+        matches!(self, Self::AllowedStandby)
     }
 
     fn denial_message(self) -> &'static str {
@@ -155,7 +153,7 @@ impl BridgeMaintenanceState {
             Self::DeniedTransportDown => {
                 "maintenance writes are disabled while transport is disconnected"
             },
-            Self::AllowedStandby | Self::AllowedMaintenanceMode => "maintenance allowed",
+            Self::AllowedStandby => "maintenance allowed",
         }
     }
 }
@@ -223,7 +221,7 @@ trait BridgeControllerBackend: Send + Sync {
         timeout: Duration,
     ) -> Result<LeaseAcquireResult, BridgeBackendError>;
     fn release_maintenance_lease(&self, session_id: u32) -> Result<bool, BridgeBackendError>;
-    fn revoke_invalid_lease(&self) -> Result<Option<u32>, BridgeBackendError>;
+    fn wait_for_lease_revocation(&self) -> Result<u32, BridgeBackendError>;
     fn send_maintenance_frame(
         &self,
         session_id: u32,
@@ -996,10 +994,10 @@ impl PiperBridgeHost {
             let backend = Arc::clone(&self.backend);
             let sessions = Arc::clone(&self.sessions);
             thread::Builder::new()
-                .name("bridge_lease_monitor".into())
-                .spawn(move || Self::lease_monitor_loop(backend, sessions))
+                .name("bridge_lease_revoker".into())
+                .spawn(move || Self::lease_revocation_loop(backend, sessions))
                 .map_err(|err| {
-                    BridgeHostError::Io(format!("failed to spawn lease monitor loop: {err}"))
+                    BridgeHostError::Io(format!("failed to spawn lease revocation loop: {err}"))
                 })?;
         }
 
@@ -1155,21 +1153,19 @@ impl PiperBridgeHost {
         }
     }
 
-    fn lease_monitor_loop(
+    fn lease_revocation_loop(
         backend: Arc<dyn BridgeControllerBackend>,
         sessions: Arc<SessionManager>,
     ) {
         loop {
-            thread::sleep(LEASE_MONITOR_INTERVAL);
-            match backend.revoke_invalid_lease() {
-                Ok(Some(holder_session_id)) => {
+            match backend.wait_for_lease_revocation() {
+                Ok(holder_session_id) => {
                     if let Some(holder) = sessions.session(holder_session_id) {
                         holder.revoke_maintenance_lease();
                     }
                 },
-                Ok(None) => {},
                 Err(err) => {
-                    warn!("failed to reconcile maintenance lease revocation: {err}");
+                    warn!("failed to wait for maintenance lease revocation: {err}");
                 },
             }
         }
@@ -1436,6 +1432,81 @@ impl PiperBridgeHost {
             },
             ConnectionOutput::Shutdown => false,
         }
+    }
+
+    fn drain_direct_outbound(
+        writer: &mut ServerStream,
+        session: &BridgeSession,
+        control_rx: Option<&Receiver<ConnectionOutput>>,
+        event_rx: Option<&Receiver<ConnectionOutput>>,
+        stats: &BridgeHostStats,
+    ) -> Result<bool, BridgeHostError> {
+        let mut drained_any = false;
+
+        if let Some(rx) = control_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(output) => {
+                        drained_any = true;
+                        if !Self::handle_outbound_direct(writer, output, session, stats) {
+                            return Err(BridgeHostError::Io(
+                                "bridge connection closed by control output".to_string(),
+                            ));
+                        }
+                    },
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        return Err(BridgeHostError::Io(
+                            "bridge control queue disconnected".to_string(),
+                        ));
+                    },
+                }
+            }
+        }
+
+        if let Some(rx) = event_rx {
+            loop {
+                if let Some(control_rx) = control_rx {
+                    loop {
+                        match control_rx.try_recv() {
+                            Ok(output) => {
+                                drained_any = true;
+                                if !Self::handle_outbound_direct(writer, output, session, stats) {
+                                    return Err(BridgeHostError::Io(
+                                        "bridge connection closed by control output".to_string(),
+                                    ));
+                                }
+                            },
+                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                return Err(BridgeHostError::Io(
+                                    "bridge control queue disconnected".to_string(),
+                                ));
+                            },
+                        }
+                    }
+                }
+
+                match rx.try_recv() {
+                    Ok(output) => {
+                        drained_any = true;
+                        if !Self::handle_outbound_direct(writer, output, session, stats) {
+                            return Err(BridgeHostError::Io(
+                                "bridge connection closed by outbound event".to_string(),
+                            ));
+                        }
+                    },
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        return Err(BridgeHostError::Io(
+                            "bridge event queue disconnected".to_string(),
+                        ));
+                    },
+                }
+            }
+        }
+
+        Ok(drained_any)
     }
 
     fn write_server_message(
@@ -1826,39 +1897,17 @@ impl PiperBridgeHost {
         let mut event_rx: Option<Receiver<ConnectionOutput>> = None;
 
         'connection: loop {
-            if let Some(rx) = control_rx.as_ref() {
-                loop {
-                    match rx.try_recv() {
-                        Ok(output) => {
-                            if !Self::handle_outbound_direct(
-                                &mut stream,
-                                output,
-                                session.as_ref().expect("session exists after hello"),
-                                ctx.stats,
-                            ) {
-                                break 'connection;
-                            }
-                        },
-                        Err(crossbeam_channel::TryRecvError::Empty) => break,
-                        Err(crossbeam_channel::TryRecvError::Disconnected) => break 'connection,
-                    }
-                }
-            }
-
-            if let Some(rx) = event_rx.as_ref() {
-                match rx.try_recv() {
-                    Ok(output) => {
-                        if !Self::handle_outbound_direct(
-                            &mut stream,
-                            output,
-                            session.as_ref().expect("session exists after hello"),
-                            ctx.stats,
-                        ) {
-                            break 'connection;
-                        }
-                    },
-                    Err(crossbeam_channel::TryRecvError::Empty) => {},
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => break 'connection,
+            if let Some(active_session) = session.as_ref() {
+                match Self::drain_direct_outbound(
+                    &mut stream,
+                    active_session,
+                    control_rx.as_ref(),
+                    event_rx.as_ref(),
+                    ctx.stats,
+                ) {
+                    Ok(true) => continue,
+                    Ok(false) => {},
+                    Err(_) => break 'connection,
                 }
             }
 
@@ -2209,20 +2258,17 @@ fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
 
 struct PiperBridgeBackend {
     driver: Arc<RobotPiper>,
-    maintenance_lease: Mutex<Option<u32>>,
-    maintenance_cv: Condvar,
 }
 
 impl PiperBridgeBackend {
     fn from_driver(driver: Arc<RobotPiper>) -> Arc<dyn BridgeControllerBackend> {
-        Arc::new(Self {
-            driver,
-            maintenance_lease: Mutex::new(None),
-            maintenance_cv: Condvar::new(),
-        })
+        Arc::new(Self { driver })
     }
 
     fn maintenance_state(&self) -> BridgeMaintenanceState {
+        if !self.driver.maintenance_runtime_open() {
+            return BridgeMaintenanceState::DeniedTransportDown;
+        }
         let health = self.driver.health();
         if health.fault.is_some() {
             return BridgeMaintenanceState::DeniedFaulted;
@@ -2256,79 +2302,64 @@ impl BridgeControllerBackend for PiperBridgeBackend {
         session_id: u32,
         timeout: Duration,
     ) -> Result<LeaseAcquireResult, BridgeBackendError> {
-        let initial_state = self.maintenance_state();
-        if !initial_state.allows_lease() {
-            return Err(BridgeBackendError::new(
-                ErrorCode::PermissionDenied,
-                initial_state.denial_message(),
-            ));
-        }
-
         let deadline = Instant::now() + timeout;
-        let mut guard = self.maintenance_lease.lock().unwrap();
         loop {
             let current_state = self.maintenance_state();
             if !current_state.allows_lease() {
-                if guard.as_ref().copied() == Some(session_id) {
-                    *guard = None;
-                    self.maintenance_cv.notify_all();
-                }
                 return Err(BridgeBackendError::new(
                     ErrorCode::PermissionDenied,
                     current_state.denial_message(),
                 ));
             }
 
-            match *guard {
-                None => {
-                    *guard = Some(session_id);
-                    return Ok(LeaseAcquireResult::Granted);
-                },
-                Some(owner) if owner == session_id => return Ok(LeaseAcquireResult::Granted),
-                Some(owner) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(LeaseAcquireResult::Denied {
-                            holder_session_id: Some(owner),
-                        });
-                    }
-                    let remaining = deadline.saturating_duration_since(now);
-                    let (next_guard, wait_result) =
-                        self.maintenance_cv.wait_timeout(guard, remaining).unwrap();
-                    guard = next_guard;
-                    if wait_result.timed_out() {
-                        return Ok(LeaseAcquireResult::Denied {
-                            holder_session_id: guard.as_ref().copied(),
-                        });
-                    }
-                },
+            let (granted, _epoch, holder_session_id) =
+                self.driver.acquire_maintenance_lease_gate(session_id);
+            if granted {
+                self.driver.note_maintenance_state_hint();
+                return Ok(LeaseAcquireResult::Granted);
             }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(LeaseAcquireResult::Denied { holder_session_id });
+            }
+
+            let observed_epoch = self.driver.maintenance_state_epoch();
+            self.driver.wait_for_maintenance_state_change_after(
+                observed_epoch,
+                Some(deadline.saturating_duration_since(now)),
+            );
         }
     }
 
     fn release_maintenance_lease(&self, session_id: u32) -> Result<bool, BridgeBackendError> {
-        let mut guard = self.maintenance_lease.lock().unwrap();
-        if guard.as_ref().copied() == Some(session_id) {
-            *guard = None;
-            self.maintenance_cv.notify_all();
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(self.driver.release_maintenance_lease_gate_if_holder(session_id))
     }
 
-    fn revoke_invalid_lease(&self) -> Result<Option<u32>, BridgeBackendError> {
-        let state = self.maintenance_state();
-        if state.allows_lease() {
-            return Ok(None);
-        }
+    fn wait_for_lease_revocation(&self) -> Result<u32, BridgeBackendError> {
+        loop {
+            let (holder_session_id, _lease_epoch) = self.driver.current_maintenance_lease();
+            let Some(_holder_session_id) = holder_session_id else {
+                let observed_epoch = self.driver.maintenance_state_epoch();
+                self.driver
+                    .wait_for_maintenance_state_change_after(observed_epoch, None);
+                continue;
+            };
 
-        let mut guard = self.maintenance_lease.lock().unwrap();
-        let holder = *guard;
-        if holder.is_some() {
-            *guard = None;
-            self.maintenance_cv.notify_all();
+            let state = self.maintenance_state();
+            if !state.allows_lease() {
+                if let Some(revoked_holder) = self.driver.revoke_maintenance_lease_gate() {
+                    return Ok(revoked_holder);
+                }
+                continue;
+            }
+
+            let observed_epoch = self.driver.maintenance_state_epoch();
+            self.driver.wait_for_maintenance_state_change_after(
+                observed_epoch,
+                self.driver.connection_timeout_remaining(),
+            );
         }
-        Ok(holder)
     }
 
     fn send_maintenance_frame(
@@ -2336,8 +2367,16 @@ impl BridgeControllerBackend for PiperBridgeBackend {
         session_id: u32,
         frame: PiperFrame,
     ) -> Result<(), BridgeBackendError> {
-        let guard = self.maintenance_lease.lock().unwrap();
-        if guard.as_ref().copied() != Some(session_id) {
+        let state = self.maintenance_state();
+        if !state.allows_lease() {
+            return Err(BridgeBackendError::new(
+                ErrorCode::PermissionDenied,
+                state.denial_message(),
+            ));
+        }
+
+        let (holder_session_id, lease_epoch) = self.driver.current_maintenance_lease();
+        if holder_session_id != Some(session_id) {
             return Err(BridgeBackendError::new(
                 ErrorCode::PermissionDenied,
                 "maintenance lease required",
@@ -2345,14 +2384,13 @@ impl BridgeControllerBackend for PiperBridgeBackend {
         }
 
         self.driver
-            .send_maintenance_frame_confirmed(frame, Duration::from_millis(10))
+            .send_maintenance_frame_confirmed(session_id, lease_epoch, frame, Duration::from_millis(10))
             .map_err(|err| {
                 if matches!(
                     err,
                     DriverError::ControlPathClosed | DriverError::MaintenanceWriteDenied(_)
                 ) {
-                    drop(guard);
-                    let _ = self.release_maintenance_lease(session_id);
+                    let _ = self.driver.release_maintenance_lease_gate_if_holder(session_id);
                 }
                 bridge_backend_error_from_driver(&err)
             })
@@ -2600,5 +2638,71 @@ mod tests {
             err.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_direct_outbound_flushes_all_pending_events_before_returning_to_read_poll() {
+        let (server, mut client) = UnixStream::pair().expect("unix pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set read timeout");
+
+        let (event_tx, event_rx) = SessionManager::new_connection_queue();
+        let (control_tx, control_rx) = SessionManager::new_connection_queue();
+        let session = BridgeSession::new(
+            9,
+            token(9),
+            BridgeRole::Observer,
+            vec![],
+            event_tx,
+            control_tx,
+            Arc::new(NoopControl),
+        );
+
+        let frame_a = PiperFrame::new_standard(0x120, &[1, 2, 3]);
+        let frame_b = PiperFrame::new_standard(0x121, &[4, 5, 6]);
+        let frame_c = PiperFrame::new_standard(0x122, &[7, 8, 9]);
+        session
+            .event_tx
+            .try_send(ConnectionOutput::Event(BridgeEvent::ReceiveFrame(frame_a)))
+            .expect("queue frame a");
+        session
+            .event_tx
+            .try_send(ConnectionOutput::Event(BridgeEvent::ReceiveFrame(frame_b)))
+            .expect("queue frame b");
+        session
+            .event_tx
+            .try_send(ConnectionOutput::Event(BridgeEvent::ReceiveFrame(frame_c)))
+            .expect("queue frame c");
+
+        let mut writer = ServerStream::Unix(server);
+        let stats = BridgeHostStats::new();
+        assert!(
+            PiperBridgeHost::drain_direct_outbound(
+                &mut writer,
+                &session,
+                Some(&control_rx),
+                Some(&event_rx),
+                &stats,
+            )
+            .expect("outbound drain should succeed")
+        );
+
+        let payload_a = protocol::read_framed(&mut client).expect("read frame a");
+        let payload_b = protocol::read_framed(&mut client).expect("read frame b");
+        let payload_c = protocol::read_framed(&mut client).expect("read frame c");
+        assert_eq!(
+            protocol::decode_server_message(&payload_a).expect("decode frame a"),
+            ServerMessage::Event(BridgeEvent::ReceiveFrame(frame_a))
+        );
+        assert_eq!(
+            protocol::decode_server_message(&payload_b).expect("decode frame b"),
+            ServerMessage::Event(BridgeEvent::ReceiveFrame(frame_b))
+        );
+        assert_eq!(
+            protocol::decode_server_message(&payload_c).expect("decode frame c"),
+            ServerMessage::Event(BridgeEvent::ReceiveFrame(frame_c))
+        );
     }
 }

@@ -10,7 +10,8 @@
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::TimingCapability;
 use piper_sdk::driver::{
-    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane,
+    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig,
+    PiperContext, PiperMetrics, ShutdownLane,
     command::{RealtimeCommand, ReliableCommand},
     rx_loop, tx_loop_mailbox,
 };
@@ -421,6 +422,7 @@ fn test_500hz_realtime_benchmark() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
+    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
 
     // 创建 500Hz RX 适配器
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration);
@@ -431,6 +433,7 @@ fn test_500hz_realtime_benchmark() {
     let runtime_phase_rx = runtime_phase.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
+    let maintenance_state_signal_rx = maintenance_state_signal.clone();
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
@@ -441,6 +444,7 @@ fn test_500hz_realtime_benchmark() {
             runtime_phase_rx,
             metrics_rx,
             last_fault_rx,
+            maintenance_state_signal_rx,
         );
     });
 
@@ -520,6 +524,7 @@ fn test_1khz_realtime_benchmark() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
+    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
 
     // 创建 1kHz RX 适配器
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration);
@@ -530,6 +535,7 @@ fn test_1khz_realtime_benchmark() {
     let runtime_phase_rx = runtime_phase.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
+    let maintenance_state_signal_rx = maintenance_state_signal.clone();
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
@@ -540,6 +546,7 @@ fn test_1khz_realtime_benchmark() {
             runtime_phase_rx,
             metrics_rx,
             last_fault_rx,
+            maintenance_state_signal_rx,
         );
     });
 
@@ -618,6 +625,8 @@ fn test_tx_latency_benchmark() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
+    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
 
     // 创建 TX 适配器（记录发送时间）
     let tx_adapter = ConfigurableTxAdapter::new(Duration::from_micros(100));
@@ -636,6 +645,8 @@ fn test_tx_latency_benchmark() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let realtime_slot_tx = realtime_slot.clone();
+    let maintenance_state_signal_tx = maintenance_state_signal.clone();
+    let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
@@ -649,6 +660,8 @@ fn test_tx_latency_benchmark() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
+            maintenance_state_signal_tx,
+            maintenance_lease_gate_tx,
         );
     });
 
@@ -735,6 +748,8 @@ fn test_send_duration_benchmark() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
+    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
 
     // 创建 TX 适配器（记录发送耗时）
     let tx_adapter = ConfigurableTxAdapter::new(Duration::from_micros(100));
@@ -753,6 +768,8 @@ fn test_send_duration_benchmark() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let realtime_slot_tx = realtime_slot.clone();
+    let maintenance_state_signal_tx = maintenance_state_signal.clone();
+    let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
@@ -766,6 +783,8 @@ fn test_send_duration_benchmark() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
+            maintenance_state_signal_tx,
+            maintenance_lease_gate_tx,
         );
     });
 
@@ -842,6 +861,7 @@ fn test_usb_fault_simulation() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
+    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
 
     // 创建 RX 适配器（模拟 5% 延迟，10ms 延迟）
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration)
@@ -854,6 +874,7 @@ fn test_usb_fault_simulation() {
     let runtime_phase_rx = runtime_phase.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
+    let maintenance_state_signal_rx = maintenance_state_signal.clone();
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
@@ -864,6 +885,7 @@ fn test_usb_fault_simulation() {
             runtime_phase_rx,
             metrics_rx,
             last_fault_rx,
+            maintenance_state_signal_rx,
         );
     });
 
