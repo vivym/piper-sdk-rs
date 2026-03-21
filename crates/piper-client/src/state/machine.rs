@@ -363,6 +363,16 @@ pub struct Piper<State = Disconnected> {
     pub(crate) _state: State, // 改为直接存储状态（不再使用 PhantomData）
 }
 
+impl<State> Piper<State> {
+    /// Attach the non-realtime bridge host to this controller-owned Piper instance.
+    pub fn attach_bridge_host(
+        &self,
+        config: crate::bridge_host::BridgeHostConfig,
+    ) -> crate::bridge_host::PiperBridgeHost {
+        crate::bridge_host::PiperBridgeHost::attach_to_driver(Arc::clone(&self.driver), config)
+    }
+}
+
 fn wait_for_fresh_collision_protection_update<SendQuery, ReadCached>(
     timeout: Duration,
     poll_interval: Duration,

@@ -109,7 +109,7 @@ impl std::fmt::Display for BridgeHostError {
 impl std::error::Error for BridgeHostError {}
 
 #[derive(Debug, Clone)]
-pub struct BridgeStatusInput {
+pub(crate) struct BridgeStatusInput {
     pub health: HealthStatus,
     pub usb_stall_count: u64,
     pub can_bus_off_count: u64,
@@ -148,7 +148,7 @@ impl BridgeMaintenanceState {
 }
 
 #[derive(Debug, Clone)]
-pub struct BridgeBackendError {
+pub(crate) struct BridgeBackendError {
     code: ErrorCode,
     message: String,
 }
@@ -182,7 +182,7 @@ trait RawTapCleanup: Send + Sync {
     fn uninstall(&self);
 }
 
-pub struct RawTapSubscription {
+pub(crate) struct RawTapSubscription {
     cleanup: Option<Box<dyn RawTapCleanup>>,
 }
 
@@ -202,10 +202,24 @@ impl Drop for RawTapSubscription {
     }
 }
 
-pub trait BridgeControllerBackend: Send + Sync {
+trait BridgeControllerBackend: Send + Sync {
     fn status_snapshot(&self) -> BridgeStatusInput;
-    fn maintenance_state(&self, maintenance_mode: bool) -> BridgeMaintenanceState;
-    fn send_maintenance_frame(&self, frame: PiperFrame) -> Result<(), BridgeBackendError>;
+    fn grant_role(&self, requested: BridgeRole) -> BridgeRole {
+        requested
+    }
+    fn acquire_maintenance_lease(
+        &self,
+        session_id: u32,
+        role: BridgeRole,
+        timeout: Duration,
+    ) -> Result<LeaseAcquireResult, BridgeBackendError>;
+    fn release_maintenance_lease(&self, session_id: u32) -> Result<bool, BridgeBackendError>;
+    fn revoke_invalid_lease(&self) -> Result<Option<u32>, BridgeBackendError>;
+    fn send_maintenance_frame(
+        &self,
+        session_id: u32,
+        frame: PiperFrame,
+    ) -> Result<(), BridgeBackendError>;
     fn install_raw_frame_tap(
         &self,
         tx: Sender<PiperFrame>,
@@ -216,7 +230,6 @@ pub trait BridgeControllerBackend: Send + Sync {
 enum LeaseAcquireResult {
     Granted,
     Denied { holder_session_id: Option<u32> },
-    NotConnected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +278,8 @@ struct BridgeHostStats {
     ipc_in_total: AtomicU64,
     ipc_out_total: AtomicU64,
     queue_drop_total: AtomicU64,
+    inactive_enqueue_total: AtomicU64,
+    session_replacement_discard_total: AtomicU64,
 }
 
 impl BridgeHostStats {
@@ -276,6 +291,8 @@ impl BridgeHostStats {
             ipc_in_total: AtomicU64::new(0),
             ipc_out_total: AtomicU64::new(0),
             queue_drop_total: AtomicU64::new(0),
+            inactive_enqueue_total: AtomicU64::new(0),
+            session_replacement_discard_total: AtomicU64::new(0),
         }
     }
 
@@ -545,14 +562,22 @@ impl RawTapManager {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BroadcastFrameStats {
+    dropped: u64,
+    inactive: u64,
+}
+
 struct BridgeSession {
     session_id: u32,
     session_token: SessionToken,
+    role_granted: BridgeRole,
     filters: RwLock<Vec<CanIdFilter>>,
     event_tx: Sender<ConnectionOutput>,
     control_tx: Sender<ConnectionOutput>,
     pending_gap: AtomicU32,
     lifecycle: AtomicU8,
+    replacement_close_queued: AtomicBool,
     raw_frame_tap_enabled: AtomicBool,
     control: Arc<dyn SessionControl>,
 }
@@ -561,6 +586,7 @@ impl BridgeSession {
     fn new(
         session_id: u32,
         session_token: SessionToken,
+        role_granted: BridgeRole,
         filters: Vec<CanIdFilter>,
         event_tx: Sender<ConnectionOutput>,
         control_tx: Sender<ConnectionOutput>,
@@ -569,11 +595,13 @@ impl BridgeSession {
         Self {
             session_id,
             session_token,
+            role_granted,
             filters: RwLock::new(filters),
             event_tx,
             control_tx,
             pending_gap: AtomicU32::new(0),
             lifecycle: AtomicU8::new(SessionLifecycle::Active as u8),
+            replacement_close_queued: AtomicBool::new(false),
             raw_frame_tap_enabled: AtomicBool::new(false),
             control,
         }
@@ -585,6 +613,10 @@ impl BridgeSession {
 
     fn session_token(&self) -> SessionToken {
         self.session_token
+    }
+
+    fn role_granted(&self) -> BridgeRole {
+        self.role_granted
     }
 
     fn lifecycle(&self) -> SessionLifecycle {
@@ -669,7 +701,14 @@ impl BridgeSession {
     }
 
     fn replace_and_close(&self) {
-        if !self.mark_replaced() {
+        match self.lifecycle() {
+            SessionLifecycle::Active => {
+                self.mark_replaced();
+            },
+            SessionLifecycle::Replaced => {},
+            SessionLifecycle::Closing | SessionLifecycle::Closed => return,
+        }
+        if self.replacement_close_queued.swap(true, Ordering::AcqRel) {
             return;
         }
         if self
@@ -732,8 +771,6 @@ struct Registry {
 struct SessionManager {
     registry: RwLock<Registry>,
     next_session_id: AtomicU32,
-    maintenance_lease: Mutex<Option<u32>>,
-    maintenance_cv: Condvar,
 }
 
 impl SessionManager {
@@ -744,8 +781,6 @@ impl SessionManager {
                 token_to_session: HashMap::new(),
             }),
             next_session_id: AtomicU32::new(1),
-            maintenance_lease: Mutex::new(None),
-            maintenance_cv: Condvar::new(),
         }
     }
 
@@ -765,7 +800,7 @@ impl SessionManager {
     fn prepare_session(
         &self,
         session_token: SessionToken,
-        role_request: BridgeRole,
+        role_granted: BridgeRole,
         filters: Vec<CanIdFilter>,
         control: Arc<dyn SessionControl>,
     ) -> PreparedSession {
@@ -774,7 +809,7 @@ impl SessionManager {
         PreparedSession {
             session_id: self.next_session_id(),
             session_token,
-            role_granted: role_request,
+            role_granted,
             filters,
             event_tx,
             event_rx,
@@ -799,6 +834,7 @@ impl SessionManager {
         let session = Arc::new(BridgeSession::new(
             prepared.session_id,
             prepared.session_token,
+            prepared.role_granted,
             prepared.filters,
             prepared.event_tx,
             prepared.control_tx,
@@ -807,14 +843,6 @@ impl SessionManager {
         registry.token_to_session.insert(prepared.session_token, prepared.session_id);
         registry.sessions.insert(prepared.session_id, Arc::clone(&session));
         drop(registry);
-
-        if let Some(ref old_session) = replaced {
-            let mut lease = self.maintenance_lease.lock().unwrap();
-            if lease.as_ref().copied() == Some(old_session.session_id()) {
-                *lease = Some(prepared.session_id);
-                self.maintenance_cv.notify_all();
-            }
-        }
 
         RegisterResult { session, replaced }
     }
@@ -829,12 +857,6 @@ impl SessionManager {
             }
             Some(removed)
         };
-
-        let mut lease = self.maintenance_lease.lock().unwrap();
-        if lease.as_ref().copied() == Some(session_id) {
-            *lease = None;
-            self.maintenance_cv.notify_all();
-        }
 
         if let Some(ref session) = removed {
             session.mark_closed();
@@ -864,18 +886,20 @@ impl SessionManager {
             .count()
     }
 
-    fn broadcast_frame(&self, frame: PiperFrame) -> u64 {
+    fn broadcast_frame(&self, frame: PiperFrame) -> BroadcastFrameStats {
         let registry = self.registry.read().unwrap();
-        let mut dropped = 0u64;
+        let mut stats = BroadcastFrameStats::default();
         for session in registry.sessions.values() {
             if !session.raw_frame_tap_enabled() || !session.matches_filter(frame.id) {
                 continue;
             }
-            if session.enqueue_frame(frame) == EnqueueFrameResult::QueueFull {
-                dropped += 1;
+            match session.enqueue_frame(frame) {
+                EnqueueFrameResult::Delivered => {},
+                EnqueueFrameResult::QueueFull => stats.dropped += 1,
+                EnqueueFrameResult::Inactive => stats.inactive += 1,
             }
         }
-        dropped
+        stats
     }
 
     fn set_filters(&self, session_id: u32, filters: Vec<CanIdFilter>) -> bool {
@@ -895,75 +919,11 @@ impl SessionManager {
             false
         }
     }
-
-    fn has_maintenance_lease(&self, session_id: u32) -> bool {
-        self.active_session(session_id).is_some()
-            && self.maintenance_lease.lock().unwrap().as_ref().copied() == Some(session_id)
-    }
-
-    fn acquire_maintenance_lease(&self, session_id: u32, timeout: Duration) -> LeaseAcquireResult {
-        if self.active_session(session_id).is_none() {
-            return LeaseAcquireResult::NotConnected;
-        }
-
-        let deadline = Instant::now() + timeout;
-        let mut guard = self.maintenance_lease.lock().unwrap();
-        loop {
-            match *guard {
-                None => {
-                    *guard = Some(session_id);
-                    return LeaseAcquireResult::Granted;
-                },
-                Some(owner) if owner == session_id => return LeaseAcquireResult::Granted,
-                Some(owner) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return LeaseAcquireResult::Denied {
-                            holder_session_id: Some(owner),
-                        };
-                    }
-                    let remaining = deadline.saturating_duration_since(now);
-                    let (next_guard, wait_result) =
-                        self.maintenance_cv.wait_timeout(guard, remaining).unwrap();
-                    guard = next_guard;
-                    if wait_result.timed_out() {
-                        return LeaseAcquireResult::Denied {
-                            holder_session_id: guard.as_ref().copied(),
-                        };
-                    }
-                },
-            }
-        }
-    }
-
-    fn release_maintenance_lease(&self, session_id: u32) -> bool {
-        let mut guard = self.maintenance_lease.lock().unwrap();
-        if guard.as_ref().copied() == Some(session_id) {
-            *guard = None;
-            self.maintenance_cv.notify_all();
-            return true;
-        }
-        false
-    }
-
-    fn revoke_maintenance_lease(&self) -> Option<Arc<BridgeSession>> {
-        let holder = {
-            let mut guard = self.maintenance_lease.lock().unwrap();
-            let holder = *guard;
-            if holder.is_some() {
-                *guard = None;
-                self.maintenance_cv.notify_all();
-            }
-            holder
-        };
-        holder.and_then(|session_id| self.session(session_id))
-    }
 }
 
 struct ConnectionContext<'a> {
     backend: &'a Arc<dyn BridgeControllerBackend>,
     sessions: &'a Arc<SessionManager>,
-    maintenance_mode: &'a Arc<AtomicBool>,
     raw_tap: &'a Arc<Mutex<RawTapManager>>,
     stats: &'a Arc<BridgeHostStats>,
     warn_limiter: &'a Arc<WarnRateLimiter>,
@@ -973,17 +933,15 @@ pub struct PiperBridgeHost {
     backend: Arc<dyn BridgeControllerBackend>,
     config: BridgeHostConfig,
     sessions: Arc<SessionManager>,
-    maintenance_mode: Arc<AtomicBool>,
     stats: Arc<BridgeHostStats>,
     warn_limiter: Arc<WarnRateLimiter>,
     started: AtomicBool,
 }
 
 impl PiperBridgeHost {
-    pub fn attach(backend: Arc<dyn BridgeControllerBackend>, config: BridgeHostConfig) -> Self {
+    fn attach_backend(backend: Arc<dyn BridgeControllerBackend>, config: BridgeHostConfig) -> Self {
         Self {
             backend,
-            maintenance_mode: Arc::new(AtomicBool::new(config.maintenance_mode)),
             config,
             sessions: Arc::new(SessionManager::new()),
             stats: Arc::new(BridgeHostStats::new()),
@@ -992,12 +950,9 @@ impl PiperBridgeHost {
         }
     }
 
-    pub fn set_maintenance_mode(&self, enabled: bool) {
-        self.maintenance_mode.store(enabled, Ordering::Release);
-    }
-
-    pub fn maintenance_mode(&self) -> bool {
-        self.maintenance_mode.load(Ordering::Acquire)
+    pub(crate) fn attach_to_driver(driver: Arc<RobotPiper>, config: BridgeHostConfig) -> Self {
+        let backend = PiperBridgeBackend::from_driver(Arc::clone(&driver), config.maintenance_mode);
+        Self::attach_backend(backend, config)
     }
 
     pub fn run(self) -> Result<(), BridgeHostError> {
@@ -1031,10 +986,9 @@ impl PiperBridgeHost {
         {
             let backend = Arc::clone(&self.backend);
             let sessions = Arc::clone(&self.sessions);
-            let maintenance_mode = Arc::clone(&self.maintenance_mode);
             thread::Builder::new()
                 .name("bridge_lease_monitor".into())
-                .spawn(move || Self::lease_monitor_loop(backend, sessions, maintenance_mode))
+                .spawn(move || Self::lease_monitor_loop(backend, sessions))
                 .map_err(|err| {
                     BridgeHostError::Io(format!("failed to spawn lease monitor loop: {err}"))
                 })?;
@@ -1060,7 +1014,6 @@ impl PiperBridgeHost {
             })?;
             let backend = Arc::clone(&self.backend);
             let sessions = Arc::clone(&self.sessions);
-            let maintenance_mode = Arc::clone(&self.maintenance_mode);
             let raw_tap_manager = Arc::clone(&raw_tap);
             let stats = Arc::clone(&self.stats);
             let warn_limiter = Arc::clone(&self.warn_limiter);
@@ -1073,7 +1026,6 @@ impl PiperBridgeHost {
                                 Ok(stream) => {
                                     let backend = Arc::clone(&backend);
                                     let sessions = Arc::clone(&sessions);
-                                    let maintenance_mode = Arc::clone(&maintenance_mode);
                                     let raw_tap_manager = Arc::clone(&raw_tap_manager);
                                     let stats = Arc::clone(&stats);
                                     let warn_limiter = Arc::clone(&warn_limiter);
@@ -1088,7 +1040,6 @@ impl PiperBridgeHost {
                                             ConnectionContext {
                                                 backend: &backend,
                                                 sessions: &sessions,
-                                                maintenance_mode: &maintenance_mode,
                                                 raw_tap: &raw_tap_manager,
                                                 stats: &stats,
                                                 warn_limiter: &warn_limiter,
@@ -1114,7 +1065,6 @@ impl PiperBridgeHost {
             })?;
             let backend = Arc::clone(&self.backend);
             let sessions = Arc::clone(&self.sessions);
-            let maintenance_mode = Arc::clone(&self.maintenance_mode);
             let raw_tap_manager = Arc::clone(&raw_tap);
             let stats = Arc::clone(&self.stats);
             let warn_limiter = Arc::clone(&self.warn_limiter);
@@ -1131,7 +1081,6 @@ impl PiperBridgeHost {
                                     }
                                     let backend = Arc::clone(&backend);
                                     let sessions = Arc::clone(&sessions);
-                                    let maintenance_mode = Arc::clone(&maintenance_mode);
                                     let raw_tap_manager = Arc::clone(&raw_tap_manager);
                                     let stats = Arc::clone(&stats);
                                     let warn_limiter = Arc::clone(&warn_limiter);
@@ -1144,7 +1093,6 @@ impl PiperBridgeHost {
                                                 ConnectionContext {
                                                     backend: &backend,
                                                     sessions: &sessions,
-                                                    maintenance_mode: &maintenance_mode,
                                                     raw_tap: &raw_tap_manager,
                                                     stats: &stats,
                                                     warn_limiter: &warn_limiter,
@@ -1182,9 +1130,12 @@ impl PiperBridgeHost {
     ) {
         while let Ok(frame) = rx.recv() {
             stats.frame_rx_total.fetch_add(1, Ordering::Relaxed);
-            let dropped = sessions.broadcast_frame(frame);
-            if dropped > 0 {
-                stats.queue_drop_total.fetch_add(dropped, Ordering::Relaxed);
+            let fanout = sessions.broadcast_frame(frame);
+            if fanout.dropped > 0 {
+                stats.queue_drop_total.fetch_add(fanout.dropped, Ordering::Relaxed);
+            }
+            if fanout.inactive > 0 {
+                stats.inactive_enqueue_total.fetch_add(fanout.inactive, Ordering::Relaxed);
             }
         }
     }
@@ -1192,22 +1143,21 @@ impl PiperBridgeHost {
     fn lease_monitor_loop(
         backend: Arc<dyn BridgeControllerBackend>,
         sessions: Arc<SessionManager>,
-        maintenance_mode: Arc<AtomicBool>,
     ) {
         loop {
             thread::sleep(LEASE_MONITOR_INTERVAL);
-            let maintenance_state =
-                backend.maintenance_state(maintenance_mode.load(Ordering::Acquire));
-            if !Self::maintenance_allowed(maintenance_state)
-                && let Some(holder) = sessions.revoke_maintenance_lease()
-            {
-                holder.revoke_maintenance_lease();
+            match backend.revoke_invalid_lease() {
+                Ok(Some(holder_session_id)) => {
+                    if let Some(holder) = sessions.session(holder_session_id) {
+                        holder.revoke_maintenance_lease();
+                    }
+                },
+                Ok(None) => {},
+                Err(err) => {
+                    warn!("failed to reconcile maintenance lease revocation: {err}");
+                },
             }
         }
-    }
-
-    fn maintenance_allowed(maintenance_state: BridgeMaintenanceState) -> bool {
-        maintenance_state.allows_lease()
     }
 
     fn build_status(
@@ -1237,6 +1187,10 @@ impl PiperBridgeHost {
             cpu_usage_percent: status_input.cpu_usage_percent,
             session_count: sessions.count(),
             queue_drop_count: stats.queue_drop_total.load(Ordering::Relaxed),
+            inactive_enqueue_count: stats.inactive_enqueue_total.load(Ordering::Relaxed),
+            session_replacement_discard_count: stats
+                .session_replacement_discard_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1369,33 +1323,7 @@ impl PiperBridgeHost {
             .name("bridge_writer".into())
             .spawn(move || {
                 loop {
-                    if let Ok(control) = control_rx.try_recv() {
-                        match control {
-                            ConnectionOutput::Event(event) => {
-                                if Self::write_server_message(
-                                    &writer,
-                                    &ServerMessage::Event(event),
-                                    &stats,
-                                )
-                                .is_err()
-                                {
-                                    break;
-                                }
-                            },
-                            ConnectionOutput::CloseAfterEvent(event) => {
-                                let _ = Self::write_server_message(
-                                    &writer,
-                                    &ServerMessage::Event(event),
-                                    &stats,
-                                );
-                                break;
-                            },
-                            ConnectionOutput::Shutdown => break,
-                        }
-                        continue;
-                    }
-
-                    crossbeam_channel::select! {
+                    crossbeam_channel::select_biased! {
                         recv(control_rx) -> control => {
                             match control {
                                 Ok(ConnectionOutput::Event(event)) => {
@@ -1404,6 +1332,15 @@ impl PiperBridgeHost {
                                     }
                                 },
                                 Ok(ConnectionOutput::CloseAfterEvent(event)) => {
+                                    let mut discarded = 0u64;
+                                    while event_rx.try_recv().is_ok() {
+                                        discarded += 1;
+                                    }
+                                    if discarded > 0 {
+                                        stats
+                                            .session_replacement_discard_total
+                                            .fetch_add(discarded, Ordering::Relaxed);
+                                    }
                                     let _ = Self::write_server_message(&writer, &ServerMessage::Event(event), &stats);
                                     break;
                                 },
@@ -1553,7 +1490,7 @@ impl PiperBridgeHost {
 
                     let prepared = ctx.sessions.prepare_session(
                         session_token,
-                        role_request,
+                        ctx.backend.grant_role(role_request),
                         filters,
                         control.clone(),
                     );
@@ -1587,6 +1524,7 @@ impl PiperBridgeHost {
                         break;
                     }
                     if let Some(replaced) = register.replaced {
+                        let _ = ctx.backend.release_maintenance_lease(replaced.session_id());
                         replaced.replace_and_close();
                     }
                     if let Err(err) =
@@ -1707,24 +1645,12 @@ impl PiperBridgeHost {
                             request_id,
                             timeout_ms,
                         } => {
-                            let maintenance_state = ctx
-                                .backend
-                                .maintenance_state(ctx.maintenance_mode.load(Ordering::Acquire));
-                            if !Self::maintenance_allowed(maintenance_state) {
-                                let _ = Self::send_error(
-                                    &writer,
-                                    ctx.stats,
-                                    request_id,
-                                    ErrorCode::PermissionDenied,
-                                    maintenance_state.denial_message(),
-                                );
-                                continue;
-                            }
-                            match ctx.sessions.acquire_maintenance_lease(
+                            match ctx.backend.acquire_maintenance_lease(
                                 active_session.session_id(),
+                                active_session.role_granted(),
                                 Duration::from_millis(timeout_ms as u64),
                             ) {
-                                LeaseAcquireResult::Granted => {
+                                Ok(LeaseAcquireResult::Granted) => {
                                     let _ = Self::write_server_message(
                                         &writer,
                                         &ServerMessage::Response(ServerResponse::LeaseGranted {
@@ -1734,7 +1660,7 @@ impl PiperBridgeHost {
                                         ctx.stats,
                                     );
                                 },
-                                LeaseAcquireResult::Denied { holder_session_id } => {
+                                Ok(LeaseAcquireResult::Denied { holder_session_id }) => {
                                     let _ = Self::write_server_message(
                                         &writer,
                                         &ServerMessage::Response(ServerResponse::LeaseDenied {
@@ -1744,20 +1670,20 @@ impl PiperBridgeHost {
                                         ctx.stats,
                                     );
                                 },
-                                LeaseAcquireResult::NotConnected => {
+                                Err(err) => {
                                     let _ = Self::send_error(
                                         &writer,
                                         ctx.stats,
                                         request_id,
-                                        ErrorCode::NotConnected,
-                                        "bridge session was replaced or closed",
+                                        err.code(),
+                                        err.message(),
                                     );
-                                    break;
                                 },
                             }
                         },
                         ClientRequest::ReleaseWriterLease { request_id } => {
-                            ctx.sessions.release_maintenance_lease(active_session.session_id());
+                            let _ =
+                                ctx.backend.release_maintenance_lease(active_session.session_id());
                             let _ = Self::write_server_message(
                                 &writer,
                                 &ServerMessage::Response(ServerResponse::Ok { request_id }),
@@ -1765,37 +1691,10 @@ impl PiperBridgeHost {
                             );
                         },
                         ClientRequest::SendFrame { request_id, frame } => {
-                            let maintenance_state = ctx
+                            match ctx
                                 .backend
-                                .maintenance_state(ctx.maintenance_mode.load(Ordering::Acquire));
-                            if !Self::maintenance_allowed(maintenance_state) {
-                                let _ = Self::send_error(
-                                    &writer,
-                                    ctx.stats,
-                                    request_id,
-                                    ErrorCode::PermissionDenied,
-                                    maintenance_state.denial_message(),
-                                );
-                                continue;
-                            }
-                            if !ctx.sessions.has_maintenance_lease(active_session.session_id()) {
-                                ctx.warn_limiter.warn("send-without-lease", || {
-                                    format!(
-                                        "rejecting send-frame without maintenance lease from session {} ({peer_label})",
-                                        active_session.session_id()
-                                    )
-                                });
-                                let _ = Self::send_error(
-                                    &writer,
-                                    ctx.stats,
-                                    request_id,
-                                    ErrorCode::PermissionDenied,
-                                    "maintenance lease required",
-                                );
-                                continue;
-                            }
-
-                            match ctx.backend.send_maintenance_frame(frame) {
+                                .send_maintenance_frame(active_session.session_id(), frame)
+                            {
                                 Ok(()) => {
                                     ctx.stats.maintenance_tx_total.fetch_add(1, Ordering::Relaxed);
                                     let _ = Self::write_server_message(
@@ -1831,6 +1730,7 @@ impl PiperBridgeHost {
         if let Some(active_session) = session
             && let Some(removed) = ctx.sessions.unregister_session(active_session.session_id())
         {
+            let _ = ctx.backend.release_maintenance_lease(active_session.session_id());
             removed.shutdown();
             if let Err(err) = Self::reconcile_raw_tap(ctx.raw_tap, ctx.sessions, ctx.backend) {
                 warn!("failed to reconcile raw frame tap after disconnect: {err}");
@@ -1948,7 +1848,7 @@ impl PiperBridgeHost {
 
                     let prepared = ctx.sessions.prepare_session(
                         session_token,
-                        role_request,
+                        ctx.backend.grant_role(role_request),
                         filters,
                         Arc::clone(&control),
                     );
@@ -1971,6 +1871,7 @@ impl PiperBridgeHost {
                     event_rx = Some(prepared_event_rx);
                     session = Some(Arc::clone(&register.session));
                     if let Some(replaced) = register.replaced {
+                        let _ = ctx.backend.release_maintenance_lease(replaced.session_id());
                         replaced.replace_and_close();
                     }
                     if let Err(err) =
@@ -2091,24 +1992,12 @@ impl PiperBridgeHost {
                             request_id,
                             timeout_ms,
                         } => {
-                            let maintenance_state = ctx
-                                .backend
-                                .maintenance_state(ctx.maintenance_mode.load(Ordering::Acquire));
-                            if !Self::maintenance_allowed(maintenance_state) {
-                                let _ = Self::send_error_direct(
-                                    &mut stream,
-                                    ctx.stats,
-                                    request_id,
-                                    ErrorCode::PermissionDenied,
-                                    maintenance_state.denial_message(),
-                                );
-                                continue;
-                            }
-                            match ctx.sessions.acquire_maintenance_lease(
+                            match ctx.backend.acquire_maintenance_lease(
                                 active_session.session_id(),
+                                active_session.role_granted(),
                                 Duration::from_millis(timeout_ms as u64),
                             ) {
-                                LeaseAcquireResult::Granted => {
+                                Ok(LeaseAcquireResult::Granted) => {
                                     let _ = Self::write_server_message_direct(
                                         &mut stream,
                                         &ServerMessage::Response(ServerResponse::LeaseGranted {
@@ -2118,7 +2007,7 @@ impl PiperBridgeHost {
                                         ctx.stats,
                                     );
                                 },
-                                LeaseAcquireResult::Denied { holder_session_id } => {
+                                Ok(LeaseAcquireResult::Denied { holder_session_id }) => {
                                     let _ = Self::write_server_message_direct(
                                         &mut stream,
                                         &ServerMessage::Response(ServerResponse::LeaseDenied {
@@ -2128,20 +2017,20 @@ impl PiperBridgeHost {
                                         ctx.stats,
                                     );
                                 },
-                                LeaseAcquireResult::NotConnected => {
+                                Err(err) => {
                                     let _ = Self::send_error_direct(
                                         &mut stream,
                                         ctx.stats,
                                         request_id,
-                                        ErrorCode::NotConnected,
-                                        "bridge session was replaced or closed",
+                                        err.code(),
+                                        err.message(),
                                     );
-                                    break;
                                 },
                             }
                         },
                         ClientRequest::ReleaseWriterLease { request_id } => {
-                            ctx.sessions.release_maintenance_lease(active_session.session_id());
+                            let _ =
+                                ctx.backend.release_maintenance_lease(active_session.session_id());
                             let _ = Self::write_server_message_direct(
                                 &mut stream,
                                 &ServerMessage::Response(ServerResponse::Ok { request_id }),
@@ -2149,37 +2038,10 @@ impl PiperBridgeHost {
                             );
                         },
                         ClientRequest::SendFrame { request_id, frame } => {
-                            let maintenance_state = ctx
+                            match ctx
                                 .backend
-                                .maintenance_state(ctx.maintenance_mode.load(Ordering::Acquire));
-                            if !Self::maintenance_allowed(maintenance_state) {
-                                let _ = Self::send_error_direct(
-                                    &mut stream,
-                                    ctx.stats,
-                                    request_id,
-                                    ErrorCode::PermissionDenied,
-                                    maintenance_state.denial_message(),
-                                );
-                                continue;
-                            }
-                            if !ctx.sessions.has_maintenance_lease(active_session.session_id()) {
-                                ctx.warn_limiter.warn("send-without-lease", || {
-                                    format!(
-                                        "rejecting send-frame without maintenance lease from session {} ({peer_label})",
-                                        active_session.session_id()
-                                    )
-                                });
-                                let _ = Self::send_error_direct(
-                                    &mut stream,
-                                    ctx.stats,
-                                    request_id,
-                                    ErrorCode::PermissionDenied,
-                                    "maintenance lease required",
-                                );
-                                continue;
-                            }
-
-                            match ctx.backend.send_maintenance_frame(frame) {
+                                .send_maintenance_frame(active_session.session_id(), frame)
+                            {
                                 Ok(()) => {
                                     ctx.stats.maintenance_tx_total.fetch_add(1, Ordering::Relaxed);
                                     let _ = Self::write_server_message_direct(
@@ -2215,6 +2077,7 @@ impl PiperBridgeHost {
         if let Some(active_session) = session
             && let Some(removed) = ctx.sessions.unregister_session(active_session.session_id())
         {
+            let _ = ctx.backend.release_maintenance_lease(active_session.session_id());
             removed.shutdown();
             if let Err(err) = Self::reconcile_raw_tap(ctx.raw_tap, ctx.sessions, ctx.backend) {
                 warn!("failed to reconcile raw frame tap after tls disconnect: {err}");
@@ -2268,17 +2131,52 @@ fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
     BridgeBackendError::new(code, error.to_string())
 }
 
-pub struct PiperBridgeBackend {
+struct PiperBridgeBackend {
     driver: Arc<RobotPiper>,
+    maintenance_mode: AtomicBool,
+    maintenance_lease: Mutex<Option<u32>>,
+    maintenance_cv: Condvar,
 }
 
 impl PiperBridgeBackend {
-    pub fn from_piper<State>(
-        piper: &crate::state::Piper<State>,
+    fn from_driver(
+        driver: Arc<RobotPiper>,
+        maintenance_mode: bool,
     ) -> Arc<dyn BridgeControllerBackend> {
         Arc::new(Self {
-            driver: Arc::clone(&piper.driver),
+            driver,
+            maintenance_mode: AtomicBool::new(maintenance_mode),
+            maintenance_lease: Mutex::new(None),
+            maintenance_cv: Condvar::new(),
         })
+    }
+
+    fn maintenance_state(&self) -> BridgeMaintenanceState {
+        let health = self.driver.health();
+        if health.fault.is_some() {
+            return BridgeMaintenanceState::DeniedFaulted;
+        }
+        if !health.rx_alive || !health.tx_alive || !health.connected {
+            return BridgeMaintenanceState::DeniedTransportDown;
+        }
+
+        let control = self.driver.get_robot_control();
+        if control.is_enabled {
+            return BridgeMaintenanceState::DeniedActiveControl;
+        }
+
+        if self.maintenance_mode.load(Ordering::Acquire) {
+            BridgeMaintenanceState::AllowedMaintenanceMode
+        } else {
+            BridgeMaintenanceState::AllowedStandby
+        }
+    }
+
+    fn role_denied_error() -> BridgeBackendError {
+        BridgeBackendError::new(
+            ErrorCode::PermissionDenied,
+            "writer lease requires a WriterCandidate bridge role",
+        )
     }
 }
 
@@ -2293,28 +2191,114 @@ impl BridgeControllerBackend for PiperBridgeBackend {
         }
     }
 
-    fn maintenance_state(&self, maintenance_mode: bool) -> BridgeMaintenanceState {
-        let health = self.driver.health();
-        if health.fault.is_some() {
-            return BridgeMaintenanceState::DeniedFaulted;
-        }
-        if !health.rx_alive || !health.tx_alive || !health.connected {
-            return BridgeMaintenanceState::DeniedTransportDown;
-        }
-
-        let control = self.driver.get_robot_control();
-        if control.is_enabled {
-            return BridgeMaintenanceState::DeniedActiveControl;
+    fn acquire_maintenance_lease(
+        &self,
+        session_id: u32,
+        role: BridgeRole,
+        timeout: Duration,
+    ) -> Result<LeaseAcquireResult, BridgeBackendError> {
+        if role != BridgeRole::WriterCandidate {
+            return Err(Self::role_denied_error());
         }
 
-        if maintenance_mode {
-            BridgeMaintenanceState::AllowedMaintenanceMode
-        } else {
-            BridgeMaintenanceState::AllowedStandby
+        let initial_state = self.maintenance_state();
+        if !initial_state.allows_lease() {
+            return Err(BridgeBackendError::new(
+                ErrorCode::PermissionDenied,
+                initial_state.denial_message(),
+            ));
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.maintenance_lease.lock().unwrap();
+        loop {
+            let current_state = self.maintenance_state();
+            if !current_state.allows_lease() {
+                if guard.as_ref().copied() == Some(session_id) {
+                    *guard = None;
+                    self.maintenance_cv.notify_all();
+                }
+                return Err(BridgeBackendError::new(
+                    ErrorCode::PermissionDenied,
+                    current_state.denial_message(),
+                ));
+            }
+
+            match *guard {
+                None => {
+                    *guard = Some(session_id);
+                    return Ok(LeaseAcquireResult::Granted);
+                },
+                Some(owner) if owner == session_id => return Ok(LeaseAcquireResult::Granted),
+                Some(owner) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(LeaseAcquireResult::Denied {
+                            holder_session_id: Some(owner),
+                        });
+                    }
+                    let remaining = deadline.saturating_duration_since(now);
+                    let (next_guard, wait_result) =
+                        self.maintenance_cv.wait_timeout(guard, remaining).unwrap();
+                    guard = next_guard;
+                    if wait_result.timed_out() {
+                        return Ok(LeaseAcquireResult::Denied {
+                            holder_session_id: guard.as_ref().copied(),
+                        });
+                    }
+                },
+            }
         }
     }
 
-    fn send_maintenance_frame(&self, frame: PiperFrame) -> Result<(), BridgeBackendError> {
+    fn release_maintenance_lease(&self, session_id: u32) -> Result<bool, BridgeBackendError> {
+        let mut guard = self.maintenance_lease.lock().unwrap();
+        if guard.as_ref().copied() == Some(session_id) {
+            *guard = None;
+            self.maintenance_cv.notify_all();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn revoke_invalid_lease(&self) -> Result<Option<u32>, BridgeBackendError> {
+        let state = self.maintenance_state();
+        if state.allows_lease() {
+            return Ok(None);
+        }
+
+        let mut guard = self.maintenance_lease.lock().unwrap();
+        let holder = *guard;
+        if holder.is_some() {
+            *guard = None;
+            self.maintenance_cv.notify_all();
+        }
+        Ok(holder)
+    }
+
+    fn send_maintenance_frame(
+        &self,
+        session_id: u32,
+        frame: PiperFrame,
+    ) -> Result<(), BridgeBackendError> {
+        let _guard = self.maintenance_lease.lock().unwrap();
+        if _guard.as_ref().copied() != Some(session_id) {
+            return Err(BridgeBackendError::new(
+                ErrorCode::PermissionDenied,
+                "maintenance lease required",
+            ));
+        }
+
+        let maintenance_state = self.maintenance_state();
+        if !maintenance_state.allows_lease() {
+            drop(_guard);
+            let _ = self.release_maintenance_lease(session_id);
+            return Err(BridgeBackendError::new(
+                ErrorCode::PermissionDenied,
+                maintenance_state.denial_message(),
+            ));
+        }
+
         self.driver
             .send_frame(frame)
             .map_err(|err| bridge_backend_error_from_driver(&err))
@@ -2436,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn same_token_replacement_invalidates_old_session_and_preserves_lease_on_new_active_session() {
+    fn same_token_replacement_invalidates_old_session_without_counting_it_as_active() {
         let manager = SessionManager::new();
         let first = manager.commit_prepared(manager.prepare_session(
             token(1),
@@ -2444,10 +2428,6 @@ mod tests {
             vec![],
             Arc::new(NoopControl),
         ));
-        assert_eq!(
-            manager.acquire_maintenance_lease(first.session.session_id(), Duration::from_millis(1)),
-            LeaseAcquireResult::Granted
-        );
 
         let second = manager.commit_prepared(manager.prepare_session(
             token(1),
@@ -2459,13 +2439,9 @@ mod tests {
         assert!(first.replaced.is_none());
         assert!(second.replaced.is_some());
         let old = second.replaced.as_ref().unwrap().clone();
+        old.replace_and_close();
         assert!(!old.is_active());
         assert!(second.session.is_active());
-        assert_eq!(
-            manager.acquire_maintenance_lease(old.session_id(), Duration::from_millis(1)),
-            LeaseAcquireResult::NotConnected
-        );
-        assert!(manager.has_maintenance_lease(second.session.session_id()));
         assert!(!manager.set_filters(old.session_id(), vec![CanIdFilter::new(0x100, 0x1FF)]));
         assert!(manager.set_filters(
             second.session.session_id(),
@@ -2480,6 +2456,7 @@ mod tests {
         let session = BridgeSession::new(
             1,
             token(2),
+            BridgeRole::WriterCandidate,
             vec![],
             event_tx,
             control_tx,
@@ -2516,7 +2493,10 @@ mod tests {
 
         assert_eq!(
             manager.broadcast_frame(PiperFrame::new_standard(0x120, &[1, 2, 3])),
-            0
+            BroadcastFrameStats {
+                dropped: 0,
+                inactive: 1,
+            }
         );
     }
 }

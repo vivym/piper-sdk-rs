@@ -4,9 +4,7 @@
 //! attaches the non-realtime bridge host to that in-process controller surface.
 
 use clap::Parser;
-use piper_sdk::{
-    BridgeHostConfig, BridgeTlsServerConfig, PiperBridgeBackend, PiperBridgeHost, PiperBuilder,
-};
+use piper_sdk::{BridgeHostConfig, BridgeTlsServerConfig, PiperBuilder};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -69,7 +67,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let piper = builder.build()?;
-    let backend = PiperBridgeBackend::from_piper(&piper);
     let tcp_tls = match args.tcp_tls {
         Some(addr) => Some(BridgeTlsServerConfig {
             listen_addr: addr.parse()?,
@@ -88,15 +85,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    let host = PiperBridgeHost::attach(
-        backend,
-        BridgeHostConfig {
-            uds_path: Some(PathBuf::from(args.uds)),
-            tcp_tls,
-            maintenance_mode: false,
-            allow_raw_frame_tap: args.allow_raw_frame_tap,
-        },
-    );
+    let host = piper.attach_bridge_host(BridgeHostConfig {
+        uds_path: Some(PathBuf::from(args.uds)),
+        tcp_tls,
+        maintenance_mode: false,
+        allow_raw_frame_tap: args.allow_raw_frame_tap,
+    });
 
     tracing::info!("embedded bridge host starting");
     host.run()?;

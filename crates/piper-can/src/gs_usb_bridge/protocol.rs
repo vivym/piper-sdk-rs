@@ -148,6 +148,8 @@ pub struct BridgeStatus {
     pub cpu_usage_percent: u8,
     pub session_count: u32,
     pub queue_drop_count: u64,
+    pub inactive_enqueue_count: u64,
+    pub session_replacement_discard_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -509,6 +511,8 @@ fn encode_payload_from_server(message: &ServerMessage) -> Result<Vec<u8>, Protoc
             put_u8(&mut buf, status.cpu_usage_percent);
             put_u32(&mut buf, status.session_count);
             put_u64(&mut buf, status.queue_drop_count);
+            put_u64(&mut buf, status.inactive_enqueue_count);
+            put_u64(&mut buf, status.session_replacement_discard_count);
         },
         ServerMessage::Response(ServerResponse::LeaseGranted {
             request_id,
@@ -643,6 +647,8 @@ pub fn decode_server_message(payload: &[u8]) -> Result<ServerMessage, ProtocolEr
                     cpu_usage_percent: cursor.u8()?,
                     session_count: cursor.u32()?,
                     queue_drop_count: cursor.u64()?,
+                    inactive_enqueue_count: cursor.u64()?,
+                    session_replacement_discard_count: cursor.u64()?,
                 },
             })
         },
@@ -716,6 +722,8 @@ mod tests {
             cpu_usage_percent: 12,
             session_count: 4,
             queue_drop_count: 5,
+            inactive_enqueue_count: 6,
+            session_replacement_discard_count: 7,
         }
     }
 

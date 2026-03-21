@@ -78,7 +78,6 @@ pub use client::{
     BilateralLoopConfig,
     BilateralRunReport,
     BridgeClientOptions,
-    BridgeControllerBackend,
     BridgeDeviceState,
     BridgeEndpoint,
     BridgeError,
@@ -88,7 +87,6 @@ pub use client::{
     BridgeResult,
     BridgeRole,
     BridgeStatus,
-    BridgeStatusInput,
     BridgeTlsClientConfig,
     BridgeTlsServerConfig,
     CanIdFilter,
@@ -111,7 +109,6 @@ pub use client::{
     MaintenanceLease,
     MasterFollowerController,
     Observer,
-    PiperBridgeBackend,
     PiperBridgeClient,
     PiperBridgeHost,
     PiperBuilder, // Client 层 Builder（推荐使用）
