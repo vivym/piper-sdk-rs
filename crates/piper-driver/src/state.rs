@@ -94,26 +94,41 @@ impl EndPoseState {
 #[derive(Debug, Clone, Default)]
 pub struct MonitorSnapshot<T: Clone + Default> {
     /// 最近一份完整 monitor-complete 快照
-    pub latest_complete: T,
+    latest_complete: Option<Arc<T>>,
     /// 当前 raw 状态（允许部分帧/部分关节）
-    pub latest_raw: T,
+    latest_raw: T,
 }
 
 impl<T: Clone + Default> MonitorSnapshot<T> {
     /// 构造同时更新 complete/raw 的监控快照
     pub fn from_complete(complete: T) -> Self {
         Self {
-            latest_complete: complete.clone(),
+            latest_complete: Some(Arc::new(complete.clone())),
             latest_raw: complete,
         }
     }
 
     /// 构造保留上一份完整快照、仅更新 raw 的监控快照
-    pub fn with_raw(latest_complete: T, latest_raw: T) -> Self {
+    pub fn with_raw(latest_complete: Option<Arc<T>>, latest_raw: T) -> Self {
         Self {
             latest_complete,
             latest_raw,
         }
+    }
+
+    /// 返回最近一份完整监控快照。
+    pub fn latest_complete(&self) -> Option<&T> {
+        self.latest_complete.as_deref()
+    }
+
+    /// 返回最近一份完整监控快照的副本。
+    pub fn latest_complete_cloned(&self) -> Option<T> {
+        self.latest_complete().cloned()
+    }
+
+    /// 返回当前 raw 诊断状态。
+    pub fn latest_raw(&self) -> &T {
+        &self.latest_raw
     }
 }
 
@@ -1072,7 +1087,7 @@ impl PiperContext {
     ///
     /// let ctx = PiperContext::new();
     /// let joint_pos = ctx.joint_position_monitor.load();
-    /// assert_eq!(joint_pos.latest_complete.hardware_timestamp_us, 0);
+    /// assert!(joint_pos.latest_complete().is_none());
     /// ```
     pub fn new() -> Self {
         Self {
@@ -1187,11 +1202,11 @@ impl PiperContext {
             )));
         self.motion_snapshot.store(Arc::new(MotionSnapshot {
             joint_position: joint_position.clone(),
-            end_pose: end_pose.latest_complete.clone(),
+            end_pose: end_pose.latest_complete_cloned().unwrap_or_default(),
         }));
         self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
             joint_position,
-            end_pose: end_pose.latest_raw.clone(),
+            end_pose: end_pose.latest_raw().clone(),
         }));
     }
 
@@ -1206,7 +1221,7 @@ impl PiperContext {
             )));
         self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
             joint_position,
-            end_pose: end_pose.latest_raw.clone(),
+            end_pose: end_pose.latest_raw().clone(),
         }));
     }
 
@@ -1217,11 +1232,11 @@ impl PiperContext {
             end_pose.clone(),
         )));
         self.motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.latest_complete.clone(),
+            joint_position: joint_position.latest_complete_cloned().unwrap_or_default(),
             end_pose: end_pose.clone(),
         }));
         self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.latest_raw.clone(),
+            joint_position: joint_position.latest_raw().clone(),
             end_pose,
         }));
     }
@@ -1255,7 +1270,7 @@ impl PiperContext {
             end_pose.clone(),
         )));
         self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.latest_raw.clone(),
+            joint_position: joint_position.latest_raw().clone(),
             end_pose,
         }));
     }
@@ -1475,19 +1490,16 @@ mod tests {
         let ctx = PiperContext::new();
         // 验证所有 Arc/ArcSwap 都已初始化
         let joint_pos = ctx.joint_position_monitor.load();
-        assert_eq!(joint_pos.latest_complete.hardware_timestamp_us, 0);
-        assert_eq!(joint_pos.latest_complete.joint_pos, [0.0; 6]);
-        assert_eq!(joint_pos.latest_raw.hardware_timestamp_us, 0);
+        assert!(joint_pos.latest_complete().is_none());
+        assert_eq!(joint_pos.latest_raw().hardware_timestamp_us, 0);
 
         let end_pose = ctx.end_pose_monitor.load();
-        assert_eq!(end_pose.latest_complete.hardware_timestamp_us, 0);
-        assert_eq!(end_pose.latest_complete.end_pose, [0.0; 6]);
-        assert_eq!(end_pose.latest_raw.hardware_timestamp_us, 0);
+        assert!(end_pose.latest_complete().is_none());
+        assert_eq!(end_pose.latest_raw().hardware_timestamp_us, 0);
 
         let joint_dynamic = ctx.joint_dynamic_monitor.load();
-        assert_eq!(joint_dynamic.latest_complete.group_timestamp_us, 0);
-        assert_eq!(joint_dynamic.latest_complete.group_host_rx_mono_us, 0);
-        assert_eq!(joint_dynamic.latest_raw.group_timestamp_us, 0);
+        assert!(joint_dynamic.latest_complete().is_none());
+        assert_eq!(joint_dynamic.latest_raw().group_timestamp_us, 0);
 
         let robot_control = ctx.robot_control.load();
         assert_eq!(robot_control.hardware_timestamp_us, 0);
@@ -1873,14 +1885,127 @@ mod tests {
 
         // 验证新状态字段存在且为默认值
         let joint_pos = ctx.joint_position_monitor.load();
-        assert_eq!(joint_pos.latest_complete.hardware_timestamp_us, 0);
-        assert_eq!(joint_pos.latest_complete.joint_pos, [0.0; 6]);
-        assert_eq!(joint_pos.latest_raw.hardware_timestamp_us, 0);
+        assert!(joint_pos.latest_complete().is_none());
+        assert_eq!(joint_pos.latest_raw().hardware_timestamp_us, 0);
 
         let end_pose = ctx.end_pose_monitor.load();
-        assert_eq!(end_pose.latest_complete.hardware_timestamp_us, 0);
-        assert_eq!(end_pose.latest_complete.end_pose, [0.0; 6]);
-        assert_eq!(end_pose.latest_raw.hardware_timestamp_us, 0);
+        assert!(end_pose.latest_complete().is_none());
+        assert_eq!(end_pose.latest_raw().hardware_timestamp_us, 0);
+    }
+
+    #[test]
+    fn test_joint_position_monitor_snapshot_reuses_complete_arc_for_raw_updates() {
+        let ctx = PiperContext::new();
+        let complete = JointPositionState {
+            hardware_timestamp_us: 100,
+            host_rx_mono_us: 200,
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        };
+        ctx.publish_joint_position(complete);
+
+        let first = ctx.capture_joint_position_monitor_snapshot();
+        let first_complete =
+            first.latest_complete.as_ref().expect("complete snapshot should exist").clone();
+
+        ctx.publish_raw_joint_position(JointPositionState {
+            hardware_timestamp_us: 101,
+            host_rx_mono_us: 201,
+            joint_pos: [2.0; 6],
+            frame_valid_mask: 0b001,
+        });
+
+        let second = ctx.capture_joint_position_monitor_snapshot();
+        let second_complete = second
+            .latest_complete
+            .as_ref()
+            .expect("complete snapshot should remain")
+            .clone();
+
+        assert!(Arc::ptr_eq(&first_complete, &second_complete));
+        assert_eq!(second.latest_raw().frame_valid_mask, 0b001);
+        assert_eq!(
+            second.latest_complete().expect("complete snapshot should remain").joint_pos,
+            [1.0; 6]
+        );
+    }
+
+    #[test]
+    fn test_end_pose_monitor_snapshot_reuses_complete_arc_for_raw_updates() {
+        let ctx = PiperContext::new();
+        let complete = EndPoseState {
+            hardware_timestamp_us: 300,
+            host_rx_mono_us: 400,
+            end_pose: [1.5; 6],
+            frame_valid_mask: 0b111,
+        };
+        ctx.publish_end_pose(complete);
+
+        let first = ctx.capture_end_pose_monitor_snapshot();
+        let first_complete =
+            first.latest_complete.as_ref().expect("complete snapshot should exist").clone();
+
+        ctx.publish_raw_end_pose(EndPoseState {
+            hardware_timestamp_us: 301,
+            host_rx_mono_us: 401,
+            end_pose: [2.5; 6],
+            frame_valid_mask: 0b001,
+        });
+
+        let second = ctx.capture_end_pose_monitor_snapshot();
+        let second_complete = second
+            .latest_complete
+            .as_ref()
+            .expect("complete snapshot should remain")
+            .clone();
+
+        assert!(Arc::ptr_eq(&first_complete, &second_complete));
+        assert_eq!(second.latest_raw().frame_valid_mask, 0b001);
+        assert_eq!(
+            second.latest_complete().expect("complete snapshot should remain").end_pose,
+            [1.5; 6]
+        );
+    }
+
+    #[test]
+    fn test_joint_dynamic_monitor_snapshot_reuses_complete_arc_for_raw_updates() {
+        let ctx = PiperContext::new();
+        let complete = JointDynamicState {
+            group_timestamp_us: 500,
+            group_host_rx_mono_us: 600,
+            joint_vel: [1.0; 6],
+            joint_current: [2.0; 6],
+            timestamps: [10; 6],
+            valid_mask: 0b11_1111,
+        };
+        ctx.publish_joint_dynamic(complete);
+
+        let first = ctx.capture_joint_dynamic_monitor_snapshot();
+        let first_complete =
+            first.latest_complete.as_ref().expect("complete snapshot should exist").clone();
+
+        ctx.publish_raw_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 501,
+            group_host_rx_mono_us: 601,
+            joint_vel: [3.0; 6],
+            joint_current: [4.0; 6],
+            timestamps: [20; 6],
+            valid_mask: 0b000001,
+        });
+
+        let second = ctx.capture_joint_dynamic_monitor_snapshot();
+        let second_complete = second
+            .latest_complete
+            .as_ref()
+            .expect("complete snapshot should remain")
+            .clone();
+
+        assert!(Arc::ptr_eq(&first_complete, &second_complete));
+        assert_eq!(second.latest_raw().valid_mask, 0b000001);
+        assert_eq!(
+            second.latest_complete().expect("complete snapshot should remain").valid_mask,
+            0b11_1111
+        );
     }
 
     // ============================================================

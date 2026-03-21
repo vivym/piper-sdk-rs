@@ -201,7 +201,7 @@ impl Observer {
         match self.driver.get_aligned_motion(policy.max_state_skew_us) {
             AlignmentResult::Ok(state) => {
                 if !state.is_complete() {
-                    return Err(self.incomplete_control_state_error());
+                    return Err(Self::incomplete_control_state_error(&state));
                 }
 
                 let age = control_feedback_age(
@@ -233,7 +233,7 @@ impl Observer {
             },
             AlignmentResult::Misaligned { state, .. } => {
                 if !state.is_complete() {
-                    return Err(self.incomplete_control_state_error());
+                    return Err(Self::incomplete_control_state_error(&state));
                 }
 
                 let age = control_feedback_age(
@@ -261,17 +261,15 @@ impl Observer {
     /// 如需查看半成品/诊断数据，请使用 `raw_joint_position_state()`。
     pub fn joint_positions(&self) -> Result<JointArray<Rad>> {
         let joint_pos = self.driver.get_joint_position_monitor_snapshot();
-        if !joint_pos.latest_complete.is_fully_valid() {
+        let Some(latest_complete) = joint_pos.latest_complete() else {
             return Err(RobotError::monitor_state_incomplete(
                 MonitorStateSource::JointPosition,
-                joint_pos.latest_raw.frame_valid_mask,
+                joint_pos.latest_raw().frame_valid_mask,
                 COMPLETE_COLD_GROUP_MASK,
             ));
-        }
+        };
 
-        Ok(JointArray::new(
-            joint_pos.latest_complete.joint_pos.map(Rad),
-        ))
+        Ok(JointArray::new(latest_complete.joint_pos.map(Rad)))
     }
 
     /// 获取关节速度（监控/诊断接口）
@@ -287,17 +285,15 @@ impl Observer {
     /// 返回 `JointArray<RadPerSecond>`，保持类型安全。
     pub fn joint_velocities(&self) -> Result<JointArray<RadPerSecond>> {
         let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
-        if !dyn_state.latest_complete.is_complete() {
+        let Some(latest_complete) = dyn_state.latest_complete() else {
             return Err(RobotError::monitor_state_incomplete(
                 MonitorStateSource::JointDynamic,
-                dyn_state.latest_raw.valid_mask,
+                dyn_state.latest_raw().valid_mask,
                 COMPLETE_DYNAMIC_GROUP_MASK,
             ));
-        }
+        };
 
-        Ok(JointArray::new(
-            dyn_state.latest_complete.joint_vel.map(RadPerSecond),
-        ))
+        Ok(JointArray::new(latest_complete.joint_vel.map(RadPerSecond)))
     }
 
     /// 获取关节力矩（监控/诊断接口）
@@ -309,32 +305,32 @@ impl Observer {
     /// 如需查看半成品/诊断数据，请使用 `raw_joint_dynamic_state()`。
     pub fn joint_torques(&self) -> Result<JointArray<NewtonMeter>> {
         let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
-        if !dyn_state.latest_complete.is_complete() {
+        let Some(latest_complete) = dyn_state.latest_complete() else {
             return Err(RobotError::monitor_state_incomplete(
                 MonitorStateSource::JointDynamic,
-                dyn_state.latest_raw.valid_mask,
+                dyn_state.latest_raw().valid_mask,
                 COMPLETE_DYNAMIC_GROUP_MASK,
             ));
-        }
+        };
 
         Ok(JointArray::new(
-            dyn_state.latest_complete.get_all_torques().map(NewtonMeter),
+            latest_complete.get_all_torques().map(NewtonMeter),
         ))
     }
 
     /// 获取原始关节位置状态（允许部分帧组，仅供诊断）
     pub fn raw_joint_position_state(&self) -> piper_driver::JointPositionState {
-        self.driver.get_joint_position_monitor_snapshot().latest_raw
+        self.driver.get_joint_position_monitor_snapshot().latest_raw().clone()
     }
 
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
     pub fn raw_joint_dynamic_state(&self) -> piper_driver::JointDynamicState {
-        self.driver.get_joint_dynamic_monitor_snapshot().latest_raw
+        self.driver.get_joint_dynamic_monitor_snapshot().latest_raw().clone()
     }
 
     /// 获取原始末端位姿状态（允许部分帧组，仅供诊断）
     pub fn raw_end_pose_state(&self) -> piper_driver::state::EndPoseState {
-        self.driver.get_end_pose_monitor_snapshot().latest_raw
+        self.driver.get_end_pose_monitor_snapshot().latest_raw().clone()
     }
 
     /// 获取夹爪状态
@@ -398,15 +394,15 @@ impl Observer {
     /// ```
     pub fn end_pose(&self) -> Result<piper_driver::state::EndPoseState> {
         let end_pose = self.driver.get_end_pose_monitor_snapshot();
-        if !end_pose.latest_complete.is_fully_valid() {
+        let Some(latest_complete) = end_pose.latest_complete() else {
             return Err(RobotError::monitor_state_incomplete(
                 MonitorStateSource::EndPose,
-                end_pose.latest_raw.frame_valid_mask,
+                end_pose.latest_raw().frame_valid_mask,
                 COMPLETE_COLD_GROUP_MASK,
             ));
-        }
+        };
 
-        Ok(end_pose.latest_complete)
+        Ok(latest_complete.clone())
     }
 
     /// 检查是否全部使能
@@ -531,12 +527,10 @@ impl Observer {
         }
     }
 
-    fn incomplete_control_state_error(&self) -> RobotError {
-        let raw_motion = self.driver.capture_raw_motion_snapshot();
-        let raw_dynamic = self.driver.get_raw_joint_dynamic();
+    fn incomplete_control_state_error(state: &piper_driver::AlignedMotionState) -> RobotError {
         RobotError::control_state_incomplete(
-            raw_motion.joint_position.frame_valid_mask,
-            raw_dynamic.valid_mask,
+            state.position_frame_valid_mask,
+            state.dynamic_valid_mask,
         )
     }
 }
@@ -1030,7 +1024,7 @@ mod tests {
         assert!(matches!(
             error,
             RobotError::ControlStateIncomplete {
-                position_frame_valid_mask: 0b101,
+                position_frame_valid_mask: 0,
                 dynamic_valid_mask: 0b111111,
             }
         ));
@@ -1066,7 +1060,43 @@ mod tests {
             error,
             RobotError::ControlStateIncomplete {
                 position_frame_valid_mask: 0b111,
-                dynamic_valid_mask: 0b001111,
+                dynamic_valid_mask: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_control_snapshot_reports_control_candidate_masks_when_control_grade_rejected() {
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, 1_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, 4_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, 7_000),
+            joint_dynamic_frame(1, 0, 1000, 7_000),
+            joint_dynamic_frame(2, 0, 1000, 7_000),
+            joint_dynamic_frame(3, 0, 1000, 7_000),
+            joint_dynamic_frame(4, 0, 1000, 7_000),
+            joint_dynamic_frame(5, 0, 1000, 7_000),
+            joint_dynamic_frame(6, 0, 1000, 7_000),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(20));
+
+        let error = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 500,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RobotError::ControlStateIncomplete {
+                position_frame_valid_mask: 0,
+                dynamic_valid_mask: 0b111111,
             }
         ));
     }

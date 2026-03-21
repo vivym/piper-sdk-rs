@@ -43,11 +43,16 @@ fn test_joint_position_state_concurrent_read() {
             for _ in 0..reads_per_thread {
                 let state = ctx_reader.joint_position_monitor.load();
                 // 验证状态是递增的（或至少不倒退太多）
-                if state.latest_complete.hardware_timestamp_us >= last_timestamp {
-                    last_timestamp = state.latest_complete.hardware_timestamp_us;
+                if let Some(complete) = state.latest_complete()
+                    && complete.hardware_timestamp_us >= last_timestamp
+                {
+                    last_timestamp = complete.hardware_timestamp_us;
                 }
                 // 验证状态完整性
-                assert!(state.latest_complete.joint_pos.len() == 6);
+                assert!(
+                    state.latest_complete().map(|s| s.joint_pos.len()) == Some(6)
+                        || state.latest_complete().is_none()
+                );
                 thread::yield_now();
             }
         });
@@ -90,7 +95,10 @@ fn test_end_pose_state_concurrent_read() {
         let handle = thread::spawn(move || {
             for _ in 0..reads_per_thread {
                 let state = ctx_reader.end_pose_monitor.load();
-                assert!(state.latest_complete.end_pose.len() == 6);
+                assert!(
+                    state.latest_complete().map(|s| s.end_pose.len()) == Some(6)
+                        || state.latest_complete().is_none()
+                );
                 thread::yield_now();
             }
         });
@@ -443,7 +451,10 @@ fn test_multiple_states_concurrent_read() {
                 let gripper = ctx_reader.gripper.load();
 
                 // 验证状态完整性
-                assert!(joint_pos.latest_complete.joint_pos.len() == 6);
+                assert!(
+                    joint_pos.latest_complete().map(|s| s.joint_pos.len()) == Some(6)
+                        || joint_pos.latest_complete().is_none()
+                );
                 // control_mode 是 u8，范围 0-255，无需额外验证
                 let _ = robot_control.control_mode;
                 assert!(gripper.travel >= 0.0);

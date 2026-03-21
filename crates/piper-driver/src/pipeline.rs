@@ -1739,10 +1739,9 @@ mod tests {
         let joint_pos = ctx.joint_position_monitor.load();
         // 如果帧组完整，应该有时间戳更新
         // 但由于异步性，可能需要多次尝试或调整测试策略
-        assert!(
-            joint_pos.latest_complete.joint_pos.iter().any(|&v| v != 0.0)
-                || joint_pos.latest_complete.hardware_timestamp_us == 0
-        );
+        assert!(joint_pos.latest_complete().is_none_or(|state| {
+            state.joint_pos.iter().any(|&v| v != 0.0) || state.hardware_timestamp_us == 0
+        }));
     }
 
     #[test]
