@@ -93,8 +93,6 @@ pub struct PiperMetrics {
     pub rx_joint_position_control_grade_rejected_total: AtomicU64,
     /// 末端位姿完整组因缺帧/超时而被丢弃的次数
     pub rx_end_pose_incomplete_groups_dropped_total: AtomicU64,
-    /// 末端位姿完整组不满足控制级跨度约束而被拒绝的次数
-    pub rx_end_pose_control_grade_rejected_total: AtomicU64,
     /// 关节动态部分帧组被丢弃的次数
     pub rx_joint_dynamic_groups_dropped_total: AtomicU64,
 }
@@ -148,9 +146,6 @@ impl PiperMetrics {
             rx_end_pose_incomplete_groups_dropped_total: self
                 .rx_end_pose_incomplete_groups_dropped_total
                 .load(Ordering::Relaxed),
-            rx_end_pose_control_grade_rejected_total: self
-                .rx_end_pose_control_grade_rejected_total
-                .load(Ordering::Relaxed),
             rx_joint_dynamic_groups_dropped_total: self
                 .rx_joint_dynamic_groups_dropped_total
                 .load(Ordering::Relaxed),
@@ -185,7 +180,6 @@ impl PiperMetrics {
             .store(0, Ordering::Relaxed);
         self.rx_joint_position_control_grade_rejected_total.store(0, Ordering::Relaxed);
         self.rx_end_pose_incomplete_groups_dropped_total.store(0, Ordering::Relaxed);
-        self.rx_end_pose_control_grade_rejected_total.store(0, Ordering::Relaxed);
         self.rx_joint_dynamic_groups_dropped_total.store(0, Ordering::Relaxed);
     }
 }
@@ -241,8 +235,6 @@ pub struct MetricsSnapshot {
     pub rx_joint_position_control_grade_rejected_total: u64,
     /// 末端位姿完整组因缺帧/超时而被丢弃的次数
     pub rx_end_pose_incomplete_groups_dropped_total: u64,
-    /// 末端位姿完整组不满足控制级跨度约束而被拒绝的次数
-    pub rx_end_pose_control_grade_rejected_total: u64,
     /// 关节动态部分帧组被丢弃的次数
     pub rx_joint_dynamic_groups_dropped_total: u64,
 }
@@ -416,7 +408,6 @@ mod tests {
             rx_joint_position_incomplete_groups_dropped_total: 0,
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
-            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -451,7 +442,6 @@ mod tests {
             rx_joint_position_incomplete_groups_dropped_total: 0,
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
-            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -486,7 +476,6 @@ mod tests {
             rx_joint_position_incomplete_groups_dropped_total: 0,
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
-            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -530,7 +519,6 @@ mod tests {
             rx_joint_position_incomplete_groups_dropped_total: 0,
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
-            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -565,7 +553,6 @@ mod tests {
             rx_joint_position_incomplete_groups_dropped_total: 0,
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
-            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
 
@@ -599,7 +586,6 @@ mod tests {
             rx_joint_position_incomplete_groups_dropped_total: 0,
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
-            rx_end_pose_control_grade_rejected_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
         };
         assert!(!normal.is_overwrite_rate_abnormal());

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::connection::initialize_connected_driver;
 use crate::types::*;
 use crate::{
-    observer::{CollisionProtectionSnapshot, Observer, RuntimeHealthSnapshot},
+    observer::{CollisionProtectionSnapshot, MonitorReadPolicy, Observer, RuntimeHealthSnapshot},
     raw_commander::RawCommander,
 };
 use piper_protocol::control::{InstallPosition, MitControlCommand};
@@ -2069,40 +2069,34 @@ impl Piper<Active<PositionMode>> {
             self._state.0.send_strategy,
         )
     }
-    /// 更新单个关节位置（保持其他关节不变）
+
+    /// 基于调用方已持有的 6 关节快照更新单个关节目标。
     ///
-    /// **注意**：此方法会先读取当前所有关节位置，然后只更新目标关节。
-    /// 如果需要更新多个关节，请使用 `motion_commander().send_position_command_batch()` 方法。
-    ///
-    /// **为什么需要读取当前位置？**
-    /// - 每个 CAN 帧（0x155, 0x156, 0x157）包含两个关节的角度
-    /// - 如果只发送单个关节，另一个关节会被错误地设置为 0.0
-    /// - 因此必须先读取当前位置，然后更新目标关节，最后批量发送
-    ///
-    /// # 参数
-    ///
-    /// - `joint`: 目标关节
-    /// - `position`: 目标位置（Rad）
-    ///
-    /// # 示例
-    ///
-    /// ```rust,ignore
-    /// // 只更新 J1，保持其他关节不变
-    /// robot.command_position(Joint::J1, Rad(1.57))?;
-    ///
-    /// // 更新多个关节，使用批量方法
-    /// let mut positions = robot.observer().joint_positions()?;
-    /// positions[Joint::J1] = Rad(1.0);
-    /// positions[Joint::J2] = Rad(0.5);
-    /// robot.motion_commander().send_position_command(&positions)?;
-    /// ```
-    pub fn command_position(&self, joint: Joint, position: Rad) -> Result<()> {
-        // 读取当前所有关节位置
-        let mut positions = self.observer.joint_positions()?;
-        // 只更新目标关节
+    /// 这是位置模式下最安全的单关节便捷入口：不会读取 driver，也不会隐式重放陈旧反馈。
+    pub fn command_position_from_snapshot(
+        &self,
+        joint: Joint,
+        position: Rad,
+        current_positions: &JointArray<Rad>,
+    ) -> Result<()> {
+        let mut positions = *current_positions;
         positions[joint] = position;
-        // 批量发送所有关节（包括更新的和未更新的）
         self.send_position_command(&positions)
+    }
+
+    /// 按显式 freshness 策略读取当前位置并更新单个关节目标。
+    ///
+    /// 该方法只会使用完整且新鲜的关节位置监控快照做 read-modify-write。
+    /// 如需更新多个关节，或者调用方已经持有一份新鲜的 6 关节目标，请优先使用
+    /// `send_position_command()` 或 `command_position_from_snapshot()`。
+    pub fn command_position_with_policy(
+        &self,
+        joint: Joint,
+        position: Rad,
+        policy: MonitorReadPolicy,
+    ) -> Result<()> {
+        let positions = self.observer.joint_positions_with_policy(policy)?;
+        self.command_position_from_snapshot(joint, position, &positions)
     }
 
     /// 控制夹爪
@@ -2701,7 +2695,9 @@ mod tests {
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_driver::Piper as RobotPiper;
     use piper_protocol::control::MitControlCommand;
+    use piper_protocol::ids::{ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56};
     use semver::Version;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2711,6 +2707,24 @@ mod tests {
     impl RxAdapter for IdleRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
             Err(CanError::Timeout)
+        }
+    }
+
+    struct ScriptedRxAdapter {
+        frames: VecDeque<PiperFrame>,
+    }
+
+    impl ScriptedRxAdapter {
+        fn new(frames: Vec<PiperFrame>) -> Self {
+            Self {
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl RxAdapter for ScriptedRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            self.frames.pop_front().ok_or(CanError::Timeout)
         }
     }
 
@@ -2772,6 +2786,31 @@ mod tests {
         }
     }
 
+    fn build_active_position_piper(driver: Arc<RobotPiper>) -> Piper<Active<PositionMode>> {
+        let observer = Observer::new(driver.clone());
+
+        Piper {
+            driver,
+            observer,
+            quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            _state: Active(PositionMode::with_strategy(SendStrategy::default())),
+        }
+    }
+
+    fn joint_feedback_frame(
+        can_id: u16,
+        first_deg_milli: i32,
+        second_deg_milli: i32,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
+        data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(can_id, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
     #[test]
     fn test_state_type_sizes() {
         // 大部分状态类型是 ZST（零大小类型）
@@ -2821,6 +2860,73 @@ mod tests {
     #[test]
     fn test_motion_type_default() {
         assert_eq!(MotionType::default(), MotionType::Joint);
+    }
+
+    #[test]
+    fn command_position_from_snapshot_does_not_require_driver_feedback() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter,
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let robot = build_active_position_piper(driver);
+
+        robot
+            .command_position_from_snapshot(Joint::J1, Rad(1.57), &JointArray::splat(Rad(0.0)))
+            .expect("command_position_from_snapshot should succeed without feedback");
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(sent_frames.lock().expect("sent frames lock").len(), 3);
+    }
+
+    #[test]
+    fn command_position_with_policy_rejects_stale_feedback_without_sending() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                ScriptedRxAdapter::new(vec![
+                    joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, 1_000),
+                    joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, 1_000),
+                    joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, 1_000),
+                ]),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let robot = build_active_position_piper(driver.clone());
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(25));
+
+        let error = robot
+            .command_position_with_policy(
+                Joint::J1,
+                Rad(1.0),
+                MonitorReadPolicy {
+                    max_feedback_age: Duration::from_millis(10),
+                },
+            )
+            .expect_err("stale joint positions must reject read-modify-write");
+
+        assert!(matches!(
+            error,
+            RobotError::MonitorStateStale {
+                state_source: MonitorStateSource::JointPosition,
+                max_age_ms: 10,
+                ..
+            }
+        ));
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "stale read-modify-write helper must not send frames"
+        );
     }
 
     #[test]

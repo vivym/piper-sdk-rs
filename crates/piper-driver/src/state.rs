@@ -975,10 +975,6 @@ pub struct PiperContext {
     pub motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
     /// 控制级关节位置状态（完整帧组 + 对齐跨度约束）
     pub control_joint_position: Arc<ArcSwap<JointPositionState>>,
-    /// 控制级末端位姿状态（完整帧组 + 对齐跨度约束）
-    pub control_end_pose: Arc<ArcSwap<EndPoseState>>,
-    /// 控制级运动状态快照（单次 load 保证逻辑原子）
-    pub control_motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
     /// 关节动态监控快照（完整监控 + raw 诊断，共享一次原子发布）
     pub joint_dynamic_monitor: Arc<ArcSwap<JointDynamicMonitorSnapshot>>,
     /// 原始运动状态快照（单次 load 保证逻辑原子）
@@ -1098,8 +1094,6 @@ impl PiperContext {
             end_pose_monitor: Arc::new(ArcSwap::from_pointee(EndPoseMonitorSnapshot::default())),
             motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
             control_joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
-            control_end_pose: Arc::new(ArcSwap::from_pointee(EndPoseState::default())),
-            control_motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
             joint_dynamic_monitor: Arc::new(ArcSwap::from_pointee(
                 JointDynamicMonitorSnapshot::default(),
             )),
@@ -1188,11 +1182,6 @@ impl PiperContext {
         self.raw_motion_snapshot.load().as_ref().clone()
     }
 
-    /// 捕获控制级运动状态快照（只用于闭环控制对齐读取）
-    pub fn capture_control_motion_snapshot(&self) -> MotionSnapshot {
-        self.control_motion_snapshot.load().as_ref().clone()
-    }
-
     /// 发布新的关节位置完整监控快照，并与当前末端位姿组合成逻辑原子快照。
     pub fn publish_joint_position(&self, joint_position: JointPositionState) {
         let end_pose = self.end_pose_monitor.load();
@@ -1241,24 +1230,9 @@ impl PiperContext {
         }));
     }
 
-    /// 发布新的控制级关节位置，并与当前控制级末端位姿组合成逻辑原子快照。
+    /// 发布新的控制级关节位置。
     pub fn publish_control_joint_position(&self, joint_position: JointPositionState) {
-        let end_pose = self.control_end_pose.load();
-        self.control_joint_position.store(Arc::new(joint_position.clone()));
-        self.control_motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position,
-            end_pose: end_pose.as_ref().clone(),
-        }));
-    }
-
-    /// 发布新的控制级末端位姿，并与当前控制级关节位置组合成逻辑原子快照。
-    pub fn publish_control_end_pose(&self, end_pose: EndPoseState) {
-        let joint_position = self.control_joint_position.load();
-        self.control_end_pose.store(Arc::new(end_pose.clone()));
-        self.control_motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.as_ref().clone(),
-            end_pose,
-        }));
+        self.control_joint_position.store(Arc::new(joint_position));
     }
 
     /// 发布新的原始末端位姿，并与当前原始关节位置组合成逻辑原子快照。
@@ -1314,7 +1288,6 @@ pub struct AlignedMotionState {
     pub joint_pos: [f64; 6],
     pub joint_vel: [f64; 6],
     pub joint_current: [f64; 6],
-    pub end_pose: [f64; 6],
     pub position_timestamp_us: u64,
     pub dynamic_timestamp_us: u64,
     pub position_host_rx_mono_us: u64,
@@ -1541,7 +1514,6 @@ mod tests {
             joint_pos: [1.0; 6],
             joint_vel: [2.0; 6],
             joint_current: [3.0; 6],
-            end_pose: [4.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
             position_host_rx_mono_us: 2000,
@@ -1560,7 +1532,6 @@ mod tests {
             joint_pos: [1.0; 6],
             joint_vel: [2.0; 6],
             joint_current: [3.0; 6],
-            end_pose: [4.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
             position_host_rx_mono_us: 2000,
@@ -1577,7 +1548,6 @@ mod tests {
             joint_pos: [1.0; 6],
             joint_vel: [2.0; 6],
             joint_current: [3.0; 6],
-            end_pose: [4.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
             position_host_rx_mono_us: 2000,
@@ -1600,7 +1570,6 @@ mod tests {
             joint_pos: [0.0; 6],
             joint_vel: [0.0; 6],
             joint_current: [0.0; 6],
-            end_pose: [0.0; 6],
             position_timestamp_us: 0,
             dynamic_timestamp_us: 0,
             position_host_rx_mono_us: 0,

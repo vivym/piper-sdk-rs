@@ -143,6 +143,23 @@ pub enum RobotError {
         required_mask: u8,
     },
 
+    /// 监控/诊断读取到的完整状态已过期
+    #[error(
+        "Monitor state stale for {state_source}: age {age_ms}ms exceeds allowed {max_age_ms}ms"
+    )]
+    MonitorStateStale {
+        /// 过期状态的来源
+        state_source: MonitorStateSource,
+        /// 反馈年龄
+        age: Duration,
+        /// 允许的最大反馈年龄
+        max_age: Duration,
+        /// 便于日志直接打印的毫秒值
+        age_ms: u128,
+        /// 便于日志直接打印的毫秒值
+        max_age_ms: u128,
+    },
+
     /// 当前后端不支持主机侧实时闭环
     #[error("Realtime control unsupported on current backend: {reason}")]
     RealtimeUnsupported {
@@ -322,6 +339,7 @@ impl RobotError {
                 | Self::StateMisaligned { .. }
                 | Self::ControlStateIncomplete { .. }
                 | Self::MonitorStateIncomplete { .. }
+                | Self::MonitorStateStale { .. }
         )
     }
 
@@ -416,6 +434,21 @@ impl RobotError {
             state_source,
             valid_mask,
             required_mask,
+        }
+    }
+
+    /// 创建监控状态过期错误
+    pub fn monitor_state_stale(
+        state_source: MonitorStateSource,
+        age: Duration,
+        max_age: Duration,
+    ) -> Self {
+        Self::MonitorStateStale {
+            state_source,
+            age,
+            max_age,
+            age_ms: age.as_millis(),
+            max_age_ms: max_age.as_millis(),
         }
     }
 
@@ -558,6 +591,14 @@ mod tests {
             RobotError::monitor_state_incomplete(MonitorStateSource::EndPose, 0b101, 0b111);
         assert!(!monitor_incomplete.is_fatal());
         assert!(monitor_incomplete.is_retryable());
+
+        let monitor_stale = RobotError::monitor_state_stale(
+            MonitorStateSource::JointPosition,
+            Duration::from_millis(75),
+            Duration::from_millis(50),
+        );
+        assert!(!monitor_stale.is_fatal());
+        assert!(monitor_stale.is_retryable());
     }
 
     #[test]
@@ -613,6 +654,16 @@ mod tests {
         assert!(msg.contains("end pose"));
         assert!(msg.contains("101"));
         assert!(msg.contains("111"));
+
+        let monitor_stale = RobotError::monitor_state_stale(
+            MonitorStateSource::JointDynamic,
+            Duration::from_millis(75),
+            Duration::from_millis(50),
+        );
+        let msg = format!("{}", monitor_stale);
+        assert!(msg.contains("joint dynamic"));
+        assert!(msg.contains("75"));
+        assert!(msg.contains("50"));
     }
 
     #[test]
@@ -705,6 +756,25 @@ mod tests {
 
         let source = std::error::Error::source(&err);
         assert!(source.is_none());
+    }
+
+    #[test]
+    fn test_monitor_state_stale_helper() {
+        let err = RobotError::monitor_state_stale(
+            MonitorStateSource::EndPose,
+            Duration::from_millis(80),
+            Duration::from_millis(50),
+        );
+
+        assert!(matches!(
+            err,
+            RobotError::MonitorStateStale {
+                state_source: MonitorStateSource::EndPose,
+                age_ms: 80,
+                max_age_ms: 50,
+                ..
+            }
+        ));
     }
 
     #[test]

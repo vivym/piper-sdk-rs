@@ -108,6 +108,7 @@ pub use client::{
     LoopTimingMode,
     MaintenanceLease,
     MasterFollowerController,
+    MonitorReadPolicy,
     Observer,
     PiperBridgeClient,
     PiperBridgeHost,

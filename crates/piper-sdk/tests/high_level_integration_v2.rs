@@ -195,8 +195,12 @@ fn test_enable_position_mode() {
         assert!(result.is_ok() || result.is_err());
 
         if let Ok(active_robot) = result {
-            // 测试在 Active 状态下可以调用 command_position
-            let result = active_robot.command_position(Joint::J1, Rad(0.0));
+            // 测试在 Active 状态下可以调用 command_position_from_snapshot
+            let result = active_robot.command_position_from_snapshot(
+                Joint::J1,
+                Rad(0.0),
+                &JointArray::from([Rad(0.0); 6]),
+            );
             assert!(result.is_ok() || result.is_err());
         }
     }

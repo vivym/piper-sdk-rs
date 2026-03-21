@@ -58,8 +58,8 @@ pub use dual_arm::{
     JointSpaceBilateralController, LoopTimingMode, MasterFollowerController, StopAttemptResult,
 };
 pub use observer::{
-    CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, ControlSnapshotFull, Observer,
-    RuntimeHealthSnapshot,
+    CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, ControlSnapshotFull,
+    MonitorReadPolicy, Observer, RuntimeHealthSnapshot,
 };
 pub use piper_driver::RuntimeFaultKind;
 pub use recording::{

@@ -810,10 +810,6 @@ impl Piper {
         self.ctx.capture_motion_snapshot()
     }
 
-    fn capture_control_motion_snapshot(&self) -> MotionSnapshot {
-        self.ctx.capture_control_motion_snapshot()
-    }
-
     /// 获取原始运动快照（允许部分帧组，仅供诊断）
     pub fn capture_raw_motion_snapshot(&self) -> MotionSnapshot {
         self.ctx.capture_raw_motion_snapshot()
@@ -1013,27 +1009,24 @@ impl Piper {
     /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内
     /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回状态数据
     pub fn get_aligned_motion(&self, max_time_diff_us: u64) -> AlignmentResult {
-        let snapshot = self.capture_control_motion_snapshot();
+        let joint_position = self.ctx.control_joint_position.load();
         let joint_dynamic = self.get_joint_dynamic();
 
-        let time_diff = snapshot
-            .joint_position
-            .hardware_timestamp_us
-            .abs_diff(joint_dynamic.group_timestamp_us);
+        let time_diff =
+            joint_position.hardware_timestamp_us.abs_diff(joint_dynamic.group_timestamp_us);
 
         let state = AlignedMotionState {
-            joint_pos: snapshot.joint_position.joint_pos,
+            joint_pos: joint_position.joint_pos,
             joint_vel: joint_dynamic.joint_vel,
             joint_current: joint_dynamic.joint_current,
-            end_pose: snapshot.end_pose.end_pose,
-            position_timestamp_us: snapshot.joint_position.hardware_timestamp_us,
+            position_timestamp_us: joint_position.hardware_timestamp_us,
             dynamic_timestamp_us: joint_dynamic.group_timestamp_us,
-            position_host_rx_mono_us: snapshot.joint_position.host_rx_mono_us,
+            position_host_rx_mono_us: joint_position.host_rx_mono_us,
             dynamic_host_rx_mono_us: joint_dynamic.group_host_rx_mono_us,
-            position_frame_valid_mask: snapshot.joint_position.frame_valid_mask,
+            position_frame_valid_mask: joint_position.frame_valid_mask,
             dynamic_valid_mask: joint_dynamic.valid_mask,
             skew_us: (joint_dynamic.group_timestamp_us as i64)
-                - (snapshot.joint_position.hardware_timestamp_us as i64),
+                - (joint_position.hardware_timestamp_us as i64),
         };
 
         if time_diff > max_time_diff_us {

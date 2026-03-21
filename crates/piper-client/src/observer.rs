@@ -106,6 +106,21 @@ impl Default for ControlReadPolicy {
     }
 }
 
+/// 监控读取策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorReadPolicy {
+    /// 允许的最大反馈年龄
+    pub max_feedback_age: Duration,
+}
+
+impl Default for MonitorReadPolicy {
+    fn default() -> Self {
+        Self {
+            max_feedback_age: Duration::from_millis(50),
+        }
+    }
+}
+
 /// 可直接用于控制闭环的对齐快照
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ControlSnapshot {
@@ -257,17 +272,32 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 默认只返回完整监控快照；失败时只描述位置组自身的完整性。
+    /// 默认只返回完整且新鲜的监控快照；失败时只描述位置组自身的完整性或新鲜度。
     /// 如需查看半成品/诊断数据，请使用 `raw_joint_position_state()`。
     pub fn joint_positions(&self) -> Result<JointArray<Rad>> {
+        self.joint_positions_with_policy(MonitorReadPolicy::default())
+    }
+
+    /// 获取关节位置（完整且新鲜的监控快照）
+    pub fn joint_positions_with_policy(
+        &self,
+        policy: MonitorReadPolicy,
+    ) -> Result<JointArray<Rad>> {
         let joint_pos = self.driver.get_joint_position_monitor_snapshot();
-        let Some(latest_complete) = joint_pos.latest_complete() else {
-            return Err(RobotError::monitor_state_incomplete(
-                MonitorStateSource::JointPosition,
-                joint_pos.latest_raw().frame_valid_mask,
-                COMPLETE_COLD_GROUP_MASK,
-            ));
-        };
+        let latest_complete = Self::fresh_joint_position_state(
+            &joint_pos,
+            MonitorStateSource::JointPosition,
+            policy,
+        )?;
+
+        Ok(JointArray::new(latest_complete.joint_pos.map(Rad)))
+    }
+
+    /// 获取最近一份完整关节位置监控快照（允许过期）
+    pub fn last_complete_joint_positions(&self) -> Result<JointArray<Rad>> {
+        let joint_pos = self.driver.get_joint_position_monitor_snapshot();
+        let latest_complete =
+            Self::complete_joint_position_state(&joint_pos, MonitorStateSource::JointPosition)?;
 
         Ok(JointArray::new(latest_complete.joint_pos.map(Rad)))
     }
@@ -277,21 +307,33 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 默认只返回完整监控快照；失败时只描述动态组自身的完整性。
+    /// 默认只返回完整且新鲜的监控快照；失败时只描述动态组自身的完整性或新鲜度。
     /// 如需查看半成品/诊断数据，请使用 `raw_joint_dynamic_state()`。
     ///
     /// # 返回值
     ///
     /// 返回 `JointArray<RadPerSecond>`，保持类型安全。
     pub fn joint_velocities(&self) -> Result<JointArray<RadPerSecond>> {
+        self.joint_velocities_with_policy(MonitorReadPolicy::default())
+    }
+
+    /// 获取关节速度（完整且新鲜的监控快照）
+    pub fn joint_velocities_with_policy(
+        &self,
+        policy: MonitorReadPolicy,
+    ) -> Result<JointArray<RadPerSecond>> {
         let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
-        let Some(latest_complete) = dyn_state.latest_complete() else {
-            return Err(RobotError::monitor_state_incomplete(
-                MonitorStateSource::JointDynamic,
-                dyn_state.latest_raw().valid_mask,
-                COMPLETE_DYNAMIC_GROUP_MASK,
-            ));
-        };
+        let latest_complete =
+            Self::fresh_joint_dynamic_state(&dyn_state, MonitorStateSource::JointDynamic, policy)?;
+
+        Ok(JointArray::new(latest_complete.joint_vel.map(RadPerSecond)))
+    }
+
+    /// 获取最近一份完整关节速度监控快照（允许过期）
+    pub fn last_complete_joint_velocities(&self) -> Result<JointArray<RadPerSecond>> {
+        let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
+        let latest_complete =
+            Self::complete_joint_dynamic_state(&dyn_state, MonitorStateSource::JointDynamic)?;
 
         Ok(JointArray::new(latest_complete.joint_vel.map(RadPerSecond)))
     }
@@ -301,17 +343,31 @@ impl Observer {
     /// # 注意
     ///
     /// 控制闭环不要使用此接口拼接多路状态；请改用 `control_snapshot()`。
-    /// 默认只返回完整监控快照；失败时只描述动态组自身的完整性。
+    /// 默认只返回完整且新鲜的监控快照；失败时只描述动态组自身的完整性或新鲜度。
     /// 如需查看半成品/诊断数据，请使用 `raw_joint_dynamic_state()`。
     pub fn joint_torques(&self) -> Result<JointArray<NewtonMeter>> {
+        self.joint_torques_with_policy(MonitorReadPolicy::default())
+    }
+
+    /// 获取关节力矩（完整且新鲜的监控快照）
+    pub fn joint_torques_with_policy(
+        &self,
+        policy: MonitorReadPolicy,
+    ) -> Result<JointArray<NewtonMeter>> {
         let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
-        let Some(latest_complete) = dyn_state.latest_complete() else {
-            return Err(RobotError::monitor_state_incomplete(
-                MonitorStateSource::JointDynamic,
-                dyn_state.latest_raw().valid_mask,
-                COMPLETE_DYNAMIC_GROUP_MASK,
-            ));
-        };
+        let latest_complete =
+            Self::fresh_joint_dynamic_state(&dyn_state, MonitorStateSource::JointDynamic, policy)?;
+
+        Ok(JointArray::new(
+            latest_complete.get_all_torques().map(NewtonMeter),
+        ))
+    }
+
+    /// 获取最近一份完整关节力矩监控快照（允许过期）
+    pub fn last_complete_joint_torques(&self) -> Result<JointArray<NewtonMeter>> {
+        let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
+        let latest_complete =
+            Self::complete_joint_dynamic_state(&dyn_state, MonitorStateSource::JointDynamic)?;
 
         Ok(JointArray::new(
             latest_complete.get_all_torques().map(NewtonMeter),
@@ -370,9 +426,9 @@ impl Observer {
         (driver_state.driver_enabled_mask & (1 << joint_index)) != 0
     }
 
-    /// 获取末端位姿（完整监控快照，可能与其他状态有时间偏斜）
+    /// 获取末端位姿（完整且新鲜的监控快照，可能与其他状态有时间偏斜）
     ///
-    /// 失败时只描述末端位姿组自身是否完整；控制闭环不要使用此接口拼接多路状态。
+    /// 失败时只描述末端位姿组自身是否完整或是否过期；控制闭环不要使用此接口拼接多路状态。
     ///
     /// # 返回值
     ///
@@ -393,14 +449,26 @@ impl Observer {
     /// # }
     /// ```
     pub fn end_pose(&self) -> Result<piper_driver::state::EndPoseState> {
+        self.end_pose_with_policy(MonitorReadPolicy::default())
+    }
+
+    /// 获取末端位姿（完整且新鲜的监控快照）
+    pub fn end_pose_with_policy(
+        &self,
+        policy: MonitorReadPolicy,
+    ) -> Result<piper_driver::state::EndPoseState> {
         let end_pose = self.driver.get_end_pose_monitor_snapshot();
-        let Some(latest_complete) = end_pose.latest_complete() else {
-            return Err(RobotError::monitor_state_incomplete(
-                MonitorStateSource::EndPose,
-                end_pose.latest_raw().frame_valid_mask,
-                COMPLETE_COLD_GROUP_MASK,
-            ));
-        };
+        let latest_complete =
+            Self::fresh_end_pose_state(&end_pose, MonitorStateSource::EndPose, policy)?;
+
+        Ok(latest_complete.clone())
+    }
+
+    /// 获取最近一份完整末端位姿监控快照（允许过期）
+    pub fn last_complete_end_pose(&self) -> Result<piper_driver::state::EndPoseState> {
+        let end_pose = self.driver.get_end_pose_monitor_snapshot();
+        let latest_complete =
+            Self::complete_end_pose_state(&end_pose, MonitorStateSource::EndPose)?;
 
         Ok(latest_complete.clone())
     }
@@ -532,6 +600,92 @@ impl Observer {
             state.position_frame_valid_mask,
             state.dynamic_valid_mask,
         )
+    }
+
+    fn complete_joint_position_state(
+        snapshot: &piper_driver::JointPositionMonitorSnapshot,
+        state_source: MonitorStateSource,
+    ) -> Result<&piper_driver::JointPositionState> {
+        snapshot.latest_complete().ok_or_else(|| {
+            RobotError::monitor_state_incomplete(
+                state_source,
+                snapshot.latest_raw().frame_valid_mask,
+                COMPLETE_COLD_GROUP_MASK,
+            )
+        })
+    }
+
+    fn fresh_joint_position_state(
+        snapshot: &piper_driver::JointPositionMonitorSnapshot,
+        state_source: MonitorStateSource,
+        policy: MonitorReadPolicy,
+    ) -> Result<&piper_driver::JointPositionState> {
+        let latest_complete = Self::complete_joint_position_state(snapshot, state_source)?;
+        Self::ensure_monitor_fresh(state_source, latest_complete.host_rx_mono_us, policy)?;
+        Ok(latest_complete)
+    }
+
+    fn complete_joint_dynamic_state(
+        snapshot: &piper_driver::JointDynamicMonitorSnapshot,
+        state_source: MonitorStateSource,
+    ) -> Result<&piper_driver::JointDynamicState> {
+        snapshot.latest_complete().ok_or_else(|| {
+            RobotError::monitor_state_incomplete(
+                state_source,
+                snapshot.latest_raw().valid_mask,
+                COMPLETE_DYNAMIC_GROUP_MASK,
+            )
+        })
+    }
+
+    fn fresh_joint_dynamic_state(
+        snapshot: &piper_driver::JointDynamicMonitorSnapshot,
+        state_source: MonitorStateSource,
+        policy: MonitorReadPolicy,
+    ) -> Result<&piper_driver::JointDynamicState> {
+        let latest_complete = Self::complete_joint_dynamic_state(snapshot, state_source)?;
+        Self::ensure_monitor_fresh(state_source, latest_complete.group_host_rx_mono_us, policy)?;
+        Ok(latest_complete)
+    }
+
+    fn complete_end_pose_state(
+        snapshot: &piper_driver::EndPoseMonitorSnapshot,
+        state_source: MonitorStateSource,
+    ) -> Result<&piper_driver::state::EndPoseState> {
+        snapshot.latest_complete().ok_or_else(|| {
+            RobotError::monitor_state_incomplete(
+                state_source,
+                snapshot.latest_raw().frame_valid_mask,
+                COMPLETE_COLD_GROUP_MASK,
+            )
+        })
+    }
+
+    fn fresh_end_pose_state(
+        snapshot: &piper_driver::EndPoseMonitorSnapshot,
+        state_source: MonitorStateSource,
+        policy: MonitorReadPolicy,
+    ) -> Result<&piper_driver::state::EndPoseState> {
+        let latest_complete = Self::complete_end_pose_state(snapshot, state_source)?;
+        Self::ensure_monitor_fresh(state_source, latest_complete.host_rx_mono_us, policy)?;
+        Ok(latest_complete)
+    }
+
+    fn ensure_monitor_fresh(
+        state_source: MonitorStateSource,
+        host_rx_mono_us: u64,
+        policy: MonitorReadPolicy,
+    ) -> Result<()> {
+        let age = host_rx_mono_age(host_rx_mono_us);
+        if age > policy.max_feedback_age {
+            return Err(RobotError::monitor_state_stale(
+                state_source,
+                age,
+                policy.max_feedback_age,
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -1147,6 +1301,59 @@ mod tests {
     }
 
     #[test]
+    fn test_joint_positions_report_monitor_state_stale() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(25));
+
+        let error = observer
+            .joint_positions_with_policy(MonitorReadPolicy {
+                max_feedback_age: Duration::from_millis(10),
+            })
+            .expect_err("stale joint positions must fail");
+
+        assert!(matches!(
+            error,
+            RobotError::MonitorStateStale {
+                state_source: MonitorStateSource::JointPosition,
+                max_age_ms: 10,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_last_complete_joint_positions_tolerates_stale_feedback() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(25));
+
+        let positions = observer
+            .last_complete_joint_positions()
+            .expect("last complete positions should remain readable");
+
+        assert_eq!(positions, JointArray::splat(Rad(0.0)));
+    }
+
+    #[test]
     fn test_joint_velocities_report_monitor_state_incomplete() {
         let timestamp_us = 1_000;
         let frames = vec![
@@ -1173,6 +1380,40 @@ mod tests {
                 state_source: MonitorStateSource::JointDynamic,
                 valid_mask: 0b001111,
                 required_mask: COMPLETE_DYNAMIC_GROUP_MASK,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_joint_velocities_report_monitor_state_stale() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_dynamic_frame(1, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(2, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(3, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(4, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(5, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(6, 1000, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(25));
+
+        let error = observer
+            .joint_velocities_with_policy(MonitorReadPolicy {
+                max_feedback_age: Duration::from_millis(10),
+            })
+            .expect_err("stale joint velocities must fail");
+
+        assert!(matches!(
+            error,
+            RobotError::MonitorStateStale {
+                state_source: MonitorStateSource::JointDynamic,
+                max_age_ms: 10,
+                ..
             }
         ));
     }
@@ -1209,6 +1450,38 @@ mod tests {
     }
 
     #[test]
+    fn test_last_complete_joint_torques_tolerates_stale_feedback() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_dynamic_frame(1, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(2, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(3, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(4, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(5, 1000, 1000, timestamp_us),
+            joint_dynamic_frame(6, 1000, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(25));
+
+        let torques = observer
+            .last_complete_joint_torques()
+            .expect("last complete torques should remain readable");
+
+        assert_eq!(
+            torques,
+            JointArray::new(std::array::from_fn(|index| {
+                NewtonMeter(piper_driver::JointDynamicState::calculate_torque(
+                    index, 1.0,
+                ))
+            }))
+        );
+    }
+
+    #[test]
     fn test_end_pose_reports_monitor_state_incomplete() {
         let timestamp_us = 1_000;
         let frames = vec![
@@ -1241,6 +1514,59 @@ mod tests {
                 required_mask: COMPLETE_COLD_GROUP_MASK,
             }
         ));
+    }
+
+    #[test]
+    fn test_end_pose_reports_monitor_state_stale() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            end_pose_frame(ID_END_POSE_1 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_2 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_3 as u16, 0, 0, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(25));
+
+        let error = observer
+            .end_pose_with_policy(MonitorReadPolicy {
+                max_feedback_age: Duration::from_millis(10),
+            })
+            .expect_err("stale end pose must fail");
+
+        assert!(matches!(
+            error,
+            RobotError::MonitorStateStale {
+                state_source: MonitorStateSource::EndPose,
+                max_age_ms: 10,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_last_complete_end_pose_tolerates_stale_feedback() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            end_pose_frame(ID_END_POSE_1 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_2 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_3 as u16, 0, 0, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(25));
+
+        let end_pose = observer
+            .last_complete_end_pose()
+            .expect("last complete end pose should remain readable");
+
+        assert_eq!(end_pose.end_pose, [0.0; 6]);
     }
 
     #[test]

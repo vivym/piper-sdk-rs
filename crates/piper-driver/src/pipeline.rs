@@ -148,8 +148,6 @@ pub struct ParserState<'a> {
     pub pending_end_pose: [f64; 6],
     /// 末端位姿帧组掩码（Bit 0-2 对应 0x2A2, 0x2A3, 0x2A4）
     pub end_pose_frame_mask: u8,
-    /// 末端位姿各帧时间戳（用于严格组装判定）
-    pub end_pose_frame_timestamps: [u64; 3],
 
     // === 关节动态状态：缓冲提交（关键改进） ===
     /// 待提交的关节动态状态
@@ -190,7 +188,6 @@ impl<'a> ParserState<'a> {
             joint_pos_frame_timestamps: [0; 3],
             pending_end_pose: [0.0; 6],
             end_pose_frame_mask: 0,
-            end_pose_frame_timestamps: [0; 3],
             pending_joint_dynamic: JointDynamicState::default(),
             vel_update_mask: 0,
             pending_velocity_started_at: None,
@@ -225,7 +222,6 @@ fn reset_pending_joint_position(state: &mut ParserState) {
 fn reset_pending_end_pose(state: &mut ParserState) {
     state.pending_end_pose = [0.0; 6];
     state.end_pose_frame_mask = 0;
-    state.end_pose_frame_timestamps = [0; 3];
 }
 
 fn reset_pending_joint_control(state: &mut ParserState) {
@@ -1113,12 +1109,9 @@ fn parse_and_update_state(
                 reset_pending_end_pose(state);
 
                 let host_rx_mono_us = host_rx_mono_us();
-                let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_end_pose[0] = feedback.x() / 1000.0;
                 state.pending_end_pose[1] = feedback.y() / 1000.0;
                 state.end_pose_frame_mask |= 1 << 0;
-                state.end_pose_frame_timestamps[0] = alignment_timestamp_us;
 
                 ctx.publish_raw_end_pose(EndPoseState {
                     hardware_timestamp_us: frame.timestamp_us,
@@ -1135,12 +1128,9 @@ fn parse_and_update_state(
                 }
 
                 let host_rx_mono_us = host_rx_mono_us();
-                let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_end_pose[2] = feedback.z() / 1000.0;
                 state.pending_end_pose[3] = feedback.rx_rad();
                 state.end_pose_frame_mask |= 1 << 1;
-                state.end_pose_frame_timestamps[1] = alignment_timestamp_us;
 
                 ctx.publish_raw_end_pose(EndPoseState {
                     hardware_timestamp_us: frame.timestamp_us,
@@ -1157,12 +1147,9 @@ fn parse_and_update_state(
                 }
 
                 let host_rx_mono_us = host_rx_mono_us();
-                let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
                 state.pending_end_pose[4] = feedback.ry_rad();
                 state.pending_end_pose[5] = feedback.rz_rad();
                 state.end_pose_frame_mask |= 1 << 2;
-                state.end_pose_frame_timestamps[2] = alignment_timestamp_us;
 
                 let new_end_pose_state = EndPoseState {
                     hardware_timestamp_us: frame.timestamp_us,
@@ -1176,17 +1163,6 @@ fn parse_and_update_state(
                         .load()
                         .end_pose_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if control_grade_group_ready(
-                        state.end_pose_frame_mask,
-                        &state.end_pose_frame_timestamps,
-                        timing_capability,
-                    ) {
-                        ctx.publish_control_end_pose(new_end_pose_state.clone());
-                    } else {
-                        metrics
-                            .rx_end_pose_control_grade_rejected_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
                 } else {
                     ctx.publish_raw_end_pose(new_end_pose_state.clone());
                     metrics
