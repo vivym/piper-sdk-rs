@@ -10,8 +10,8 @@
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::TimingCapability;
 use piper_sdk::driver::{
-    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig,
-    PiperContext, PiperMetrics, ShutdownLane,
+    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig, PiperContext,
+    PiperMetrics, ShutdownLane,
     command::{RealtimeCommand, ReliableCommand},
     rx_loop, tx_loop_mailbox,
 };

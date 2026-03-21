@@ -1745,8 +1745,7 @@ impl Piper {
         observed_epoch: u64,
         timeout: Option<Duration>,
     ) -> bool {
-        self.maintenance_state_signal
-            .wait_for_change_after(observed_epoch, timeout)
+        self.maintenance_state_signal.wait_for_change_after(observed_epoch, timeout)
     }
 
     #[doc(hidden)]
@@ -1766,10 +1765,7 @@ impl Piper {
 
     #[doc(hidden)]
     pub fn release_maintenance_lease_gate_if_holder(&self, session_id: u32) -> bool {
-        let released = self
-            .maintenance_lease_gate
-            .release_if_holder(session_id)
-            .is_some();
+        let released = self.maintenance_lease_gate.release_if_holder(session_id).is_some();
         if released {
             self.maintenance_state_signal.note();
         }

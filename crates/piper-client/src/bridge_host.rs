@@ -2341,8 +2341,7 @@ impl BridgeControllerBackend for PiperBridgeBackend {
             let (holder_session_id, _lease_epoch) = self.driver.current_maintenance_lease();
             let Some(_holder_session_id) = holder_session_id else {
                 let observed_epoch = self.driver.maintenance_state_epoch();
-                self.driver
-                    .wait_for_maintenance_state_change_after(observed_epoch, None);
+                self.driver.wait_for_maintenance_state_change_after(observed_epoch, None);
                 continue;
             };
 
@@ -2384,7 +2383,12 @@ impl BridgeControllerBackend for PiperBridgeBackend {
         }
 
         self.driver
-            .send_maintenance_frame_confirmed(session_id, lease_epoch, frame, Duration::from_millis(10))
+            .send_maintenance_frame_confirmed(
+                session_id,
+                lease_epoch,
+                frame,
+                Duration::from_millis(10),
+            )
             .map_err(|err| {
                 if matches!(
                     err,
