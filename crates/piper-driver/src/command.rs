@@ -61,14 +61,16 @@ pub enum ReliableCommandKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceCommandMeta {
     session_id: u32,
+    session_key: u64,
     lease_epoch: u64,
 }
 
 impl MaintenanceCommandMeta {
     #[inline]
-    pub fn new(session_id: u32, lease_epoch: u64) -> Self {
+    pub fn new(session_id: u32, session_key: u64, lease_epoch: u64) -> Self {
         Self {
             session_id,
+            session_key,
             lease_epoch,
         }
     }
@@ -76,6 +78,11 @@ impl MaintenanceCommandMeta {
     #[inline]
     pub fn session_id(&self) -> u32 {
         self.session_id
+    }
+
+    #[inline]
+    pub fn session_key(&self) -> u64 {
+        self.session_key
     }
 
     #[inline]
@@ -235,6 +242,7 @@ impl ReliableCommand {
     pub fn maintenance_confirmed(
         frame: PiperFrame,
         session_id: u32,
+        session_key: u64,
         lease_epoch: u64,
         ack: ReliableAck,
     ) -> Self {
@@ -242,7 +250,11 @@ impl ReliableCommand {
             frame,
             ack: Some(ack),
             kind: ReliableCommandKind::Maintenance,
-            maintenance: Some(MaintenanceCommandMeta::new(session_id, lease_epoch)),
+            maintenance: Some(MaintenanceCommandMeta::new(
+                session_id,
+                session_key,
+                lease_epoch,
+            )),
         }
     }
 

@@ -5,8 +5,8 @@
 use crate::heartbeat::monotonic_micros;
 use crate::metrics::PiperMetrics;
 use crate::piper::{
-    NORMAL_FRAME_SEND_BUDGET, NormalSendGate, RuntimeFaultKind, RuntimePhase, ShutdownDispatch,
-    ShutdownLane,
+    MaintenanceGate, MaintenanceGateState, NORMAL_FRAME_SEND_BUDGET, NormalSendGate,
+    RuntimeFaultKind, RuntimePhase, ShutdownDispatch, ShutdownLane,
 };
 use crate::state::*;
 use crossbeam_channel::Receiver;
@@ -71,6 +71,39 @@ fn reliable_abort_error(fault_latched: bool) -> crate::DriverError {
 
 fn realtime_abort_error(sent: usize, total: usize) -> crate::DriverError {
     crate::DriverError::RealtimeDeliveryAbortedByFault { sent, total }
+}
+
+fn derive_maintenance_gate_state(
+    runtime_phase: &Arc<AtomicU8>,
+    ctx: &Arc<PiperContext>,
+    last_fault: &Arc<AtomicU8>,
+) -> MaintenanceGateState {
+    if load_runtime_phase(runtime_phase) != RuntimePhase::Running {
+        return MaintenanceGateState::DeniedTransportDown;
+    }
+    if last_fault.load(Ordering::Acquire) != 0 {
+        return MaintenanceGateState::DeniedFaulted;
+    }
+    if !ctx.connection_monitor.check_connection() {
+        return MaintenanceGateState::DeniedTransportDown;
+    }
+    if ctx.robot_control.load().is_enabled {
+        return MaintenanceGateState::DeniedActiveControl;
+    }
+    MaintenanceGateState::AllowedStandby
+}
+
+fn refresh_maintenance_gate_state(
+    maintenance_gate: &Arc<MaintenanceGate>,
+    runtime_phase: &Arc<AtomicU8>,
+    ctx: &Arc<PiperContext>,
+    last_fault: &Arc<AtomicU8>,
+) {
+    maintenance_gate.set_state(derive_maintenance_gate_state(
+        runtime_phase,
+        ctx,
+        last_fault,
+    ));
 }
 
 /// Pipeline 配置
@@ -344,6 +377,8 @@ pub fn io_loop(
     ctx: Arc<PiperContext>,
     config: PipelineConfig,
 ) {
+    let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+    let last_fault = Arc::new(AtomicU8::new(0));
     // === 帧解析器状态（封装所有临时状态） ===
     let mut state = ParserState::new();
     let metrics = Arc::new(PiperMetrics::new());
@@ -423,6 +458,8 @@ pub fn io_loop(
             &mut state,
             &metrics,
             None,
+            &runtime_phase,
+            &last_fault,
         );
 
         // ============================================================
@@ -513,7 +550,7 @@ pub fn rx_loop(
     runtime_phase: Arc<AtomicU8>,
     metrics: Arc<PiperMetrics>,
     last_fault: Arc<AtomicU8>,
-    maintenance_state_signal: Arc<crate::piper::MaintenanceStateSignal>,
+    maintenance_gate: Arc<MaintenanceGate>,
 ) {
     // 设置线程优先级（可选 feature）
     #[cfg(feature = "realtime")]
@@ -584,6 +621,12 @@ pub fn rx_loop(
                 // === 检查速度帧缓冲区超时 ===
                 flush_pending_velocity_on_idle(&ctx, &config, &mut state, &metrics);
 
+                if maintenance_gate.current_state() != MaintenanceGateState::DeniedTransportDown
+                    && !ctx.connection_monitor.check_connection()
+                {
+                    maintenance_gate.set_state(MaintenanceGateState::DeniedTransportDown);
+                }
+
                 continue;
             },
             Err(e) => {
@@ -598,7 +641,7 @@ pub fn rx_loop(
                     error!("RX thread: Fatal error detected, latching runtime fault");
                     record_fault(&last_fault, RuntimeFaultKind::TransportError);
                     store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                    maintenance_state_signal.note();
+                    maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
                     break;
                 }
 
@@ -630,19 +673,24 @@ pub fn rx_loop(
             &config,
             &mut state,
             &metrics,
-            Some(&maintenance_state_signal),
+            Some(&maintenance_gate),
+            &runtime_phase,
+            &last_fault,
         );
 
         // 双线程 runtime 也必须刷新连接监控，否则 health()/wait_for_feedback()
         // 会永远基于初始状态判断。
         ctx.connection_monitor.register_feedback();
+        if maintenance_gate.current_state() == MaintenanceGateState::DeniedTransportDown {
+            refresh_maintenance_gate_state(&maintenance_gate, &runtime_phase, &ctx, &last_fault);
+        }
     }
 
     if workers_running.load(Ordering::Acquire)
         && load_runtime_phase(&runtime_phase) == RuntimePhase::Running
     {
         record_fault(&last_fault, RuntimeFaultKind::RxExited);
-        maintenance_state_signal.note();
+        maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
     }
     trace!("RX thread: loop exited");
 }
@@ -673,8 +721,8 @@ pub fn tx_loop_mailbox(
     metrics: Arc<PiperMetrics>,
     ctx: Arc<PiperContext>,
     last_fault: Arc<AtomicU8>,
-    maintenance_state_signal: Arc<crate::piper::MaintenanceStateSignal>,
-    maintenance_lease_gate: Arc<crate::piper::MaintenanceLeaseGate>,
+    maintenance_gate: Arc<MaintenanceGate>,
+    _compat_maintenance_gate: Arc<MaintenanceGate>,
 ) {
     loop {
         let phase = load_runtime_phase(&runtime_phase);
@@ -776,7 +824,7 @@ pub fn tx_loop_mailbox(
                         }
                         record_fault(&last_fault, RuntimeFaultKind::TransportError);
                         store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        maintenance_state_signal.note();
+                        maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
                         delivery_error = Some(crate::DriverError::RealtimeDeliveryFailed {
                             sent: sent_count,
                             total: total_frames,
@@ -845,7 +893,7 @@ pub fn tx_loop_mailbox(
                 if let Some(denied) = maintenance_write_denial(&runtime_phase, &ctx, &last_fault) {
                     Err(denied)
                 } else if let Some(meta) = maintenance_meta {
-                    if !maintenance_lease_gate.is_valid(meta.session_id(), meta.lease_epoch()) {
+                    if !maintenance_gate.is_valid(meta.session_key(), meta.lease_epoch()) {
                         Err(crate::DriverError::MaintenanceWriteDenied(
                             "maintenance lease is no longer valid".to_string(),
                         ))
@@ -868,7 +916,7 @@ pub fn tx_loop_mailbox(
                                 }
                                 record_fault(&last_fault, RuntimeFaultKind::TransportError);
                                 store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                                maintenance_state_signal.note();
+                                maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
                                 Err(crate::DriverError::ReliableDeliveryFailed { source: e })
                             },
                         }
@@ -897,7 +945,7 @@ pub fn tx_loop_mailbox(
                         }
                         record_fault(&last_fault, RuntimeFaultKind::TransportError);
                         store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        maintenance_state_signal.note();
+                        maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
                         Err(crate::DriverError::ReliableDeliveryFailed { source: e })
                     },
                 }
@@ -929,7 +977,7 @@ pub fn tx_loop_mailbox(
         && load_runtime_phase(&runtime_phase) == RuntimePhase::Running
     {
         record_fault(&last_fault, RuntimeFaultKind::TxExited);
-        maintenance_state_signal.note();
+        maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
     }
     shutdown_lane.close_with(Err(crate::DriverError::ChannelClosed));
     drain_reliable_queue(&reliable_rx, &metrics, false, false);
@@ -1040,26 +1088,22 @@ fn maintenance_write_denial(
     if load_runtime_phase(runtime_phase) != RuntimePhase::Running {
         return Some(crate::DriverError::ControlPathClosed);
     }
-
-    if last_fault.load(Ordering::Acquire) != 0 {
-        return Some(crate::DriverError::MaintenanceWriteDenied(
+    match derive_maintenance_gate_state(runtime_phase, ctx, last_fault) {
+        MaintenanceGateState::AllowedStandby => None,
+        MaintenanceGateState::DeniedFaulted => Some(crate::DriverError::MaintenanceWriteDenied(
             "maintenance writes are disabled while a runtime fault is latched".to_string(),
-        ));
+        )),
+        MaintenanceGateState::DeniedActiveControl => {
+            Some(crate::DriverError::MaintenanceWriteDenied(
+                "maintenance writes are disabled while active control is enabled".to_string(),
+            ))
+        },
+        MaintenanceGateState::DeniedTransportDown => {
+            Some(crate::DriverError::MaintenanceWriteDenied(
+                "maintenance writes are disabled while transport is disconnected".to_string(),
+            ))
+        },
     }
-
-    if !ctx.connection_monitor.check_connection() {
-        return Some(crate::DriverError::MaintenanceWriteDenied(
-            "maintenance writes are disabled while transport is disconnected".to_string(),
-        ));
-    }
-
-    if ctx.robot_control.load().is_enabled {
-        return Some(crate::DriverError::MaintenanceWriteDenied(
-            "maintenance writes are disabled while active control is enabled".to_string(),
-        ));
-    }
-
-    None
 }
 
 /// 辅助函数：解析帧并更新状态
@@ -1078,6 +1122,7 @@ fn maintenance_write_denial(
 ///
 /// 使用 `ParserState` 结构体封装所有可变状态，避免函数参数列表过长。
 /// 原本有 14 个参数，现在只有 4 个，代码可读性大幅提升。
+#[allow(clippy::too_many_arguments)]
 fn parse_and_update_state(
     frame: &PiperFrame,
     timing_capability: TimingCapability,
@@ -1085,7 +1130,9 @@ fn parse_and_update_state(
     config: &PipelineConfig,
     state: &mut ParserState,
     metrics: &Arc<PiperMetrics>,
-    maintenance_state_signal: Option<&Arc<crate::piper::MaintenanceStateSignal>>,
+    maintenance_gate: Option<&Arc<MaintenanceGate>>,
+    runtime_phase: &Arc<AtomicU8>,
+    last_fault: &Arc<AtomicU8>,
 ) {
     match frame.id {
         ID_JOINT_FEEDBACK_12 => {
@@ -1357,9 +1404,9 @@ fn parse_and_update_state(
                 let previous_enabled = previous.is_enabled;
                 ctx.robot_control.store(Arc::new(new_robot_control_state.clone()));
                 if previous_enabled != new_robot_control_state.is_enabled
-                    && let Some(signal) = maintenance_state_signal
+                    && let Some(gate) = maintenance_gate
                 {
-                    signal.note();
+                    refresh_maintenance_gate_state(gate, runtime_phase, ctx, last_fault);
                 }
                 ctx.fps_stats
                     .load()

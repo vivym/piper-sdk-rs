@@ -35,8 +35,10 @@ pub use metrics::{MetricsSnapshot, PiperMetrics};
 pub use mode::{AtomicDriverMode, DriverMode};
 pub use pipeline::{PipelineConfig, io_loop, rx_loop, tx_loop_mailbox};
 pub use piper::{
-    HealthStatus, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, Piper,
-    RuntimeFaultKind, ShutdownLane, ShutdownReceipt,
+    HealthStatus, MaintenanceGate, MaintenanceGateState, MaintenanceLeaseAcquireResult,
+    MaintenanceLeaseGate, MaintenanceLeaseSnapshot, MaintenanceRevocationEvent,
+    MaintenanceRevocationReason, MaintenanceStateSignal, NormalSendGate, Piper, RuntimeFaultKind,
+    ShutdownLane, ShutdownReceipt,
 };
 pub use piper_can::TimingCapability;
 pub use recording::{AsyncRecordingHook, TimestampedFrame};

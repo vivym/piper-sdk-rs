@@ -168,136 +168,319 @@ impl NormalSendPermit<'_> {
 }
 
 #[doc(hidden)]
-#[derive(Debug, Default)]
-pub struct MaintenanceStateSignal {
-    epoch: AtomicU64,
-    wait_lock: Mutex<()>,
-    wait_cv: Condvar,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MaintenanceGateState {
+    DeniedFaulted = 0,
+    DeniedActiveControl = 1,
+    DeniedTransportDown = 2,
+    AllowedStandby = 3,
 }
 
-impl MaintenanceStateSignal {
-    pub fn current_epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
+impl MaintenanceGateState {
+    pub fn allows_lease(self) -> bool {
+        matches!(self, Self::AllowedStandby)
     }
 
-    pub fn note(&self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.wait_cv.notify_all();
-    }
-
-    pub fn wait_for_change_after(&self, observed_epoch: u64, timeout: Option<Duration>) -> bool {
-        if self.current_epoch() != observed_epoch {
-            return true;
-        }
-
-        match timeout {
-            Some(timeout) => {
-                let start = Instant::now();
-                let mut remaining = timeout;
-                let mut guard = self.wait_lock.lock().unwrap();
-                loop {
-                    if self.current_epoch() != observed_epoch {
-                        return true;
-                    }
-
-                    let (next_guard, wait_result) =
-                        self.wait_cv.wait_timeout(guard, remaining).unwrap();
-                    guard = next_guard;
-                    if self.current_epoch() != observed_epoch {
-                        return true;
-                    }
-                    if wait_result.timed_out() {
-                        return false;
-                    }
-
-                    let elapsed = start.elapsed();
-                    if elapsed >= timeout {
-                        return false;
-                    }
-                    remaining = timeout.saturating_sub(elapsed);
-                }
-            },
-            None => {
-                let mut guard = self.wait_lock.lock().unwrap();
-                loop {
-                    if self.current_epoch() != observed_epoch {
-                        return true;
-                    }
-                    guard = self.wait_cv.wait(guard).unwrap();
-                }
-            },
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::DeniedFaulted,
+            1 => Self::DeniedActiveControl,
+            3 => Self::AllowedStandby,
+            _ => Self::DeniedTransportDown,
         }
     }
 }
 
 #[doc(hidden)]
-#[derive(Debug, Default)]
-pub struct MaintenanceLeaseGate {
-    holder_session_id: AtomicU32,
-    lease_epoch: AtomicU64,
-    admin_lock: Mutex<()>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceRevocationReason {
+    ControllerStateChanged,
+    SessionReplaced,
+    SessionClosed,
 }
 
-impl MaintenanceLeaseGate {
-    pub fn snapshot(&self) -> (Option<u32>, u64) {
-        (
-            match self.holder_session_id.load(Ordering::Acquire) {
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceRevocationEvent {
+    session_id: u32,
+    session_key: u64,
+    reason: MaintenanceRevocationReason,
+}
+
+impl MaintenanceRevocationEvent {
+    pub fn session_id(self) -> u32 {
+        self.session_id
+    }
+
+    pub fn session_key(self) -> u64 {
+        self.session_key
+    }
+
+    pub fn reason(self) -> MaintenanceRevocationReason {
+        self.reason
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceLeaseSnapshot {
+    state: MaintenanceGateState,
+    holder_session_id: Option<u32>,
+    holder_session_key: Option<u64>,
+    lease_epoch: u64,
+}
+
+impl MaintenanceLeaseSnapshot {
+    pub fn state(self) -> MaintenanceGateState {
+        self.state
+    }
+
+    pub fn holder_session_id(self) -> Option<u32> {
+        self.holder_session_id
+    }
+
+    pub fn holder_session_key(self) -> Option<u64> {
+        self.holder_session_key
+    }
+
+    pub fn lease_epoch(self) -> u64 {
+        self.lease_epoch
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceLeaseAcquireResult {
+    Granted { lease_epoch: u64 },
+    DeniedHeld { holder_session_id: Option<u32> },
+    DeniedState { state: MaintenanceGateState },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MaintenanceGateInner {
+    state: MaintenanceGateState,
+    holder_session_id: Option<u32>,
+    holder_session_key: Option<u64>,
+    lease_epoch: u64,
+}
+
+impl Default for MaintenanceGateInner {
+    fn default() -> Self {
+        Self {
+            state: MaintenanceGateState::DeniedTransportDown,
+            holder_session_id: None,
+            holder_session_key: None,
+            lease_epoch: 0,
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MaintenanceGate {
+    state: AtomicU8,
+    holder_session_id: AtomicU32,
+    holder_session_key: AtomicU64,
+    lease_epoch: AtomicU64,
+    inner: Mutex<MaintenanceGateInner>,
+    wait_cv: Condvar,
+    event_sink: Mutex<Option<Sender<MaintenanceRevocationEvent>>>,
+}
+
+impl Default for MaintenanceGate {
+    fn default() -> Self {
+        let inner = MaintenanceGateInner::default();
+        Self {
+            state: AtomicU8::new(inner.state as u8),
+            holder_session_id: AtomicU32::new(0),
+            holder_session_key: AtomicU64::new(0),
+            lease_epoch: AtomicU64::new(inner.lease_epoch),
+            inner: Mutex::new(inner),
+            wait_cv: Condvar::new(),
+            event_sink: Mutex::new(None),
+        }
+    }
+}
+
+impl MaintenanceGate {
+    fn sync_atomics(&self, inner: &MaintenanceGateInner) {
+        self.state.store(inner.state as u8, Ordering::Release);
+        self.holder_session_id
+            .store(inner.holder_session_id.unwrap_or(0), Ordering::Release);
+        self.holder_session_key
+            .store(inner.holder_session_key.unwrap_or(0), Ordering::Release);
+        self.lease_epoch.store(inner.lease_epoch, Ordering::Release);
+    }
+
+    fn emit(&self, event: MaintenanceRevocationEvent) {
+        if let Some(sink) = self.event_sink.lock().unwrap().as_ref() {
+            let _ = sink.try_send(event);
+        }
+    }
+
+    fn build_revocation_event(
+        &self,
+        inner: &MaintenanceGateInner,
+        reason: MaintenanceRevocationReason,
+    ) -> Option<MaintenanceRevocationEvent> {
+        Some(MaintenanceRevocationEvent {
+            session_id: inner.holder_session_id?,
+            session_key: inner.holder_session_key?,
+            reason,
+        })
+    }
+
+    pub fn set_event_sink(&self, sink: Sender<MaintenanceRevocationEvent>) {
+        *self.event_sink.lock().unwrap() = Some(sink);
+    }
+
+    pub fn snapshot(&self) -> MaintenanceLeaseSnapshot {
+        MaintenanceLeaseSnapshot {
+            state: MaintenanceGateState::from_raw(self.state.load(Ordering::Acquire)),
+            holder_session_id: match self.holder_session_id.load(Ordering::Acquire) {
                 0 => None,
                 holder => Some(holder),
             },
-            self.lease_epoch.load(Ordering::Acquire),
-        )
-    }
-
-    pub fn current_holder(&self) -> Option<u32> {
-        match self.holder_session_id.load(Ordering::Acquire) {
-            0 => None,
-            holder => Some(holder),
-        }
-    }
-
-    pub fn current_epoch(&self) -> u64 {
-        self.lease_epoch.load(Ordering::Acquire)
-    }
-
-    pub fn grant(&self, session_id: u32) -> (bool, u64, Option<u32>) {
-        let _guard = self.admin_lock.lock().unwrap();
-        match self.holder_session_id.load(Ordering::Acquire) {
-            0 => {
-                self.holder_session_id.store(session_id, Ordering::Release);
-                let epoch = self.lease_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-                (true, epoch, None)
+            holder_session_key: match self.holder_session_key.load(Ordering::Acquire) {
+                0 => None,
+                holder => Some(holder),
             },
-            holder if holder == session_id => (true, self.current_epoch(), None),
-            holder => (false, self.current_epoch(), Some(holder)),
+            lease_epoch: self.lease_epoch.load(Ordering::Acquire),
         }
     }
 
-    pub fn release_if_holder(&self, session_id: u32) -> Option<u64> {
-        let _guard = self.admin_lock.lock().unwrap();
-        if self.holder_session_id.load(Ordering::Acquire) != session_id {
-            return None;
-        }
-        self.holder_session_id.store(0, Ordering::Release);
-        Some(self.lease_epoch.fetch_add(1, Ordering::AcqRel) + 1)
+    pub fn current_state(&self) -> MaintenanceGateState {
+        MaintenanceGateState::from_raw(self.state.load(Ordering::Acquire))
     }
 
-    pub fn revoke_any(&self) -> Option<(u32, u64)> {
-        let _guard = self.admin_lock.lock().unwrap();
-        let holder = self.holder_session_id.load(Ordering::Acquire);
-        if holder == 0 {
-            return None;
+    pub fn set_state(&self, new_state: MaintenanceGateState) {
+        let event = {
+            let mut inner = self.inner.lock().unwrap();
+            let mut event = None;
+            if inner.state != new_state {
+                inner.state = new_state;
+            }
+            if !new_state.allows_lease() {
+                event = self.build_revocation_event(
+                    &inner,
+                    MaintenanceRevocationReason::ControllerStateChanged,
+                );
+                if event.is_some() {
+                    inner.holder_session_id = None;
+                    inner.holder_session_key = None;
+                    inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+                }
+            }
+            self.sync_atomics(&inner);
+            self.wait_cv.notify_all();
+            event
+        };
+
+        if let Some(event) = event {
+            self.emit(event);
         }
-        self.holder_session_id.store(0, Ordering::Release);
-        let epoch = self.lease_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        Some((holder, epoch))
     }
 
-    pub fn is_valid(&self, session_id: u32, lease_epoch: u64) -> bool {
-        self.holder_session_id.load(Ordering::Acquire) == session_id
+    pub fn acquire_blocking(
+        &self,
+        session_id: u32,
+        session_key: u64,
+        timeout: Duration,
+    ) -> MaintenanceLeaseAcquireResult {
+        let deadline = Instant::now() + timeout;
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            if !inner.state.allows_lease() {
+                return MaintenanceLeaseAcquireResult::DeniedState { state: inner.state };
+            }
+
+            match inner.holder_session_key {
+                None => {
+                    inner.holder_session_id = Some(session_id);
+                    inner.holder_session_key = Some(session_key);
+                    inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+                    let lease_epoch = inner.lease_epoch;
+                    self.sync_atomics(&inner);
+                    self.wait_cv.notify_all();
+                    return MaintenanceLeaseAcquireResult::Granted { lease_epoch };
+                },
+                Some(holder_key) if holder_key == session_key => {
+                    return MaintenanceLeaseAcquireResult::Granted {
+                        lease_epoch: inner.lease_epoch,
+                    };
+                },
+                _ => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return MaintenanceLeaseAcquireResult::DeniedHeld {
+                            holder_session_id: inner.holder_session_id,
+                        };
+                    }
+                    let timeout = deadline.saturating_duration_since(now);
+                    let (next_inner, wait_result) =
+                        self.wait_cv.wait_timeout(inner, timeout).unwrap();
+                    inner = next_inner;
+                    if wait_result.timed_out() {
+                        return MaintenanceLeaseAcquireResult::DeniedHeld {
+                            holder_session_id: inner.holder_session_id,
+                        };
+                    }
+                },
+            }
+        }
+    }
+
+    pub fn release_if_holder(&self, session_key: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.holder_session_key != Some(session_key) {
+            return false;
+        }
+        inner.holder_session_id = None;
+        inner.holder_session_key = None;
+        inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+        self.sync_atomics(&inner);
+        self.wait_cv.notify_all();
+        true
+    }
+
+    pub fn revoke_if_holder(
+        &self,
+        session_key: u64,
+        reason: MaintenanceRevocationReason,
+    ) -> Option<MaintenanceRevocationEvent> {
+        let event = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.holder_session_key != Some(session_key) {
+                return None;
+            }
+            let event = self.build_revocation_event(&inner, reason);
+            inner.holder_session_id = None;
+            inner.holder_session_key = None;
+            inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+            self.sync_atomics(&inner);
+            self.wait_cv.notify_all();
+            event
+        };
+
+        if let Some(event) = event {
+            self.emit(event);
+        }
+        event
+    }
+
+    pub fn is_valid(&self, session_key: u64, lease_epoch: u64) -> bool {
+        self.holder_session_key.load(Ordering::Acquire) == session_key
             && self.lease_epoch.load(Ordering::Acquire) == lease_epoch
+            && self.current_state().allows_lease()
     }
 }
+
+#[doc(hidden)]
+pub type MaintenanceStateSignal = MaintenanceGate;
+
+#[doc(hidden)]
+pub type MaintenanceLeaseGate = MaintenanceGate;
 
 /// 停机命令的有界确认句柄。
 ///
@@ -592,10 +775,8 @@ pub struct Piper {
     metrics: Arc<PiperMetrics>,
     /// 最近一次运行时故障。
     runtime_fault: Arc<AtomicU8>,
-    /// Maintenance state-change notifier for controller-owned bridge integrations.
-    maintenance_state_signal: Arc<MaintenanceStateSignal>,
-    /// Maintenance lease gate used by bridge-maintenance send-point validation.
-    maintenance_lease_gate: Arc<MaintenanceLeaseGate>,
+    /// Controller-owned maintenance gate used by bridge integrations.
+    maintenance_gate: Arc<MaintenanceGate>,
     /// CAN 接口名称（用于录制元数据）
     interface: String,
     /// CAN 总线速度（bps）（用于录制元数据）
@@ -714,8 +895,7 @@ impl Piper {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         let metrics = Arc::new(PiperMetrics::new());
         let runtime_fault = Arc::new(AtomicU8::new(0));
-        let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
-        let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
 
         let ctx_clone = ctx.clone();
         let workers_running_clone = workers_running.clone();
@@ -724,7 +904,7 @@ impl Piper {
         let runtime_fault_rx = runtime_fault.clone();
         let config_clone = config.clone().unwrap_or_default();
         let timing_capability_rx = timing_capability;
-        let maintenance_state_signal_rx = maintenance_state_signal.clone();
+        let maintenance_gate_rx = maintenance_gate.clone();
 
         let rx_thread = spawn(move || {
             crate::pipeline::rx_loop(
@@ -736,7 +916,7 @@ impl Piper {
                 runtime_phase_rx,
                 metrics_clone,
                 runtime_fault_rx,
-                maintenance_state_signal_rx,
+                maintenance_gate_rx,
             );
         });
 
@@ -748,8 +928,8 @@ impl Piper {
         let realtime_slot_tx = realtime_slot.clone();
         let runtime_fault_tx = runtime_fault.clone();
         let shutdown_lane_tx = shutdown_lane.clone();
-        let maintenance_state_signal_tx = maintenance_state_signal.clone();
-        let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+        let maintenance_gate_tx = maintenance_gate.clone();
+        let maintenance_gate_tx_compat = maintenance_gate.clone();
 
         let tx_thread = spawn(move || {
             crate::pipeline::tx_loop_mailbox(
@@ -763,8 +943,8 @@ impl Piper {
                 metrics_tx,
                 ctx_tx,
                 runtime_fault_tx,
-                maintenance_state_signal_tx,
-                maintenance_lease_gate_tx,
+                maintenance_gate_tx,
+                maintenance_gate_tx_compat,
             );
         });
 
@@ -784,8 +964,7 @@ impl Piper {
             normal_send_gate,
             metrics,
             runtime_fault,
-            maintenance_state_signal,
-            maintenance_lease_gate,
+            maintenance_gate,
             interface: "unknown".to_string(),
             bus_speed: 1_000_000,
             driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
@@ -839,7 +1018,7 @@ impl Piper {
         }
         self.normal_send_gate.close();
         self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
-        self.maintenance_state_signal.note();
+        self.maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
     }
 
     /// 请求 worker 停止并关闭所有命令通路。
@@ -849,7 +1028,7 @@ impl Piper {
         self.workers_running.store(false, Ordering::Release);
         self.shutdown_lane.close_with(Err(DriverError::ChannelClosed));
         self.clear_realtime_slot(DriverError::ChannelClosed, false);
-        self.maintenance_state_signal.note();
+        self.maintenance_gate.set_state(MaintenanceGateState::DeniedTransportDown);
     }
 
     /// 获取性能指标快照
@@ -1708,6 +1887,7 @@ impl Piper {
     pub fn send_maintenance_frame_confirmed(
         &self,
         session_id: u32,
+        session_key: u64,
         lease_epoch: u64,
         frame: PiperFrame,
         timeout: Duration,
@@ -1721,7 +1901,13 @@ impl Piper {
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.enqueue_reliable_timeout(
-            ReliableCommand::maintenance_confirmed(frame, session_id, lease_epoch, ack_tx),
+            ReliableCommand::maintenance_confirmed(
+                frame,
+                session_id,
+                session_key,
+                lease_epoch,
+                ack_tx,
+            ),
             timeout,
         )?;
 
@@ -1735,55 +1921,47 @@ impl Piper {
     }
 
     #[doc(hidden)]
-    pub fn maintenance_state_epoch(&self) -> u64 {
-        self.maintenance_state_signal.current_epoch()
+    pub fn maintenance_lease_snapshot(&self) -> MaintenanceLeaseSnapshot {
+        self.maintenance_gate.snapshot()
     }
 
     #[doc(hidden)]
-    pub fn wait_for_maintenance_state_change_after(
+    pub fn register_maintenance_event_sink(&self, sink: Sender<MaintenanceRevocationEvent>) {
+        self.maintenance_gate.set_event_sink(sink);
+    }
+
+    #[doc(hidden)]
+    pub fn acquire_maintenance_lease_gate(
         &self,
-        observed_epoch: u64,
-        timeout: Option<Duration>,
-    ) -> bool {
-        self.maintenance_state_signal.wait_for_change_after(observed_epoch, timeout)
+        session_id: u32,
+        session_key: u64,
+        timeout: Duration,
+    ) -> MaintenanceLeaseAcquireResult {
+        self.maintenance_gate.acquire_blocking(session_id, session_key, timeout)
     }
 
     #[doc(hidden)]
-    pub fn note_maintenance_state_hint(&self) {
-        self.maintenance_state_signal.note();
+    pub fn release_maintenance_lease_gate_if_holder(&self, session_key: u64) -> bool {
+        self.maintenance_gate.release_if_holder(session_key)
     }
 
     #[doc(hidden)]
-    pub fn current_maintenance_lease(&self) -> (Option<u32>, u64) {
-        self.maintenance_lease_gate.snapshot()
+    pub fn revoke_maintenance_lease_gate(
+        &self,
+        session_key: u64,
+        reason: MaintenanceRevocationReason,
+    ) -> Option<MaintenanceRevocationEvent> {
+        self.maintenance_gate.revoke_if_holder(session_key, reason)
     }
 
     #[doc(hidden)]
-    pub fn acquire_maintenance_lease_gate(&self, session_id: u32) -> (bool, u64, Option<u32>) {
-        self.maintenance_lease_gate.grant(session_id)
+    pub fn set_maintenance_gate_state(&self, state: MaintenanceGateState) {
+        self.maintenance_gate.set_state(state);
     }
 
     #[doc(hidden)]
-    pub fn release_maintenance_lease_gate_if_holder(&self, session_id: u32) -> bool {
-        let released = self.maintenance_lease_gate.release_if_holder(session_id).is_some();
-        if released {
-            self.maintenance_state_signal.note();
-        }
-        released
-    }
-
-    #[doc(hidden)]
-    pub fn revoke_maintenance_lease_gate(&self) -> Option<u32> {
-        let revoked = self.maintenance_lease_gate.revoke_any().map(|(holder, _)| holder);
-        if revoked.is_some() {
-            self.maintenance_state_signal.note();
-        }
-        revoked
-    }
-
-    #[doc(hidden)]
-    pub fn maintenance_lease_is_valid(&self, session_id: u32, lease_epoch: u64) -> bool {
-        self.maintenance_lease_gate.is_valid(session_id, lease_epoch)
+    pub fn maintenance_lease_is_valid(&self, session_key: u64, lease_epoch: u64) -> bool {
+        self.maintenance_gate.is_valid(session_key, lease_epoch)
     }
 
     #[doc(hidden)]
@@ -2813,17 +2991,21 @@ mod tests {
             .unwrap(),
         );
 
-        let (granted, lease_epoch, holder) = piper.acquire_maintenance_lease_gate(7);
-        assert!(granted);
-        assert!(holder.is_none());
+        let session_key = 77;
         piper.ctx.connection_monitor.register_feedback();
-        piper.note_maintenance_state_hint();
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        let lease_epoch =
+            match piper.acquire_maintenance_lease_gate(7, session_key, Duration::from_millis(10)) {
+                MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+                other => panic!("unexpected maintenance acquire result: {other:?}"),
+            };
 
         let blocking_frame = PiperFrame::new_standard(0x201, &[0x01]);
         let piper_blocking = Arc::clone(&piper);
         let blocking_handle = std::thread::spawn(move || {
             piper_blocking.send_maintenance_frame_confirmed(
                 7,
+                session_key,
                 lease_epoch,
                 blocking_frame,
                 Duration::from_millis(500),
@@ -2839,6 +3021,7 @@ mod tests {
         let stale_handle = std::thread::spawn(move || {
             piper_stale.send_maintenance_frame_confirmed(
                 7,
+                session_key,
                 lease_epoch,
                 stale_frame,
                 Duration::from_millis(500),
@@ -2846,7 +3029,15 @@ mod tests {
         });
 
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(piper.revoke_maintenance_lease_gate(), Some(7));
+        assert_eq!(
+            piper
+                .revoke_maintenance_lease_gate(
+                    session_key,
+                    MaintenanceRevocationReason::SessionReplaced,
+                )
+                .map(|event| event.session_id()),
+            Some(7)
+        );
         let _ = release_tx.send(());
 
         blocking_handle
@@ -2865,6 +3056,52 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[blocking_frame]);
+    }
+
+    #[test]
+    fn test_maintenance_gate_waiter_wakes_immediately_after_holder_releases() {
+        let gate = Arc::new(MaintenanceGate::default());
+        gate.set_state(MaintenanceGateState::AllowedStandby);
+        match gate.acquire_blocking(1, 11, Duration::from_millis(10)) {
+            MaintenanceLeaseAcquireResult::Granted { .. } => {},
+            other => panic!("initial maintenance lease grant failed: {other:?}"),
+        }
+
+        let waiter_gate = Arc::clone(&gate);
+        let waiter = std::thread::spawn(move || {
+            waiter_gate.acquire_blocking(2, 22, Duration::from_millis(250))
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(gate.release_if_holder(11));
+
+        match waiter.join().expect("waiter thread should finish") {
+            MaintenanceLeaseAcquireResult::Granted { .. } => {},
+            other => panic!("waiting maintenance lease did not wake correctly: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_maintenance_gate_emits_revocation_event_on_denied_state_transition() {
+        let gate = MaintenanceGate::default();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        gate.set_event_sink(tx);
+        gate.set_state(MaintenanceGateState::AllowedStandby);
+        match gate.acquire_blocking(7, 77, Duration::from_millis(10)) {
+            MaintenanceLeaseAcquireResult::Granted { .. } => {},
+            other => panic!("initial maintenance lease grant failed: {other:?}"),
+        }
+
+        gate.set_state(MaintenanceGateState::DeniedActiveControl);
+        let event = rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("lease revocation should be emitted immediately");
+        assert_eq!(event.session_id(), 7);
+        assert_eq!(event.session_key(), 77);
+        assert_eq!(
+            event.reason(),
+            MaintenanceRevocationReason::ControllerStateChanged
+        );
     }
 
     #[test]
