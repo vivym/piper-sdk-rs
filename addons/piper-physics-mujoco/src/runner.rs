@@ -101,7 +101,7 @@ pub struct GravityCompensationRunFailure {
     pub stats: GravityCompensationRunStats,
     /// Terminal error that stopped the main loop
     #[source]
-    pub error: GravityCompensationRunnerError,
+    pub error: Box<GravityCompensationRunnerError>,
     iterations: u64,
     stats_runtime_secs: f64,
 }
@@ -111,7 +111,7 @@ impl GravityCompensationRunFailure {
         Self {
             iterations: stats.iterations,
             stats,
-            error,
+            error: Box::new(error),
             stats_runtime_secs: stats.runtime.as_secs_f64(),
         }
     }
@@ -504,7 +504,7 @@ mod tests {
             .expect_err("stale feedback should stop the runner");
 
         assert!(matches!(
-            error.error,
+            error.error.as_ref(),
             GravityCompensationRunnerError::Robot(RobotError::FeedbackStale { .. })
         ));
         assert_eq!(error.stats.iterations, 0);
@@ -532,7 +532,7 @@ mod tests {
             .expect_err("misaligned feedback should stop the runner");
 
         assert!(matches!(
-            error.error,
+            error.error.as_ref(),
             GravityCompensationRunnerError::Robot(RobotError::StateMisaligned { .. })
         ));
     }
@@ -561,7 +561,7 @@ mod tests {
             .expect_err("solver error should stop the runner");
 
         assert!(matches!(
-            error.error,
+            error.error.as_ref(),
             GravityCompensationRunnerError::Physics(PhysicsError::CalculationFailed(_))
         ));
     }
@@ -588,7 +588,7 @@ mod tests {
             .expect_err("send error should stop the runner");
 
         assert!(matches!(
-            error.error,
+            error.error.as_ref(),
             GravityCompensationRunnerError::Robot(RobotError::CanIoError(_))
         ));
     }
@@ -656,7 +656,7 @@ mod tests {
             .expect_err("unhealthy runtime should stop the runner");
 
         assert!(matches!(
-            error.error,
+            error.error.as_ref(),
             GravityCompensationRunnerError::Robot(RobotError::RuntimeHealthUnhealthy { .. })
         ));
         assert_eq!(gravity.call_count(), 0);

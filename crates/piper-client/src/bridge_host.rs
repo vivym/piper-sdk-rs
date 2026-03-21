@@ -39,12 +39,18 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone)]
+pub struct BridgeTlsClientPolicy {
+    pub fingerprint_sha256: String,
+    pub granted_role: BridgeRole,
+}
+
+#[derive(Debug, Clone)]
 pub struct BridgeTlsServerConfig {
     pub listen_addr: SocketAddr,
     pub server_cert_pem: PathBuf,
     pub server_key_pem: PathBuf,
     pub client_ca_cert_pem: PathBuf,
-    pub allowed_client_cert_sha256: Vec<String>,
+    pub client_policies: Vec<BridgeTlsClientPolicy>,
     pub handshake_timeout: Duration,
 }
 
@@ -55,17 +61,22 @@ impl BridgeTlsServerConfig {
             server_cert_pem: PathBuf::new(),
             server_key_pem: PathBuf::new(),
             client_ca_cert_pem: PathBuf::new(),
-            allowed_client_cert_sha256: Vec::new(),
+            client_policies: Vec::new(),
             handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
         }
     }
 }
 
 #[derive(Debug, Clone)]
+pub struct BridgeUdsListenerConfig {
+    pub path: PathBuf,
+    pub granted_role: BridgeRole,
+}
+
+#[derive(Debug, Clone)]
 pub struct BridgeHostConfig {
-    pub uds_path: Option<PathBuf>,
+    pub uds: Option<BridgeUdsListenerConfig>,
     pub tcp_tls: Option<BridgeTlsServerConfig>,
-    pub maintenance_mode: bool,
     pub allow_raw_frame_tap: bool,
 }
 
@@ -73,11 +84,13 @@ impl Default for BridgeHostConfig {
     fn default() -> Self {
         Self {
             #[cfg(unix)]
-            uds_path: Some(PathBuf::from("/tmp/piper_bridge.sock")),
+            uds: Some(BridgeUdsListenerConfig {
+                path: PathBuf::from("/tmp/piper_bridge.sock"),
+                granted_role: BridgeRole::Observer,
+            }),
             #[cfg(not(unix))]
-            uds_path: None,
+            uds: None,
             tcp_tls: None,
-            maintenance_mode: false,
             allow_raw_frame_tap: false,
         }
     }
@@ -204,13 +217,9 @@ impl Drop for RawTapSubscription {
 
 trait BridgeControllerBackend: Send + Sync {
     fn status_snapshot(&self) -> BridgeStatusInput;
-    fn grant_role(&self, requested: BridgeRole) -> BridgeRole {
-        requested
-    }
     fn acquire_maintenance_lease(
         &self,
         session_id: u32,
-        role: BridgeRole,
         timeout: Duration,
     ) -> Result<LeaseAcquireResult, BridgeBackendError>;
     fn release_maintenance_lease(&self, session_id: u32) -> Result<bool, BridgeBackendError>;
@@ -493,7 +502,7 @@ impl SessionControl for TcpShutdownControl {
 
 struct TlsListenerConfig {
     server_config: Arc<ServerConfig>,
-    allowed_fingerprints: Arc<Vec<[u8; 32]>>,
+    client_roles: Arc<HashMap<[u8; 32], BridgeRole>>,
     handshake_timeout: Duration,
 }
 
@@ -951,7 +960,7 @@ impl PiperBridgeHost {
     }
 
     pub(crate) fn attach_to_driver(driver: Arc<RobotPiper>, config: BridgeHostConfig) -> Self {
-        let backend = PiperBridgeBackend::from_driver(Arc::clone(&driver), config.maintenance_mode);
+        let backend = PiperBridgeBackend::from_driver(Arc::clone(&driver));
         Self::attach_backend(backend, config)
     }
 
@@ -959,7 +968,7 @@ impl PiperBridgeHost {
         if self.started.swap(true, Ordering::AcqRel) {
             return Err(BridgeHostError::AlreadyRunning);
         }
-        if self.config.uds_path.is_none() && self.config.tcp_tls.is_none() {
+        if self.config.uds.is_none() && self.config.tcp_tls.is_none() {
             return Err(BridgeHostError::InvalidConfig(
                 "at least one bridge endpoint must be enabled".to_string(),
             ));
@@ -997,7 +1006,9 @@ impl PiperBridgeHost {
         let mut handles = Vec::new();
 
         #[cfg(unix)]
-        if let Some(path) = &self.config.uds_path {
+        if let Some(uds) = &self.config.uds {
+            let path = &uds.path;
+            let granted_role = uds.granted_role;
             if path.exists() {
                 std::fs::remove_file(path).map_err(|err| {
                     BridgeHostError::Listener(format!(
@@ -1037,6 +1048,7 @@ impl PiperBridgeHost {
                                         Self::handle_connection(
                                             reader,
                                             writer,
+                                            granted_role,
                                             ConnectionContext {
                                                 backend: &backend,
                                                 sessions: &sessions,
@@ -1087,17 +1099,20 @@ impl PiperBridgeHost {
                                     let tls_listener = Arc::clone(&tls_listener);
                                     thread::spawn(move || {
                                         match Self::accept_tls_stream(stream, &tls_listener) {
-                                            Ok((stream, control)) => Self::handle_tls_connection(
-                                                stream,
-                                                control,
-                                                ConnectionContext {
-                                                    backend: &backend,
-                                                    sessions: &sessions,
-                                                    raw_tap: &raw_tap_manager,
-                                                    stats: &stats,
-                                                    warn_limiter: &warn_limiter,
-                                                },
-                                            ),
+                                            Ok((stream, control, granted_role)) => {
+                                                Self::handle_tls_connection(
+                                                    stream,
+                                                    control,
+                                                    granted_role,
+                                                    ConnectionContext {
+                                                        backend: &backend,
+                                                        sessions: &sessions,
+                                                        raw_tap: &raw_tap_manager,
+                                                        stats: &stats,
+                                                        warn_limiter: &warn_limiter,
+                                                    },
+                                                )
+                                            },
                                             Err(err) => {
                                                 warn!("bridge tcp tls connection rejected: {err}")
                                             },
@@ -1205,7 +1220,7 @@ impl PiperBridgeHost {
     fn build_tls_listener_config(
         config: &BridgeTlsServerConfig,
     ) -> Result<TlsListenerConfig, BridgeHostError> {
-        if config.allowed_client_cert_sha256.is_empty() {
+        if config.client_policies.is_empty() {
             return Err(BridgeHostError::InvalidConfig(
                 "tcp tls requires at least one allowed client certificate fingerprint".to_string(),
             ));
@@ -1234,18 +1249,21 @@ impl PiperBridgeHost {
                 ))
             })?;
 
-        let mut fingerprints = Vec::with_capacity(config.allowed_client_cert_sha256.len());
-        for fingerprint in &config.allowed_client_cert_sha256 {
-            fingerprints.push(parse_cert_fingerprint(fingerprint).map_err(|err| {
-                BridgeHostError::InvalidConfig(format!(
-                    "invalid tls client fingerprint {fingerprint}: {err}"
-                ))
-            })?);
+        let mut client_roles = HashMap::with_capacity(config.client_policies.len());
+        for policy in &config.client_policies {
+            let fingerprint =
+                parse_cert_fingerprint(&policy.fingerprint_sha256).map_err(|err| {
+                    BridgeHostError::InvalidConfig(format!(
+                        "invalid tls client fingerprint {}: {err}",
+                        policy.fingerprint_sha256
+                    ))
+                })?;
+            client_roles.insert(fingerprint, policy.granted_role);
         }
 
         Ok(TlsListenerConfig {
             server_config: Arc::new(server_config),
-            allowed_fingerprints: Arc::new(fingerprints),
+            client_roles: Arc::new(client_roles),
             handshake_timeout: config.handshake_timeout,
         })
     }
@@ -1253,7 +1271,7 @@ impl PiperBridgeHost {
     fn accept_tls_stream(
         tcp_stream: TcpStream,
         tls_listener: &TlsListenerConfig,
-    ) -> Result<(ServerStream, Arc<dyn SessionControl>), BridgeHostError> {
+    ) -> Result<(ServerStream, Arc<dyn SessionControl>, BridgeRole), BridgeHostError> {
         tcp_stream
             .set_read_timeout(Some(tls_listener.handshake_timeout))
             .map_err(|err| {
@@ -1291,11 +1309,11 @@ impl PiperBridgeHost {
         let fingerprint = Sha256::digest(peer_cert.as_ref());
         let mut fingerprint_bytes = [0u8; 32];
         fingerprint_bytes.copy_from_slice(&fingerprint);
-        if !tls_listener.allowed_fingerprints.contains(&fingerprint_bytes) {
+        let Some(granted_role) = tls_listener.client_roles.get(&fingerprint_bytes).copied() else {
             return Err(BridgeHostError::Listener(
                 "tcp tls client certificate is not in the allowlist".to_string(),
             ));
-        }
+        };
 
         stream.sock.set_read_timeout(None).map_err(|err| {
             BridgeHostError::Io(format!("failed to clear tcp tls read timeout: {err}"))
@@ -1309,6 +1327,7 @@ impl PiperBridgeHost {
             Arc::new(TcpShutdownControl {
                 sock: Mutex::new(shutdown_sock),
             }),
+            granted_role,
         ))
     }
 
@@ -1327,7 +1346,12 @@ impl PiperBridgeHost {
                         recv(control_rx) -> control => {
                             match control {
                                 Ok(ConnectionOutput::Event(event)) => {
-                                    if Self::write_server_message(&writer, &ServerMessage::Event(event), &stats).is_err() {
+                                    if !Self::handle_session_event_output(
+                                        &writer,
+                                        &session,
+                                        event,
+                                        &stats,
+                                    ) {
                                         break;
                                     }
                                 },
@@ -1350,7 +1374,12 @@ impl PiperBridgeHost {
                         recv(event_rx) -> output => {
                             match output {
                                 Ok(ConnectionOutput::Event(event)) => {
-                                    if Self::write_server_message(&writer, &ServerMessage::Event(event), &stats).is_err() {
+                                    if !Self::handle_session_event_output(
+                                        &writer,
+                                        &session,
+                                        event,
+                                        &stats,
+                                    ) {
                                         break;
                                     }
                                 },
@@ -1387,12 +1416,18 @@ impl PiperBridgeHost {
     fn handle_outbound_direct(
         writer: &mut ServerStream,
         output: ConnectionOutput,
+        session: &BridgeSession,
         stats: &BridgeHostStats,
     ) -> bool {
         match output {
             ConnectionOutput::Event(event) => {
-                Self::write_server_message_direct(writer, &ServerMessage::Event(event), stats)
-                    .is_ok()
+                if !session.is_active() {
+                    stats.session_replacement_discard_total.fetch_add(1, Ordering::Relaxed);
+                    true
+                } else {
+                    Self::write_server_message_direct(writer, &ServerMessage::Event(event), stats)
+                        .is_ok()
+                }
             },
             ConnectionOutput::CloseAfterEvent(event) => {
                 let _ =
@@ -1418,6 +1453,20 @@ impl PiperBridgeHost {
         Ok(())
     }
 
+    fn handle_session_event_output(
+        writer: &Arc<Mutex<ServerStream>>,
+        session: &BridgeSession,
+        event: BridgeEvent,
+        stats: &BridgeHostStats,
+    ) -> bool {
+        if !session.is_active() {
+            stats.session_replacement_discard_total.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
+        Self::write_server_message(writer, &ServerMessage::Event(event), stats).is_ok()
+    }
+
     fn send_error(
         writer: &Arc<Mutex<ServerStream>>,
         stats: &BridgeHostStats,
@@ -1439,6 +1488,7 @@ impl PiperBridgeHost {
     fn handle_connection(
         mut reader: ServerStream,
         writer: Arc<Mutex<ServerStream>>,
+        granted_role: BridgeRole,
         ctx: ConnectionContext<'_>,
     ) {
         let peer_label = reader.peer_label();
@@ -1474,7 +1524,6 @@ impl PiperBridgeHost {
                 ClientRequest::Hello {
                     request_id,
                     session_token,
-                    role_request,
                     filters,
                 } => {
                     if session.is_some() {
@@ -1490,7 +1539,7 @@ impl PiperBridgeHost {
 
                     let prepared = ctx.sessions.prepare_session(
                         session_token,
-                        ctx.backend.grant_role(role_request),
+                        granted_role,
                         filters,
                         control.clone(),
                     );
@@ -1645,9 +1694,18 @@ impl PiperBridgeHost {
                             request_id,
                             timeout_ms,
                         } => {
+                            if active_session.role_granted() != BridgeRole::WriterCandidate {
+                                let _ = Self::send_error(
+                                    &writer,
+                                    ctx.stats,
+                                    request_id,
+                                    ErrorCode::PermissionDenied,
+                                    "writer lease requires a WriterCandidate bridge role",
+                                );
+                                continue;
+                            }
                             match ctx.backend.acquire_maintenance_lease(
                                 active_session.session_id(),
-                                active_session.role_granted(),
                                 Duration::from_millis(timeout_ms as u64),
                             ) {
                                 Ok(LeaseAcquireResult::Granted) => {
@@ -1759,6 +1817,7 @@ impl PiperBridgeHost {
     fn handle_tls_connection(
         mut stream: ServerStream,
         control: Arc<dyn SessionControl>,
+        granted_role: BridgeRole,
         ctx: ConnectionContext<'_>,
     ) {
         let peer_label = stream.peer_label();
@@ -1771,7 +1830,12 @@ impl PiperBridgeHost {
                 loop {
                     match rx.try_recv() {
                         Ok(output) => {
-                            if !Self::handle_outbound_direct(&mut stream, output, ctx.stats) {
+                            if !Self::handle_outbound_direct(
+                                &mut stream,
+                                output,
+                                session.as_ref().expect("session exists after hello"),
+                                ctx.stats,
+                            ) {
                                 break 'connection;
                             }
                         },
@@ -1782,16 +1846,19 @@ impl PiperBridgeHost {
             }
 
             if let Some(rx) = event_rx.as_ref() {
-                for _ in 0..32 {
-                    match rx.try_recv() {
-                        Ok(output) => {
-                            if !Self::handle_outbound_direct(&mut stream, output, ctx.stats) {
-                                break 'connection;
-                            }
-                        },
-                        Err(crossbeam_channel::TryRecvError::Empty) => break,
-                        Err(crossbeam_channel::TryRecvError::Disconnected) => break 'connection,
-                    }
+                match rx.try_recv() {
+                    Ok(output) => {
+                        if !Self::handle_outbound_direct(
+                            &mut stream,
+                            output,
+                            session.as_ref().expect("session exists after hello"),
+                            ctx.stats,
+                        ) {
+                            break 'connection;
+                        }
+                    },
+                    Err(crossbeam_channel::TryRecvError::Empty) => {},
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break 'connection,
                 }
             }
 
@@ -1832,7 +1899,6 @@ impl PiperBridgeHost {
                 ClientRequest::Hello {
                     request_id,
                     session_token,
-                    role_request,
                     filters,
                 } => {
                     if session.is_some() {
@@ -1848,7 +1914,7 @@ impl PiperBridgeHost {
 
                     let prepared = ctx.sessions.prepare_session(
                         session_token,
-                        ctx.backend.grant_role(role_request),
+                        granted_role,
                         filters,
                         Arc::clone(&control),
                     );
@@ -1992,9 +2058,18 @@ impl PiperBridgeHost {
                             request_id,
                             timeout_ms,
                         } => {
+                            if active_session.role_granted() != BridgeRole::WriterCandidate {
+                                let _ = Self::send_error_direct(
+                                    &mut stream,
+                                    ctx.stats,
+                                    request_id,
+                                    ErrorCode::PermissionDenied,
+                                    "writer lease requires a WriterCandidate bridge role",
+                                );
+                                continue;
+                            }
                             match ctx.backend.acquire_maintenance_lease(
                                 active_session.session_id(),
-                                active_session.role_granted(),
                                 Duration::from_millis(timeout_ms as u64),
                             ) {
                                 Ok(LeaseAcquireResult::Granted) => {
@@ -2106,6 +2181,7 @@ fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
         DriverError::ControlPathClosed
         | DriverError::CommandAbortedByFault
         | DriverError::RealtimeDeliveryAbortedByFault { .. } => ErrorCode::PermissionDenied,
+        DriverError::MaintenanceWriteDenied(_) => ErrorCode::PermissionDenied,
         DriverError::ChannelClosed
         | DriverError::IoThread(_)
         | DriverError::NotDualThread
@@ -2133,19 +2209,14 @@ fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
 
 struct PiperBridgeBackend {
     driver: Arc<RobotPiper>,
-    maintenance_mode: AtomicBool,
     maintenance_lease: Mutex<Option<u32>>,
     maintenance_cv: Condvar,
 }
 
 impl PiperBridgeBackend {
-    fn from_driver(
-        driver: Arc<RobotPiper>,
-        maintenance_mode: bool,
-    ) -> Arc<dyn BridgeControllerBackend> {
+    fn from_driver(driver: Arc<RobotPiper>) -> Arc<dyn BridgeControllerBackend> {
         Arc::new(Self {
             driver,
-            maintenance_mode: AtomicBool::new(maintenance_mode),
             maintenance_lease: Mutex::new(None),
             maintenance_cv: Condvar::new(),
         })
@@ -2165,18 +2236,7 @@ impl PiperBridgeBackend {
             return BridgeMaintenanceState::DeniedActiveControl;
         }
 
-        if self.maintenance_mode.load(Ordering::Acquire) {
-            BridgeMaintenanceState::AllowedMaintenanceMode
-        } else {
-            BridgeMaintenanceState::AllowedStandby
-        }
-    }
-
-    fn role_denied_error() -> BridgeBackendError {
-        BridgeBackendError::new(
-            ErrorCode::PermissionDenied,
-            "writer lease requires a WriterCandidate bridge role",
-        )
+        BridgeMaintenanceState::AllowedStandby
     }
 }
 
@@ -2194,13 +2254,8 @@ impl BridgeControllerBackend for PiperBridgeBackend {
     fn acquire_maintenance_lease(
         &self,
         session_id: u32,
-        role: BridgeRole,
         timeout: Duration,
     ) -> Result<LeaseAcquireResult, BridgeBackendError> {
-        if role != BridgeRole::WriterCandidate {
-            return Err(Self::role_denied_error());
-        }
-
         let initial_state = self.maintenance_state();
         if !initial_state.allows_lease() {
             return Err(BridgeBackendError::new(
@@ -2281,27 +2336,26 @@ impl BridgeControllerBackend for PiperBridgeBackend {
         session_id: u32,
         frame: PiperFrame,
     ) -> Result<(), BridgeBackendError> {
-        let _guard = self.maintenance_lease.lock().unwrap();
-        if _guard.as_ref().copied() != Some(session_id) {
+        let guard = self.maintenance_lease.lock().unwrap();
+        if guard.as_ref().copied() != Some(session_id) {
             return Err(BridgeBackendError::new(
                 ErrorCode::PermissionDenied,
                 "maintenance lease required",
             ));
         }
 
-        let maintenance_state = self.maintenance_state();
-        if !maintenance_state.allows_lease() {
-            drop(_guard);
-            let _ = self.release_maintenance_lease(session_id);
-            return Err(BridgeBackendError::new(
-                ErrorCode::PermissionDenied,
-                maintenance_state.denial_message(),
-            ));
-        }
-
         self.driver
-            .send_frame(frame)
-            .map_err(|err| bridge_backend_error_from_driver(&err))
+            .send_maintenance_frame_confirmed(frame, Duration::from_millis(10))
+            .map_err(|err| {
+                if matches!(
+                    err,
+                    DriverError::ControlPathClosed | DriverError::MaintenanceWriteDenied(_)
+                ) {
+                    drop(guard);
+                    let _ = self.release_maintenance_lease(session_id);
+                }
+                bridge_backend_error_from_driver(&err)
+            })
     }
 
     fn install_raw_frame_tap(
@@ -2407,7 +2461,12 @@ fn message_kind(request: &ClientRequest) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
 
     struct NoopControl;
 
@@ -2498,5 +2557,48 @@ mod tests {
                 inactive: 1,
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_session_drops_direct_outbound_events_without_writing() {
+        let (server, mut client) = UnixStream::pair().expect("unix pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("set read timeout");
+
+        let (event_tx, _event_rx) = SessionManager::new_connection_queue();
+        let (control_tx, _control_rx) = SessionManager::new_connection_queue();
+        let session = BridgeSession::new(
+            7,
+            token(7),
+            BridgeRole::WriterCandidate,
+            vec![],
+            event_tx,
+            control_tx,
+            Arc::new(NoopControl),
+        );
+        assert!(session.mark_replaced());
+
+        let mut writer = ServerStream::Unix(server);
+        let stats = BridgeHostStats::new();
+        let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+        assert!(PiperBridgeHost::handle_outbound_direct(
+            &mut writer,
+            ConnectionOutput::Event(BridgeEvent::ReceiveFrame(frame)),
+            &session,
+            &stats,
+        ));
+        assert_eq!(
+            stats.session_replacement_discard_total.load(Ordering::Relaxed),
+            1
+        );
+
+        let mut buf = [0u8; 1];
+        let err = client.read(&mut buf).expect_err("replaced session should not write");
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
     }
 }

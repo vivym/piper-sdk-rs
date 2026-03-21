@@ -828,29 +828,65 @@ pub fn tx_loop_mailbox(
 
             let frame = command.frame();
             let ack = command.take_ack();
-            let send_result = match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
-                Ok(_) => {
-                    metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+            let is_maintenance = matches!(
+                command.kind(),
+                crate::command::ReliableCommandKind::Maintenance
+            );
+            let send_result = if is_maintenance {
+                if let Some(denied) = maintenance_write_denial(&runtime_phase, &ctx, &last_fault) {
+                    Err(denied)
+                } else {
+                    match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
+                        Ok(_) => {
+                            metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 
-                    if let Ok(hooks) = ctx.hooks.try_read() {
-                        hooks.trigger_all_sent(&frame);
+                            if let Ok(hooks) = ctx.hooks.try_read() {
+                                hooks.trigger_all_sent(&frame);
+                            }
+                            Ok(())
+                        },
+                        Err(e) => {
+                            error!("TX thread: Failed to send maintenance frame: {}", e);
+                            if matches!(e, CanError::Timeout) {
+                                metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                            Err(crate::DriverError::ReliableDeliveryFailed { source: e })
+                        },
                     }
-                    Ok(())
-                },
-                Err(e) => {
-                    error!("TX thread: Failed to send reliable frame: {}", e);
-                    if matches!(e, CanError::Timeout) {
-                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                    store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                    Err(crate::DriverError::ReliableDeliveryFailed { source: e })
-                },
+                }
+            } else {
+                match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
+                    Ok(_) => {
+                        metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+
+                        if let Ok(hooks) = ctx.hooks.try_read() {
+                            hooks.trigger_all_sent(&frame);
+                        }
+                        Ok(())
+                    },
+                    Err(e) => {
+                        error!("TX thread: Failed to send reliable frame: {}", e);
+                        if matches!(e, CanError::Timeout) {
+                            metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                        Err(crate::DriverError::ReliableDeliveryFailed { source: e })
+                    },
+                }
             };
 
-            let should_break = send_result.is_err();
+            let should_break = matches!(
+                send_result,
+                Err(crate::DriverError::ReliableDeliveryFailed { .. })
+                    | Err(crate::DriverError::ChannelClosed)
+            );
             if let Some(ack) = ack {
                 let _ = ack.send(send_result);
             }
@@ -972,6 +1008,36 @@ fn send_shutdown_dispatch(
     );
     shutdown_lane.finish(send_result);
     should_break
+}
+
+fn maintenance_write_denial(
+    runtime_phase: &Arc<AtomicU8>,
+    ctx: &Arc<PiperContext>,
+    last_fault: &Arc<AtomicU8>,
+) -> Option<crate::DriverError> {
+    if load_runtime_phase(runtime_phase) != RuntimePhase::Running {
+        return Some(crate::DriverError::ControlPathClosed);
+    }
+
+    if last_fault.load(Ordering::Acquire) != 0 {
+        return Some(crate::DriverError::MaintenanceWriteDenied(
+            "maintenance writes are disabled while a runtime fault is latched".to_string(),
+        ));
+    }
+
+    if !ctx.connection_monitor.check_connection() {
+        return Some(crate::DriverError::MaintenanceWriteDenied(
+            "maintenance writes are disabled while transport is disconnected".to_string(),
+        ));
+    }
+
+    if ctx.robot_control.load().is_enabled {
+        return Some(crate::DriverError::MaintenanceWriteDenied(
+            "maintenance writes are disabled while active control is enabled".to_string(),
+        ));
+    }
+
+    None
 }
 
 /// 辅助函数：解析帧并更新状态

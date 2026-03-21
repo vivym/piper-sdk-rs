@@ -52,6 +52,12 @@ pub type RealtimeAck = Sender<Result<(), DriverError>>;
 pub type ReliableAck = Sender<Result<(), DriverError>>;
 pub type ShutdownAck = Sender<Result<(), DriverError>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliableCommandKind {
+    Standard,
+    Maintenance,
+}
+
 #[derive(Debug)]
 pub struct RealtimeCommand {
     frames: FrameBuffer,
@@ -141,6 +147,7 @@ impl RealtimeCommand {
 pub struct ReliableCommand {
     frame: PiperFrame,
     ack: Option<ReliableAck>,
+    kind: ReliableCommandKind,
 }
 
 #[derive(Debug, Clone)]
@@ -179,7 +186,11 @@ impl ShutdownCommand {
 impl ReliableCommand {
     #[inline]
     pub fn single(frame: PiperFrame) -> Self {
-        Self { frame, ack: None }
+        Self {
+            frame,
+            ack: None,
+            kind: ReliableCommandKind::Standard,
+        }
     }
 
     #[inline]
@@ -187,12 +198,27 @@ impl ReliableCommand {
         Self {
             frame,
             ack: Some(ack),
+            kind: ReliableCommandKind::Standard,
+        }
+    }
+
+    #[inline]
+    pub fn maintenance_confirmed(frame: PiperFrame, ack: ReliableAck) -> Self {
+        Self {
+            frame,
+            ack: Some(ack),
+            kind: ReliableCommandKind::Maintenance,
         }
     }
 
     #[inline]
     pub fn frame(&self) -> PiperFrame {
         self.frame
+    }
+
+    #[inline]
+    pub fn kind(&self) -> ReliableCommandKind {
+        self.kind
     }
 
     #[inline]

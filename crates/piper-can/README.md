@@ -160,7 +160,8 @@ pub trait CanAdapter {
 bridge 会话在 `Hello` 握手阶段通过 `SessionToken([u8; 16])` 建立；steady-state
 阶段不再靠 peer 地址或 caller-supplied `client_id` 补丁式鉴权。
 
-默认角色是只读 observer。若需要写 CAN，必须显式获取独占 `MaintenanceLease`：
+默认角色是只读 observer。若需要写 CAN，服务端 listener / TLS policy 必须显式授予
+`WriterCandidate`，然后客户端再获取独占 `MaintenanceLease`：
 
 ```rust
 use piper_can::{
@@ -168,7 +169,6 @@ use piper_can::{
 };
 
 let options = BridgeClientOptions {
-    role_request: BridgeRole::WriterCandidate,
     tcp_tls: Some(BridgeTlsClientConfig {
         ca_cert_pem: "/path/to/ca.pem".into(),
         client_cert_pem: "/path/to/client.pem".into(),
@@ -181,6 +181,7 @@ let mut client = BridgeClient::connect(
     BridgeEndpoint::TcpTls("127.0.0.1:18888".parse()?),
     options,
 )?;
+assert_eq!(client.role_granted(), BridgeRole::WriterCandidate);
 let mut lease = client.acquire_writer_lease(std::time::Duration::from_millis(500))?;
 lease.send_frame(PiperFrame::new_standard(0x123, &[1, 2, 3, 4]))?;
 lease.release()?;

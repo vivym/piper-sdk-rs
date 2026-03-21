@@ -94,6 +94,10 @@ pub enum DriverError {
     #[error("Command aborted because runtime fault latched")]
     CommandAbortedByFault,
 
+    /// 维护写入在发送点被运行时状态拒绝
+    #[error("Maintenance write denied: {0}")]
+    MaintenanceWriteDenied(String),
+
     /// 已确认的实时命令等待 TX 线程确认超时
     #[error("Realtime delivery confirmation timed out")]
     RealtimeDeliveryTimeout,
@@ -190,6 +194,10 @@ mod tests {
         let driver_error = DriverError::CommandAbortedByFault;
         let msg = format!("{}", driver_error);
         assert!(msg.contains("runtime fault latched"));
+
+        let driver_error = DriverError::MaintenanceWriteDenied("standby required".to_string());
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("Maintenance write denied"));
 
         let driver_error = DriverError::RealtimeDeliveryTimeout;
         let msg = format!("{}", driver_error);

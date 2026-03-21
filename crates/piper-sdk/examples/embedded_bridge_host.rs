@@ -4,7 +4,10 @@
 //! attaches the non-realtime bridge host to that in-process controller surface.
 
 use clap::Parser;
-use piper_sdk::{BridgeHostConfig, BridgeTlsServerConfig, PiperBuilder};
+use piper_sdk::{
+    BridgeHostConfig, BridgeRole, BridgeTlsClientPolicy, BridgeTlsServerConfig,
+    BridgeUdsListenerConfig, PiperBuilder,
+};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -26,6 +29,10 @@ struct Args {
     /// Unix stream socket path.
     #[arg(long, default_value = "/tmp/piper_bridge.sock")]
     uds: String,
+
+    /// Granted bridge role for the UDS listener: observer | writer-candidate.
+    #[arg(long, default_value = "observer")]
+    uds_role: String,
 
     /// TLS-protected TCP listen address.
     #[arg(long)]
@@ -52,10 +59,22 @@ struct Args {
     allow_raw_frame_tap: bool,
 }
 
+fn parse_bridge_role(raw: &str) -> Result<BridgeRole, Box<dyn std::error::Error>> {
+    match raw {
+        "observer" => Ok(BridgeRole::Observer),
+        "writer-candidate" => Ok(BridgeRole::WriterCandidate),
+        other => Err(format!(
+            "invalid bridge role `{other}`; expected `observer` or `writer-candidate`"
+        )
+        .into()),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     piper_sdk::init_logger!();
 
     let args = Args::parse();
+    let uds_role = parse_bridge_role(&args.uds_role)?;
 
     let mut builder = PiperBuilder::new().baud_rate(args.bitrate);
     if let Some(iface) = args.socketcan {
@@ -79,16 +98,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             client_ca_cert_pem: PathBuf::from(
                 args.tls_client_ca.ok_or("--tcp-tls requires --tls-client-ca")?,
             ),
-            allowed_client_cert_sha256: args.tls_allowed_client_cert_sha256,
+            client_policies: args
+                .tls_allowed_client_cert_sha256
+                .into_iter()
+                .map(|fingerprint_sha256| BridgeTlsClientPolicy {
+                    fingerprint_sha256,
+                    granted_role: BridgeRole::WriterCandidate,
+                })
+                .collect(),
             handshake_timeout: std::time::Duration::from_secs(5),
         }),
         None => None,
     };
 
     let host = piper.attach_bridge_host(BridgeHostConfig {
-        uds_path: Some(PathBuf::from(args.uds)),
+        uds: Some(BridgeUdsListenerConfig {
+            path: PathBuf::from(args.uds),
+            granted_role: uds_role,
+        }),
         tcp_tls,
-        maintenance_mode: false,
         allow_raw_frame_tap: args.allow_raw_frame_tap,
     });
 

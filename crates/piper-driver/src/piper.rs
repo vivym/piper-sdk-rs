@@ -367,6 +367,9 @@ fn clone_driver_error(error: &DriverError) -> DriverError {
             source: clone_can_error(source),
         },
         DriverError::CommandAbortedByFault => DriverError::CommandAbortedByFault,
+        DriverError::MaintenanceWriteDenied(message) => {
+            DriverError::MaintenanceWriteDenied(message.clone())
+        },
         DriverError::RealtimeDeliveryTimeout => DriverError::RealtimeDeliveryTimeout,
     }
 }
@@ -1550,6 +1553,35 @@ impl Piper {
     /// - `DriverError::ChannelFull`: 队列满（非阻塞）
     pub fn send_reliable(&self, frame: PiperFrame) -> Result<(), DriverError> {
         self.enqueue_reliable(ReliableCommand::single(frame))
+    }
+
+    /// 发送维护帧并等待 TX 线程在实际发送点完成最终运行时准入判定。
+    #[doc(hidden)]
+    pub fn send_maintenance_frame_confirmed(
+        &self,
+        frame: PiperFrame,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        if !self.tx_thread_alive() {
+            return Err(DriverError::ChannelClosed);
+        }
+        if !self.normal_control_open() {
+            return Err(DriverError::ControlPathClosed);
+        }
+
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.enqueue_reliable_timeout(
+            ReliableCommand::maintenance_confirmed(frame, ack_tx),
+            timeout,
+        )?;
+
+        match ack_rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(DriverError::ChannelClosed)
+            },
+        }
     }
 
     /// 发送命令（根据优先级自动选择队列）

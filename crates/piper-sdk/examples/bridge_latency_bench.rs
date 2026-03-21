@@ -194,19 +194,27 @@ fn stable_session_token(endpoint: &str, tool_name: &str) -> Result<SessionToken,
 fn connect_client(
     endpoint_raw: &str,
     args: &Args,
-    role: BridgeRole,
+    required_role: BridgeRole,
     timeout: Duration,
 ) -> Result<PiperBridgeClient, Box<dyn std::error::Error>> {
     let endpoint = parse_endpoint(endpoint_raw)?;
     let options = BridgeClientOptions {
         session_token: stable_session_token(endpoint_raw, "bridge_latency_bench")?,
-        role_request: role,
         filters: Vec::new(),
         connect_timeout: Duration::from_secs(5),
         request_timeout: timeout,
         tcp_tls: maybe_tls_config(&endpoint, args)?,
     };
-    Ok(PiperBridgeClient::connect(endpoint, options)?)
+    let client = PiperBridgeClient::connect(endpoint, options)?;
+    if required_role == BridgeRole::WriterCandidate
+        && client.role_granted() != BridgeRole::WriterCandidate
+    {
+        return Err(
+            "bridge server did not grant WriterCandidate role; send bench requires a writer-capable listener or TLS client policy"
+                .into(),
+        );
+    }
+    Ok(client)
 }
 
 fn print_stats(label: &str, stats: &mut LatencyStats) {

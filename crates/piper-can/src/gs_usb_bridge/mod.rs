@@ -116,7 +116,6 @@ pub struct BridgeTlsClientConfig {
 #[derive(Debug, Clone)]
 pub struct BridgeClientOptions {
     pub session_token: SessionToken,
-    pub role_request: BridgeRole,
     pub filters: Vec<protocol::CanIdFilter>,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -127,7 +126,6 @@ impl Default for BridgeClientOptions {
     fn default() -> Self {
         Self {
             session_token: SessionToken::random(),
-            role_request: BridgeRole::Observer,
             filters: Vec::new(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_millis(100),
@@ -280,7 +278,6 @@ impl GsUsbBridgeClient {
         let hello = ClientRequest::Hello {
             request_id: 1,
             session_token: options.session_token,
-            role_request: options.role_request,
             filters: options.filters,
         };
         let encoded = encode_client_request(&hello)?;
@@ -755,11 +752,9 @@ mod tests {
                 ClientRequest::Hello {
                     request_id,
                     session_token,
-                    role_request,
                     filters,
                 } => {
                     assert_eq!(session_token, SessionToken::new([7; SESSION_TOKEN_LEN]));
-                    assert_eq!(role_request, BridgeRole::WriterCandidate);
                     assert_eq!(filters, vec![CanIdFilter::new(0x100, 0x200)]);
                     let response = ServerMessage::Response(ServerResponse::HelloAck {
                         request_id,
@@ -775,7 +770,6 @@ mod tests {
 
         let options = BridgeClientOptions {
             session_token: SessionToken::new([7; SESSION_TOKEN_LEN]),
-            role_request: BridgeRole::WriterCandidate,
             filters: vec![CanIdFilter::new(0x100, 0x200)],
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
@@ -805,7 +799,6 @@ mod tests {
 
         let options = BridgeClientOptions {
             session_token: SessionToken::random(),
-            role_request: BridgeRole::Observer,
             filters: vec![],
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
@@ -848,7 +841,6 @@ mod tests {
 
         let options = BridgeClientOptions {
             session_token: SessionToken::random(),
-            role_request: BridgeRole::Observer,
             filters: vec![],
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),

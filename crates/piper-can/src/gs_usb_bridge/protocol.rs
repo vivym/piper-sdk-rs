@@ -157,7 +157,6 @@ pub enum ClientRequest {
     Hello {
         request_id: u32,
         session_token: SessionToken,
-        role_request: BridgeRole,
         filters: Vec<CanIdFilter>,
     },
     GetStatus {
@@ -415,13 +414,11 @@ fn encode_payload_from_request(message: &ClientRequest) -> Result<Vec<u8>, Proto
         ClientRequest::Hello {
             request_id,
             session_token,
-            role_request,
             filters,
         } => {
             put_u8(&mut buf, TAG_HELLO);
             put_u32(&mut buf, *request_id);
             put_token(&mut buf, *session_token);
-            put_u8(&mut buf, *role_request as u8);
             put_filters(&mut buf, filters)?;
         },
         ClientRequest::GetStatus { request_id } => {
@@ -576,7 +573,6 @@ pub fn decode_client_request(payload: &[u8]) -> Result<ClientRequest, ProtocolEr
         TAG_HELLO => ClientRequest::Hello {
             request_id,
             session_token: cursor.token()?,
-            role_request: BridgeRole::from_u8(cursor.u8()?)?,
             filters: cursor.filters()?,
         },
         TAG_GET_STATUS => ClientRequest::GetStatus { request_id },
@@ -732,7 +728,6 @@ mod tests {
         let request = ClientRequest::Hello {
             request_id: 7,
             session_token: TEST_TOKEN,
-            role_request: BridgeRole::WriterCandidate,
             filters: vec![CanIdFilter::new(0x100, 0x1FF)],
         };
         let encoded = encode_client_request(&request).unwrap();

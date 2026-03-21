@@ -44,8 +44,8 @@ pub use bridge::{
     PiperBridgeClient, SessionToken,
 };
 pub use bridge_host::{
-    BridgeHostConfig, BridgeHostError, BridgeMaintenanceState, BridgeTlsServerConfig,
-    PiperBridgeHost,
+    BridgeHostConfig, BridgeHostError, BridgeMaintenanceState, BridgeTlsClientPolicy,
+    BridgeTlsServerConfig, BridgeUdsListenerConfig, PiperBridgeHost,
 };
 pub use builder::PiperBuilder;
 pub use diagnostics::PiperDiagnostics;
