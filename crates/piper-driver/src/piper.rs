@@ -385,6 +385,7 @@ struct MaintenanceGateInner {
     holder_session_id: Option<u32>,
     holder_session_key: Option<u64>,
     lease_epoch: u64,
+    applied_lease_epoch: u64,
 }
 
 impl Default for MaintenanceGateInner {
@@ -394,6 +395,7 @@ impl Default for MaintenanceGateInner {
             holder_session_id: None,
             holder_session_key: None,
             lease_epoch: 0,
+            applied_lease_epoch: 0,
         }
     }
 }
@@ -495,7 +497,10 @@ impl MaintenanceGate {
         lease_epoch: u64,
     ) -> Result<(), DriverError> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.holder_session_key != Some(session_key) || inner.lease_epoch != lease_epoch {
+        if inner.holder_session_key != Some(session_key)
+            || inner.lease_epoch != lease_epoch
+            || inner.applied_lease_epoch >= lease_epoch
+        {
             return Ok(());
         }
 
@@ -513,6 +518,17 @@ impl MaintenanceGate {
             false,
         )?;
         Ok(())
+    }
+
+    fn mark_grant_applied(&self, session_key: u64, lease_epoch: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.holder_session_key == Some(session_key)
+            && inner.lease_epoch == lease_epoch
+            && inner.applied_lease_epoch < lease_epoch
+        {
+            inner.applied_lease_epoch = lease_epoch;
+            self.wait_cv.notify_all();
+        }
     }
 
     pub fn snapshot(&self) -> MaintenanceLeaseSnapshot {
@@ -651,28 +667,32 @@ impl MaintenanceGate {
                         let _ = self.rollback_tentative_grant(session_key, lease_epoch);
                         return Err(err);
                     }
+                    self.mark_grant_applied(session_key, lease_epoch);
                     return Ok(MaintenanceLeaseAcquireResult::Granted { lease_epoch });
                 },
                 Some(holder_key) if holder_key == session_key => {
-                    let lease_epoch = inner.lease_epoch;
-                    let ack_rx = match self.send_control_command_locked(
-                        MaintenanceControlOp::Grant {
-                            session_id,
-                            session_key,
-                            lease_epoch,
-                        },
-                        true,
-                    ) {
-                        Ok(Some(ack_rx)) => ack_rx,
-                        Ok(None) => unreachable!("blocking grant must return ack"),
-                        Err(err) => return Err(err),
-                    };
-                    drop(inner);
-                    if let Err(err) = Self::wait_control_ack_until(ack_rx, deadline) {
-                        let _ = self.rollback_tentative_grant(session_key, lease_epoch);
-                        return Err(err);
+                    if inner.applied_lease_epoch >= inner.lease_epoch {
+                        return Ok(MaintenanceLeaseAcquireResult::Granted {
+                            lease_epoch: inner.lease_epoch,
+                        });
                     }
-                    return Ok(MaintenanceLeaseAcquireResult::Granted { lease_epoch });
+
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(DriverError::Timeout);
+                    }
+
+                    let timeout = deadline.saturating_duration_since(now);
+                    let (next_inner, wait_result) =
+                        self.wait_cv.wait_timeout(inner, timeout).unwrap();
+                    inner = next_inner;
+
+                    if wait_result.timed_out()
+                        && inner.holder_session_key == Some(session_key)
+                        && inner.applied_lease_epoch < inner.lease_epoch
+                    {
+                        return Err(DriverError::Timeout);
+                    }
                 },
                 _ => {
                     let now = Instant::now();
@@ -2767,6 +2787,60 @@ mod tests {
         });
     }
 
+    fn attach_recording_maintenance_control_sink(
+        gate: &MaintenanceGate,
+        ops: Arc<Mutex<Vec<MaintenanceControlOp>>>,
+    ) {
+        let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceLaneCommand>();
+        gate.set_control_sink(tx);
+        std::thread::spawn(move || {
+            while let Ok(command) = rx.recv() {
+                match command {
+                    MaintenanceLaneCommand::Control { op, ack } => {
+                        ops.lock().expect("maintenance ops lock").push(op);
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                    },
+                    MaintenanceLaneCommand::Send { ack, .. } => {
+                        let _ = ack.send(Err(DriverError::ChannelClosed));
+                    },
+                }
+            }
+        });
+    }
+
+    fn attach_delayed_first_grant_control_sink(
+        gate: &MaintenanceGate,
+        ops: Arc<Mutex<Vec<MaintenanceControlOp>>>,
+        first_grant_started: mpsc::Sender<()>,
+        first_grant_release: mpsc::Receiver<()>,
+    ) {
+        let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceLaneCommand>();
+        gate.set_control_sink(tx);
+        std::thread::spawn(move || {
+            let mut delayed_first_grant = true;
+            while let Ok(command) = rx.recv() {
+                match command {
+                    MaintenanceLaneCommand::Control { op, ack } => {
+                        ops.lock().expect("maintenance ops lock").push(op);
+                        if matches!(op, MaintenanceControlOp::Grant { .. }) && delayed_first_grant {
+                            delayed_first_grant = false;
+                            let _ = first_grant_started.send(());
+                            let _ = first_grant_release.recv();
+                        }
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                    },
+                    MaintenanceLaneCommand::Send { ack, .. } => {
+                        let _ = ack.send(Err(DriverError::ChannelClosed));
+                    },
+                }
+            }
+        });
+    }
+
     struct RecordingTxAdapter {
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
     }
@@ -4029,6 +4103,130 @@ mod tests {
         assert!(
             reacquired_epoch > holder_lease_epoch,
             "rollback should bump lease epoch before the next successful grant"
+        );
+    }
+
+    #[test]
+    fn test_maintenance_same_holder_reacquire_is_idempotent_after_grant_applied() {
+        let gate = MaintenanceGate::default();
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        attach_recording_maintenance_control_sink(&gate, ops.clone());
+        gate.set_state(MaintenanceGateState::AllowedStandby);
+
+        let first_epoch = match gate
+            .acquire_blocking(3, 33, Duration::from_millis(20))
+            .expect("initial same-holder acquire should sync to control lane")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected first same-holder acquire result: {other:?}"),
+        };
+
+        let second_epoch = match gate
+            .acquire_blocking(3, 33, Duration::from_millis(20))
+            .expect("duplicate same-holder acquire should succeed idempotently")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected duplicate same-holder acquire result: {other:?}"),
+        };
+
+        assert_eq!(
+            second_epoch, first_epoch,
+            "duplicate same-holder acquire should reuse the existing lease epoch"
+        );
+
+        let snapshot = gate.snapshot();
+        assert_eq!(snapshot.holder_session_id(), Some(3));
+        assert_eq!(snapshot.holder_session_key(), Some(33));
+        assert_eq!(snapshot.lease_epoch(), first_epoch);
+
+        let ops = ops.lock().expect("maintenance ops lock");
+        assert_eq!(
+            ops.iter().filter(|op| matches!(op, MaintenanceControlOp::Grant { .. })).count(),
+            1,
+            "duplicate same-holder acquire must not enqueue a second grant"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(op, MaintenanceControlOp::Release { .. })),
+            "idempotent same-holder reacquire must not revoke the held lease"
+        );
+    }
+
+    #[test]
+    fn test_maintenance_same_holder_timeout_does_not_revoke_inflight_grant() {
+        let gate = Arc::new(MaintenanceGate::default());
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let (first_grant_started_tx, first_grant_started_rx) = mpsc::channel();
+        let (first_grant_release_tx, first_grant_release_rx) = mpsc::channel();
+        attach_delayed_first_grant_control_sink(
+            &gate,
+            ops.clone(),
+            first_grant_started_tx,
+            first_grant_release_rx,
+        );
+        gate.set_state(MaintenanceGateState::AllowedStandby);
+
+        let first_gate = Arc::clone(&gate);
+        let first_acquire = std::thread::spawn(move || {
+            first_gate.acquire_blocking(4, 44, Duration::from_millis(500))
+        });
+
+        first_grant_started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first grant should reach control lane before duplicate acquire");
+
+        let second_gate = Arc::clone(&gate);
+        let duplicate_started = Instant::now();
+        let duplicate_acquire = std::thread::spawn(move || {
+            second_gate.acquire_blocking(4, 44, Duration::from_millis(20))
+        });
+
+        let duplicate_error = duplicate_acquire
+            .join()
+            .expect("duplicate same-holder acquire should finish")
+            .expect_err("in-flight same-holder reacquire should time out without revoking");
+        assert!(matches!(duplicate_error, DriverError::Timeout));
+        assert!(
+            duplicate_started.elapsed() < Duration::from_millis(150),
+            "duplicate same-holder reacquire should remain bounded by caller timeout"
+        );
+
+        let snapshot = gate.snapshot();
+        assert_eq!(snapshot.holder_session_id(), Some(4));
+        assert_eq!(snapshot.holder_session_key(), Some(44));
+
+        {
+            let ops = ops.lock().expect("maintenance ops lock");
+            assert_eq!(
+                ops.iter().filter(|op| matches!(op, MaintenanceControlOp::Grant { .. })).count(),
+                1,
+                "duplicate same-holder timeout must not enqueue a second grant"
+            );
+            assert!(
+                ops.iter().all(|op| !matches!(op, MaintenanceControlOp::Release { .. })),
+                "duplicate same-holder timeout must not revoke the in-flight lease"
+            );
+        }
+
+        let _ = first_grant_release_tx.send(());
+        let first_epoch = match first_acquire
+            .join()
+            .expect("first same-holder acquire should finish")
+            .expect("initial grant should still complete after delayed ack")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected delayed first acquire result: {other:?}"),
+        };
+
+        let reacquired_epoch = match gate
+            .acquire_blocking(4, 44, Duration::from_millis(20))
+            .expect("same-holder acquire should succeed once the original grant is applied")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected post-ack same-holder acquire result: {other:?}"),
+        };
+        assert_eq!(
+            reacquired_epoch, first_epoch,
+            "same-holder reacquire after delayed ack should observe the original lease epoch"
         );
     }
 
