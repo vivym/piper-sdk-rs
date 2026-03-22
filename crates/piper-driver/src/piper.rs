@@ -113,6 +113,7 @@ pub(crate) const SOFT_CONTROL_SEND_BUDGET: Duration = Duration::from_millis(5);
 pub(crate) const SOFT_CONTROL_SEND_MIN_DEADLINE: Duration = Duration::from_millis(1);
 pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
 pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_MODE_SWITCH_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StartupValidationDeadline {
@@ -1318,6 +1319,15 @@ impl Piper {
         RuntimePhase::from_raw(self.runtime_phase.load(Ordering::Acquire))
     }
 
+    fn record_runtime_fault_once(&self, fault: RuntimeFaultKind) {
+        let _ = self.runtime_fault.compare_exchange(
+            0,
+            fault as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     fn normal_control_open(&self) -> bool {
         self.runtime_phase() == RuntimePhase::Running
     }
@@ -1641,6 +1651,11 @@ impl Piper {
         self.normal_send_gate.close_for_fault();
         self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
         let _ = self.maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
+    }
+
+    fn latch_fault_with_kind(&self, fault: RuntimeFaultKind) {
+        self.record_runtime_fault_once(fault);
+        self.latch_fault();
     }
 
     /// 请求 worker 停止并关闭所有命令通路。
@@ -2293,6 +2308,61 @@ impl Piper {
         self.driver_mode.get(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// 尝试在有界时间内设置 Driver 模式。
+    pub fn try_set_mode(
+        &self,
+        mode: crate::mode::DriverMode,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        match mode {
+            crate::mode::DriverMode::Replay => {
+                if self.driver_mode.get(std::sync::atomic::Ordering::Acquire).is_replay() {
+                    return Ok(());
+                }
+
+                match self.runtime_phase() {
+                    RuntimePhase::Running => {},
+                    RuntimePhase::FaultLatched => return Err(DriverError::ControlPathClosed),
+                    RuntimePhase::Stopping => return Err(DriverError::ChannelClosed),
+                }
+
+                self.normal_send_gate.pause_for_replay();
+                let deadline = Instant::now() + timeout;
+
+                while self.normal_send_gate.inflight_normal_sends() > 0 {
+                    if !self.tx_thread_alive() {
+                        self.normal_send_gate.resume_from_replay();
+                        return Err(DriverError::ChannelClosed);
+                    }
+                    if Instant::now() >= deadline {
+                        self.latch_fault_with_kind(RuntimeFaultKind::TransportError);
+                        return Err(DriverError::Timeout);
+                    }
+                    spin_sleep::sleep(Duration::from_micros(50));
+                }
+
+                if !self.tx_thread_alive() {
+                    self.normal_send_gate.resume_from_replay();
+                    return Err(DriverError::ChannelClosed);
+                }
+
+                match self.runtime_phase() {
+                    RuntimePhase::Running => {
+                        self.driver_mode.set(mode, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    },
+                    RuntimePhase::FaultLatched => Err(DriverError::ControlPathClosed),
+                    RuntimePhase::Stopping => Err(DriverError::ChannelClosed),
+                }
+            },
+            crate::mode::DriverMode::Normal => {
+                self.driver_mode.set(mode, std::sync::atomic::Ordering::Release);
+                self.normal_send_gate.resume_from_replay();
+                Ok(())
+            },
+        }
+    }
+
     /// 设置 Driver 模式
     ///
     /// # 参数
@@ -2331,20 +2401,10 @@ impl Piper {
     /// # }
     /// ```
     pub fn set_mode(&self, mode: crate::mode::DriverMode) {
-        match mode {
-            crate::mode::DriverMode::Replay => {
-                self.normal_send_gate.pause_for_replay();
-                while self.normal_send_gate.inflight_normal_sends() > 0 && self.tx_thread_alive() {
-                    spin_sleep::sleep(Duration::from_micros(50));
-                }
-                self.driver_mode.set(mode, std::sync::atomic::Ordering::Release);
-            },
-            crate::mode::DriverMode::Normal => {
-                self.driver_mode.set(mode, std::sync::atomic::Ordering::Release);
-                self.normal_send_gate.resume_from_replay();
-            },
+        match self.try_set_mode(mode, DEFAULT_MODE_SWITCH_TIMEOUT) {
+            Ok(()) => tracing::info!("Driver mode set to: {:?}", mode),
+            Err(error) => tracing::error!("Failed to set driver mode to {:?}: {}", mode, error),
         }
-        tracing::info!("Driver mode set to: {:?}", mode);
     }
 
     /// 发送控制帧（阻塞，带超时）
@@ -3024,6 +3084,24 @@ mod tests {
         }
     }
 
+    fn install_tx_loop_barrier() -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        crate::pipeline::install_tx_loop_dispatch_barrier(reached_tx, release_rx);
+        (reached_rx, release_tx)
+    }
+
+    fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool, message: &str) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("{message}");
+    }
+
     struct BootstrappedMockRxAdapter {
         bootstrap: Option<PiperFrame>,
     }
@@ -3642,6 +3720,184 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_reliable_uses_current_mode_after_try_set_mode_replay_returns() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let replay_frame = PiperFrame::new_standard(0x155, &[0xA5]);
+        let (reached_rx, release_tx) = install_tx_loop_barrier();
+
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("TX loop should hit dispatch barrier");
+
+        piper
+            .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+            .expect("Replay barrier should succeed");
+        piper
+            .send_replay_frame(replay_frame)
+            .expect("replay frame should enqueue while Replay mode is active");
+
+        let _ = release_tx.send(());
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "replay frame should be sent after Replay mode switch",
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[replay_frame]);
+    }
+
+    #[test]
+    fn test_realtime_uses_current_mode_after_try_set_mode_normal_returns() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let realtime_frame = PiperFrame::new_standard(0x156, &[0xB6]);
+        let (reached_rx, release_tx) = install_tx_loop_barrier();
+
+        piper
+            .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+            .expect("entering Replay should succeed");
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("TX loop should hit dispatch barrier");
+
+        piper
+            .try_set_mode(crate::mode::DriverMode::Normal, Duration::from_millis(100))
+            .expect("returning to Normal should succeed");
+        piper
+            .send_realtime(realtime_frame)
+            .expect("realtime frame should enqueue after returning to Normal");
+
+        let _ = release_tx.send(());
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "realtime frame should be sent after returning to Normal mode",
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[realtime_frame]);
+    }
+
+    #[test]
+    fn test_standard_reliable_uses_current_mode_after_try_set_mode_normal_returns() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let reliable_frame = PiperFrame::new_standard(0x157, &[0xC7]);
+        let (reached_rx, release_tx) = install_tx_loop_barrier();
+
+        piper
+            .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+            .expect("entering Replay should succeed");
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("TX loop should hit dispatch barrier");
+
+        piper
+            .try_set_mode(crate::mode::DriverMode::Normal, Duration::from_millis(100))
+            .expect("returning to Normal should succeed");
+        piper
+            .send_frame(reliable_frame)
+            .expect("standard reliable frame should enqueue after returning to Normal");
+
+        let _ = release_tx.send(());
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "standard reliable frame should be sent after returning to Normal mode",
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[reliable_frame]);
+    }
+
+    #[test]
+    fn test_maintenance_uses_current_mode_after_try_set_mode_normal_returns() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let session_key = 99;
+        let maintenance_frame = PiperFrame::new_standard(0x158, &[0xD8]);
+
+        piper.ctx.connection_monitor.register_feedback();
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        let lease_epoch = match piper
+            .acquire_maintenance_lease_gate(9, session_key, Duration::from_millis(10))
+            .expect("maintenance acquire should succeed")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected maintenance acquire result: {other:?}"),
+        };
+
+        piper
+            .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+            .expect("entering Replay should succeed");
+        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("TX loop should hit dispatch barrier");
+
+        piper
+            .try_set_mode(crate::mode::DriverMode::Normal, Duration::from_millis(100))
+            .expect("returning to Normal should succeed");
+
+        let piper_send = Arc::clone(&piper);
+        let send_handle = std::thread::spawn(move || {
+            piper_send.send_maintenance_frame_confirmed(
+                9,
+                session_key,
+                lease_epoch,
+                maintenance_frame,
+                Duration::from_millis(200),
+            )
+        });
+
+        wait_until(
+            Duration::from_millis(200),
+            || piper.get_metrics().tx_reliable_enqueued_total >= 1,
+            "maintenance frame should enqueue while the TX loop is paused at the barrier",
+        );
+        let _ = release_tx.send(());
+        send_handle
+            .join()
+            .expect("maintenance send thread should finish")
+            .expect("maintenance frame should not be rejected by stale Replay mode snapshot");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[maintenance_frame]);
+    }
+
+    #[test]
     fn test_reliable_command_enqueued_before_replay_mode_is_rejected_at_send_point() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let (started_tx, started_rx) = mpsc::channel();
@@ -3806,6 +4062,110 @@ mod tests {
         );
         let metrics = piper.get_metrics();
         assert_eq!(metrics.tx_packages_partial_total, 1);
+    }
+
+    #[test]
+    fn test_try_set_mode_replay_times_out_and_latches_transport_fault() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            BlockingFirstSendTxAdapter {
+                sent_frames: sent_frames.clone(),
+                started_tx,
+                release_rx,
+                sends: 0,
+            },
+            None,
+        )
+        .unwrap();
+        let first = PiperFrame::new_standard(0x301, &[0x01]);
+
+        piper.send_frame(first).expect("first reliable frame should queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first reliable frame should begin sending");
+
+        let start = Instant::now();
+
+        let error = piper
+            .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(50))
+            .expect_err("Replay barrier should time out while a normal send is stuck");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(error, DriverError::Timeout));
+        assert!(elapsed >= Duration::from_millis(45));
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert!(matches!(
+            piper.send_frame(PiperFrame::new_standard(0x302, &[0x02])),
+            Err(DriverError::ControlPathClosed)
+        ));
+
+        let _ = release_tx.send(());
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "in-flight frame should finish after releasing the blocked adapter",
+        );
+    }
+
+    #[test]
+    fn test_set_mode_replay_wrapper_is_bounded_and_latches_fault_on_timeout() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let first = PiperFrame::new_standard(0x311, &[0x01]);
+
+        piper.send_frame(first).expect("first reliable frame should queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first reliable frame should begin sending");
+
+        let piper_mode = Arc::clone(&piper);
+        let handle = std::thread::spawn(move || {
+            let started_at = Instant::now();
+            piper_mode.set_mode(crate::mode::DriverMode::Replay);
+            started_at.elapsed()
+        });
+
+        wait_until(
+            Duration::from_millis(250),
+            || handle.is_finished(),
+            "set_mode wrapper should not block indefinitely while waiting for Replay barrier",
+        );
+        let elapsed = handle.join().expect("mode switch thread should finish");
+
+        assert!(elapsed >= Duration::from_millis(90));
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert!(matches!(
+            piper.send_frame(PiperFrame::new_standard(0x312, &[0x02])),
+            Err(DriverError::ControlPathClosed)
+        ));
+
+        let _ = release_tx.send(());
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "in-flight frame should finish after releasing the blocked adapter",
+        );
     }
 
     #[test]

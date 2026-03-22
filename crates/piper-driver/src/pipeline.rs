@@ -30,6 +30,49 @@ use spin_sleep;
 
 const STRICT_GROUP_MAX_SPAN_US: u64 = 2_000;
 
+#[cfg(test)]
+#[derive(Debug)]
+struct TxLoopDispatchBarrier {
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static TX_LOOP_DISPATCH_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<TxLoopDispatchBarrier>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn tx_loop_dispatch_barrier_slot() -> &'static std::sync::Mutex<Option<TxLoopDispatchBarrier>> {
+    TX_LOOP_DISPATCH_BARRIER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_tx_loop_dispatch_barrier(
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+) {
+    let mut guard = tx_loop_dispatch_barrier_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(TxLoopDispatchBarrier {
+        reached_tx,
+        release_rx,
+    });
+}
+
+#[cfg(test)]
+fn maybe_wait_tx_loop_dispatch_barrier() {
+    let barrier = tx_loop_dispatch_barrier_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(barrier) = barrier {
+        let _ = barrier.reached_tx.send(());
+        let _ = barrier.release_rx.recv();
+    }
+}
+
 #[inline]
 fn host_rx_mono_us() -> u64 {
     monotonic_micros()
@@ -1062,7 +1105,11 @@ pub fn tx_loop_mailbox(
 
     loop {
         let phase = load_runtime_phase(&runtime_phase);
-        let mode = driver_mode.get(Ordering::Acquire);
+        #[cfg(test)]
+        {
+            let _ = driver_mode.get(Ordering::Acquire);
+            maybe_wait_tx_loop_dispatch_barrier();
+        }
         if phase == RuntimePhase::Stopping || !workers_running.load(Ordering::Acquire) {
             trace!("TX thread: stopping runtime, exiting");
             break;
@@ -1093,7 +1140,7 @@ pub fn tx_loop_mailbox(
         ));
 
         if let Some(dispatch) = pending_maintenance_sends.pop_front() {
-            if mode.is_replay() {
+            if driver_mode.get(Ordering::Acquire).is_replay() {
                 finish_maintenance_dispatch(&dispatch, Err(crate::DriverError::ReplayModeActive));
                 continue;
             }
@@ -1191,7 +1238,7 @@ pub fn tx_loop_mailbox(
             continue;
         }
 
-        if mode.is_replay() {
+        if driver_mode.get(Ordering::Acquire).is_replay() {
             reject_replay_mode_dispatches(&realtime_slot, &soft_realtime_rx, &metrics);
         }
 
@@ -1443,8 +1490,9 @@ pub fn tx_loop_mailbox(
             let package_command = total_frames > 1;
             let (frames, mut ack, kind, maintenance, deadline) = command.into_parts();
             debug_assert!(maintenance.is_none());
+            let current_mode = driver_mode.get(Ordering::Acquire);
 
-            if mode.is_replay() && kind != crate::command::ReliableCommandKind::Replay {
+            if current_mode.is_replay() && kind != crate::command::ReliableCommandKind::Replay {
                 if let Some(ack) = ack.take() {
                     let _ = ack.send(crate::command::DeliveryPhase::Finished(Err(
                         crate::DriverError::ReplayModeActive,
@@ -1453,7 +1501,7 @@ pub fn tx_loop_mailbox(
                 continue;
             }
 
-            if mode.is_normal() && kind == crate::command::ReliableCommandKind::Replay {
+            if current_mode.is_normal() && kind == crate::command::ReliableCommandKind::Replay {
                 if let Some(ack) = ack.take() {
                     let _ = ack.send(crate::command::DeliveryPhase::Finished(Err(
                         crate::DriverError::InvalidInput(

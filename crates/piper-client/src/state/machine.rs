@@ -1187,9 +1187,11 @@ where
         Capability: MotionCapability,
     {
         use piper_driver::mode::DriverMode;
+        use std::time::Duration;
+        const REPLAY_MODE_SWITCH_TIMEOUT: Duration = Duration::from_millis(100);
 
         // 切换 Driver 到 Replay 模式
-        self.driver.set_mode(DriverMode::Replay);
+        self.driver.try_set_mode(DriverMode::Replay, REPLAY_MODE_SWITCH_TIMEOUT)?;
 
         tracing::info!("Entered ReplayMode - TX thread periodic sending paused");
 
@@ -2451,6 +2453,35 @@ where
         })
     }
 
+    fn replay_cancel_requested(cancel_signal: &std::sync::atomic::AtomicBool) -> bool {
+        !cancel_signal.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn wait_replay_delay_or_cancel(
+        delay: std::time::Duration,
+        cancel_signal: &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        use std::thread;
+        use std::time::Duration;
+
+        const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+        if Self::replay_cancel_requested(cancel_signal) {
+            return false;
+        }
+
+        let wait_started_at = std::time::Instant::now();
+        while wait_started_at.elapsed() < delay {
+            let remaining = delay.saturating_sub(wait_started_at.elapsed());
+            thread::sleep(remaining.min(CANCEL_POLL_INTERVAL));
+            if Self::replay_cancel_requested(cancel_signal) {
+                return false;
+            }
+        }
+
+        true
+    }
+
     fn exit_replay_mode_to_standby(self) -> Piper<Standby, Capability> {
         use piper_driver::mode::DriverMode;
 
@@ -2680,7 +2711,6 @@ where
         cancel_signal: &std::sync::atomic::AtomicBool,
     ) -> Result<Piper<Standby, Capability>> {
         use piper_tools::PiperRecording;
-        use std::thread;
         use std::time::Duration;
         const REPLAY_FRAME_COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -2743,7 +2773,7 @@ where
 
         for frame in recording.frames {
             // ✅ 每一帧都检查取消信号
-            if !cancel_signal.load(std::sync::atomic::Ordering::Relaxed) {
+            if Self::replay_cancel_requested(cancel_signal) {
                 tracing::warn!("Replay cancelled by user signal");
                 return Ok(self.exit_replay_mode_to_standby());
             }
@@ -2763,7 +2793,15 @@ where
             // 等待适当的延迟
             if delay_us > 0 {
                 let delay = Duration::from_micros(delay_us);
-                thread::sleep(delay);
+                if !Self::wait_replay_delay_or_cancel(delay, cancel_signal) {
+                    tracing::warn!("Replay cancelled by user signal");
+                    return Ok(self.exit_replay_mode_to_standby());
+                }
+            }
+
+            if Self::replay_cancel_requested(cancel_signal) {
+                tracing::warn!("Replay cancelled by user signal");
+                return Ok(self.exit_replay_mode_to_standby());
             }
 
             // 发送帧
@@ -3093,6 +3131,17 @@ mod tests {
         ));
         recording.save(&path).expect("test recording should be written successfully");
         path
+    }
+
+    fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool, message: &str) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("{message}");
     }
 
     fn build_active_mit_piper(
@@ -3761,6 +3810,62 @@ mod tests {
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "cancelled replay before first frame must not emit any frame"
         );
+        drop(standby);
+        let _ = std::fs::remove_file(recording_path);
+    }
+
+    #[test]
+    fn replay_recording_with_cancel_stops_before_next_frame_after_inter_frame_cancel() {
+        use piper_driver::mode::DriverMode;
+        use std::sync::atomic::AtomicBool;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let recording_path =
+            write_test_recording(&[(1_000, 0x155, &[0x01]), (101_000, 0x156, &[0x02])]);
+        let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+        let driver = replay.driver.clone();
+        let cancel_signal = Arc::new(AtomicBool::new(true));
+        let cancel_signal_worker = Arc::clone(&cancel_signal);
+        let recording_path_worker = recording_path.clone();
+
+        let handle = thread::spawn(move || {
+            replay.replay_recording_with_cancel(
+                &recording_path_worker,
+                1.0,
+                cancel_signal_worker.as_ref(),
+            )
+        });
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "first replay frame should be emitted before cancellation",
+        );
+        cancel_signal.store(false, std::sync::atomic::Ordering::Release);
+
+        let standby = handle
+            .join()
+            .expect("replay worker should finish")
+            .expect("cancelled replay should return Standby");
+
+        assert_eq!(
+            driver.mode(),
+            DriverMode::Normal,
+            "cancelled replay must restore driver mode to Normal"
+        );
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.len(),
+            1,
+            "cancel observed during inter-frame wait must prevent the next replay frame"
+        );
+        assert_eq!(sent[0].id, 0x155);
+        assert_eq!(sent[0].len, 1);
+        assert_eq!(sent[0].data[0], 0x01);
+        assert_eq!(sent[0].timestamp_us, 1_000);
+
         drop(standby);
         let _ = std::fs::remove_file(recording_path);
     }
