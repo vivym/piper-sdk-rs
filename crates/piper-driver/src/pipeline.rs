@@ -1641,9 +1641,7 @@ pub fn tx_loop_mailbox(
                     count_package_fault_aborted(&metrics);
                 } else if send_succeeded {
                     count_package_completed(&metrics);
-                } else if replay_paused_partial {
-                    count_package_partial(&metrics);
-                } else if deadline_missed && sent_count > 0 {
+                } else if replay_paused_partial || (deadline_missed && sent_count > 0) {
                     count_package_partial(&metrics);
                 }
             }

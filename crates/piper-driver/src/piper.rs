@@ -348,6 +348,12 @@ impl NormalSendGate {
     }
 }
 
+impl Default for NormalSendGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for NormalSendPermit<'_> {
     fn drop(&mut self) {
         self.gate.inflight_normal_sends.fetch_sub(1, Ordering::AcqRel);
