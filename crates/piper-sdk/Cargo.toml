@@ -19,8 +19,10 @@ piper-driver = { workspace = true }
 piper-can = { workspace = true }
 piper-protocol = { workspace = true }
 # ✅ 日志初始化宏支持
+log = "0.4"
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 crossbeam-channel = { workspace = true }
@@ -29,7 +31,6 @@ clap = { workspace = true }
 proptest = { workspace = true }
 ctrlc = { workspace = true }
 rand = { workspace = true }
-log = "0.4"
 # For examples and tests (platform-specific)
 libc = { workspace = true }
 rusb = { workspace = true }

@@ -143,11 +143,12 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 ///
 /// ## 功能
 ///
-/// - 兼容 `log` crate（通过 `tracing_subscriber` 的内建桥接）
+/// - 兼容 `log` crate（通过 `tracing_log::LogTracer` 桥接）
 /// - 幂等：可安全重复调用
-/// - 如果宿主程序已安装全局日志系统，会静默跳过而不是 panic
+/// - 如果宿主程序已安装 `tracing` subscriber 或 `log` logger，会静默跳过
 /// - 默认级别：`INFO`
 /// - 格式：compact，隐藏 target（易读）
+/// - 如果设置了 `RUST_LOG`，仅在 SDK 实际接管日志初始化时生效
 ///
 /// ## 使用示例
 ///
@@ -167,19 +168,52 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 ///     Ok(())
 /// }
 /// ```
+#[doc(hidden)]
+pub fn __init_logger() {
+    // 保守策略：只有在 SDK 同时接管 tracing + log 全局状态时，才安装 stdout subscriber。
+    // 如果宿主已拥有任一日志栈，直接 no-op，避免半初始化把同步 I/O 带回实时进程。
+    if ::tracing::dispatcher::has_been_set() {
+        return;
+    }
+    if ::log::max_level() != ::log::LevelFilter::Off {
+        return;
+    }
+
+    let has_rust_log = ::std::env::var_os("RUST_LOG").is_some();
+    let bridge_max_level = if has_rust_log {
+        ::log::LevelFilter::Trace
+    } else {
+        ::log::LevelFilter::Info
+    };
+
+    if ::tracing_log::LogTracer::builder()
+        .with_max_level(bridge_max_level)
+        .init()
+        .is_err()
+    {
+        return;
+    }
+
+    if has_rust_log {
+        let subscriber = ::tracing_subscriber::fmt()
+            .with_env_filter(::tracing_subscriber::EnvFilter::from_default_env())
+            .with_target(false)
+            .compact()
+            .finish();
+        let _ = ::tracing::subscriber::set_global_default(subscriber);
+    } else {
+        let subscriber = ::tracing_subscriber::fmt()
+            .with_max_level(::tracing::Level::INFO)
+            .with_target(false)
+            .compact()
+            .finish();
+        let _ = ::tracing::subscriber::set_global_default(subscriber);
+    }
+}
+
 #[macro_export]
 macro_rules! init_logger {
     () => {
-        // 使用默认配置，保持现有初始化分支。
-        // 如果全局 subscriber/logger 已存在，则静默跳过。
-        if ::std::env::var("RUST_LOG").is_ok() {
-            let _ = ::tracing_subscriber::fmt().with_target(false).compact().try_init();
-        } else {
-            let _ = ::tracing_subscriber::fmt()
-                .with_max_level(::tracing::Level::INFO)
-                .with_target(false)
-                .compact()
-                .try_init();
-        }
+        $crate::__init_logger();
     };
 }
