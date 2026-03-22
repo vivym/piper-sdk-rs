@@ -6,8 +6,8 @@ use crate::heartbeat::monotonic_micros;
 use crate::metrics::PiperMetrics;
 use crate::piper::{
     MaintenanceControlOp, MaintenanceGate, MaintenanceGateState, MaintenanceLaneCommand,
-    MaintenanceLeaseSnapshot, NORMAL_FRAME_SEND_BUDGET, NormalSendGate, RuntimeFaultKind,
-    RuntimePhase, SOFT_CONTROL_SEND_BUDGET, SOFT_CONTROL_SEND_MIN_DEADLINE,
+    MaintenanceLeaseSnapshot, MaintenanceSendPhase, NORMAL_FRAME_SEND_BUDGET, NormalSendGate,
+    RuntimeFaultKind, RuntimePhase, SOFT_CONTROL_SEND_BUDGET, SOFT_CONTROL_SEND_MIN_DEADLINE,
     SOFT_DEADLINE_MISS_FAULT_THRESHOLD, ShutdownDispatch, ShutdownLane,
 };
 use crate::state::*;
@@ -219,7 +219,7 @@ struct MaintenanceLaneDispatch {
     frame: PiperFrame,
     meta: crate::command::MaintenanceCommandMeta,
     deadline: Instant,
-    ack: crossbeam_channel::Sender<Result<(), crate::DriverError>>,
+    ack: crossbeam_channel::Sender<MaintenanceSendPhase>,
 }
 
 fn drain_maintenance_lane(
@@ -275,6 +275,17 @@ fn maintenance_send_denial(
         ));
     }
     None
+}
+
+fn maintenance_dispatch_committed(dispatch: &MaintenanceLaneDispatch) {
+    let _ = dispatch.ack.send(MaintenanceSendPhase::Committed);
+}
+
+fn finish_maintenance_dispatch(
+    dispatch: &MaintenanceLaneDispatch,
+    result: Result<(), crate::DriverError>,
+) {
+    let _ = dispatch.ack.send(MaintenanceSendPhase::Finished(result));
 }
 
 fn refresh_local_maintenance_tx_state(
@@ -995,16 +1006,22 @@ pub fn tx_loop_mailbox(
         if let Some(dispatch) = pending_maintenance_sends.pop_front() {
             let Some(permit) = normal_send_gate.acquire() else {
                 count_fault_abort(&metrics);
-                let _ = dispatch.ack.send(Err(reliable_abort_error(
-                    load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
-                )));
+                finish_maintenance_dispatch(
+                    &dispatch,
+                    Err(reliable_abort_error(
+                        load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
+                    )),
+                );
                 continue;
             };
             if !permit.still_open() {
                 count_fault_abort(&metrics);
-                let _ = dispatch.ack.send(Err(reliable_abort_error(
-                    load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
-                )));
+                finish_maintenance_dispatch(
+                    &dispatch,
+                    Err(reliable_abort_error(
+                        load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
+                    )),
+                );
                 continue;
             }
 
@@ -1015,6 +1032,7 @@ pub fn tx_loop_mailbox(
             {
                 Err(denied)
             } else {
+                maintenance_dispatch_committed(&dispatch);
                 match tx.send_control(dispatch.frame, normal_send_budget) {
                     Ok(_) => {
                         soft_deadline_miss_streak = 0;
@@ -1069,7 +1087,7 @@ pub fn tx_loop_mailbox(
                 Err(crate::DriverError::ReliableDeliveryFailed { .. })
                     | Err(crate::DriverError::ChannelClosed)
             );
-            let _ = dispatch.ack.send(send_result);
+            finish_maintenance_dispatch(&dispatch, send_result);
             if should_break {
                 break;
             }

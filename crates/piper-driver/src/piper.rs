@@ -159,6 +159,22 @@ where
     }
 }
 
+fn wait_for_maintenance_send_result(
+    ack_rx: Receiver<MaintenanceSendPhase>,
+    deadline: Instant,
+) -> Result<(), DriverError> {
+    match recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)? {
+        MaintenanceSendPhase::Finished(result) => result,
+        MaintenanceSendPhase::Committed => loop {
+            match ack_rx.recv() {
+                Ok(MaintenanceSendPhase::Finished(result)) => return result,
+                Ok(MaintenanceSendPhase::Committed) => continue,
+                Err(_) => return Err(DriverError::ChannelClosed),
+            }
+        },
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct NormalSendGate {
@@ -300,6 +316,13 @@ pub enum MaintenanceControlOp {
 
 #[doc(hidden)]
 #[derive(Debug)]
+pub enum MaintenanceSendPhase {
+    Committed,
+    Finished(Result<(), DriverError>),
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
 pub enum MaintenanceLaneCommand {
     Control {
         op: MaintenanceControlOp,
@@ -309,7 +332,7 @@ pub enum MaintenanceLaneCommand {
         frame: PiperFrame,
         meta: MaintenanceCommandMeta,
         deadline: Instant,
-        ack: Sender<Result<(), DriverError>>,
+        ack: Sender<MaintenanceSendPhase>,
     },
 }
 
@@ -333,7 +356,7 @@ impl MaintenanceLaneCommand {
         frame: PiperFrame,
         meta: MaintenanceCommandMeta,
         deadline: Instant,
-        ack: Sender<Result<(), DriverError>>,
+        ack: Sender<MaintenanceSendPhase>,
     ) -> Self {
         Self::Send {
             frame,
@@ -2435,6 +2458,10 @@ impl Piper {
     }
 
     /// 发送维护帧并等待 TX 线程在实际发送点完成最终运行时准入判定。
+    ///
+    /// `timeout` 只约束此帧能否在 deadline 前进入 TX commit point。
+    /// 一旦 TX 线程在 deadline 前进入 `tx.send_control(...)`，调用方将继续等待真实发送结果，
+    /// 即使该结果返回时间晚于最初的 `timeout`。
     #[doc(hidden)]
     pub fn send_maintenance_frame_confirmed(
         &self,
@@ -2452,7 +2479,7 @@ impl Piper {
         }
 
         let deadline = Instant::now() + timeout;
-        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
         self.maintenance_lane_tx
             .send(MaintenanceLaneCommand::send(
                 frame,
@@ -2463,7 +2490,7 @@ impl Piper {
             .map_err(|_| DriverError::ChannelClosed)?;
         self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
 
-        recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)?
+        wait_for_maintenance_send_result(ack_rx, deadline)
     }
 
     #[doc(hidden)]
@@ -2864,7 +2891,9 @@ mod tests {
                         }
                     },
                     MaintenanceLaneCommand::Send { ack, .. } => {
-                        let _ = ack.send(Err(DriverError::ChannelClosed));
+                        let _ = ack.send(MaintenanceSendPhase::Finished(Err(
+                            DriverError::ChannelClosed,
+                        )));
                     },
                 }
             }
@@ -2887,7 +2916,9 @@ mod tests {
                         }
                     },
                     MaintenanceLaneCommand::Send { ack, .. } => {
-                        let _ = ack.send(Err(DriverError::ChannelClosed));
+                        let _ = ack.send(MaintenanceSendPhase::Finished(Err(
+                            DriverError::ChannelClosed,
+                        )));
                     },
                 }
             }
@@ -2918,7 +2949,9 @@ mod tests {
                         }
                     },
                     MaintenanceLaneCommand::Send { ack, .. } => {
-                        let _ = ack.send(Err(DriverError::ChannelClosed));
+                        let _ = ack.send(MaintenanceSendPhase::Finished(Err(
+                            DriverError::ChannelClosed,
+                        )));
                     },
                 }
             }
@@ -4167,6 +4200,64 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[blocking_frame]);
+    }
+
+    #[test]
+    fn test_maintenance_send_returns_real_result_after_commit_point_crosses_deadline() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let session_key = 98;
+        piper.ctx.connection_monitor.register_feedback();
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        let lease_epoch = match piper
+            .acquire_maintenance_lease_gate(9, session_key, Duration::from_millis(10))
+            .expect("maintenance acquire should reach TX control lane")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected maintenance acquire result: {other:?}"),
+        };
+
+        let frame = PiperFrame::new_standard(0x213, &[0x03]);
+        let piper_send = Arc::clone(&piper);
+        let send_handle = std::thread::spawn(move || {
+            piper_send.send_maintenance_frame_confirmed(
+                9,
+                session_key,
+                lease_epoch,
+                frame,
+                Duration::from_millis(20),
+            )
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("maintenance frame should enter tx.send_control before deadline");
+
+        std::thread::sleep(Duration::from_millis(40));
+        let _ = release_tx.send(());
+
+        send_handle
+            .join()
+            .expect("maintenance sender should finish after delayed adapter release")
+            .expect("send that crossed commit point before deadline must return real result");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[frame]);
     }
 
     #[test]
