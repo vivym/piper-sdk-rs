@@ -1723,12 +1723,8 @@ mod tests {
         T: RealtimeTxAdapter + Send + 'static,
     {
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(
-                rx_adapter,
-                tx_adapter,
-                None,
-            )
-            .expect("driver should start"),
+            RobotPiper::new_dual_thread_parts(rx_adapter, tx_adapter, None)
+                .expect("driver should start"),
         );
         let observer = Observer::<StrictRealtime>::new(driver.clone());
         driver

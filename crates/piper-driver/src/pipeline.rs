@@ -14,9 +14,7 @@ use crate::state::*;
 use crossbeam_channel::Receiver;
 #[cfg(test)]
 use piper_can::CanAdapter;
-use piper_can::{
-    BackendCapability, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
-};
+use piper_can::{BackendCapability, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_protocol::config::*;
 use piper_protocol::feedback::*;
 use piper_protocol::ids::*;
@@ -76,9 +74,7 @@ fn record_soft_deadline_miss(
 ) {
     metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
     if *soft_deadline_miss_streak > 0 {
-        metrics
-            .tx_soft_consecutive_deadline_miss_total
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.tx_soft_consecutive_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
     }
     *soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
     if *soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {

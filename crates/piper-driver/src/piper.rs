@@ -1907,8 +1907,7 @@ impl Piper {
     pub fn send_realtime(&self, frame: PiperFrame) -> Result<(), DriverError> {
         if !self.backend_capability.is_strict_realtime() {
             return Err(DriverError::InvalidInput(
-                "strict realtime delivery is only available on StrictRealtime backends"
-                    .to_string(),
+                "strict realtime delivery is only available on StrictRealtime backends".to_string(),
             ));
         }
         self.send_realtime_command(RealtimeCommand::single(frame))
@@ -2920,12 +2919,9 @@ mod tests {
 
     #[test]
     fn test_soft_realtime_deadline_miss_streak_counts_per_command_package() {
-        let piper = Piper::new_dual_thread_parts(
-            SoftRxAdapter,
-            PartialTimeoutTxAdapter { sends: 0 },
-            None,
-        )
-        .unwrap();
+        let piper =
+            Piper::new_dual_thread_parts(SoftRxAdapter, PartialTimeoutTxAdapter { sends: 0 }, None)
+                .unwrap();
         let frames = [
             PiperFrame::new_standard(0x155, &[0x01]),
             PiperFrame::new_standard(0x156, &[0x02]),
@@ -3130,12 +3126,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_shutdown_channel_closed_when_tx_thread_exits() {
-        let piper = Piper::new_dual_thread_parts(
-            MockRxAdapter,
-            MockTxAdapter,
-            None,
-        )
-        .unwrap();
+        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
         piper.request_stop();
         let deadline = Instant::now() + Duration::from_millis(100);
         while piper.tx_thread_alive() && Instant::now() < deadline {
@@ -3218,12 +3209,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_receipt_returns_ready_ack_even_after_deadline_passes() {
-        let piper = Piper::new_dual_thread_parts(
-            MockRxAdapter,
-            MockTxAdapter,
-            None,
-        )
-        .unwrap();
+        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
         let receipt = piper
             .enqueue_shutdown(
                 PiperFrame::new_standard(0x471, &[0x01]),

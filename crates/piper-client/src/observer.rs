@@ -970,12 +970,8 @@ mod tests {
         frames: Vec<PiperFrame>,
     ) -> (Arc<RobotPiper>, Observer<StrictRealtime>) {
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(
-                ScriptedRxAdapter::new(frames),
-                IdleTxAdapter,
-                None,
-            )
-            .expect("driver should start"),
+            RobotPiper::new_dual_thread_parts(ScriptedRxAdapter::new(frames), IdleTxAdapter, None)
+                .expect("driver should start"),
         );
         let observer = Observer::<StrictRealtime>::new(driver.clone());
         (driver, observer)
@@ -985,12 +981,8 @@ mod tests {
         frames: Vec<TimedFrame>,
     ) -> (Arc<RobotPiper>, Observer<StrictRealtime>) {
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(
-                PacedRxAdapter::new(frames),
-                IdleTxAdapter,
-                None,
-            )
-            .expect("driver should start"),
+            RobotPiper::new_dual_thread_parts(PacedRxAdapter::new(frames), IdleTxAdapter, None)
+                .expect("driver should start"),
         );
         let observer = Observer::<StrictRealtime>::new(driver.clone());
         (driver, observer)

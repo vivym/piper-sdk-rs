@@ -9,9 +9,7 @@ use crate::piper::Piper;
 use piper_can::SocketCanAdapter;
 use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_can::gs_usb::device::GsUsbDeviceSelector;
-use piper_can::{
-    CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter,
-};
+use piper_can::{CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter};
 use std::time::Duration;
 
 /// 类型化的连接目标。
@@ -241,13 +239,9 @@ impl PiperBuilder {
             )?,
         };
 
-        Piper::new_dual_thread_parts(
-            backend.rx,
-            backend.tx,
-            Some(self.pipeline_config),
-        )
-        .map(|piper| piper.with_metadata(backend.interface, backend.bus_speed))
-        .map_err(DriverError::Can)
+        Piper::new_dual_thread_parts(backend.rx, backend.tx, Some(self.pipeline_config))
+            .map(|piper| piper.with_metadata(backend.interface, backend.bus_speed))
+            .map_err(DriverError::Can)
     }
 
     fn build_auto_strict(
@@ -345,12 +339,7 @@ mod tests {
         fn backend(&self, label: impl Into<String>, bus_speed: u32) -> BuiltBackend {
             let label = label.into();
             self.calls.lock().unwrap().push(label.clone());
-            BuiltBackend::new(
-                TestRxAdapter,
-                TestTxAdapter,
-                label,
-                bus_speed,
-            )
+            BuiltBackend::new(TestRxAdapter, TestTxAdapter, label, bus_speed)
         }
     }
 

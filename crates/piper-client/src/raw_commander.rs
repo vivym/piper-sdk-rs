@@ -98,10 +98,7 @@ impl<'a> RawCommander<'a> {
     ///
     /// - `positions`: 各关节目标位置（弧度）
     /// - `strategy`: 发送策略（默认使用 Auto，即可靠模式）
-    pub(crate) fn send_position_command_batch(
-        &self,
-        positions: &JointArray<Rad>,
-    ) -> Result<()> {
+    pub(crate) fn send_position_command_batch(&self, positions: &JointArray<Rad>) -> Result<()> {
         use piper_protocol::control::{JointControl12, JointControl34, JointControl56};
 
         // 准备所有关节的角度（度）
@@ -449,12 +446,8 @@ mod tests {
     }
 
     fn build_driver(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> RobotPiper {
-        RobotPiper::new_dual_thread_parts(
-            IdleRxAdapter,
-            RecordingTxAdapter::new(sent_frames),
-            None,
-        )
-        .expect("driver should start")
+        RobotPiper::new_dual_thread_parts(IdleRxAdapter, RecordingTxAdapter::new(sent_frames), None)
+            .expect("driver should start")
     }
 
     fn wait_for_sent_frames(

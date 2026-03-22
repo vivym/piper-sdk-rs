@@ -16,9 +16,7 @@ use crate::{
     raw_commander::RawCommander,
 };
 use piper_driver::BackendCapability;
-use piper_protocol::control::{
-    InstallPosition, MitControlCommand, MitMode as ProtocolMitMode,
-};
+use piper_protocol::control::{InstallPosition, MitControlCommand, MitMode as ProtocolMitMode};
 use piper_protocol::feedback::{ControlMode, MoveMode};
 use tracing::{debug, info, trace};
 
@@ -881,7 +879,8 @@ where
 
             let current = self.driver.get_robot_control();
             let mode_echo = self.driver.get_control_mode_echo();
-            let is_robot_state_fresh = current.hardware_timestamp_us > baseline.hardware_timestamp_us
+            let is_robot_state_fresh = current.hardware_timestamp_us
+                > baseline.hardware_timestamp_us
                 || current.host_rx_mono_us > baseline.host_rx_mono_us;
             let is_robot_state_match = current.is_enabled
                 && current.control_mode == expected.control_mode
@@ -2939,7 +2938,11 @@ mod tests {
         frame
     }
 
-    fn robot_status_frame(control_mode: ControlMode, move_mode: MoveMode, timestamp_us: u64) -> PiperFrame {
+    fn robot_status_frame(
+        control_mode: ControlMode,
+        move_mode: MoveMode,
+        timestamp_us: u64,
+    ) -> PiperFrame {
         let mut frame = PiperFrame::new_standard(
             piper_protocol::ids::ID_ROBOT_STATUS as u16,
             &[
@@ -3048,11 +3051,11 @@ mod tests {
 
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
         let error = match standby.enable_mit_mode(MitModeConfig {
-                timeout: Duration::from_millis(50),
-                debounce_threshold: 1,
-                poll_interval: Duration::from_millis(1),
-                speed_percent: 100,
-            }) {
+            timeout: Duration::from_millis(50),
+            debounce_threshold: 1,
+            poll_interval: Duration::from_millis(1),
+            speed_percent: 100,
+        }) {
             Ok(_) => panic!("missing 0x151 echo must block Active<MitMode>"),
             Err(error) => error,
         };
@@ -3090,13 +3093,13 @@ mod tests {
 
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames);
         let error = match standby.enable_position_mode(PositionModeConfig {
-                timeout: Duration::from_millis(50),
-                debounce_threshold: 1,
-                poll_interval: Duration::from_millis(1),
-                speed_percent: 40,
-                install_position: InstallPosition::Horizontal,
-                motion_type: MotionType::Linear,
-            }) {
+            timeout: Duration::from_millis(50),
+            debounce_threshold: 1,
+            poll_interval: Duration::from_millis(1),
+            speed_percent: 40,
+            install_position: InstallPosition::Horizontal,
+            motion_type: MotionType::Linear,
+        }) {
             Ok(_) => panic!("mismatched 0x151 echo must reject Active<PositionMode>"),
             Err(error) => error,
         };
