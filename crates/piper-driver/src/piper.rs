@@ -273,6 +273,7 @@ pub enum MaintenanceLaneCommand {
     Send {
         frame: PiperFrame,
         meta: MaintenanceCommandMeta,
+        deadline: Instant,
         ack: Sender<Result<(), DriverError>>,
     },
 }
@@ -296,9 +297,15 @@ impl MaintenanceLaneCommand {
     fn send(
         frame: PiperFrame,
         meta: MaintenanceCommandMeta,
+        deadline: Instant,
         ack: Sender<Result<(), DriverError>>,
     ) -> Self {
-        Self::Send { frame, meta, ack }
+        Self::Send {
+            frame,
+            meta,
+            deadline,
+            ack,
+        }
     }
 }
 
@@ -443,8 +450,49 @@ impl MaintenanceGate {
         }
     }
 
-    fn wait_control_ack(ack_rx: Receiver<()>) -> Result<(), DriverError> {
-        ack_rx.recv().map_err(|_| DriverError::ChannelClosed)
+    fn wait_control_ack_until(ack_rx: Receiver<()>, deadline: Instant) -> Result<(), DriverError> {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return match ack_rx.try_recv() {
+                Ok(()) => Ok(()),
+                Err(crossbeam_channel::TryRecvError::Empty) => Err(DriverError::Timeout),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    Err(DriverError::ChannelClosed)
+                },
+            };
+        };
+        match ack_rx.recv_timeout(remaining) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(DriverError::ChannelClosed)
+            },
+        }
+    }
+
+    fn rollback_tentative_grant(
+        &self,
+        session_key: u64,
+        lease_epoch: u64,
+    ) -> Result<(), DriverError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.holder_session_key != Some(session_key) || inner.lease_epoch != lease_epoch {
+            return Ok(());
+        }
+
+        inner.holder_session_id = None;
+        inner.holder_session_key = None;
+        inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+        let rollback_epoch = inner.lease_epoch;
+        self.sync_atomics(&inner);
+        self.wait_cv.notify_all();
+        self.send_control_command_locked(
+            MaintenanceControlOp::Release {
+                session_key,
+                lease_epoch: rollback_epoch,
+            },
+            false,
+        )?;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> MaintenanceLeaseSnapshot {
@@ -579,17 +627,8 @@ impl MaintenanceGate {
                         },
                     };
                     drop(inner);
-                    if let Err(err) = Self::wait_control_ack(ack_rx) {
-                        let mut inner = self.inner.lock().unwrap();
-                        if inner.holder_session_key == Some(session_key)
-                            && inner.lease_epoch == lease_epoch
-                        {
-                            inner.holder_session_id = None;
-                            inner.holder_session_key = None;
-                            inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
-                            self.sync_atomics(&inner);
-                            self.wait_cv.notify_all();
-                        }
+                    if let Err(err) = Self::wait_control_ack_until(ack_rx, deadline) {
+                        let _ = self.rollback_tentative_grant(session_key, lease_epoch);
                         return Err(err);
                     }
                     return Ok(MaintenanceLeaseAcquireResult::Granted { lease_epoch });
@@ -609,7 +648,10 @@ impl MaintenanceGate {
                         Err(err) => return Err(err),
                     };
                     drop(inner);
-                    Self::wait_control_ack(ack_rx)?;
+                    if let Err(err) = Self::wait_control_ack_until(ack_rx, deadline) {
+                        let _ = self.rollback_tentative_grant(session_key, lease_epoch);
+                        return Err(err);
+                    }
                     return Ok(MaintenanceLeaseAcquireResult::Granted { lease_epoch });
                 },
                 _ => {
@@ -2344,23 +2386,19 @@ impl Piper {
             return Err(DriverError::ControlPathClosed);
         }
 
+        let deadline = Instant::now() + timeout;
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.maintenance_lane_tx
             .send(MaintenanceLaneCommand::send(
                 frame,
                 MaintenanceCommandMeta::new(session_id, session_key, lease_epoch),
+                deadline,
                 ack_tx,
             ))
             .map_err(|_| DriverError::ChannelClosed)?;
         self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
 
-        match ack_rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(DriverError::ChannelClosed)
-            },
-        }
+        ack_rx.recv().map_err(|_| DriverError::ChannelClosed)?
     }
 
     #[doc(hidden)]
@@ -3744,6 +3782,174 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[blocking_frame]);
+    }
+
+    #[test]
+    fn test_maintenance_send_timeout_never_later_sends_expired_frame() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let session_key = 88;
+        piper.ctx.connection_monitor.register_feedback();
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        let lease_epoch = match piper
+            .acquire_maintenance_lease_gate(8, session_key, Duration::from_millis(10))
+            .expect("maintenance acquire should reach TX control lane")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected maintenance acquire result: {other:?}"),
+        };
+
+        let blocking_frame = PiperFrame::new_standard(0x211, &[0x01]);
+        let piper_blocking = Arc::clone(&piper);
+        let blocking_handle = std::thread::spawn(move || {
+            piper_blocking.send_maintenance_frame_confirmed(
+                8,
+                session_key,
+                lease_epoch,
+                blocking_frame,
+                Duration::from_millis(500),
+            )
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first maintenance frame should begin sending");
+
+        let expired_frame = PiperFrame::new_standard(0x212, &[0x02]);
+        let piper_expired = Arc::clone(&piper);
+        let expired_handle = std::thread::spawn(move || {
+            piper_expired.send_maintenance_frame_confirmed(
+                8,
+                session_key,
+                lease_epoch,
+                expired_frame,
+                Duration::from_millis(10),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        let _ = release_tx.send(());
+
+        blocking_handle
+            .join()
+            .expect("blocking maintenance sender should finish")
+            .expect("first frame should complete after it entered commit point");
+
+        let expired_error = expired_handle
+            .join()
+            .expect("expired maintenance sender should finish")
+            .expect_err("deadline-expired maintenance send must not commit later");
+        assert!(matches!(expired_error, DriverError::Timeout));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[blocking_frame]);
+    }
+
+    #[test]
+    fn test_maintenance_acquire_timeout_rolls_back_tentative_grant() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames,
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let holder_session_key = 77;
+        piper.ctx.connection_monitor.register_feedback();
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        let holder_lease_epoch = match piper
+            .acquire_maintenance_lease_gate(7, holder_session_key, Duration::from_millis(10))
+            .expect("initial maintenance acquire should reach TX control lane")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected initial acquire result: {other:?}"),
+        };
+
+        let blocking_frame = PiperFrame::new_standard(0x221, &[0x01]);
+        let piper_blocking = Arc::clone(&piper);
+        let blocking_handle = std::thread::spawn(move || {
+            piper_blocking.send_maintenance_frame_confirmed(
+                7,
+                holder_session_key,
+                holder_lease_epoch,
+                blocking_frame,
+                Duration::from_millis(500),
+            )
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first maintenance frame should begin sending");
+
+        assert!(
+            piper
+                .release_maintenance_lease_gate_if_holder(holder_session_key)
+                .expect("holder release should enqueue tx-lane update"),
+            "current lease holder should release successfully"
+        );
+
+        let piper_waiter = Arc::clone(&piper);
+        let acquire_started = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            piper_waiter.acquire_maintenance_lease_gate(8, 88, Duration::from_millis(20))
+        });
+
+        let acquire_error = waiter
+            .join()
+            .expect("waiting maintenance acquire should finish")
+            .expect_err("grant ack that misses deadline must time out");
+        assert!(matches!(acquire_error, DriverError::Timeout));
+        assert!(
+            acquire_started.elapsed() < Duration::from_millis(150),
+            "maintenance acquire should remain bounded by caller timeout"
+        );
+
+        let snapshot = piper.maintenance_lease_snapshot();
+        assert_eq!(snapshot.holder_session_id(), None);
+        assert_eq!(snapshot.holder_session_key(), None);
+
+        let _ = release_tx.send(());
+        blocking_handle
+            .join()
+            .expect("blocking maintenance sender should finish")
+            .expect("in-flight frame should complete after release");
+
+        let reacquired_epoch = match piper
+            .acquire_maintenance_lease_gate(9, 99, Duration::from_millis(100))
+            .expect("fresh maintenance acquire should reach TX control lane")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected reacquire result after timeout rollback: {other:?}"),
+        };
+        assert!(
+            reacquired_epoch > holder_lease_epoch,
+            "rollback should bump lease epoch before the next successful grant"
+        );
     }
 
     #[test]

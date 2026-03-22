@@ -218,6 +218,7 @@ fn apply_maintenance_control_op(state: &mut MaintenanceTxState, op: MaintenanceC
 struct MaintenanceLaneDispatch {
     frame: PiperFrame,
     meta: crate::command::MaintenanceCommandMeta,
+    deadline: Instant,
     ack: crossbeam_channel::Sender<Result<(), crate::DriverError>>,
 }
 
@@ -237,8 +238,18 @@ fn drain_maintenance_lane(
                     let _ = ack.send(());
                 }
             },
-            MaintenanceLaneCommand::Send { frame, meta, ack } => {
-                pending_sends.push_back(MaintenanceLaneDispatch { frame, meta, ack });
+            MaintenanceLaneCommand::Send {
+                frame,
+                meta,
+                deadline,
+                ack,
+            } => {
+                pending_sends.push_back(MaintenanceLaneDispatch {
+                    frame,
+                    meta,
+                    deadline,
+                    ack,
+                });
             },
         }
     }
@@ -993,7 +1004,9 @@ pub fn tx_loop_mailbox(
                 continue;
             }
 
-            let send_result = if let Some(denied) =
+            let send_result = if Instant::now() >= dispatch.deadline {
+                Err(crate::DriverError::Timeout)
+            } else if let Some(denied) =
                 maintenance_send_denial(&maintenance_tx_state, dispatch.meta)
             {
                 Err(denied)
