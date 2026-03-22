@@ -90,6 +90,27 @@ pub enum DriverError {
         source: CanError,
     },
 
+    /// 已确认的可靠帧包在 TX 线程中发送失败
+    #[error("Reliable package delivery failed after sending {sent}/{total} frames: {source}")]
+    ReliablePackageDeliveryFailed {
+        /// 已成功发送的帧数
+        sent: usize,
+        /// 计划发送的总帧数
+        total: usize,
+        /// 底层 CAN 发送错误
+        #[source]
+        source: CanError,
+    },
+
+    /// 已确认的可靠帧包在发送过程中超时
+    #[error("Reliable package timed out after sending {sent}/{total} frames")]
+    ReliablePackageTimeout {
+        /// 已成功发送的帧数
+        sent: usize,
+        /// 计划发送的总帧数
+        total: usize,
+    },
+
     /// 命令因故障锁存而在 TX 线程中止
     #[error("Command aborted because runtime fault latched")]
     CommandAbortedByFault,
@@ -186,6 +207,18 @@ mod tests {
         };
         let msg = format!("{}", driver_error);
         assert!(msg.contains("Reliable delivery failed"));
+
+        let driver_error = DriverError::ReliablePackageDeliveryFailed {
+            sent: 2,
+            total: 3,
+            source: CanError::Timeout,
+        };
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("2/3"));
+
+        let driver_error = DriverError::ReliablePackageTimeout { sent: 1, total: 3 };
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("1/3"));
 
         let driver_error = DriverError::RealtimeDeliveryAbortedByFault { sent: 1, total: 6 };
         let msg = format!("{}", driver_error);

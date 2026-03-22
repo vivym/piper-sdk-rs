@@ -22,7 +22,9 @@
 //! - **接口配置**：波特率等配置由系统工具（`ip link`）完成，不在应用层设置
 //! - **权限要求**：可能需要 `dialout` 组权限或 `sudo`
 
-use crate::{CanAdapter, CanError, PiperFrame};
+use crate::{
+    BackendCapability, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame,
+};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socketcan::{
@@ -188,13 +190,14 @@ impl SocketCanAdapter {
             );
 
             if ret < 0 {
-                // 警告：无法启用时间戳，但不阻塞初始化
-                warn!(
-                    "Failed to enable SO_TIMESTAMPING on '{}': {}",
-                    interface,
-                    std::io::Error::last_os_error()
-                );
-                false
+                return Err(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::UnsupportedConfig,
+                    format!(
+                        "failed to enable SO_TIMESTAMPING on '{}': {}; strict realtime requires trusted CAN timestamps",
+                        interface,
+                        std::io::Error::last_os_error()
+                    ),
+                )));
             } else {
                 true
             }
@@ -302,114 +305,102 @@ impl SocketCanAdapter {
             return Err(CanError::NotStarted);
         }
 
-        let fd = self.socket.as_raw_fd();
+        loop {
+            let fd = self.socket.as_raw_fd();
 
-        // 使用 poll 实现超时
-        // 注意：nix 0.30 的 PollFd::new 需要 BorrowedFd，PollTimeout 需要毫秒数
-        use std::os::fd::BorrowedFd;
-        let pollfd = PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, PollFlags::POLLIN);
+            // 使用 poll 实现超时
+            // 注意：nix 0.30 的 PollFd::new 需要 BorrowedFd，PollTimeout 需要毫秒数
+            use std::os::fd::BorrowedFd;
+            let pollfd = PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, PollFlags::POLLIN);
 
-        // 将 Duration 转换为毫秒数（u16，最大 65535ms）
-        let timeout_ms = self.read_timeout.as_millis().min(65535) as u16;
-        match poll(&mut [pollfd], PollTimeout::from(timeout_ms)) {
-            Ok(0) => {
-                // 超时
-                return Err(CanError::Timeout);
-            },
-            Ok(_) => {
-                // 有数据可用，继续
-            },
-            Err(e) => {
-                return Err(CanError::Io(std::io::Error::other(format!(
-                    "poll failed: {}",
-                    e
-                ))));
-            },
-        }
-
-        // 准备缓冲区（防御性编程：使用编译时计算的大小）
-        const CAN_FRAME_LEN: usize = std::mem::size_of::<libc::can_frame>();
-        let mut frame_buf = [0u8; CAN_FRAME_LEN];
-        let mut cmsg_buf = [0u8; 1024]; // CMSG 缓冲区
-
-        // 构建 IO 向量
-        let mut iov = [IoSliceMut::new(&mut frame_buf)];
-
-        // 调用 recvmsg
-        let msg = match recvmsg::<SockaddrStorage>(
-            fd,
-            &mut iov,
-            Some(&mut cmsg_buf),
-            MsgFlags::empty(),
-        ) {
-            Ok(msg) => msg,
-            Err(nix::errno::Errno::EAGAIN) => {
-                // 超时（虽然 poll 已检查，但作为防御性编程保留）
-                // 注意：EWOULDBLOCK 在某些平台上等同于 EAGAIN，所以只匹配 EAGAIN
-                return Err(CanError::Timeout);
-            },
-            Err(e) => {
-                return Err(CanError::Io(std::io::Error::other(format!(
-                    "recvmsg failed: {}",
-                    e
-                ))));
-            },
-        };
-
-        // 验证数据长度
-        if msg.bytes < CAN_FRAME_LEN {
-            return Err(CanError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Incomplete CAN frame: {} bytes (expected at least {})",
-                    msg.bytes, CAN_FRAME_LEN
-                ),
-            )));
-        }
-
-        // 先提取时间戳（在解析 CAN 帧之前，避免生命周期冲突）
-        let timestamp_us = self.extract_timestamp_from_cmsg(&msg)?;
-
-        // 在 recvmsg 调用完成后，iov 不再使用，可以安全地使用 frame_buf
-        // 解析 CAN 帧
-        let received_bytes = msg.bytes;
-        let can_frame = self.parse_raw_can_frame(&frame_buf[..received_bytes])?;
-
-        // 过滤错误帧（与 receive() 方法保持一致）
-        if can_frame.is_error_frame() {
-            // 处理错误帧（与 receive() 方法逻辑一致）
-            if let Ok(error_frame) = CanErrorFrame::try_from(can_frame) {
-                let socketcan_error = SocketCanError::from(error_frame);
-                match &socketcan_error {
-                    SocketCanError::BusOff => {
-                        error!("CAN Bus Off error detected");
-                        return Err(CanError::BusOff);
-                    },
-                    SocketCanError::ControllerProblem(problem) => {
-                        let problem_str = format!("{}", problem);
-                        if problem_str.contains("overflow") || problem_str.contains("Overflow") {
-                            error!("CAN Buffer Overflow detected: {}", problem);
-                            return Err(CanError::BufferOverflow);
-                        } else {
-                            warn!("CAN Controller Problem: {}, ignoring", problem);
-                            // 继续循环，尝试接收下一个帧
-                            return self.receive_with_timestamp();
-                        }
-                    },
-                    _ => {
-                        warn!("CAN Error Frame received: {}, ignoring", socketcan_error);
-                        // 继续循环，尝试接收下一个帧
-                        return self.receive_with_timestamp();
-                    },
-                }
-            } else {
-                warn!("Received CAN error frame but failed to parse, ignoring");
-                // 继续循环，尝试接收下一个帧
-                return self.receive_with_timestamp();
+            // 将 Duration 转换为毫秒数（u16，最大 65535ms）
+            let timeout_ms = self.read_timeout.as_millis().min(65535) as u16;
+            match poll(&mut [pollfd], PollTimeout::from(timeout_ms)) {
+                Ok(0) => {
+                    return Err(CanError::Timeout);
+                },
+                Ok(_) => {},
+                Err(e) => {
+                    return Err(CanError::Io(std::io::Error::other(format!(
+                        "poll failed: {}",
+                        e
+                    ))));
+                },
             }
-        }
 
-        Ok((can_frame, timestamp_us))
+            // 准备缓冲区（防御性编程：使用编译时计算的大小）
+            const CAN_FRAME_LEN: usize = std::mem::size_of::<libc::can_frame>();
+            let mut frame_buf = [0u8; CAN_FRAME_LEN];
+            let mut cmsg_buf = [0u8; 1024]; // CMSG 缓冲区
+
+            // 构建 IO 向量
+            let mut iov = [IoSliceMut::new(&mut frame_buf)];
+
+            // 调用 recvmsg
+            let msg = match recvmsg::<SockaddrStorage>(
+                fd,
+                &mut iov,
+                Some(&mut cmsg_buf),
+                MsgFlags::empty(),
+            ) {
+                Ok(msg) => msg,
+                Err(nix::errno::Errno::EAGAIN) => {
+                    return Err(CanError::Timeout);
+                },
+                Err(e) => {
+                    return Err(CanError::Io(std::io::Error::other(format!(
+                        "recvmsg failed: {}",
+                        e
+                    ))));
+                },
+            };
+
+            if msg.bytes < CAN_FRAME_LEN {
+                return Err(CanError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Incomplete CAN frame: {} bytes (expected at least {})",
+                        msg.bytes, CAN_FRAME_LEN
+                    ),
+                )));
+            }
+
+            let timestamp_us = self.extract_timestamp_from_cmsg(&msg)?;
+            let received_bytes = msg.bytes;
+            let can_frame = self.parse_raw_can_frame(&frame_buf[..received_bytes])?;
+
+            if can_frame.is_error_frame() {
+                if let Ok(error_frame) = CanErrorFrame::try_from(can_frame) {
+                    let socketcan_error = SocketCanError::from(error_frame);
+                    match &socketcan_error {
+                        SocketCanError::BusOff => {
+                            error!("CAN Bus Off error detected");
+                            return Err(CanError::BusOff);
+                        },
+                        SocketCanError::ControllerProblem(problem) => {
+                            let problem_str = format!("{}", problem);
+                            if problem_str.contains("overflow") || problem_str.contains("Overflow")
+                            {
+                                error!("CAN Buffer Overflow detected: {}", problem);
+                                return Err(CanError::BufferOverflow);
+                            }
+
+                            warn!("CAN Controller Problem: {}, ignoring", problem);
+                            continue;
+                        },
+                        _ => {
+                            warn!("CAN Error Frame received: {}, ignoring", socketcan_error);
+                            continue;
+                        },
+                    }
+                }
+
+                warn!("Received CAN error frame but failed to parse, ignoring");
+                continue;
+            }
+
+            return Ok((can_frame, timestamp_us));
+        }
     }
 
     /// 解析原始 CAN 帧数据
@@ -636,7 +627,11 @@ impl SplittableAdapter for SocketCanAdapter {
     type TxAdapter = SocketCanTxAdapter;
 
     fn backend_capability(&self) -> crate::BackendCapability {
-        crate::BackendCapability::StrictRealtime
+        if self.timestamping_enabled {
+            BackendCapability::StrictRealtime
+        } else {
+            BackendCapability::MonitorOnly
+        }
     }
 
     /// 分离为独立的 RX 和 TX 适配器

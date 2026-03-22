@@ -22,7 +22,10 @@
 //! - **线程安全**：RX 和 TX 适配器可以在不同线程中并发使用
 //! - **时间戳支持**：使用 `recvmsg` 和 CMSG 提取硬件/软件时间戳（与 `SocketCanAdapter` 一致）
 
-use crate::{BackendCapability, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
+use crate::{
+    BackendCapability, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter,
+    RxAdapter,
+};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socketcan::{
@@ -139,7 +142,10 @@ impl SocketCanRxAdapter {
         if timestamping_enabled {
             trace!("SocketCanRxAdapter: SO_TIMESTAMPING verified on dup'd socket");
         } else {
-            warn!("SocketCanRxAdapter: SO_TIMESTAMPING not available on dup'd socket");
+            return Err(CanError::Device(CanDeviceError::new(
+                CanDeviceErrorKind::UnsupportedConfig,
+                "SO_TIMESTAMPING is not available on the dup'd SocketCAN RX socket; strict realtime requires trusted CAN timestamps",
+            )));
         }
 
         let hw_timestamp_available = false; // 运行时检测
@@ -344,7 +350,11 @@ impl RxAdapter for SocketCanRxAdapter {
     }
 
     fn backend_capability(&self) -> BackendCapability {
-        BackendCapability::StrictRealtime
+        if self.timestamping_enabled {
+            BackendCapability::StrictRealtime
+        } else {
+            BackendCapability::MonitorOnly
+        }
     }
 }
 

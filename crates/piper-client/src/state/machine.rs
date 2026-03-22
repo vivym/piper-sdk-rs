@@ -54,7 +54,9 @@ pub struct MitPassthroughMode;
 /// 位置模式
 ///
 /// 纯位置控制模式。
-pub struct PositionMode;
+pub struct PositionMode {
+    pub(crate) command_timeout: Duration,
+}
 
 /// 错误状态
 ///
@@ -120,6 +122,12 @@ struct ModeConfirmationExpectation {
     mit_mode: u8,
     install_position: u8,
     trajectory_stay_time: u8,
+}
+
+#[derive(Clone)]
+struct ModeConfirmationBaseline {
+    robot_control: piper_driver::RobotControlState,
+    mode_echo: piper_driver::MasterSlaveControlModeState,
 }
 
 // ==================== 运动类型 ====================
@@ -269,6 +277,8 @@ pub struct PositionModeConfig {
     /// - `Circular`: 使用 `move_circular()` 方法
     /// - `ContinuousPositionVelocity`: 待实现
     pub motion_type: MotionType,
+    /// 多帧任务型运动命令的整包发送超时。
+    pub command_timeout: Duration,
 }
 
 impl Default for PositionModeConfig {
@@ -280,6 +290,7 @@ impl Default for PositionModeConfig {
             speed_percent: 50,                          // 默认 50% 速度
             install_position: InstallPosition::Invalid, // 默认无效值（不设置安装位置）
             motion_type: MotionType::Joint,             // ✅ 默认关节模式，向后兼容
+            command_timeout: Duration::from_millis(20),
         }
     }
 }
@@ -489,6 +500,9 @@ impl Piper<Disconnected, UnspecifiedCapability> {
         use piper_driver::Piper as RobotPiper;
 
         let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
+        if driver.backend_capability().is_strict_realtime() {
+            driver.wait_for_timestamped_feedback(config.feedback_timeout)?;
+        }
         let quirks = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
@@ -536,6 +550,9 @@ impl Piper<Disconnected, UnspecifiedCapability> {
         // 1. 创建新的 driver 实例
         use piper_driver::Piper as RobotPiper;
         let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
+        if driver.backend_capability().is_strict_realtime() {
+            driver.wait_for_timestamped_feedback(config.feedback_timeout)?;
+        }
         let quirks = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
@@ -598,7 +615,7 @@ where
         )?;
         debug!("All motors enabled (debounced)");
 
-        let baseline = self.driver.get_robot_control();
+        let baseline = self.capture_mode_confirmation_baseline();
 
         // 3. 设置 MIT 模式
         let control_cmd = ControlModeCommandFrame::new(
@@ -612,7 +629,6 @@ where
         self.driver.send_reliable(control_cmd.to_frame())?;
         self.wait_for_mode_confirmation(
             baseline,
-            self.driver.get_control_mode_echo(),
             config.timeout,
             config.poll_interval,
             ModeConfirmationExpectation {
@@ -662,7 +678,7 @@ where
             config.poll_interval,
         )?;
         debug!("All motors enabled (debounced)");
-        let baseline = self.driver.get_robot_control();
+        let baseline = self.capture_mode_confirmation_baseline();
 
         // 3. 设置位置模式
         // ✅ 修改：使用配置的 motion_type
@@ -679,7 +695,6 @@ where
         self.driver.send_reliable(control_cmd.to_frame())?;
         self.wait_for_mode_confirmation(
             baseline,
-            self.driver.get_control_mode_echo(),
             config.timeout,
             config.poll_interval,
             ModeConfirmationExpectation {
@@ -692,7 +707,12 @@ where
             },
         )?;
         info!("Robot enabled - Active<PositionMode>");
-        Ok(transition_piper_state(self, Active(PositionMode)))
+        Ok(transition_piper_state(
+            self,
+            Active(PositionMode {
+                command_timeout: config.command_timeout,
+            }),
+        ))
     }
 
     /// 使能全部关节并切换到 MIT 模式
@@ -862,8 +882,7 @@ where
 
     fn wait_for_mode_confirmation(
         &self,
-        baseline: piper_driver::RobotControlState,
-        baseline_mode_echo: piper_driver::MasterSlaveControlModeState,
+        baseline: ModeConfirmationBaseline,
         timeout: Duration,
         poll_interval: Duration,
         expected: ModeConfirmationExpectation,
@@ -880,14 +899,14 @@ where
             let current = self.driver.get_robot_control();
             let mode_echo = self.driver.get_control_mode_echo();
             let is_robot_state_fresh = current.hardware_timestamp_us
-                > baseline.hardware_timestamp_us
-                || current.host_rx_mono_us > baseline.host_rx_mono_us;
+                > baseline.robot_control.hardware_timestamp_us
+                || current.host_rx_mono_us > baseline.robot_control.host_rx_mono_us;
             let is_robot_state_match = current.is_enabled
                 && current.control_mode == expected.control_mode
                 && current.move_mode == expected.move_mode;
             let is_mode_echo_fresh = mode_echo.is_valid
-                && (mode_echo.hardware_timestamp_us > baseline_mode_echo.hardware_timestamp_us
-                    || mode_echo.host_rx_mono_us > baseline_mode_echo.host_rx_mono_us);
+                && (mode_echo.hardware_timestamp_us > baseline.mode_echo.hardware_timestamp_us
+                    || mode_echo.host_rx_mono_us > baseline.mode_echo.host_rx_mono_us);
             let is_mode_echo_match = mode_echo.control_mode == expected.control_mode
                 && mode_echo.move_mode == expected.move_mode
                 && mode_echo.speed_percent == expected.speed_percent
@@ -1234,7 +1253,7 @@ impl Piper<Standby, SoftRealtime> {
             config.poll_interval,
         )?;
 
-        let baseline = self.driver.get_robot_control();
+        let baseline = self.capture_mode_confirmation_baseline();
         let control_cmd = ControlModeCommandFrame::new(
             ControlModeCommand::CanControl,
             MoveMode::MoveM,
@@ -1246,7 +1265,6 @@ impl Piper<Standby, SoftRealtime> {
         self.driver.send_reliable(control_cmd.to_frame())?;
         self.wait_for_mode_confirmation(
             baseline,
-            self.driver.get_control_mode_echo(),
             config.timeout,
             config.poll_interval,
             ModeConfirmationExpectation {
@@ -1269,6 +1287,13 @@ impl<State, Capability> Piper<State, Capability>
 where
     Capability: CapabilityMarker,
 {
+    fn capture_mode_confirmation_baseline(&self) -> ModeConfirmationBaseline {
+        ModeConfirmationBaseline {
+            robot_control: self.driver.get_robot_control(),
+            mode_echo: self.driver.get_control_mode_echo(),
+        }
+    }
+
     fn into_state<NextState>(self, next_state: NextState) -> Piper<NextState, Capability> {
         let this = std::mem::ManuallyDrop::new(self);
         let driver = unsafe { std::ptr::read(&this.driver) };
@@ -2069,7 +2094,7 @@ where
     /// ```
     pub fn send_position_command(&self, positions: &JointArray<Rad>) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_position_command_batch(positions)
+        raw.send_position_command_batch(positions, self._state.0.command_timeout)
     }
 
     /// 发送末端位姿命令（笛卡尔空间控制）
@@ -2102,7 +2127,7 @@ where
         orientation: EulerAngles,
     ) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_end_pose_command(position, orientation)
+        raw.send_end_pose_command(position, orientation, self._state.0.command_timeout)
     }
 
     /// 发送直线运动命令
@@ -2133,7 +2158,7 @@ where
     /// ```
     pub fn move_linear(&self, position: Position3D, orientation: EulerAngles) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_end_pose_command(position, orientation)
+        raw.send_end_pose_command(position, orientation, self._state.0.command_timeout)
     }
 
     /// 发送圆弧运动命令
@@ -2179,6 +2204,7 @@ where
             via_orientation,
             target_position,
             target_orientation,
+            self._state.0.command_timeout,
         )
     }
 
@@ -2851,6 +2877,29 @@ mod tests {
         }
     }
 
+    struct SoftCapabilityRx<R> {
+        inner: R,
+    }
+
+    impl<R> SoftCapabilityRx<R> {
+        fn new(inner: R) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl<R> RxAdapter for SoftCapabilityRx<R>
+    where
+        R: RxAdapter,
+    {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            self.inner.receive()
+        }
+
+        fn backend_capability(&self) -> piper_driver::BackendCapability {
+            piper_driver::BackendCapability::SoftRealtime
+        }
+    }
+
     fn build_active_mit_piper(
         quirks: DeviceQuirks,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
@@ -2882,7 +2931,9 @@ mod tests {
             driver,
             observer,
             quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
-            _state: Active(PositionMode),
+            _state: Active(PositionMode {
+                command_timeout: Duration::from_millis(20),
+            }),
         }
     }
 
@@ -2902,6 +2953,31 @@ mod tests {
             .expect("driver should start"),
         );
         let observer = Observer::<StrictRealtime>::new(driver.clone());
+
+        Piper {
+            driver,
+            observer,
+            quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            _state: Standby,
+        }
+    }
+
+    fn build_soft_standby_piper<R>(
+        rx_adapter: R,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    ) -> Piper<Standby, SoftRealtime>
+    where
+        R: RxAdapter + Send + 'static,
+    {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                SoftCapabilityRx::new(rx_adapter),
+                RecordingTxAdapter::new(sent_frames),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let observer = Observer::<SoftRealtime>::new(driver.clone());
 
         Piper {
             driver,
@@ -3001,8 +3077,14 @@ mod tests {
         // Active<MitMode> 包含 MitMode（ZST），所以也是 ZST
         assert_eq!(std::mem::size_of::<Active<MitMode>>(), 0);
 
-        assert_eq!(std::mem::size_of::<PositionMode>(), 0);
-        assert_eq!(std::mem::size_of::<Active<PositionMode>>(), 0);
+        assert_eq!(
+            std::mem::size_of::<PositionMode>(),
+            std::mem::size_of::<Duration>()
+        );
+        assert_eq!(
+            std::mem::size_of::<Active<PositionMode>>(),
+            std::mem::size_of::<Duration>()
+        );
     }
 
     #[test]
@@ -3033,6 +3115,7 @@ mod tests {
         let config = PositionModeConfig::default();
         assert_eq!(config.motion_type, MotionType::Joint); // 向后兼容
         assert_eq!(config.speed_percent, 50);
+        assert_eq!(config.command_timeout, Duration::from_millis(20));
     }
 
     #[test]
@@ -3099,6 +3182,7 @@ mod tests {
             speed_percent: 40,
             install_position: InstallPosition::Horizontal,
             motion_type: MotionType::Linear,
+            command_timeout: Duration::from_millis(20),
         }) {
             Ok(_) => panic!("mismatched 0x151 echo must reject Active<PositionMode>"),
             Err(error) => error,
@@ -3138,6 +3222,39 @@ mod tests {
             .expect("fresh matching 0x2A1 + 0x151 should allow Active<MitMode>");
 
         assert!(active.observer().is_all_enabled());
+    }
+
+    #[test]
+    fn enable_mit_passthrough_succeeds_with_fresh_matching_robot_and_echo() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames();
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::ZERO,
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveM,
+                70,
+                piper_protocol::control::MitMode::Mit,
+                InstallPosition::Invalid,
+                101,
+            ),
+        });
+
+        let standby = build_soft_standby_piper(PacedRxAdapter::new(frames), sent_frames);
+        let active = standby
+            .enable_mit_passthrough(MitModeConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 70,
+            })
+            .expect("fresh matching 0x2A1 + 0x151 should allow MIT passthrough");
+
+        assert!(matches!(active._state, Active(MitPassthroughMode)));
     }
 
     #[test]

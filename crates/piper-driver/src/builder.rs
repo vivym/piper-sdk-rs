@@ -99,7 +99,6 @@ impl BackendFactory for RealBackendFactory {
             let mut can = SocketCanAdapter::new(iface).map_err(DriverError::Can)?;
             can.configure(baud_rate).map_err(DriverError::Can)?;
             can.set_receive_timeout(receive_timeout);
-            let capability = can.backend_capability();
             let (rx, tx) = can.split().map_err(DriverError::Can)?;
             Ok(BuiltBackend::new(rx, tx, iface, baud_rate))
         }
@@ -239,9 +238,20 @@ impl PiperBuilder {
             )?,
         };
 
-        Piper::new_dual_thread_parts(backend.rx, backend.tx, Some(self.pipeline_config))
-            .map(|piper| piper.with_metadata(backend.interface, backend.bus_speed))
-            .map_err(DriverError::Can)
+        let piper =
+            Piper::new_dual_thread_parts(backend.rx, backend.tx, Some(self.pipeline_config))
+                .map(|piper| piper.with_metadata(backend.interface, backend.bus_speed))
+                .map_err(DriverError::Can)?;
+
+        if piper.backend_capability().is_strict_realtime()
+            && let Err(error) = piper
+                .wait_for_timestamped_feedback(crate::piper::STRICT_TIMESTAMP_VALIDATION_TIMEOUT)
+        {
+            piper.request_stop();
+            return Err(error);
+        }
+
+        Ok(piper)
     }
 
     fn build_auto_strict(
@@ -299,6 +309,10 @@ mod tests {
     impl RxAdapter for TestRxAdapter {
         fn receive(&mut self) -> Result<piper_can::PiperFrame, CanError> {
             Err(CanError::Timeout)
+        }
+
+        fn backend_capability(&self) -> piper_can::BackendCapability {
+            piper_can::BackendCapability::SoftRealtime
         }
     }
 

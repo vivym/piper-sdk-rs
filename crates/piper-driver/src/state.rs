@@ -2,6 +2,7 @@
 
 use crate::fps_stats::FpsStatistics;
 use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// 关节位置状态（帧组同步）
@@ -1058,6 +1059,8 @@ pub struct PiperContext {
     ///
     /// 使用 App Start Relative Time 模式，确保时间单调性。
     pub connection_monitor: crate::heartbeat::ConnectionMonitor,
+    /// 最近一次带可信设备时间戳的反馈到达主机的单调时间（微秒）。
+    pub last_timestamped_feedback_host_rx_mono_us: AtomicU64,
 
     // === 钩子管理（v1.2.1）===
     /// 钩子管理器（用于运行时回调注册）
@@ -1158,10 +1161,20 @@ impl PiperContext {
             connection_monitor: crate::heartbeat::ConnectionMonitor::new(
                 std::time::Duration::from_secs(1),
             ),
+            last_timestamped_feedback_host_rx_mono_us: AtomicU64::new(0),
 
             // 钩子管理器（v1.2.1）
             hooks: Arc::new(RwLock::new(HookManager::new())),
         }
+    }
+
+    pub fn register_timestamped_feedback(&self, host_rx_mono_us: u64) {
+        self.last_timestamped_feedback_host_rx_mono_us
+            .store(host_rx_mono_us, Ordering::Release);
+    }
+
+    pub fn last_timestamped_feedback_host_rx_mono_us(&self) -> u64 {
+        self.last_timestamped_feedback_host_rx_mono_us.load(Ordering::Acquire)
     }
 
     /// 捕获运动状态快照（逻辑原子性）

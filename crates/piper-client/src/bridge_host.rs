@@ -2470,7 +2470,9 @@ fn backend_health_score(health: &HealthStatus) -> u8 {
 
 fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
     let code = match error {
-        DriverError::Timeout | DriverError::RealtimeDeliveryTimeout => ErrorCode::Timeout,
+        DriverError::Timeout
+        | DriverError::RealtimeDeliveryTimeout
+        | DriverError::ReliablePackageTimeout { .. } => ErrorCode::Timeout,
         DriverError::ChannelFull | DriverError::ShutdownConflict => ErrorCode::Busy,
         DriverError::ControlPathClosed
         | DriverError::CommandAbortedByFault
@@ -2495,6 +2497,7 @@ fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
         },
         DriverError::PoisonedLock
         | DriverError::ReliableDeliveryFailed { .. }
+        | DriverError::ReliablePackageDeliveryFailed { .. }
         | DriverError::RealtimeDeliveryFailed { .. }
         | DriverError::RealtimeDeliveryOverwritten => ErrorCode::DeviceError,
     };

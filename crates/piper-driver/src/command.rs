@@ -179,7 +179,7 @@ impl RealtimeCommand {
 
 #[derive(Debug, Clone)]
 pub struct ReliableCommand {
-    frame: PiperFrame,
+    frames: FrameBuffer,
     ack: Option<ReliableAck>,
     kind: ReliableCommandKind,
     maintenance: Option<MaintenanceCommandMeta>,
@@ -268,8 +268,10 @@ impl ShutdownCommand {
 impl ReliableCommand {
     #[inline]
     pub fn single(frame: PiperFrame) -> Self {
+        let mut frames = FrameBuffer::new();
+        frames.push(frame);
         Self {
-            frame,
+            frames,
             ack: None,
             kind: ReliableCommandKind::Standard,
             maintenance: None,
@@ -278,8 +280,33 @@ impl ReliableCommand {
 
     #[inline]
     pub fn confirmed(frame: PiperFrame, ack: ReliableAck) -> Self {
+        let mut frames = FrameBuffer::new();
+        frames.push(frame);
         Self {
-            frame,
+            frames,
+            ack: Some(ack),
+            kind: ReliableCommandKind::Standard,
+            maintenance: None,
+        }
+    }
+
+    #[inline]
+    pub fn package(frames: impl IntoIterator<Item = PiperFrame>) -> Self {
+        Self {
+            frames: frames.into_iter().collect(),
+            ack: None,
+            kind: ReliableCommandKind::Standard,
+            maintenance: None,
+        }
+    }
+
+    #[inline]
+    pub fn package_confirmed(
+        frames: impl IntoIterator<Item = PiperFrame>,
+        ack: ReliableAck,
+    ) -> Self {
+        Self {
+            frames: frames.into_iter().collect(),
             ack: Some(ack),
             kind: ReliableCommandKind::Standard,
             maintenance: None,
@@ -294,8 +321,10 @@ impl ReliableCommand {
         lease_epoch: u64,
         ack: ReliableAck,
     ) -> Self {
+        let mut frames = FrameBuffer::new();
+        frames.push(frame);
         Self {
-            frame,
+            frames,
             ack: Some(ack),
             kind: ReliableCommandKind::Maintenance,
             maintenance: Some(MaintenanceCommandMeta::new(
@@ -308,7 +337,35 @@ impl ReliableCommand {
 
     #[inline]
     pub fn frame(&self) -> PiperFrame {
-        self.frame
+        debug_assert_eq!(self.frames.len(), 1);
+        self.frames[0]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    #[inline]
+    pub fn into_frames(self) -> FrameBuffer {
+        self.frames
+    }
+
+    #[inline]
+    pub fn into_parts(
+        self,
+    ) -> (
+        FrameBuffer,
+        Option<ReliableAck>,
+        ReliableCommandKind,
+        Option<MaintenanceCommandMeta>,
+    ) {
+        (self.frames, self.ack, self.kind, self.maintenance)
     }
 
     #[inline]

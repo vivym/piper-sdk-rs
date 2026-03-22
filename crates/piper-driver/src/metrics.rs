@@ -85,13 +85,13 @@ pub struct PiperMetrics {
     /// TX 超时次数（异常现象，说明设备响应慢）
     pub tx_timeouts: AtomicU64,
 
-    /// 实时帧包完整发送成功次数
+    /// 多帧命令包完整发送成功次数
     pub tx_packages_completed_total: AtomicU64,
-    /// 实时帧包部分发送次数（底层 transport 失败前已发送前缀帧）
+    /// 多帧命令包部分发送次数（失败前已发送前缀帧）
     pub tx_packages_partial_total: AtomicU64,
-    /// 实时帧包因故障锁存而中止的次数
+    /// 多帧命令包因故障锁存而中止的次数
     pub tx_packages_fault_aborted_total: AtomicU64,
-    /// 实时帧包因底层 transport 错误而完全失败（0 帧成功发送）的次数
+    /// 多帧命令包因底层 transport 错误而完全失败（0 帧成功发送）的次数
     pub tx_packages_transport_failed_total: AtomicU64,
     /// 关节位置完整组因缺帧/超时而被丢弃的次数
     pub rx_joint_position_incomplete_groups_dropped_total: AtomicU64,
@@ -255,13 +255,13 @@ pub struct MetricsSnapshot {
     pub rx_timeouts: u64,
     /// TX 超时次数
     pub tx_timeouts: u64,
-    /// 实时帧包完整发送成功次数
+    /// 多帧命令包完整发送成功次数
     pub tx_packages_completed_total: u64,
-    /// 实时帧包部分发送次数（发送失败前已发送前缀帧）
+    /// 多帧命令包部分发送次数（发送失败前已发送前缀帧）
     pub tx_packages_partial_total: u64,
-    /// 实时帧包因故障锁存而中止的次数
+    /// 多帧命令包因故障锁存而中止的次数
     pub tx_packages_fault_aborted_total: u64,
-    /// 实时帧包因 transport 错误在 0 帧成功发送时失败的次数
+    /// 多帧命令包因 transport 错误在 0 帧成功发送时失败的次数
     pub tx_packages_transport_failed_total: u64,
     /// 关节位置完整组因缺帧/超时而被丢弃的次数
     pub rx_joint_position_incomplete_groups_dropped_total: u64,

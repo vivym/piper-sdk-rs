@@ -97,8 +97,12 @@ impl<'a> RawCommander<'a> {
     /// # 参数
     ///
     /// - `positions`: 各关节目标位置（弧度）
-    /// - `strategy`: 发送策略（默认使用 Auto，即可靠模式）
-    pub(crate) fn send_position_command_batch(&self, positions: &JointArray<Rad>) -> Result<()> {
+    /// - `timeout`: 整包可靠发送超时
+    pub(crate) fn send_position_command_batch(
+        &self,
+        positions: &JointArray<Rad>,
+        timeout: Duration,
+    ) -> Result<()> {
         use piper_protocol::control::{JointControl12, JointControl34, JointControl56};
 
         // 准备所有关节的角度（度）
@@ -116,11 +120,7 @@ impl<'a> RawCommander<'a> {
             JointControl56::new(j5_deg, j6_deg).to_frame(), // 0x157
         ];
 
-        // 位置/轨迹类命令始终走可靠队列，禁止复用 strict mailbox 语义。
-        for frame in frames {
-            self.driver.send_reliable(frame)?;
-        }
-
+        self.driver.send_reliable_package_confirmed(frames, timeout)?;
         Ok(())
     }
 
@@ -203,25 +203,21 @@ impl<'a> RawCommander<'a> {
     ///
     /// - `position`: 末端位置（米）
     /// - `orientation`: 末端姿态（欧拉角，度）
-    /// - `strategy`: 发送策略（默认使用 Auto，即可靠模式）
     pub(crate) fn send_end_pose_command(
         &self,
         position: Position3D,
         orientation: EulerAngles,
+        timeout: Duration,
     ) -> Result<()> {
         let frames = Self::build_end_pose_frames(&position, &orientation);
-
-        for frame in frames {
-            self.driver.send_reliable(frame)?;
-        }
-
+        self.driver.send_reliable_package_confirmed(frames, timeout)?;
         Ok(())
     }
 
     /// 发送圆弧运动命令（原子性发送所有点）
     ///
     /// **关键设计**：将所有点打包到一个 Frame Package 里，一次性发送。
-    /// 这避免了邮箱模式的覆盖问题，确保中间点和终点都被正确发送。
+    /// 这避免了逐帧 reliable 入队带来的“半包已生效”问题，确保中间点和终点语义一致。
     ///
     /// # 参数
     ///
@@ -229,7 +225,6 @@ impl<'a> RawCommander<'a> {
     /// - `via_orientation`: 中间点姿态（欧拉角，度）
     /// - `target_position`: 终点位置（米）
     /// - `target_orientation`: 终点姿态（欧拉角，度）
-    /// - `strategy`: 发送策略（默认使用 Auto，即可靠模式）
     ///
     /// # 协议说明
     ///
@@ -244,15 +239,14 @@ impl<'a> RawCommander<'a> {
     ///
     /// **为什么需要打包发送？**
     ///
-    /// `send_realtime_package` 使用邮箱模式（Mailbox），采用覆盖策略（Last Write Wins）。
-    /// 如果分两次发送位姿数据：
-    /// - 第一次发送：中间点（4帧）放入邮箱
-    /// - 第二次发送：终点（4帧）**覆盖**邮箱中的中间点
-    /// - 结果：中间点丢失，只有终点被发送
+    /// 如果逐帧调用 `send_reliable()`：
+    /// - 前几帧可能已经进入 FIFO 并开始发送
+    /// - 后续帧遇到队列满或 transport fault 时会形成“半包已生效”
+    /// - 结果：中间点和终点的解释不再原子，机械臂侧很难安全收口
     ///
     /// **解决方案**：
     /// - 将所有 8 帧打包成一个 Package
-    /// - 一次性发送，确保原子性
+    /// - 整包作为单个 reliable 队列元素入队，确保全有或全无
     /// - 利用 CAN 总线优先级（0x152 < 0x153 < 0x154 < 0x158）保证顺序
     ///
     /// # 性能特性
@@ -266,6 +260,7 @@ impl<'a> RawCommander<'a> {
         via_orientation: EulerAngles,
         target_position: Position3D,
         target_orientation: EulerAngles,
+        timeout: Duration,
     ) -> Result<()> {
         use piper_protocol::control::{ArcPointCommand, ArcPointIndex};
 
@@ -296,10 +291,7 @@ impl<'a> RawCommander<'a> {
             target_index_frame,    // 0x158: index=0x03 (End)
         ];
 
-        for frame in package {
-            self.driver.send_reliable(frame)?;
-        }
-
+        self.driver.send_reliable_package_confirmed(package, timeout)?;
         Ok(())
     }
 

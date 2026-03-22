@@ -112,6 +112,17 @@ pub(crate) const NORMAL_FRAME_SEND_BUDGET: Duration = Duration::from_micros(500)
 pub(crate) const SOFT_CONTROL_SEND_BUDGET: Duration = Duration::from_millis(5);
 pub(crate) const SOFT_CONTROL_SEND_MIN_DEADLINE: Duration = Duration::from_millis(1);
 pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
+pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn strict_realtime_timestamp_error(reason: impl Into<String>) -> DriverError {
+    DriverError::Can(CanError::Device(piper_can::CanDeviceError::new(
+        piper_can::CanDeviceErrorKind::UnsupportedConfig,
+        format!(
+            "StrictRealtime requires trusted CAN timestamps; refusing strict connection: {}",
+            reason.into()
+        ),
+    )))
+}
 
 #[doc(hidden)]
 #[derive(Debug, Default)]
@@ -904,6 +915,21 @@ fn clone_driver_error(error: &DriverError) -> DriverError {
         DriverError::ReliableDeliveryFailed { source } => DriverError::ReliableDeliveryFailed {
             source: clone_can_error(source),
         },
+        DriverError::ReliablePackageDeliveryFailed {
+            sent,
+            total,
+            source,
+        } => DriverError::ReliablePackageDeliveryFailed {
+            sent: *sent,
+            total: *total,
+            source: clone_can_error(source),
+        },
+        DriverError::ReliablePackageTimeout { sent, total } => {
+            DriverError::ReliablePackageTimeout {
+                sent: *sent,
+                total: *total,
+            }
+        },
         DriverError::CommandAbortedByFault => DriverError::CommandAbortedByFault,
         DriverError::MaintenanceWriteDenied(message) => {
             DriverError::MaintenanceWriteDenied(message.clone())
@@ -1037,6 +1063,7 @@ impl Piper {
     /// # }
     /// ```
     pub const MAX_REALTIME_PACKAGE_SIZE: usize = 10;
+    pub const MAX_RELIABLE_PACKAGE_SIZE: usize = 10;
 
     /// 设置元数据（内部方法，由 Builder 调用）
     pub(crate) fn with_metadata(mut self, interface: String, bus_speed: u32) -> Self {
@@ -1646,6 +1673,37 @@ impl Piper {
         }
     }
 
+    /// 等待至少一帧带可信设备时间戳的反馈。
+    ///
+    /// StrictRealtime 后端必须在启动期证明设备时间基线可用，否则拒绝暴露 strict 控制语义。
+    pub fn wait_for_timestamped_feedback(&self, timeout: Duration) -> Result<(), DriverError> {
+        if !self.backend_capability.is_strict_realtime() {
+            return Err(DriverError::InvalidInput(
+                "timestamped feedback validation is only available on StrictRealtime backends"
+                    .to_string(),
+            ));
+        }
+
+        let start = Instant::now();
+        loop {
+            if self.ctx.last_timestamped_feedback_host_rx_mono_us() != 0 {
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(strict_realtime_timestamp_error(
+                    "no timestamped feedback arrived before validation timeout",
+                ));
+            }
+
+            if !self.rx_thread_alive() || !self.tx_thread_alive() {
+                return Err(DriverError::ChannelClosed);
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// 获取 FPS 统计结果
     ///
     /// 返回最近一次统计窗口内的更新频率（FPS）。
@@ -2205,6 +2263,70 @@ impl Piper {
         self.enqueue_reliable(ReliableCommand::single(frame))
     }
 
+    /// 发送可靠帧包（FIFO，整包作为单个队列元素）。
+    pub fn send_reliable_package(
+        &self,
+        frames: impl IntoIterator<Item = PiperFrame>,
+    ) -> Result<(), DriverError> {
+        use crate::command::FrameBuffer;
+
+        let buffer: FrameBuffer = frames.into_iter().collect();
+        if buffer.is_empty() {
+            return Err(DriverError::InvalidInput(
+                "Reliable frame package cannot be empty".to_string(),
+            ));
+        }
+        if buffer.len() > Self::MAX_RELIABLE_PACKAGE_SIZE {
+            return Err(DriverError::InvalidInput(format!(
+                "Reliable frame package too large: {} (max: {})",
+                buffer.len(),
+                Self::MAX_RELIABLE_PACKAGE_SIZE
+            )));
+        }
+
+        self.enqueue_reliable(ReliableCommand::package(buffer))
+    }
+
+    /// 发送可靠帧包并等待 TX 线程确认整包实际发送结果。
+    pub fn send_reliable_package_confirmed(
+        &self,
+        frames: impl IntoIterator<Item = PiperFrame>,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        use crate::command::FrameBuffer;
+
+        let buffer: FrameBuffer = frames.into_iter().collect();
+        if buffer.is_empty() {
+            return Err(DriverError::InvalidInput(
+                "Reliable frame package cannot be empty".to_string(),
+            ));
+        }
+        if buffer.len() > Self::MAX_RELIABLE_PACKAGE_SIZE {
+            return Err(DriverError::InvalidInput(format!(
+                "Reliable frame package too large: {} (max: {})",
+                buffer.len(),
+                Self::MAX_RELIABLE_PACKAGE_SIZE
+            )));
+        }
+
+        let start = Instant::now();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.enqueue_reliable_timeout(ReliableCommand::package_confirmed(buffer, ack_tx), timeout)?;
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(DriverError::Timeout);
+        }
+
+        match ack_rx.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(DriverError::ChannelClosed)
+            },
+        }
+    }
+
     /// 发送维护帧并等待 TX 线程在实际发送点完成最终运行时准入判定。
     #[doc(hidden)]
     pub fn send_maintenance_frame_confirmed(
@@ -2366,11 +2488,13 @@ impl Piper {
                 self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             },
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
+            Err(crossbeam_channel::TrySendError::Full(command)) => {
                 self.metrics.tx_reliable_queue_full_total.fetch_add(1, Ordering::Relaxed);
+                command.complete(Err(DriverError::ChannelFull));
                 Err(DriverError::ChannelFull)
             },
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            Err(crossbeam_channel::TrySendError::Disconnected(command)) => {
+                command.complete(Err(DriverError::ChannelClosed));
                 Err(DriverError::ChannelClosed)
             },
         }
@@ -2394,11 +2518,13 @@ impl Piper {
                 self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             },
-            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+            Err(crossbeam_channel::SendTimeoutError::Timeout(command)) => {
                 self.metrics.tx_reliable_queue_full_total.fetch_add(1, Ordering::Relaxed);
+                command.complete(Err(DriverError::Timeout));
                 Err(DriverError::Timeout)
             },
-            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(command)) => {
+                command.complete(Err(DriverError::ChannelClosed));
                 Err(DriverError::ChannelClosed)
             },
         }
@@ -2931,6 +3057,48 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_for_timestamped_feedback_times_out_without_timestamped_frames() {
+        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
+
+        let error = piper
+            .wait_for_timestamped_feedback(Duration::from_millis(20))
+            .expect_err("strict validation should reject missing trusted timestamps");
+
+        match error {
+            DriverError::Can(CanError::Device(device_error)) => {
+                assert_eq!(
+                    device_error.kind,
+                    piper_can::CanDeviceErrorKind::UnsupportedConfig
+                );
+                assert!(
+                    device_error
+                        .message
+                        .to_ascii_lowercase()
+                        .contains("strictrealtime requires trusted can timestamps"),
+                    "unexpected error message: {device_error}"
+                );
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wait_for_timestamped_feedback_succeeds_after_timestamped_frame() {
+        let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
+        frame.timestamp_us = 123;
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![frame], Duration::from_millis(10)),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        piper
+            .wait_for_timestamped_feedback(Duration::from_millis(200))
+            .expect("timestamped feedback should satisfy strict validation");
+    }
+
+    #[test]
     fn test_soft_realtime_rejects_strict_mailbox_apis() {
         let piper = Piper::new_dual_thread_parts(SoftRxAdapter, MockTxAdapter, None).unwrap();
 
@@ -3126,6 +3294,94 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn test_send_reliable_package_confirmed_success() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts(
+            MockRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, &[0x01]),
+            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x157, &[0x03]),
+        ];
+
+        piper
+            .send_reliable_package_confirmed(frames, Duration::from_millis(200))
+            .expect("confirmed reliable package send should succeed");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &frames);
+        let metrics = piper.get_metrics();
+        assert_eq!(metrics.tx_packages_completed_total, 1);
+    }
+
+    #[test]
+    fn test_send_reliable_package_confirmed_reports_partial_transport_failure() {
+        let piper = Piper::new_dual_thread_parts(
+            MockRxAdapter,
+            FailOnNthTxAdapter {
+                fail_on: 2,
+                sends: 0,
+            },
+            None,
+        )
+        .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, &[0x01]),
+            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x157, &[0x03]),
+        ];
+
+        let error = piper
+            .send_reliable_package_confirmed(frames, Duration::from_millis(200))
+            .expect_err("transport failure should surface partial package delivery");
+
+        assert!(matches!(
+            error,
+            DriverError::ReliablePackageDeliveryFailed {
+                sent: 1,
+                total: 3,
+                ..
+            }
+        ));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+    }
+
+    #[test]
+    fn test_soft_reliable_package_timeout_counts_per_command() {
+        let piper =
+            Piper::new_dual_thread_parts(SoftRxAdapter, PartialTimeoutTxAdapter { sends: 0 }, None)
+                .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, &[0x01]),
+            PiperFrame::new_standard(0x156, &[0x02]),
+        ];
+
+        for _ in 0..3 {
+            let error = piper
+                .send_reliable_package_confirmed(frames, Duration::from_millis(200))
+                .expect_err("each partial reliable package should time out");
+            assert!(matches!(
+                error,
+                DriverError::ReliablePackageTimeout { sent: 1, total: 2 }
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+        let metrics = piper.get_metrics();
+        assert_eq!(metrics.tx_soft_deadline_miss_total, 3);
+        assert_eq!(metrics.tx_soft_consecutive_deadline_miss_total, 2);
+        assert_eq!(metrics.tx_frames_sent_total, 3);
+        assert_eq!(metrics.tx_packages_partial_total, 3);
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
     }
 
     #[test]

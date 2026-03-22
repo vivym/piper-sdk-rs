@@ -652,6 +652,10 @@ pub(crate) fn io_loop(
             &last_fault,
         );
 
+        if frame.timestamp_us > 0 {
+            ctx.register_timestamped_feedback(host_rx_mono_us());
+        }
+
         // ============================================================
         // 连接监控：注册反馈（每帧处理后更新最后反馈时间）
         // ============================================================
@@ -882,6 +886,10 @@ pub fn rx_loop(
             &runtime_phase,
             &last_fault,
         );
+
+        if frame.timestamp_us > 0 {
+            ctx.register_timestamped_feedback(host_rx_mono_us());
+        }
 
         // 双线程 runtime 也必须刷新连接监控，否则 health()/wait_for_feedback()
         // 会永远基于初始状态判断。
@@ -1267,67 +1275,126 @@ pub fn tx_loop_mailbox(
             continue;
         }
 
-        if let Ok(mut command) = reliable_rx.try_recv() {
-            let Some(permit) = normal_send_gate.acquire() else {
-                count_fault_abort(&metrics);
-                command.complete(Err(reliable_abort_error(
-                    load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
-                )));
-                continue;
-            };
-            if !permit.still_open() {
-                count_fault_abort(&metrics);
-                command.complete(Err(reliable_abort_error(
-                    load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
-                )));
-                continue;
+        if let Ok(command) = reliable_rx.try_recv() {
+            let total_frames = command.len();
+            let package_command = total_frames > 1;
+            let (frames, ack, kind, maintenance) = command.into_parts();
+            debug_assert_eq!(kind, crate::command::ReliableCommandKind::Standard);
+            debug_assert!(maintenance.is_none());
+
+            let mut sent_count = 0usize;
+            let mut send_result = Ok(());
+            let mut should_break = false;
+            let mut deadline_missed = false;
+            let mut transport_error = false;
+
+            for frame in frames {
+                let Some(permit) = normal_send_gate.acquire() else {
+                    count_fault_abort(&metrics);
+                    send_result = Err(reliable_abort_error(
+                        load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
+                    ));
+                    break;
+                };
+                if !permit.still_open() {
+                    count_fault_abort(&metrics);
+                    send_result = Err(reliable_abort_error(
+                        load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
+                    ));
+                    break;
+                }
+
+                match tx.send_control(frame, normal_send_budget) {
+                    Ok(_) => {
+                        sent_count += 1;
+                        metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+
+                        if let Ok(hooks) = ctx.hooks.try_read() {
+                            hooks.trigger_all_sent(&frame);
+                        }
+                    },
+                    Err(CanError::Timeout) => {
+                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                        if package_command {
+                            deadline_missed = true;
+                            send_result = Err(crate::DriverError::ReliablePackageTimeout {
+                                sent: sent_count,
+                                total: total_frames,
+                            });
+                            if backend_capability.is_strict_realtime() {
+                                record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                                store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                                refresh_local_maintenance_tx_state(
+                                    &maintenance_gate,
+                                    &mut maintenance_tx_state,
+                                    MaintenanceGateState::DeniedFaulted,
+                                );
+                                should_break = true;
+                            }
+                        } else if backend_capability.is_soft_realtime() {
+                            deadline_missed = true;
+                            send_result = Err(crate::DriverError::Timeout);
+                        } else {
+                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                            refresh_local_maintenance_tx_state(
+                                &maintenance_gate,
+                                &mut maintenance_tx_state,
+                                MaintenanceGateState::DeniedFaulted,
+                            );
+                            send_result = Err(crate::DriverError::ReliableDeliveryFailed {
+                                source: CanError::Timeout,
+                            });
+                            should_break = true;
+                        }
+                        break;
+                    },
+                    Err(e) => {
+                        error!(
+                            "TX thread: Failed to send reliable frame {} in package: {}",
+                            sent_count, e
+                        );
+                        metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                        refresh_local_maintenance_tx_state(
+                            &maintenance_gate,
+                            &mut maintenance_tx_state,
+                            MaintenanceGateState::DeniedFaulted,
+                        );
+                        send_result = if package_command {
+                            Err(crate::DriverError::ReliablePackageDeliveryFailed {
+                                sent: sent_count,
+                                total: total_frames,
+                                source: e,
+                            })
+                        } else {
+                            Err(crate::DriverError::ReliableDeliveryFailed { source: e })
+                        };
+                        transport_error = true;
+                        should_break = true;
+                        break;
+                    },
+                }
             }
 
-            let frame = command.frame();
-            let ack = command.take_ack();
-            let send_result = match tx.send_control(frame, normal_send_budget) {
-                Ok(_) => {
-                    metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-
-                    if let Ok(hooks) = ctx.hooks.try_read() {
-                        hooks.trigger_all_sent(&frame);
-                    }
-                    Ok(())
-                },
-                Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
-                    metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                    Err(crate::DriverError::Timeout)
-                },
-                Err(e) => {
-                    error!("TX thread: Failed to send reliable frame: {}", e);
-                    if matches!(e, CanError::Timeout) {
-                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                    store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                    refresh_local_maintenance_tx_state(
-                        &maintenance_gate,
-                        &mut maintenance_tx_state,
-                        MaintenanceGateState::DeniedFaulted,
-                    );
-                    Err(crate::DriverError::ReliableDeliveryFailed { source: e })
-                },
-            };
-
-            let should_break = matches!(
+            let send_succeeded = send_result.is_ok();
+            let fault_aborted = matches!(
                 &send_result,
-                Err(crate::DriverError::ReliableDeliveryFailed { .. })
+                Err(crate::DriverError::CommandAbortedByFault)
                     | Err(crate::DriverError::ChannelClosed)
             );
             let soft_outcome = if backend_capability.is_soft_realtime() {
-                Some(matches!(&send_result, Ok(())))
+                Some(send_succeeded)
             } else {
                 None
             };
             let soft_timed_out = backend_capability.is_soft_realtime()
-                && matches!(&send_result, Err(crate::DriverError::Timeout));
+                && matches!(
+                    &send_result,
+                    Err(crate::DriverError::Timeout)
+                        | Err(crate::DriverError::ReliablePackageTimeout { .. })
+                );
             if let Some(ack) = ack {
                 let _ = ack.send(send_result);
             }
@@ -1350,6 +1417,22 @@ pub fn tx_loop_mailbox(
                             MaintenanceGateState::DeniedFaulted,
                         );
                     }
+                }
+            }
+
+            if package_command {
+                if transport_error {
+                    if sent_count == 0 {
+                        count_package_transport_failed(&metrics);
+                    } else {
+                        count_package_partial(&metrics);
+                    }
+                } else if fault_aborted {
+                    count_package_fault_aborted(&metrics);
+                } else if send_succeeded {
+                    count_package_completed(&metrics);
+                } else if deadline_missed && sent_count > 0 {
+                    count_package_partial(&metrics);
                 }
             }
 
