@@ -132,6 +132,8 @@ pub use client::recording::{
     RecordingConfig, RecordingHandle, RecordingMetadata, RecordingStats, StopCondition,
 };
 
+use std::sync::{Mutex, OnceLock};
+
 // 类型别名：为驱动层提供清晰的别名
 pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 
@@ -152,6 +154,8 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 /// - `RUST_LOG` 分支会把 `log` 全局门限收窄到 `EnvFilter` 的最大启用级别
 /// - 如果 `EnvFilter` 无法给出静态级别提示，会保守回退到 `TRACE`
 /// - 历史上曾设置过但已 drop 的 scoped subscriber 不会阻止后续初始化
+/// - SDK 会串行化自身的初始化调用
+/// - 如果 bridge 已安装但输掉 tracing 全局竞态，会立即关闭 `log` fast path，避免残留 bridge-only 状态
 ///
 /// ## 使用示例
 ///
@@ -171,57 +175,108 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 ///     Ok(())
 /// }
 /// ```
+static LOGGER_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+enum LoggerInitConfig {
+    EnvFilter {
+        env_filter: Box<::tracing_subscriber::EnvFilter>,
+        bridge_max_level: ::log::LevelFilter,
+    },
+    Default,
+}
+
+impl LoggerInitConfig {
+    fn detect() -> Self {
+        if ::std::env::var_os("RUST_LOG").is_some() {
+            let env_filter = ::tracing_subscriber::EnvFilter::from_default_env();
+            let bridge_max_level = env_filter
+                .max_level_hint()
+                .map(|hint| ::tracing_log::AsLog::as_log(&hint))
+                .unwrap_or(::log::LevelFilter::Trace);
+
+            Self::EnvFilter {
+                env_filter: Box::new(env_filter),
+                bridge_max_level,
+            }
+        } else {
+            Self::Default
+        }
+    }
+
+    fn bridge_max_level(&self) -> ::log::LevelFilter {
+        match self {
+            Self::EnvFilter {
+                bridge_max_level, ..
+            } => *bridge_max_level,
+            Self::Default => ::log::LevelFilter::Info,
+        }
+    }
+
+    fn into_dispatch(self) -> ::tracing::Dispatch {
+        match self {
+            Self::EnvFilter {
+                env_filter,
+                bridge_max_level: _,
+            } => ::tracing::Dispatch::new(
+                ::tracing_subscriber::fmt()
+                    .with_env_filter(*env_filter)
+                    .with_target(false)
+                    .compact()
+                    .finish(),
+            ),
+            Self::Default => ::tracing::Dispatch::new(
+                ::tracing_subscriber::fmt()
+                    .with_max_level(::tracing::Level::INFO)
+                    .with_target(false)
+                    .compact()
+                    .finish(),
+            ),
+        }
+    }
+}
+
+fn logger_init_lock() -> &'static Mutex<()> {
+    LOGGER_INIT_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn has_active_tracing_subscriber() -> bool {
+    ::tracing::dispatcher::get_default(|dispatch| {
+        !dispatch.is::<::tracing::subscriber::NoSubscriber>()
+    })
+}
+
+fn host_owns_log_path() -> bool {
+    ::log::max_level() != ::log::LevelFilter::Off
+}
+
+fn init_logger_inner(after_bridge: impl FnOnce()) {
+    // 只串行化 SDK 自己的初始化路径；外部宿主的竞态仍可能发生，
+    // 所以在输掉 tracing 全局安装时要主动关闭 log fast path。
+    let _guard = logger_init_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if has_active_tracing_subscriber() || host_owns_log_path() {
+        return;
+    }
+
+    let config = LoggerInitConfig::detect();
+    if ::tracing_log::LogTracer::builder()
+        .with_max_level(config.bridge_max_level())
+        .init()
+        .is_err()
+    {
+        return;
+    }
+
+    after_bridge();
+
+    if ::tracing::dispatcher::set_global_default(config.into_dispatch()).is_err() {
+        ::log::set_max_level(::log::LevelFilter::Off);
+    }
+}
+
 #[doc(hidden)]
 pub fn __init_logger() {
-    // 保守策略：只有在 SDK 同时接管 tracing + log 全局状态时，才安装 stdout subscriber。
-    // 如果宿主已拥有任一日志栈，直接 no-op，避免半初始化把同步 I/O 带回实时进程。
-    let has_active_tracing = ::tracing::dispatcher::get_default(|dispatch| {
-        !dispatch.is::<::tracing::subscriber::NoSubscriber>()
-    });
-    if has_active_tracing {
-        return;
-    }
-    if ::log::max_level() != ::log::LevelFilter::Off {
-        return;
-    }
-
-    if ::std::env::var_os("RUST_LOG").is_some() {
-        let env_filter = ::tracing_subscriber::EnvFilter::from_default_env();
-        let bridge_max_level = env_filter
-            .max_level_hint()
-            .map(|hint| ::tracing_log::AsLog::as_log(&hint))
-            .unwrap_or(::log::LevelFilter::Trace);
-
-        if ::tracing_log::LogTracer::builder()
-            .with_max_level(bridge_max_level)
-            .init()
-            .is_err()
-        {
-            return;
-        }
-
-        let subscriber = ::tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_target(false)
-            .compact()
-            .finish();
-        let _ = ::tracing::subscriber::set_global_default(subscriber);
-    } else {
-        if ::tracing_log::LogTracer::builder()
-            .with_max_level(::log::LevelFilter::Info)
-            .init()
-            .is_err()
-        {
-            return;
-        }
-
-        let subscriber = ::tracing_subscriber::fmt()
-            .with_max_level(::tracing::Level::INFO)
-            .with_target(false)
-            .compact()
-            .finish();
-        let _ = ::tracing::subscriber::set_global_default(subscriber);
-    }
+    init_logger_inner(|| {});
 }
 
 #[macro_export]
@@ -229,4 +284,27 @@ macro_rules! init_logger {
     () => {
         $crate::__init_logger();
     };
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn init_logger_disables_bridge_if_subscriber_race_is_lost() {
+        super::init_logger_inner(|| {
+            ::tracing::subscriber::set_global_default(::tracing_subscriber::registry())
+                .expect("test hook should win the tracing global-init race");
+        });
+
+        assert!(
+            ::tracing::dispatcher::get_default(|dispatch| {
+                dispatch.is::<::tracing_subscriber::registry::Registry>()
+            }),
+            "external subscriber should remain the active global dispatcher after the race",
+        );
+        assert_eq!(
+            ::log::max_level(),
+            ::log::LevelFilter::Off,
+            "losing the subscriber race should disable the SDK log fast path",
+        );
+    }
 }
