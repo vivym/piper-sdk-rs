@@ -149,6 +149,8 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 /// - 默认级别：`INFO`
 /// - 格式：compact，隐藏 target（易读）
 /// - 如果设置了 `RUST_LOG`，仅在 SDK 实际接管日志初始化时生效
+/// - `RUST_LOG` 分支会把 `log` 全局门限收窄到 `EnvFilter` 的最大启用级别
+/// - 如果 `EnvFilter` 无法给出静态级别提示，会保守回退到 `TRACE`
 ///
 /// ## 使用示例
 ///
@@ -179,29 +181,36 @@ pub fn __init_logger() {
         return;
     }
 
-    let has_rust_log = ::std::env::var_os("RUST_LOG").is_some();
-    let bridge_max_level = if has_rust_log {
-        ::log::LevelFilter::Trace
-    } else {
-        ::log::LevelFilter::Info
-    };
+    if ::std::env::var_os("RUST_LOG").is_some() {
+        let env_filter = ::tracing_subscriber::EnvFilter::from_default_env();
+        let bridge_max_level = env_filter
+            .max_level_hint()
+            .map(|hint| ::tracing_log::AsLog::as_log(&hint))
+            .unwrap_or(::log::LevelFilter::Trace);
 
-    if ::tracing_log::LogTracer::builder()
-        .with_max_level(bridge_max_level)
-        .init()
-        .is_err()
-    {
-        return;
-    }
+        if ::tracing_log::LogTracer::builder()
+            .with_max_level(bridge_max_level)
+            .init()
+            .is_err()
+        {
+            return;
+        }
 
-    if has_rust_log {
         let subscriber = ::tracing_subscriber::fmt()
-            .with_env_filter(::tracing_subscriber::EnvFilter::from_default_env())
+            .with_env_filter(env_filter)
             .with_target(false)
             .compact()
             .finish();
         let _ = ::tracing::subscriber::set_global_default(subscriber);
     } else {
+        if ::tracing_log::LogTracer::builder()
+            .with_max_level(::log::LevelFilter::Info)
+            .init()
+            .is_err()
+        {
+            return;
+        }
+
         let subscriber = ::tracing_subscriber::fmt()
             .with_max_level(::tracing::Level::INFO)
             .with_target(false)

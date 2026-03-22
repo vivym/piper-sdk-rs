@@ -16,8 +16,8 @@ fn init_logger_applies_rust_log_filter() {
     );
     assert_eq!(
         log::max_level(),
-        log::LevelFilter::Trace,
-        "RUST_LOG branch should leave log filtering to the EnvFilter-backed subscriber",
+        log::LevelFilter::Error,
+        "RUST_LOG=error should tighten the log facade fast path to ERROR",
     );
     assert!(
         !tracing::enabled!(Level::INFO),
