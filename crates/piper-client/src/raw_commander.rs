@@ -7,7 +7,6 @@
 //! - `RawCommander` 现在只负责"纯指令发送"，不负责状态管理
 //! - 使用引用而不是 Arc，避免高频调用时的原子操作开销
 
-use crate::state::machine::SendStrategy;
 use crate::types::*;
 use piper_can::PiperFrame;
 use piper_driver::Piper as RobotPiper;
@@ -102,7 +101,6 @@ impl<'a> RawCommander<'a> {
     pub(crate) fn send_position_command_batch(
         &self,
         positions: &JointArray<Rad>,
-        strategy: SendStrategy,
     ) -> Result<()> {
         use piper_protocol::control::{JointControl12, JointControl34, JointControl56};
 
@@ -121,19 +119,9 @@ impl<'a> RawCommander<'a> {
             JointControl56::new(j5_deg, j6_deg).to_frame(), // 0x157
         ];
 
-        // 根据策略选择发送方式
-        match strategy {
-            SendStrategy::Realtime => {
-                // 实时模式：邮箱模式，零延迟，可覆盖
-                self.driver.send_realtime_package(frames)?;
-            },
-            SendStrategy::Auto | SendStrategy::Reliable { .. } => {
-                // 可靠模式：队列模式，按顺序，不丢失
-                // 对于多个帧，需要逐个发送到可靠队列
-                for frame in frames {
-                    self.driver.send_reliable(frame)?;
-                }
-            },
+        // 位置/轨迹类命令始终走可靠队列，禁止复用 strict mailbox 语义。
+        for frame in frames {
+            self.driver.send_reliable(frame)?;
         }
 
         Ok(())
@@ -223,22 +211,11 @@ impl<'a> RawCommander<'a> {
         &self,
         position: Position3D,
         orientation: EulerAngles,
-        strategy: SendStrategy,
     ) -> Result<()> {
         let frames = Self::build_end_pose_frames(&position, &orientation);
 
-        // 根据策略选择发送方式
-        match strategy {
-            SendStrategy::Realtime => {
-                // 实时模式：邮箱模式，零延迟，可覆盖
-                self.driver.send_realtime_package(frames)?;
-            },
-            SendStrategy::Auto | SendStrategy::Reliable { .. } => {
-                // 可靠模式：队列模式，按顺序，不丢失
-                for frame in frames {
-                    self.driver.send_reliable(frame)?;
-                }
-            },
+        for frame in frames {
+            self.driver.send_reliable(frame)?;
         }
 
         Ok(())
@@ -292,7 +269,6 @@ impl<'a> RawCommander<'a> {
         via_orientation: EulerAngles,
         target_position: Position3D,
         target_orientation: EulerAngles,
-        strategy: SendStrategy,
     ) -> Result<()> {
         use piper_protocol::control::{ArcPointCommand, ArcPointIndex};
 
@@ -323,23 +299,8 @@ impl<'a> RawCommander<'a> {
             target_index_frame,    // 0x158: index=0x03 (End)
         ];
 
-        // 根据策略选择发送方式
-        match strategy {
-            SendStrategy::Realtime => {
-                // 实时模式：邮箱模式，零延迟，可覆盖
-                // CAN 总线仲裁机制确保：
-                // - 中间点位姿帧（0x152, 0x153, 0x154）先于中间点序号帧（0x158）发送
-                // - 终点位姿帧（0x152, 0x153, 0x154）先于终点序号帧（0x158）发送
-                // - 中间点相关帧先于终点相关帧发送（因为它们在数组中的顺序）
-                self.driver.send_realtime_package(package)?;
-            },
-            SendStrategy::Auto | SendStrategy::Reliable { .. } => {
-                // 可靠模式：队列模式，按顺序，不丢失
-                // 对于多个帧，需要逐个发送到可靠队列
-                for frame in package {
-                    self.driver.send_reliable(frame)?;
-                }
-            },
+        for frame in package {
+            self.driver.send_reliable(frame)?;
         }
 
         Ok(())
@@ -439,7 +400,6 @@ unsafe impl<'a> Sync for RawCommander<'a> {}
 mod tests {
     use super::*;
     use piper_can::{CanError, RealtimeTxAdapter, RxAdapter};
-    use piper_driver::BackendCapability;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -490,7 +450,6 @@ mod tests {
 
     fn build_driver(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> RobotPiper {
         RobotPiper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             IdleRxAdapter,
             RecordingTxAdapter::new(sent_frames),
             None,

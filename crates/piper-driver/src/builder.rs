@@ -10,7 +10,7 @@ use piper_can::SocketCanAdapter;
 use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_can::gs_usb::device::GsUsbDeviceSelector;
 use piper_can::{
-    BackendCapability, CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter,
+    CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter,
 };
 use std::time::Duration;
 
@@ -45,7 +45,6 @@ struct BuiltBackend {
     tx: Box<dyn RealtimeTxAdapter + Send>,
     interface: String,
     bus_speed: u32,
-    capability: BackendCapability,
 }
 
 impl BuiltBackend {
@@ -54,14 +53,12 @@ impl BuiltBackend {
         tx: impl RealtimeTxAdapter + Send + 'static,
         interface: impl Into<String>,
         bus_speed: u32,
-        capability: BackendCapability,
     ) -> Self {
         Self {
             rx: Box::new(rx),
             tx: Box::new(tx),
             interface: interface.into(),
             bus_speed,
-            capability,
         }
     }
 }
@@ -106,7 +103,7 @@ impl BackendFactory for RealBackendFactory {
             can.set_receive_timeout(receive_timeout);
             let capability = can.backend_capability();
             let (rx, tx) = can.split().map_err(DriverError::Can)?;
-            Ok(BuiltBackend::new(rx, tx, iface, baud_rate, capability))
+            Ok(BuiltBackend::new(rx, tx, iface, baud_rate))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -136,7 +133,6 @@ impl BackendFactory for RealBackendFactory {
             GsUsbCanAdapter::new_with_selector(device_selector).map_err(DriverError::Can)?;
         can.configure(baud_rate).map_err(DriverError::Can)?;
         can.set_receive_timeout(receive_timeout);
-        let capability = can.backend_capability();
         let (rx, tx) = can.split().map_err(DriverError::Can)?;
 
         let interface = match selector {
@@ -147,7 +143,7 @@ impl BackendFactory for RealBackendFactory {
             },
         };
 
-        Ok(BuiltBackend::new(rx, tx, interface, baud_rate, capability))
+        Ok(BuiltBackend::new(rx, tx, interface, baud_rate))
     }
 }
 
@@ -246,7 +242,6 @@ impl PiperBuilder {
         };
 
         Piper::new_dual_thread_parts(
-            backend.capability,
             backend.rx,
             backend.tx,
             Some(self.pipeline_config),
@@ -355,7 +350,6 @@ mod tests {
                 TestTxAdapter,
                 label,
                 bus_speed,
-                BackendCapability::StrictRealtime,
             )
         }
     }

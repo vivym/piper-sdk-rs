@@ -1084,18 +1084,17 @@ impl Piper {
         C::RxAdapter: Send + 'static,
         C::TxAdapter: Send + 'static,
     {
-        let backend_capability = can.backend_capability();
         let (rx_adapter, tx_adapter) = can.split()?;
-        Self::new_dual_thread_parts(backend_capability, rx_adapter, tx_adapter, config)
+        Self::new_dual_thread_parts(rx_adapter, tx_adapter, config)
     }
 
     /// 使用已拆分的 RX/TX 适配器创建双线程 runtime。
     pub fn new_dual_thread_parts(
-        backend_capability: BackendCapability,
         rx_adapter: impl RxAdapter + Send + 'static,
         tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
     ) -> Result<Self, CanError> {
+        let backend_capability = rx_adapter.backend_capability();
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
         let (soft_realtime_tx, soft_realtime_rx) =
@@ -1445,14 +1444,14 @@ impl Piper {
         }
     }
 
-    /// 获取主从模式控制模式指令状态（无锁）
+    /// 获取 0x151 控制模式回显状态（无锁）。
     ///
-    /// 包含控制模式、运动模式、速度等（主从模式下，~200Hz更新）。
+    /// 包含控制模式、运动模式、速度、MIT 模式和安装位置等字段。
     ///
     /// # 性能
     /// - 无锁读取（ArcSwap::load）
     /// - 返回快照副本
-    pub fn get_master_slave_control_mode(&self) -> MasterSlaveControlModeState {
+    pub fn get_control_mode_echo(&self) -> MasterSlaveControlModeState {
         self.ctx.master_slave_control_mode.load().as_ref().clone()
     }
 
@@ -1906,6 +1905,12 @@ impl Piper {
     ///
     /// 发送单个实时帧（向后兼容，API 不变）
     pub fn send_realtime(&self, frame: PiperFrame) -> Result<(), DriverError> {
+        if !self.backend_capability.is_strict_realtime() {
+            return Err(DriverError::InvalidInput(
+                "strict realtime delivery is only available on StrictRealtime backends"
+                    .to_string(),
+            ));
+        }
         self.send_realtime_command(RealtimeCommand::single(frame))
     }
 
@@ -1937,6 +1942,13 @@ impl Piper {
         frames: impl IntoIterator<Item = PiperFrame>,
     ) -> Result<(), DriverError> {
         use crate::command::FrameBuffer;
+
+        if !self.backend_capability.is_strict_realtime() {
+            return Err(DriverError::InvalidInput(
+                "strict realtime package delivery is only available on StrictRealtime backends"
+                    .to_string(),
+            ));
+        }
 
         let buffer: FrameBuffer = frames.into_iter().collect();
 
@@ -2441,6 +2453,18 @@ mod tests {
         }
     }
 
+    struct SoftRxAdapter;
+
+    impl piper_can::RxAdapter for SoftRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            Err(CanError::Timeout)
+        }
+
+        fn backend_capability(&self) -> BackendCapability {
+            BackendCapability::SoftRealtime
+        }
+    }
+
     struct FatalRxAdapter {
         tripped: bool,
     }
@@ -2464,6 +2488,36 @@ mod tests {
                 return Err(CanError::Timeout);
             }
             Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+    }
+
+    struct PartialTimeoutTxAdapter {
+        sends: usize,
+    }
+
+    impl piper_can::RealtimeTxAdapter for PartialTimeoutTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+
+            self.sends += 1;
+            if self.sends % 2 == 1 {
+                Ok(())
+            } else {
+                Err(CanError::Timeout)
+            }
         }
 
         fn send_shutdown_until(
@@ -2843,7 +2897,6 @@ mod tests {
     fn test_wait_for_feedback_uses_connection_monitor() {
         let frame = PiperFrame::new_standard(0x251, &[0; 8]);
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
             MockTxAdapter,
             None,
@@ -2852,6 +2905,50 @@ mod tests {
 
         assert!(piper.wait_for_feedback(Duration::from_millis(200)).is_ok());
         assert!(piper.health().connected);
+    }
+
+    #[test]
+    fn test_soft_realtime_rejects_strict_mailbox_apis() {
+        let piper = Piper::new_dual_thread_parts(SoftRxAdapter, MockTxAdapter, None).unwrap();
+
+        let single = piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01]));
+        assert!(matches!(single, Err(DriverError::InvalidInput(_))));
+
+        let package = piper.send_realtime_package([PiperFrame::new_standard(0x155, &[0x01])]);
+        assert!(matches!(package, Err(DriverError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_soft_realtime_deadline_miss_streak_counts_per_command_package() {
+        let piper = Piper::new_dual_thread_parts(
+            SoftRxAdapter,
+            PartialTimeoutTxAdapter { sends: 0 },
+            None,
+        )
+        .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, &[0x01]),
+            PiperFrame::new_standard(0x156, &[0x02]),
+        ];
+
+        for _ in 0..3 {
+            let error = piper
+                .send_soft_realtime_package_confirmed(frames, Duration::from_millis(200))
+                .expect_err("each partial package should time out");
+            assert!(matches!(error, DriverError::Timeout));
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        let metrics = piper.get_metrics();
+        assert_eq!(metrics.tx_soft_deadline_miss_total, 3);
+        assert_eq!(metrics.tx_soft_consecutive_deadline_miss_total, 2);
+        assert_eq!(metrics.tx_frames_sent_total, 3);
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert!(matches!(
+            piper.send_soft_realtime_package_confirmed(frames, Duration::from_millis(50)),
+            Err(DriverError::ControlPathClosed)
+        ));
     }
 
     #[test]
@@ -2881,7 +2978,6 @@ mod tests {
         let frame =
             PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"S-V1.8-1");
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
             MockTxAdapter,
             None,
@@ -2901,7 +2997,6 @@ mod tests {
             PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"S-V1.6");
         let frame_2 = PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"-3");
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             ScriptedRxAdapter::new(vec![frame_1, frame_2], Duration::from_millis(20)),
             MockTxAdapter,
             None,
@@ -2993,7 +3088,6 @@ mod tests {
     fn test_send_realtime_package_confirmed_success() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3018,7 +3112,6 @@ mod tests {
     fn test_enqueue_shutdown_success() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3038,7 +3131,6 @@ mod tests {
     #[test]
     fn test_enqueue_shutdown_channel_closed_when_tx_thread_exits() {
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             MockTxAdapter,
             None,
@@ -3064,7 +3156,6 @@ mod tests {
     #[test]
     fn test_enqueue_shutdown_reports_transport_failure() {
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             FailOnNthTxAdapter {
                 fail_on: 1,
@@ -3087,7 +3178,6 @@ mod tests {
     #[test]
     fn test_shutdown_receipt_times_out_waiting_for_ack() {
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             SlowTxAdapter {
                 delay: Duration::from_millis(50),
@@ -3109,7 +3199,6 @@ mod tests {
     #[test]
     fn test_shutdown_receipt_times_out_when_deadline_has_already_passed() {
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             SlowTxAdapter {
                 delay: Duration::from_millis(50),
@@ -3130,7 +3219,6 @@ mod tests {
     #[test]
     fn test_shutdown_receipt_returns_ready_ack_even_after_deadline_passes() {
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             MockTxAdapter,
             None,
@@ -3153,7 +3241,6 @@ mod tests {
     fn test_latch_fault_closes_normal_control_path_but_keeps_shutdown_lane() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3189,7 +3276,6 @@ mod tests {
     fn test_rx_fatal_keeps_shutdown_lane_available_while_tx_is_alive() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             FatalRxAdapter { tripped: false },
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3220,7 +3306,6 @@ mod tests {
     fn test_fault_latched_shutdown_preempts_pending_realtime_and_reliable_commands() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3260,7 +3345,6 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
             Piper::new_dual_thread_parts(
-                BackendCapability::StrictRealtime,
                 MockRxAdapter,
                 BlockingFirstSendTxAdapter {
                     sent_frames: sent_frames.clone(),
@@ -3314,7 +3398,6 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
             Piper::new_dual_thread_parts(
-                BackendCapability::StrictRealtime,
                 MockRxAdapter,
                 BlockingFirstSendTxAdapter {
                     sent_frames: sent_frames.clone(),
@@ -3458,7 +3541,6 @@ mod tests {
     #[test]
     fn test_send_realtime_package_confirmed_reports_partial_failure() {
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             FailOnNthTxAdapter {
                 fail_on: 2,
@@ -3494,7 +3576,6 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         drop(release_tx);
         let piper = Piper::new_dual_thread_parts(
-            BackendCapability::StrictRealtime,
             MockRxAdapter,
             CoordinatedFailTxAdapter {
                 started_tx,
@@ -3528,7 +3609,6 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
             Piper::new_dual_thread_parts(
-                BackendCapability::StrictRealtime,
                 MockRxAdapter,
                 CoordinatedFailTxAdapter {
                     started_tx,

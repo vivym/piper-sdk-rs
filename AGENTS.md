@@ -28,7 +28,7 @@ cargo test --test gs_usb_performance_tests -- --ignored --test-threads=1
 
 # Debug tools
 cargo test --test gs_usb_debug_scan -- --ignored --nocapture
-cargo test --test gs_usb_debug_step_by_step -- --ignored --nocapture
+./scripts/run_realtime_acceptance.sh gs-usb-soft
 ```
 
 ### Running Examples

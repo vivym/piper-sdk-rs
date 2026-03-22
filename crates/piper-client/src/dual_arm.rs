@@ -1462,7 +1462,7 @@ mod tests {
     use crate::state::StrictRealtime;
     use crate::types::RadPerSecond;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-    use piper_driver::{BackendCapability, Piper as RobotPiper};
+    use piper_driver::Piper as RobotPiper;
     use piper_protocol::control::MitControlCommand;
     use piper_protocol::ids::{
         ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
@@ -1724,7 +1724,6 @@ mod tests {
     {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                BackendCapability::StrictRealtime,
                 rx_adapter,
                 tx_adapter,
                 None,

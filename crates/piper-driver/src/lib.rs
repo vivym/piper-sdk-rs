@@ -33,7 +33,7 @@ pub use heartbeat::ConnectionMonitor;
 pub use hooks::{FrameCallback, HookHandle, HookManager};
 pub use metrics::{MetricsSnapshot, PiperMetrics};
 pub use mode::{AtomicDriverMode, DriverMode};
-pub use pipeline::{PipelineConfig, io_loop, rx_loop, tx_loop_mailbox};
+pub use pipeline::{PipelineConfig, rx_loop, tx_loop_mailbox};
 pub use piper::{
     HealthStatus, MaintenanceGate, MaintenanceGateState, MaintenanceLeaseAcquireResult,
     MaintenanceLeaseGate, MaintenanceLeaseSnapshot, MaintenanceRevocationEvent,

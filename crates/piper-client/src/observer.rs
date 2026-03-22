@@ -971,7 +971,6 @@ mod tests {
     ) -> (Arc<RobotPiper>, Observer<StrictRealtime>) {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                BackendCapability::StrictRealtime,
                 ScriptedRxAdapter::new(frames),
                 IdleTxAdapter,
                 None,
@@ -987,7 +986,6 @@ mod tests {
     ) -> (Arc<RobotPiper>, Observer<StrictRealtime>) {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                BackendCapability::StrictRealtime,
                 PacedRxAdapter::new(frames),
                 IdleTxAdapter,
                 None,
@@ -1003,7 +1001,6 @@ mod tests {
     ) -> (Arc<RobotPiper>, Observer<MonitorOnly>) {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                BackendCapability::MonitorOnly,
                 MonitorOnlyRxAdapter::new(frames),
                 IdleTxAdapter,
                 None,
@@ -1039,7 +1036,6 @@ mod tests {
         let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                BackendCapability::StrictRealtime,
                 ScriptedRxAdapter::new(vec![frame]),
                 IdleTxAdapter,
                 None,
@@ -1295,7 +1291,6 @@ mod tests {
     fn test_control_snapshot_prioritizes_incomplete_over_stale_and_misaligned() {
         let error = Observer::<StrictRealtime>::new(Arc::new(
             RobotPiper::new_dual_thread_parts(
-                BackendCapability::StrictRealtime,
                 ScriptedRxAdapter::new(Vec::new()),
                 IdleTxAdapter,
                 None,

@@ -12,7 +12,7 @@ Failed to set bitrate: USB error: Pipe error
 
 ### 逐步调试结果
 
-通过 `gs_usb_debug_step_by_step` 测试，逐步验证每个初始化步骤：
+早期调试时通过一个临时的逐步初始化 harness，逐步验证每个初始化步骤：
 
 1. ✅ **设备扫描**：成功找到设备
 2. ✅ **准备接口**：成功声明接口
@@ -107,14 +107,11 @@ pub fn prepare_interface(&mut self) -> Result<(), GsUsbError> {
 ⚠️ **重要**：设备是独占的，必须使用 `--test-threads=1` 串行运行：
 
 ```bash
-# 逐步调试
-cargo test --test gs_usb_debug_step_by_step -- --ignored --nocapture
+# 设备扫描
+cargo test --test gs_usb_debug_scan -- --ignored --nocapture
 
 # Stage 1 测试（串行）
 cargo test --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1 --nocapture
-
-# 设备扫描
-cargo test --test gs_usb_debug_scan -- --ignored --nocapture
 ```
 
 ## 测试结果（串行运行后）
@@ -132,4 +129,3 @@ cargo test --test gs_usb_debug_scan -- --ignored --nocapture
 ## 注意事项
 
 ⚠️ **设备可能因 reset 断开**：如果运行测试后设备找不到，可能需要重新插拔 USB 设备。
-

@@ -23,6 +23,55 @@ cargo test --test gs_usb_integration_tests -- --ignored --test-threads=1
 cargo test --test gs_usb_performance_tests -- --ignored --test-threads=1
 ```
 
+### 一键运行实时验收
+
+仓库提供了统一脚本：
+
+```bash
+# SocketCAN StrictRealtime 验收（默认 can0）
+./scripts/run_realtime_acceptance.sh socketcan-strict
+
+# 指定 SocketCAN 接口
+PIPER_TEST_SOCKETCAN_IFACE=vcan0 ./scripts/run_realtime_acceptance.sh socketcan-strict
+
+# GS-USB SoftRealtime 验收
+./scripts/run_realtime_acceptance.sh gs-usb-soft
+
+# 顺序跑完整套
+./scripts/run_realtime_acceptance.sh all
+```
+
+脚本覆盖两类验收：
+- `socketcan-strict`: SocketCAN 超时配置 + StrictRealtime benchmark
+- `gs-usb-soft`: GS-USB 超时配置 + GS-USB 性能测试
+
+脚本默认会把每一步的日志、环境快照和汇总报告写到：
+
+```bash
+artifacts/realtime_acceptance/<timestamp>/
+```
+
+其中包括：
+- `summary.md`: 验收步骤汇总
+- `environment.txt`: 运行环境快照
+- `git-status.txt`: 工作区状态
+- `git-diff-stat.txt`: 当前代码变更摘要
+- `logs/*.log`: 每一步的完整日志
+
+常用环境变量：
+
+```bash
+# 自定义产物目录
+PIPER_ACCEPTANCE_OUT_DIR=/tmp/piper-acceptance ./scripts/run_realtime_acceptance.sh all
+
+# 失败后继续跑完剩余步骤，并把所有失败都记录下来
+PIPER_ACCEPTANCE_CONTINUE_ON_FAILURE=1 ./scripts/run_realtime_acceptance.sh all
+```
+
+失败时脚本会自动追加诊断：
+- `socketcan-strict`: 记录 `ip -details link show <iface>`
+- `gs-usb-soft`: 运行 `gs_usb_debug_scan`
+
 ### 方法 2：运行单个测试（自动串行）
 
 ```bash
@@ -38,7 +87,6 @@ cargo test --test gs_usb_stage1_loopback_tests -- --ignored test_loopback_end_to
 | `gs_usb_integration_tests.rs` | 集成测试（基本功能验证） | ✅ 是 |
 | `gs_usb_performance_tests.rs` | 性能测试（1kHz 等） | ✅ 是 |
 | `gs_usb_debug_scan.rs` | 设备扫描诊断工具 | ✅ 是 |
-| `gs_usb_debug_step_by_step.rs` | 逐步初始化调试工具 | ✅ 是 |
 
 ## 单元测试
 
@@ -66,8 +114,11 @@ cargo test --test gs_usb_debug_scan -- --ignored --nocapture
 ```
 
 ### 逐步初始化调试
+当前仓库没有单独的 `gs_usb_debug_step_by_step` 测试文件。
+如需现场诊断，优先使用：
+
 ```bash
-cargo test --test gs_usb_debug_step_by_step -- --ignored --nocapture
+cargo test --test gs_usb_debug_scan -- --ignored --nocapture
 ```
 
 这些工具可以帮助诊断设备连接、权限和初始化问题。

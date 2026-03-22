@@ -124,8 +124,12 @@ fn test_socketcan_timeout_config() {
     use piper_sdk::can::SocketCanAdapter;
     use std::time::Duration;
 
+    let interface =
+        std::env::var("PIPER_TEST_SOCKETCAN_IFACE").unwrap_or_else(|_| "can0".to_string());
+
     // 测试不同的超时配置
-    let mut adapter = SocketCanAdapter::new("can0").expect("Failed to create SocketCAN adapter");
+    let mut adapter =
+        SocketCanAdapter::new(&interface).expect("Failed to create SocketCAN adapter");
 
     // 设置 2ms 超时
     adapter
@@ -137,7 +141,7 @@ fn test_socketcan_timeout_config() {
     match adapter.receive() {
         Err(piper_sdk::can::CanError::Timeout) => {
             let elapsed = start.elapsed();
-            println!("SocketCAN timeout: {:?}", elapsed);
+            println!("SocketCAN timeout on {}: {:?}", interface, elapsed);
 
             // 超时应该在 2-5ms 范围内（允许一些抖动，CI环境会放宽上限）
             let max_threshold = adjust_threshold_ms(10);

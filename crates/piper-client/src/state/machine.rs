@@ -16,7 +16,9 @@ use crate::{
     raw_commander::RawCommander,
 };
 use piper_driver::BackendCapability;
-use piper_protocol::control::{InstallPosition, MitControlCommand};
+use piper_protocol::control::{
+    InstallPosition, MitControlCommand, MitMode as ProtocolMitMode,
+};
 use piper_protocol::feedback::{ControlMode, MoveMode};
 use tracing::{debug, info, trace};
 
@@ -54,17 +56,7 @@ pub struct MitPassthroughMode;
 /// 位置模式
 ///
 /// 纯位置控制模式。
-pub struct PositionMode {
-    /// 发送策略配置
-    pub(crate) send_strategy: SendStrategy,
-}
-
-impl PositionMode {
-    /// 使用指定策略创建位置模式
-    pub(crate) fn with_strategy(send_strategy: SendStrategy) -> Self {
-        Self { send_strategy }
-    }
-}
+pub struct PositionMode;
 
 /// 错误状态
 ///
@@ -121,6 +113,16 @@ pub struct ErrorState;
 /// # }
 /// ```
 pub struct ReplayMode;
+
+#[derive(Clone, Copy)]
+struct ModeConfirmationExpectation {
+    control_mode: u8,
+    move_mode: u8,
+    speed_percent: u8,
+    mit_mode: u8,
+    install_position: u8,
+    trajectory_stay_time: u8,
+}
 
 // ==================== 运动类型 ====================
 
@@ -269,16 +271,6 @@ pub struct PositionModeConfig {
     /// - `Circular`: 使用 `move_circular()` 方法
     /// - `ContinuousPositionVelocity`: 待实现
     pub motion_type: MotionType,
-    /// 发送策略（新增）
-    ///
-    /// 默认为 `SendStrategy::Auto`，根据命令类型自动选择：
-    /// - 位置命令：使用 Reliable（队列模式，不丢失）
-    /// - MIT 力控命令：使用 Realtime（邮箱模式，零延迟）
-    ///
-    /// **配置建议**：
-    /// - 轨迹控制：保持 `Auto` 或显式设置为 `Reliable`
-    /// - 高频力控：仅在 MIT 模式下设置为 `Realtime`
-    pub send_strategy: SendStrategy,
 }
 
 impl Default for PositionModeConfig {
@@ -290,47 +282,8 @@ impl Default for PositionModeConfig {
             speed_percent: 50,                          // 默认 50% 速度
             install_position: InstallPosition::Invalid, // 默认无效值（不设置安装位置）
             motion_type: MotionType::Joint,             // ✅ 默认关节模式，向后兼容
-            send_strategy: SendStrategy::Auto,          // 默认自动选择策略
         }
     }
-}
-
-/// 发送策略配置
-///
-/// 决定不同类型命令的发送方式：
-/// - **Realtime**：邮箱模式，零延迟，可覆盖（适用于高频力控）
-/// - **Reliable**：队列模式，按顺序，不丢失（适用于轨迹控制）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SendStrategy {
-    /// 自动选择（推荐）
-    ///
-    /// 根据控制模式自动选择最优策略：
-    /// - MIT 模式：使用 Realtime
-    /// - Position 模式：使用 Reliable
-    #[default]
-    Auto,
-
-    /// 强制实时模式
-    ///
-    /// **使用场景**：超高频力控（>1kHz）
-    /// **风险**：命令可能被覆盖
-    Realtime,
-
-    /// 强制可靠模式
-    ///
-    /// **使用场景**：轨迹控制、序列指令
-    /// **保证**：命令按顺序发送，不丢失
-    /// **配置**：可设置超时和到达确认
-    Reliable {
-        /// 单个命令发送超时（默认 10ms）
-        timeout: Duration,
-
-        /// 是否确认到达（默认 true）
-        ///
-        /// 如果启用，会阻塞等待每个命令完成（增加延迟）
-        /// 如果禁用，只保证进入队列，不保证已发送
-        check_arrival: bool,
-    },
 }
 
 /// 失能配置（带 Debounce 参数）
@@ -366,7 +319,7 @@ impl Default for DisableConfig {
 ///
 /// # 内存开销
 ///
-/// 大部分状态是零大小类型（ZST），除了 `Active<PositionMode>` 包含 `send_strategy` 配置。
+/// 大部分状态是零大小类型（ZST）。
 pub struct Piper<State = Disconnected, Capability = UnspecifiedCapability> {
     pub(crate) driver: Arc<piper_driver::Piper>,
     pub(crate) observer: Observer<Capability>,
@@ -661,10 +614,17 @@ where
         self.driver.send_reliable(control_cmd.to_frame())?;
         self.wait_for_mode_confirmation(
             baseline,
+            self.driver.get_control_mode_echo(),
             config.timeout,
             config.poll_interval,
-            ControlMode::CanControl as u8,
-            MoveMode::MoveM as u8,
+            ModeConfirmationExpectation {
+                control_mode: ControlMode::CanControl as u8,
+                move_mode: MoveMode::MoveM as u8,
+                speed_percent: config.speed_percent,
+                mit_mode: ProtocolMitMode::Mit as u8,
+                install_position: InstallPosition::Invalid as u8,
+                trajectory_stay_time: 0,
+            },
         )?;
         info!("Robot enabled - Active<MitMode>");
 
@@ -721,14 +681,20 @@ where
         self.driver.send_reliable(control_cmd.to_frame())?;
         self.wait_for_mode_confirmation(
             baseline,
+            self.driver.get_control_mode_echo(),
             config.timeout,
             config.poll_interval,
-            ControlMode::CanControl as u8,
-            move_mode as u8,
+            ModeConfirmationExpectation {
+                control_mode: ControlMode::CanControl as u8,
+                move_mode: move_mode as u8,
+                speed_percent: config.speed_percent,
+                mit_mode: ProtocolMitMode::PositionVelocity as u8,
+                install_position: config.install_position as u8,
+                trajectory_stay_time: 0,
+            },
         )?;
         info!("Robot enabled - Active<PositionMode>");
-        let position_mode = PositionMode::with_strategy(config.send_strategy);
-        Ok(transition_piper_state(self, Active(position_mode)))
+        Ok(transition_piper_state(self, Active(PositionMode)))
     }
 
     /// 使能全部关节并切换到 MIT 模式
@@ -899,10 +865,10 @@ where
     fn wait_for_mode_confirmation(
         &self,
         baseline: piper_driver::RobotControlState,
+        baseline_mode_echo: piper_driver::MasterSlaveControlModeState,
         timeout: Duration,
         poll_interval: Duration,
-        expected_control_mode: u8,
-        expected_move_mode: u8,
+        expected: ModeConfirmationExpectation,
     ) -> Result<()> {
         let start = Instant::now();
 
@@ -914,12 +880,26 @@ where
             }
 
             let current = self.driver.get_robot_control();
-            let is_fresh = current.hardware_timestamp_us > baseline.hardware_timestamp_us
+            let mode_echo = self.driver.get_control_mode_echo();
+            let is_robot_state_fresh = current.hardware_timestamp_us > baseline.hardware_timestamp_us
                 || current.host_rx_mono_us > baseline.host_rx_mono_us;
-            let is_match = current.is_enabled
-                && current.control_mode == expected_control_mode
-                && current.move_mode == expected_move_mode;
-            if is_fresh && is_match {
+            let is_robot_state_match = current.is_enabled
+                && current.control_mode == expected.control_mode
+                && current.move_mode == expected.move_mode;
+            let is_mode_echo_fresh = mode_echo.is_valid
+                && (mode_echo.hardware_timestamp_us > baseline_mode_echo.hardware_timestamp_us
+                    || mode_echo.host_rx_mono_us > baseline_mode_echo.host_rx_mono_us);
+            let is_mode_echo_match = mode_echo.control_mode == expected.control_mode
+                && mode_echo.move_mode == expected.move_mode
+                && mode_echo.speed_percent == expected.speed_percent
+                && mode_echo.mit_mode == expected.mit_mode
+                && mode_echo.install_position == expected.install_position
+                && mode_echo.trajectory_stay_time == expected.trajectory_stay_time;
+            if is_robot_state_fresh
+                && is_robot_state_match
+                && is_mode_echo_fresh
+                && is_mode_echo_match
+            {
                 return Ok(());
             }
 
@@ -1267,10 +1247,17 @@ impl Piper<Standby, SoftRealtime> {
         self.driver.send_reliable(control_cmd.to_frame())?;
         self.wait_for_mode_confirmation(
             baseline,
+            self.driver.get_control_mode_echo(),
             config.timeout,
             config.poll_interval,
-            ControlMode::CanControl as u8,
-            MoveMode::MoveM as u8,
+            ModeConfirmationExpectation {
+                control_mode: ControlMode::CanControl as u8,
+                move_mode: MoveMode::MoveM as u8,
+                speed_percent: config.speed_percent,
+                mit_mode: ProtocolMitMode::Mit as u8,
+                install_position: InstallPosition::Invalid as u8,
+                trajectory_stay_time: 0,
+            },
         )?;
 
         Ok(transition_piper_state(self, Active(MitPassthroughMode)))
@@ -2083,7 +2070,7 @@ where
     /// ```
     pub fn send_position_command(&self, positions: &JointArray<Rad>) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_position_command_batch(positions, self._state.0.send_strategy)
+        raw.send_position_command_batch(positions)
     }
 
     /// 发送末端位姿命令（笛卡尔空间控制）
@@ -2116,7 +2103,7 @@ where
         orientation: EulerAngles,
     ) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_end_pose_command(position, orientation, self._state.0.send_strategy)
+        raw.send_end_pose_command(position, orientation)
     }
 
     /// 发送直线运动命令
@@ -2147,7 +2134,7 @@ where
     /// ```
     pub fn move_linear(&self, position: Position3D, orientation: EulerAngles) -> Result<()> {
         let raw = RawCommander::new(&self.driver);
-        raw.send_end_pose_command(position, orientation, self._state.0.send_strategy)
+        raw.send_end_pose_command(position, orientation)
     }
 
     /// 发送圆弧运动命令
@@ -2193,7 +2180,6 @@ where
             via_orientation,
             target_position,
             target_orientation,
-            self._state.0.send_strategy,
         )
     }
 
@@ -2771,6 +2757,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Duration;
 
     struct IdleRxAdapter;
 
@@ -2795,6 +2782,37 @@ mod tests {
     impl RxAdapter for ScriptedRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
             self.frames.pop_front().ok_or(CanError::Timeout)
+        }
+    }
+
+    struct TimedFrame {
+        delay: Duration,
+        frame: PiperFrame,
+    }
+
+    struct PacedRxAdapter {
+        frames: VecDeque<TimedFrame>,
+    }
+
+    impl PacedRxAdapter {
+        fn new(frames: Vec<TimedFrame>) -> Self {
+            Self {
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl RxAdapter for PacedRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            match self.frames.pop_front() {
+                Some(timed) => {
+                    if !timed.delay.is_zero() {
+                        thread::sleep(timed.delay);
+                    }
+                    Ok(timed.frame)
+                },
+                None => Err(CanError::Timeout),
+            }
         }
     }
 
@@ -2840,7 +2858,6 @@ mod tests {
     ) -> Piper<Active<MitMode>, StrictRealtime> {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                piper_driver::BackendCapability::StrictRealtime,
                 IdleRxAdapter,
                 RecordingTxAdapter::new(sent_frames),
                 None,
@@ -2866,7 +2883,32 @@ mod tests {
             driver,
             observer,
             quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
-            _state: Active(PositionMode::with_strategy(SendStrategy::default())),
+            _state: Active(PositionMode),
+        }
+    }
+
+    fn build_standby_piper<R>(
+        rx_adapter: R,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    ) -> Piper<Standby, StrictRealtime>
+    where
+        R: RxAdapter + Send + 'static,
+    {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                rx_adapter,
+                RecordingTxAdapter::new(sent_frames),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
+
+        Piper {
+            driver,
+            observer,
+            quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            _state: Standby,
         }
     }
 
@@ -2884,6 +2926,67 @@ mod tests {
         frame
     }
 
+    fn joint_driver_enabled_frame(joint_index: u8, timestamp_us: u64) -> PiperFrame {
+        let id = piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_BASE + (joint_index as u32) - 1;
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&240u16.to_be_bytes());
+        data[2..4].copy_from_slice(&45i16.to_be_bytes());
+        data[4] = 50;
+        data[5] = 0x40;
+        data[6..8].copy_from_slice(&5000u16.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(id as u16, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn robot_status_frame(control_mode: ControlMode, move_mode: MoveMode, timestamp_us: u64) -> PiperFrame {
+        let mut frame = PiperFrame::new_standard(
+            piper_protocol::ids::ID_ROBOT_STATUS as u16,
+            &[
+                control_mode as u8,
+                piper_protocol::feedback::RobotStatus::Normal as u8,
+                move_mode as u8,
+                piper_protocol::feedback::TeachStatus::Closed as u8,
+                piper_protocol::feedback::MotionStatus::Arrived as u8,
+                0,
+                0,
+                0,
+            ],
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn control_mode_echo_frame(
+        control_mode: piper_protocol::control::ControlModeCommand,
+        move_mode: MoveMode,
+        speed_percent: u8,
+        mit_mode: piper_protocol::control::MitMode,
+        install_position: InstallPosition,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut frame = piper_protocol::control::ControlModeCommandFrame::new(
+            control_mode,
+            move_mode,
+            speed_percent,
+            mit_mode,
+            0,
+            install_position,
+        )
+        .to_frame();
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn enabled_joint_frames() -> Vec<TimedFrame> {
+        (1..=6)
+            .map(|joint_index| TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_enabled_frame(joint_index, joint_index as u64),
+            })
+            .collect()
+    }
+
     #[test]
     fn test_state_type_sizes() {
         // 大部分状态类型是 ZST（零大小类型）
@@ -2895,9 +2998,8 @@ mod tests {
         // Active<MitMode> 包含 MitMode（ZST），所以也是 ZST
         assert_eq!(std::mem::size_of::<Active<MitMode>>(), 0);
 
-        // PositionMode 包含 SendStrategy，不是 ZST
-        assert!(std::mem::size_of::<PositionMode>() > 0);
-        assert!(std::mem::size_of::<Active<PositionMode>>() > 0);
+        assert_eq!(std::mem::size_of::<PositionMode>(), 0);
+        assert_eq!(std::mem::size_of::<Active<PositionMode>>(), 0);
     }
 
     #[test]
@@ -2936,11 +3038,110 @@ mod tests {
     }
 
     #[test]
+    fn enable_mit_mode_times_out_without_fresh_control_mode_echo() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames();
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
+        let error = match standby.enable_mit_mode(MitModeConfig {
+                timeout: Duration::from_millis(50),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 100,
+            }) {
+            Ok(_) => panic!("missing 0x151 echo must block Active<MitMode>"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
+        assert!(
+            sent_frames
+                .lock()
+                .expect("sent frames lock")
+                .iter()
+                .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
+            "mode switch command should still be sent before confirmation times out"
+        );
+    }
+
+    #[test]
+    fn enable_position_mode_rejects_mismatched_control_mode_echo() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames();
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveL, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(5),
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveL,
+                40,
+                piper_protocol::control::MitMode::PositionVelocity,
+                InstallPosition::Invalid,
+                101,
+            ),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames);
+        let error = match standby.enable_position_mode(PositionModeConfig {
+                timeout: Duration::from_millis(50),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 40,
+                install_position: InstallPosition::Horizontal,
+                motion_type: MotionType::Linear,
+            }) {
+            Ok(_) => panic!("mismatched 0x151 echo must reject Active<PositionMode>"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
+    }
+
+    #[test]
+    fn enable_mit_mode_succeeds_with_fresh_matching_robot_and_echo() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames();
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(5),
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveM,
+                80,
+                piper_protocol::control::MitMode::Mit,
+                InstallPosition::Invalid,
+                101,
+            ),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames);
+        let active = standby
+            .enable_mit_mode(MitModeConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 80,
+            })
+            .expect("fresh matching 0x2A1 + 0x151 should allow Active<MitMode>");
+
+        assert!(active.observer().is_all_enabled());
+    }
+
+    #[test]
     fn command_position_from_snapshot_does_not_require_driver_feedback() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                piper_driver::BackendCapability::StrictRealtime,
                 IdleRxAdapter,
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
@@ -2962,7 +3163,6 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                piper_driver::BackendCapability::StrictRealtime,
                 ScriptedRxAdapter::new(vec![
                     joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, 1_000),
                     joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, 1_000),

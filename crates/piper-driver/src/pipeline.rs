@@ -12,8 +12,10 @@ use crate::piper::{
 };
 use crate::state::*;
 use crossbeam_channel::Receiver;
+#[cfg(test)]
+use piper_can::CanAdapter;
 use piper_can::{
-    BackendCapability, CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
+    BackendCapability, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
 };
 use piper_protocol::config::*;
 use piper_protocol::feedback::*;
@@ -63,6 +65,31 @@ fn count_package_fault_aborted(metrics: &Arc<PiperMetrics>) {
 
 fn count_package_transport_failed(metrics: &Arc<PiperMetrics>) {
     metrics.tx_packages_transport_failed_total.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_soft_deadline_miss(
+    metrics: &Arc<PiperMetrics>,
+    soft_deadline_miss_streak: &mut u32,
+    runtime_phase: &Arc<AtomicU8>,
+    last_fault: &Arc<AtomicU8>,
+    maintenance_gate: &Arc<MaintenanceGate>,
+) {
+    metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
+    if *soft_deadline_miss_streak > 0 {
+        metrics
+            .tx_soft_consecutive_deadline_miss_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    *soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
+    if *soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
+        record_fault(last_fault, RuntimeFaultKind::TransportError);
+        store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
+        maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+    }
+}
+
+fn reset_soft_deadline_miss_streak(soft_deadline_miss_streak: &mut u32) {
+    *soft_deadline_miss_streak = 0;
 }
 
 fn reliable_abort_error(fault_latched: bool) -> crate::DriverError {
@@ -516,8 +543,10 @@ fn flush_pending_velocity_on_idle(
 /// - `cmd_rx`: 命令接收通道（从控制线程接收控制帧）
 /// - `ctx`: 共享状态上下文
 /// - `config`: Pipeline 配置
-pub fn io_loop(
+#[cfg(test)]
+pub(crate) fn io_loop(
     mut can: impl CanAdapter,
+    backend_capability: BackendCapability,
     cmd_rx: Receiver<PiperFrame>,
     ctx: Arc<PiperContext>,
     config: PipelineConfig,
@@ -581,7 +610,7 @@ pub fn io_loop(
                 // 如果缓冲区不为空，且距离上次速度帧到达已经超时，强制提交或丢弃
                 flush_pending_velocity_on_idle(
                     &ctx,
-                    BackendCapability::StrictRealtime,
+                    backend_capability,
                     &config,
                     &mut state,
                     &metrics,
@@ -603,7 +632,7 @@ pub fn io_loop(
         // ============================================================
         parse_and_update_state(
             &frame,
-            BackendCapability::StrictRealtime,
+            backend_capability,
             &ctx,
             &config,
             &mut state,
@@ -649,7 +678,8 @@ pub fn io_loop(
 ///
 /// # 返回值
 /// 返回是否检测到通道已断开（Disconnected）。
-fn drain_tx_queue(can: &mut impl CanAdapter, cmd_rx: &Receiver<PiperFrame>) -> bool {
+#[cfg(test)]
+fn drain_tx_queue(can: &mut impl piper_can::CanAdapter, cmd_rx: &Receiver<PiperFrame>) -> bool {
     // 限制单次 drain 的最大帧数和时间预算，避免长时间占用
     const MAX_DRAIN_PER_CYCLE: usize = 32;
     const TIME_BUDGET: Duration = Duration::from_micros(500); // 给发送最多 0.5ms 预算
@@ -1057,6 +1087,7 @@ pub fn tx_loop_mailbox(
             let mut sent_count = 0usize;
             let mut send_result = Ok(());
             let mut should_break = false;
+            let mut deadline_missed = false;
 
             for frame in frames {
                 let Some(permit) = normal_send_gate.acquire() else {
@@ -1071,22 +1102,7 @@ pub fn tx_loop_mailbox(
                 }
 
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
-                    if soft_deadline_miss_streak > 0 {
-                        metrics
-                            .tx_soft_consecutive_deadline_miss_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
-                    if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
-                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        refresh_local_maintenance_tx_state(
-                            &maintenance_gate,
-                            &mut maintenance_tx_state,
-                            MaintenanceGateState::DeniedFaulted,
-                        );
-                    }
+                    deadline_missed = true;
                     send_result = Err(crate::DriverError::Timeout);
                     break;
                 };
@@ -1094,7 +1110,6 @@ pub fn tx_loop_mailbox(
                 match tx.send_control(frame, remaining.max(SOFT_CONTROL_SEND_MIN_DEADLINE)) {
                     Ok(_) => {
                         sent_count += 1;
-                        soft_deadline_miss_streak = 0;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
                         if let Ok(hooks) = ctx.hooks.try_read() {
                             hooks.trigger_all_sent(&frame);
@@ -1102,22 +1117,7 @@ pub fn tx_loop_mailbox(
                     },
                     Err(CanError::Timeout) => {
                         metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                        metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
-                        if soft_deadline_miss_streak > 0 {
-                            metrics
-                                .tx_soft_consecutive_deadline_miss_total
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
-                        if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
-                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                            refresh_local_maintenance_tx_state(
-                                &maintenance_gate,
-                                &mut maintenance_tx_state,
-                                MaintenanceGateState::DeniedFaulted,
-                            );
-                        }
+                        deadline_missed = true;
                         send_result = Err(crate::DriverError::Timeout);
                         break;
                     },
@@ -1142,6 +1142,24 @@ pub fn tx_loop_mailbox(
             }
 
             let _ = ack.send(send_result);
+            if deadline_missed {
+                record_soft_deadline_miss(
+                    &metrics,
+                    &mut soft_deadline_miss_streak,
+                    &runtime_phase,
+                    &last_fault,
+                    &maintenance_gate,
+                );
+                if load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched {
+                    refresh_local_maintenance_tx_state(
+                        &maintenance_gate,
+                        &mut maintenance_tx_state,
+                        MaintenanceGateState::DeniedFaulted,
+                    );
+                }
+            } else if sent_count == total_frames {
+                reset_soft_deadline_miss_streak(&mut soft_deadline_miss_streak);
+            }
             if should_break {
                 break;
             }
@@ -1183,7 +1201,6 @@ pub fn tx_loop_mailbox(
                     } else {
                         match tx.send_control(frame, normal_send_budget) {
                             Ok(_) => {
-                                soft_deadline_miss_streak = 0;
                                 metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 
                                 if let Ok(hooks) = ctx.hooks.try_read() {
@@ -1193,23 +1210,6 @@ pub fn tx_loop_mailbox(
                             },
                             Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
                                 metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                                metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
-                                if soft_deadline_miss_streak > 0 {
-                                    metrics
-                                        .tx_soft_consecutive_deadline_miss_total
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                                soft_deadline_miss_streak =
-                                    soft_deadline_miss_streak.saturating_add(1);
-                                if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
-                                    record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                                    store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                                    refresh_local_maintenance_tx_state(
-                                        &maintenance_gate,
-                                        &mut maintenance_tx_state,
-                                        MaintenanceGateState::DeniedFaulted,
-                                    );
-                                }
                                 Err(crate::DriverError::Timeout)
                             },
                             Err(e) => {
@@ -1238,7 +1238,6 @@ pub fn tx_loop_mailbox(
             } else {
                 match tx.send_control(frame, normal_send_budget) {
                     Ok(_) => {
-                        soft_deadline_miss_streak = 0;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 
                         if let Ok(hooks) = ctx.hooks.try_read() {
@@ -1248,22 +1247,6 @@ pub fn tx_loop_mailbox(
                     },
                     Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
                         metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                        metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
-                        if soft_deadline_miss_streak > 0 {
-                            metrics
-                                .tx_soft_consecutive_deadline_miss_total
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
-                        if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
-                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                            refresh_local_maintenance_tx_state(
-                                &maintenance_gate,
-                                &mut maintenance_tx_state,
-                                MaintenanceGateState::DeniedFaulted,
-                            );
-                        }
                         Err(crate::DriverError::Timeout)
                     },
                     Err(e) => {
@@ -1286,12 +1269,40 @@ pub fn tx_loop_mailbox(
             };
 
             let should_break = matches!(
-                send_result,
+                &send_result,
                 Err(crate::DriverError::ReliableDeliveryFailed { .. })
                     | Err(crate::DriverError::ChannelClosed)
             );
+            let soft_outcome = if backend_capability.is_soft_realtime() {
+                Some(matches!(&send_result, Ok(())))
+            } else {
+                None
+            };
+            let soft_timed_out = backend_capability.is_soft_realtime()
+                && matches!(&send_result, Err(crate::DriverError::Timeout));
             if let Some(ack) = ack {
                 let _ = ack.send(send_result);
+            }
+
+            if let Some(soft_succeeded) = soft_outcome {
+                if soft_succeeded {
+                    reset_soft_deadline_miss_streak(&mut soft_deadline_miss_streak);
+                } else if soft_timed_out {
+                    record_soft_deadline_miss(
+                        &metrics,
+                        &mut soft_deadline_miss_streak,
+                        &runtime_phase,
+                        &last_fault,
+                        &maintenance_gate,
+                    );
+                    if load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched {
+                        refresh_local_maintenance_tx_state(
+                            &maintenance_gate,
+                            &mut maintenance_tx_state,
+                            MaintenanceGateState::DeniedFaulted,
+                        );
+                    }
+                }
             }
 
             if should_break {
@@ -2173,7 +2184,13 @@ mod tests {
         let ctx_clone = ctx.clone();
         let config = PipelineConfig::default();
         let handle = thread::spawn(move || {
-            io_loop(mock_can, cmd_rx, ctx_clone, config);
+            io_loop(
+                mock_can,
+                BackendCapability::StrictRealtime,
+                cmd_rx,
+                ctx_clone,
+                config,
+            );
         });
 
         // 等待 io_loop 处理帧（需要多次循环才能处理完）
@@ -2209,7 +2226,13 @@ mod tests {
 
         let config = PipelineConfig::default();
         let handle = thread::spawn(move || {
-            io_loop(mock_can, cmd_rx, ctx, config);
+            io_loop(
+                mock_can,
+                BackendCapability::StrictRealtime,
+                cmd_rx,
+                ctx,
+                config,
+            );
         });
 
         // 发送命令帧
