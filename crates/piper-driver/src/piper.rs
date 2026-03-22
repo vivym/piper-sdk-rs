@@ -1194,8 +1194,27 @@ impl Piper {
         C::RxAdapter: Send + 'static,
         C::TxAdapter: Send + 'static,
     {
+        Self::new_dual_thread_with_startup_timeout(can, config, STRICT_TIMESTAMP_VALIDATION_TIMEOUT)
+    }
+
+    /// 使用显式的 strict 启动验收超时创建双线程 runtime。
+    pub fn new_dual_thread_with_startup_timeout<C>(
+        can: C,
+        config: Option<PipelineConfig>,
+        startup_timeout: Duration,
+    ) -> Result<Self, DriverError>
+    where
+        C: SplittableAdapter + Send + 'static,
+        C::RxAdapter: Send + 'static,
+        C::TxAdapter: Send + 'static,
+    {
         let (rx_adapter, tx_adapter) = can.split().map_err(DriverError::Can)?;
-        Self::new_dual_thread_parts(rx_adapter, tx_adapter, config)
+        Self::new_dual_thread_parts_with_startup_timeout(
+            rx_adapter,
+            tx_adapter,
+            config,
+            startup_timeout,
+        )
     }
 
     /// 使用已拆分的 RX/TX 适配器创建双线程 runtime。
@@ -1204,9 +1223,24 @@ impl Piper {
         tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
     ) -> Result<Self, DriverError> {
+        Self::new_dual_thread_parts_with_startup_timeout(
+            rx_adapter,
+            tx_adapter,
+            config,
+            STRICT_TIMESTAMP_VALIDATION_TIMEOUT,
+        )
+    }
+
+    /// 使用显式的 strict 启动验收超时创建双线程 runtime。
+    pub fn new_dual_thread_parts_with_startup_timeout(
+        rx_adapter: impl RxAdapter + Send + 'static,
+        tx_adapter: impl RealtimeTxAdapter + Send + 'static,
+        config: Option<PipelineConfig>,
+        startup_timeout: Duration,
+    ) -> Result<Self, DriverError> {
         let piper = Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
             .map_err(DriverError::Can)?;
-        piper.validate_startup()
+        piper.validate_startup(startup_timeout)
     }
 
     fn new_dual_thread_parts_internal(
@@ -1319,13 +1353,12 @@ impl Piper {
         Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
     }
 
-    fn validate_startup(self) -> Result<Self, DriverError> {
+    fn validate_startup(self, startup_timeout: Duration) -> Result<Self, DriverError> {
         if !self.backend_capability.is_strict_realtime() {
             return Ok(self);
         }
 
-        if let Err(error) = self.wait_for_timestamped_feedback(STRICT_TIMESTAMP_VALIDATION_TIMEOUT)
-        {
+        if let Err(error) = self.wait_for_timestamped_feedback(startup_timeout) {
             self.request_stop();
             return Err(error);
         }
@@ -2672,7 +2705,7 @@ mod tests {
 
     impl BootstrappedMockRxAdapter {
         fn new() -> Self {
-            let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+            let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
             frame.timestamp_us = 1;
             Self {
                 bootstrap: Some(frame),
@@ -2698,6 +2731,57 @@ mod tests {
 
         fn backend_capability(&self) -> BackendCapability {
             BackendCapability::SoftRealtime
+        }
+    }
+
+    struct TimestampedJunkRxAdapter {
+        emitted: bool,
+    }
+
+    impl TimestampedJunkRxAdapter {
+        fn new() -> Self {
+            Self { emitted: false }
+        }
+    }
+
+    impl piper_can::RxAdapter for TimestampedJunkRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            if !self.emitted {
+                self.emitted = true;
+                let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+                frame.timestamp_us = 123;
+                return Ok(frame);
+            }
+            Err(CanError::Timeout)
+        }
+    }
+
+    struct DelayedTimestampedFeedbackRxAdapter {
+        delay: Duration,
+        emitted: bool,
+    }
+
+    impl DelayedTimestampedFeedbackRxAdapter {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                emitted: false,
+            }
+        }
+    }
+
+    impl piper_can::RxAdapter for DelayedTimestampedFeedbackRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            if !self.emitted {
+                self.emitted = true;
+                if !self.delay.is_zero() {
+                    std::thread::sleep(self.delay);
+                }
+                let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
+                frame.timestamp_us = 1;
+                return Ok(frame);
+            }
+            Err(CanError::Timeout)
         }
     }
 
@@ -3023,7 +3107,7 @@ mod tests {
         fn new(frames: Vec<PiperFrame>, first_delay: Duration) -> Self {
             Self {
                 bootstrap: Some({
-                    let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+                    let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
                     frame.timestamp_us = 1;
                     frame
                 }),
@@ -3213,6 +3297,22 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_for_feedback_ignores_unrecognized_bus_traffic() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            TimestampedJunkRxAdapter::new(),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        let error = piper
+            .wait_for_feedback(Duration::from_millis(30))
+            .expect_err("unrecognized traffic must not satisfy feedback wait");
+        assert!(matches!(error, DriverError::Timeout));
+        assert!(!piper.health().connected);
+    }
+
+    #[test]
     fn test_public_new_dual_thread_parts_rejects_strict_backend_without_timestamped_feedback() {
         let error = match Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None) {
             Ok(_) => panic!("public constructor must validate strict startup"),
@@ -3275,6 +3375,61 @@ mod tests {
         piper
             .wait_for_timestamped_feedback(Duration::from_millis(200))
             .expect("timestamped feedback should satisfy strict validation");
+    }
+
+    #[test]
+    fn test_wait_for_timestamped_feedback_ignores_unrecognized_bus_traffic() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            TimestampedJunkRxAdapter::new(),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        let error = piper
+            .wait_for_timestamped_feedback(Duration::from_millis(30))
+            .expect_err("junk traffic must not satisfy strict timestamp validation");
+
+        match error {
+            DriverError::Can(CanError::Device(device_error)) => {
+                assert_eq!(
+                    device_error.kind,
+                    piper_can::CanDeviceErrorKind::UnsupportedConfig
+                );
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_public_constructor_honors_custom_startup_timeout() {
+        let error = match Piper::new_dual_thread_parts_with_startup_timeout(
+            DelayedTimestampedFeedbackRxAdapter::new(Duration::from_millis(30)),
+            MockTxAdapter,
+            None,
+            Duration::from_millis(10),
+        ) {
+            Ok(_) => panic!("late feedback must not satisfy a shorter startup timeout"),
+            Err(error) => error,
+        };
+
+        match error {
+            DriverError::Can(CanError::Device(device_error)) => {
+                assert_eq!(
+                    device_error.kind,
+                    piper_can::CanDeviceErrorKind::UnsupportedConfig
+                );
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        Piper::new_dual_thread_parts_with_startup_timeout(
+            DelayedTimestampedFeedbackRxAdapter::new(Duration::from_millis(30)),
+            MockTxAdapter,
+            None,
+            Duration::from_millis(100),
+        )
+        .expect("longer startup timeout should admit the same delayed feedback");
     }
 
     #[test]

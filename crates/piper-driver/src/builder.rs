@@ -10,7 +10,7 @@ use piper_can::SocketCanAdapter;
 use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_can::gs_usb::device::GsUsbDeviceSelector;
 use piper_can::{CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 类型化的连接目标。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -149,6 +149,7 @@ pub struct PiperBuilder {
     target: ConnectionTarget,
     baud_rate: u32,
     pipeline_config: PipelineConfig,
+    startup_validation_timeout: Duration,
 }
 
 impl PiperBuilder {
@@ -158,6 +159,7 @@ impl PiperBuilder {
             target: ConnectionTarget::AutoStrict,
             baud_rate: 1_000_000,
             pipeline_config: PipelineConfig::default(),
+            startup_validation_timeout: crate::piper::STRICT_TIMESTAMP_VALIDATION_TIMEOUT,
         }
     }
 
@@ -207,6 +209,12 @@ impl PiperBuilder {
         self
     }
 
+    /// 设置 StrictRealtime 启动验收超时。
+    pub fn startup_validation_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_validation_timeout = timeout;
+        self
+    }
+
     /// 构建 Piper 实例。
     pub fn build(self) -> Result<Piper, DriverError> {
         self.build_with_factory(&RealBackendFactory)
@@ -214,12 +222,17 @@ impl PiperBuilder {
 
     fn build_with_factory(self, factory: &impl BackendFactory) -> Result<Piper, DriverError> {
         let receive_timeout = Duration::from_millis(self.pipeline_config.receive_timeout_ms);
+        let startup_deadline = Instant::now() + self.startup_validation_timeout;
         match &self.target {
-            ConnectionTarget::AutoStrict => self.build_auto_strict(factory, receive_timeout),
-            ConnectionTarget::AutoAny => self.build_auto_any(factory, receive_timeout),
+            ConnectionTarget::AutoStrict => {
+                self.build_auto_strict(factory, receive_timeout, startup_deadline)
+            },
+            ConnectionTarget::AutoAny => {
+                self.build_auto_any(factory, receive_timeout, startup_deadline)
+            },
             ConnectionTarget::SocketCan { iface } => {
                 let backend = factory.open_socketcan(iface, self.baud_rate, receive_timeout)?;
-                self.build_backend(backend)
+                self.build_backend(backend, self.startup_validation_timeout)
             },
             ConnectionTarget::GsUsbAuto => {
                 let backend = factory.open_gs_usb(
@@ -227,7 +240,7 @@ impl PiperBuilder {
                     self.baud_rate,
                     receive_timeout,
                 )?;
-                self.build_backend(backend)
+                self.build_backend(backend, self.startup_validation_timeout)
             },
             ConnectionTarget::GsUsbSerial { serial } => {
                 let backend = factory.open_gs_usb(
@@ -235,7 +248,7 @@ impl PiperBuilder {
                     self.baud_rate,
                     receive_timeout,
                 )?;
-                self.build_backend(backend)
+                self.build_backend(backend, self.startup_validation_timeout)
             },
             ConnectionTarget::GsUsbBusAddress { bus, address } => {
                 let backend = factory.open_gs_usb(
@@ -246,16 +259,25 @@ impl PiperBuilder {
                     self.baud_rate,
                     receive_timeout,
                 )?;
-                self.build_backend(backend)
+                self.build_backend(backend, self.startup_validation_timeout)
             },
         }
     }
 
-    fn build_backend(&self, backend: BuiltBackend) -> Result<Piper, DriverError> {
+    fn build_backend(
+        &self,
+        backend: BuiltBackend,
+        startup_timeout: Duration,
+    ) -> Result<Piper, DriverError> {
         let interface = backend.interface;
         let bus_speed = backend.bus_speed;
-        Piper::new_dual_thread_parts(backend.rx, backend.tx, Some(self.pipeline_config.clone()))
-            .map(|piper| piper.with_metadata(interface, bus_speed))
+        Piper::new_dual_thread_parts_with_startup_timeout(
+            backend.rx,
+            backend.tx,
+            Some(self.pipeline_config.clone()),
+            startup_timeout,
+        )
+        .map(|piper| piper.with_metadata(interface, bus_speed))
     }
 
     fn strict_candidate_summary(errors: &[(String, DriverError)]) -> String {
@@ -284,6 +306,7 @@ impl PiperBuilder {
         &self,
         factory: &impl BackendFactory,
         receive_timeout: Duration,
+        startup_deadline: Instant,
     ) -> Result<Piper, Vec<(String, DriverError)>> {
         #[cfg(target_os = "linux")]
         let mut errors = Vec::new();
@@ -297,9 +320,16 @@ impl PiperBuilder {
                     continue;
                 }
 
+                let startup_timeout = startup_deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO);
+                if startup_timeout.is_zero() && !errors.is_empty() {
+                    break;
+                }
+
                 let result = factory
                     .open_socketcan(iface, self.baud_rate, receive_timeout)
-                    .and_then(|backend| self.build_backend(backend));
+                    .and_then(|backend| self.build_backend(backend, startup_timeout));
                 match result {
                     Ok(piper) => return Ok(piper),
                     Err(error) => errors.push((iface.to_string(), error)),
@@ -307,7 +337,7 @@ impl PiperBuilder {
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (factory, receive_timeout);
+        let _ = (factory, receive_timeout, startup_deadline);
 
         Err(errors)
     }
@@ -316,8 +346,9 @@ impl PiperBuilder {
         &self,
         factory: &impl BackendFactory,
         receive_timeout: Duration,
+        startup_deadline: Instant,
     ) -> Result<Piper, DriverError> {
-        match self.try_socketcan_candidates(factory, receive_timeout) {
+        match self.try_socketcan_candidates(factory, receive_timeout, startup_deadline) {
             Ok(piper) => Ok(piper),
             Err(errors) if errors.is_empty() => {
                 Err(DriverError::Can(CanError::Device(CanDeviceError::new(
@@ -341,14 +372,16 @@ impl PiperBuilder {
         &self,
         factory: &impl BackendFactory,
         receive_timeout: Duration,
+        startup_deadline: Instant,
     ) -> Result<Piper, DriverError> {
-        let strict_errors = match self.try_socketcan_candidates(factory, receive_timeout) {
-            Ok(piper) => return Ok(piper),
-            Err(errors) => errors,
-        };
+        let strict_errors =
+            match self.try_socketcan_candidates(factory, receive_timeout, startup_deadline) {
+                Ok(piper) => return Ok(piper),
+                Err(errors) => errors,
+            };
 
         match factory.open_gs_usb(GsUsbSelectorSpec::Auto, self.baud_rate, receive_timeout) {
-            Ok(backend) => self.build_backend(backend),
+            Ok(backend) => self.build_backend(backend, self.startup_validation_timeout),
             Err(error) if strict_errors.is_empty() => Err(error),
             Err(error) => Err(Self::attach_auto_context(
                 error,
@@ -399,7 +432,7 @@ mod tests {
 
     impl StrictBootstrapRxAdapter {
         fn new() -> Self {
-            let mut frame = piper_can::PiperFrame::new_standard(0x7FF, &[0]);
+            let mut frame = piper_can::PiperFrame::new_standard(0x251, &[0; 8]);
             frame.timestamp_us = 1;
             Self {
                 bootstrap: Some(frame),
@@ -558,6 +591,10 @@ mod tests {
         assert_eq!(builder.target, ConnectionTarget::AutoStrict);
         assert_eq!(builder.baud_rate, 1_000_000);
         assert_eq!(builder.pipeline_config, PipelineConfig::default());
+        assert_eq!(
+            builder.startup_validation_timeout,
+            crate::piper::STRICT_TIMESTAMP_VALIDATION_TIMEOUT
+        );
     }
 
     #[test]
@@ -570,7 +607,8 @@ mod tests {
         let builder = PiperBuilder::new()
             .gs_usb_bus_address(1, 12)
             .baud_rate(500_000)
-            .pipeline_config(config.clone());
+            .pipeline_config(config.clone())
+            .startup_validation_timeout(Duration::from_millis(25));
 
         assert_eq!(
             builder.target,
@@ -581,6 +619,10 @@ mod tests {
         );
         assert_eq!(builder.baud_rate, 500_000);
         assert_eq!(builder.pipeline_config, config);
+        assert_eq!(
+            builder.startup_validation_timeout,
+            Duration::from_millis(25)
+        );
     }
 
     #[test]
@@ -615,6 +657,7 @@ mod tests {
 
         let result = PiperBuilder::new()
             .target(ConnectionTarget::AutoStrict)
+            .startup_validation_timeout(Duration::from_millis(20))
             .build_with_factory(&factory);
 
         #[cfg(target_os = "linux")]
@@ -640,6 +683,7 @@ mod tests {
 
         let result = PiperBuilder::new()
             .target(ConnectionTarget::AutoAny)
+            .startup_validation_timeout(Duration::from_millis(20))
             .build_with_factory(&factory);
 
         #[cfg(target_os = "linux")]
@@ -657,6 +701,65 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         {
             result.expect("non-Linux AutoAny should go straight to GS-USB");
+        }
+    }
+
+    #[test]
+    fn test_auto_any_uses_shared_startup_deadline_across_strict_candidates() {
+        let factory = FallbackFactory {
+            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let result = PiperBuilder::new()
+            .target(ConnectionTarget::AutoAny)
+            .startup_validation_timeout(Duration::from_millis(5))
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            let piper = result.expect("AutoAny should still fall back to GS-USB");
+            assert_eq!(
+                piper.backend_capability(),
+                piper_can::BackendCapability::SoftRealtime
+            );
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string(), "gs-usb:auto".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            result.expect("non-Linux AutoAny should go straight to GS-USB");
+        }
+    }
+
+    #[test]
+    fn test_auto_strict_stops_after_shared_startup_deadline_exhausts() {
+        let factory = FallbackFactory {
+            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let result = PiperBuilder::new()
+            .target(ConnectionTarget::AutoStrict)
+            .startup_validation_timeout(Duration::from_millis(5))
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                result.is_err(),
+                "strict auto build should fail after budget exhaustion"
+            );
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(result.is_err());
         }
     }
 

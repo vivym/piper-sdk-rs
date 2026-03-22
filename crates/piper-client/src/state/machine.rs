@@ -499,7 +499,11 @@ impl Piper<Disconnected, UnspecifiedCapability> {
     {
         use piper_driver::Piper as RobotPiper;
 
-        let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
+        let driver = Arc::new(RobotPiper::new_dual_thread_with_startup_timeout(
+            can_adapter,
+            None,
+            config.feedback_timeout,
+        )?);
         let quirks = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
@@ -546,7 +550,11 @@ impl Piper<Disconnected, UnspecifiedCapability> {
 
         // 1. 创建新的 driver 实例
         use piper_driver::Piper as RobotPiper;
-        let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
+        let driver = Arc::new(RobotPiper::new_dual_thread_with_startup_timeout(
+            can_adapter,
+            None,
+            config.feedback_timeout,
+        )?);
         let quirks = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
@@ -2919,7 +2927,7 @@ mod tests {
     }
 
     fn bootstrap_timestamp_frame() -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+        let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
         frame.timestamp_us = 1;
         frame
     }

@@ -963,7 +963,7 @@ mod tests {
     }
 
     fn bootstrap_timestamp_frame() -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+        let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
         frame.timestamp_us = 1;
         frame
     }

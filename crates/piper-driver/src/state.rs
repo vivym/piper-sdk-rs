@@ -1168,7 +1168,7 @@ impl PiperContext {
         }
     }
 
-    pub fn register_timestamped_feedback(&self, host_rx_mono_us: u64) {
+    pub fn register_timestamped_robot_feedback(&self, host_rx_mono_us: u64) {
         self.last_timestamped_feedback_host_rx_mono_us
             .store(host_rx_mono_us, Ordering::Release);
     }

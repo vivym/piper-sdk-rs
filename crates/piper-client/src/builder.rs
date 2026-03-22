@@ -73,6 +73,7 @@ impl PiperBuilder {
             DriverBuilder::new()
                 .target(self.target.clone())
                 .baud_rate(self.baud_rate)
+                .startup_validation_timeout(self.feedback_timeout)
                 .build()?,
         );
 

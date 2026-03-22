@@ -651,7 +651,7 @@ pub(crate) fn io_loop(
         // ============================================================
         // 2. 根据 CAN ID 解析帧并更新状态
         // ============================================================
-        parse_and_update_state(
+        let parsed = parse_and_update_state(
             &frame,
             backend_capability,
             &ctx,
@@ -663,14 +663,16 @@ pub(crate) fn io_loop(
             &last_fault,
         );
 
-        if frame.timestamp_us > 0 {
-            ctx.register_timestamped_feedback(host_rx_mono_us());
+        if parsed.counts_as_robot_feedback && frame.timestamp_us > 0 {
+            ctx.register_timestamped_robot_feedback(host_rx_mono_us());
         }
 
         // ============================================================
         // 连接监控：注册反馈（每帧处理后更新最后反馈时间）
         // ============================================================
-        ctx.connection_monitor.register_feedback();
+        if parsed.counts_as_robot_feedback {
+            ctx.connection_monitor.register_feedback();
+        }
 
         // ============================================================
         // 3. 双重 Drain 策略：收到帧后立即发送响应（往往此时上层已计算出新的控制命令）
@@ -886,7 +888,7 @@ pub fn rx_loop(
         // 3. 根据 CAN ID 解析帧并更新状态
         // ============================================================
         // 复用 io_loop 中的解析逻辑（通过调用辅助函数）
-        parse_and_update_state(
+        let parsed = parse_and_update_state(
             &frame,
             backend_capability,
             &ctx,
@@ -898,13 +900,15 @@ pub fn rx_loop(
             &last_fault,
         );
 
-        if frame.timestamp_us > 0 {
-            ctx.register_timestamped_feedback(host_rx_mono_us());
+        if parsed.counts_as_robot_feedback && frame.timestamp_us > 0 {
+            ctx.register_timestamped_robot_feedback(host_rx_mono_us());
         }
 
         // 双线程 runtime 也必须刷新连接监控，否则 health()/wait_for_feedback()
         // 会永远基于初始状态判断。
-        ctx.connection_monitor.register_feedback();
+        if parsed.counts_as_robot_feedback {
+            ctx.connection_monitor.register_feedback();
+        }
         if maintenance_gate.current_state() == MaintenanceGateState::DeniedTransportDown {
             refresh_maintenance_gate_state(&maintenance_gate, &runtime_phase, &ctx, &last_fault);
         }
@@ -1606,6 +1610,12 @@ fn send_shutdown_dispatch(
 /// 使用 `ParserState` 结构体封装所有可变状态，避免函数参数列表过长。
 /// 原本有 14 个参数，现在只有 4 个，代码可读性大幅提升。
 #[allow(clippy::too_many_arguments)]
+#[derive(Debug, Clone, Copy, Default)]
+struct ParsedFeedbackOutcome {
+    counts_as_robot_feedback: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn parse_and_update_state(
     frame: &PiperFrame,
     backend_capability: BackendCapability,
@@ -1616,10 +1626,13 @@ fn parse_and_update_state(
     maintenance_gate: Option<&Arc<MaintenanceGate>>,
     runtime_phase: &Arc<AtomicU8>,
     last_fault: &Arc<AtomicU8>,
-) {
+) -> ParsedFeedbackOutcome {
+    let mut outcome = ParsedFeedbackOutcome::default();
+
     match frame.id {
         ID_JOINT_FEEDBACK_12 => {
             if let Ok(feedback) = JointFeedback12::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.joint_pos_frame_mask != 0 {
                     metrics
                         .rx_joint_position_incomplete_groups_dropped_total
@@ -1647,6 +1660,7 @@ fn parse_and_update_state(
         },
         ID_JOINT_FEEDBACK_34 => {
             if let Ok(feedback) = JointFeedback34::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.joint_pos_frame_mask == 0 {
                     reset_pending_joint_position(state);
                 }
@@ -1671,6 +1685,7 @@ fn parse_and_update_state(
         },
         ID_JOINT_FEEDBACK_56 => {
             if let Ok(feedback) = JointFeedback56::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.joint_pos_frame_mask == 0 {
                     reset_pending_joint_position(state);
                 }
@@ -1720,6 +1735,7 @@ fn parse_and_update_state(
         },
         ID_END_POSE_1 => {
             if let Ok(feedback) = EndPoseFeedback1::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.end_pose_frame_mask != 0 {
                     metrics
                         .rx_end_pose_incomplete_groups_dropped_total
@@ -1742,6 +1758,7 @@ fn parse_and_update_state(
         },
         ID_END_POSE_2 => {
             if let Ok(feedback) = EndPoseFeedback2::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.end_pose_frame_mask == 0 {
                     reset_pending_end_pose(state);
                 }
@@ -1761,6 +1778,7 @@ fn parse_and_update_state(
         },
         ID_END_POSE_3 => {
             if let Ok(feedback) = EndPoseFeedback3::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.end_pose_frame_mask == 0 {
                     reset_pending_end_pose(state);
                 }
@@ -1798,6 +1816,7 @@ fn parse_and_update_state(
             let joint_index = (id - ID_JOINT_DRIVER_HIGH_SPEED_BASE) as usize;
 
             if let Ok(feedback) = JointDriverHighSpeedFeedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 let now = Instant::now();
                 let timeout = Duration::from_micros(config.velocity_buffer_timeout_us);
                 if state.vel_update_mask != 0 {
@@ -1861,6 +1880,7 @@ fn parse_and_update_state(
         },
         ID_ROBOT_STATUS => {
             if let Ok(feedback) = RobotStatusFeedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 let fault_angle_limit_mask = feedback.fault_code_angle_limit.joint1_limit() as u8
@@ -1909,6 +1929,7 @@ fn parse_and_update_state(
         },
         ID_GRIPPER_FEEDBACK => {
             if let Ok(feedback) = GripperFeedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 let current = ctx.gripper.load();
@@ -1941,6 +1962,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = JointDriverLowSpeedFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
+                    outcome.counts_as_robot_feedback = true;
                     let host_rx_mono_us = host_rx_mono_us();
 
                     ctx.joint_driver_low_speed.rcu(|old| {
@@ -2008,6 +2030,7 @@ fn parse_and_update_state(
         },
         ID_COLLISION_PROTECTION_LEVEL_FEEDBACK => {
             if let Ok(feedback) = CollisionProtectionLevelFeedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 if let Ok(mut collision) = ctx.collision_protection.try_write() {
@@ -2026,6 +2049,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = MotorLimitFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
+                    outcome.counts_as_robot_feedback = true;
                     let host_rx_mono_us = host_rx_mono_us();
 
                     if let Ok(mut joint_limit) = ctx.joint_limit_config.write() {
@@ -2052,6 +2076,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = MotorMaxAccelFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
+                    outcome.counts_as_robot_feedback = true;
                     let host_rx_mono_us = host_rx_mono_us();
 
                     if let Ok(mut joint_accel) = ctx.joint_accel_config.write() {
@@ -2074,6 +2099,7 @@ fn parse_and_update_state(
         },
         ID_END_VELOCITY_ACCEL_FEEDBACK => {
             if let Ok(feedback) = EndVelocityAccelFeedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 if let Ok(mut end_limit) = ctx.end_limit_config.write() {
@@ -2094,6 +2120,7 @@ fn parse_and_update_state(
         },
         ID_FIRMWARE_READ => {
             if let Ok(feedback) = FirmwareReadFeedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 if let Ok(mut firmware_state) = ctx.firmware_version.write() {
@@ -2113,6 +2140,7 @@ fn parse_and_update_state(
         },
         ID_CONTROL_MODE => {
             if let Ok(feedback) = ControlModeCommandFeedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 let new_state = MasterSlaveControlModeState {
@@ -2136,6 +2164,7 @@ fn parse_and_update_state(
         },
         ID_JOINT_CONTROL_12 => {
             if let Ok(feedback) = JointControl12Feedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.joint_control_frame_mask != 0 {
                     reset_pending_joint_control(state);
                 }
@@ -2151,6 +2180,7 @@ fn parse_and_update_state(
         },
         ID_JOINT_CONTROL_34 => {
             if let Ok(feedback) = JointControl34Feedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.joint_control_frame_mask == 0 {
                     reset_pending_joint_control(state);
                 }
@@ -2166,6 +2196,7 @@ fn parse_and_update_state(
         },
         ID_JOINT_CONTROL_56 => {
             if let Ok(feedback) = JointControl56Feedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 if state.joint_control_frame_mask == 0 {
                     reset_pending_joint_control(state);
                 }
@@ -2198,6 +2229,7 @@ fn parse_and_update_state(
         },
         ID_GRIPPER_CONTROL => {
             if let Ok(feedback) = GripperControlFeedback::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 let new_state = MasterSlaveGripperControlState {
@@ -2221,6 +2253,8 @@ fn parse_and_update_state(
             debug!("RX thread: Received unhandled frame ID=0x{:X}", frame.id);
         },
     }
+
+    outcome
 }
 
 #[cfg(test)]

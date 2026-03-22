@@ -409,7 +409,7 @@ mod tests {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
             if !self.bootstrap_emitted {
                 self.bootstrap_emitted = true;
-                let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+                let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
                 frame.timestamp_us = 1;
                 return Ok(frame);
             }
