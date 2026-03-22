@@ -114,7 +114,7 @@ pub(crate) const SOFT_CONTROL_SEND_MIN_DEADLINE: Duration = Duration::from_milli
 pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
 pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
 
-fn strict_realtime_timestamp_error(reason: impl Into<String>) -> DriverError {
+pub(crate) fn strict_realtime_timestamp_error(reason: impl Into<String>) -> DriverError {
     DriverError::Can(CanError::Device(piper_can::CanDeviceError::new(
         piper_can::CanDeviceErrorKind::UnsupportedConfig,
         format!(
@@ -1231,12 +1231,13 @@ impl Piper {
         C::RxAdapter: Send + 'static,
         C::TxAdapter: Send + 'static,
     {
+        let startup_deadline = Instant::now() + startup_timeout;
         let (rx_adapter, tx_adapter) = can.split().map_err(DriverError::Can)?;
-        Self::new_dual_thread_parts_with_startup_timeout(
+        Self::new_dual_thread_parts_with_startup_deadline(
             rx_adapter,
             tx_adapter,
             config,
-            startup_timeout,
+            startup_deadline,
         )
     }
 
@@ -1261,9 +1262,24 @@ impl Piper {
         config: Option<PipelineConfig>,
         startup_timeout: Duration,
     ) -> Result<Self, DriverError> {
+        let startup_deadline = Instant::now() + startup_timeout;
+        Self::new_dual_thread_parts_with_startup_deadline(
+            rx_adapter,
+            tx_adapter,
+            config,
+            startup_deadline,
+        )
+    }
+
+    pub(crate) fn new_dual_thread_parts_with_startup_deadline(
+        rx_adapter: impl RxAdapter + Send + 'static,
+        tx_adapter: impl RealtimeTxAdapter + Send + 'static,
+        config: Option<PipelineConfig>,
+        startup_deadline: Instant,
+    ) -> Result<Self, DriverError> {
         let piper = Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
             .map_err(DriverError::Can)?;
-        piper.validate_startup(startup_timeout)
+        piper.validate_startup_until(startup_deadline)
     }
 
     fn new_dual_thread_parts_internal(
@@ -1341,8 +1357,6 @@ impl Piper {
             );
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
         Ok(Self {
             reliable_tx: ManuallyDrop::new(reliable_tx),
             maintenance_lane_tx: ManuallyDrop::new(maintenance_lane_tx),
@@ -1376,12 +1390,12 @@ impl Piper {
         Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
     }
 
-    fn validate_startup(self, startup_timeout: Duration) -> Result<Self, DriverError> {
+    fn validate_startup_until(self, startup_deadline: Instant) -> Result<Self, DriverError> {
         if !self.backend_capability.is_strict_realtime() {
             return Ok(self);
         }
 
-        if let Err(error) = self.wait_for_timestamped_feedback(startup_timeout) {
+        if let Err(error) = self.wait_for_timestamped_feedback_until(startup_deadline) {
             self.request_stop();
             return Err(error);
         }
@@ -1838,15 +1852,18 @@ impl Piper {
             ));
         }
 
-        let start = Instant::now();
+        self.wait_for_timestamped_feedback_until(Instant::now() + timeout)
+    }
+
+    fn wait_for_timestamped_feedback_until(&self, deadline: Instant) -> Result<(), DriverError> {
         loop {
             if self.ctx.last_timestamped_feedback_host_rx_mono_us() != 0 {
                 return Ok(());
             }
 
-            if start.elapsed() >= timeout {
+            if Instant::now() >= deadline {
                 return Err(strict_realtime_timestamp_error(
-                    "no timestamped feedback arrived before validation timeout",
+                    "no timestamped feedback arrived before validation deadline",
                 ));
             }
 
@@ -3120,6 +3137,32 @@ mod tests {
         }
     }
 
+    struct SlowSplitCanAdapter {
+        delay: Duration,
+    }
+
+    impl CanAdapter for SlowSplitCanAdapter {
+        fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
+            Ok(())
+        }
+
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            Err(CanError::Timeout)
+        }
+    }
+
+    impl SplittableAdapter for SlowSplitCanAdapter {
+        type RxAdapter = BootstrappedMockRxAdapter;
+        type TxAdapter = MockTxAdapter;
+
+        fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            Ok((BootstrappedMockRxAdapter::new(), MockTxAdapter))
+        }
+    }
+
     fn wait_shutdown(
         piper: &Piper,
         frame: PiperFrame,
@@ -3463,6 +3506,61 @@ mod tests {
             Duration::from_millis(100),
         )
         .expect("longer startup timeout should admit the same delayed feedback");
+    }
+
+    #[test]
+    fn test_public_constructor_uses_absolute_startup_deadline_from_entry() {
+        let error = match Piper::new_dual_thread_parts_with_startup_timeout(
+            DelayedTimestampedFeedbackRxAdapter::new(Duration::from_millis(7)),
+            MockTxAdapter,
+            None,
+            Duration::from_millis(5),
+        ) {
+            Ok(_) => panic!("feedback arriving after deadline must be rejected"),
+            Err(error) => error,
+        };
+
+        match error {
+            DriverError::Can(CanError::Device(device_error)) => {
+                assert_eq!(
+                    device_error.kind,
+                    piper_can::CanDeviceErrorKind::UnsupportedConfig
+                );
+                assert!(
+                    device_error.message.contains("validation deadline"),
+                    "unexpected error message: {device_error}"
+                );
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_public_constructor_counts_split_time_against_startup_deadline() {
+        let error = match Piper::new_dual_thread_with_startup_timeout(
+            SlowSplitCanAdapter {
+                delay: Duration::from_millis(20),
+            },
+            None,
+            Duration::from_millis(5),
+        ) {
+            Ok(_) => panic!("slow split must exhaust the startup deadline"),
+            Err(error) => error,
+        };
+
+        match error {
+            DriverError::Can(CanError::Device(device_error)) => {
+                assert_eq!(
+                    device_error.kind,
+                    piper_can::CanDeviceErrorKind::UnsupportedConfig
+                );
+                assert!(
+                    device_error.message.contains("validation deadline"),
+                    "unexpected error message: {device_error}"
+                );
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

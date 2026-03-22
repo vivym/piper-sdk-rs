@@ -231,8 +231,7 @@ impl PiperBuilder {
                 self.build_auto_any(factory, receive_timeout, startup_deadline)
             },
             ConnectionTarget::SocketCan { iface } => {
-                let backend = factory.open_socketcan(iface, self.baud_rate, receive_timeout)?;
-                self.build_backend(backend, self.startup_validation_timeout)
+                self.build_socketcan_backend(factory, iface, receive_timeout, startup_deadline)
             },
             ConnectionTarget::GsUsbAuto => {
                 let backend = factory.open_gs_usb(
@@ -264,6 +263,30 @@ impl PiperBuilder {
         }
     }
 
+    fn startup_deadline_expired_error(&self, context: impl Into<String>) -> DriverError {
+        crate::piper::strict_realtime_timestamp_error(format!(
+            "startup validation deadline elapsed {}",
+            context.into()
+        ))
+    }
+
+    fn build_socketcan_backend(
+        &self,
+        factory: &impl BackendFactory,
+        iface: &str,
+        receive_timeout: Duration,
+        startup_deadline: Instant,
+    ) -> Result<Piper, DriverError> {
+        if Instant::now() >= startup_deadline {
+            return Err(self.startup_deadline_expired_error(format!(
+                "before opening SocketCAN target {iface}"
+            )));
+        }
+
+        let backend = factory.open_socketcan(iface, self.baud_rate, receive_timeout)?;
+        self.build_backend_until_deadline(backend, startup_deadline)
+    }
+
     fn build_backend(
         &self,
         backend: BuiltBackend,
@@ -276,6 +299,29 @@ impl PiperBuilder {
             backend.tx,
             Some(self.pipeline_config.clone()),
             startup_timeout,
+        )
+        .map(|piper| piper.with_metadata(interface, bus_speed))
+    }
+
+    fn build_backend_until_deadline(
+        &self,
+        backend: BuiltBackend,
+        startup_deadline: Instant,
+    ) -> Result<Piper, DriverError> {
+        if Instant::now() >= startup_deadline {
+            return Err(self.startup_deadline_expired_error(format!(
+                "before completing strict runtime startup for {}",
+                backend.interface
+            )));
+        }
+
+        let interface = backend.interface;
+        let bus_speed = backend.bus_speed;
+        Piper::new_dual_thread_parts_with_startup_deadline(
+            backend.rx,
+            backend.tx,
+            Some(self.pipeline_config.clone()),
+            startup_deadline,
         )
         .map(|piper| piper.with_metadata(interface, bus_speed))
     }
@@ -320,19 +366,27 @@ impl PiperBuilder {
                     continue;
                 }
 
-                let startup_timeout = startup_deadline
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO);
-                if startup_timeout.is_zero() && !errors.is_empty() {
+                if Instant::now() >= startup_deadline {
+                    errors.push((
+                        iface.to_string(),
+                        self.startup_deadline_expired_error(format!(
+                            "before trying SocketCAN candidate {iface}"
+                        )),
+                    ));
                     break;
                 }
 
-                let result = factory
-                    .open_socketcan(iface, self.baud_rate, receive_timeout)
-                    .and_then(|backend| self.build_backend(backend, startup_timeout));
+                let result =
+                    self.build_socketcan_backend(factory, iface, receive_timeout, startup_deadline);
                 match result {
                     Ok(piper) => return Ok(piper),
-                    Err(error) => errors.push((iface.to_string(), error)),
+                    Err(error) => {
+                        let deadline_expired = Instant::now() >= startup_deadline;
+                        errors.push((iface.to_string(), error));
+                        if deadline_expired {
+                            break;
+                        }
+                    },
                 }
             }
         }
@@ -585,6 +639,60 @@ mod tests {
         }
     }
 
+    struct SlowOpenFactory {
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        socketcan_available: Vec<String>,
+        calls: Mutex<Vec<String>>,
+        socketcan_delay: Duration,
+    }
+
+    impl BackendFactory for SlowOpenFactory {
+        #[cfg(target_os = "linux")]
+        fn socketcan_available(&self, iface: &str) -> bool {
+            self.socketcan_available.iter().any(|item| item == iface)
+        }
+
+        fn open_socketcan(
+            &self,
+            iface: &str,
+            baud_rate: u32,
+            _receive_timeout: Duration,
+        ) -> Result<BuiltBackend, DriverError> {
+            self.calls.lock().unwrap().push(format!("socketcan:{iface}"));
+            if !self.socketcan_delay.is_zero() {
+                std::thread::sleep(self.socketcan_delay);
+            }
+            Ok(BuiltBackend::new(
+                StrictBootstrapRxAdapter::new(),
+                TestTxAdapter,
+                format!("socketcan:{iface}"),
+                baud_rate,
+            ))
+        }
+
+        fn open_gs_usb(
+            &self,
+            selector: GsUsbSelectorSpec,
+            baud_rate: u32,
+            _receive_timeout: Duration,
+        ) -> Result<BuiltBackend, DriverError> {
+            let label = match selector {
+                GsUsbSelectorSpec::Auto => "gs-usb:auto".to_string(),
+                GsUsbSelectorSpec::Serial(serial) => format!("gs-usb:serial:{serial}"),
+                GsUsbSelectorSpec::BusAddress { bus, address } => {
+                    format!("gs-usb:bus-address:{bus}:{address}")
+                },
+            };
+            self.calls.lock().unwrap().push(label.clone());
+            Ok(BuiltBackend::new(
+                TestRxAdapter,
+                TestTxAdapter,
+                label,
+                baud_rate,
+            ))
+        }
+    }
+
     #[test]
     fn test_builder_defaults() {
         let builder = PiperBuilder::new();
@@ -752,6 +860,113 @@ mod tests {
                 result.is_err(),
                 "strict auto build should fail after budget exhaustion"
             );
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_explicit_socketcan_counts_open_time_against_startup_deadline() {
+        let factory = SlowOpenFactory {
+            socketcan_available: vec!["can0".to_string()],
+            calls: Mutex::new(Vec::new()),
+            socketcan_delay: Duration::from_millis(20),
+        };
+
+        let result = PiperBuilder::new()
+            .socketcan("can0")
+            .startup_validation_timeout(Duration::from_millis(5))
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            let error = result.expect_err("slow open should exhaust explicit strict deadline");
+            match error {
+                DriverError::Can(CanError::Device(device_error)) => {
+                    assert_eq!(device_error.kind, CanDeviceErrorKind::UnsupportedConfig);
+                    assert!(
+                        device_error.message.contains("validation deadline"),
+                        "unexpected error message: {device_error}"
+                    );
+                },
+                other => panic!("unexpected error: {other:?}"),
+            }
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_auto_any_stops_after_slow_open_exhausts_shared_deadline() {
+        let factory = SlowOpenFactory {
+            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            calls: Mutex::new(Vec::new()),
+            socketcan_delay: Duration::from_millis(20),
+        };
+
+        let result = PiperBuilder::new()
+            .target(ConnectionTarget::AutoAny)
+            .startup_validation_timeout(Duration::from_millis(5))
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            let piper =
+                result.expect("AutoAny should fall back after slow strict open exhausts budget");
+            assert_eq!(
+                piper.backend_capability(),
+                piper_can::BackendCapability::SoftRealtime
+            );
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string(), "gs-usb:auto".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            result.expect("non-Linux AutoAny should go straight to GS-USB");
+        }
+    }
+
+    #[test]
+    fn test_auto_strict_stops_after_slow_open_exhausts_shared_deadline() {
+        let factory = SlowOpenFactory {
+            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            calls: Mutex::new(Vec::new()),
+            socketcan_delay: Duration::from_millis(20),
+        };
+
+        let result = PiperBuilder::new()
+            .target(ConnectionTarget::AutoStrict)
+            .startup_validation_timeout(Duration::from_millis(5))
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            let error = result
+                .expect_err("AutoStrict should fail once slow open exhausts the shared deadline");
+            match error {
+                DriverError::Can(CanError::Device(device_error)) => {
+                    assert_eq!(device_error.kind, CanDeviceErrorKind::UnsupportedConfig);
+                    assert!(
+                        device_error.message.contains("validation deadline"),
+                        "unexpected error message: {device_error}"
+                    );
+                },
+                other => panic!("unexpected error: {other:?}"),
+            }
             assert_eq!(
                 factory.calls.lock().unwrap().as_slice(),
                 &["socketcan:can0".to_string()]
