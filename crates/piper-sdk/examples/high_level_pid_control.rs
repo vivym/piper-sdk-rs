@@ -8,8 +8,9 @@
 //! cargo run --example high_level_pid_control
 //! ```
 
+use piper_sdk::client::ControlSnapshot;
 use piper_sdk::client::control::{Controller, PidController};
-use piper_sdk::client::types::{JointArray, Rad};
+use piper_sdk::client::types::{JointArray, NewtonMeter, Rad, RadPerSecond};
 use std::time::Duration;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -39,20 +40,33 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 2. 模拟控制循环
     let dt = Duration::from_millis(10); // 10ms = 100Hz
     let mut current_position = JointArray::from([Rad(0.0); 6]);
+    let mut current_velocity = JointArray::from([RadPerSecond(0.0); 6]);
 
     println!("▶️  开始控制循环 (模拟)...\n");
 
     for iteration in 0..100 {
+        let snapshot = ControlSnapshot {
+            position: current_position,
+            velocity: current_velocity,
+            torque: JointArray::from([NewtonMeter(0.0); 6]),
+            position_timestamp_us: iteration as u64 * 10_000,
+            dynamic_timestamp_us: iteration as u64 * 10_000,
+            skew_us: 0,
+        };
+
         // 计算控制输出
-        let output = pid.tick(&current_position, dt)?;
+        let output = pid.tick(&snapshot, dt)?;
 
         // 模拟系统响应（简化的一阶系统）
         // 实际应用中，这里会发送命令到机器人
         for i in 0..6 {
             let force = output[i].0;
-            // 简化的动力学：位置变化 = 力 * dt / 质量
-            let position_change = force * dt.as_secs_f64() * 0.01;
-            current_position[i] = Rad(current_position[i].0 + position_change);
+            // 简化的动力学：力矩 -> 角加速度 -> 速度 -> 位置
+            let acceleration = force * 0.01;
+            current_velocity[i] =
+                RadPerSecond(current_velocity[i].0 + acceleration * dt.as_secs_f64());
+            current_position[i] =
+                Rad(current_position[i].0 + current_velocity[i].0 * dt.as_secs_f64());
         }
 
         // 每 10 次迭代打印一次状态
@@ -87,8 +101,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     pid.on_time_jump(large_dt)?;
 
     println!("   ✅ on_time_jump() 调用成功");
-    println!("   ✅ 微分项已重置");
     println!("   ✅ 积分项保留 (防止机械臂下坠)");
+    println!("   ✅ 微分项直接使用实测速度，不依赖旧误差差分");
     println!();
 
     // 4. 展示重置功能

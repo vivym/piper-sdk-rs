@@ -31,9 +31,9 @@
 use super::controller::Controller;
 use super::scheduler::{CycleScheduler, SleepStrategy};
 use crate::Piper;
-use crate::observer::ControlReadPolicy;
+use crate::observer::{ControlReadPolicy, ControlSnapshot};
 use crate::state::{Active, MitMode, StrictRealtime};
-use crate::types::RobotError;
+use crate::types::{JointArray, NewtonMeter, RobotError};
 use piper_driver::BackendCapability;
 use std::time::Duration;
 
@@ -94,7 +94,7 @@ impl Default for LoopConfig {
 ///
 /// - 计算实际 dt
 /// - 如果 dt > max_dt，调用 `controller.on_time_jump(real_dt)`，然后钳位 dt
-/// - 使用钳位后的 dt 调用 `controller.tick()`
+/// - 使用钳位后的 dt 调用 `controller.tick()`，并传入完整 `ControlSnapshot`
 ///
 /// # 示例
 ///
@@ -178,10 +178,10 @@ where
         }
 
         // 3. 读取当前状态
-        let current = piper.observer().control_snapshot(config.read_policy)?.position;
+        let snapshot = piper.observer().control_snapshot(config.read_policy)?;
 
         // 4. 调用控制器（只返回力矩）
-        let torques = controller.tick(&current, dt).map_err(RobotError::from)?;
+        let torques = tick_controller(&mut controller, &snapshot, dt)?;
 
         // 5. 发送命令（使用纯力矩模式，kp/kd=0）
         let zero_positions = crate::types::JointArray::from([crate::types::Rad(0.0); 6]);
@@ -258,8 +258,8 @@ where
             dt = max_dt;
         }
 
-        let current = piper.observer().control_snapshot(config.read_policy)?.position;
-        let torques = controller.tick(&current, dt).map_err(RobotError::from)?;
+        let snapshot = piper.observer().control_snapshot(config.read_policy)?;
+        let torques = tick_controller(&mut controller, &snapshot, dt)?;
 
         let zero_positions = crate::types::JointArray::from([crate::types::Rad(0.0); 6]);
         let zero_velocities = crate::types::JointArray::from([0.0; 6]);
@@ -290,9 +290,51 @@ fn ensure_realtime_control_supported(
     }
 }
 
+fn tick_controller<C>(
+    controller: &mut C,
+    snapshot: &ControlSnapshot,
+    dt: Duration,
+) -> Result<JointArray<NewtonMeter>, RobotError>
+where
+    C: Controller,
+    RobotError: From<C::Error>,
+{
+    controller.tick(snapshot, dt).map_err(RobotError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Rad, RadPerSecond};
+
+    #[derive(Default)]
+    struct RecordingController {
+        seen_snapshot: Option<ControlSnapshot>,
+    }
+
+    impl Controller for RecordingController {
+        type Error = RobotError;
+
+        fn tick(
+            &mut self,
+            snapshot: &ControlSnapshot,
+            _dt: Duration,
+        ) -> Result<JointArray<NewtonMeter>, Self::Error> {
+            self.seen_snapshot = Some(*snapshot);
+            Ok(JointArray::splat(NewtonMeter(0.0)))
+        }
+    }
+
+    fn test_snapshot() -> ControlSnapshot {
+        ControlSnapshot {
+            position: JointArray::splat(Rad(1.2)),
+            velocity: JointArray::splat(RadPerSecond(-0.4)),
+            torque: JointArray::splat(NewtonMeter(3.5)),
+            position_timestamp_us: 10_000,
+            dynamic_timestamp_us: 10_020,
+            skew_us: 20,
+        }
+    }
 
     #[test]
     fn test_loop_config_default() {
@@ -325,5 +367,17 @@ mod tests {
         // 注意：此测试需要实际的 robot 实例，在单元测试中无法完成
         // 只验证配置构造
         assert_eq!(config.frequency_hz, -1.0);
+    }
+
+    #[test]
+    fn test_tick_controller_passes_full_snapshot() {
+        let snapshot = test_snapshot();
+        let mut controller = RecordingController::default();
+
+        let torques = tick_controller(&mut controller, &snapshot, Duration::from_millis(5))
+            .expect("tick_controller should succeed");
+
+        assert_eq!(controller.seen_snapshot, Some(snapshot));
+        assert_eq!(torques, JointArray::splat(NewtonMeter(0.0)));
     }
 }

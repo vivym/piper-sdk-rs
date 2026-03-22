@@ -5,25 +5,27 @@
 //! # 算法
 //!
 //! ```text
-//! output = Kp * e + Ki * ∫e dt + Kd * de/dt
+//! output = Kp * position_error + Ki * ∫position_error dt - Kd * measured_velocity
 //! ```
 //!
 //! 其中：
-//! - `e` = 目标位置 - 当前位置（误差）
-//! - `∫e dt` = 累积误差（积分项）
-//! - `de/dt` = 误差变化率（微分项）
+//! - `position_error` = 目标位置 - 当前位置（误差）
+//! - `∫position_error dt` = 累积误差（积分项）
+//! - `measured_velocity` = 实测关节速度（假设目标速度为 0）
 //!
 //! # 特性
 //!
 //! - **积分饱和保护**: 限制积分项累积，防止积分饱和（Integral Windup）
-//! - **时间跳变处理**: 正确处理 `dt` 异常，只重置微分项，保留积分项
+//! - **速度阻尼项**: 直接使用实测速度构造 D 项，避免误差差分尖峰
+//! - **时间跳变处理**: `dt` 异常时只钳位积分步长，不引入误差差分历史
 //! - **强类型单位**: 使用 `Rad` 和 `NewtonMeter` 确保单位正确
 //!
 //! # 示例
 //!
 //! ```rust,no_run
 //! use piper_client::control::{PidController, Controller};
-//! use piper_client::types::{JointArray, Rad};
+//! use piper_client::ControlSnapshot;
+//! use piper_client::types::{JointArray, NewtonMeter, Rad, RadPerSecond};
 //!
 //! // 创建 PID 控制器
 //! let target = JointArray::from([Rad(1.0); 6]);
@@ -34,12 +36,20 @@
 //!
 //! // 在控制循环中使用
 //! # use std::time::Duration;
-//! # let current = JointArray::from([Rad(0.5); 6]);
+//! # let snapshot = ControlSnapshot {
+//! #     position: JointArray::from([Rad(0.5); 6]),
+//! #     velocity: JointArray::from([RadPerSecond(0.0); 6]),
+//! #     torque: JointArray::from([NewtonMeter(0.0); 6]),
+//! #     position_timestamp_us: 1_000,
+//! #     dynamic_timestamp_us: 1_000,
+//! #     skew_us: 0,
+//! # };
 //! # let dt = Duration::from_millis(10);
-//! let output = pid.tick(&current, dt).unwrap();
+//! let output = pid.tick(&snapshot, dt).unwrap();
 //! ```
 
 use super::controller::Controller;
+use crate::observer::ControlSnapshot;
 use crate::types::{JointArray, NewtonMeter, Rad};
 use std::time::Duration;
 
@@ -62,9 +72,6 @@ pub struct PidController {
 
     /// 积分项累积值
     integral: JointArray<f64>,
-
-    /// 上一次的误差（用于计算微分）
-    last_error: JointArray<f64>,
 
     /// 积分项限制（防止积分饱和）
     integral_limit: f64,
@@ -101,7 +108,6 @@ impl PidController {
             ki: 0.0,
             kd: 0.0,
             integral: JointArray::from([0.0; 6]),
-            last_error: JointArray::from([0.0; 6]),
             integral_limit: 10.0,
             output_limit: 100.0,
         }
@@ -210,7 +216,7 @@ impl Controller for PidController {
 
     fn tick(
         &mut self,
-        current: &JointArray<Rad>,
+        snapshot: &ControlSnapshot,
         dt: Duration,
     ) -> Result<JointArray<NewtonMeter>, Self::Error> {
         let dt_sec = dt.as_secs_f64();
@@ -225,7 +231,7 @@ impl Controller for PidController {
         }
 
         // 1. 计算误差
-        let error = self.target.map_with(*current, |t, c| (t - c).0);
+        let error = self.target.map_with(snapshot.position, |t, c| (t - c).0);
 
         // 2. 比例项（P）
         let p_term = error.map(|e| self.kp * e);
@@ -239,15 +245,12 @@ impl Controller for PidController {
         let i_term = self.integral.map(|i| self.ki * i);
 
         // 4. 微分项（D）
-        let d_term = error.map_with(self.last_error, |e, le| self.kd * (e - le) / dt_sec);
+        let d_term = snapshot.velocity.map(|v| -self.kd * v.0);
 
-        // 5. 更新上一次误差
-        self.last_error = error;
-
-        // 6. 计算总输出
+        // 5. 计算总输出
         let output = p_term.map_with(i_term, |p, i| p + i).map_with(d_term, |pi, d| pi + d);
 
-        // 7. 钳位输出
+        // 6. 钳位输出
         let clamped_output =
             output.map(|o| NewtonMeter(o.clamp(-self.output_limit, self.output_limit)));
 
@@ -256,24 +259,15 @@ impl Controller for PidController {
 
     fn on_time_jump(&mut self, dt: Duration) -> Result<(), Self::Error> {
         tracing::warn!(
-            "PID controller detected time jump: {:?}, resetting derivative term only",
+            "PID controller detected time jump: {:?}, preserving integral and measured-velocity derivative state",
             dt
         );
-
-        // ✅ 只重置微分项
-        self.last_error = JointArray::from([0.0; 6]);
-
-        // ❌ 不要清零积分项！
-        // 原因：机械臂可能依赖积分项对抗重力
-        // 清零会导致机械臂瞬间下坠（Sagging）
-
         Ok(())
     }
 
     fn reset(&mut self) -> Result<(), Self::Error> {
         // 完全重置控制器状态
         self.integral = JointArray::from([0.0; 6]);
-        self.last_error = JointArray::from([0.0; 6]);
         Ok(())
     }
 }
@@ -281,6 +275,18 @@ impl Controller for PidController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::RadPerSecond;
+
+    fn test_snapshot(position: f64, velocity: f64) -> ControlSnapshot {
+        ControlSnapshot {
+            position: JointArray::splat(Rad(position)),
+            velocity: JointArray::splat(RadPerSecond(velocity)),
+            torque: JointArray::splat(NewtonMeter(0.0)),
+            position_timestamp_us: 1_000,
+            dynamic_timestamp_us: 1_000,
+            skew_us: 0,
+        }
+    }
 
     #[test]
     fn test_pid_new() {
@@ -314,10 +320,10 @@ mod tests {
         let target = JointArray::from([Rad(1.0); 6]);
         let mut pid = PidController::new(target).with_gains(10.0, 0.0, 0.0);
 
-        let current = JointArray::from([Rad(0.5); 6]);
+        let snapshot = test_snapshot(0.5, 0.0);
         let dt = Duration::from_millis(10);
 
-        let output = pid.tick(&current, dt).unwrap();
+        let output = pid.tick(&snapshot, dt).unwrap();
 
         // 误差 = 1.0 - 0.5 = 0.5
         // 输出 = 10.0 * 0.5 = 5.0
@@ -329,17 +335,17 @@ mod tests {
         let target = JointArray::from([Rad(1.0); 6]);
         let mut pid = PidController::new(target).with_gains(0.0, 1.0, 0.0); // 只有积分项
 
-        let current = JointArray::from([Rad(0.5); 6]);
+        let snapshot = test_snapshot(0.5, 0.0);
         let dt = Duration::from_millis(100); // 0.1 秒
 
         // 第一次 tick
-        let output1 = pid.tick(&current, dt).unwrap();
+        let output1 = pid.tick(&snapshot, dt).unwrap();
         // 误差 = 0.5, 积分 = 0.5 * 0.1 = 0.05
         // 输出 = 1.0 * 0.05 = 0.05
         assert!((output1[0].0 - 0.05).abs() < 1e-10);
 
         // 第二次 tick
-        let output2 = pid.tick(&current, dt).unwrap();
+        let output2 = pid.tick(&snapshot, dt).unwrap();
         // 积分 = 0.05 + 0.5 * 0.1 = 0.1
         // 输出 = 1.0 * 0.1 = 0.1
         assert!((output2[0].0 - 0.1).abs() < 1e-10);
@@ -350,13 +356,13 @@ mod tests {
         let target = JointArray::from([Rad(1.0); 6]);
         let mut pid = PidController::new(target).with_gains(0.0, 1.0, 0.0).with_integral_limit(0.5); // 积分限制
 
-        let current = JointArray::from([Rad(0.0); 6]);
+        let snapshot = test_snapshot(0.0, 0.0);
         let dt = Duration::from_secs(1);
 
         // 误差 = 1.0, 每秒累积 1.0
         // 但积分被限制在 0.5
         for _ in 0..10 {
-            pid.tick(&current, dt).unwrap();
+            pid.tick(&snapshot, dt).unwrap();
         }
 
         // 积分应该被钳位到 0.5
@@ -364,23 +370,31 @@ mod tests {
     }
 
     #[test]
-    fn test_pid_derivative_term() {
+    fn test_pid_derivative_zero_velocity() {
         let target = JointArray::from([Rad(1.0); 6]);
         let mut pid = PidController::new(target).with_gains(0.0, 0.0, 1.0); // 只有微分项
 
         let dt = Duration::from_millis(100);
+        let snapshot = test_snapshot(0.5, 0.0);
 
-        // 第一次：误差从 0 变化
-        let current1 = JointArray::from([Rad(0.5); 6]);
-        let output1 = pid.tick(&current1, dt).unwrap();
-        // 误差 = 0.5, 上次误差 = 0, 变化率 = 0.5 / 0.1 = 5.0
-        // 输出 = 1.0 * 5.0 = 5.0
-        assert!((output1[0].0 - 5.0).abs() < 1e-10);
+        let output = pid.tick(&snapshot, dt).unwrap();
 
-        // 第二次：误差不变
-        let output2 = pid.tick(&current1, dt).unwrap();
-        // 误差变化 = 0, 输出 = 0
-        assert!((output2[0].0 - 0.0).abs() < 1e-10);
+        // 速度为 0 时，阻尼项应该为 0
+        assert!((output[0].0 - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_pid_derivative_measured_velocity_damping() {
+        let target = JointArray::from([Rad(1.0); 6]);
+        let mut pid = PidController::new(target).with_gains(0.0, 0.0, 2.0); // 只有微分项
+
+        let dt = Duration::from_millis(100);
+        let snapshot = test_snapshot(0.5, 0.25);
+
+        let output = pid.tick(&snapshot, dt).unwrap();
+
+        // D 项 = -Kd * velocity = -2.0 * 0.25 = -0.5
+        assert!((output[0].0 + 0.5).abs() < 1e-10);
     }
 
     #[test]
@@ -389,10 +403,10 @@ mod tests {
         let mut pid =
             PidController::new(target).with_gains(100.0, 0.0, 0.0).with_output_limit(50.0);
 
-        let current = JointArray::from([Rad(0.0); 6]);
+        let snapshot = test_snapshot(0.0, 0.0);
         let dt = Duration::from_millis(10);
 
-        let output = pid.tick(&current, dt).unwrap();
+        let output = pid.tick(&snapshot, dt).unwrap();
 
         // 理论输出 = 100.0 * 100.0 = 10000.0
         // 但被钳位到 50.0
@@ -404,11 +418,11 @@ mod tests {
         let target = JointArray::from([Rad(1.0); 6]);
         let mut pid = PidController::new(target).with_gains(0.0, 1.0, 1.0);
 
-        let current = JointArray::from([Rad(0.5); 6]);
+        let snapshot = test_snapshot(0.5, 0.2);
         let dt = Duration::from_secs(1);
 
         // 累积一些积分
-        pid.tick(&current, dt).unwrap();
+        pid.tick(&snapshot, dt).unwrap();
         let integral_before = pid.integral()[0];
         assert!(integral_before > 0.0);
 
@@ -418,9 +432,21 @@ mod tests {
         // ✅ 积分应该保留
         let integral_after = pid.integral()[0];
         assert_eq!(integral_before, integral_after);
+    }
 
-        // ✅ 微分项应该被重置
-        assert_eq!(pid.last_error[0], 0.0);
+    #[test]
+    fn test_pid_on_time_jump_does_not_inject_derivative_spike() {
+        let target = JointArray::from([Rad(1.0); 6]);
+        let mut pid = PidController::new(target).with_gains(0.0, 0.0, 1.0);
+
+        let snapshot = test_snapshot(0.5, 0.3);
+        let dt = Duration::from_millis(100);
+
+        let output_before = pid.tick(&snapshot, dt).unwrap();
+        pid.on_time_jump(Duration::from_secs(10)).unwrap();
+        let output_after = pid.tick(&snapshot, dt).unwrap();
+
+        assert_eq!(output_before, output_after);
     }
 
     #[test]
@@ -428,20 +454,18 @@ mod tests {
         let target = JointArray::from([Rad(1.0); 6]);
         let mut pid = PidController::new(target).with_gains(1.0, 1.0, 1.0);
 
-        let current = JointArray::from([Rad(0.5); 6]);
+        let snapshot = test_snapshot(0.5, 0.5);
         let dt = Duration::from_secs(1);
 
         // 累积一些状态
-        pid.tick(&current, dt).unwrap();
+        pid.tick(&snapshot, dt).unwrap();
         assert!(pid.integral()[0] != 0.0);
-        assert!(pid.last_error[0] != 0.0);
 
         // 重置
         pid.reset().unwrap();
 
-        // 所有状态应该被清零
+        // 积分状态应该被清零
         assert_eq!(pid.integral()[0], 0.0);
-        assert_eq!(pid.last_error[0], 0.0);
     }
 
     #[test]
@@ -460,11 +484,11 @@ mod tests {
         let target = JointArray::from([Rad(1.0); 6]);
         let mut pid = PidController::new(target).with_gains(10.0, 1.0, 1.0);
 
-        let current = JointArray::from([Rad(0.5); 6]);
+        let snapshot = test_snapshot(0.5, 1.0);
         let dt = Duration::from_secs(0);
 
         // dt = 0 应该返回零输出
-        let output = pid.tick(&current, dt).unwrap();
+        let output = pid.tick(&snapshot, dt).unwrap();
         assert_eq!(output[0].0, 0.0);
     }
 }
