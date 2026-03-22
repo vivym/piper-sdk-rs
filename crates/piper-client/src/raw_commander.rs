@@ -388,15 +388,31 @@ unsafe impl<'a> Sync for RawCommander<'a> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piper_can::{CanError, RealtimeTxAdapter, RxAdapter};
+    use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    struct IdleRxAdapter;
+    struct IdleRxAdapter {
+        bootstrap_emitted: bool,
+    }
+
+    impl IdleRxAdapter {
+        fn new() -> Self {
+            Self {
+                bootstrap_emitted: false,
+            }
+        }
+    }
 
     impl RxAdapter for IdleRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            if !self.bootstrap_emitted {
+                self.bootstrap_emitted = true;
+                let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+                frame.timestamp_us = 1;
+                return Ok(frame);
+            }
             Err(CanError::Timeout)
         }
     }
@@ -438,8 +454,12 @@ mod tests {
     }
 
     fn build_driver(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> RobotPiper {
-        RobotPiper::new_dual_thread_parts(IdleRxAdapter, RecordingTxAdapter::new(sent_frames), None)
-            .expect("driver should start")
+        RobotPiper::new_dual_thread_parts(
+            IdleRxAdapter::new(),
+            RecordingTxAdapter::new(sent_frames),
+            None,
+        )
+        .expect("driver should start")
     }
 
     fn wait_for_sent_frames(

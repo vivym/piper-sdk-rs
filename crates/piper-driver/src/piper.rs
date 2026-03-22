@@ -124,6 +124,41 @@ fn strict_realtime_timestamp_error(reason: impl Into<String>) -> DriverError {
     )))
 }
 
+fn recv_until_deadline<T, F>(
+    rx: &Receiver<T>,
+    deadline: Instant,
+    timeout_error: F,
+) -> Result<T, DriverError>
+where
+    F: Fn() -> DriverError,
+{
+    match rx.try_recv() {
+        Ok(value) => return Ok(value),
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            return Err(DriverError::ChannelClosed);
+        },
+        Err(crossbeam_channel::TryRecvError::Empty) => {},
+    }
+
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return match rx.try_recv() {
+            Ok(value) => Ok(value),
+            Err(crossbeam_channel::TryRecvError::Empty) => Err(timeout_error()),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(DriverError::ChannelClosed),
+        };
+    };
+
+    match rx.recv_timeout(remaining) {
+        Ok(value) => Ok(value),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => match rx.try_recv() {
+            Ok(value) => Ok(value),
+            Err(crossbeam_channel::TryRecvError::Empty) => Err(timeout_error()),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(DriverError::ChannelClosed),
+        },
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(DriverError::ChannelClosed),
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct NormalSendGate {
@@ -451,22 +486,7 @@ impl MaintenanceGate {
     }
 
     fn wait_control_ack_until(ack_rx: Receiver<()>, deadline: Instant) -> Result<(), DriverError> {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return match ack_rx.try_recv() {
-                Ok(()) => Ok(()),
-                Err(crossbeam_channel::TryRecvError::Empty) => Err(DriverError::Timeout),
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    Err(DriverError::ChannelClosed)
-                },
-            };
-        };
-        match ack_rx.recv_timeout(remaining) {
-            Ok(()) => Ok(()),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(DriverError::ChannelClosed)
-            },
-        }
+        recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)
     }
 
     fn rollback_tentative_grant(
@@ -772,24 +792,7 @@ impl ShutdownReceipt {
     ///
     /// timeout 语义已经在 enqueue 时绑定到 shutdown command，本方法只等待 ack。
     pub fn wait(self) -> Result<(), DriverError> {
-        let wait_result = match self.deadline.checked_duration_since(Instant::now()) {
-            Some(remaining) => self.ack_rx.recv_timeout(remaining),
-            None => match self.ack_rx.try_recv() {
-                Ok(result) => return result,
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    return Err(DriverError::Timeout);
-                },
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    return Err(DriverError::ChannelClosed);
-                },
-            },
-        };
-
-        match wait_result {
-            Ok(result) => result,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
-            Err(_) => Err(DriverError::ChannelClosed),
-        }
+        recv_until_deadline(&self.ack_rx, self.deadline, || DriverError::Timeout)?
     }
 }
 
@@ -1165,18 +1168,28 @@ impl Piper {
     /// # 注意
     /// - 适配器必须已启动（调用 `configure()` 或 `start()`）
     /// - 分离后，原适配器不再可用（消费 `can`）
-    pub fn new_dual_thread<C>(can: C, config: Option<PipelineConfig>) -> Result<Self, CanError>
+    pub fn new_dual_thread<C>(can: C, config: Option<PipelineConfig>) -> Result<Self, DriverError>
     where
         C: SplittableAdapter + Send + 'static,
         C::RxAdapter: Send + 'static,
         C::TxAdapter: Send + 'static,
     {
-        let (rx_adapter, tx_adapter) = can.split()?;
+        let (rx_adapter, tx_adapter) = can.split().map_err(DriverError::Can)?;
         Self::new_dual_thread_parts(rx_adapter, tx_adapter, config)
     }
 
     /// 使用已拆分的 RX/TX 适配器创建双线程 runtime。
     pub fn new_dual_thread_parts(
+        rx_adapter: impl RxAdapter + Send + 'static,
+        tx_adapter: impl RealtimeTxAdapter + Send + 'static,
+        config: Option<PipelineConfig>,
+    ) -> Result<Self, DriverError> {
+        let piper = Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
+            .map_err(DriverError::Can)?;
+        piper.validate_startup()
+    }
+
+    fn new_dual_thread_parts_internal(
         rx_adapter: impl RxAdapter + Send + 'static,
         tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
@@ -1275,6 +1288,29 @@ impl Piper {
             driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
             backend_capability,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_dual_thread_parts_unvalidated(
+        rx_adapter: impl RxAdapter + Send + 'static,
+        tx_adapter: impl RealtimeTxAdapter + Send + 'static,
+        config: Option<PipelineConfig>,
+    ) -> Result<Self, CanError> {
+        Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
+    }
+
+    fn validate_startup(self) -> Result<Self, DriverError> {
+        if !self.backend_capability.is_strict_realtime() {
+            return Ok(self);
+        }
+
+        if let Err(error) = self.wait_for_timestamped_feedback(STRICT_TIMESTAMP_VALIDATION_TIMEOUT)
+        {
+            self.request_stop();
+            return Err(error);
+        }
+
+        Ok(self)
     }
 
     pub fn backend_capability(&self) -> BackendCapability {
@@ -2131,17 +2167,10 @@ impl Piper {
         }
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let deadline = Instant::now() + timeout;
         self.send_realtime_command(RealtimeCommand::confirmed(buffer, ack_tx))?;
 
-        match ack_rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                Err(DriverError::RealtimeDeliveryTimeout)
-            },
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(DriverError::ChannelClosed)
-            },
-        }
+        recv_until_deadline(&ack_rx, deadline, || DriverError::RealtimeDeliveryTimeout)?
     }
 
     /// 发送 SoftRealtime 原始批命令并等待实际发送结果。
@@ -2196,13 +2225,7 @@ impl Piper {
             },
         }
 
-        match ack_rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(DriverError::ChannelClosed)
-            },
-        }
+        recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)?
     }
 
     /// 内部方法：发送实时命令（统一处理单个帧和帧包）
@@ -2351,22 +2374,11 @@ impl Piper {
             )));
         }
 
-        let start = Instant::now();
+        let deadline = Instant::now() + timeout;
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.enqueue_reliable_timeout(ReliableCommand::package_confirmed(buffer, ack_tx), timeout)?;
 
-        let remaining = timeout.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            return Err(DriverError::Timeout);
-        }
-
-        match ack_rx.recv_timeout(remaining) {
-            Ok(result) => result,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(DriverError::ChannelClosed)
-            },
-        }
+        recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)?
     }
 
     /// 发送维护帧并等待 TX 线程在实际发送点完成最终运行时准入判定。
@@ -2398,7 +2410,7 @@ impl Piper {
             .map_err(|_| DriverError::ChannelClosed)?;
         self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
 
-        ack_rx.recv().map_err(|_| DriverError::ChannelClosed)?
+        recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)?
     }
 
     #[doc(hidden)]
@@ -2630,6 +2642,29 @@ mod tests {
 
     impl piper_can::RxAdapter for MockRxAdapter {
         fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            Err(CanError::Timeout)
+        }
+    }
+
+    struct BootstrappedMockRxAdapter {
+        bootstrap: Option<PiperFrame>,
+    }
+
+    impl BootstrappedMockRxAdapter {
+        fn new() -> Self {
+            let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+            frame.timestamp_us = 1;
+            Self {
+                bootstrap: Some(frame),
+            }
+        }
+    }
+
+    impl piper_can::RxAdapter for BootstrappedMockRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
             Err(CanError::Timeout)
         }
     }
@@ -2886,11 +2921,11 @@ mod tests {
     }
 
     impl SplittableAdapter for MockCanAdapter {
-        type RxAdapter = MockRxAdapter;
+        type RxAdapter = BootstrappedMockRxAdapter;
         type TxAdapter = MockTxAdapter;
 
         fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
-            Ok((MockRxAdapter, MockTxAdapter))
+            Ok((BootstrappedMockRxAdapter::new(), MockTxAdapter))
         }
     }
 
@@ -2904,6 +2939,7 @@ mod tests {
     }
 
     struct ScriptedRxAdapter {
+        bootstrap: Option<PiperFrame>,
         frames: VecDeque<PiperFrame>,
         first_delay: Duration,
         emitted_first_frame: bool,
@@ -2912,6 +2948,11 @@ mod tests {
     impl ScriptedRxAdapter {
         fn new(frames: Vec<PiperFrame>, first_delay: Duration) -> Self {
             Self {
+                bootstrap: Some({
+                    let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+                    frame.timestamp_us = 1;
+                    frame
+                }),
                 frames: frames.into(),
                 first_delay,
                 emitted_first_frame: false,
@@ -2921,6 +2962,9 @@ mod tests {
 
     impl piper_can::RxAdapter for ScriptedRxAdapter {
         fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
             if !self.emitted_first_frame && !self.first_delay.is_zero() {
                 std::thread::sleep(self.first_delay);
                 self.emitted_first_frame = true;
@@ -3071,8 +3115,8 @@ mod tests {
 
     #[test]
     fn test_wait_for_feedback_timeout() {
-        let mock_can = MockCanAdapter;
-        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+        let piper =
+            Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None).unwrap();
 
         // MockCanAdapter 不发送帧，所以应该超时
         let result = piper.wait_for_feedback(std::time::Duration::from_millis(10));
@@ -3095,8 +3139,31 @@ mod tests {
     }
 
     #[test]
+    fn test_public_new_dual_thread_parts_rejects_strict_backend_without_timestamped_feedback() {
+        let error = match Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None) {
+            Ok(_) => panic!("public constructor must validate strict startup"),
+            Err(error) => error,
+        };
+
+        match error {
+            DriverError::Can(CanError::Device(device_error)) => {
+                assert_eq!(
+                    device_error.kind,
+                    piper_can::CanDeviceErrorKind::UnsupportedConfig
+                );
+                assert!(
+                    device_error.message.contains("refusing strict connection"),
+                    "unexpected error message: {device_error}"
+                );
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_wait_for_timestamped_feedback_times_out_without_timestamped_frames() {
-        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
+        let piper =
+            Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None).unwrap();
 
         let error = piper
             .wait_for_timestamped_feedback(Duration::from_millis(20))
@@ -3134,6 +3201,17 @@ mod tests {
         piper
             .wait_for_timestamped_feedback(Duration::from_millis(200))
             .expect("timestamped feedback should satisfy strict validation");
+    }
+
+    #[test]
+    fn test_recv_until_deadline_prefers_ready_value_over_expired_deadline() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(7u8).expect("send should succeed");
+
+        let value = recv_until_deadline(&rx, Instant::now(), || DriverError::Timeout)
+            .expect("ready ack should win over timeout");
+
+        assert_eq!(value, 7);
     }
 
     #[test]
@@ -3179,8 +3257,8 @@ mod tests {
 
     #[test]
     fn test_health_reports_runtime_only_faults() {
-        let mock_can = MockCanAdapter;
-        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+        let piper =
+            Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None).unwrap();
 
         let health = piper.health();
         assert!(health.rx_alive);
@@ -3313,7 +3391,7 @@ mod tests {
     #[test]
     fn test_send_realtime_package_confirmed_success() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3337,7 +3415,7 @@ mod tests {
     #[test]
     fn test_send_reliable_package_confirmed_success() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3363,7 +3441,7 @@ mod tests {
 
     #[test]
     fn test_send_reliable_package_confirmed_reports_partial_transport_failure() {
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             FailOnNthTxAdapter {
                 fail_on: 2,
@@ -3425,7 +3503,7 @@ mod tests {
     #[test]
     fn test_enqueue_shutdown_success() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3444,7 +3522,8 @@ mod tests {
 
     #[test]
     fn test_enqueue_shutdown_channel_closed_when_tx_thread_exits() {
-        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
+        let piper =
+            Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None).unwrap();
         piper.request_stop();
         let deadline = Instant::now() + Duration::from_millis(100);
         while piper.tx_thread_alive() && Instant::now() < deadline {
@@ -3464,7 +3543,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_shutdown_reports_transport_failure() {
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             FailOnNthTxAdapter {
                 fail_on: 1,
@@ -3486,7 +3565,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_receipt_times_out_waiting_for_ack() {
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             SlowTxAdapter {
                 delay: Duration::from_millis(50),
@@ -3507,7 +3586,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_receipt_times_out_when_deadline_has_already_passed() {
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             SlowTxAdapter {
                 delay: Duration::from_millis(50),
@@ -3527,7 +3606,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_receipt_returns_ready_ack_even_after_deadline_passes() {
-        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
+        let piper =
+            Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None).unwrap();
         let receipt = piper
             .enqueue_shutdown(
                 PiperFrame::new_standard(0x471, &[0x01]),
@@ -3544,7 +3624,7 @@ mod tests {
     #[test]
     fn test_latch_fault_closes_normal_control_path_but_keeps_shutdown_lane() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3579,7 +3659,7 @@ mod tests {
     #[test]
     fn test_rx_fatal_keeps_shutdown_lane_available_while_tx_is_alive() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             FatalRxAdapter { tripped: false },
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3609,7 +3689,7 @@ mod tests {
     #[test]
     fn test_fault_latched_shutdown_preempts_pending_realtime_and_reliable_commands() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -3648,7 +3728,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
-            Piper::new_dual_thread_parts(
+            Piper::new_dual_thread_parts_unvalidated(
                 MockRxAdapter,
                 BlockingFirstSendTxAdapter {
                     sent_frames: sent_frames.clone(),
@@ -3701,7 +3781,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
-            Piper::new_dual_thread_parts(
+            Piper::new_dual_thread_parts_unvalidated(
                 MockRxAdapter,
                 BlockingFirstSendTxAdapter {
                     sent_frames: sent_frames.clone(),
@@ -3790,7 +3870,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
-            Piper::new_dual_thread_parts(
+            Piper::new_dual_thread_parts_unvalidated(
                 MockRxAdapter,
                 BlockingFirstSendTxAdapter {
                     sent_frames: sent_frames.clone(),
@@ -3866,7 +3946,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
-            Piper::new_dual_thread_parts(
+            Piper::new_dual_thread_parts_unvalidated(
                 MockRxAdapter,
                 BlockingFirstSendTxAdapter {
                     sent_frames,
@@ -4012,7 +4092,7 @@ mod tests {
 
     #[test]
     fn test_send_realtime_package_confirmed_reports_partial_failure() {
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             FailOnNthTxAdapter {
                 fail_on: 2,
@@ -4047,7 +4127,7 @@ mod tests {
         drop(started_rx);
         let (release_tx, release_rx) = mpsc::channel();
         drop(release_tx);
-        let piper = Piper::new_dual_thread_parts(
+        let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
             CoordinatedFailTxAdapter {
                 started_tx,
@@ -4080,7 +4160,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
-            Piper::new_dual_thread_parts(
+            Piper::new_dual_thread_parts_unvalidated(
                 MockRxAdapter,
                 CoordinatedFailTxAdapter {
                     started_tx,

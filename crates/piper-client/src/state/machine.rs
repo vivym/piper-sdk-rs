@@ -500,9 +500,6 @@ impl Piper<Disconnected, UnspecifiedCapability> {
         use piper_driver::Piper as RobotPiper;
 
         let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
-        if driver.backend_capability().is_strict_realtime() {
-            driver.wait_for_timestamped_feedback(config.feedback_timeout)?;
-        }
         let quirks = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
@@ -550,9 +547,6 @@ impl Piper<Disconnected, UnspecifiedCapability> {
         // 1. 创建新的 driver 实例
         use piper_driver::Piper as RobotPiper;
         let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
-        if driver.backend_capability().is_strict_realtime() {
-            driver.wait_for_timestamped_feedback(config.feedback_timeout)?;
-        }
         let quirks = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
@@ -2784,21 +2778,37 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    struct IdleRxAdapter;
+    struct IdleRxAdapter {
+        bootstrap_emitted: bool,
+    }
+
+    impl IdleRxAdapter {
+        fn new() -> Self {
+            Self {
+                bootstrap_emitted: false,
+            }
+        }
+    }
 
     impl RxAdapter for IdleRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            if !self.bootstrap_emitted {
+                self.bootstrap_emitted = true;
+                return Ok(bootstrap_timestamp_frame());
+            }
             Err(CanError::Timeout)
         }
     }
 
     struct ScriptedRxAdapter {
+        bootstrap: Option<PiperFrame>,
         frames: VecDeque<PiperFrame>,
     }
 
     impl ScriptedRxAdapter {
         fn new(frames: Vec<PiperFrame>) -> Self {
             Self {
+                bootstrap: Some(bootstrap_timestamp_frame()),
                 frames: frames.into(),
             }
         }
@@ -2806,6 +2816,9 @@ mod tests {
 
     impl RxAdapter for ScriptedRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
             self.frames.pop_front().ok_or(CanError::Timeout)
         }
     }
@@ -2816,12 +2829,14 @@ mod tests {
     }
 
     struct PacedRxAdapter {
+        bootstrap: Option<PiperFrame>,
         frames: VecDeque<TimedFrame>,
     }
 
     impl PacedRxAdapter {
         fn new(frames: Vec<TimedFrame>) -> Self {
             Self {
+                bootstrap: Some(bootstrap_timestamp_frame()),
                 frames: frames.into(),
             }
         }
@@ -2829,6 +2844,9 @@ mod tests {
 
     impl RxAdapter for PacedRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
             match self.frames.pop_front() {
                 Some(timed) => {
                     if !timed.delay.is_zero() {
@@ -2900,13 +2918,19 @@ mod tests {
         }
     }
 
+    fn bootstrap_timestamp_frame() -> PiperFrame {
+        let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+        frame.timestamp_us = 1;
+        frame
+    }
+
     fn build_active_mit_piper(
         quirks: DeviceQuirks,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
     ) -> Piper<Active<MitMode>, StrictRealtime> {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                IdleRxAdapter,
+                IdleRxAdapter::new(),
                 RecordingTxAdapter::new(sent_frames),
                 None,
             )
@@ -3262,7 +3286,7 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                IdleRxAdapter,
+                IdleRxAdapter::new(),
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
             )

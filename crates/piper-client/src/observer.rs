@@ -770,12 +770,14 @@ mod tests {
     use std::time::Duration;
 
     struct ScriptedRxAdapter {
+        bootstrap: Option<PiperFrame>,
         frames: VecDeque<PiperFrame>,
     }
 
     impl ScriptedRxAdapter {
         fn new(frames: Vec<PiperFrame>) -> Self {
             Self {
+                bootstrap: Some(bootstrap_timestamp_frame()),
                 frames: frames.into(),
             }
         }
@@ -783,6 +785,9 @@ mod tests {
 
     impl RxAdapter for ScriptedRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
             self.frames.pop_front().ok_or(CanError::Timeout)
         }
     }
@@ -815,12 +820,14 @@ mod tests {
     }
 
     struct PacedRxAdapter {
+        bootstrap: Option<PiperFrame>,
         frames: VecDeque<TimedFrame>,
     }
 
     impl PacedRxAdapter {
         fn new(frames: Vec<TimedFrame>) -> Self {
             Self {
+                bootstrap: Some(bootstrap_timestamp_frame()),
                 frames: frames.into(),
             }
         }
@@ -828,6 +835,9 @@ mod tests {
 
     impl RxAdapter for PacedRxAdapter {
         fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
             match self.frames.pop_front() {
                 Some(timed) => {
                     if !timed.delay.is_zero() {
@@ -949,6 +959,12 @@ mod tests {
 
         let mut frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
         frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn bootstrap_timestamp_frame() -> PiperFrame {
+        let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
+        frame.timestamp_us = 1;
         frame
     }
 

@@ -214,81 +214,150 @@ impl PiperBuilder {
 
     fn build_with_factory(self, factory: &impl BackendFactory) -> Result<Piper, DriverError> {
         let receive_timeout = Duration::from_millis(self.pipeline_config.receive_timeout_ms);
-        let backend = match &self.target {
-            ConnectionTarget::AutoStrict => self.build_auto_strict(factory, receive_timeout)?,
-            ConnectionTarget::AutoAny => self.build_auto_any(factory, receive_timeout)?,
+        match &self.target {
+            ConnectionTarget::AutoStrict => self.build_auto_strict(factory, receive_timeout),
+            ConnectionTarget::AutoAny => self.build_auto_any(factory, receive_timeout),
             ConnectionTarget::SocketCan { iface } => {
-                factory.open_socketcan(iface, self.baud_rate, receive_timeout)?
+                let backend = factory.open_socketcan(iface, self.baud_rate, receive_timeout)?;
+                self.build_backend(backend)
             },
             ConnectionTarget::GsUsbAuto => {
-                factory.open_gs_usb(GsUsbSelectorSpec::Auto, self.baud_rate, receive_timeout)?
+                let backend = factory.open_gs_usb(
+                    GsUsbSelectorSpec::Auto,
+                    self.baud_rate,
+                    receive_timeout,
+                )?;
+                self.build_backend(backend)
             },
-            ConnectionTarget::GsUsbSerial { serial } => factory.open_gs_usb(
-                GsUsbSelectorSpec::Serial(serial.clone()),
-                self.baud_rate,
-                receive_timeout,
-            )?,
-            ConnectionTarget::GsUsbBusAddress { bus, address } => factory.open_gs_usb(
-                GsUsbSelectorSpec::BusAddress {
-                    bus: *bus,
-                    address: *address,
-                },
-                self.baud_rate,
-                receive_timeout,
-            )?,
-        };
-
-        let piper =
-            Piper::new_dual_thread_parts(backend.rx, backend.tx, Some(self.pipeline_config))
-                .map(|piper| piper.with_metadata(backend.interface, backend.bus_speed))
-                .map_err(DriverError::Can)?;
-
-        if piper.backend_capability().is_strict_realtime()
-            && let Err(error) = piper
-                .wait_for_timestamped_feedback(crate::piper::STRICT_TIMESTAMP_VALIDATION_TIMEOUT)
-        {
-            piper.request_stop();
-            return Err(error);
+            ConnectionTarget::GsUsbSerial { serial } => {
+                let backend = factory.open_gs_usb(
+                    GsUsbSelectorSpec::Serial(serial.clone()),
+                    self.baud_rate,
+                    receive_timeout,
+                )?;
+                self.build_backend(backend)
+            },
+            ConnectionTarget::GsUsbBusAddress { bus, address } => {
+                let backend = factory.open_gs_usb(
+                    GsUsbSelectorSpec::BusAddress {
+                        bus: *bus,
+                        address: *address,
+                    },
+                    self.baud_rate,
+                    receive_timeout,
+                )?;
+                self.build_backend(backend)
+            },
         }
+    }
 
-        Ok(piper)
+    fn build_backend(&self, backend: BuiltBackend) -> Result<Piper, DriverError> {
+        let interface = backend.interface;
+        let bus_speed = backend.bus_speed;
+        Piper::new_dual_thread_parts(backend.rx, backend.tx, Some(self.pipeline_config.clone()))
+            .map(|piper| piper.with_metadata(interface, bus_speed))
+    }
+
+    fn strict_candidate_summary(errors: &[(String, DriverError)]) -> String {
+        errors
+            .iter()
+            .map(|(iface, error)| format!("{iface}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn attach_auto_context(error: DriverError, context: impl Into<String>) -> DriverError {
+        let context = context.into();
+        match error {
+            DriverError::Can(CanError::Device(mut device_error)) => {
+                device_error.message = format!("{}; {}", device_error.message, context);
+                DriverError::Can(CanError::Device(device_error))
+            },
+            other => DriverError::Can(CanError::Device(CanDeviceError::new(
+                CanDeviceErrorKind::Backend,
+                format!("{other}; {context}"),
+            ))),
+        }
+    }
+
+    fn try_socketcan_candidates(
+        &self,
+        factory: &impl BackendFactory,
+        receive_timeout: Duration,
+    ) -> Result<Piper, Vec<(String, DriverError)>> {
+        #[cfg(target_os = "linux")]
+        let mut errors = Vec::new();
+        #[cfg(not(target_os = "linux"))]
+        let errors = Vec::new();
+
+        #[cfg(target_os = "linux")]
+        {
+            for iface in ["can0", "vcan0"] {
+                if !factory.socketcan_available(iface) {
+                    continue;
+                }
+
+                let result = factory
+                    .open_socketcan(iface, self.baud_rate, receive_timeout)
+                    .and_then(|backend| self.build_backend(backend));
+                match result {
+                    Ok(piper) => return Ok(piper),
+                    Err(error) => errors.push((iface.to_string(), error)),
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (factory, receive_timeout);
+
+        Err(errors)
     }
 
     fn build_auto_strict(
         &self,
-        _factory: &impl BackendFactory,
-        _receive_timeout: Duration,
-    ) -> Result<BuiltBackend, DriverError> {
-        #[cfg(target_os = "linux")]
-        {
-            for iface in ["can0", "vcan0"] {
-                if factory.socketcan_available(iface) {
-                    return factory.open_socketcan(iface, self.baud_rate, receive_timeout);
-                }
-            }
+        factory: &impl BackendFactory,
+        receive_timeout: Duration,
+    ) -> Result<Piper, DriverError> {
+        match self.try_socketcan_candidates(factory, receive_timeout) {
+            Ok(piper) => Ok(piper),
+            Err(errors) if errors.is_empty() => {
+                Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::NotFound,
+                    "AutoStrict could not find a SocketCAN interface; userspace GS-USB is intentionally excluded from strict realtime auto-selection",
+                ))))
+            },
+            Err(errors) => {
+                let summary = Self::strict_candidate_summary(&errors);
+                let (_, last_error) =
+                    errors.into_iter().last().expect("non-empty strict candidate errors");
+                Err(Self::attach_auto_context(
+                    last_error,
+                    format!("tried SocketCAN candidates: {summary}"),
+                ))
+            },
         }
-
-        Err(DriverError::Can(CanError::Device(CanDeviceError::new(
-            CanDeviceErrorKind::NotFound,
-            "AutoStrict could not find a SocketCAN interface; userspace GS-USB is intentionally excluded from strict realtime auto-selection",
-        ))))
     }
 
     fn build_auto_any(
         &self,
         factory: &impl BackendFactory,
         receive_timeout: Duration,
-    ) -> Result<BuiltBackend, DriverError> {
-        #[cfg(target_os = "linux")]
-        {
-            for iface in ["can0", "vcan0"] {
-                if factory.socketcan_available(iface) {
-                    return factory.open_socketcan(iface, self.baud_rate, receive_timeout);
-                }
-            }
-        }
+    ) -> Result<Piper, DriverError> {
+        let strict_errors = match self.try_socketcan_candidates(factory, receive_timeout) {
+            Ok(piper) => return Ok(piper),
+            Err(errors) => errors,
+        };
 
-        factory.open_gs_usb(GsUsbSelectorSpec::Auto, self.baud_rate, receive_timeout)
+        match factory.open_gs_usb(GsUsbSelectorSpec::Auto, self.baud_rate, receive_timeout) {
+            Ok(backend) => self.build_backend(backend),
+            Err(error) if strict_errors.is_empty() => Err(error),
+            Err(error) => Err(Self::attach_auto_context(
+                error,
+                format!(
+                    "strict candidates failed before GS-USB fallback: {}",
+                    Self::strict_candidate_summary(&strict_errors)
+                ),
+            )),
+        }
     }
 }
 
@@ -313,6 +382,37 @@ mod tests {
 
         fn backend_capability(&self) -> piper_can::BackendCapability {
             piper_can::BackendCapability::SoftRealtime
+        }
+    }
+
+    struct StrictNoTimestampRxAdapter;
+
+    impl RxAdapter for StrictNoTimestampRxAdapter {
+        fn receive(&mut self) -> Result<piper_can::PiperFrame, CanError> {
+            Err(CanError::Timeout)
+        }
+    }
+
+    struct StrictBootstrapRxAdapter {
+        bootstrap: Option<piper_can::PiperFrame>,
+    }
+
+    impl StrictBootstrapRxAdapter {
+        fn new() -> Self {
+            let mut frame = piper_can::PiperFrame::new_standard(0x7FF, &[0]);
+            frame.timestamp_us = 1;
+            Self {
+                bootstrap: Some(frame),
+            }
+        }
+    }
+
+    impl RxAdapter for StrictBootstrapRxAdapter {
+        fn receive(&mut self) -> Result<piper_can::PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
+            Err(CanError::Timeout)
         }
     }
 
@@ -389,6 +489,69 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FallbackFactory {
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        socketcan_available: Vec<String>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl BackendFactory for FallbackFactory {
+        #[cfg(target_os = "linux")]
+        fn socketcan_available(&self, iface: &str) -> bool {
+            self.socketcan_available.iter().any(|item| item == iface)
+        }
+
+        fn open_socketcan(
+            &self,
+            iface: &str,
+            baud_rate: u32,
+            _receive_timeout: Duration,
+        ) -> Result<BuiltBackend, DriverError> {
+            self.calls.lock().unwrap().push(format!("socketcan:{iface}"));
+            match iface {
+                "can0" => Ok(BuiltBackend::new(
+                    StrictNoTimestampRxAdapter,
+                    TestTxAdapter,
+                    format!("socketcan:{iface}"),
+                    baud_rate,
+                )),
+                "vcan0" => Ok(BuiltBackend::new(
+                    StrictBootstrapRxAdapter::new(),
+                    TestTxAdapter,
+                    format!("socketcan:{iface}"),
+                    baud_rate,
+                )),
+                other => Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::NotFound,
+                    format!("unexpected SocketCAN candidate: {other}"),
+                )))),
+            }
+        }
+
+        fn open_gs_usb(
+            &self,
+            selector: GsUsbSelectorSpec,
+            baud_rate: u32,
+            _receive_timeout: Duration,
+        ) -> Result<BuiltBackend, DriverError> {
+            let label = match selector {
+                GsUsbSelectorSpec::Auto => "gs-usb:auto".to_string(),
+                GsUsbSelectorSpec::Serial(serial) => format!("gs-usb:serial:{serial}"),
+                GsUsbSelectorSpec::BusAddress { bus, address } => {
+                    format!("gs-usb:bus-address:{bus}:{address}")
+                },
+            };
+            self.calls.lock().unwrap().push(label.clone());
+            Ok(BuiltBackend::new(
+                TestRxAdapter,
+                TestTxAdapter,
+                label,
+                baud_rate,
+            ))
+        }
+    }
+
     #[test]
     fn test_builder_defaults() {
         let builder = PiperBuilder::new();
@@ -440,6 +603,60 @@ mod tests {
         {
             assert!(result.is_err());
             assert!(factory.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_auto_strict_retries_next_socketcan_candidate_after_validation_failure() {
+        let factory = FallbackFactory {
+            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let result = PiperBuilder::new()
+            .target(ConnectionTarget::AutoStrict)
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            result.expect("vcan0 should be tried after can0 strict validation fails");
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string(), "socketcan:vcan0".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_auto_any_falls_back_to_gs_usb_after_strict_validation_failure() {
+        let factory = FallbackFactory {
+            socketcan_available: vec!["can0".to_string()],
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let result = PiperBuilder::new()
+            .target(ConnectionTarget::AutoAny)
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            let piper = result.expect("AutoAny should fall back to GS-USB");
+            assert_eq!(
+                piper.backend_capability(),
+                piper_can::BackendCapability::SoftRealtime
+            );
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string(), "gs-usb:auto".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            result.expect("non-Linux AutoAny should go straight to GS-USB");
         }
     }
 
