@@ -187,21 +187,6 @@ impl MaintenanceGateState {
         matches!(self, Self::AllowedStandby)
     }
 
-    fn denial_message(self) -> &'static str {
-        match self {
-            Self::DeniedFaulted => {
-                "maintenance writes are disabled while a runtime fault is latched"
-            },
-            Self::DeniedActiveControl => {
-                "maintenance writes are disabled while active control is enabled"
-            },
-            Self::DeniedTransportDown => {
-                "maintenance writes are disabled while transport is disconnected"
-            },
-            Self::AllowedStandby => "maintenance allowed",
-        }
-    }
-
     fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::DeniedFaulted,
@@ -239,6 +224,58 @@ impl MaintenanceRevocationEvent {
 
     pub fn reason(self) -> MaintenanceRevocationReason {
         self.reason
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaintenanceControlOp {
+    Grant {
+        session_id: u32,
+        session_key: u64,
+        lease_epoch: u64,
+    },
+    Release {
+        session_key: u64,
+        lease_epoch: u64,
+    },
+    Revoke {
+        session_key: u64,
+        lease_epoch: u64,
+        reason: MaintenanceRevocationReason,
+    },
+    SetState {
+        state: MaintenanceGateState,
+        holder_session_id: Option<u32>,
+        holder_session_key: Option<u64>,
+        lease_epoch: u64,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MaintenanceControlCommand {
+    op: MaintenanceControlOp,
+    ack: Option<Sender<()>>,
+}
+
+impl MaintenanceControlCommand {
+    fn new(op: MaintenanceControlOp) -> Self {
+        Self { op, ack: None }
+    }
+
+    fn blocking(op: MaintenanceControlOp) -> (Self, Receiver<()>) {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        (
+            Self {
+                op,
+                ack: Some(ack_tx),
+            },
+            ack_rx,
+        )
+    }
+
+    pub(crate) fn into_parts(self) -> (MaintenanceControlOp, Option<Sender<()>>) {
+        (self.op, self.ack)
     }
 }
 
@@ -306,6 +343,7 @@ pub struct MaintenanceGate {
     inner: Mutex<MaintenanceGateInner>,
     wait_cv: Condvar,
     event_sink: Mutex<Option<Sender<MaintenanceRevocationEvent>>>,
+    control_sink: Mutex<Option<Sender<MaintenanceControlCommand>>>,
 }
 
 impl Default for MaintenanceGate {
@@ -319,6 +357,7 @@ impl Default for MaintenanceGate {
             inner: Mutex::new(inner),
             wait_cv: Condvar::new(),
             event_sink: Mutex::new(None),
+            control_sink: Mutex::new(None),
         }
     }
 }
@@ -353,6 +392,32 @@ impl MaintenanceGate {
 
     pub fn set_event_sink(&self, sink: Sender<MaintenanceRevocationEvent>) {
         *self.event_sink.lock().unwrap() = Some(sink);
+    }
+
+    #[doc(hidden)]
+    pub fn set_control_sink(&self, sink: Sender<MaintenanceControlCommand>) {
+        *self.control_sink.lock().unwrap() = Some(sink);
+    }
+
+    fn send_control_command_locked(
+        &self,
+        op: MaintenanceControlOp,
+        wait_for_ack: bool,
+    ) -> Result<Option<Receiver<()>>, DriverError> {
+        let sink = self.control_sink.lock().unwrap().clone().ok_or(DriverError::ChannelClosed)?;
+        if wait_for_ack {
+            let (command, ack_rx) = MaintenanceControlCommand::blocking(op);
+            sink.send(command).map_err(|_| DriverError::ChannelClosed)?;
+            Ok(Some(ack_rx))
+        } else {
+            sink.send(MaintenanceControlCommand::new(op))
+                .map_err(|_| DriverError::ChannelClosed)?;
+            Ok(None)
+        }
+    }
+
+    fn wait_control_ack(ack_rx: Receiver<()>) -> Result<(), DriverError> {
+        ack_rx.recv().map_err(|_| DriverError::ChannelClosed)
     }
 
     pub fn snapshot(&self) -> MaintenanceLeaseSnapshot {
@@ -402,17 +467,61 @@ impl MaintenanceGate {
         }
     }
 
+    pub fn set_state_synced(&self, new_state: MaintenanceGateState) -> Result<(), DriverError> {
+        let event = {
+            let mut inner = self.inner.lock().unwrap();
+            let mut event = None;
+            let mut changed = false;
+            if inner.state != new_state {
+                inner.state = new_state;
+                changed = true;
+            }
+            if !new_state.allows_lease() {
+                event = self.build_revocation_event(
+                    &inner,
+                    MaintenanceRevocationReason::ControllerStateChanged,
+                );
+                if event.is_some() {
+                    inner.holder_session_id = None;
+                    inner.holder_session_key = None;
+                    inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+                    changed = true;
+                }
+            }
+            self.sync_atomics(&inner);
+            self.wait_cv.notify_all();
+
+            if changed {
+                self.send_control_command_locked(
+                    MaintenanceControlOp::SetState {
+                        state: inner.state,
+                        holder_session_id: inner.holder_session_id,
+                        holder_session_key: inner.holder_session_key,
+                        lease_epoch: inner.lease_epoch,
+                    },
+                    false,
+                )?;
+            }
+            event
+        };
+
+        if let Some(event) = event {
+            self.emit(event);
+        }
+        Ok(())
+    }
+
     pub fn acquire_blocking(
         &self,
         session_id: u32,
         session_key: u64,
         timeout: Duration,
-    ) -> MaintenanceLeaseAcquireResult {
+    ) -> Result<MaintenanceLeaseAcquireResult, DriverError> {
         let deadline = Instant::now() + timeout;
         let mut inner = self.inner.lock().unwrap();
         loop {
             if !inner.state.allows_lease() {
-                return MaintenanceLeaseAcquireResult::DeniedState { state: inner.state };
+                return Ok(MaintenanceLeaseAcquireResult::DeniedState { state: inner.state });
             }
 
             match inner.holder_session_key {
@@ -423,70 +532,144 @@ impl MaintenanceGate {
                     let lease_epoch = inner.lease_epoch;
                     self.sync_atomics(&inner);
                     self.wait_cv.notify_all();
-                    return MaintenanceLeaseAcquireResult::Granted { lease_epoch };
+                    let ack_rx = match self.send_control_command_locked(
+                        MaintenanceControlOp::Grant {
+                            session_id,
+                            session_key,
+                            lease_epoch,
+                        },
+                        true,
+                    ) {
+                        Ok(Some(ack_rx)) => ack_rx,
+                        Ok(None) => unreachable!("blocking grant must return ack"),
+                        Err(err) => {
+                            inner.holder_session_id = None;
+                            inner.holder_session_key = None;
+                            inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+                            self.sync_atomics(&inner);
+                            self.wait_cv.notify_all();
+                            return Err(err);
+                        },
+                    };
+                    drop(inner);
+                    if let Err(err) = Self::wait_control_ack(ack_rx) {
+                        let mut inner = self.inner.lock().unwrap();
+                        if inner.holder_session_key == Some(session_key)
+                            && inner.lease_epoch == lease_epoch
+                        {
+                            inner.holder_session_id = None;
+                            inner.holder_session_key = None;
+                            inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+                            self.sync_atomics(&inner);
+                            self.wait_cv.notify_all();
+                        }
+                        return Err(err);
+                    }
+                    return Ok(MaintenanceLeaseAcquireResult::Granted { lease_epoch });
                 },
                 Some(holder_key) if holder_key == session_key => {
-                    return MaintenanceLeaseAcquireResult::Granted {
-                        lease_epoch: inner.lease_epoch,
+                    let lease_epoch = inner.lease_epoch;
+                    let ack_rx = match self.send_control_command_locked(
+                        MaintenanceControlOp::Grant {
+                            session_id,
+                            session_key,
+                            lease_epoch,
+                        },
+                        true,
+                    ) {
+                        Ok(Some(ack_rx)) => ack_rx,
+                        Ok(None) => unreachable!("blocking grant must return ack"),
+                        Err(err) => return Err(err),
                     };
+                    drop(inner);
+                    Self::wait_control_ack(ack_rx)?;
+                    return Ok(MaintenanceLeaseAcquireResult::Granted { lease_epoch });
                 },
                 _ => {
                     let now = Instant::now();
                     if now >= deadline {
-                        return MaintenanceLeaseAcquireResult::DeniedHeld {
+                        return Ok(MaintenanceLeaseAcquireResult::DeniedHeld {
                             holder_session_id: inner.holder_session_id,
-                        };
+                        });
                     }
                     let timeout = deadline.saturating_duration_since(now);
                     let (next_inner, wait_result) =
                         self.wait_cv.wait_timeout(inner, timeout).unwrap();
                     inner = next_inner;
                     if wait_result.timed_out() {
-                        return MaintenanceLeaseAcquireResult::DeniedHeld {
+                        return Ok(MaintenanceLeaseAcquireResult::DeniedHeld {
                             holder_session_id: inner.holder_session_id,
-                        };
+                        });
                     }
                 },
             }
         }
     }
 
-    pub fn release_if_holder(&self, session_key: u64) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.holder_session_key != Some(session_key) {
-            return false;
+    pub fn release_if_holder(&self, session_key: u64) -> Result<bool, DriverError> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.holder_session_key != Some(session_key) {
+                return Ok(false);
+            }
+            inner.holder_session_id = None;
+            inner.holder_session_key = None;
+            inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+            let lease_epoch = inner.lease_epoch;
+            self.sync_atomics(&inner);
+            self.wait_cv.notify_all();
+            match self.send_control_command_locked(
+                MaintenanceControlOp::Release {
+                    session_key,
+                    lease_epoch,
+                },
+                false,
+            ) {
+                Ok(None) => {},
+                Ok(Some(_)) => unreachable!("non-blocking release must not return ack"),
+                Err(err) => return Err(err),
+            }
         }
-        inner.holder_session_id = None;
-        inner.holder_session_key = None;
-        inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
-        self.sync_atomics(&inner);
-        self.wait_cv.notify_all();
-        true
+        Ok(true)
     }
 
     pub fn revoke_if_holder(
         &self,
         session_key: u64,
         reason: MaintenanceRevocationReason,
-    ) -> Option<MaintenanceRevocationEvent> {
+    ) -> Result<Option<MaintenanceRevocationEvent>, DriverError> {
         let event = {
             let mut inner = self.inner.lock().unwrap();
             if inner.holder_session_key != Some(session_key) {
-                return None;
+                return Ok(None);
             }
             let event = self.build_revocation_event(&inner, reason);
             inner.holder_session_id = None;
             inner.holder_session_key = None;
             inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+            let lease_epoch = inner.lease_epoch;
             self.sync_atomics(&inner);
             self.wait_cv.notify_all();
+            match self.send_control_command_locked(
+                MaintenanceControlOp::Revoke {
+                    session_key,
+                    lease_epoch,
+                    reason,
+                },
+                false,
+            ) {
+                Ok(None) => {},
+                Ok(Some(_)) => unreachable!("non-blocking revoke must not return ack"),
+                Err(err) => return Err(err),
+            }
             event
         };
-
         if let Some(event) = event {
             self.emit(event);
+            Ok(Some(event))
+        } else {
+            Ok(None)
         }
-        event
     }
 
     pub fn is_valid(&self, session_key: u64, lease_epoch: u64) -> bool {
@@ -495,30 +678,8 @@ impl MaintenanceGate {
             && self.current_state().allows_lease()
     }
 
-    pub fn commit_send<T, F>(
-        &self,
-        session_key: u64,
-        lease_epoch: u64,
-        send: F,
-    ) -> Result<Result<T, CanError>, DriverError>
-    where
-        F: FnOnce() -> Result<T, CanError>,
-    {
-        {
-            let inner = self.inner.lock().unwrap();
-            if !inner.state.allows_lease() {
-                return Err(DriverError::MaintenanceWriteDenied(
-                    inner.state.denial_message().to_string(),
-                ));
-            }
-            if inner.holder_session_key != Some(session_key) || inner.lease_epoch != lease_epoch {
-                return Err(DriverError::MaintenanceWriteDenied(
-                    "maintenance lease is no longer valid".to_string(),
-                ));
-            }
-        }
-
-        Ok(send())
+    pub fn local_set_state(&self, new_state: MaintenanceGateState) {
+        self.set_state(new_state);
     }
 }
 
@@ -947,6 +1108,9 @@ impl Piper {
         let metrics = Arc::new(PiperMetrics::new());
         let runtime_fault = Arc::new(AtomicU8::new(0));
         let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let (maintenance_ctrl_tx, maintenance_ctrl_rx) =
+            crossbeam_channel::unbounded::<MaintenanceControlCommand>();
+        maintenance_gate.set_control_sink(maintenance_ctrl_tx);
 
         let ctx_clone = ctx.clone();
         let workers_running_clone = workers_running.clone();
@@ -980,7 +1144,6 @@ impl Piper {
         let runtime_fault_tx = runtime_fault.clone();
         let shutdown_lane_tx = shutdown_lane.clone();
         let maintenance_gate_tx = maintenance_gate.clone();
-        let maintenance_gate_tx_compat = maintenance_gate.clone();
         let backend_capability_tx = backend_capability;
 
         let tx_thread = spawn(move || {
@@ -997,8 +1160,8 @@ impl Piper {
                 metrics_tx,
                 ctx_tx,
                 runtime_fault_tx,
+                maintenance_ctrl_rx,
                 maintenance_gate_tx,
-                maintenance_gate_tx_compat,
             );
         });
 
@@ -1073,7 +1236,7 @@ impl Piper {
         }
         self.normal_send_gate.close();
         self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
-        self.maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+        let _ = self.maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
     }
 
     /// 请求 worker 停止并关闭所有命令通路。
@@ -1083,7 +1246,9 @@ impl Piper {
         self.workers_running.store(false, Ordering::Release);
         self.shutdown_lane.close_with(Err(DriverError::ChannelClosed));
         self.clear_realtime_slot(DriverError::ChannelClosed, false);
-        self.maintenance_gate.set_state(MaintenanceGateState::DeniedTransportDown);
+        let _ = self
+            .maintenance_gate
+            .set_state_synced(MaintenanceGateState::DeniedTransportDown);
     }
 
     /// 获取性能指标快照
@@ -2064,12 +2229,15 @@ impl Piper {
         session_id: u32,
         session_key: u64,
         timeout: Duration,
-    ) -> MaintenanceLeaseAcquireResult {
+    ) -> Result<MaintenanceLeaseAcquireResult, DriverError> {
         self.maintenance_gate.acquire_blocking(session_id, session_key, timeout)
     }
 
     #[doc(hidden)]
-    pub fn release_maintenance_lease_gate_if_holder(&self, session_key: u64) -> bool {
+    pub fn release_maintenance_lease_gate_if_holder(
+        &self,
+        session_key: u64,
+    ) -> Result<bool, DriverError> {
         self.maintenance_gate.release_if_holder(session_key)
     }
 
@@ -2078,13 +2246,13 @@ impl Piper {
         &self,
         session_key: u64,
         reason: MaintenanceRevocationReason,
-    ) -> Option<MaintenanceRevocationEvent> {
+    ) -> Result<Option<MaintenanceRevocationEvent>, DriverError> {
         self.maintenance_gate.revoke_if_holder(session_key, reason)
     }
 
     #[doc(hidden)]
     pub fn set_maintenance_gate_state(&self, state: MaintenanceGateState) {
-        self.maintenance_gate.set_state(state);
+        let _ = self.maintenance_gate.set_state_synced(state);
     }
 
     #[doc(hidden)]
@@ -2308,6 +2476,19 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    fn attach_test_maintenance_control_sink(gate: &MaintenanceGate) {
+        let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceControlCommand>();
+        gate.set_control_sink(tx);
+        std::thread::spawn(move || {
+            while let Ok(command) = rx.recv() {
+                let (_, ack) = command.into_parts();
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+            }
+        });
     }
 
     struct RecordingTxAdapter {
@@ -2864,7 +3045,10 @@ mod tests {
         )
         .unwrap();
         piper.request_stop();
-        std::thread::sleep(Duration::from_millis(5));
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while piper.tx_thread_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(!piper.tx_thread_alive());
 
         let error = piper
@@ -3146,11 +3330,13 @@ mod tests {
         let session_key = 77;
         piper.ctx.connection_monitor.register_feedback();
         piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
-        let lease_epoch =
-            match piper.acquire_maintenance_lease_gate(7, session_key, Duration::from_millis(10)) {
-                MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
-                other => panic!("unexpected maintenance acquire result: {other:?}"),
-            };
+        let lease_epoch = match piper
+            .acquire_maintenance_lease_gate(7, session_key, Duration::from_millis(10))
+            .expect("maintenance acquire should reach TX control lane")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected maintenance acquire result: {other:?}"),
+        };
 
         let blocking_frame = PiperFrame::new_standard(0x201, &[0x01]);
         let piper_blocking = Arc::clone(&piper);
@@ -3187,6 +3373,7 @@ mod tests {
                     session_key,
                     MaintenanceRevocationReason::SessionReplaced,
                 )
+                .expect("maintenance revoke should sync to TX control lane")
                 .map(|event| event.session_id()),
             Some(7)
         );
@@ -3213,8 +3400,12 @@ mod tests {
     #[test]
     fn test_maintenance_gate_waiter_wakes_immediately_after_holder_releases() {
         let gate = Arc::new(MaintenanceGate::default());
+        attach_test_maintenance_control_sink(&gate);
         gate.set_state(MaintenanceGateState::AllowedStandby);
-        match gate.acquire_blocking(1, 11, Duration::from_millis(10)) {
+        match gate
+            .acquire_blocking(1, 11, Duration::from_millis(10))
+            .expect("initial acquire should sync to control lane")
+        {
             MaintenanceLeaseAcquireResult::Granted { .. } => {},
             other => panic!("initial maintenance lease grant failed: {other:?}"),
         }
@@ -3225,9 +3416,13 @@ mod tests {
         });
 
         std::thread::sleep(Duration::from_millis(20));
-        assert!(gate.release_if_holder(11));
+        assert!(gate.release_if_holder(11).expect("release should sync to control lane"));
 
-        match waiter.join().expect("waiter thread should finish") {
+        match waiter
+            .join()
+            .expect("waiter thread should finish")
+            .expect("waiter acquire should sync to control lane")
+        {
             MaintenanceLeaseAcquireResult::Granted { .. } => {},
             other => panic!("waiting maintenance lease did not wake correctly: {other:?}"),
         }
@@ -3238,8 +3433,12 @@ mod tests {
         let gate = MaintenanceGate::default();
         let (tx, rx) = crossbeam_channel::bounded(1);
         gate.set_event_sink(tx);
+        attach_test_maintenance_control_sink(&gate);
         gate.set_state(MaintenanceGateState::AllowedStandby);
-        match gate.acquire_blocking(7, 77, Duration::from_millis(10)) {
+        match gate
+            .acquire_blocking(7, 77, Duration::from_millis(10))
+            .expect("initial acquire should sync to control lane")
+        {
             MaintenanceLeaseAcquireResult::Granted { .. } => {},
             other => panic!("initial maintenance lease grant failed: {other:?}"),
         }

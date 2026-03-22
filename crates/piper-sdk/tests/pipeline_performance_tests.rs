@@ -177,8 +177,10 @@ fn start_tx_loop(
     reliable_rx: crossbeam_channel::Receiver<ReliableCommand>,
 ) -> thread::JoinHandle<()> {
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let _maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     thread::spawn(move || {
         tx_loop_mailbox(
@@ -194,7 +196,7 @@ fn start_tx_loop(
             metrics,
             ctx,
             fault,
-            maintenance_state_signal,
+            maintenance_ctrl_rx,
             maintenance_lease_gate,
         );
     })

@@ -2527,11 +2527,15 @@ impl MaintenanceBroker {
         timeout: Duration,
     ) -> Result<LeaseAcquireResult, BridgeBackendError> {
         self.ensure_current(authority)?;
-        match self.driver.acquire_maintenance_lease_gate(
-            authority.session_id(),
-            authority.session_key().raw(),
-            timeout,
-        ) {
+        match self
+            .driver
+            .acquire_maintenance_lease_gate(
+                authority.session_id(),
+                authority.session_key().raw(),
+                timeout,
+            )
+            .map_err(|err| bridge_backend_error_from_driver(&err))?
+        {
             MaintenanceLeaseAcquireResult::Granted { .. } => {
                 if !authority.is_current() {
                     let _ = self
@@ -2566,9 +2570,29 @@ impl MaintenanceBroker {
         }
     }
 
-    fn release(&self, authority: &SessionAuthority) -> bool {
+    fn release(&self, authority: &SessionAuthority) -> Result<bool, BridgeBackendError> {
         self.driver
             .release_maintenance_lease_gate_if_holder(authority.session_key().raw())
+            .map_err(|err| bridge_backend_error_from_driver(&err))
+    }
+
+    fn issue_send_permit(
+        &self,
+        authority: &SessionAuthority,
+    ) -> Result<(u32, u64, u64), BridgeBackendError> {
+        self.ensure_current(authority)?;
+        let snapshot = self.driver.maintenance_lease_snapshot();
+        if snapshot.holder_session_key() != Some(authority.session_key().raw()) {
+            return Err(BridgeBackendError::new(
+                ErrorCode::PermissionDenied,
+                "maintenance lease required",
+            ));
+        }
+        Ok((
+            authority.session_id(),
+            authority.session_key().raw(),
+            snapshot.lease_epoch(),
+        ))
     }
 
     fn send(
@@ -2576,36 +2600,13 @@ impl MaintenanceBroker {
         authority: &SessionAuthority,
         frame: PiperFrame,
     ) -> Result<(), BridgeBackendError> {
-        self.ensure_current(authority)?;
-        let snapshot = self.driver.maintenance_lease_snapshot();
-        let current_state = match snapshot.state() {
-            MaintenanceGateState::DeniedFaulted => BridgeMaintenanceState::DeniedFaulted,
-            MaintenanceGateState::DeniedActiveControl => {
-                BridgeMaintenanceState::DeniedActiveControl
-            },
-            MaintenanceGateState::DeniedTransportDown => {
-                BridgeMaintenanceState::DeniedTransportDown
-            },
-            MaintenanceGateState::AllowedStandby => BridgeMaintenanceState::AllowedStandby,
-        };
-        if current_state != BridgeMaintenanceState::AllowedStandby {
-            return Err(BridgeBackendError::new(
-                ErrorCode::PermissionDenied,
-                current_state.denial_message(),
-            ));
-        }
-        if snapshot.holder_session_key() != Some(authority.session_key().raw()) {
-            return Err(BridgeBackendError::new(
-                ErrorCode::PermissionDenied,
-                "maintenance lease required",
-            ));
-        }
+        let (session_id, session_key, lease_epoch) = self.issue_send_permit(authority)?;
 
         self.driver
             .send_maintenance_frame_confirmed(
-                authority.session_id(),
-                authority.session_key().raw(),
-                snapshot.lease_epoch(),
+                session_id,
+                session_key,
+                lease_epoch,
                 frame,
                 Duration::from_millis(10),
             )
@@ -2668,7 +2669,7 @@ impl BridgeControllerBackend for PiperBridgeBackend {
         &self,
         authority: &SessionAuthority,
     ) -> Result<bool, BridgeBackendError> {
-        Ok(self.broker.release(authority))
+        self.broker.release(authority)
     }
 
     fn send_maintenance_frame(

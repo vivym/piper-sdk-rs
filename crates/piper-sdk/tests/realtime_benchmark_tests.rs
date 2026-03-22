@@ -624,7 +624,7 @@ fn test_tx_latency_benchmark() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
-    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let _maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
 
     // 创建 TX 适配器（记录发送时间）
@@ -644,8 +644,9 @@ fn test_tx_latency_benchmark() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let realtime_slot_tx = realtime_slot.clone();
-    let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
@@ -662,7 +663,7 @@ fn test_tx_latency_benchmark() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
-            maintenance_state_signal_tx,
+            maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
         );
     });
@@ -750,7 +751,7 @@ fn test_send_duration_benchmark() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
-    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let _maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
 
     // 创建 TX 适配器（记录发送耗时）
@@ -770,8 +771,9 @@ fn test_send_duration_benchmark() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let realtime_slot_tx = realtime_slot.clone();
-    let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
@@ -788,7 +790,7 @@ fn test_send_duration_benchmark() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
-            maintenance_state_signal_tx,
+            maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
         );
     });

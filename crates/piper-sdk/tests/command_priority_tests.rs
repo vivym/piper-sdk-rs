@@ -158,8 +158,9 @@ fn test_priority_scheduling() {
     let runtime_phase_tx = runtime_phase.clone();
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
-    let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
@@ -175,7 +176,7 @@ fn test_priority_scheduling() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
-            maintenance_state_signal_tx,
+            maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
         );
     });
@@ -249,7 +250,7 @@ fn test_reliable_command_not_dropped() {
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let last_fault = Arc::new(AtomicU8::new(0));
     let metrics = Arc::new(PiperMetrics::new());
-    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let _maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
 
     // 创建慢速 TX 适配器（模拟瓶颈）
@@ -313,8 +314,9 @@ fn test_reliable_command_not_dropped() {
     let runtime_phase_tx = runtime_phase.clone();
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
-    let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
@@ -330,7 +332,7 @@ fn test_reliable_command_not_dropped() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
-            maintenance_state_signal_tx,
+            maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
         );
     });
@@ -460,7 +462,7 @@ fn test_realtime_overwrite_strategy() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let _maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -472,8 +474,9 @@ fn test_realtime_overwrite_strategy() {
     let runtime_phase_tx = runtime_phase.clone();
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
-    let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
@@ -489,7 +492,7 @@ fn test_realtime_overwrite_strategy() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
-            maintenance_state_signal_tx,
+            maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
         );
     });

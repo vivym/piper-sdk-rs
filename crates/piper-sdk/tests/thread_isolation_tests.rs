@@ -220,8 +220,9 @@ fn test_rx_unaffected_by_tx_timeout() {
     let runtime_phase_tx = runtime_phase.clone();
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
-    let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
@@ -238,7 +239,7 @@ fn test_rx_unaffected_by_tx_timeout() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
-            maintenance_state_signal_tx,
+            maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
         );
     });
@@ -351,8 +352,9 @@ fn test_tx_detects_rx_failure() {
     let runtime_phase_tx = runtime_phase.clone();
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
-    let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
@@ -369,7 +371,7 @@ fn test_tx_detects_rx_failure() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
-            maintenance_state_signal_tx,
+            maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
         );
     });
@@ -479,8 +481,9 @@ fn test_thread_lifecycle_linkage() {
     let runtime_phase_tx = runtime_phase.clone();
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
-    let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
+    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
@@ -497,7 +500,7 @@ fn test_thread_lifecycle_linkage() {
             metrics_tx,
             ctx_tx,
             last_fault_tx,
-            maintenance_state_signal_tx,
+            maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
         );
     });
