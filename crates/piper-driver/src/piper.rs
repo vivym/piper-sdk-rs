@@ -3,7 +3,8 @@
 //! 提供对外的 `Piper` 结构体，封装底层 IO 线程和状态同步细节。
 
 use crate::command::{
-    CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand, SoftRealtimeCommand,
+    CommandPriority, MaintenanceCommandMeta, PiperCommand, RealtimeCommand, ReliableCommand,
+    SoftRealtimeCommand,
 };
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
@@ -228,7 +229,7 @@ impl MaintenanceRevocationEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MaintenanceControlOp {
+pub enum MaintenanceControlOp {
     Grant {
         session_id: u32,
         session_key: u64,
@@ -253,20 +254,27 @@ pub(crate) enum MaintenanceControlOp {
 
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct MaintenanceControlCommand {
-    op: MaintenanceControlOp,
-    ack: Option<Sender<()>>,
+pub enum MaintenanceLaneCommand {
+    Control {
+        op: MaintenanceControlOp,
+        ack: Option<Sender<()>>,
+    },
+    Send {
+        frame: PiperFrame,
+        meta: MaintenanceCommandMeta,
+        ack: Sender<Result<(), DriverError>>,
+    },
 }
 
-impl MaintenanceControlCommand {
-    fn new(op: MaintenanceControlOp) -> Self {
-        Self { op, ack: None }
+impl MaintenanceLaneCommand {
+    fn control(op: MaintenanceControlOp) -> Self {
+        Self::Control { op, ack: None }
     }
 
-    fn blocking(op: MaintenanceControlOp) -> (Self, Receiver<()>) {
+    fn blocking_control(op: MaintenanceControlOp) -> (Self, Receiver<()>) {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         (
-            Self {
+            Self::Control {
                 op,
                 ack: Some(ack_tx),
             },
@@ -274,8 +282,12 @@ impl MaintenanceControlCommand {
         )
     }
 
-    pub(crate) fn into_parts(self) -> (MaintenanceControlOp, Option<Sender<()>>) {
-        (self.op, self.ack)
+    fn send(
+        frame: PiperFrame,
+        meta: MaintenanceCommandMeta,
+        ack: Sender<Result<(), DriverError>>,
+    ) -> Self {
+        Self::Send { frame, meta, ack }
     }
 }
 
@@ -343,7 +355,7 @@ pub struct MaintenanceGate {
     inner: Mutex<MaintenanceGateInner>,
     wait_cv: Condvar,
     event_sink: Mutex<Option<Sender<MaintenanceRevocationEvent>>>,
-    control_sink: Mutex<Option<Sender<MaintenanceControlCommand>>>,
+    lane_sink: Mutex<Option<Sender<MaintenanceLaneCommand>>>,
 }
 
 impl Default for MaintenanceGate {
@@ -357,7 +369,7 @@ impl Default for MaintenanceGate {
             inner: Mutex::new(inner),
             wait_cv: Condvar::new(),
             event_sink: Mutex::new(None),
-            control_sink: Mutex::new(None),
+            lane_sink: Mutex::new(None),
         }
     }
 }
@@ -395,8 +407,12 @@ impl MaintenanceGate {
     }
 
     #[doc(hidden)]
-    pub fn set_control_sink(&self, sink: Sender<MaintenanceControlCommand>) {
-        *self.control_sink.lock().unwrap() = Some(sink);
+    pub fn set_lane_sink(&self, sink: Sender<MaintenanceLaneCommand>) {
+        *self.lane_sink.lock().unwrap() = Some(sink);
+    }
+
+    pub fn set_control_sink(&self, sink: Sender<MaintenanceLaneCommand>) {
+        self.set_lane_sink(sink);
     }
 
     fn send_control_command_locked(
@@ -404,13 +420,13 @@ impl MaintenanceGate {
         op: MaintenanceControlOp,
         wait_for_ack: bool,
     ) -> Result<Option<Receiver<()>>, DriverError> {
-        let sink = self.control_sink.lock().unwrap().clone().ok_or(DriverError::ChannelClosed)?;
+        let sink = self.lane_sink.lock().unwrap().clone().ok_or(DriverError::ChannelClosed)?;
         if wait_for_ack {
-            let (command, ack_rx) = MaintenanceControlCommand::blocking(op);
+            let (command, ack_rx) = MaintenanceLaneCommand::blocking_control(op);
             sink.send(command).map_err(|_| DriverError::ChannelClosed)?;
             Ok(Some(ack_rx))
         } else {
-            sink.send(MaintenanceControlCommand::new(op))
+            sink.send(MaintenanceLaneCommand::control(op))
                 .map_err(|_| DriverError::ChannelClosed)?;
             Ok(None)
         }
@@ -964,6 +980,8 @@ impl RuntimePhase {
 pub struct Piper {
     /// 普通可靠命令发送通道。
     reliable_tx: ManuallyDrop<Sender<ReliableCommand>>,
+    /// 维护写入/授权线性化通道。
+    maintenance_lane_tx: ManuallyDrop<Sender<MaintenanceLaneCommand>>,
     /// SoftRealtime 原始批命令发送通道。
     soft_realtime_tx: ManuallyDrop<Sender<SoftRealtimeCommand>>,
     /// 单飞急停通道。
@@ -1107,9 +1125,9 @@ impl Piper {
         let metrics = Arc::new(PiperMetrics::new());
         let runtime_fault = Arc::new(AtomicU8::new(0));
         let maintenance_gate = Arc::new(MaintenanceGate::default());
-        let (maintenance_ctrl_tx, maintenance_ctrl_rx) =
-            crossbeam_channel::unbounded::<MaintenanceControlCommand>();
-        maintenance_gate.set_control_sink(maintenance_ctrl_tx);
+        let (maintenance_lane_tx, maintenance_lane_rx) =
+            crossbeam_channel::unbounded::<MaintenanceLaneCommand>();
+        maintenance_gate.set_lane_sink(maintenance_lane_tx.clone());
 
         let ctx_clone = ctx.clone();
         let workers_running_clone = workers_running.clone();
@@ -1159,7 +1177,7 @@ impl Piper {
                 metrics_tx,
                 ctx_tx,
                 runtime_fault_tx,
-                maintenance_ctrl_rx,
+                maintenance_lane_rx,
                 maintenance_gate_tx,
             );
         });
@@ -1168,6 +1186,7 @@ impl Piper {
 
         Ok(Self {
             reliable_tx: ManuallyDrop::new(reliable_tx),
+            maintenance_lane_tx: ManuallyDrop::new(maintenance_lane_tx),
             soft_realtime_tx: ManuallyDrop::new(soft_realtime_tx),
             shutdown_lane,
             realtime_slot,
@@ -2204,16 +2223,14 @@ impl Piper {
         }
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        self.enqueue_reliable_timeout(
-            ReliableCommand::maintenance_confirmed(
+        self.maintenance_lane_tx
+            .send(MaintenanceLaneCommand::send(
                 frame,
-                session_id,
-                session_key,
-                lease_epoch,
+                MaintenanceCommandMeta::new(session_id, session_key, lease_epoch),
                 ack_tx,
-            ),
-            timeout,
-        )?;
+            ))
+            .map_err(|_| DriverError::ChannelClosed)?;
+        self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
 
         match ack_rx.recv_timeout(timeout) {
             Ok(result) => result,
@@ -2397,6 +2414,7 @@ impl Drop for Piper {
 
         unsafe {
             ManuallyDrop::drop(&mut self.reliable_tx);
+            ManuallyDrop::drop(&mut self.maintenance_lane_tx);
             ManuallyDrop::drop(&mut self.soft_realtime_tx);
         }
 
@@ -2532,13 +2550,19 @@ mod tests {
     }
 
     fn attach_test_maintenance_control_sink(gate: &MaintenanceGate) {
-        let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceControlCommand>();
+        let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceLaneCommand>();
         gate.set_control_sink(tx);
         std::thread::spawn(move || {
             while let Ok(command) = rx.recv() {
-                let (_, ack) = command.into_parts();
-                if let Some(ack) = ack {
-                    let _ = ack.send(());
+                match command {
+                    MaintenanceLaneCommand::Control { ack, .. } => {
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                    },
+                    MaintenanceLaneCommand::Send { ack, .. } => {
+                        let _ = ack.send(Err(DriverError::ChannelClosed));
+                    },
                 }
             }
         });
