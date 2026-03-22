@@ -62,9 +62,6 @@ impl BuiltBackend {
 }
 
 trait BackendFactory {
-    #[cfg(target_os = "linux")]
-    fn socketcan_available(&self, iface: &str) -> bool;
-
     fn open_socketcan(
         &self,
         iface: &str,
@@ -83,11 +80,6 @@ trait BackendFactory {
 struct RealBackendFactory;
 
 impl BackendFactory for RealBackendFactory {
-    #[cfg(target_os = "linux")]
-    fn socketcan_available(&self, iface: &str) -> bool {
-        SocketCanAdapter::new(iface).is_ok()
-    }
-
     fn open_socketcan(
         &self,
         iface: &str,
@@ -362,10 +354,6 @@ impl PiperBuilder {
         #[cfg(target_os = "linux")]
         {
             for iface in ["can0", "vcan0"] {
-                if !factory.socketcan_available(iface) {
-                    continue;
-                }
-
                 if Instant::now() >= startup_deadline {
                     errors.push((
                         iface.to_string(),
@@ -531,8 +519,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeFactory {
-        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-        socketcan_available: Vec<String>,
+        openable_socketcan: Vec<String>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -545,18 +532,26 @@ mod tests {
     }
 
     impl BackendFactory for FakeFactory {
-        #[cfg(target_os = "linux")]
-        fn socketcan_available(&self, iface: &str) -> bool {
-            self.socketcan_available.iter().any(|item| item == iface)
-        }
-
         fn open_socketcan(
             &self,
             iface: &str,
             baud_rate: u32,
             _receive_timeout: Duration,
         ) -> Result<BuiltBackend, DriverError> {
-            Ok(self.backend(format!("socketcan:{iface}"), baud_rate))
+            self.calls.lock().unwrap().push(format!("socketcan:{iface}"));
+            if self.openable_socketcan.iter().any(|item| item == iface) {
+                Ok(BuiltBackend::new(
+                    StrictBootstrapRxAdapter::new(),
+                    TestTxAdapter,
+                    format!("socketcan:{iface}"),
+                    baud_rate,
+                ))
+            } else {
+                Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::NotFound,
+                    format!("unexpected SocketCAN candidate: {iface}"),
+                ))))
+            }
         }
 
         fn open_gs_usb(
@@ -578,17 +573,11 @@ mod tests {
 
     #[derive(Default)]
     struct FallbackFactory {
-        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-        socketcan_available: Vec<String>,
+        openable_socketcan: Vec<String>,
         calls: Mutex<Vec<String>>,
     }
 
     impl BackendFactory for FallbackFactory {
-        #[cfg(target_os = "linux")]
-        fn socketcan_available(&self, iface: &str) -> bool {
-            self.socketcan_available.iter().any(|item| item == iface)
-        }
-
         fn open_socketcan(
             &self,
             iface: &str,
@@ -596,6 +585,12 @@ mod tests {
             _receive_timeout: Duration,
         ) -> Result<BuiltBackend, DriverError> {
             self.calls.lock().unwrap().push(format!("socketcan:{iface}"));
+            if !self.openable_socketcan.iter().any(|item| item == iface) {
+                return Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::NotFound,
+                    format!("unexpected SocketCAN candidate: {iface}"),
+                ))));
+            }
             match iface {
                 "can0" => Ok(BuiltBackend::new(
                     StrictNoTimestampRxAdapter,
@@ -640,18 +635,12 @@ mod tests {
     }
 
     struct SlowOpenFactory {
-        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-        socketcan_available: Vec<String>,
+        openable_socketcan: Vec<String>,
         calls: Mutex<Vec<String>>,
         socketcan_delay: Duration,
     }
 
     impl BackendFactory for SlowOpenFactory {
-        #[cfg(target_os = "linux")]
-        fn socketcan_available(&self, iface: &str) -> bool {
-            self.socketcan_available.iter().any(|item| item == iface)
-        }
-
         fn open_socketcan(
             &self,
             iface: &str,
@@ -659,6 +648,12 @@ mod tests {
             _receive_timeout: Duration,
         ) -> Result<BuiltBackend, DriverError> {
             self.calls.lock().unwrap().push(format!("socketcan:{iface}"));
+            if !self.openable_socketcan.iter().any(|item| item == iface) {
+                return Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::NotFound,
+                    format!("unexpected SocketCAN candidate: {iface}"),
+                ))));
+            }
             if !self.socketcan_delay.is_zero() {
                 std::thread::sleep(self.socketcan_delay);
             }
@@ -736,7 +731,7 @@ mod tests {
     #[test]
     fn test_auto_strict_prefers_can0_then_vcan0_and_never_falls_back_to_gs_usb() {
         let factory = FakeFactory {
-            socketcan_available: vec!["vcan0".to_string()],
+            openable_socketcan: vec!["vcan0".to_string()],
             calls: Mutex::new(Vec::new()),
         };
 
@@ -746,7 +741,7 @@ mod tests {
             result.unwrap();
             assert_eq!(
                 factory.calls.lock().unwrap().as_slice(),
-                &["socketcan:vcan0".to_string()]
+                &["socketcan:can0".to_string(), "socketcan:vcan0".to_string()]
             );
         }
         #[cfg(not(target_os = "linux"))]
@@ -759,7 +754,7 @@ mod tests {
     #[test]
     fn test_auto_strict_retries_next_socketcan_candidate_after_validation_failure() {
         let factory = FallbackFactory {
-            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
             calls: Mutex::new(Vec::new()),
         };
 
@@ -785,7 +780,7 @@ mod tests {
     #[test]
     fn test_auto_any_falls_back_to_gs_usb_after_strict_validation_failure() {
         let factory = FallbackFactory {
-            socketcan_available: vec!["can0".to_string()],
+            openable_socketcan: vec!["can0".to_string()],
             calls: Mutex::new(Vec::new()),
         };
 
@@ -803,7 +798,11 @@ mod tests {
             );
             assert_eq!(
                 factory.calls.lock().unwrap().as_slice(),
-                &["socketcan:can0".to_string(), "gs-usb:auto".to_string()]
+                &[
+                    "socketcan:can0".to_string(),
+                    "socketcan:vcan0".to_string(),
+                    "gs-usb:auto".to_string()
+                ]
             );
         }
         #[cfg(not(target_os = "linux"))]
@@ -815,7 +814,7 @@ mod tests {
     #[test]
     fn test_auto_any_uses_shared_startup_deadline_across_strict_candidates() {
         let factory = FallbackFactory {
-            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
             calls: Mutex::new(Vec::new()),
         };
 
@@ -845,7 +844,7 @@ mod tests {
     #[test]
     fn test_auto_strict_stops_after_shared_startup_deadline_exhausts() {
         let factory = FallbackFactory {
-            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
             calls: Mutex::new(Vec::new()),
         };
 
@@ -874,7 +873,7 @@ mod tests {
     #[test]
     fn test_explicit_socketcan_counts_open_time_against_startup_deadline() {
         let factory = SlowOpenFactory {
-            socketcan_available: vec!["can0".to_string()],
+            openable_socketcan: vec!["can0".to_string()],
             calls: Mutex::new(Vec::new()),
             socketcan_delay: Duration::from_millis(20),
         };
@@ -911,7 +910,7 @@ mod tests {
     #[test]
     fn test_auto_any_stops_after_slow_open_exhausts_shared_deadline() {
         let factory = SlowOpenFactory {
-            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
             calls: Mutex::new(Vec::new()),
             socketcan_delay: Duration::from_millis(20),
         };
@@ -943,7 +942,7 @@ mod tests {
     #[test]
     fn test_auto_strict_stops_after_slow_open_exhausts_shared_deadline() {
         let factory = SlowOpenFactory {
-            socketcan_available: vec!["can0".to_string(), "vcan0".to_string()],
+            openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
             calls: Mutex::new(Vec::new()),
             socketcan_delay: Duration::from_millis(20),
         };
