@@ -432,6 +432,9 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 
@@ -631,6 +634,9 @@ fn test_command_priority_performance() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 
@@ -698,6 +704,9 @@ fn test_command_priority_performance() {
             last_fault_tx2,
             maintenance_ctrl_rx2,
             maintenance_lease_gate_tx2,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 

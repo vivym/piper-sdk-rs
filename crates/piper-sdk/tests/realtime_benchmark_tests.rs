@@ -665,6 +665,9 @@ fn test_tx_latency_benchmark() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 
@@ -792,6 +795,9 @@ fn test_send_duration_benchmark() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 

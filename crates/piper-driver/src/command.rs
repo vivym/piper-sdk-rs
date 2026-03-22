@@ -48,8 +48,14 @@ pub type FrameBuffer = SmallVec<[PiperFrame; 6]>;
 /// - Single 只是 len=1 的 FrameBuffer
 /// - 简化 TX 线程逻辑（不需要 match 分支）
 /// - 消除 CPU 分支预测压力
-pub type RealtimeAck = Sender<Result<(), DriverError>>;
-pub type ReliableAck = Sender<Result<(), DriverError>>;
+#[derive(Debug)]
+pub enum DeliveryPhase {
+    Committed,
+    Finished(Result<(), DriverError>),
+}
+
+pub type RealtimeAck = Sender<DeliveryPhase>;
+pub type ReliableAck = Sender<DeliveryPhase>;
 pub type ShutdownAck = Sender<Result<(), DriverError>>;
 pub type SoftRealtimeAck = Sender<Result<(), DriverError>>;
 
@@ -57,6 +63,7 @@ pub type SoftRealtimeAck = Sender<Result<(), DriverError>>;
 pub enum ReliableCommandKind {
     Standard,
     Maintenance,
+    Replay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +103,7 @@ impl MaintenanceCommandMeta {
 pub struct RealtimeCommand {
     frames: FrameBuffer,
     ack: Option<RealtimeAck>,
+    deadline: Option<Instant>,
 }
 
 impl RealtimeCommand {
@@ -109,6 +117,7 @@ impl RealtimeCommand {
         RealtimeCommand {
             frames: buffer,
             ack: None,
+            deadline: None,
         }
     }
 
@@ -125,16 +134,22 @@ impl RealtimeCommand {
         RealtimeCommand {
             frames: buffer,
             ack: None,
+            deadline: None,
         }
     }
 
     /// 创建带确认通道的帧包命令。
     #[inline]
-    pub fn confirmed(frames: impl IntoIterator<Item = PiperFrame>, ack: RealtimeAck) -> Self {
+    pub fn confirmed(
+        frames: impl IntoIterator<Item = PiperFrame>,
+        deadline: Instant,
+        ack: RealtimeAck,
+    ) -> Self {
         let buffer: FrameBuffer = frames.into_iter().collect();
         RealtimeCommand {
             frames: buffer,
             ack: Some(ack),
+            deadline: Some(deadline),
         }
     }
 
@@ -168,11 +183,16 @@ impl RealtimeCommand {
         self.ack.take()
     }
 
+    #[inline]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     /// 完成确认通道。
     #[inline]
     pub fn complete(mut self, result: Result<(), DriverError>) {
         if let Some(ack) = self.ack.take() {
-            let _ = ack.send(result);
+            let _ = ack.send(DeliveryPhase::Finished(result));
         }
     }
 }
@@ -183,6 +203,7 @@ pub struct ReliableCommand {
     ack: Option<ReliableAck>,
     kind: ReliableCommandKind,
     maintenance: Option<MaintenanceCommandMeta>,
+    deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -275,11 +296,12 @@ impl ReliableCommand {
             ack: None,
             kind: ReliableCommandKind::Standard,
             maintenance: None,
+            deadline: None,
         }
     }
 
     #[inline]
-    pub fn confirmed(frame: PiperFrame, ack: ReliableAck) -> Self {
+    pub fn confirmed(frame: PiperFrame, deadline: Instant, ack: ReliableAck) -> Self {
         let mut frames = FrameBuffer::new();
         frames.push(frame);
         Self {
@@ -287,6 +309,7 @@ impl ReliableCommand {
             ack: Some(ack),
             kind: ReliableCommandKind::Standard,
             maintenance: None,
+            deadline: Some(deadline),
         }
     }
 
@@ -297,12 +320,14 @@ impl ReliableCommand {
             ack: None,
             kind: ReliableCommandKind::Standard,
             maintenance: None,
+            deadline: None,
         }
     }
 
     #[inline]
     pub fn package_confirmed(
         frames: impl IntoIterator<Item = PiperFrame>,
+        deadline: Instant,
         ack: ReliableAck,
     ) -> Self {
         Self {
@@ -310,6 +335,7 @@ impl ReliableCommand {
             ack: Some(ack),
             kind: ReliableCommandKind::Standard,
             maintenance: None,
+            deadline: Some(deadline),
         }
     }
 
@@ -332,6 +358,33 @@ impl ReliableCommand {
                 session_key,
                 lease_epoch,
             )),
+            deadline: None,
+        }
+    }
+
+    #[inline]
+    pub fn replay(frame: PiperFrame) -> Self {
+        let mut frames = FrameBuffer::new();
+        frames.push(frame);
+        Self {
+            frames,
+            ack: None,
+            kind: ReliableCommandKind::Replay,
+            maintenance: None,
+            deadline: None,
+        }
+    }
+
+    #[inline]
+    pub fn replay_confirmed(frame: PiperFrame, deadline: Instant, ack: ReliableAck) -> Self {
+        let mut frames = FrameBuffer::new();
+        frames.push(frame);
+        Self {
+            frames,
+            ack: Some(ack),
+            kind: ReliableCommandKind::Replay,
+            maintenance: None,
+            deadline: Some(deadline),
         }
     }
 
@@ -364,8 +417,15 @@ impl ReliableCommand {
         Option<ReliableAck>,
         ReliableCommandKind,
         Option<MaintenanceCommandMeta>,
+        Option<Instant>,
     ) {
-        (self.frames, self.ack, self.kind, self.maintenance)
+        (
+            self.frames,
+            self.ack,
+            self.kind,
+            self.maintenance,
+            self.deadline,
+        )
     }
 
     #[inline]
@@ -384,9 +444,14 @@ impl ReliableCommand {
     }
 
     #[inline]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    #[inline]
     pub fn complete(mut self, result: Result<(), DriverError>) {
         if let Some(ack) = self.ack.take() {
-            let _ = ack.send(result);
+            let _ = ack.send(DeliveryPhase::Finished(result));
         }
     }
 }
@@ -562,8 +627,8 @@ mod realtime_command_tests {
     #[test]
     fn test_reliable_command_confirmed() {
         let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
-        let (ack_tx, _ack_rx) = crossbeam_channel::bounded(1);
-        let mut cmd = ReliableCommand::confirmed(frame, ack_tx);
+        let (ack_tx, _ack_rx) = crossbeam_channel::bounded(2);
+        let mut cmd = ReliableCommand::confirmed(frame, Instant::now(), ack_tx);
         assert_eq!(cmd.frame(), frame);
         assert!(cmd.take_ack().is_some());
         assert!(cmd.take_ack().is_none());

@@ -198,6 +198,9 @@ fn start_tx_loop(
             fault,
             maintenance_ctrl_rx,
             maintenance_lease_gate,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     })
 }

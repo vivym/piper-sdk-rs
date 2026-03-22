@@ -2475,6 +2475,7 @@ fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
         | DriverError::ReliablePackageTimeout { .. } => ErrorCode::Timeout,
         DriverError::ChannelFull | DriverError::ShutdownConflict => ErrorCode::Busy,
         DriverError::ControlPathClosed
+        | DriverError::ReplayModeActive
         | DriverError::CommandAbortedByFault
         | DriverError::RealtimeDeliveryAbortedByFault { .. } => ErrorCode::PermissionDenied,
         DriverError::MaintenanceWriteDenied(_) => ErrorCode::PermissionDenied,

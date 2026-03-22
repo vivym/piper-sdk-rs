@@ -241,6 +241,9 @@ fn test_rx_unaffected_by_tx_timeout() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 
@@ -373,6 +376,9 @@ fn test_tx_detects_rx_failure() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 
@@ -502,6 +508,9 @@ fn test_thread_lifecycle_linkage() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 

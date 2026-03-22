@@ -3,8 +3,8 @@
 //! 提供对外的 `Piper` 结构体，封装底层 IO 线程和状态同步细节。
 
 use crate::command::{
-    CommandPriority, MaintenanceCommandMeta, PiperCommand, RealtimeCommand, ReliableCommand,
-    SoftRealtimeCommand,
+    CommandPriority, DeliveryPhase, MaintenanceCommandMeta, PiperCommand, RealtimeCommand,
+    ReliableCommand, ReliableCommandKind, SoftRealtimeCommand,
 };
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
@@ -189,11 +189,31 @@ fn wait_for_maintenance_send_result(
     deadline: Instant,
 ) -> Result<(), DriverError> {
     match recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)? {
-        MaintenanceSendPhase::Finished(result) => result,
-        MaintenanceSendPhase::Committed => loop {
+        DeliveryPhase::Finished(result) => result,
+        DeliveryPhase::Committed => loop {
             match ack_rx.recv() {
-                Ok(MaintenanceSendPhase::Finished(result)) => return result,
-                Ok(MaintenanceSendPhase::Committed) => continue,
+                Ok(DeliveryPhase::Finished(result)) => return result,
+                Ok(DeliveryPhase::Committed) => continue,
+                Err(_) => return Err(DriverError::ChannelClosed),
+            }
+        },
+    }
+}
+
+fn wait_for_delivery_result<F>(
+    ack_rx: Receiver<DeliveryPhase>,
+    deadline: Instant,
+    timeout_error: F,
+) -> Result<(), DriverError>
+where
+    F: Fn() -> DriverError,
+{
+    match recv_until_deadline(&ack_rx, deadline, timeout_error)? {
+        DeliveryPhase::Finished(result) => result,
+        DeliveryPhase::Committed => loop {
+            match ack_rx.recv() {
+                Ok(DeliveryPhase::Finished(result)) => return result,
+                Ok(DeliveryPhase::Committed) => continue,
                 Err(_) => return Err(DriverError::ChannelClosed),
             }
         },
@@ -340,11 +360,7 @@ pub enum MaintenanceControlOp {
 }
 
 #[doc(hidden)]
-#[derive(Debug)]
-pub enum MaintenanceSendPhase {
-    Committed,
-    Finished(Result<(), DriverError>),
-}
+pub type MaintenanceSendPhase = DeliveryPhase;
 
 #[doc(hidden)]
 #[derive(Debug)]
@@ -1001,6 +1017,7 @@ fn clone_driver_error(error: &DriverError) -> DriverError {
         DriverError::Protocol(source) => DriverError::Protocol(clone_protocol_error(source)),
         DriverError::ChannelClosed => DriverError::ChannelClosed,
         DriverError::ControlPathClosed => DriverError::ControlPathClosed,
+        DriverError::ReplayModeActive => DriverError::ReplayModeActive,
         DriverError::ChannelFull => DriverError::ChannelFull,
         DriverError::ShutdownConflict => DriverError::ShutdownConflict,
         DriverError::NotDualThread => DriverError::NotDualThread,
@@ -1148,7 +1165,7 @@ pub struct Piper {
     /// CAN 总线速度（bps）（用于录制元数据）
     bus_speed: u32,
     /// Driver 工作模式（用于回放模式控制）
-    driver_mode: crate::mode::AtomicDriverMode,
+    driver_mode: Arc<crate::mode::AtomicDriverMode>,
     /// Capability of the active backend.
     backend_capability: BackendCapability,
 }
@@ -1207,6 +1224,31 @@ impl Piper {
 
     fn normal_control_open(&self) -> bool {
         self.runtime_phase() == RuntimePhase::Running
+    }
+
+    fn replay_mode_active(&self) -> bool {
+        self.mode().is_replay()
+    }
+
+    fn ensure_mode_allows_reliable_kind(
+        &self,
+        kind: ReliableCommandKind,
+    ) -> Result<(), DriverError> {
+        if self.replay_mode_active() {
+            return match kind {
+                ReliableCommandKind::Replay => Ok(()),
+                ReliableCommandKind::Standard | ReliableCommandKind::Maintenance => {
+                    Err(DriverError::ReplayModeActive)
+                },
+            };
+        }
+
+        match kind {
+            ReliableCommandKind::Replay => Err(DriverError::InvalidInput(
+                "replay frames may only be sent while DriverMode::Replay is active".to_string(),
+            )),
+            ReliableCommandKind::Standard | ReliableCommandKind::Maintenance => Ok(()),
+        }
     }
 
     fn shutdown_lane_open(&self) -> bool {
@@ -1325,6 +1367,9 @@ impl Piper {
         let metrics = Arc::new(PiperMetrics::new());
         let runtime_fault = Arc::new(AtomicU8::new(0));
         let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let driver_mode = Arc::new(crate::mode::AtomicDriverMode::new(
+            crate::mode::DriverMode::Normal,
+        ));
         let (maintenance_lane_tx, maintenance_lane_rx) =
             crossbeam_channel::unbounded::<MaintenanceLaneCommand>();
         maintenance_gate.set_lane_sink(maintenance_lane_tx.clone());
@@ -1362,6 +1407,7 @@ impl Piper {
         let shutdown_lane_tx = shutdown_lane.clone();
         let maintenance_gate_tx = maintenance_gate.clone();
         let backend_capability_tx = backend_capability;
+        let driver_mode_tx = driver_mode.clone();
 
         let tx_thread = spawn(move || {
             crate::pipeline::tx_loop_mailbox(
@@ -1379,6 +1425,7 @@ impl Piper {
                 runtime_fault_tx,
                 maintenance_lane_rx,
                 maintenance_gate_tx,
+                driver_mode_tx,
             );
         });
 
@@ -1401,7 +1448,7 @@ impl Piper {
             maintenance_gate,
             interface: "unknown".to_string(),
             bus_speed: 1_000_000,
-            driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
+            driver_mode,
             backend_capability,
         })
     }
@@ -1460,6 +1507,11 @@ impl Piper {
             tx_alive,
             fault,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn auto_disable_on_drop_allowed(&self) -> bool {
+        self.runtime_phase() == RuntimePhase::Running
     }
 
     /// 锁存故障并关闭正常控制路径。
@@ -2011,6 +2063,31 @@ impl Piper {
         self.enqueue_reliable(ReliableCommand::single(frame))
     }
 
+    #[doc(hidden)]
+    pub fn send_replay_frame(&self, frame: PiperFrame) -> Result<(), DriverError> {
+        self.enqueue_reliable(ReliableCommand::replay(frame))
+    }
+
+    #[doc(hidden)]
+    pub fn send_replay_frame_confirmed(
+        &self,
+        frame: PiperFrame,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        if !self.tx_thread_alive() {
+            return Err(DriverError::ChannelClosed);
+        }
+
+        let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+        self.enqueue_reliable_timeout_until(
+            ReliableCommand::replay_confirmed(frame, deadline, ack_tx),
+            deadline,
+        )?;
+
+        wait_for_delivery_result(ack_rx, deadline, || DriverError::Timeout)
+    }
+
     /// 获取钩子管理器的引用（用于高级诊断）
     ///
     /// # 设计理念
@@ -2196,6 +2273,9 @@ impl Piper {
                 "strict realtime delivery is only available on StrictRealtime backends".to_string(),
             ));
         }
+        if self.replay_mode_active() {
+            return Err(DriverError::ReplayModeActive);
+        }
         self.send_realtime_command(RealtimeCommand::single(frame))
     }
 
@@ -2214,10 +2294,9 @@ impl Piper {
     /// - `DriverError::InvalidInput`: 帧列表为空或过大
     /// - `DriverError::PoisonedLock`: 锁中毒
     ///
-    /// # 原子性保证
-    /// Package 内的所有帧要么全部发送成功，要么都不发送。
-    /// 如果发送过程中出现错误，已发送的帧不会被回滚（CAN 总线特性），
-    /// 但未发送的帧不会继续发送。
+    /// # 发送语义
+    /// 一旦 TX 线程开始发送首帧，后续会返回真实发送结果。
+    /// 如中途失败，已发送的帧不会回滚，但剩余帧不会继续发送。
     ///
     /// # 性能特性
     /// - 如果帧数量 ≤ 4，完全在栈上分配，零堆内存分配
@@ -2233,6 +2312,9 @@ impl Piper {
                 "strict realtime package delivery is only available on StrictRealtime backends"
                     .to_string(),
             ));
+        }
+        if self.replay_mode_active() {
+            return Err(DriverError::ReplayModeActive);
         }
 
         let buffer: FrameBuffer = frames.into_iter().collect();
@@ -2277,6 +2359,9 @@ impl Piper {
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
+        if self.replay_mode_active() {
+            return Err(DriverError::ReplayModeActive);
+        }
         if !self.normal_control_open() {
             return Err(DriverError::ControlPathClosed);
         }
@@ -2297,11 +2382,11 @@ impl Piper {
             )));
         }
 
-        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         let deadline = Instant::now() + timeout;
-        self.send_realtime_command(RealtimeCommand::confirmed(buffer, ack_tx))?;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+        self.send_realtime_command(RealtimeCommand::confirmed(buffer, deadline, ack_tx))?;
 
-        recv_until_deadline(&ack_rx, deadline, || DriverError::RealtimeDeliveryTimeout)?
+        wait_for_delivery_result(ack_rx, deadline, || DriverError::RealtimeDeliveryTimeout)
     }
 
     /// 发送 SoftRealtime 原始批命令并等待实际发送结果。
@@ -2320,6 +2405,9 @@ impl Piper {
         }
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
+        }
+        if self.replay_mode_active() {
+            return Err(DriverError::ReplayModeActive);
         }
         if !self.normal_control_open() {
             return Err(DriverError::ControlPathClosed);
@@ -2364,6 +2452,10 @@ impl Piper {
         if !self.tx_thread_alive() {
             command.complete(Err(DriverError::ChannelClosed));
             return Err(DriverError::ChannelClosed);
+        }
+        if self.replay_mode_active() {
+            command.complete(Err(DriverError::ReplayModeActive));
+            return Err(DriverError::ReplayModeActive);
         }
         match self.realtime_slot.lock() {
             Ok(mut slot) => {
@@ -2506,10 +2598,13 @@ impl Piper {
         }
 
         let deadline = Instant::now() + timeout;
-        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        self.enqueue_reliable_timeout(ReliableCommand::package_confirmed(buffer, ack_tx), timeout)?;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+        self.enqueue_reliable_timeout_until(
+            ReliableCommand::package_confirmed(buffer, deadline, ack_tx),
+            deadline,
+        )?;
 
-        recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)?
+        wait_for_delivery_result(ack_rx, deadline, || DriverError::Timeout)
     }
 
     /// 发送维护帧并等待 TX 线程在实际发送点完成最终运行时准入判定。
@@ -2528,6 +2623,9 @@ impl Piper {
     ) -> Result<(), DriverError> {
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
+        }
+        if self.replay_mode_active() {
+            return Err(DriverError::ReplayModeActive);
         }
         if !self.normal_control_open() {
             return Err(DriverError::ControlPathClosed);
@@ -2602,7 +2700,7 @@ impl Piper {
 
     #[doc(hidden)]
     pub fn maintenance_runtime_open(&self) -> bool {
-        self.runtime_phase() == RuntimePhase::Running
+        self.runtime_phase() == RuntimePhase::Running && !self.replay_mode_active()
     }
 
     /// 发送命令（根据优先级自动选择队列）
@@ -2664,6 +2762,10 @@ impl Piper {
             command.complete(Err(DriverError::ChannelClosed));
             return Err(DriverError::ChannelClosed);
         }
+        if let Err(error) = self.ensure_mode_allows_reliable_kind(command.kind()) {
+            command.complete(Err(clone_driver_error(&error)));
+            return Err(error);
+        }
         if !self.normal_control_open() {
             command.complete(Err(DriverError::ControlPathClosed));
             return Err(DriverError::ControlPathClosed);
@@ -2690,15 +2792,31 @@ impl Piper {
         command: ReliableCommand,
         timeout: Duration,
     ) -> Result<(), DriverError> {
+        self.enqueue_reliable_timeout_until(command, Instant::now() + timeout)
+    }
+
+    fn enqueue_reliable_timeout_until(
+        &self,
+        command: ReliableCommand,
+        deadline: Instant,
+    ) -> Result<(), DriverError> {
         if !self.tx_thread_alive() {
             command.complete(Err(DriverError::ChannelClosed));
             return Err(DriverError::ChannelClosed);
+        }
+        if let Err(error) = self.ensure_mode_allows_reliable_kind(command.kind()) {
+            command.complete(Err(clone_driver_error(&error)));
+            return Err(error);
         }
         if !self.normal_control_open() {
             command.complete(Err(DriverError::ControlPathClosed));
             return Err(DriverError::ControlPathClosed);
         }
-        match self.reliable_tx.send_timeout(command, timeout) {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            command.complete(Err(DriverError::Timeout));
+            return Err(DriverError::Timeout);
+        };
+        match self.reliable_tx.send_timeout(command, remaining) {
             Ok(_) => {
                 self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -3166,6 +3284,37 @@ mod tests {
         }
     }
 
+    struct TimeoutOnceShutdownTxAdapter {
+        shutdown_sends: usize,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    }
+
+    impl piper_can::RealtimeTxAdapter for TimeoutOnceShutdownTxAdapter {
+        fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            self.shutdown_sends += 1;
+            if self.shutdown_sends == 1 {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
     impl SplittableAdapter for MockCanAdapter {
         type RxAdapter = BootstrappedMockRxAdapter;
         type TxAdapter = MockTxAdapter;
@@ -3308,6 +3457,107 @@ mod tests {
             },
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
+    }
+
+    #[test]
+    fn test_replay_mode_rejects_normal_control_paths_but_allows_replay_frames() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let replay_frame = PiperFrame::new_standard(0x155, &[0xAA]);
+
+        piper.set_mode(crate::mode::DriverMode::Replay);
+
+        assert!(matches!(
+            piper.send_frame(PiperFrame::new_standard(0x123, &[0x01])),
+            Err(DriverError::ReplayModeActive)
+        ));
+        assert!(matches!(
+            piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01])),
+            Err(DriverError::ReplayModeActive)
+        ));
+        assert!(matches!(
+            piper.send_maintenance_frame_confirmed(
+                7,
+                77,
+                1,
+                replay_frame,
+                Duration::from_millis(50)
+            ),
+            Err(DriverError::ReplayModeActive)
+        ));
+
+        piper
+            .send_replay_frame_confirmed(replay_frame, Duration::from_millis(200))
+            .expect("replay frame should still be sendable in Replay mode");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[replay_frame]);
+    }
+
+    #[test]
+    fn test_soft_realtime_batch_is_rejected_in_replay_mode() {
+        let piper = Piper::new_dual_thread_parts(SoftRxAdapter, MockTxAdapter, None).unwrap();
+        piper.set_mode(crate::mode::DriverMode::Replay);
+
+        let error = piper
+            .send_soft_realtime_package_confirmed(
+                [PiperFrame::new_standard(0x155, &[0x01])],
+                Duration::from_millis(50),
+            )
+            .expect_err("soft realtime batch should be blocked while Replay mode is active");
+
+        assert!(matches!(error, DriverError::ReplayModeActive));
+    }
+
+    #[test]
+    fn test_reliable_command_enqueued_before_replay_mode_is_rejected_at_send_point() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let first = PiperFrame::new_standard(0x101, &[0x01]);
+        let second = [PiperFrame::new_standard(0x102, &[0x02])];
+        piper.send_frame(first).expect("first reliable frame should queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first reliable frame should start sending");
+
+        let piper_clone = Arc::clone(&piper);
+        let handle = std::thread::spawn(move || {
+            piper_clone.send_reliable_package_confirmed(second, Duration::from_millis(500))
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        piper.set_mode(crate::mode::DriverMode::Replay);
+        let _ = release_tx.send(());
+
+        let error = handle.join().expect("reliable sender thread should finish").expect_err(
+            "queued standard reliable command must be rejected once Replay mode is active",
+        );
+        assert!(matches!(error, DriverError::ReplayModeActive));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[first]);
     }
 
     #[test]
@@ -4038,6 +4288,48 @@ mod tests {
         .expect_err("slow tx should time out confirmed shutdown send");
 
         assert!(matches!(error, DriverError::Timeout));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert!(matches!(
+            piper.send_frame(PiperFrame::new_standard(0x123, &[0x01])),
+            Err(DriverError::ControlPathClosed)
+        ));
+    }
+
+    #[test]
+    fn test_shutdown_timeout_latches_fault_but_still_allows_retry_via_shutdown_lane() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            TimeoutOnceShutdownTxAdapter {
+                shutdown_sends: 0,
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let retry_frame = PiperFrame::new_standard(0x472, &[0x02]);
+
+        let error = wait_shutdown(
+            &piper,
+            PiperFrame::new_standard(0x471, &[0x01]),
+            Duration::from_millis(50),
+        )
+        .expect_err("first shutdown attempt should time out");
+        assert!(matches!(error, DriverError::Timeout));
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert!(matches!(
+            piper.send_reliable(PiperFrame::new_standard(0x123, &[0x01])),
+            Err(DriverError::ControlPathClosed)
+        ));
+
+        wait_shutdown(&piper, retry_frame, Duration::from_millis(200))
+            .expect("shutdown lane should remain available for retry after timeout");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[retry_frame]);
     }
 
     #[test]
@@ -4847,6 +5139,106 @@ mod tests {
             .take()
             .expect("confirmed send result should be captured");
         assert!(matches!(result, Err(DriverError::ChannelClosed)));
+    }
+
+    #[test]
+    fn test_realtime_confirmed_timeout_never_late_sends_expired_command() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let first = [PiperFrame::new_standard(0x155, &[0x01])];
+        let expired = [PiperFrame::new_standard(0x156, &[0x02])];
+
+        piper.send_realtime_package(first).expect("first realtime package should queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first realtime frame should start sending");
+
+        let piper_clone = Arc::clone(&piper);
+        let handle = std::thread::spawn(move || {
+            piper_clone.send_realtime_package_confirmed(expired, Duration::from_millis(20))
+        });
+
+        let enqueue_deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if piper.realtime_slot.lock().expect("realtime slot lock").is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < enqueue_deadline,
+                "confirmed realtime command should remain pending while TX is blocked"
+            );
+            std::thread::yield_now();
+        }
+
+        let error = handle
+            .join()
+            .expect("confirmed realtime sender should finish")
+            .expect_err("expired confirmed realtime command must time out before commit");
+        assert!(matches!(error, DriverError::RealtimeDeliveryTimeout));
+
+        let _ = release_tx.send(());
+        std::thread::sleep(Duration::from_millis(20));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &first);
+    }
+
+    #[test]
+    fn test_reliable_confirmed_timeout_never_late_sends_expired_command() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let first = PiperFrame::new_standard(0x201, &[0x01]);
+        let expired = [PiperFrame::new_standard(0x202, &[0x02])];
+
+        piper.send_frame(first).expect("first reliable frame should queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first reliable frame should start sending");
+
+        let piper_clone = Arc::clone(&piper);
+        let handle = std::thread::spawn(move || {
+            piper_clone.send_reliable_package_confirmed(expired, Duration::from_millis(20))
+        });
+
+        let error = handle
+            .join()
+            .expect("confirmed reliable sender should finish")
+            .expect_err("expired confirmed reliable command must time out before commit");
+        assert!(matches!(error, DriverError::Timeout));
+
+        let _ = release_tx.send(());
+        std::thread::sleep(Duration::from_millis(20));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[first]);
     }
 
     #[test]

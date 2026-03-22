@@ -56,6 +56,7 @@ pub struct MitPassthroughMode;
 /// 纯位置控制模式。
 pub struct PositionMode {
     pub(crate) command_timeout: Duration,
+    pub(crate) motion_type: MotionType,
 }
 
 /// 错误状态
@@ -333,7 +334,14 @@ pub struct Piper<State = Disconnected, Capability = UnspecifiedCapability> {
     pub(crate) driver: Arc<piper_driver::Piper>,
     pub(crate) observer: Observer<Capability>,
     pub(crate) quirks: DeviceQuirks,
+    pub(crate) drop_policy: DropPolicy,
     pub(crate) _state: State, // 改为直接存储状态（不再使用 PhantomData）
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropPolicy {
+    Noop,
+    DisableAll,
 }
 
 pub enum ConnectedPiper {
@@ -439,18 +447,21 @@ pub(crate) fn connected_piper_from_driver(
             observer: Observer::<StrictRealtime>::new(driver.clone()),
             driver,
             quirks,
+            drop_policy: DropPolicy::Noop,
             _state: Standby,
         }),
         BackendCapability::SoftRealtime => ConnectedPiper::Soft(Piper {
             observer: Observer::<SoftRealtime>::new(driver.clone()),
             driver,
             quirks,
+            drop_policy: DropPolicy::Noop,
             _state: Standby,
         }),
         BackendCapability::MonitorOnly => ConnectedPiper::Monitor(Piper {
             observer: Observer::<MonitorOnly>::new(driver.clone()),
             driver,
             quirks,
+            drop_policy: DropPolicy::Noop,
             _state: Standby,
         }),
     }
@@ -459,6 +470,7 @@ pub(crate) fn connected_piper_from_driver(
 fn transition_piper_state<State, NewState, Capability>(
     this: Piper<State, Capability>,
     new_state: NewState,
+    drop_policy: DropPolicy,
 ) -> Piper<NewState, Capability>
 where
     Capability: CapabilityMarker,
@@ -473,6 +485,7 @@ where
         driver,
         observer,
         quirks,
+        drop_policy,
         _state: new_state,
     }
 }
@@ -644,7 +657,11 @@ where
         )?;
         info!("Robot enabled - Active<MitMode>");
 
-        Ok(transition_piper_state(self, Active(MitMode)))
+        Ok(transition_piper_state(
+            self,
+            Active(MitMode),
+            DropPolicy::DisableAll,
+        ))
     }
 
     /// 使能位置模式
@@ -665,6 +682,12 @@ where
             "Enabling Position mode (motion_type={:?}, speed_percent={})",
             config.motion_type, config.speed_percent
         );
+
+        if config.motion_type == MotionType::ContinuousPositionVelocity {
+            return Err(RobotError::ConfigError(
+                "MotionType::ContinuousPositionVelocity is not implemented yet".to_string(),
+            ));
+        }
 
         // === PHASE 1: All operations that can panic ===
 
@@ -713,7 +736,9 @@ where
             self,
             Active(PositionMode {
                 command_timeout: config.command_timeout,
+                motion_type: config.motion_type,
             }),
+            DropPolicy::DisableAll,
         ))
     }
 
@@ -1151,7 +1176,7 @@ where
 
         tracing::info!("Entered ReplayMode - TX thread periodic sending paused");
 
-        Ok(transition_piper_state(self, ReplayMode))
+        Ok(transition_piper_state(self, ReplayMode, DropPolicy::Noop))
     }
 
     /// 设置碰撞保护级别
@@ -1279,7 +1304,11 @@ impl Piper<Standby, SoftRealtime> {
             },
         )?;
 
-        Ok(transition_piper_state(self, Active(MitPassthroughMode)))
+        Ok(transition_piper_state(
+            self,
+            Active(MitPassthroughMode),
+            DropPolicy::DisableAll,
+        ))
     }
 }
 
@@ -1296,7 +1325,11 @@ where
         }
     }
 
-    fn into_state<NextState>(self, next_state: NextState) -> Piper<NextState, Capability> {
+    fn into_state<NextState>(
+        self,
+        next_state: NextState,
+        drop_policy: DropPolicy,
+    ) -> Piper<NextState, Capability> {
         let this = std::mem::ManuallyDrop::new(self);
         let driver = unsafe { std::ptr::read(&this.driver) };
         let observer = unsafe { std::ptr::read(&this.observer) };
@@ -1306,6 +1339,7 @@ where
             driver,
             observer,
             quirks,
+            drop_policy,
             _state: next_state,
         }
     }
@@ -1433,7 +1467,7 @@ where
             raw_commander.emergency_stop_enqueue(Instant::now() + Duration::from_millis(20))?;
         receipt.wait()?;
 
-        Ok(transition_piper_state(self, ErrorState))
+        Ok(transition_piper_state(self, ErrorState, DropPolicy::Noop))
     }
 
     /// 等待机械臂失能完成（带 Debounce 机制）
@@ -1508,7 +1542,7 @@ where
         use piper_protocol::control::MotorEnableCommand;
 
         self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
-        Ok(self.into_state(Standby))
+        Ok(self.into_state(Standby, DropPolicy::Noop))
     }
 
     /// 优雅关闭机械臂
@@ -1593,6 +1627,7 @@ where
             driver,
             observer,
             quirks,
+            drop_policy: DropPolicy::Noop,
             _state: Standby,
         })
     }
@@ -2029,7 +2064,7 @@ where
         )?;
         info!("Robot disabled - Standby mode");
 
-        Ok(transition_piper_state(self, Standby))
+        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
     }
 }
 
@@ -2063,7 +2098,7 @@ impl Piper<Active<MitPassthroughMode>, SoftRealtime> {
         )?;
         info!("Robot disabled - Standby mode");
 
-        Ok(transition_piper_state(self, Standby))
+        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
     }
 }
 
@@ -2073,6 +2108,22 @@ impl<Capability> Piper<Active<PositionMode>, Capability>
 where
     Capability: MotionCapability,
 {
+    fn ensure_position_motion_type(
+        &self,
+        expected: MotionType,
+        operation: &str,
+    ) -> Result<&PositionMode> {
+        let position_mode = &self._state.0;
+        if position_mode.motion_type != expected {
+            return Err(RobotError::ConfigError(format!(
+                "{operation} requires MotionType::{expected:?}, but this PositionMode is MotionType::{actual:?}",
+                actual = position_mode.motion_type
+            )));
+        }
+
+        Ok(position_mode)
+    }
+
     /// 发送位置命令（批量发送所有关节）
     ///
     /// 一次性发送所有 6 个关节的目标位置。
@@ -2095,8 +2146,10 @@ where
     /// # }
     /// ```
     pub fn send_position_command(&self, positions: &JointArray<Rad>) -> Result<()> {
+        let position_mode =
+            self.ensure_position_motion_type(MotionType::Joint, "send_position_command")?;
         let raw = RawCommander::new(&self.driver);
-        raw.send_position_command_batch(positions, self._state.0.command_timeout)
+        raw.send_position_command_batch(positions, position_mode.command_timeout)
     }
 
     /// 发送末端位姿命令（笛卡尔空间控制）
@@ -2128,8 +2181,10 @@ where
         position: Position3D,
         orientation: EulerAngles,
     ) -> Result<()> {
+        let position_mode =
+            self.ensure_position_motion_type(MotionType::Cartesian, "command_cartesian_pose")?;
         let raw = RawCommander::new(&self.driver);
-        raw.send_end_pose_command(position, orientation, self._state.0.command_timeout)
+        raw.send_end_pose_command(position, orientation, position_mode.command_timeout)
     }
 
     /// 发送直线运动命令
@@ -2159,8 +2214,9 @@ where
     /// )?;
     /// ```
     pub fn move_linear(&self, position: Position3D, orientation: EulerAngles) -> Result<()> {
+        let position_mode = self.ensure_position_motion_type(MotionType::Linear, "move_linear")?;
         let raw = RawCommander::new(&self.driver);
-        raw.send_end_pose_command(position, orientation, self._state.0.command_timeout)
+        raw.send_end_pose_command(position, orientation, position_mode.command_timeout)
     }
 
     /// 发送圆弧运动命令
@@ -2200,13 +2256,15 @@ where
         target_position: Position3D,
         target_orientation: EulerAngles,
     ) -> Result<()> {
+        let position_mode =
+            self.ensure_position_motion_type(MotionType::Circular, "move_circular")?;
         let raw = RawCommander::new(&self.driver);
         raw.send_circular_motion(
             via_position,
             via_orientation,
             target_position,
             target_orientation,
-            self._state.0.command_timeout,
+            position_mode.command_timeout,
         )
     }
 
@@ -2314,7 +2372,7 @@ where
 
         // === PHASE 2: No-panic zone - must not panic after this point ===
 
-        Ok(transition_piper_state(self, Standby))
+        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
     }
 }
 
@@ -2379,6 +2437,7 @@ where
         use piper_tools::PiperRecording;
         use std::thread;
         use std::time::Duration;
+        const REPLAY_FRAME_COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
 
         // === 安全检查 ===
 
@@ -2469,11 +2528,13 @@ where
                 timestamp_us: frame.timestamp_us,
             };
 
-            self.driver.send_frame(piper_frame).map_err(|e| {
-                crate::RobotError::Infrastructure(piper_driver::DriverError::IoThread(
-                    e.to_string(),
-                ))
-            })?;
+            self.driver
+                .send_replay_frame_confirmed(piper_frame, REPLAY_FRAME_COMMIT_TIMEOUT)
+                .map_err(|e| {
+                    crate::RobotError::Infrastructure(piper_driver::DriverError::IoThread(
+                        e.to_string(),
+                    ))
+                })?;
 
             // 跟踪进度（每 1000 帧打印一次）
             if frame.timestamp_us % 1_000_000 < 1000 {
@@ -2494,7 +2555,7 @@ where
         tracing::info!("Exited ReplayMode - TX thread normal operation resumed");
 
         // 状态转换：ReplayMode -> Standby
-        Ok(transition_piper_state(self, Standby))
+        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
     }
 
     /// 回放录制（带取消支持）
@@ -2559,6 +2620,7 @@ where
         use piper_tools::PiperRecording;
         use std::thread;
         use std::time::Duration;
+        const REPLAY_FRAME_COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
 
         // === 安全检查 ===
 
@@ -2669,11 +2731,13 @@ where
                 timestamp_us: frame.timestamp_us,
             };
 
-            self.driver.send_frame(piper_frame).map_err(|e| {
-                crate::RobotError::Infrastructure(piper_driver::DriverError::IoThread(
-                    e.to_string(),
-                ))
-            })?;
+            self.driver
+                .send_replay_frame_confirmed(piper_frame, REPLAY_FRAME_COMMIT_TIMEOUT)
+                .map_err(|e| {
+                    crate::RobotError::Infrastructure(piper_driver::DriverError::IoThread(
+                        e.to_string(),
+                    ))
+                })?;
 
             // 跟踪进度（每 1000 帧打印一次）
             if frame.timestamp_us % 1_000_000 < 1000 {
@@ -2694,7 +2758,7 @@ where
         tracing::info!("Exited ReplayMode - TX thread normal operation resumed");
 
         // 状态转换：ReplayMode -> Standby
-        Ok(transition_piper_state(self, Standby))
+        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
     }
 
     /// 退出回放模式（返回 Standby）
@@ -2727,7 +2791,7 @@ where
         self.driver.set_mode(DriverMode::Normal);
 
         // 状态转换：ReplayMode -> Standby
-        Ok(transition_piper_state(self, Standby))
+        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
     }
 }
 
@@ -2759,6 +2823,11 @@ where
 
 impl<State, Capability> Drop for Piper<State, Capability> {
     fn drop(&mut self) {
+        if self.drop_policy != DropPolicy::DisableAll || !self.driver.auto_disable_on_drop_allowed()
+        {
+            return;
+        }
+
         // 尝试失能（忽略错误，因为可能已经失能）
         use piper_protocol::control::MotorEnableCommand;
         let _ = self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame());
@@ -2926,6 +2995,29 @@ mod tests {
         }
     }
 
+    struct MonitorCapabilityRx<R> {
+        inner: R,
+    }
+
+    impl<R> MonitorCapabilityRx<R> {
+        fn new(inner: R) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl<R> RxAdapter for MonitorCapabilityRx<R>
+    where
+        R: RxAdapter,
+    {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            self.inner.receive()
+        }
+
+        fn backend_capability(&self) -> piper_driver::BackendCapability {
+            piper_driver::BackendCapability::MonitorOnly
+        }
+    }
+
     fn bootstrap_timestamp_frame() -> PiperFrame {
         let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
         frame.timestamp_us = 1;
@@ -2950,6 +3042,7 @@ mod tests {
             driver,
             observer,
             quirks,
+            drop_policy: DropPolicy::DisableAll,
             _state: Active(MitMode),
         }
     }
@@ -2957,14 +3050,23 @@ mod tests {
     fn build_active_position_piper(
         driver: Arc<RobotPiper>,
     ) -> Piper<Active<PositionMode>, StrictRealtime> {
+        build_active_position_piper_with_motion_type(driver, MotionType::Joint)
+    }
+
+    fn build_active_position_piper_with_motion_type(
+        driver: Arc<RobotPiper>,
+        motion_type: MotionType,
+    ) -> Piper<Active<PositionMode>, StrictRealtime> {
         let observer = Observer::<StrictRealtime>::new(driver.clone());
 
         Piper {
             driver,
             observer,
             quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            drop_policy: DropPolicy::DisableAll,
             _state: Active(PositionMode {
                 command_timeout: Duration::from_millis(20),
+                motion_type,
             }),
         }
     }
@@ -2990,6 +3092,7 @@ mod tests {
             driver,
             observer,
             quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            drop_policy: DropPolicy::Noop,
             _state: Standby,
         }
     }
@@ -3015,6 +3118,7 @@ mod tests {
             driver,
             observer,
             quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            drop_policy: DropPolicy::Noop,
             _state: Standby,
         }
     }
@@ -3111,11 +3215,11 @@ mod tests {
 
         assert_eq!(
             std::mem::size_of::<PositionMode>(),
-            std::mem::size_of::<Duration>()
+            std::mem::size_of::<(Duration, MotionType)>()
         );
         assert_eq!(
             std::mem::size_of::<Active<PositionMode>>(),
-            std::mem::size_of::<Duration>()
+            std::mem::size_of::<(Duration, MotionType)>()
         );
     }
 
@@ -3353,6 +3457,177 @@ mod tests {
         assert!(
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "stale read-modify-write helper must not send frames"
+        );
+    }
+
+    #[test]
+    fn active_drop_sends_disable_all_but_standby_replay_error_and_monitor_do_not() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let disable_all_frame = MotorEnableCommand::disable_all().to_frame();
+
+        let standby_sent = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), standby_sent.clone());
+        let standby_driver = standby.driver.clone();
+        drop(standby);
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            standby_sent.lock().expect("standby sent frames lock").is_empty(),
+            "dropping Standby must not disable motors"
+        );
+        drop(standby_driver);
+
+        let replay_sent = Arc::new(Mutex::new(Vec::new()));
+        let replay = build_standby_piper(IdleRxAdapter::new(), replay_sent.clone())
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+        let replay_driver = replay.driver.clone();
+        drop(replay);
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            replay_sent.lock().expect("replay sent frames lock").is_empty(),
+            "dropping ReplayMode must not disable motors"
+        );
+        drop(replay_driver);
+
+        let error_sent = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            error_sent.clone(),
+        );
+        let error = transition_piper_state(active, ErrorState, DropPolicy::Noop);
+        let error_driver = error.driver.clone();
+        drop(error);
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            error_sent.lock().expect("error sent frames lock").is_empty(),
+            "dropping ErrorState must not disable motors"
+        );
+        drop(error_driver);
+
+        let active_sent = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            active_sent.clone(),
+        );
+        let active_driver = active.driver.clone();
+        drop(active);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            active_sent.lock().expect("active sent frames lock").as_slice(),
+            &[disable_all_frame],
+            "dropping Active<MitMode> must best-effort disable all motors once"
+        );
+        drop(active_driver);
+
+        let monitor_sent = Arc::new(Mutex::new(Vec::new()));
+        let monitor_driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                MonitorCapabilityRx::new(IdleRxAdapter::new()),
+                RecordingTxAdapter::new(monitor_sent.clone()),
+                None,
+            )
+            .expect("monitor driver should start"),
+        );
+        let monitor = connected_piper_from_driver(
+            monitor_driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+        match monitor {
+            ConnectedPiper::Monitor(piper) => {
+                let monitor_driver = piper.driver.clone();
+                drop(piper);
+                thread::sleep(Duration::from_millis(20));
+                drop(monitor_driver);
+            },
+            other => panic!(
+                "expected monitor connection, got {:?}",
+                other.backend_capability()
+            ),
+        }
+        assert!(
+            monitor_sent.lock().expect("monitor sent frames lock").is_empty(),
+            "dropping monitor handle must not disable motors"
+        );
+    }
+
+    #[test]
+    fn enable_position_mode_rejects_continuous_position_velocity_without_sending_any_frame() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone());
+
+        let error = match standby.enable_position_mode(PositionModeConfig {
+            motion_type: MotionType::ContinuousPositionVelocity,
+            ..Default::default()
+        }) {
+            Ok(_) => panic!("ContinuousPositionVelocity should be rejected before mode switching"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RobotError::ConfigError(_)));
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "unsupported motion type must not emit enable or mode-switch frames"
+        );
+    }
+
+    #[test]
+    fn position_mode_runtime_motion_type_guard_rejects_mismatched_helpers_without_sending() {
+        let joint_sent = Arc::new(Mutex::new(Vec::new()));
+        let joint_driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                RecordingTxAdapter::new(joint_sent.clone()),
+                None,
+            )
+            .expect("joint driver should start"),
+        );
+        let joint_robot =
+            build_active_position_piper_with_motion_type(joint_driver, MotionType::Joint);
+        let zero_position = Position3D::new(0.0, 0.0, 0.0);
+        let zero_orientation = EulerAngles::new(0.0, 0.0, 0.0);
+
+        assert!(matches!(
+            joint_robot.command_cartesian_pose(zero_position, zero_orientation),
+            Err(RobotError::ConfigError(_))
+        ));
+        assert!(matches!(
+            joint_robot.move_linear(zero_position, zero_orientation),
+            Err(RobotError::ConfigError(_))
+        ));
+        assert!(matches!(
+            joint_robot.move_circular(
+                zero_position,
+                zero_orientation,
+                zero_position,
+                zero_orientation
+            ),
+            Err(RobotError::ConfigError(_))
+        ));
+        assert!(
+            joint_sent.lock().expect("joint sent frames lock").is_empty(),
+            "mismatched Cartesian helpers must not emit any CAN frame in joint mode"
+        );
+
+        let cartesian_sent = Arc::new(Mutex::new(Vec::new()));
+        let cartesian_driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                RecordingTxAdapter::new(cartesian_sent.clone()),
+                None,
+            )
+            .expect("cartesian driver should start"),
+        );
+        let cartesian_robot =
+            build_active_position_piper_with_motion_type(cartesian_driver, MotionType::Cartesian);
+
+        assert!(matches!(
+            cartesian_robot.send_position_command(&JointArray::splat(Rad(0.0))),
+            Err(RobotError::ConfigError(_))
+        ));
+        assert!(
+            cartesian_sent.lock().expect("cartesian sent frames lock").is_empty(),
+            "joint helper must not emit frames in cartesian mode"
         );
     }
 

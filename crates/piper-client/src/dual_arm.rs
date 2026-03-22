@@ -1309,6 +1309,7 @@ fn force_error_state(
         observer: unsafe { std::ptr::read(&piper.observer) },
         // SAFETY: `piper.quirks` is moved exactly once into the new state wrapper.
         quirks: unsafe { std::ptr::read(&piper.quirks) },
+        drop_policy: crate::state::machine::DropPolicy::Noop,
         _state: ErrorState,
     }
 }
@@ -1740,6 +1741,7 @@ mod tests {
             driver,
             observer,
             quirks: crate::types::DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            drop_policy: crate::state::machine::DropPolicy::Noop,
             _state: state,
         }
     }

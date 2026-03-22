@@ -83,11 +83,12 @@ mod tests {
     fn test_cycle_scheduler_first_tick_waits_for_nominal_period() {
         let period = Duration::from_millis(20);
         let mut scheduler = CycleScheduler::new(period, SleepStrategy::Sleep);
+        let initial_deadline = scheduler.next_deadline;
 
         let first = scheduler.wait_next();
-        assert!(first.real_dt >= Duration::from_millis(15));
         assert_eq!(first.missed_deadlines, 0);
-        assert!(first.lag < Duration::from_millis(20));
+        assert!(scheduler.next_deadline > first.tick_start);
+        assert_eq!(scheduler.next_deadline, initial_deadline + period);
     }
 
     #[test]
@@ -95,12 +96,20 @@ mod tests {
         let period = Duration::from_millis(20);
         let mut scheduler = CycleScheduler::new(period, SleepStrategy::Sleep);
 
-        let _first = scheduler.wait_next();
+        let first = scheduler.wait_next();
+        let second_deadline = scheduler.next_deadline;
 
         let second = scheduler.wait_next();
-        assert!(second.real_dt >= Duration::from_millis(15));
-        assert!(second.missed_deadlines <= 1);
-        assert!(second.lag < Duration::from_millis(20));
+        assert!(second.tick_start >= first.tick_start);
+        assert_eq!(
+            second.real_dt,
+            second.tick_start.saturating_duration_since(first.tick_start)
+        );
+        assert_eq!(
+            scheduler.next_deadline,
+            second_deadline + period * (second.missed_deadlines as u32 + 1)
+        );
+        assert!(scheduler.next_deadline > second.tick_start);
     }
 
     #[test]

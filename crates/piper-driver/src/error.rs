@@ -23,6 +23,10 @@ pub enum DriverError {
     #[error("Normal control path closed")]
     ControlPathClosed,
 
+    /// Driver 已处于 Replay 模式，普通控制入口被封锁
+    #[error("Replay mode active; normal control paths are disabled")]
+    ReplayModeActive,
+
     /// 命令通道已满（缓冲区容量 10）
     #[error("Command channel full (buffer size: 10)")]
     ChannelFull,
@@ -164,6 +168,10 @@ mod tests {
         let driver_error = DriverError::ControlPathClosed;
         let msg = format!("{}", driver_error);
         assert_eq!(msg, "Normal control path closed");
+
+        let driver_error = DriverError::ReplayModeActive;
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("Replay mode active"));
 
         // 测试 ChannelFull
         let driver_error = DriverError::ChannelFull;

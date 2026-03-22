@@ -178,6 +178,9 @@ fn test_priority_scheduling() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 
@@ -334,6 +337,9 @@ fn test_reliable_command_not_dropped() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 
@@ -494,6 +500,9 @@ fn test_realtime_overwrite_strategy() {
             last_fault_tx,
             maintenance_ctrl_rx,
             maintenance_lease_gate_tx,
+            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+                piper_sdk::driver::DriverMode::Normal,
+            )),
         );
     });
 

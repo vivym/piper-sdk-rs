@@ -101,6 +101,41 @@ fn realtime_abort_error(sent: usize, total: usize) -> crate::DriverError {
     crate::DriverError::RealtimeDeliveryAbortedByFault { sent, total }
 }
 
+fn drain_soft_realtime_queue_with_reason<F>(
+    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    metrics: &Arc<PiperMetrics>,
+    reason: F,
+    count_as_fault_abort: bool,
+) where
+    F: Fn() -> crate::DriverError,
+{
+    while let Ok(command) = soft_realtime_rx.try_recv() {
+        if count_as_fault_abort {
+            count_fault_abort(metrics);
+        }
+        command.complete(Err(reason()));
+    }
+}
+
+fn reject_replay_mode_dispatches(
+    realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
+    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    metrics: &Arc<PiperMetrics>,
+) {
+    abort_realtime_slot_with(
+        realtime_slot,
+        metrics,
+        crate::DriverError::ReplayModeActive,
+        false,
+    );
+    drain_soft_realtime_queue_with_reason(
+        soft_realtime_rx,
+        metrics,
+        || crate::DriverError::ReplayModeActive,
+        false,
+    );
+}
+
 fn derive_maintenance_gate_state(
     runtime_phase: &Arc<AtomicU8>,
     ctx: &Arc<PiperContext>,
@@ -964,6 +999,7 @@ pub fn tx_loop_mailbox(
     last_fault: Arc<AtomicU8>,
     maintenance_lane_rx: Receiver<MaintenanceLaneCommand>,
     maintenance_gate: Arc<MaintenanceGate>,
+    driver_mode: Arc<crate::mode::AtomicDriverMode>,
 ) {
     let normal_send_budget = if backend_capability.is_strict_realtime() {
         NORMAL_FRAME_SEND_BUDGET
@@ -976,6 +1012,7 @@ pub fn tx_loop_mailbox(
 
     loop {
         let phase = load_runtime_phase(&runtime_phase);
+        let mode = driver_mode.get(Ordering::Acquire);
         if phase == RuntimePhase::Stopping || !workers_running.load(Ordering::Acquire) {
             trace!("TX thread: stopping runtime, exiting");
             break;
@@ -987,9 +1024,11 @@ pub fn tx_loop_mailbox(
                 dispatch,
                 &shutdown_lane,
                 &runtime_phase,
+                &normal_send_gate,
                 &metrics,
                 &ctx,
                 &last_fault,
+                &maintenance_gate,
                 "TX thread: Failed to send shutdown frame",
             );
             if should_break {
@@ -1004,6 +1043,10 @@ pub fn tx_loop_mailbox(
         ));
 
         if let Some(dispatch) = pending_maintenance_sends.pop_front() {
+            if mode.is_replay() {
+                finish_maintenance_dispatch(&dispatch, Err(crate::DriverError::ReplayModeActive));
+                continue;
+            }
             let Some(permit) = normal_send_gate.acquire() else {
                 count_fault_abort(&metrics);
                 finish_maintenance_dispatch(
@@ -1102,6 +1145,10 @@ pub fn tx_loop_mailbox(
             continue;
         }
 
+        if mode.is_replay() {
+            reject_replay_mode_dispatches(&realtime_slot, &soft_realtime_rx, &metrics);
+        }
+
         let realtime_command = if backend_capability.is_strict_realtime() {
             match realtime_slot.lock() {
                 Ok(mut slot) => slot.take(),
@@ -1115,16 +1162,29 @@ pub fn tx_loop_mailbox(
         };
 
         if let Some(mut command) = realtime_command {
-            let ack = command.take_ack();
+            let deadline = command.deadline();
+            let mut ack = command.take_ack();
             let frames = command.into_frames();
             let total_frames = frames.len();
             let mut sent_count = 0;
             let mut delivery_error = None;
             let mut transport_error = false;
+            let mut committed = false;
 
             for frame in frames {
                 if delivery_error.is_some() {
                     break;
+                }
+
+                if !committed && let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        delivery_error = Some(crate::DriverError::RealtimeDeliveryTimeout);
+                        break;
+                    }
+                    if let Some(ack) = ack.as_ref() {
+                        let _ = ack.send(crate::command::DeliveryPhase::Committed);
+                    }
+                    committed = true;
                 }
 
                 let Some(permit) = normal_send_gate.acquire() else {
@@ -1152,9 +1212,11 @@ pub fn tx_loop_mailbox(
                                 dispatch,
                                 &shutdown_lane,
                                 &runtime_phase,
+                                &normal_send_gate,
                                 &metrics,
                                 &ctx,
                                 &last_fault,
+                                &maintenance_gate,
                                 "TX thread: Failed to send shutdown frame while preempting realtime package",
                             );
                             count_fault_abort(&metrics);
@@ -1192,12 +1254,12 @@ pub fn tx_loop_mailbox(
             }
 
             let had_delivery_error = delivery_error.is_some();
-            if let Some(ack) = ack {
+            if let Some(ack) = ack.take() {
                 let result = match delivery_error {
                     Some(err) => Err(err),
                     None => Ok(()),
                 };
-                let _ = ack.send(result);
+                let _ = ack.send(crate::command::DeliveryPhase::Finished(result));
             }
 
             if transport_error {
@@ -1313,17 +1375,49 @@ pub fn tx_loop_mailbox(
         if let Ok(command) = reliable_rx.try_recv() {
             let total_frames = command.len();
             let package_command = total_frames > 1;
-            let (frames, ack, kind, maintenance) = command.into_parts();
-            debug_assert_eq!(kind, crate::command::ReliableCommandKind::Standard);
+            let (frames, mut ack, kind, maintenance, deadline) = command.into_parts();
             debug_assert!(maintenance.is_none());
+
+            if mode.is_replay() && kind != crate::command::ReliableCommandKind::Replay {
+                if let Some(ack) = ack.take() {
+                    let _ = ack.send(crate::command::DeliveryPhase::Finished(Err(
+                        crate::DriverError::ReplayModeActive,
+                    )));
+                }
+                continue;
+            }
+
+            if mode.is_normal() && kind == crate::command::ReliableCommandKind::Replay {
+                if let Some(ack) = ack.take() {
+                    let _ = ack.send(crate::command::DeliveryPhase::Finished(Err(
+                        crate::DriverError::InvalidInput(
+                            "replay frames require DriverMode::Replay".to_string(),
+                        ),
+                    )));
+                }
+                continue;
+            }
 
             let mut sent_count = 0usize;
             let mut send_result = Ok(());
             let mut should_break = false;
             let mut deadline_missed = false;
             let mut transport_error = false;
+            let mut committed = false;
 
             for frame in frames {
+                if !committed && let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        deadline_missed = true;
+                        send_result = Err(crate::DriverError::Timeout);
+                        break;
+                    }
+                    if let Some(ack) = ack.as_ref() {
+                        let _ = ack.send(crate::command::DeliveryPhase::Committed);
+                    }
+                    committed = true;
+                }
+
                 let Some(permit) = normal_send_gate.acquire() else {
                     count_fault_abort(&metrics);
                     send_result = Err(reliable_abort_error(
@@ -1430,8 +1524,8 @@ pub fn tx_loop_mailbox(
                     Err(crate::DriverError::Timeout)
                         | Err(crate::DriverError::ReliablePackageTimeout { .. })
                 );
-            if let Some(ack) = ack {
-                let _ = ack.send(send_result);
+            if let Some(ack) = ack.take() {
+                let _ = ack.send(crate::command::DeliveryPhase::Finished(send_result));
             }
 
             if let Some(soft_succeeded) = soft_outcome {
@@ -1572,9 +1666,11 @@ fn send_shutdown_dispatch(
     dispatch: ShutdownDispatch,
     shutdown_lane: &Arc<ShutdownLane>,
     runtime_phase: &Arc<AtomicU8>,
+    normal_send_gate: &Arc<NormalSendGate>,
     metrics: &Arc<PiperMetrics>,
     ctx: &Arc<PiperContext>,
     last_fault: &Arc<AtomicU8>,
+    maintenance_gate: &Arc<MaintenanceGate>,
     error_prefix: &str,
 ) -> bool {
     let frame = dispatch.frame;
@@ -1592,11 +1688,16 @@ fn send_shutdown_dispatch(
             if matches!(e, CanError::Timeout) {
                 metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
                 record_fault(last_fault, RuntimeFaultKind::TransportError);
+                store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
+                normal_send_gate.close();
+                maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
                 Err(crate::DriverError::Timeout)
             } else {
                 metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                 record_fault(last_fault, RuntimeFaultKind::TransportError);
                 store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
+                normal_send_gate.close();
+                maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
                 Err(crate::DriverError::ReliableDeliveryFailed { source: e })
             }
         },
