@@ -221,11 +221,47 @@ where
 }
 
 #[doc(hidden)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NormalSendGate {
-    closed: AtomicBool,
+    state: AtomicU8,
     epoch: AtomicU64,
     inflight_normal_sends: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum NormalSendGateState {
+    Open = 0,
+    ReplayPaused = 1,
+    FaultClosed = 2,
+    StoppingClosed = 3,
+}
+
+impl NormalSendGateState {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Open,
+            1 => Self::ReplayPaused,
+            2 => Self::FaultClosed,
+            _ => Self::StoppingClosed,
+        }
+    }
+
+    fn deny_reason(self) -> Option<NormalSendGateDenyReason> {
+        match self {
+            Self::Open => None,
+            Self::ReplayPaused => Some(NormalSendGateDenyReason::ReplayPaused),
+            Self::FaultClosed => Some(NormalSendGateDenyReason::FaultClosed),
+            Self::StoppingClosed => Some(NormalSendGateDenyReason::StoppingClosed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NormalSendGateDenyReason {
+    ReplayPaused,
+    FaultClosed,
+    StoppingClosed,
 }
 
 #[derive(Debug)]
@@ -236,30 +272,75 @@ pub(crate) struct NormalSendPermit<'a> {
 
 impl NormalSendGate {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: AtomicU8::new(NormalSendGateState::Open as u8),
+            epoch: AtomicU64::new(0),
+            inflight_normal_sends: AtomicUsize::new(0),
+        }
     }
 
-    pub(crate) fn acquire(&self) -> Option<NormalSendPermit<'_>> {
-        let epoch = self.epoch.load(Ordering::Acquire);
-        if self.closed.load(Ordering::Acquire) {
-            return None;
+    fn state(&self) -> NormalSendGateState {
+        NormalSendGateState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    fn set_state(&self, new_state: NormalSendGateState) {
+        let previous = self.state.swap(new_state as u8, Ordering::AcqRel);
+        if previous != new_state as u8 {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
         }
+    }
 
-        self.inflight_normal_sends.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn is_replay_paused(&self) -> bool {
+        self.state() == NormalSendGateState::ReplayPaused
+    }
 
-        let closed = self.closed.load(Ordering::Acquire);
-        let current_epoch = self.epoch.load(Ordering::Acquire);
-        if closed || current_epoch != epoch {
+    pub(crate) fn acquire_normal(&self) -> Result<NormalSendPermit<'_>, NormalSendGateDenyReason> {
+        loop {
+            let epoch = self.epoch.load(Ordering::Acquire);
+            let state = self.state();
+            if let Some(reason) = state.deny_reason() {
+                return Err(reason);
+            }
+
+            self.inflight_normal_sends.fetch_add(1, Ordering::AcqRel);
+
+            let current_epoch = self.epoch.load(Ordering::Acquire);
+            let current_state = self.state();
+            if current_state == NormalSendGateState::Open && current_epoch == epoch {
+                return Ok(NormalSendPermit { gate: self, epoch });
+            }
+
             self.inflight_normal_sends.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
 
-        Some(NormalSendPermit { gate: self, epoch })
+            if let Some(reason) = current_state.deny_reason() {
+                return Err(reason);
+            }
+        }
     }
 
-    pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn pause_for_replay(&self) {
+        match self.state() {
+            NormalSendGateState::Open => self.set_state(NormalSendGateState::ReplayPaused),
+            NormalSendGateState::ReplayPaused
+            | NormalSendGateState::FaultClosed
+            | NormalSendGateState::StoppingClosed => {},
+        }
+    }
+
+    pub(crate) fn resume_from_replay(&self) {
+        if self.state() == NormalSendGateState::ReplayPaused {
+            self.set_state(NormalSendGateState::Open);
+        }
+    }
+
+    pub(crate) fn close_for_fault(&self) {
+        if self.state() != NormalSendGateState::StoppingClosed {
+            self.set_state(NormalSendGateState::FaultClosed);
+        }
+    }
+
+    pub(crate) fn close_for_stop(&self) {
+        self.set_state(NormalSendGateState::StoppingClosed);
     }
 
     pub fn inflight_normal_sends(&self) -> usize {
@@ -274,9 +355,18 @@ impl Drop for NormalSendPermit<'_> {
 }
 
 impl NormalSendPermit<'_> {
-    pub(crate) fn still_open(&self) -> bool {
-        !self.gate.closed.load(Ordering::Acquire)
-            && self.gate.epoch.load(Ordering::Acquire) == self.epoch
+    pub(crate) fn send_allowed(&self) -> Result<(), NormalSendGateDenyReason> {
+        let current_state = self.gate.state();
+        let current_epoch = self.gate.epoch.load(Ordering::Acquire);
+        if current_epoch == self.epoch {
+            return current_state.deny_reason().map_or(Ok(()), Err);
+        }
+
+        match current_state {
+            NormalSendGateState::Open | NormalSendGateState::ReplayPaused => Ok(()),
+            NormalSendGateState::FaultClosed => Err(NormalSendGateDenyReason::FaultClosed),
+            NormalSendGateState::StoppingClosed => Err(NormalSendGateDenyReason::StoppingClosed),
+        }
     }
 }
 
@@ -1230,6 +1320,10 @@ impl Piper {
         self.mode().is_replay()
     }
 
+    fn replay_barrier_active(&self) -> bool {
+        self.normal_send_gate.is_replay_paused()
+    }
+
     fn ensure_mode_allows_reliable_kind(
         &self,
         kind: ReliableCommandKind,
@@ -1237,6 +1331,17 @@ impl Piper {
         if self.replay_mode_active() {
             return match kind {
                 ReliableCommandKind::Replay => Ok(()),
+                ReliableCommandKind::Standard | ReliableCommandKind::Maintenance => {
+                    Err(DriverError::ReplayModeActive)
+                },
+            };
+        }
+
+        if self.replay_barrier_active() {
+            return match kind {
+                ReliableCommandKind::Replay => Err(DriverError::InvalidInput(
+                    "replay frames may only be sent while DriverMode::Replay is active".to_string(),
+                )),
                 ReliableCommandKind::Standard | ReliableCommandKind::Maintenance => {
                     Err(DriverError::ReplayModeActive)
                 },
@@ -1527,7 +1632,7 @@ impl Piper {
         if previous == RuntimePhase::Stopping {
             return;
         }
-        self.normal_send_gate.close();
+        self.normal_send_gate.close_for_fault();
         self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
         let _ = self.maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
     }
@@ -1535,7 +1640,7 @@ impl Piper {
     /// 请求 worker 停止并关闭所有命令通路。
     pub fn request_stop(&self) {
         self.runtime_phase.store(RuntimePhase::Stopping as u8, Ordering::Release);
-        self.normal_send_gate.close();
+        self.normal_send_gate.close_for_stop();
         self.workers_running.store(false, Ordering::Release);
         self.shutdown_lane.close_with(Err(DriverError::ChannelClosed));
         self.clear_realtime_slot(DriverError::ChannelClosed, false);
@@ -2220,7 +2325,19 @@ impl Piper {
     /// # }
     /// ```
     pub fn set_mode(&self, mode: crate::mode::DriverMode) {
-        self.driver_mode.set(mode, std::sync::atomic::Ordering::Relaxed);
+        match mode {
+            crate::mode::DriverMode::Replay => {
+                self.normal_send_gate.pause_for_replay();
+                while self.normal_send_gate.inflight_normal_sends() > 0 && self.tx_thread_alive() {
+                    spin_sleep::sleep(Duration::from_micros(50));
+                }
+                self.driver_mode.set(mode, std::sync::atomic::Ordering::Release);
+            },
+            crate::mode::DriverMode::Normal => {
+                self.driver_mode.set(mode, std::sync::atomic::Ordering::Release);
+                self.normal_send_gate.resume_from_replay();
+            },
+        }
         tracing::info!("Driver mode set to: {:?}", mode);
     }
 
@@ -2273,7 +2390,7 @@ impl Piper {
                 "strict realtime delivery is only available on StrictRealtime backends".to_string(),
             ));
         }
-        if self.replay_mode_active() {
+        if self.replay_mode_active() || self.replay_barrier_active() {
             return Err(DriverError::ReplayModeActive);
         }
         self.send_realtime_command(RealtimeCommand::single(frame))
@@ -2313,7 +2430,7 @@ impl Piper {
                     .to_string(),
             ));
         }
-        if self.replay_mode_active() {
+        if self.replay_mode_active() || self.replay_barrier_active() {
             return Err(DriverError::ReplayModeActive);
         }
 
@@ -2359,7 +2476,7 @@ impl Piper {
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
-        if self.replay_mode_active() {
+        if self.replay_mode_active() || self.replay_barrier_active() {
             return Err(DriverError::ReplayModeActive);
         }
         if !self.normal_control_open() {
@@ -2406,7 +2523,7 @@ impl Piper {
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
-        if self.replay_mode_active() {
+        if self.replay_mode_active() || self.replay_barrier_active() {
             return Err(DriverError::ReplayModeActive);
         }
         if !self.normal_control_open() {
@@ -2453,7 +2570,7 @@ impl Piper {
             command.complete(Err(DriverError::ChannelClosed));
             return Err(DriverError::ChannelClosed);
         }
-        if self.replay_mode_active() {
+        if self.replay_mode_active() || self.replay_barrier_active() {
             command.complete(Err(DriverError::ReplayModeActive));
             return Err(DriverError::ReplayModeActive);
         }
@@ -2624,7 +2741,7 @@ impl Piper {
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
-        if self.replay_mode_active() {
+        if self.replay_mode_active() || self.replay_barrier_active() {
             return Err(DriverError::ReplayModeActive);
         }
         if !self.normal_control_open() {
@@ -2700,7 +2817,9 @@ impl Piper {
 
     #[doc(hidden)]
     pub fn maintenance_runtime_open(&self) -> bool {
-        self.runtime_phase() == RuntimePhase::Running && !self.replay_mode_active()
+        self.runtime_phase() == RuntimePhase::Running
+            && !self.replay_mode_active()
+            && !self.replay_barrier_active()
     }
 
     /// 发送命令（根据优先级自动选择队列）
@@ -2837,7 +2956,7 @@ impl Piper {
 impl Drop for Piper {
     fn drop(&mut self) {
         self.runtime_phase.store(RuntimePhase::Stopping as u8, Ordering::Release);
-        self.normal_send_gate.close();
+        self.normal_send_gate.close_for_stop();
         self.workers_running.store(false, Ordering::Release);
         self.shutdown_lane.close_with(Err(DriverError::ChannelClosed));
 
@@ -3548,8 +3667,13 @@ mod tests {
         });
 
         std::thread::sleep(Duration::from_millis(20));
-        piper.set_mode(crate::mode::DriverMode::Replay);
+        let piper_mode = Arc::clone(&piper);
+        let mode_handle =
+            std::thread::spawn(move || piper_mode.set_mode(crate::mode::DriverMode::Replay));
         let _ = release_tx.send(());
+        mode_handle
+            .join()
+            .expect("Replay barrier thread should finish once current frame drains");
 
         let error = handle.join().expect("reliable sender thread should finish").expect_err(
             "queued standard reliable command must be rejected once Replay mode is active",
@@ -3558,6 +3682,124 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[first]);
+    }
+
+    #[test]
+    fn test_realtime_command_enqueued_before_replay_mode_is_rejected_at_send_point() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let first = [PiperFrame::new_standard(0x155, &[0x01])];
+        let second = [PiperFrame::new_standard(0x156, &[0x02])];
+        piper.send_realtime_package(first).expect("first realtime frame should queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first realtime frame should start sending");
+
+        let piper_clone = Arc::clone(&piper);
+        let handle = std::thread::spawn(move || {
+            piper_clone.send_realtime_package_confirmed(second, Duration::from_millis(500))
+        });
+
+        let enqueue_deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if piper.realtime_slot.lock().expect("realtime slot lock").is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < enqueue_deadline,
+                "confirmed realtime command should remain pending while the first send blocks"
+            );
+            std::thread::yield_now();
+        }
+
+        let piper_mode = Arc::clone(&piper);
+        let mode_handle =
+            std::thread::spawn(move || piper_mode.set_mode(crate::mode::DriverMode::Replay));
+        let _ = release_tx.send(());
+        mode_handle
+            .join()
+            .expect("Replay barrier thread should finish once current frame drains");
+
+        let error = handle
+            .join()
+            .expect("realtime sender thread should finish")
+            .expect_err("queued realtime command must be rejected once Replay mode is active");
+        assert!(matches!(error, DriverError::ReplayModeActive));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &first);
+    }
+
+    #[test]
+    fn test_reliable_package_is_truncated_after_current_frame_when_replay_barrier_engages() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let frames = [
+            PiperFrame::new_standard(0x201, &[0x01]),
+            PiperFrame::new_standard(0x202, &[0x02]),
+        ];
+
+        let piper_send = Arc::clone(&piper);
+        let send_handle = std::thread::spawn(move || {
+            piper_send.send_reliable_package_confirmed(frames, Duration::from_millis(500))
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first package frame should start sending");
+
+        let piper_mode = Arc::clone(&piper);
+        let mode_handle =
+            std::thread::spawn(move || piper_mode.set_mode(crate::mode::DriverMode::Replay));
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = release_tx.send(());
+        mode_handle
+            .join()
+            .expect("Replay barrier thread should finish once current frame drains");
+
+        let error = send_handle
+            .join()
+            .expect("reliable package sender should finish")
+            .expect_err("Replay barrier should truncate the remaining package frames");
+        assert!(matches!(error, DriverError::ReplayModeActive));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.as_slice(),
+            &[frames[0]],
+            "only the in-flight frame may complete before Replay barrier closes the gate"
+        );
+        let metrics = piper.get_metrics();
+        assert_eq!(metrics.tx_packages_partial_total, 1);
     }
 
     #[test]

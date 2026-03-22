@@ -335,6 +335,7 @@ pub struct Piper<State = Disconnected, Capability = UnspecifiedCapability> {
     pub(crate) observer: Observer<Capability>,
     pub(crate) quirks: DeviceQuirks,
     pub(crate) drop_policy: DropPolicy,
+    pub(crate) driver_mode_drop_policy: DriverModeDropPolicy,
     pub(crate) _state: State, // 改为直接存储状态（不再使用 PhantomData）
 }
 
@@ -342,6 +343,12 @@ pub struct Piper<State = Disconnected, Capability = UnspecifiedCapability> {
 pub(crate) enum DropPolicy {
     Noop,
     DisableAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriverModeDropPolicy {
+    Preserve,
+    RestoreNormal,
 }
 
 pub enum ConnectedPiper {
@@ -448,6 +455,7 @@ pub(crate) fn connected_piper_from_driver(
             driver,
             quirks,
             drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Standby,
         }),
         BackendCapability::SoftRealtime => ConnectedPiper::Soft(Piper {
@@ -455,6 +463,7 @@ pub(crate) fn connected_piper_from_driver(
             driver,
             quirks,
             drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Standby,
         }),
         BackendCapability::MonitorOnly => ConnectedPiper::Monitor(Piper {
@@ -462,6 +471,7 @@ pub(crate) fn connected_piper_from_driver(
             driver,
             quirks,
             drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Standby,
         }),
     }
@@ -471,6 +481,7 @@ fn transition_piper_state<State, NewState, Capability>(
     this: Piper<State, Capability>,
     new_state: NewState,
     drop_policy: DropPolicy,
+    driver_mode_drop_policy: DriverModeDropPolicy,
 ) -> Piper<NewState, Capability>
 where
     Capability: CapabilityMarker,
@@ -486,6 +497,7 @@ where
         observer,
         quirks,
         drop_policy,
+        driver_mode_drop_policy,
         _state: new_state,
     }
 }
@@ -661,6 +673,7 @@ where
             self,
             Active(MitMode),
             DropPolicy::DisableAll,
+            DriverModeDropPolicy::Preserve,
         ))
     }
 
@@ -739,6 +752,7 @@ where
                 motion_type: config.motion_type,
             }),
             DropPolicy::DisableAll,
+            DriverModeDropPolicy::Preserve,
         ))
     }
 
@@ -1168,7 +1182,10 @@ where
     /// # Ok(())
     /// # }
     /// ```
-    pub fn enter_replay_mode(self) -> Result<Piper<ReplayMode, Capability>> {
+    pub fn enter_replay_mode(self) -> Result<Piper<ReplayMode, Capability>>
+    where
+        Capability: MotionCapability,
+    {
         use piper_driver::mode::DriverMode;
 
         // 切换 Driver 到 Replay 模式
@@ -1176,7 +1193,12 @@ where
 
         tracing::info!("Entered ReplayMode - TX thread periodic sending paused");
 
-        Ok(transition_piper_state(self, ReplayMode, DropPolicy::Noop))
+        Ok(transition_piper_state(
+            self,
+            ReplayMode,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::RestoreNormal,
+        ))
     }
 
     /// 设置碰撞保护级别
@@ -1308,6 +1330,7 @@ impl Piper<Standby, SoftRealtime> {
             self,
             Active(MitPassthroughMode),
             DropPolicy::DisableAll,
+            DriverModeDropPolicy::Preserve,
         ))
     }
 }
@@ -1329,6 +1352,7 @@ where
         self,
         next_state: NextState,
         drop_policy: DropPolicy,
+        driver_mode_drop_policy: DriverModeDropPolicy,
     ) -> Piper<NextState, Capability> {
         let this = std::mem::ManuallyDrop::new(self);
         let driver = unsafe { std::ptr::read(&this.driver) };
@@ -1340,6 +1364,7 @@ where
             observer,
             quirks,
             drop_policy,
+            driver_mode_drop_policy,
             _state: next_state,
         }
     }
@@ -1467,7 +1492,12 @@ where
             raw_commander.emergency_stop_enqueue(Instant::now() + Duration::from_millis(20))?;
         receipt.wait()?;
 
-        Ok(transition_piper_state(self, ErrorState, DropPolicy::Noop))
+        Ok(transition_piper_state(
+            self,
+            ErrorState,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        ))
     }
 
     /// 等待机械臂失能完成（带 Debounce 机制）
@@ -1542,7 +1572,7 @@ where
         use piper_protocol::control::MotorEnableCommand;
 
         self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
-        Ok(self.into_state(Standby, DropPolicy::Noop))
+        Ok(self.into_state(Standby, DropPolicy::Noop, DriverModeDropPolicy::Preserve))
     }
 
     /// 优雅关闭机械臂
@@ -1628,6 +1658,7 @@ where
             observer,
             quirks,
             drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Standby,
         })
     }
@@ -2064,7 +2095,12 @@ where
         )?;
         info!("Robot disabled - Standby mode");
 
-        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
+        Ok(transition_piper_state(
+            self,
+            Standby,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        ))
     }
 }
 
@@ -2098,7 +2134,12 @@ impl Piper<Active<MitPassthroughMode>, SoftRealtime> {
         )?;
         info!("Robot disabled - Standby mode");
 
-        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
+        Ok(transition_piper_state(
+            self,
+            Standby,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        ))
     }
 }
 
@@ -2372,7 +2413,12 @@ where
 
         // === PHASE 2: No-panic zone - must not panic after this point ===
 
-        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
+        Ok(transition_piper_state(
+            self,
+            Standby,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        ))
     }
 }
 
@@ -2380,8 +2426,45 @@ where
 
 impl<Capability> Piper<ReplayMode, Capability>
 where
-    Capability: CapabilityMarker,
+    Capability: MotionCapability,
 {
+    fn recording_frame_to_piper_frame(
+        frame: &piper_tools::TimestampedFrame,
+    ) -> Result<piper_can::PiperFrame> {
+        if frame.data.len() > 8 {
+            return Err(RobotError::ConfigError(format!(
+                "recording frame 0x{:X} has {} data bytes; CAN 2.0 frames support at most 8",
+                frame.can_id,
+                frame.data.len()
+            )));
+        }
+
+        let mut data = [0u8; 8];
+        data[..frame.data.len()].copy_from_slice(&frame.data);
+
+        Ok(piper_can::PiperFrame {
+            id: frame.can_id,
+            data,
+            len: frame.data.len() as u8,
+            is_extended: frame.can_id > 0x7FF,
+            timestamp_us: frame.timestamp_us,
+        })
+    }
+
+    fn exit_replay_mode_to_standby(self) -> Piper<Standby, Capability> {
+        use piper_driver::mode::DriverMode;
+
+        self.driver.set_mode(DriverMode::Normal);
+        tracing::info!("Exited ReplayMode - TX thread normal operation resumed");
+
+        transition_piper_state(
+            self,
+            Standby,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        )
+    }
+
     /// 回放预先录制的 CAN 帧
     ///
     /// # 参数
@@ -2433,7 +2516,6 @@ where
         recording_path: impl AsRef<std::path::Path>,
         speed_factor: f64,
     ) -> Result<Piper<Standby, Capability>> {
-        use piper_driver::mode::DriverMode;
         use piper_tools::PiperRecording;
         use std::thread;
         use std::time::Duration;
@@ -2516,17 +2598,7 @@ where
             }
 
             // 发送帧
-            let piper_frame = piper_can::PiperFrame {
-                id: frame.can_id,
-                data: {
-                    let mut data = [0u8; 8];
-                    data.copy_from_slice(&frame.data);
-                    data
-                },
-                len: frame.data.len() as u8,
-                is_extended: frame.can_id > 0x7FF,
-                timestamp_us: frame.timestamp_us,
-            };
+            let piper_frame = Self::recording_frame_to_piper_frame(&frame)?;
 
             self.driver
                 .send_replay_frame_confirmed(piper_frame, REPLAY_FRAME_COMMIT_TIMEOUT)
@@ -2546,16 +2618,7 @@ where
         }
 
         tracing::info!("Replay completed successfully");
-
-        // === 退出 Replay 模式 ===
-
-        // 恢复 Driver 到 Normal 模式
-        self.driver.set_mode(DriverMode::Normal);
-
-        tracing::info!("Exited ReplayMode - TX thread normal operation resumed");
-
-        // 状态转换：ReplayMode -> Standby
-        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
+        Ok(self.exit_replay_mode_to_standby())
     }
 
     /// 回放录制（带取消支持）
@@ -2616,7 +2679,6 @@ where
         speed_factor: f64,
         cancel_signal: &std::sync::atomic::AtomicBool,
     ) -> Result<Piper<Standby, Capability>> {
-        use piper_driver::mode::DriverMode;
         use piper_tools::PiperRecording;
         use std::thread;
         use std::time::Duration;
@@ -2683,21 +2745,7 @@ where
             // ✅ 每一帧都检查取消信号
             if !cancel_signal.load(std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!("Replay cancelled by user signal");
-
-                // ⚠️ 安全停止：退出前必须恢复 Driver 到 Normal 模式
-                self.driver.set_mode(DriverMode::Normal);
-                tracing::info!("Safely exited ReplayMode due to cancellation");
-
-                // 状态转换：ReplayMode -> Standby
-                let this = std::mem::ManuallyDrop::new(self);
-
-                // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
-                let _driver = unsafe { std::ptr::read(&this.driver) };
-                let _observer = unsafe { std::ptr::read(&this.observer) };
-
-                return Err(crate::RobotError::Infrastructure(
-                    piper_driver::DriverError::IoThread("Replay cancelled by user".to_string()),
-                ));
+                return Ok(self.exit_replay_mode_to_standby());
             }
 
             // 计算时间间隔（考虑速度因子）
@@ -2719,17 +2767,7 @@ where
             }
 
             // 发送帧
-            let piper_frame = piper_can::PiperFrame {
-                id: frame.can_id,
-                data: {
-                    let mut data = [0u8; 8];
-                    data.copy_from_slice(&frame.data);
-                    data
-                },
-                len: frame.data.len() as u8,
-                is_extended: frame.can_id > 0x7FF,
-                timestamp_us: frame.timestamp_us,
-            };
+            let piper_frame = Self::recording_frame_to_piper_frame(&frame)?;
 
             self.driver
                 .send_replay_frame_confirmed(piper_frame, REPLAY_FRAME_COMMIT_TIMEOUT)
@@ -2749,16 +2787,7 @@ where
         }
 
         tracing::info!("Replay completed successfully");
-
-        // === 退出 Replay 模式 ===
-
-        // 恢复 Driver 到 Normal 模式
-        self.driver.set_mode(DriverMode::Normal);
-
-        tracing::info!("Exited ReplayMode - TX thread normal operation resumed");
-
-        // 状态转换：ReplayMode -> Standby
-        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
+        Ok(self.exit_replay_mode_to_standby())
     }
 
     /// 退出回放模式（返回 Standby）
@@ -2783,15 +2812,8 @@ where
     /// # }
     /// ```
     pub fn stop_replay(self) -> Result<Piper<Standby, Capability>> {
-        use piper_driver::mode::DriverMode;
-
         tracing::info!("Stopping replay - exiting ReplayMode");
-
-        // 恢复 Driver 到 Normal 模式
-        self.driver.set_mode(DriverMode::Normal);
-
-        // 状态转换：ReplayMode -> Standby
-        Ok(transition_piper_state(self, Standby, DropPolicy::Noop))
+        Ok(self.exit_replay_mode_to_standby())
     }
 }
 
@@ -2823,6 +2845,10 @@ where
 
 impl<State, Capability> Drop for Piper<State, Capability> {
     fn drop(&mut self) {
+        if self.driver_mode_drop_policy == DriverModeDropPolicy::RestoreNormal {
+            self.driver.set_mode(piper_driver::mode::DriverMode::Normal);
+        }
+
         if self.drop_policy != DropPolicy::DisableAll || !self.driver.auto_disable_on_drop_allowed()
         {
             return;
@@ -2848,8 +2874,10 @@ mod tests {
     use piper_driver::Piper as RobotPiper;
     use piper_protocol::control::MitControlCommand;
     use piper_protocol::ids::{ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56};
+    use piper_tools::{PiperRecording, RecordingMetadata, TimestampSource, TimestampedFrame};
     use semver::Version;
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2946,6 +2974,26 @@ mod tests {
         }
     }
 
+    struct FailSendTxAdapter;
+
+    impl RealtimeTxAdapter for FailSendTxAdapter {
+        fn send_control(
+            &mut self,
+            _frame: PiperFrame,
+            _budget: std::time::Duration,
+        ) -> std::result::Result<(), CanError> {
+            Err(CanError::BusOff)
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            _deadline: std::time::Instant,
+        ) -> std::result::Result<(), CanError> {
+            Err(CanError::BusOff)
+        }
+    }
+
     impl RealtimeTxAdapter for RecordingTxAdapter {
         fn send_control(
             &mut self,
@@ -3024,6 +3072,29 @@ mod tests {
         frame
     }
 
+    fn write_test_recording(frames: &[(u64, u32, &[u8])]) -> PathBuf {
+        static NEXT_RECORDING_ID: AtomicUsize = AtomicUsize::new(0);
+
+        let mut recording =
+            PiperRecording::new(RecordingMetadata::new("can0".to_string(), 1_000_000));
+        for (timestamp_us, can_id, data) in frames {
+            recording.add_frame(TimestampedFrame::new(
+                *timestamp_us,
+                *can_id,
+                data.to_vec(),
+                TimestampSource::Hardware,
+            ));
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "piper-client-replay-test-{}-{}.bin",
+            std::process::id(),
+            NEXT_RECORDING_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        recording.save(&path).expect("test recording should be written successfully");
+        path
+    }
+
     fn build_active_mit_piper(
         quirks: DeviceQuirks,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
@@ -3043,6 +3114,7 @@ mod tests {
             observer,
             quirks,
             drop_policy: DropPolicy::DisableAll,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Active(MitMode),
         }
     }
@@ -3064,6 +3136,7 @@ mod tests {
             observer,
             quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
             drop_policy: DropPolicy::DisableAll,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Active(PositionMode {
                 command_timeout: Duration::from_millis(20),
                 motion_type,
@@ -3093,6 +3166,31 @@ mod tests {
             observer,
             quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
             drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
+            _state: Standby,
+        }
+    }
+
+    fn build_standby_piper_with_tx<R, T>(
+        rx_adapter: R,
+        tx_adapter: T,
+    ) -> Piper<Standby, StrictRealtime>
+    where
+        R: RxAdapter + Send + 'static,
+        T: RealtimeTxAdapter + Send + 'static,
+    {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(rx_adapter, tx_adapter, None)
+                .expect("driver should start"),
+        );
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
+
+        Piper {
+            driver,
+            observer,
+            quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Standby,
         }
     }
@@ -3119,6 +3217,7 @@ mod tests {
             observer,
             quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
             drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Standby,
         }
     }
@@ -3462,6 +3561,7 @@ mod tests {
 
     #[test]
     fn active_drop_sends_disable_all_but_standby_replay_error_and_monitor_do_not() {
+        use piper_driver::mode::DriverMode;
         use piper_protocol::control::MotorEnableCommand;
 
         let disable_all_frame = MotorEnableCommand::disable_all().to_frame();
@@ -3482,11 +3582,17 @@ mod tests {
             .enter_replay_mode()
             .expect("enter_replay_mode should succeed");
         let replay_driver = replay.driver.clone();
+        assert_eq!(replay_driver.mode(), DriverMode::Replay);
         drop(replay);
         thread::sleep(Duration::from_millis(20));
         assert!(
             replay_sent.lock().expect("replay sent frames lock").is_empty(),
             "dropping ReplayMode must not disable motors"
+        );
+        assert_eq!(
+            replay_driver.mode(),
+            DriverMode::Normal,
+            "dropping ReplayMode must restore driver mode to Normal"
         );
         drop(replay_driver);
 
@@ -3495,7 +3601,12 @@ mod tests {
             DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
             error_sent.clone(),
         );
-        let error = transition_piper_state(active, ErrorState, DropPolicy::Noop);
+        let error = transition_piper_state(
+            active,
+            ErrorState,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        );
         let error_driver = error.driver.clone();
         drop(error);
         thread::sleep(Duration::from_millis(20));
@@ -3549,6 +3660,109 @@ mod tests {
             monitor_sent.lock().expect("monitor sent frames lock").is_empty(),
             "dropping monitor handle must not disable motors"
         );
+    }
+
+    #[test]
+    fn monitor_connection_cannot_require_motion() {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                MonitorCapabilityRx::new(IdleRxAdapter::new()),
+                RecordingTxAdapter::new(Arc::new(Mutex::new(Vec::new()))),
+                None,
+            )
+            .expect("monitor driver should start"),
+        );
+        let connected = connected_piper_from_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = match connected.require_motion() {
+            Ok(_) => panic!("monitor-only connection must remain read-only"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RobotError::RealtimeUnsupported { .. }));
+    }
+
+    #[test]
+    fn replay_recording_load_failure_restores_driver_mode() {
+        use piper_driver::mode::DriverMode;
+
+        static NEXT_MISSING_RECORDING_ID: AtomicUsize = AtomicUsize::new(0);
+
+        let replay = build_standby_piper(IdleRxAdapter::new(), Arc::new(Mutex::new(Vec::new())))
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+        let driver = replay.driver.clone();
+        let missing_path = std::env::temp_dir().join(format!(
+            "piper-client-missing-replay-{}-{}.bin",
+            std::process::id(),
+            NEXT_MISSING_RECORDING_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+
+        let error = match replay.replay_recording(&missing_path, 1.0) {
+            Ok(_) => panic!("missing recording file must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RobotError::Infrastructure(_)));
+        assert_eq!(
+            driver.mode(),
+            DriverMode::Normal,
+            "failed replay load must restore driver mode to Normal"
+        );
+    }
+
+    #[test]
+    fn replay_recording_send_failure_restores_driver_mode() {
+        use piper_driver::mode::DriverMode;
+
+        let recording_path = write_test_recording(&[(1_000, 0x155, &[0x01])]);
+        let standby = build_standby_piper_with_tx(IdleRxAdapter::new(), FailSendTxAdapter);
+        let driver = standby.driver.clone();
+        let replay = standby.enter_replay_mode().expect("enter_replay_mode should succeed");
+
+        let error = match replay.replay_recording(&recording_path, 1.0) {
+            Ok(_) => panic!("transport failure during replay must surface as error"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RobotError::Infrastructure(_)));
+        assert_eq!(
+            driver.mode(),
+            DriverMode::Normal,
+            "failed replay send must restore driver mode to Normal"
+        );
+
+        let _ = std::fs::remove_file(recording_path);
+    }
+
+    #[test]
+    fn replay_recording_with_cancel_returns_standby_and_restores_driver_mode() {
+        use piper_driver::mode::DriverMode;
+        use std::sync::atomic::AtomicBool;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let recording_path = write_test_recording(&[(1_000, 0x155, &[0x01])]);
+        let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+        let driver = replay.driver.clone();
+        let cancel_signal = AtomicBool::new(false);
+
+        let standby = replay
+            .replay_recording_with_cancel(&recording_path, 1.0, &cancel_signal)
+            .expect("cancelled replay should return to Standby instead of error");
+
+        assert_eq!(
+            driver.mode(),
+            DriverMode::Normal,
+            "cancelled replay must restore driver mode to Normal"
+        );
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "cancelled replay before first frame must not emit any frame"
+        );
+        drop(standby);
+        let _ = std::fs::remove_file(recording_path);
     }
 
     #[test]

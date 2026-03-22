@@ -7,8 +7,9 @@ use crate::metrics::PiperMetrics;
 use crate::piper::{
     MaintenanceControlOp, MaintenanceGate, MaintenanceGateState, MaintenanceLaneCommand,
     MaintenanceLeaseSnapshot, MaintenanceSendPhase, NORMAL_FRAME_SEND_BUDGET, NormalSendGate,
-    RuntimeFaultKind, RuntimePhase, SOFT_CONTROL_SEND_BUDGET, SOFT_CONTROL_SEND_MIN_DEADLINE,
-    SOFT_DEADLINE_MISS_FAULT_THRESHOLD, ShutdownDispatch, ShutdownLane,
+    NormalSendGateDenyReason, RuntimeFaultKind, RuntimePhase, SOFT_CONTROL_SEND_BUDGET,
+    SOFT_CONTROL_SEND_MIN_DEADLINE, SOFT_DEADLINE_MISS_FAULT_THRESHOLD, ShutdownDispatch,
+    ShutdownLane,
 };
 use crate::state::*;
 use crossbeam_channel::Receiver;
@@ -99,6 +100,55 @@ fn reliable_abort_error(fault_latched: bool) -> crate::DriverError {
 
 fn realtime_abort_error(sent: usize, total: usize) -> crate::DriverError {
     crate::DriverError::RealtimeDeliveryAbortedByFault { sent, total }
+}
+
+fn count_gate_fault_abort(
+    metrics: &Arc<PiperMetrics>,
+    reason: NormalSendGateDenyReason,
+    count_package_abort: bool,
+) {
+    if reason == NormalSendGateDenyReason::FaultClosed {
+        count_fault_abort(metrics);
+        if count_package_abort {
+            count_package_fault_aborted(metrics);
+        }
+    }
+}
+
+fn maintenance_gate_abort_error(reason: NormalSendGateDenyReason) -> crate::DriverError {
+    match reason {
+        NormalSendGateDenyReason::ReplayPaused => crate::DriverError::ReplayModeActive,
+        NormalSendGateDenyReason::FaultClosed => crate::DriverError::CommandAbortedByFault,
+        NormalSendGateDenyReason::StoppingClosed => crate::DriverError::ChannelClosed,
+    }
+}
+
+fn realtime_gate_abort_error(
+    reason: NormalSendGateDenyReason,
+    sent: usize,
+    total: usize,
+) -> crate::DriverError {
+    match reason {
+        NormalSendGateDenyReason::ReplayPaused => crate::DriverError::ReplayModeActive,
+        NormalSendGateDenyReason::FaultClosed => realtime_abort_error(sent, total),
+        NormalSendGateDenyReason::StoppingClosed => crate::DriverError::ChannelClosed,
+    }
+}
+
+fn soft_gate_abort_error(reason: NormalSendGateDenyReason) -> crate::DriverError {
+    match reason {
+        NormalSendGateDenyReason::ReplayPaused => crate::DriverError::ReplayModeActive,
+        NormalSendGateDenyReason::FaultClosed => crate::DriverError::CommandAbortedByFault,
+        NormalSendGateDenyReason::StoppingClosed => crate::DriverError::ChannelClosed,
+    }
+}
+
+fn reliable_gate_abort_error(reason: NormalSendGateDenyReason) -> crate::DriverError {
+    match reason {
+        NormalSendGateDenyReason::ReplayPaused => crate::DriverError::ReplayModeActive,
+        NormalSendGateDenyReason::FaultClosed => crate::DriverError::CommandAbortedByFault,
+        NormalSendGateDenyReason::StoppingClosed => crate::DriverError::ChannelClosed,
+    }
 }
 
 fn drain_soft_realtime_queue_with_reason<F>(
@@ -1047,24 +1097,20 @@ pub fn tx_loop_mailbox(
                 finish_maintenance_dispatch(&dispatch, Err(crate::DriverError::ReplayModeActive));
                 continue;
             }
-            let Some(permit) = normal_send_gate.acquire() else {
-                count_fault_abort(&metrics);
-                finish_maintenance_dispatch(
-                    &dispatch,
-                    Err(reliable_abort_error(
-                        load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
-                    )),
-                );
-                continue;
+            let permit = match normal_send_gate.acquire_normal() {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    count_gate_fault_abort(&metrics, reason, false);
+                    finish_maintenance_dispatch(
+                        &dispatch,
+                        Err(maintenance_gate_abort_error(reason)),
+                    );
+                    continue;
+                },
             };
-            if !permit.still_open() {
-                count_fault_abort(&metrics);
-                finish_maintenance_dispatch(
-                    &dispatch,
-                    Err(reliable_abort_error(
-                        load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
-                    )),
-                );
+            if let Err(reason) = permit.send_allowed() {
+                count_gate_fault_abort(&metrics, reason, false);
+                finish_maintenance_dispatch(&dispatch, Err(maintenance_gate_abort_error(reason)));
                 continue;
             }
 
@@ -1176,6 +1222,22 @@ pub fn tx_loop_mailbox(
                     break;
                 }
 
+                let permit = match normal_send_gate.acquire_normal() {
+                    Ok(permit) => permit,
+                    Err(reason) => {
+                        count_gate_fault_abort(&metrics, reason, false);
+                        delivery_error =
+                            Some(realtime_gate_abort_error(reason, sent_count, total_frames));
+                        break;
+                    },
+                };
+                if let Err(reason) = permit.send_allowed() {
+                    count_gate_fault_abort(&metrics, reason, false);
+                    delivery_error =
+                        Some(realtime_gate_abort_error(reason, sent_count, total_frames));
+                    break;
+                }
+
                 if !committed && let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
                         delivery_error = Some(crate::DriverError::RealtimeDeliveryTimeout);
@@ -1185,17 +1247,6 @@ pub fn tx_loop_mailbox(
                         let _ = ack.send(crate::command::DeliveryPhase::Committed);
                     }
                     committed = true;
-                }
-
-                let Some(permit) = normal_send_gate.acquire() else {
-                    count_fault_abort(&metrics);
-                    delivery_error = Some(realtime_abort_error(sent_count, total_frames));
-                    break;
-                };
-                if !permit.still_open() {
-                    count_fault_abort(&metrics);
-                    delivery_error = Some(realtime_abort_error(sent_count, total_frames));
-                    break;
                 }
 
                 match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
@@ -1254,6 +1305,16 @@ pub fn tx_loop_mailbox(
             }
 
             let had_delivery_error = delivery_error.is_some();
+            let no_delivery_error = delivery_error.is_none();
+            let replay_paused_partial = matches!(
+                delivery_error.as_ref(),
+                Some(crate::DriverError::ReplayModeActive)
+            ) && sent_count > 0;
+            let fault_or_stop_abort = matches!(
+                delivery_error.as_ref(),
+                Some(crate::DriverError::RealtimeDeliveryAbortedByFault { .. })
+                    | Some(crate::DriverError::ChannelClosed)
+            );
             if let Some(ack) = ack.take() {
                 let result = match delivery_error {
                     Some(err) => Err(err),
@@ -1268,9 +1329,11 @@ pub fn tx_loop_mailbox(
                 } else {
                     count_package_partial(&metrics);
                 }
-            } else if had_delivery_error {
+            } else if fault_or_stop_abort {
                 count_package_fault_aborted(&metrics);
-            } else {
+            } else if replay_paused_partial {
+                count_package_partial(&metrics);
+            } else if no_delivery_error {
                 count_package_completed(&metrics);
             }
 
@@ -1292,14 +1355,17 @@ pub fn tx_loop_mailbox(
             let mut deadline_missed = false;
 
             for frame in frames {
-                let Some(permit) = normal_send_gate.acquire() else {
-                    count_fault_abort(&metrics);
-                    send_result = Err(crate::DriverError::CommandAbortedByFault);
-                    break;
+                let permit = match normal_send_gate.acquire_normal() {
+                    Ok(permit) => permit,
+                    Err(reason) => {
+                        count_gate_fault_abort(&metrics, reason, false);
+                        send_result = Err(soft_gate_abort_error(reason));
+                        break;
+                    },
                 };
-                if !permit.still_open() {
-                    count_fault_abort(&metrics);
-                    send_result = Err(crate::DriverError::CommandAbortedByFault);
+                if let Err(reason) = permit.send_allowed() {
+                    count_gate_fault_abort(&metrics, reason, false);
+                    send_result = Err(soft_gate_abort_error(reason));
                     break;
                 }
 
@@ -1406,6 +1472,34 @@ pub fn tx_loop_mailbox(
             let mut committed = false;
 
             for frame in frames {
+                if kind == crate::command::ReliableCommandKind::Replay
+                    && !driver_mode.get(Ordering::Acquire).is_replay()
+                {
+                    send_result = Err(crate::DriverError::InvalidInput(
+                        "replay frames require DriverMode::Replay".to_string(),
+                    ));
+                    break;
+                }
+
+                let _permit = if kind == crate::command::ReliableCommandKind::Replay {
+                    None
+                } else {
+                    let permit = match normal_send_gate.acquire_normal() {
+                        Ok(permit) => permit,
+                        Err(reason) => {
+                            count_gate_fault_abort(&metrics, reason, false);
+                            send_result = Err(reliable_gate_abort_error(reason));
+                            break;
+                        },
+                    };
+                    if let Err(reason) = permit.send_allowed() {
+                        count_gate_fault_abort(&metrics, reason, false);
+                        send_result = Err(reliable_gate_abort_error(reason));
+                        break;
+                    }
+                    Some(permit)
+                };
+
                 if !committed && let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
                         deadline_missed = true;
@@ -1416,21 +1510,6 @@ pub fn tx_loop_mailbox(
                         let _ = ack.send(crate::command::DeliveryPhase::Committed);
                     }
                     committed = true;
-                }
-
-                let Some(permit) = normal_send_gate.acquire() else {
-                    count_fault_abort(&metrics);
-                    send_result = Err(reliable_abort_error(
-                        load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
-                    ));
-                    break;
-                };
-                if !permit.still_open() {
-                    count_fault_abort(&metrics);
-                    send_result = Err(reliable_abort_error(
-                        load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched,
-                    ));
-                    break;
                 }
 
                 match tx.send_control(frame, normal_send_budget) {
@@ -1524,6 +1603,8 @@ pub fn tx_loop_mailbox(
                     Err(crate::DriverError::Timeout)
                         | Err(crate::DriverError::ReliablePackageTimeout { .. })
                 );
+            let replay_paused_partial =
+                matches!(&send_result, Err(crate::DriverError::ReplayModeActive)) && sent_count > 0;
             if let Some(ack) = ack.take() {
                 let _ = ack.send(crate::command::DeliveryPhase::Finished(send_result));
             }
@@ -1560,6 +1641,8 @@ pub fn tx_loop_mailbox(
                     count_package_fault_aborted(&metrics);
                 } else if send_succeeded {
                     count_package_completed(&metrics);
+                } else if replay_paused_partial {
+                    count_package_partial(&metrics);
                 } else if deadline_missed && sent_count > 0 {
                     count_package_partial(&metrics);
                 }
@@ -1689,14 +1772,14 @@ fn send_shutdown_dispatch(
                 metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
                 record_fault(last_fault, RuntimeFaultKind::TransportError);
                 store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
-                normal_send_gate.close();
+                normal_send_gate.close_for_fault();
                 maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
                 Err(crate::DriverError::Timeout)
             } else {
                 metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                 record_fault(last_fault, RuntimeFaultKind::TransportError);
                 store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
-                normal_send_gate.close();
+                normal_send_gate.close_for_fault();
                 maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
                 Err(crate::DriverError::ReliableDeliveryFailed { source: e })
             }
