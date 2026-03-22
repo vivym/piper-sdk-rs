@@ -26,14 +26,18 @@ fn init_logger_is_noop_when_host_only_installed_log_logger() {
         .expect("host log logger should install for this test process");
 
     assert!(
-        !tracing::dispatcher::has_been_set(),
+        tracing::dispatcher::get_default(|dispatch| {
+            dispatch.is::<tracing::subscriber::NoSubscriber>()
+        }),
         "test process should start without a tracing subscriber",
     );
 
     piper_sdk::init_logger!();
 
     assert!(
-        !tracing::dispatcher::has_been_set(),
+        tracing::dispatcher::get_default(|dispatch| {
+            dispatch.is::<tracing::subscriber::NoSubscriber>()
+        }),
         "SDK logger should not install a tracing subscriber when host already owns the log path",
     );
     assert_eq!(

@@ -145,12 +145,13 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 ///
 /// - 兼容 `log` crate（通过 `tracing_log::LogTracer` 桥接）
 /// - 幂等：可安全重复调用
-/// - 如果宿主程序已安装 `tracing` subscriber 或 `log` logger，会静默跳过
+/// - 如果当前线程已有活跃 `tracing` subscriber，或宿主已安装 `log` logger，会静默跳过
 /// - 默认级别：`INFO`
 /// - 格式：compact，隐藏 target（易读）
 /// - 如果设置了 `RUST_LOG`，仅在 SDK 实际接管日志初始化时生效
 /// - `RUST_LOG` 分支会把 `log` 全局门限收窄到 `EnvFilter` 的最大启用级别
 /// - 如果 `EnvFilter` 无法给出静态级别提示，会保守回退到 `TRACE`
+/// - 历史上曾设置过但已 drop 的 scoped subscriber 不会阻止后续初始化
 ///
 /// ## 使用示例
 ///
@@ -174,7 +175,10 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 pub fn __init_logger() {
     // 保守策略：只有在 SDK 同时接管 tracing + log 全局状态时，才安装 stdout subscriber。
     // 如果宿主已拥有任一日志栈，直接 no-op，避免半初始化把同步 I/O 带回实时进程。
-    if ::tracing::dispatcher::has_been_set() {
+    let has_active_tracing = ::tracing::dispatcher::get_default(|dispatch| {
+        !dispatch.is::<::tracing::subscriber::NoSubscriber>()
+    });
+    if has_active_tracing {
         return;
     }
     if ::log::max_level() != ::log::LevelFilter::Off {

@@ -11,7 +11,9 @@ fn init_logger_applies_rust_log_filter() {
     piper_sdk::init_logger!();
 
     assert!(
-        tracing::dispatcher::has_been_set(),
+        tracing::dispatcher::get_default(|dispatch| {
+            !dispatch.is::<tracing::subscriber::NoSubscriber>()
+        }),
         "SDK logger should install a tracing subscriber when it owns initialization",
     );
     assert_eq!(
