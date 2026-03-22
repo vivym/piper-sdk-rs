@@ -20,6 +20,8 @@
 //! ```
 
 use clap::Parser;
+use piper_sdk::client::MotionConnectedPiper;
+use piper_sdk::client::state::MotionCapability;
 use piper_sdk::client::state::*;
 use piper_sdk::prelude::*;
 use std::time::{Duration, Instant};
@@ -72,6 +74,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
     println!("   ✅ 连接成功\n");
 
+    let robot = robot.require_motion()?;
+    match robot {
+        MotionConnectedPiper::Strict(robot) => run_demo(robot)?,
+        MotionConnectedPiper::Soft(robot) => run_demo(robot)?,
+    }
+
+    Ok(())
+}
+
+fn run_demo<Capability>(
+    robot: Piper<Standby, Capability>,
+) -> std::result::Result<(), Box<dyn std::error::Error>>
+where
+    Capability: MotionCapability,
+{
     // ==================== 步骤 2: 使能机械臂 ====================
     println!("⚡ 步骤 2: 使能机械臂（位置模式）...");
     let robot = robot.enable_position_mode(PositionModeConfig::default())?;

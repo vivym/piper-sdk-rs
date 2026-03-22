@@ -8,8 +8,8 @@
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::command::{CommandPriority, PiperCommand, ReliableCommand};
 use piper_sdk::driver::{
-    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig, PiperContext,
-    PiperMetrics, ShutdownLane, TimingCapability, rx_loop, tx_loop_mailbox,
+    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
+    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -141,7 +141,7 @@ fn test_priority_scheduling() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx_rx,
             config,
             is_running_rx,
@@ -160,10 +160,13 @@ fn test_priority_scheduling() {
     let last_fault_tx = last_fault.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,
@@ -312,10 +315,13 @@ fn test_reliable_command_not_dropped() {
     let last_fault_tx = last_fault.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,
@@ -468,10 +474,13 @@ fn test_realtime_overwrite_strategy() {
     let last_fault_tx = last_fault.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,

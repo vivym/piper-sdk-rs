@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 use piper_control::park_blocking;
+use piper_sdk::client::MotionConnectedPiper;
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -20,11 +21,19 @@ impl ParkCommand {
 
         println!("🔌 连接到机器人...");
         let standby = builder.build()?;
+        let standby = standby.require_motion()?;
         println!(
             "⏳ 前往停靠位姿（orientation = {}）...",
             profile.orientation
         );
-        let _standby = park_blocking(standby, &profile)?;
+        match standby {
+            MotionConnectedPiper::Strict(standby) => {
+                let _standby = park_blocking(standby, &profile)?;
+            },
+            MotionConnectedPiper::Soft(standby) => {
+                let _standby = park_blocking(standby, &profile)?;
+            },
+        }
         println!("✅ 停靠完成");
         Ok(())
     }

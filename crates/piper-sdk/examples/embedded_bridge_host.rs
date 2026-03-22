@@ -6,7 +6,7 @@
 use clap::Parser;
 use piper_sdk::{
     BridgeHostConfig, BridgeRole, BridgeTlsClientPolicy, BridgeTlsServerConfig,
-    BridgeUdsListenerConfig, PiperBuilder,
+    BridgeUdsListenerConfig, ConnectedPiper, PiperBuilder,
 };
 use std::path::PathBuf;
 
@@ -111,14 +111,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    let host = piper.attach_bridge_host(BridgeHostConfig {
+    let host_config = BridgeHostConfig {
         uds: Some(BridgeUdsListenerConfig {
             path: PathBuf::from(args.uds),
             granted_role: uds_role,
         }),
         tcp_tls,
         allow_raw_frame_tap: args.allow_raw_frame_tap,
-    });
+    };
+    let host = match piper {
+        ConnectedPiper::Strict(piper) => piper.attach_bridge_host(host_config.clone()),
+        ConnectedPiper::Soft(piper) => piper.attach_bridge_host(host_config.clone()),
+        ConnectedPiper::Monitor(piper) => piper.attach_bridge_host(host_config),
+    };
 
     tracing::info!("embedded bridge host starting");
     host.run()?;

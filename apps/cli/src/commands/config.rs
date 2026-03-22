@@ -38,7 +38,7 @@ pub struct CliConfig {
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
-            target: TargetSpec::Auto,
+            target: TargetSpec::AutoStrict,
             park: ParkConfig::default(),
             safety: CliSafetySettings::default(),
             motion: CliMotionSettings::default(),
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn default_config_is_auto_target() {
         let config = CliConfig::default();
-        assert_eq!(config.target, TargetSpec::Auto);
+        assert_eq!(config.target, TargetSpec::AutoStrict);
         assert_eq!(config.park.orientation, ParkOrientation::Upright);
         assert!(config.park.rest_pose_override.is_none());
     }

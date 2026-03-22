@@ -1,9 +1,8 @@
 //! 脚本系统
 
 use anyhow::{Context, Result};
-use piper_client::ControlReadPolicy;
-use piper_client::state::Piper;
-use piper_client::state::Standby;
+use piper_client::MotionConnectedPiper;
+use piper_client::state::{MotionCapability, Piper, Standby};
 use piper_control::{
     ControlProfile, home_zero_blocking, move_to_joint_target_blocking, park_blocking, prepare_move,
     set_joint_zero_blocking,
@@ -61,7 +60,7 @@ impl ScriptExecutor {
         Self {
             config: ScriptConfig {
                 profile: ControlProfile {
-                    target: ConnectionTarget::Auto,
+                    target: ConnectionTarget::AutoStrict,
                     orientation: piper_control::ParkOrientation::Upright,
                     rest_pose_override: None,
                     safety: piper_tools::SafetyConfig::default_config(),
@@ -95,11 +94,44 @@ impl ScriptExecutor {
         println!();
 
         let builder = client_builder(&self.config.profile.target);
+        let reconnect_target = self.config.profile.target.clone();
 
         println!("🔌 连接到机器人...");
-        let mut standby = builder.build()?;
+        let connected = builder.build()?.require_motion()?;
         println!("✅ 已连接\n");
 
+        match connected {
+            MotionConnectedPiper::Strict(standby) => self.execute_motion_script(standby, script, || {
+                match client_builder(&reconnect_target).build()?.require_motion()? {
+                    MotionConnectedPiper::Strict(standby) => Ok(standby),
+                    MotionConnectedPiper::Soft(_) => Err(anyhow::anyhow!(
+                        "reconnect changed backend capability from StrictRealtime to SoftRealtime"
+                    )),
+                }
+            })
+            .await,
+            MotionConnectedPiper::Soft(standby) => self.execute_motion_script(standby, script, || {
+                match client_builder(&reconnect_target).build()?.require_motion()? {
+                    MotionConnectedPiper::Soft(standby) => Ok(standby),
+                    MotionConnectedPiper::Strict(_) => Err(anyhow::anyhow!(
+                        "reconnect changed backend capability from SoftRealtime to StrictRealtime"
+                    )),
+                }
+            })
+            .await,
+        }
+    }
+
+    async fn execute_motion_script<Capability, Reconnect>(
+        &mut self,
+        mut standby: Piper<Standby, Capability>,
+        script: &Script,
+        reconnect: Reconnect,
+    ) -> Result<ScriptResult>
+    where
+        Capability: MotionCapability,
+        Reconnect: Fn() -> Result<Piper<Standby, Capability>>,
+    {
         let mut result = ScriptResult {
             script_name: script.name.clone(),
             total_commands: script.commands.len(),
@@ -137,8 +169,7 @@ impl ScriptExecutor {
                         standby
                     } else {
                         println!("  ↻ 当前状态不可安全复用，重新连接到 Standby...");
-                        let builder = client_builder(&self.config.profile.target);
-                        builder.build()?
+                        reconnect()?
                     };
                 },
             }
@@ -168,19 +199,20 @@ impl ScriptExecutor {
         Ok(result)
     }
 
-    async fn execute_command(
+    async fn execute_command<Capability>(
         &self,
-        standby: Piper<Standby>,
+        standby: Piper<Standby, Capability>,
         command: &ScriptCommand,
-    ) -> std::result::Result<ExecutionOutcome, CommandFailure> {
+    ) -> std::result::Result<ExecutionOutcome<Capability>, CommandFailure<Capability>>
+    where
+        Capability: MotionCapability,
+    {
         match command {
             ScriptCommand::Move { joints, force } => {
                 println!("  移动: joints = {:?}", joints);
-                let snapshot = standby
-                    .observer()
-                    .control_snapshot(ControlReadPolicy::default())
-                    .map_err(CommandFailure::lost_standby)?;
-                let current = std::array::from_fn(|index| snapshot.position[index].0);
+                let positions =
+                    standby.observer().joint_positions().map_err(CommandFailure::lost_standby)?;
+                let current = std::array::from_fn(|index| positions[index].0);
                 let prepared =
                     match prepare_move(current, joints, &self.config.profile.safety, *force) {
                         Ok(prepared) => prepared,
@@ -207,11 +239,9 @@ impl ScriptExecutor {
             },
             ScriptCommand::Position => {
                 println!("  查询位置");
-                let snapshot = standby
-                    .observer()
-                    .control_snapshot(ControlReadPolicy::default())
-                    .map_err(CommandFailure::lost_standby)?;
-                for (index, position) in snapshot.position.iter().enumerate() {
+                let positions =
+                    standby.observer().joint_positions().map_err(CommandFailure::lost_standby)?;
+                for (index, position) in positions.iter().enumerate() {
                     println!(
                         "    J{}: {:.3} rad ({:.1}°)",
                         index + 1,
@@ -267,8 +297,8 @@ impl Default for ScriptExecutor {
     }
 }
 
-enum ExecutionOutcome {
-    Continue(Piper<Standby>),
+enum ExecutionOutcome<Capability> {
+    Continue(Piper<Standby, Capability>),
     Stop,
 }
 
@@ -279,13 +309,13 @@ fn normalize_set_zero_joints(joints: Option<&[usize]>) -> Result<Vec<usize>> {
     normalize_joint_indices(joints)
 }
 
-struct CommandFailure {
+struct CommandFailure<Capability> {
     error: anyhow::Error,
-    standby: Option<Piper<Standby>>,
+    standby: Option<Piper<Standby, Capability>>,
 }
 
-impl CommandFailure {
-    fn recoverable(error: impl Into<anyhow::Error>, standby: Piper<Standby>) -> Self {
+impl<Capability> CommandFailure<Capability> {
+    fn recoverable(error: impl Into<anyhow::Error>, standby: Piper<Standby, Capability>) -> Self {
         Self {
             error: error.into(),
             standby: Some(standby),

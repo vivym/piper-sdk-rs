@@ -92,6 +92,7 @@ pub use client::{
     BridgeTlsServerConfig,
     BridgeUdsListenerConfig,
     CanIdFilter,
+    ConnectedPiper,
     DualArmActiveMit,
     DualArmBuilder,
     DualArmCalibration,
@@ -110,7 +111,9 @@ pub use client::{
     LoopTimingMode,
     MaintenanceLease,
     MasterFollowerController,
+    MonitorOnly,
     MonitorReadPolicy,
+    MotionConnectedPiper,
     Observer,
     PiperBridgeClient,
     PiperBridgeHost,
@@ -119,7 +122,9 @@ pub use client::{
     RuntimeFaultKind,
     RuntimeHealthSnapshot,
     SessionToken,
+    SoftRealtime,
     StopAttemptResult,
+    StrictRealtime,
 };
 
 // 导出 recording 模块的常用类型

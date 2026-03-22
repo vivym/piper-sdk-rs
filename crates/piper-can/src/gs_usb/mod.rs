@@ -13,8 +13,8 @@ use crate::gs_usb::frame::GsUsbFrame;
 use crate::gs_usb::protocol::*;
 use crate::gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
 use crate::{
-    CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, SplittableAdapter,
-    TimingCapability,
+    BackendCapability, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame,
+    SplittableAdapter,
 };
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
@@ -470,11 +470,11 @@ impl GsUsbCanAdapter {
         self.configure_with_mode(bitrate, GS_CAN_MODE_LISTEN_ONLY | GS_CAN_MODE_HW_TIMESTAMP)
     }
 
-    pub fn timing_capability(&self) -> TimingCapability {
+    pub fn backend_capability(&self) -> BackendCapability {
         if self.device.hw_timestamp_enabled() {
-            TimingCapability::RealtimeCapable
+            BackendCapability::SoftRealtime
         } else {
-            TimingCapability::MonitorOnly
+            BackendCapability::MonitorOnly
         }
     }
 }
@@ -482,6 +482,10 @@ impl GsUsbCanAdapter {
 impl SplittableAdapter for GsUsbCanAdapter {
     type RxAdapter = GsUsbRxAdapter;
     type TxAdapter = GsUsbTxAdapter;
+
+    fn backend_capability(&self) -> BackendCapability {
+        self.backend_capability()
+    }
 
     fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
         GsUsbCanAdapter::split(self)

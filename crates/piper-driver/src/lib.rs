@@ -40,6 +40,6 @@ pub use piper::{
     MaintenanceRevocationReason, MaintenanceStateSignal, NormalSendGate, Piper, RuntimeFaultKind,
     ShutdownLane, ShutdownReceipt,
 };
-pub use piper_can::TimingCapability;
+pub use piper_can::BackendCapability;
 pub use recording::{AsyncRecordingHook, TimestampedFrame};
 pub use state::*;

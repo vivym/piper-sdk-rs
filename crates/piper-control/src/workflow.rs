@@ -1,8 +1,8 @@
 use crate::{ControlProfile, MotionWaitConfig};
 use anyhow::{Result, bail};
 use piper_client::Observer;
-use piper_client::observer::{CollisionProtectionSnapshot, ControlReadPolicy};
-use piper_client::state::{Active, DisableConfig, Piper, PositionMode, Standby};
+use piper_client::observer::{CollisionProtectionSnapshot, MonitorReadPolicy};
+use piper_client::state::{Active, DisableConfig, MotionCapability, Piper, PositionMode, Standby};
 use piper_client::types::RobotError;
 use piper_client::types::{JointArray, Rad};
 use piper_tools::SafetyConfig;
@@ -69,24 +69,28 @@ pub fn prepare_move(
     })
 }
 
-pub fn active_move_to_joint_target_blocking(
-    robot: &Piper<Active<PositionMode>>,
+pub fn active_move_to_joint_target_blocking<Capability>(
+    robot: &Piper<Active<PositionMode>, Capability>,
     target: [f64; 6],
     wait: &MotionWaitConfig,
-) -> Result<()> {
+) -> Result<()>
+where
+    Capability: MotionCapability,
+{
     match active_move_to_joint_target_with_cancel(robot, target, wait, || false)? {
         MotionExecutionOutcome::Reached => Ok(()),
         MotionExecutionOutcome::Cancelled => bail!("motion was cancelled before completion"),
     }
 }
 
-pub fn active_move_to_joint_target_with_cancel<ShouldCancel>(
-    robot: &Piper<Active<PositionMode>>,
+pub fn active_move_to_joint_target_with_cancel<Capability, ShouldCancel>(
+    robot: &Piper<Active<PositionMode>, Capability>,
     target: [f64; 6],
     wait: &MotionWaitConfig,
     should_cancel: ShouldCancel,
 ) -> Result<MotionExecutionOutcome>
 where
+    Capability: MotionCapability,
     ShouldCancel: Fn() -> bool,
 {
     let target_positions = joint_array_from_f64(target);
@@ -99,43 +103,67 @@ where
     )
 }
 
-pub fn move_to_joint_target_blocking(
-    standby: Piper<Standby>,
+pub fn move_to_joint_target_blocking<Capability>(
+    standby: Piper<Standby, Capability>,
     profile: &ControlProfile,
     target: [f64; 6],
-) -> Result<Piper<Standby>> {
+) -> Result<Piper<Standby, Capability>>
+where
+    Capability: MotionCapability,
+{
     let active = standby.enable_position_mode(profile.position_mode_config())?;
     active_move_to_joint_target_blocking(&active, target, &profile.wait)?;
     active.disable(DisableConfig::default()).map_err(Into::into)
 }
 
-pub fn home_zero_blocking(
-    standby: Piper<Standby>,
+pub fn home_zero_blocking<Capability>(
+    standby: Piper<Standby, Capability>,
     profile: &ControlProfile,
-) -> Result<Piper<Standby>> {
+) -> Result<Piper<Standby, Capability>>
+where
+    Capability: MotionCapability,
+{
     move_to_joint_target_blocking(standby, profile, [0.0; 6])
 }
 
-pub fn park_blocking(standby: Piper<Standby>, profile: &ControlProfile) -> Result<Piper<Standby>> {
+pub fn park_blocking<Capability>(
+    standby: Piper<Standby, Capability>,
+    profile: &ControlProfile,
+) -> Result<Piper<Standby, Capability>>
+where
+    Capability: MotionCapability,
+{
     move_to_joint_target_blocking(standby, profile, profile.park_pose())
 }
 
-pub fn set_joint_zero_blocking(standby: &Piper<Standby>, joints: &[usize]) -> Result<()> {
+pub fn set_joint_zero_blocking<Capability>(
+    standby: &Piper<Standby, Capability>,
+    joints: &[usize],
+) -> Result<()>
+where
+    Capability: MotionCapability,
+{
     standby.set_joint_zero_positions(joints).map_err(Into::into)
 }
 
-pub fn query_collision_protection_blocking(
-    standby: &Piper<Standby>,
+pub fn query_collision_protection_blocking<Capability>(
+    standby: &Piper<Standby, Capability>,
     wait: &MotionWaitConfig,
-) -> Result<[u8; 6]> {
+) -> Result<[u8; 6]>
+where
+    Capability: MotionCapability,
+{
     standby.query_collision_protection(wait.timeout).map_err(Into::into)
 }
 
-pub fn set_collision_protection_verified(
-    standby: &Piper<Standby>,
+pub fn set_collision_protection_verified<Capability>(
+    standby: &Piper<Standby, Capability>,
     levels: [u8; 6],
     wait: &MotionWaitConfig,
-) -> Result<()> {
+) -> Result<()>
+where
+    Capability: MotionCapability,
+{
     for (index, level) in levels.iter().enumerate() {
         if *level > 8 {
             bail!(
@@ -161,9 +189,14 @@ pub fn set_collision_protection_verified(
     )
 }
 
-fn observer_positions(observer: &Observer) -> std::result::Result<[f64; 6], RobotError> {
-    let snapshot = observer.control_snapshot(ControlReadPolicy::default())?;
-    Ok(std::array::from_fn(|index| snapshot.position[index].0))
+fn observer_positions<Capability>(
+    observer: &Observer<Capability>,
+) -> std::result::Result<[f64; 6], RobotError>
+where
+    Capability: MotionCapability,
+{
+    let positions = observer.joint_positions_with_policy(MonitorReadPolicy::default())?;
+    Ok(std::array::from_fn(|index| positions[index].0))
 }
 
 fn joint_array_from_f64(values: [f64; 6]) -> JointArray<Rad> {

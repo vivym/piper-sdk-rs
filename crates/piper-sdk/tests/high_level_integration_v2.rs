@@ -16,6 +16,7 @@ use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter};
 use piper_sdk::client::ControlReadPolicy;
 use piper_sdk::client::types::{Joint, NewtonMeter, Rad};
 use piper_sdk::prelude::JointArray;
+use piper_sdk::{ConnectedPiper, MotionConnectedPiper};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -137,7 +138,7 @@ fn test_enable_all() {
     let adapter = MockCanAdapter::new();
     let config = ConnectionConfig::default();
 
-    if let Ok(robot) = Piper::connect(adapter, config) {
+    if let Ok(robot) = Piper::connect(adapter, config).and_then(|robot| robot.require_strict()) {
         // 测试 enable_all
         let result = robot.enable_all();
         // 由于 MockCanAdapter 可能无法提供有效反馈，这里只验证 API 调用
@@ -153,8 +154,17 @@ fn test_enable_joints() {
 
     if let Ok(robot) = Piper::connect(adapter, config) {
         let joints = [Joint::J1, Joint::J2];
-        let result = robot.enable_joints(&joints);
-        assert!(result.is_ok() || result.is_err());
+        match robot.require_motion() {
+            Ok(MotionConnectedPiper::Strict(robot)) => {
+                let result = robot.enable_joints(&joints);
+                assert!(result.is_ok() || result.is_err());
+            },
+            Ok(MotionConnectedPiper::Soft(robot)) => {
+                let result = robot.enable_joints(&joints);
+                assert!(result.is_ok() || result.is_err());
+            },
+            Err(error) => panic!("motion-capable mock connection expected: {error}"),
+        }
     }
 }
 
@@ -164,7 +174,7 @@ fn test_enable_mit_mode() {
     let adapter = MockCanAdapter::new();
     let config = ConnectionConfig::default();
 
-    if let Ok(robot) = Piper::connect(adapter, config) {
+    if let Ok(robot) = Piper::connect(adapter, config).and_then(|robot| robot.require_strict()) {
         let mit_config = MitModeConfig::default();
         let result = robot.enable_mit_mode(mit_config);
         // 由于 MockCanAdapter 可能无法提供有效反馈，这里只验证 API 调用
@@ -189,19 +199,33 @@ fn test_enable_position_mode() {
     let adapter = MockCanAdapter::new();
     let config = ConnectionConfig::default();
 
-    if let Ok(robot) = Piper::connect(adapter, config) {
+    if let Ok(robot) = Piper::connect(adapter, config).and_then(|robot| robot.require_motion()) {
         let pos_config = PositionModeConfig::default();
-        let result = robot.enable_position_mode(pos_config);
-        assert!(result.is_ok() || result.is_err());
-
-        if let Ok(active_robot) = result {
-            // 测试在 Active 状态下可以调用 command_position_from_snapshot
-            let result = active_robot.command_position_from_snapshot(
-                Joint::J1,
-                Rad(0.0),
-                &JointArray::from([Rad(0.0); 6]),
-            );
-            assert!(result.is_ok() || result.is_err());
+        match robot {
+            MotionConnectedPiper::Strict(robot) => {
+                let result = robot.enable_position_mode(pos_config.clone());
+                assert!(result.is_ok() || result.is_err());
+                if let Ok(active_robot) = result {
+                    let result = active_robot.command_position_from_snapshot(
+                        Joint::J1,
+                        Rad(0.0),
+                        &JointArray::from([Rad(0.0); 6]),
+                    );
+                    assert!(result.is_ok() || result.is_err());
+                }
+            },
+            MotionConnectedPiper::Soft(robot) => {
+                let result = robot.enable_position_mode(pos_config);
+                assert!(result.is_ok() || result.is_err());
+                if let Ok(active_robot) = result {
+                    let result = active_robot.command_position_from_snapshot(
+                        Joint::J1,
+                        Rad(0.0),
+                        &JointArray::from([Rad(0.0); 6]),
+                    );
+                    assert!(result.is_ok() || result.is_err());
+                }
+            },
         }
     }
 }
@@ -212,7 +236,7 @@ fn test_emergency_stop() {
     let adapter = MockCanAdapter::new();
     let config = ConnectionConfig::default();
 
-    if let Ok(robot) = Piper::connect(adapter, config)
+    if let Ok(robot) = Piper::connect(adapter, config).and_then(|robot| robot.require_strict())
         && let Ok(active_robot) = robot.enable_all()
     {
         // 测试 emergency_stop
@@ -234,7 +258,7 @@ fn test_disable() {
     let adapter = MockCanAdapter::new();
     let config = ConnectionConfig::default();
 
-    if let Ok(robot) = Piper::connect(adapter, config)
+    if let Ok(robot) = Piper::connect(adapter, config).and_then(|robot| robot.require_strict())
         && let Ok(active_robot) = robot.enable_all()
     {
         let disable_config = DisableConfig::default();
@@ -250,18 +274,36 @@ fn test_observer() {
     let config = ConnectionConfig::default();
 
     if let Ok(robot) = Piper::connect(adapter, config) {
-        let observer = robot.observer();
-
-        // 测试各种读取方法
-        let _positions = observer.joint_positions();
-        let _velocities = observer.joint_velocities();
-        let _torques = observer.joint_torques();
-        let _snapshot = observer.control_snapshot(ControlReadPolicy::default());
-        let _gripper = observer.gripper_state();
-        let _enabled = observer.is_arm_enabled();
-
-        // 验证可以克隆 Observer
-        let _observer2 = observer.clone();
+        match robot {
+            ConnectedPiper::Strict(robot) => {
+                let observer = robot.observer();
+                let _positions = observer.joint_positions();
+                let _velocities = observer.joint_velocities();
+                let _torques = observer.joint_torques();
+                let _snapshot = observer.control_snapshot(ControlReadPolicy::default());
+                let _gripper = observer.gripper_state();
+                let _enabled = observer.is_arm_enabled();
+                let _observer2 = observer.clone();
+            },
+            ConnectedPiper::Soft(robot) => {
+                let observer = robot.observer();
+                let _positions = observer.joint_positions();
+                let _velocities = observer.joint_velocities();
+                let _torques = observer.joint_torques();
+                let _gripper = observer.gripper_state();
+                let _enabled = observer.is_arm_enabled();
+                let _observer2 = observer.clone();
+            },
+            ConnectedPiper::Monitor(robot) => {
+                let observer = robot.observer();
+                let _positions = observer.joint_positions();
+                let _velocities = observer.joint_velocities();
+                let _torques = observer.joint_torques();
+                let _gripper = observer.gripper_state();
+                let _enabled = observer.is_arm_enabled();
+                let _observer2 = observer.clone();
+            },
+        }
     }
 }
 
@@ -271,7 +313,7 @@ fn test_type_state_safety() {
     let adapter = MockCanAdapter::new();
     let config = ConnectionConfig::default();
 
-    if let Ok(robot) = Piper::connect(adapter, config) {
+    if let Ok(robot) = Piper::connect(adapter, config).and_then(|robot| robot.require_strict()) {
         // Standby 状态不能调用 command_* 方法（编译期检查）
         // 这里只验证 observer 可以访问
         let _observer = robot.observer();

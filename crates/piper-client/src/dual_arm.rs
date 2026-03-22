@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use piper_driver::{DriverError, RuntimeFaultKind, TimingCapability};
+use piper_driver::{DriverError, RuntimeFaultKind};
 use thiserror::Error;
 
 use crate::builder::PiperBuilder;
@@ -19,7 +19,7 @@ use crate::control::scheduler::{CycleScheduler, SleepStrategy};
 use crate::observer::{ControlReadPolicy, ControlSnapshotFull, Observer, RuntimeHealthSnapshot};
 use crate::raw_commander::RawCommander;
 use crate::state::machine::ErrorState;
-use crate::state::{Active, DisableConfig, MitMode, MitModeConfig, Piper, Standby};
+use crate::state::{Active, DisableConfig, MitMode, MitModeConfig, Piper, Standby, StrictRealtime};
 use crate::types::{Joint, JointArray, NewtonMeter, Rad, Result, RobotError};
 
 /// 双臂构建器
@@ -34,16 +34,16 @@ impl DualArmBuilder {
     }
 
     pub fn build(self) -> Result<DualArmStandby> {
-        let left = self.left.build()?;
-        let right = self.right.build()?;
+        let left = self.left.build()?.require_strict()?;
+        let right = self.right.build()?.require_strict()?;
         Ok(DualArmStandby { left, right })
     }
 }
 
 /// 双臂待机态
 pub struct DualArmStandby {
-    left: Piper<Standby>,
-    right: Piper<Standby>,
+    left: Piper<Standby, StrictRealtime>,
+    right: Piper<Standby, StrictRealtime>,
 }
 
 impl DualArmStandby {
@@ -82,8 +82,8 @@ impl DualArmStandby {
 
 /// 双臂 MIT 运行态
 pub struct DualArmActiveMit {
-    left: Piper<Active<MitMode>>,
-    right: Piper<Active<MitMode>>,
+    left: Piper<Active<MitMode>, StrictRealtime>,
+    right: Piper<Active<MitMode>, StrictRealtime>,
 }
 
 impl DualArmActiveMit {
@@ -142,16 +142,6 @@ impl DualArmActiveMit {
     where
         C: BilateralController,
     {
-        if self.left.driver.timing_capability() == TimingCapability::MonitorOnly {
-            return Err(DualArmError::from(RobotError::realtime_unsupported(
-                "left arm backend is monitor-only; bilateral host-side closed-loop control is disabled",
-            )));
-        }
-        if self.right.driver.timing_capability() == TimingCapability::MonitorOnly {
-            return Err(DualArmError::from(RobotError::realtime_unsupported(
-                "right arm backend is monitor-only; bilateral host-side closed-loop control is disabled",
-            )));
-        }
         if cfg.frequency_hz <= 0.0 {
             return Err(DualArmError::Config("frequency_hz must be > 0".to_string()));
         }
@@ -473,8 +463,8 @@ impl DualArmActiveMit {
 
 /// 双臂错误态
 pub struct DualArmErrorState {
-    left: Piper<ErrorState>,
-    right: Piper<ErrorState>,
+    left: Piper<ErrorState, StrictRealtime>,
+    right: Piper<ErrorState, StrictRealtime>,
 }
 
 impl DualArmErrorState {
@@ -486,12 +476,12 @@ impl DualArmErrorState {
 /// 双臂观察器
 #[derive(Clone)]
 pub struct DualArmObserver {
-    left: Observer,
-    right: Observer,
+    left: Observer<StrictRealtime>,
+    right: Observer<StrictRealtime>,
 }
 
 impl DualArmObserver {
-    pub fn new(left: Observer, right: Observer) -> Self {
+    pub fn new(left: Observer<StrictRealtime>, right: Observer<StrictRealtime>) -> Self {
         Self { left, right }
     }
 
@@ -1285,7 +1275,10 @@ enum PendingStopAttempt {
     Immediate(StopAttemptResult),
 }
 
-fn enqueue_stop_attempt(piper: &Piper<Active<MitMode>>, deadline: Instant) -> PendingStopAttempt {
+fn enqueue_stop_attempt(
+    piper: &Piper<Active<MitMode>, StrictRealtime>,
+    deadline: Instant,
+) -> PendingStopAttempt {
     match RawCommander::new(&piper.driver).emergency_stop_enqueue(deadline) {
         Ok(receipt) => PendingStopAttempt::Receipt(receipt),
         Err(err) => PendingStopAttempt::Immediate(stop_attempt_from_robot_error(&err)),
@@ -1302,7 +1295,9 @@ fn resolve_stop_attempt(pending: PendingStopAttempt) -> StopAttemptResult {
     }
 }
 
-fn force_error_state(piper: Piper<Active<MitMode>>) -> Piper<ErrorState> {
+fn force_error_state(
+    piper: Piper<Active<MitMode>, StrictRealtime>,
+) -> Piper<ErrorState, StrictRealtime> {
     let piper = std::mem::ManuallyDrop::new(piper);
 
     Piper {
@@ -1419,7 +1414,7 @@ fn sleep_strategy_from_loop_timing(mode: LoopTimingMode) -> SleepStrategy {
 }
 
 fn command_hold(
-    arm: &Piper<Active<MitMode>>,
+    arm: &Piper<Active<MitMode>, StrictRealtime>,
     position: &JointArray<Rad>,
     cfg: &DualArmSafetyConfig,
 ) -> Result<()> {
@@ -1464,9 +1459,10 @@ fn update_report_metrics(
 mod tests {
     use super::*;
     use crate::observer::Observer;
+    use crate::state::StrictRealtime;
     use crate::types::RadPerSecond;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-    use piper_driver::Piper as RobotPiper;
+    use piper_driver::{BackendCapability, Piper as RobotPiper};
     use piper_protocol::control::MitControlCommand;
     use piper_protocol::ids::{
         ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
@@ -1704,7 +1700,7 @@ mod tests {
         tx_adapter: T,
         post_feedback_delay: Duration,
         state: State,
-    ) -> Piper<State>
+    ) -> Piper<State, StrictRealtime>
     where
         T: RealtimeTxAdapter + Send + 'static,
     {
@@ -1721,16 +1717,21 @@ mod tests {
         tx_adapter: T,
         post_feedback_delay: Duration,
         state: State,
-    ) -> Piper<State>
+    ) -> Piper<State, StrictRealtime>
     where
         R: RxAdapter + Send + 'static,
         T: RealtimeTxAdapter + Send + 'static,
     {
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(rx_adapter, tx_adapter, None)
-                .expect("driver should start"),
+            RobotPiper::new_dual_thread_parts(
+                BackendCapability::StrictRealtime,
+                rx_adapter,
+                tx_adapter,
+                None,
+            )
+            .expect("driver should start"),
         );
-        let observer = Observer::new(driver.clone());
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
         driver
             .wait_for_feedback(Duration::from_millis(200))
             .expect("feedback should arrive");
@@ -1750,7 +1751,7 @@ mod tests {
         rx_adapter: R,
         tx_adapter: T,
         post_feedback_delay: Duration,
-    ) -> Piper<Active<MitMode>>
+    ) -> Piper<Active<MitMode>, StrictRealtime>
     where
         R: RxAdapter + Send + 'static,
         T: RealtimeTxAdapter + Send + 'static,
@@ -1768,7 +1769,7 @@ mod tests {
         tx_adapter: T,
         post_feedback_delay: Duration,
         state: State,
-    ) -> Piper<State>
+    ) -> Piper<State, StrictRealtime>
     where
         T: RealtimeTxAdapter + Send + 'static,
     {
@@ -1783,7 +1784,7 @@ mod tests {
     fn build_active_mit_piper(
         timestamp_us: u64,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
-    ) -> Piper<Active<MitMode>> {
+    ) -> Piper<Active<MitMode>, StrictRealtime> {
         build_piper_with_tx_adapter(
             timestamp_us,
             RecordingTxAdapter::new(sent_frames),
@@ -1796,7 +1797,7 @@ mod tests {
         timestamp_us: u64,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
         post_feedback_delay: Duration,
-    ) -> Piper<Active<MitMode>> {
+    ) -> Piper<Active<MitMode>, StrictRealtime> {
         build_piper_with_tx_adapter(
             timestamp_us,
             RecordingTxAdapter::new(sent_frames),
@@ -1809,7 +1810,7 @@ mod tests {
         timestamp_us: u64,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
         post_feedback_delay: Duration,
-    ) -> Piper<Standby> {
+    ) -> Piper<Standby, StrictRealtime> {
         build_piper_with_tx_adapter(
             timestamp_us,
             RecordingTxAdapter::new(sent_frames),
@@ -1821,7 +1822,7 @@ mod tests {
     fn build_active_mit_piper_with_frames(
         frames: Vec<PiperFrame>,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
-    ) -> Piper<Active<MitMode>> {
+    ) -> Piper<Active<MitMode>, StrictRealtime> {
         build_piper_with_frames_and_tx_adapter(
             frames,
             RecordingTxAdapter::new(sent_frames),

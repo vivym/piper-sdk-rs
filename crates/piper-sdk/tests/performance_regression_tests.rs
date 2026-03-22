@@ -7,11 +7,10 @@
 //! 4. 可集成到 CI，作为性能门禁
 
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::TimingCapability;
 use piper_sdk::driver::command::{PiperCommand, ReliableCommand};
 use piper_sdk::driver::{
-    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig, PiperContext,
-    PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
+    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
+    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -395,7 +394,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx_rx,
             config,
             is_running_rx,
@@ -414,11 +413,14 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let last_fault_tx = last_fault.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,
@@ -609,11 +611,14 @@ fn test_command_priority_performance() {
     let last_fault_tx = last_fault.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,
@@ -672,11 +677,14 @@ fn test_command_priority_performance() {
     let last_fault_tx2 = last_fault2.clone();
     let maintenance_state_signal_tx2 = maintenance_state_signal2.clone();
     let maintenance_lease_gate_tx2 = maintenance_lease_gate2.clone();
+    let (_soft_realtime_tx2, soft_realtime_rx2) = crossbeam_channel::bounded(1);
     let tx_handle2 = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter2,
+            BackendCapability::StrictRealtime,
             realtime_slot2,
+            soft_realtime_rx2,
             shutdown_lane2,
             reliable_rx2,
             is_running_tx2,

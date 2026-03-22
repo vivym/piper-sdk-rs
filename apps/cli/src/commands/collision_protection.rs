@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use piper_control::{query_collision_protection_blocking, set_collision_protection_verified};
+use piper_sdk::client::MotionConnectedPiper;
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -40,10 +41,19 @@ impl CollisionProtectionCommand {
             CollisionProtectionAction::Get { target } => {
                 let profile = config.control_profile(target.target.as_ref());
                 let builder = client_builder(&profile.target);
-                let standby = builder.build()?;
-                print_collision_protection_levels(|| {
-                    query_collision_protection_blocking(&standby, &profile.wait)
-                })
+                let standby = builder.build()?.require_motion()?;
+                match &standby {
+                    MotionConnectedPiper::Strict(standby) => {
+                        print_collision_protection_levels(|| {
+                            query_collision_protection_blocking(standby, &profile.wait)
+                        })
+                    },
+                    MotionConnectedPiper::Soft(standby) => {
+                        print_collision_protection_levels(|| {
+                            query_collision_protection_blocking(standby, &profile.wait)
+                        })
+                    },
+                }
             },
             CollisionProtectionAction::Set {
                 level,
@@ -53,8 +63,15 @@ impl CollisionProtectionCommand {
                 let desired = parse_collision_levels(*level, levels.as_deref())?;
                 let profile = config.control_profile(target.target.as_ref());
                 let builder = client_builder(&profile.target);
-                let standby = builder.build()?;
-                set_collision_protection_verified(&standby, desired, &profile.wait)?;
+                let standby = builder.build()?.require_motion()?;
+                match &standby {
+                    MotionConnectedPiper::Strict(standby) => {
+                        set_collision_protection_verified(standby, desired, &profile.wait)?
+                    },
+                    MotionConnectedPiper::Soft(standby) => {
+                        set_collision_protection_verified(standby, desired, &profile.wait)?
+                    },
+                }
                 println!("✅ 碰撞保护等级已写入并校验: {:?}", desired);
                 Ok(())
             },

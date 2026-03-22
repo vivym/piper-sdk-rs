@@ -11,8 +11,8 @@ use crate::gs_usb::protocol::{
     GS_CAN_MODE_LOOP_BACK, GS_USB_ECHO_ID,
 };
 use crate::{
-    BridgeTxAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter,
-    RxAdapter, TimingCapability,
+    BackendCapability, BridgeTxAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame,
+    RealtimeTxAdapter, RxAdapter,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -102,6 +102,79 @@ impl GsUsbRxAdapter {
         self.rx_queue.push_back(frame);
     }
 
+    fn handle_error_frame(&mut self, gs_frame: &GsUsbFrame) -> Result<bool, CanError> {
+        let can_id_raw = gs_frame.can_id;
+        if (can_id_raw & CAN_ERR_FLAG) == 0 {
+            return Ok(false);
+        }
+
+        if gs_frame.can_dlc < 2 {
+            debug!(
+                "CAN Error frame (DLC too short to parse): CAN ID: 0x{:08x}, DLC: {}, Data: {:?}",
+                can_id_raw,
+                gs_frame.can_dlc,
+                &gs_frame.data[..gs_frame.can_dlc.min(8) as usize]
+            );
+            return Ok(true);
+        }
+
+        let ctrl_err = gs_frame.data[1];
+        let is_tx_bus_off = (ctrl_err & CAN_ERR_CRTL_TX_BUS_OFF) != 0;
+        let is_rx_bus_off = (ctrl_err & CAN_ERR_CRTL_RX_BUS_OFF) != 0;
+
+        if is_tx_bus_off || is_rx_bus_off {
+            error!(
+                "CAN Bus Off detected! TX: {}, RX: {}, Controller Error: 0x{:02x}, CAN ID: 0x{:08x}, Data: {:?}",
+                is_tx_bus_off,
+                is_rx_bus_off,
+                ctrl_err,
+                can_id_raw,
+                &gs_frame.data[..gs_frame.can_dlc.min(8) as usize]
+            );
+
+            if let Some(ref callback) = self.bus_off_callback {
+                callback(true);
+            }
+            return Err(CanError::BusOff);
+        }
+
+        let is_rx_passive = (ctrl_err & CAN_ERR_CRTL_RX_PASSIVE) != 0;
+        let is_tx_passive = (ctrl_err & CAN_ERR_CRTL_TX_PASSIVE) != 0;
+
+        if is_rx_passive || is_tx_passive {
+            warn!(
+                "CAN Error Passive detected (pre-Bus Off warning): RX: {}, TX: {}, Controller Error: 0x{:02x}, CAN ID: 0x{:08x}",
+                is_rx_passive, is_tx_passive, ctrl_err, can_id_raw
+            );
+
+            if let Some(ref callback) = self.error_passive_callback {
+                callback(true);
+            }
+        }
+
+        if gs_frame.can_dlc >= 3 {
+            let prot_err = gs_frame.data[2];
+            if (prot_err & CAN_ERR_PROT_FORM) != 0 {
+                warn!(
+                    "CAN Format Error detected (possible bitrate mismatch): Protocol Error: 0x{:02x}, CAN ID: 0x{:08x}",
+                    prot_err, can_id_raw
+                );
+            }
+
+            if prot_err != 0 && (prot_err & CAN_ERR_PROT_FORM) == 0 {
+                debug!(
+                    "CAN Protocol Error: 0x{:02x}, Controller Error: 0x{:02x}, CAN ID: 0x{:08x}, Data: {:?}",
+                    prot_err,
+                    ctrl_err,
+                    can_id_raw,
+                    &gs_frame.data[..gs_frame.can_dlc.min(8) as usize]
+                );
+            }
+        }
+
+        Ok(true)
+    }
+
     /// 接收 CAN 帧（带 Echo 帧过滤）
     ///
     /// 在双线程模式下，RX 线程会读到 TX 线程发送的回显帧。
@@ -150,11 +223,10 @@ impl GsUsbRxAdapter {
                 continue;
             }
 
-            // ============================================================
-            // Bus Off 检测 - 检测错误帧并触发回调
-            // ============================================================
-            for gs_frame in &gs_frames {
-                // 1. 调试日志：非零 Flags（仅在 trace 级别）
+            // 3. 过滤 Echo 帧（关键：双线程模式下会收到 TX 回显）
+            let is_loopback = (self.mode & GS_CAN_MODE_LOOP_BACK) != 0;
+
+            for gs_frame in gs_frames {
                 if gs_frame.flags != 0 {
                     trace!(
                         "Non-zero flags detected: 0x{:02x}, CAN ID: 0x{:08x}, Channel: {}, Echo ID: 0x{:08x}, DLC: {}",
@@ -166,111 +238,10 @@ impl GsUsbRxAdapter {
                     );
                 }
 
-                // 2. 检测错误帧（CAN ID 包含 CAN_ERR_FLAG 0x20000000）
-                // 根据 Linux CAN 错误帧格式：
-                // data[0] = CAN_ERR_FLAG (0x01) - 错误帧标志（某些设备可能不设置）
-                // data[1] = Controller Error Status (CAN_ERR_CRTL_*)
-                // data[2] = Protocol Error Type (CAN_ERR_PROT_*)
-                // data[3] = Error Location (CAN_ERR_LOC_*)
-                // data[4..7] = Extended error information
-                let can_id_raw = gs_frame.can_id;
-                if (can_id_raw & CAN_ERR_FLAG) != 0 {
-                    // 首次检测到错误帧，确认设备支持 Bus Off 检测
-                    // 通过回调通知 daemon 设备支持错误帧上报
-                    // 注意：这里不能直接访问 DetailedStats，需要通过回调机制
-                    // Error Passive 和 Bus Off 回调会在检测到时被调用，那里会标记设备支持
-                    if gs_frame.can_dlc >= 2 {
-                        // data[1] = Controller Error Status
-                        let ctrl_err = gs_frame.data[1];
-
-                        // 检测 Bus Off（最高优先级）
-                        // Bus Off 在 data[1] 中检测，标准标志：
-                        // CAN_ERR_CRTL_TX_BUS_OFF = 0x40 (bit 6) - TX Bus Off (TEC > 255)
-                        // CAN_ERR_CRTL_RX_BUS_OFF = 0x80 (bit 7) - RX Bus Off (rare)
-                        let is_tx_bus_off = (ctrl_err & CAN_ERR_CRTL_TX_BUS_OFF) != 0;
-                        let is_rx_bus_off = (ctrl_err & CAN_ERR_CRTL_RX_BUS_OFF) != 0;
-
-                        if is_tx_bus_off || is_rx_bus_off {
-                            error!(
-                                "CAN Bus Off detected! TX: {}, RX: {}, Controller Error: 0x{:02x}, CAN ID: 0x{:08x}, Data: {:?}",
-                                is_tx_bus_off,
-                                is_rx_bus_off,
-                                ctrl_err,
-                                can_id_raw,
-                                &gs_frame.data[..gs_frame.can_dlc.min(8) as usize]
-                            );
-
-                            // 通过回调更新 Bus Off 状态
-                            if let Some(ref callback) = self.bus_off_callback {
-                                callback(true); // Bus Off 状态为 true
-                            }
-                        } else {
-                            // 检测 Error Passive（Bus Off 之前的警告状态）
-                            // Error Passive 在 data[1] 中检测：
-                            // CAN_ERR_CRTL_RX_PASSIVE = 0x10 (bit 4) - RX Error Passive (REC > 127)
-                            // CAN_ERR_CRTL_TX_PASSIVE = 0x20 (bit 5) - TX Error Passive (TEC > 127)
-                            let is_rx_passive = (ctrl_err & CAN_ERR_CRTL_RX_PASSIVE) != 0;
-                            let is_tx_passive = (ctrl_err & CAN_ERR_CRTL_TX_PASSIVE) != 0;
-
-                            if is_rx_passive || is_tx_passive {
-                                warn!(
-                                    "CAN Error Passive detected (pre-Bus Off warning): RX: {}, TX: {}, Controller Error: 0x{:02x}, CAN ID: 0x{:08x}",
-                                    is_rx_passive, is_tx_passive, ctrl_err, can_id_raw
-                                );
-
-                                // 通过回调更新 Error Passive 状态
-                                if let Some(ref callback) = self.error_passive_callback {
-                                    callback(true); // Error Passive 状态为 true
-                                }
-                            } else {
-                                // 如果之前处于 Error Passive 状态，现在已恢复，触发回调
-                                // 注意：这里无法直接判断"之前的状态"，回调应该处理状态变化
-                                // 如果需要，可以在回调中实现状态机
-                                // 当前实现：只在检测到 Error Passive 时调用 callback(true)
-                                // 恢复检测需要额外逻辑或通过定期轮询实现
-                            }
-
-                            // 解析协议错误类型（data[2]），用于调试
-                            if gs_frame.can_dlc >= 3 {
-                                let prot_err = gs_frame.data[2];
-
-                                // 记录格式错误（通常是波特率不匹配）
-                                if (prot_err & CAN_ERR_PROT_FORM) != 0 {
-                                    warn!(
-                                        "CAN Format Error detected (possible bitrate mismatch): Protocol Error: 0x{:02x}, CAN ID: 0x{:08x}",
-                                        prot_err, can_id_raw
-                                    );
-                                }
-
-                                // 其他协议错误类型，记录但不处理（debug 级别）
-                                if prot_err != 0 && (prot_err & CAN_ERR_PROT_FORM) == 0 {
-                                    debug!(
-                                        "CAN Protocol Error: 0x{:02x}, Controller Error: 0x{:02x}, CAN ID: 0x{:08x}, Data: {:?}",
-                                        prot_err,
-                                        ctrl_err,
-                                        can_id_raw,
-                                        &gs_frame.data[..gs_frame.can_dlc.min(8) as usize]
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        // DLC 不足，无法解析错误状态（debug 级别）
-                        debug!(
-                            "CAN Error frame (DLC too short to parse): CAN ID: 0x{:08x}, DLC: {}, Data: {:?}",
-                            can_id_raw,
-                            gs_frame.can_dlc,
-                            &gs_frame.data[..gs_frame.can_dlc.min(8) as usize]
-                        );
-                    }
+                if self.handle_error_frame(&gs_frame)? {
+                    continue;
                 }
-            }
 
-            // 3. 过滤 Echo 帧（关键：双线程模式下会收到 TX 回显）
-            let is_loopback = (self.mode & GS_CAN_MODE_LOOP_BACK) != 0;
-
-            // 注意：这里需要移动 gs_frames，所以验证日志必须在前面完成
-            for gs_frame in gs_frames {
                 // 检查是否为 Echo 帧
                 if self.is_echo_frame(&gs_frame, is_loopback) {
                     trace!(
@@ -358,11 +329,11 @@ impl RxAdapter for GsUsbRxAdapter {
         self.receive()
     }
 
-    fn timing_capability(&self) -> TimingCapability {
+    fn backend_capability(&self) -> BackendCapability {
         if self.hw_timestamp_enabled {
-            TimingCapability::RealtimeCapable
+            BackendCapability::SoftRealtime
         } else {
-            TimingCapability::MonitorOnly
+            BackendCapability::MonitorOnly
         }
     }
 }

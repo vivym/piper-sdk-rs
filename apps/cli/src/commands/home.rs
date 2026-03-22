@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 use piper_control::home_zero_blocking;
+use piper_sdk::client::MotionConnectedPiper;
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -20,8 +21,16 @@ impl HomeCommand {
 
         println!("🔌 连接到机器人...");
         let standby = builder.build()?;
+        let standby = standby.require_motion()?;
         println!("⏳ 发送零关节目标...");
-        let _standby = home_zero_blocking(standby, &profile)?;
+        match standby {
+            MotionConnectedPiper::Strict(standby) => {
+                let _standby = home_zero_blocking(standby, &profile)?;
+            },
+            MotionConnectedPiper::Soft(standby) => {
+                let _standby = home_zero_blocking(standby, &profile)?;
+            },
+        }
         println!("✅ 回零完成");
         Ok(())
     }

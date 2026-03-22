@@ -139,7 +139,9 @@ pub struct PiperDiagnostics {
 }
 
 impl PiperDiagnostics {
-    pub(super) fn new<M>(inner: &crate::state::Piper<crate::state::Active<M>>) -> Self {
+    pub(super) fn new<M, Capability>(
+        inner: &crate::state::Piper<crate::state::Active<M>, Capability>,
+    ) -> Self {
         // 克隆 Arc（轻量级操作，仅增加引用计数）
         Self {
             driver: Arc::clone(&inner.driver),

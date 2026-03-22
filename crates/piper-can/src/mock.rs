@@ -230,6 +230,10 @@ impl SplittableAdapter for MockCanAdapter {
     type RxAdapter = MockRxAdapter;
     type TxAdapter = MockTxAdapter;
 
+    fn backend_capability(&self) -> crate::BackendCapability {
+        crate::BackendCapability::StrictRealtime
+    }
+
     fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
         Ok((
             MockRxAdapter {

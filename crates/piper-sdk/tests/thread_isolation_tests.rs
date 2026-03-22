@@ -10,8 +10,8 @@ use piper_sdk::can::{
 };
 use piper_sdk::driver::command::ReliableCommand;
 use piper_sdk::driver::{
-    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig, PiperContext,
-    PiperMetrics, ShutdownLane, TimingCapability, rx_loop, tx_loop_mailbox,
+    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
+    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -203,7 +203,7 @@ fn test_rx_unaffected_by_tx_timeout() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx_rx,
             config,
             is_running_rx,
@@ -222,11 +222,14 @@ fn test_rx_unaffected_by_tx_timeout() {
     let last_fault_tx = last_fault.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,
@@ -331,7 +334,7 @@ fn test_tx_detects_rx_failure() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx_rx,
             config,
             is_running_rx,
@@ -350,11 +353,14 @@ fn test_tx_detects_rx_failure() {
     let last_fault_tx = last_fault.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,
@@ -456,7 +462,7 @@ fn test_thread_lifecycle_linkage() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx_rx,
             config,
             is_running_rx,
@@ -475,11 +481,14 @@ fn test_thread_lifecycle_linkage() {
     let last_fault_tx = last_fault.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,

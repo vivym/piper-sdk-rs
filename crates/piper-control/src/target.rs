@@ -7,9 +7,11 @@ use std::str::FromStr;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind")]
 pub enum TargetSpec {
-    #[serde(rename = "auto")]
+    #[serde(rename = "auto-strict")]
     #[default]
-    Auto,
+    AutoStrict,
+    #[serde(rename = "auto-any")]
+    AutoAny,
     #[serde(rename = "socketcan")]
     SocketCan { iface: String },
     #[serde(rename = "gs-usb-auto")]
@@ -29,7 +31,8 @@ impl TargetSpec {
 impl From<TargetSpec> for ConnectionTarget {
     fn from(value: TargetSpec) -> Self {
         match value {
-            TargetSpec::Auto => ConnectionTarget::Auto,
+            TargetSpec::AutoStrict => ConnectionTarget::AutoStrict,
+            TargetSpec::AutoAny => ConnectionTarget::AutoAny,
             TargetSpec::SocketCan { iface } => ConnectionTarget::SocketCan { iface },
             TargetSpec::GsUsbAuto => ConnectionTarget::GsUsbAuto,
             TargetSpec::GsUsbSerial { serial } => ConnectionTarget::GsUsbSerial { serial },
@@ -43,7 +46,8 @@ impl From<TargetSpec> for ConnectionTarget {
 impl From<ConnectionTarget> for TargetSpec {
     fn from(value: ConnectionTarget) -> Self {
         match value {
-            ConnectionTarget::Auto => TargetSpec::Auto,
+            ConnectionTarget::AutoStrict => TargetSpec::AutoStrict,
+            ConnectionTarget::AutoAny => TargetSpec::AutoAny,
             ConnectionTarget::SocketCan { iface } => TargetSpec::SocketCan { iface },
             ConnectionTarget::GsUsbAuto => TargetSpec::GsUsbAuto,
             ConnectionTarget::GsUsbSerial { serial } => TargetSpec::GsUsbSerial { serial },
@@ -57,7 +61,8 @@ impl From<ConnectionTarget> for TargetSpec {
 impl fmt::Display for TargetSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TargetSpec::Auto => write!(f, "auto"),
+            TargetSpec::AutoStrict => write!(f, "auto-strict"),
+            TargetSpec::AutoAny => write!(f, "auto-any"),
             TargetSpec::SocketCan { iface } => write!(f, "socketcan:{iface}"),
             TargetSpec::GsUsbAuto => write!(f, "gs-usb-auto"),
             TargetSpec::GsUsbSerial { serial } => write!(f, "gs-usb-serial:{serial}"),
@@ -72,8 +77,11 @@ impl FromStr for TargetSpec {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s == "auto" {
-            return Ok(Self::Auto);
+        if s == "auto-strict" {
+            return Ok(Self::AutoStrict);
+        }
+        if s == "auto-any" {
+            return Ok(Self::AutoAny);
         }
         if s == "gs-usb-auto" {
             return Ok(Self::GsUsbAuto);
@@ -129,7 +137,8 @@ mod tests {
     #[test]
     fn parse_and_display_round_trip() {
         let cases = [
-            "auto",
+            "auto-strict",
+            "auto-any",
             "gs-usb-auto",
             "socketcan:vcan0",
             "gs-usb-serial:ABC123",
@@ -163,7 +172,8 @@ mod tests {
         for wrapper in wrappers {
             let toml = toml::to_string(&wrapper).unwrap();
             let kind = match &wrapper.target {
-                TargetSpec::Auto => "auto",
+                TargetSpec::AutoStrict => "auto-strict",
+                TargetSpec::AutoAny => "auto-any",
                 TargetSpec::SocketCan { .. } => "socketcan",
                 TargetSpec::GsUsbAuto => "gs-usb-auto",
                 TargetSpec::GsUsbSerial { .. } => "gs-usb-serial",

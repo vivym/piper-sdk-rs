@@ -8,10 +8,9 @@
 //! 5. 生成测试报告（Markdown）
 
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::TimingCapability;
 use piper_sdk::driver::{
-    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig, PiperContext,
-    PiperMetrics, ShutdownLane,
+    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
+    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane,
     command::{RealtimeCommand, ReliableCommand},
     rx_loop, tx_loop_mailbox,
 };
@@ -437,7 +436,7 @@ fn test_500hz_realtime_benchmark() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx_rx,
             config,
             is_running_rx,
@@ -539,7 +538,7 @@ fn test_1khz_realtime_benchmark() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx_rx,
             config,
             is_running_rx,
@@ -647,11 +646,14 @@ fn test_tx_latency_benchmark() {
     let realtime_slot_tx = realtime_slot.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot_tx,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,
@@ -770,11 +772,14 @@ fn test_send_duration_benchmark() {
     let realtime_slot_tx = realtime_slot.clone();
     let maintenance_state_signal_tx = maintenance_state_signal.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot_tx,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running_tx,
@@ -878,7 +883,7 @@ fn test_usb_fault_simulation() {
     let rx_handle = thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx_rx,
             config,
             is_running_rx,

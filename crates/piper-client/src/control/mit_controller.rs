@@ -60,9 +60,10 @@ use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
 use crate::observer::{ControlReadPolicy, Observer};
+use crate::state::StrictRealtime;
 use crate::state::machine::{Active, DisableConfig, MitMode, Piper, Standby};
 use crate::types::*;
-use piper_driver::TimingCapability;
+use piper_driver::BackendCapability;
 
 /// MIT 控制器配置
 #[derive(Debug, Clone)]
@@ -139,10 +140,10 @@ pub enum ControlError {
 /// - ✅ 状态流转：`park()` 返还 `Piper<Standby>`
 pub struct MitController {
     /// ⚠️ Option 包装，允许 park() 时安全提取
-    piper: Option<Piper<Active<MitMode>>>,
+    piper: Option<Piper<Active<MitMode>, StrictRealtime>>,
 
     /// 状态观察器
-    observer: Observer,
+    observer: Observer<StrictRealtime>,
 
     /// 控制器配置
     config: MitControllerConfig,
@@ -170,10 +171,13 @@ impl MitController {
     /// # // let controller = MitController::new(piper, config)?;
     /// # // 使用 controller 进行控制...
     /// ```
-    pub fn new(piper: Piper<Active<MitMode>>, config: MitControllerConfig) -> Result<Self> {
-        if piper.driver.timing_capability() == TimingCapability::MonitorOnly {
+    pub fn new(
+        piper: Piper<Active<MitMode>, StrictRealtime>,
+        config: MitControllerConfig,
+    ) -> Result<Self> {
+        if piper.driver.backend_capability() != BackendCapability::StrictRealtime {
             return Err(RobotError::realtime_unsupported(
-                "MIT controller requires a realtime-capable backend with reliable hardware alignment timestamps",
+                "MIT controller requires a StrictRealtime backend with trusted alignment timestamps",
             ));
         }
 
@@ -421,7 +425,10 @@ impl MitController {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn park(mut self, config: DisableConfig) -> crate::types::Result<Piper<Standby>> {
+    pub fn park(
+        mut self,
+        config: DisableConfig,
+    ) -> crate::types::Result<Piper<Standby, StrictRealtime>> {
         // 安全提取 piper（Option 变为 None）
         let piper = self.piper.take().ok_or(ControlError::AlreadyParked).map_err(|e| match e {
             ControlError::AlreadyParked => crate::RobotError::InvalidTransition {
@@ -438,7 +445,7 @@ impl MitController {
     }
 
     /// 获取 Observer（只读）
-    pub fn observer(&self) -> &Observer {
+    pub fn observer(&self) -> &Observer<StrictRealtime> {
         &self.observer
     }
 }

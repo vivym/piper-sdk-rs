@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::Args;
+use piper_sdk::client::MotionConnectedPiper;
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -19,8 +20,12 @@ impl StopCommand {
 
         println!("🔌 连接到机器人...");
         let robot = builder.build()?;
+        let robot = robot.require_motion()?;
         println!("🛑 发送急停命令（失能所有关节）...");
-        robot.disable_all()?;
+        match &robot {
+            MotionConnectedPiper::Strict(robot) => robot.disable_all()?,
+            MotionConnectedPiper::Soft(robot) => robot.disable_all()?,
+        }
         println!("✅ 急停完成");
         Ok(())
     }

@@ -65,5 +65,7 @@ pub use piper_driver::RuntimeFaultKind;
 pub use recording::{
     RecordingConfig, RecordingHandle, RecordingMetadata, RecordingStats, StopCondition,
 };
-pub use state::Piper; // Type State Pattern 的状态机
+pub use state::{
+    ConnectedPiper, MonitorOnly, MotionConnectedPiper, Piper, SoftRealtime, StrictRealtime,
+}; // Type State Pattern 的状态机与能力分层入口
 pub use types::*;

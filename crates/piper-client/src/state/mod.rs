@@ -50,18 +50,27 @@
 //! # }
 //! ```
 
+pub mod capability;
 pub mod machine;
 
+pub use capability::{
+    CapabilityMarker, MonitorOnly, MotionCapability, SoftRealtime, StrictCapability,
+    StrictRealtime, UnspecifiedCapability,
+};
 pub use machine::{
     Active,
+    ConnectedPiper,
     // 配置类型
     ConnectionConfig,
     DisableConfig,
     // 状态类型
     Disconnected,
+    ErrorState,
     // 控制模式
     MitMode,
     MitModeConfig,
+    MitPassthroughMode,
+    MotionConnectedPiper,
     Piper,
     PositionMode,
     PositionModeConfig,

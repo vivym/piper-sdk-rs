@@ -1,6 +1,6 @@
 //! Client 层 Piper Builder
 //!
-//! 提供链式 API 创建 `Piper<Standby>` 实例，自动处理启动握手与固件 quirks 初始化。
+//! 提供链式 API 创建 `ConnectedPiper` 实例，自动处理启动握手与固件 quirks 初始化。
 
 use crate::connection::initialize_connected_driver;
 use crate::state::*;
@@ -66,7 +66,7 @@ impl PiperBuilder {
         self.firmware_timeout = timeout;
         self
     }
-    pub fn build(self) -> Result<Piper<Standby>> {
+    pub fn build(self) -> Result<ConnectedPiper> {
         debug!("Building Piper client connection");
 
         let driver = Arc::new(
@@ -76,25 +76,20 @@ impl PiperBuilder {
                 .build()?,
         );
 
-        let connected = initialize_connected_driver(
+        let quirks = initialize_connected_driver(
             driver.clone(),
             self.feedback_timeout,
             self.firmware_timeout,
         )?;
 
-        Ok(Piper {
-            driver,
-            observer: connected.observer,
-            quirks: connected.quirks,
-            _state: machine::Standby,
-        })
+        Ok(machine::connected_piper_from_driver(driver, quirks))
     }
 }
 
 impl Default for PiperBuilder {
     fn default() -> Self {
         Self {
-            target: ConnectionTarget::Auto,
+            target: ConnectionTarget::AutoStrict,
             baud_rate: 1_000_000,
             feedback_timeout: Duration::from_secs(5),
             firmware_timeout: Duration::from_millis(100),
@@ -109,7 +104,7 @@ mod tests {
     #[test]
     fn test_piper_builder_defaults() {
         let builder = PiperBuilder::new();
-        assert_eq!(builder.target, ConnectionTarget::Auto);
+        assert_eq!(builder.target, ConnectionTarget::AutoStrict);
         assert_eq!(builder.baud_rate, 1_000_000);
         assert_eq!(builder.feedback_timeout, Duration::from_secs(5));
         assert_eq!(builder.firmware_timeout, Duration::from_millis(100));

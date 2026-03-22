@@ -202,6 +202,28 @@ impl JointDynamicState {
     /// 公式：torque = current * COEFFICIENT_4_6
     pub const COEFFICIENT_4_6: f64 = 0.95844;
 
+    /// 计算当前动态组内最早/最晚关节时间戳的跨度。
+    pub fn group_span_us(&self) -> u64 {
+        let mut min_ts = u64::MAX;
+        let mut max_ts = 0;
+        let mut count = 0;
+
+        for &timestamp in &self.timestamps {
+            if timestamp == 0 {
+                continue;
+            }
+            min_ts = min_ts.min(timestamp);
+            max_ts = max_ts.max(timestamp);
+            count += 1;
+        }
+
+        if count == 0 {
+            0
+        } else {
+            max_ts.saturating_sub(min_ts)
+        }
+    }
+
     /// 根据关节索引和电流值计算扭矩（N·m）
     ///
     /// # 参数
@@ -977,6 +999,8 @@ pub struct PiperContext {
     pub control_joint_position: Arc<ArcSwap<JointPositionState>>,
     /// 关节动态监控快照（完整监控 + raw 诊断，共享一次原子发布）
     pub joint_dynamic_monitor: Arc<ArcSwap<JointDynamicMonitorSnapshot>>,
+    /// 控制级关节动态状态（完整 6 关节组 + 组内跨度约束）
+    pub control_joint_dynamic: Arc<ArcSwap<JointDynamicState>>,
     /// 原始运动状态快照（单次 load 保证逻辑原子）
     pub raw_motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
 
@@ -1097,6 +1121,7 @@ impl PiperContext {
             joint_dynamic_monitor: Arc::new(ArcSwap::from_pointee(
                 JointDynamicMonitorSnapshot::default(),
             )),
+            control_joint_dynamic: Arc::new(ArcSwap::from_pointee(JointDynamicState::default())),
             raw_motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
 
             // 温数据：ArcSwap
@@ -1257,6 +1282,11 @@ impl PiperContext {
             )));
     }
 
+    /// 发布新的控制级关节动态状态。
+    pub fn publish_control_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
+        self.control_joint_dynamic.store(Arc::new(joint_dynamic));
+    }
+
     /// 发布新的原始关节动态状态。
     pub fn publish_raw_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
         let current = self.joint_dynamic_monitor.load();
@@ -1294,6 +1324,7 @@ pub struct AlignedMotionState {
     pub dynamic_host_rx_mono_us: u64,
     pub position_frame_valid_mask: u8,
     pub dynamic_valid_mask: u8,
+    pub dynamic_group_span_us: u64,
     pub skew_us: i64,
 }
 
@@ -1516,6 +1547,7 @@ mod tests {
             joint_current: [3.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
+            dynamic_group_span_us: 0,
             position_host_rx_mono_us: 2000,
             dynamic_host_rx_mono_us: 2500,
             position_frame_valid_mask: 0b111,
@@ -1534,6 +1566,7 @@ mod tests {
             joint_current: [3.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
+            dynamic_group_span_us: 0,
             position_host_rx_mono_us: 2000,
             dynamic_host_rx_mono_us: 2500,
             position_frame_valid_mask: 0b111,
@@ -1550,6 +1583,7 @@ mod tests {
             joint_current: [3.0; 6],
             position_timestamp_us: 1000,
             dynamic_timestamp_us: 1500,
+            dynamic_group_span_us: 0,
             position_host_rx_mono_us: 2000,
             dynamic_host_rx_mono_us: 2500,
             position_frame_valid_mask: 0b111,
@@ -1572,6 +1606,7 @@ mod tests {
             joint_current: [0.0; 6],
             position_timestamp_us: 0,
             dynamic_timestamp_us: 0,
+            dynamic_group_span_us: 0,
             position_host_rx_mono_us: 0,
             dynamic_host_rx_mono_us: 0,
             position_frame_valid_mask: 0b111,

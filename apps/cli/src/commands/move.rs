@@ -6,7 +6,7 @@ use crate::safety::confirm_prepared_move;
 use anyhow::{Context, Result};
 use clap::Args;
 use piper_control::{move_to_joint_target_blocking, prepare_move};
-use piper_sdk::client::ControlReadPolicy;
+use piper_sdk::client::MotionConnectedPiper;
 
 #[derive(Args, Debug, Clone)]
 pub struct MoveCommand {
@@ -52,9 +52,8 @@ impl MoveCommand {
 
         println!("🔌 连接到机器人...");
         let standby = builder.build()?;
-
-        let snapshot = standby.observer().control_snapshot(ControlReadPolicy::default())?;
-        let current = std::array::from_fn(|index| snapshot.position[index].0);
+        let standby = standby.require_motion()?;
+        let current = current_positions(&standby)?;
         let prepared = prepare_move(current, &requested_positions, &profile.safety, self.force)?;
 
         if prepared.requires_confirmation && !confirm_prepared_move(&prepared)? {
@@ -78,10 +77,27 @@ impl MoveCommand {
             );
         }
 
-        let _standby = move_to_joint_target_blocking(standby, &profile, prepared.effective_target)?;
+        match standby {
+            MotionConnectedPiper::Strict(standby) => {
+                let _standby =
+                    move_to_joint_target_blocking(standby, &profile, prepared.effective_target)?;
+            },
+            MotionConnectedPiper::Soft(standby) => {
+                let _standby =
+                    move_to_joint_target_blocking(standby, &profile, prepared.effective_target)?;
+            },
+        }
         println!("✅ 移动完成");
         Ok(())
     }
+}
+
+fn current_positions(standby: &MotionConnectedPiper) -> Result<[f64; 6]> {
+    let positions = match standby {
+        MotionConnectedPiper::Strict(standby) => standby.observer().joint_positions()?,
+        MotionConnectedPiper::Soft(standby) => standby.observer().joint_positions()?,
+    };
+    Ok(std::array::from_fn(|index| positions[index].0))
 }
 
 #[cfg(test)]

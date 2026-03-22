@@ -32,9 +32,9 @@ use super::controller::Controller;
 use super::scheduler::{CycleScheduler, SleepStrategy};
 use crate::Piper;
 use crate::observer::ControlReadPolicy;
-use crate::state::{Active, MitMode};
+use crate::state::{Active, MitMode, StrictRealtime};
 use crate::types::RobotError;
-use piper_driver::TimingCapability;
+use piper_driver::BackendCapability;
 use std::time::Duration;
 
 /// 控制循环配置
@@ -118,7 +118,7 @@ impl Default for LoopConfig {
 /// # }
 /// ```
 pub fn run_controller<C>(
-    piper: Piper<Active<MitMode>>,
+    piper: Piper<Active<MitMode>, StrictRealtime>,
     mut controller: C,
     config: LoopConfig,
 ) -> Result<(), RobotError>
@@ -207,7 +207,7 @@ where
 ///
 /// ⚠️ **注意**: `spin_sleep` 会占用更多 CPU，适合对实时性要求极高的场景。
 pub fn run_controller_spin<C>(
-    piper: Piper<Active<MitMode>>,
+    piper: Piper<Active<MitMode>, StrictRealtime>,
     mut controller: C,
     config: LoopConfig,
 ) -> Result<(), RobotError>
@@ -277,12 +277,16 @@ where
     }
 }
 
-fn ensure_realtime_control_supported(piper: &Piper<Active<MitMode>>) -> Result<(), RobotError> {
-    match piper.driver.timing_capability() {
-        TimingCapability::RealtimeCapable => Ok(()),
-        TimingCapability::MonitorOnly => Err(RobotError::realtime_unsupported(
-            "controller loop requires a realtime-capable backend with reliable hardware alignment timestamps",
-        )),
+fn ensure_realtime_control_supported(
+    piper: &Piper<Active<MitMode>, StrictRealtime>,
+) -> Result<(), RobotError> {
+    match piper.driver.backend_capability() {
+        BackendCapability::StrictRealtime => Ok(()),
+        BackendCapability::SoftRealtime | BackendCapability::MonitorOnly => {
+            Err(RobotError::realtime_unsupported(
+                "controller loop requires a StrictRealtime backend with trusted alignment timestamps",
+            ))
+        },
     }
 }
 

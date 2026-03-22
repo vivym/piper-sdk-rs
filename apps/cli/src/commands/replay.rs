@@ -7,6 +7,8 @@ use crate::connection::{TargetArgs, client_builder, resolved_target_spec};
 use anyhow::Result;
 use clap::Args;
 use piper_control::TargetSpec;
+use piper_sdk::client::state::{MotionCapability, Standby};
+use piper_sdk::client::{MotionConnectedPiper, Piper};
 use piper_sdk::driver::ConnectionTarget;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -191,28 +193,42 @@ impl ReplayCommand {
 
         let builder = client_builder(&target);
 
-        let standby = builder.build()?;
+        let standby = builder.build()?.require_motion()?;
         println!("✅ 已连接");
 
         // === 进入回放模式 ===
 
+        match standby {
+            MotionConnectedPiper::Strict(standby) => {
+                Self::replay_with_standby(standby, &input, speed, &running)
+            },
+            MotionConnectedPiper::Soft(standby) => {
+                Self::replay_with_standby(standby, &input, speed, &running)
+            },
+        }
+    }
+
+    fn replay_with_standby<Capability>(
+        standby: Piper<Standby, Capability>,
+        input: &str,
+        speed: f64,
+        running: &Arc<AtomicBool>,
+    ) -> Result<()>
+    where
+        Capability: MotionCapability,
+    {
         println!("⏳ 进入回放模式...");
         let replay = standby.enter_replay_mode()?;
         println!("✅ 已进入回放模式（Driver tx_loop 已暂停）");
 
-        // === 回放录制（带取消支持） ===
-
         println!("🔄 开始回放...");
         println!();
 
-        // 使用支持取消的回放方法
-        match replay.replay_recording_with_cancel(&input, speed, &running) {
+        match replay.replay_recording_with_cancel(input, speed, running) {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("cancelled") => {
-                // ⚠️ 安全停止：发送零力矩或进入 Standby
                 println!("⚠️ 正在发送安全停止指令...");
                 println!("✅ 已进入 Standby");
-                // replay 已被消费，standby 已在方法中返回
                 Err(anyhow::anyhow!("Replay cancelled by user"))
             },
             Err(e) => Err(e.into()),

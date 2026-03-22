@@ -37,13 +37,15 @@
 //! # }
 //! ```
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::state::{CapabilityMarker, StrictCapability, UnspecifiedCapability};
 use crate::types::*;
 use piper_driver::{
-    AlignmentResult, DriverError, HealthStatus, Piper as RobotPiper, RuntimeFaultKind,
-    TimingCapability,
+    AlignmentResult, BackendCapability, DriverError, HealthStatus, Piper as RobotPiper,
+    RuntimeFaultKind,
 };
 use piper_protocol::constants::*;
 
@@ -55,9 +57,10 @@ const COMPLETE_DYNAMIC_GROUP_MASK: u8 = 0b11_1111;
 /// 直接持有 `driver::Piper` 引用，零拷贝、零延迟地读取底层状态。
 /// 不再使用缓存层，避免数据延迟和锁竞争。
 #[derive(Clone)]
-pub struct Observer {
+pub struct Observer<Capability = UnspecifiedCapability> {
     /// Driver 实例（直接持有，零拷贝）
     driver: Arc<RobotPiper>,
+    _capability: PhantomData<Capability>,
 }
 
 /// 碰撞保护配置快照
@@ -187,7 +190,10 @@ impl From<HealthStatus> for RuntimeHealthSnapshot {
     }
 }
 
-impl Observer {
+impl<Capability> Observer<Capability>
+where
+    Capability: CapabilityMarker,
+{
     /// 创建新的 Observer
     ///
     /// **注意：** 此方法通常不直接调用，Observer 应该通过 `Piper` 状态机的 `observer()` 方法获取。
@@ -195,7 +201,10 @@ impl Observer {
     ///
     /// **基准测试：** 为了支持性能基准测试，此方法在 benches 中也可访问。
     pub fn new(driver: Arc<RobotPiper>) -> Self {
-        Observer { driver }
+        Observer {
+            driver,
+            _capability: PhantomData,
+        }
     }
 
     /// 获取可直接用于控制闭环的对齐状态
@@ -205,12 +214,18 @@ impl Observer {
     /// - 位置状态和动态状态是否在允许的时间偏差内
     ///
     /// 任一条件不满足都会返回错误，不会返回“半可用”数据。
-    pub fn control_snapshot(&self, policy: ControlReadPolicy) -> Result<ControlSnapshot> {
+    pub fn control_snapshot(&self, policy: ControlReadPolicy) -> Result<ControlSnapshot>
+    where
+        Capability: StrictCapability,
+    {
         self.control_snapshot_full(policy).map(|snapshot| snapshot.state)
     }
 
     /// 获取带主机时间戳和反馈年龄的完整控制快照
-    pub fn control_snapshot_full(&self, policy: ControlReadPolicy) -> Result<ControlSnapshotFull> {
+    pub fn control_snapshot_full(&self, policy: ControlReadPolicy) -> Result<ControlSnapshotFull>
+    where
+        Capability: StrictCapability,
+    {
         self.ensure_realtime_control_supported()?;
 
         match self.driver.get_aligned_motion(policy.max_state_skew_us) {
@@ -586,12 +601,17 @@ impl Observer {
         self.driver.get_collision_protection().map(CollisionProtectionSnapshot::from)
     }
 
-    fn ensure_realtime_control_supported(&self) -> Result<()> {
-        match self.driver.timing_capability() {
-            TimingCapability::RealtimeCapable => Ok(()),
-            TimingCapability::MonitorOnly => Err(RobotError::realtime_unsupported(
-                "backend does not provide reliable hardware alignment timestamps; host-side closed-loop control is disabled",
-            )),
+    fn ensure_realtime_control_supported(&self) -> Result<()>
+    where
+        Capability: StrictCapability,
+    {
+        match self.driver.backend_capability() {
+            BackendCapability::StrictRealtime => Ok(()),
+            BackendCapability::SoftRealtime | BackendCapability::MonitorOnly => {
+                Err(RobotError::realtime_unsupported(
+                    "backend does not provide strict host-side closed-loop control semantics",
+                ))
+            },
         }
     }
 
@@ -731,14 +751,15 @@ impl Default for GripperState {
 }
 
 // 确保 Send + Sync
-unsafe impl Send for Observer {}
-unsafe impl Sync for Observer {}
+unsafe impl<Capability> Send for Observer<Capability> {}
+unsafe impl<Capability> Sync for Observer<Capability> {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{MonitorOnly, StrictRealtime};
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-    use piper_driver::TimingCapability;
+    use piper_driver::BackendCapability;
     use piper_protocol::ids::{
         ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_GRIPPER_FEEDBACK,
         ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
@@ -783,8 +804,8 @@ mod tests {
             self.inner.receive()
         }
 
-        fn timing_capability(&self) -> TimingCapability {
-            TimingCapability::MonitorOnly
+        fn backend_capability(&self) -> BackendCapability {
+            BackendCapability::MonitorOnly
         }
     }
 
@@ -945,34 +966,51 @@ mod tests {
         frame
     }
 
-    fn start_observer_with_frames(frames: Vec<PiperFrame>) -> (Arc<RobotPiper>, Observer) {
-        let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(ScriptedRxAdapter::new(frames), IdleTxAdapter, None)
-                .expect("driver should start"),
-        );
-        let observer = Observer::new(driver.clone());
-        (driver, observer)
-    }
-
-    fn start_observer_with_timed_frames(frames: Vec<TimedFrame>) -> (Arc<RobotPiper>, Observer) {
-        let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(PacedRxAdapter::new(frames), IdleTxAdapter, None)
-                .expect("driver should start"),
-        );
-        let observer = Observer::new(driver.clone());
-        (driver, observer)
-    }
-
-    fn start_monitor_only_observer(frames: Vec<PiperFrame>) -> (Arc<RobotPiper>, Observer) {
+    fn start_observer_with_frames(
+        frames: Vec<PiperFrame>,
+    ) -> (Arc<RobotPiper>, Observer<StrictRealtime>) {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
+                BackendCapability::StrictRealtime,
+                ScriptedRxAdapter::new(frames),
+                IdleTxAdapter,
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
+        (driver, observer)
+    }
+
+    fn start_observer_with_timed_frames(
+        frames: Vec<TimedFrame>,
+    ) -> (Arc<RobotPiper>, Observer<StrictRealtime>) {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                BackendCapability::StrictRealtime,
+                PacedRxAdapter::new(frames),
+                IdleTxAdapter,
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
+        (driver, observer)
+    }
+
+    fn start_monitor_only_observer(
+        frames: Vec<PiperFrame>,
+    ) -> (Arc<RobotPiper>, Observer<MonitorOnly>) {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                BackendCapability::MonitorOnly,
                 MonitorOnlyRxAdapter::new(frames),
                 IdleTxAdapter,
                 None,
             )
             .expect("driver should start"),
         );
-        let observer = Observer::new(driver.clone());
+        let observer = Observer::<MonitorOnly>::new(driver.clone());
         (driver, observer)
     }
 
@@ -1001,13 +1039,14 @@ mod tests {
         let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
+                BackendCapability::StrictRealtime,
                 ScriptedRxAdapter::new(vec![frame]),
                 IdleTxAdapter,
                 None,
             )
             .expect("driver should start"),
         );
-        let observer = Observer::new(driver.clone());
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
 
         driver
             .wait_for_feedback(Duration::from_millis(200))
@@ -1122,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_control_snapshot_rejects_monitor_only_backend() {
+    fn test_monitor_only_observer_reports_capability_without_control_snapshot_api() {
         let timestamp_us = 1_000;
         let frames = vec![
             joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
@@ -1141,11 +1180,8 @@ mod tests {
             .wait_for_feedback(Duration::from_millis(200))
             .expect("feedback should arrive");
 
-        let error = observer
-            .control_snapshot(ControlReadPolicy::default())
-            .expect_err("monitor-only backend must reject host-side closed-loop reads");
-
-        assert!(matches!(error, RobotError::RealtimeUnsupported { .. }));
+        assert_eq!(driver.backend_capability(), BackendCapability::MonitorOnly);
+        let _ = observer.runtime_health();
     }
 
     #[test]
@@ -1257,8 +1293,9 @@ mod tests {
 
     #[test]
     fn test_control_snapshot_prioritizes_incomplete_over_stale_and_misaligned() {
-        let error = Observer::new(Arc::new(
+        let error = Observer::<StrictRealtime>::new(Arc::new(
             RobotPiper::new_dual_thread_parts(
+                BackendCapability::StrictRealtime,
                 ScriptedRxAdapter::new(Vec::new()),
                 IdleTxAdapter,
                 None,

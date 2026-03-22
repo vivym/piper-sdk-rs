@@ -33,6 +33,12 @@ pub struct PiperMetrics {
 
     /// RX 有效帧数（过滤 Echo 后的真实反馈帧）
     pub rx_frames_valid: AtomicU64,
+    /// RX 收到的 transport error frame 总数
+    pub rx_error_frames_total: AtomicU64,
+    /// RX 检测到的 Bus-Off 总次数
+    pub rx_bus_off_total: AtomicU64,
+    /// RX 检测到的 Error-Passive 总次数
+    pub rx_error_passive_total: AtomicU64,
 
     /// RX 过滤掉的 Echo 帧数（GS-USB 特有）
     pub rx_echo_filtered: AtomicU64,
@@ -95,6 +101,12 @@ pub struct PiperMetrics {
     pub rx_end_pose_incomplete_groups_dropped_total: AtomicU64,
     /// 关节动态部分帧组被丢弃的次数
     pub rx_joint_dynamic_groups_dropped_total: AtomicU64,
+    /// 关节动态完整组因控制级时间跨度超限而被拒绝的次数
+    pub rx_joint_dynamic_control_grade_rejected_total: AtomicU64,
+    /// SoftRealtime 控制发送 deadline miss 总次数
+    pub tx_soft_deadline_miss_total: AtomicU64,
+    /// SoftRealtime 连续 deadline miss 续增总次数
+    pub tx_soft_consecutive_deadline_miss_total: AtomicU64,
 }
 
 impl PiperMetrics {
@@ -115,6 +127,9 @@ impl PiperMetrics {
         MetricsSnapshot {
             rx_frames_total: self.rx_frames_total.load(Ordering::Relaxed),
             rx_frames_valid: self.rx_frames_valid.load(Ordering::Relaxed),
+            rx_error_frames_total: self.rx_error_frames_total.load(Ordering::Relaxed),
+            rx_bus_off_total: self.rx_bus_off_total.load(Ordering::Relaxed),
+            rx_error_passive_total: self.rx_error_passive_total.load(Ordering::Relaxed),
             rx_echo_filtered: self.rx_echo_filtered.load(Ordering::Relaxed),
             tx_frames_sent_total: self.tx_frames_sent_total.load(Ordering::Relaxed),
             tx_realtime_enqueued_total: self.tx_realtime_enqueued_total.load(Ordering::Relaxed),
@@ -149,6 +164,13 @@ impl PiperMetrics {
             rx_joint_dynamic_groups_dropped_total: self
                 .rx_joint_dynamic_groups_dropped_total
                 .load(Ordering::Relaxed),
+            rx_joint_dynamic_control_grade_rejected_total: self
+                .rx_joint_dynamic_control_grade_rejected_total
+                .load(Ordering::Relaxed),
+            tx_soft_deadline_miss_total: self.tx_soft_deadline_miss_total.load(Ordering::Relaxed),
+            tx_soft_consecutive_deadline_miss_total: self
+                .tx_soft_consecutive_deadline_miss_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -158,6 +180,9 @@ impl PiperMetrics {
     pub fn reset(&self) {
         self.rx_frames_total.store(0, Ordering::Relaxed);
         self.rx_frames_valid.store(0, Ordering::Relaxed);
+        self.rx_error_frames_total.store(0, Ordering::Relaxed);
+        self.rx_bus_off_total.store(0, Ordering::Relaxed);
+        self.rx_error_passive_total.store(0, Ordering::Relaxed);
         self.rx_echo_filtered.store(0, Ordering::Relaxed);
         self.tx_frames_sent_total.store(0, Ordering::Relaxed);
         self.tx_realtime_enqueued_total.store(0, Ordering::Relaxed);
@@ -181,6 +206,9 @@ impl PiperMetrics {
         self.rx_joint_position_control_grade_rejected_total.store(0, Ordering::Relaxed);
         self.rx_end_pose_incomplete_groups_dropped_total.store(0, Ordering::Relaxed);
         self.rx_joint_dynamic_groups_dropped_total.store(0, Ordering::Relaxed);
+        self.rx_joint_dynamic_control_grade_rejected_total.store(0, Ordering::Relaxed);
+        self.tx_soft_deadline_miss_total.store(0, Ordering::Relaxed);
+        self.tx_soft_consecutive_deadline_miss_total.store(0, Ordering::Relaxed);
     }
 }
 
@@ -193,6 +221,12 @@ pub struct MetricsSnapshot {
     pub rx_frames_total: u64,
     /// RX 有效帧数
     pub rx_frames_valid: u64,
+    /// RX transport error frame 总数
+    pub rx_error_frames_total: u64,
+    /// RX Bus-Off 总次数
+    pub rx_bus_off_total: u64,
+    /// RX Error-Passive 总次数
+    pub rx_error_passive_total: u64,
     /// RX 过滤掉的 Echo 帧数
     pub rx_echo_filtered: u64,
     /// TX 成功发送的总帧数
@@ -237,6 +271,12 @@ pub struct MetricsSnapshot {
     pub rx_end_pose_incomplete_groups_dropped_total: u64,
     /// 关节动态部分帧组被丢弃的次数
     pub rx_joint_dynamic_groups_dropped_total: u64,
+    /// 关节动态完整组因控制级时间跨度超限而被拒绝的次数
+    pub rx_joint_dynamic_control_grade_rejected_total: u64,
+    /// SoftRealtime 控制发送 deadline miss 总次数
+    pub tx_soft_deadline_miss_total: u64,
+    /// SoftRealtime 连续 deadline miss 续增总次数
+    pub tx_soft_consecutive_deadline_miss_total: u64,
 }
 
 impl MetricsSnapshot {
@@ -409,6 +449,7 @@ mod tests {
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
+            ..Default::default()
         };
 
         assert_eq!(snapshot.echo_filter_rate(), 20.0);
@@ -443,6 +484,7 @@ mod tests {
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
+            ..Default::default()
         };
 
         assert_eq!(snapshot.echo_filter_rate(), 0.0);
@@ -477,6 +519,7 @@ mod tests {
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
+            ..Default::default()
         };
 
         // 20% 覆盖率（正常情况）
@@ -520,6 +563,7 @@ mod tests {
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
+            ..Default::default()
         };
 
         // 总数为 0 时，覆盖率应该为 0.0
@@ -554,6 +598,7 @@ mod tests {
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
+            ..Default::default()
         };
 
         assert_eq!(snapshot.overwrite_rate(), 25.0);
@@ -587,6 +632,7 @@ mod tests {
             rx_joint_position_control_grade_rejected_total: 0,
             rx_end_pose_incomplete_groups_dropped_total: 0,
             rx_joint_dynamic_groups_dropped_total: 0,
+            ..Default::default()
         };
         assert!(!normal.is_overwrite_rate_abnormal());
 

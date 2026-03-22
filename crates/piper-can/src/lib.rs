@@ -68,13 +68,32 @@ pub mod mock;
 #[cfg(feature = "mock")]
 pub use mock::MockCanAdapter;
 
-/// Backend timing capability for host-side realtime control.
+/// Backend capability level exposed to upper layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimingCapability {
-    /// Backend provides a monotonic device/transport time base suitable for host-side closed-loop control.
-    RealtimeCapable,
+pub enum BackendCapability {
+    /// Backend can be used for strict host-side closed-loop realtime control.
+    StrictRealtime,
+    /// Backend can be used for bounded soft-realtime or task-style control, but not strict host-side closed-loop control.
+    SoftRealtime,
     /// Backend can be used for monitoring / recording / open-loop commands only.
     MonitorOnly,
+}
+
+impl BackendCapability {
+    #[inline]
+    pub fn is_strict_realtime(self) -> bool {
+        matches!(self, Self::StrictRealtime)
+    }
+
+    #[inline]
+    pub fn is_soft_realtime(self) -> bool {
+        matches!(self, Self::SoftRealtime)
+    }
+
+    #[inline]
+    pub fn supports_motion_control(self) -> bool {
+        matches!(self, Self::StrictRealtime | Self::SoftRealtime)
+    }
 }
 
 /// CAN 适配层统一错误类型
@@ -169,8 +188,8 @@ pub trait CanAdapter {
 pub trait RxAdapter {
     fn receive(&mut self) -> Result<PiperFrame, CanError>;
 
-    fn timing_capability(&self) -> TimingCapability {
-        TimingCapability::RealtimeCapable
+    fn backend_capability(&self) -> BackendCapability {
+        BackendCapability::StrictRealtime
     }
 }
 
@@ -182,8 +201,8 @@ where
         (**self).receive()
     }
 
-    fn timing_capability(&self) -> TimingCapability {
-        (**self).timing_capability()
+    fn backend_capability(&self) -> BackendCapability {
+        (**self).backend_capability()
     }
 }
 
@@ -237,5 +256,8 @@ where
 pub trait SplittableAdapter: CanAdapter {
     type RxAdapter: RxAdapter;
     type TxAdapter: RealtimeTxAdapter;
+    fn backend_capability(&self) -> BackendCapability {
+        BackendCapability::StrictRealtime
+    }
     fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError>;
 }

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::Args;
-use piper_sdk::client::ControlReadPolicy;
+use piper_sdk::client::ConnectedPiper;
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -26,11 +26,23 @@ impl PositionCommand {
 
         println!("🔌 连接到机器人...");
         let robot = builder.build()?;
-        let observer = robot.observer();
-        let snapshot = observer.control_snapshot(ControlReadPolicy::default())?;
+        let (positions, end_pose) = match &robot {
+            ConnectedPiper::Strict(robot) => (
+                robot.observer().joint_positions()?,
+                robot.observer().end_pose()?,
+            ),
+            ConnectedPiper::Soft(robot) => (
+                robot.observer().joint_positions()?,
+                robot.observer().end_pose()?,
+            ),
+            ConnectedPiper::Monitor(robot) => (
+                robot.observer().joint_positions()?,
+                robot.observer().end_pose()?,
+            ),
+        };
 
         println!("📊 关节位置:");
-        for (index, pos) in snapshot.position.iter().enumerate() {
+        for (index, pos) in positions.iter().enumerate() {
             println!(
                 "  J{}: {:.3} rad ({:.1}°)",
                 index + 1,
@@ -39,7 +51,6 @@ impl PositionCommand {
             );
         }
 
-        let end_pose = observer.end_pose()?;
         println!("\n📍 末端位姿:");
         println!("  位置 (m):");
         println!("    X: {:.4}", end_pose.end_pose[0]);

@@ -59,7 +59,19 @@ impl<'a> RawCommander<'a> {
         timeout: Duration,
     ) -> Result<()> {
         let frames_array = commands.map(MitControlCommand::to_frame);
-        self.driver.send_realtime_package_confirmed(frames_array, timeout)?;
+        match self.driver.backend_capability() {
+            piper_driver::BackendCapability::StrictRealtime => {
+                self.driver.send_realtime_package_confirmed(frames_array, timeout)?
+            },
+            piper_driver::BackendCapability::SoftRealtime => {
+                self.driver.send_soft_realtime_package_confirmed(frames_array, timeout)?
+            },
+            piper_driver::BackendCapability::MonitorOnly => {
+                return Err(RobotError::realtime_unsupported(
+                    "monitor-only backends cannot send MIT command batches",
+                ));
+            },
+        }
         Ok(())
     }
 
@@ -427,6 +439,7 @@ unsafe impl<'a> Sync for RawCommander<'a> {}
 mod tests {
     use super::*;
     use piper_can::{CanError, RealtimeTxAdapter, RxAdapter};
+    use piper_driver::BackendCapability;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -476,8 +489,13 @@ mod tests {
     }
 
     fn build_driver(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> RobotPiper {
-        RobotPiper::new_dual_thread_parts(IdleRxAdapter, RecordingTxAdapter::new(sent_frames), None)
-            .expect("driver should start")
+        RobotPiper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
+            IdleRxAdapter,
+            RecordingTxAdapter::new(sent_frames),
+            None,
+        )
+        .expect("driver should start")
     }
 
     fn wait_for_sent_frames(

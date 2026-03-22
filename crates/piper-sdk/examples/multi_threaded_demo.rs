@@ -62,6 +62,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .build()?
         }
     };
+    let robot = robot.require_strict()?;
     let robot = robot.enable_mit_mode(MitModeConfig::default())?;
     println!("   ✅ 使能成功\n");
 

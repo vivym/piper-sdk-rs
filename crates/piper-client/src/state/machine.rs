@@ -6,12 +6,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::connection::initialize_connected_driver;
+use crate::state::capability::{
+    CapabilityMarker, MonitorOnly, MotionCapability, SoftRealtime, StrictCapability,
+    StrictRealtime, UnspecifiedCapability,
+};
 use crate::types::*;
 use crate::{
     observer::{CollisionProtectionSnapshot, MonitorReadPolicy, Observer, RuntimeHealthSnapshot},
     raw_commander::RawCommander,
 };
+use piper_driver::BackendCapability;
 use piper_protocol::control::{InstallPosition, MitControlCommand};
+use piper_protocol::feedback::{ControlMode, MoveMode};
 use tracing::{debug, info, trace};
 
 const COLLISION_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -39,6 +45,11 @@ pub struct Active<Mode>(Mode);
 ///
 /// 支持位置、速度、力矩的混合控制。
 pub struct MitMode;
+
+/// SoftRealtime MIT 透传模式
+///
+/// 只允许提交原始 6 关节 MIT 批命令，不提供宿主机闭环 helper。
+pub struct MitPassthroughMode;
 
 /// 位置模式
 ///
@@ -356,14 +367,57 @@ impl Default for DisableConfig {
 /// # 内存开销
 ///
 /// 大部分状态是零大小类型（ZST），除了 `Active<PositionMode>` 包含 `send_strategy` 配置。
-pub struct Piper<State = Disconnected> {
+pub struct Piper<State = Disconnected, Capability = UnspecifiedCapability> {
     pub(crate) driver: Arc<piper_driver::Piper>,
-    pub(crate) observer: Observer,
+    pub(crate) observer: Observer<Capability>,
     pub(crate) quirks: DeviceQuirks,
     pub(crate) _state: State, // 改为直接存储状态（不再使用 PhantomData）
 }
 
-impl<State> Piper<State> {
+pub enum ConnectedPiper {
+    Strict(Piper<Standby, StrictRealtime>),
+    Soft(Piper<Standby, SoftRealtime>),
+    Monitor(Piper<Standby, MonitorOnly>),
+}
+
+impl ConnectedPiper {
+    pub fn backend_capability(&self) -> BackendCapability {
+        match self {
+            Self::Strict(_) => BackendCapability::StrictRealtime,
+            Self::Soft(_) => BackendCapability::SoftRealtime,
+            Self::Monitor(_) => BackendCapability::MonitorOnly,
+        }
+    }
+
+    pub fn require_strict(self) -> Result<Piper<Standby, StrictRealtime>> {
+        match self {
+            Self::Strict(piper) => Ok(piper),
+            Self::Soft(_) | Self::Monitor(_) => Err(RobotError::realtime_unsupported(
+                "this connection is not StrictRealtime; match on ConnectedPiper or request AutoStrict",
+            )),
+        }
+    }
+
+    pub fn require_motion(self) -> Result<MotionConnectedPiper> {
+        match self {
+            Self::Strict(piper) => Ok(MotionConnectedPiper::Strict(piper)),
+            Self::Soft(piper) => Ok(MotionConnectedPiper::Soft(piper)),
+            Self::Monitor(_) => Err(RobotError::realtime_unsupported(
+                "monitor-only connections cannot enter motion control states",
+            )),
+        }
+    }
+}
+
+pub enum MotionConnectedPiper {
+    Strict(Piper<Standby, StrictRealtime>),
+    Soft(Piper<Standby, SoftRealtime>),
+}
+
+impl<State, Capability> Piper<State, Capability>
+where
+    Capability: CapabilityMarker,
+{
     /// Attach the non-realtime bridge host to this controller-owned Piper instance.
     pub fn attach_bridge_host(
         &self,
@@ -414,9 +468,56 @@ where
     }
 }
 
+pub(crate) fn connected_piper_from_driver(
+    driver: Arc<piper_driver::Piper>,
+    quirks: DeviceQuirks,
+) -> ConnectedPiper {
+    match driver.backend_capability() {
+        BackendCapability::StrictRealtime => ConnectedPiper::Strict(Piper {
+            observer: Observer::<StrictRealtime>::new(driver.clone()),
+            driver,
+            quirks,
+            _state: Standby,
+        }),
+        BackendCapability::SoftRealtime => ConnectedPiper::Soft(Piper {
+            observer: Observer::<SoftRealtime>::new(driver.clone()),
+            driver,
+            quirks,
+            _state: Standby,
+        }),
+        BackendCapability::MonitorOnly => ConnectedPiper::Monitor(Piper {
+            observer: Observer::<MonitorOnly>::new(driver.clone()),
+            driver,
+            quirks,
+            _state: Standby,
+        }),
+    }
+}
+
+fn transition_piper_state<State, NewState, Capability>(
+    this: Piper<State, Capability>,
+    new_state: NewState,
+) -> Piper<NewState, Capability>
+where
+    Capability: CapabilityMarker,
+{
+    let this = std::mem::ManuallyDrop::new(this);
+
+    let driver = unsafe { std::ptr::read(&this.driver) };
+    let observer = unsafe { std::ptr::read(&this.observer) };
+    let quirks = this.quirks.clone();
+
+    Piper {
+        driver,
+        observer,
+        quirks,
+        _state: new_state,
+    }
+}
+
 // ==================== Disconnected 状态 ====================
 
-impl Piper<Disconnected> {
+impl Piper<Disconnected, UnspecifiedCapability> {
     /// 连接到机械臂
     ///
     /// # 参数
@@ -428,7 +529,7 @@ impl Piper<Disconnected> {
     ///
     /// - `HighLevelError::Infrastructure`: CAN 设备初始化失败
     /// - `HighLevelError::Timeout`: 等待反馈超时
-    pub fn connect<C>(can_adapter: C, config: ConnectionConfig) -> Result<Piper<Standby>>
+    pub fn connect<C>(can_adapter: C, config: ConnectionConfig) -> Result<ConnectedPiper>
     where
         C: piper_can::SplittableAdapter + Send + 'static,
         C::RxAdapter: Send + 'static,
@@ -437,18 +538,13 @@ impl Piper<Disconnected> {
         use piper_driver::Piper as RobotPiper;
 
         let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
-        let connected = initialize_connected_driver(
+        let quirks = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
             config.firmware_timeout,
         )?;
 
-        Ok(Piper {
-            driver,
-            observer: connected.observer,
-            quirks: connected.quirks,
-            _state: Standby,
-        })
+        Ok(connected_piper_from_driver(driver, quirks))
     }
 
     /// 重新连接到机械臂（用于连接丢失后重新建立连接）
@@ -478,7 +574,7 @@ impl Piper<Disconnected> {
     ///
     /// **注意**: 由于 `Disconnected` 是 ZST，`self` 参数本质上只是类型标记。
     /// 此方法与 `connect()` 功能相同，但语义上表示"重新连接"操作。
-    pub fn reconnect<C>(self, can_adapter: C, config: ConnectionConfig) -> Result<Piper<Standby>>
+    pub fn reconnect<C>(self, can_adapter: C, config: ConnectionConfig) -> Result<ConnectedPiper>
     where
         C: piper_can::SplittableAdapter + Send + 'static,
         C::RxAdapter: Send + 'static,
@@ -489,7 +585,7 @@ impl Piper<Disconnected> {
         // 1. 创建新的 driver 实例
         use piper_driver::Piper as RobotPiper;
         let driver = Arc::new(RobotPiper::new_dual_thread(can_adapter, None)?);
-        let connected = initialize_connected_driver(
+        let quirks = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
             config.firmware_timeout,
@@ -497,18 +593,16 @@ impl Piper<Disconnected> {
 
         // 5. 返回到 Standby 状态
         info!("Reconnection successful");
-        Ok(Piper {
-            driver,
-            observer: connected.observer,
-            quirks: connected.quirks,
-            _state: Standby,
-        })
+        Ok(connected_piper_from_driver(driver, quirks))
     }
 }
 
 // ==================== Standby 状态 ====================
 
-impl Piper<Standby> {
+impl<Capability> Piper<Standby, Capability>
+where
+    Capability: CapabilityMarker,
+{
     /// 使能 MIT 模式
     ///
     /// # 错误
@@ -527,9 +621,14 @@ impl Piper<Standby> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn enable_mit_mode(self, config: MitModeConfig) -> Result<Piper<Active<MitMode>>> {
+    pub fn enable_mit_mode(
+        self,
+        config: MitModeConfig,
+    ) -> Result<Piper<Active<MitMode>, Capability>>
+    where
+        Capability: StrictCapability,
+    {
         use piper_protocol::control::*;
-        use piper_protocol::feedback::MoveMode;
 
         debug!("Enabling MIT mode (speed_percent={})", config.speed_percent);
 
@@ -548,50 +647,28 @@ impl Piper<Standby> {
         )?;
         debug!("All motors enabled (debounced)");
 
+        let baseline = self.driver.get_robot_control();
+
         // 3. 设置 MIT 模式
-        // ✅ 关键修正：MoveMode 必须设为 MoveM (0x04)
-        // 注意：需要固件版本 >= V1.5-2
         let control_cmd = ControlModeCommandFrame::new(
             ControlModeCommand::CanControl,
-            MoveMode::MoveM,      // ✅ 修正：从 MoveP 改为 MoveM
-            config.speed_percent, // ✅ 修正：使用配置的速度（默认100），避免设为0导致锁死
-            MitMode::Mit,         // MIT 控制器 (0xAD)
+            MoveMode::MoveM,
+            config.speed_percent,
+            piper_protocol::control::MitMode::Mit,
             0,
             InstallPosition::Invalid,
         );
         self.driver.send_reliable(control_cmd.to_frame())?;
+        self.wait_for_mode_confirmation(
+            baseline,
+            config.timeout,
+            config.poll_interval,
+            ControlMode::CanControl as u8,
+            MoveMode::MoveM as u8,
+        )?;
         info!("Robot enabled - Active<MitMode>");
 
-        // === PHASE 2: No-panic zone - must not panic after this point ===
-
-        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>.
-        // We're moving it out of ManuallyDrop, which prevents the original
-        // `self` from being dropped. This is safe because:
-        // 1. `this.driver` is immediately moved into the returned Piper
-        // 2. No other access to `this.driver` occurs after this read
-        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
-        let driver = unsafe { std::ptr::read(&this.driver) };
-
-        // SAFETY: `this.observer` is a valid Arc<Observer>.
-        // Same safety reasoning as driver above.
-        let observer = unsafe { std::ptr::read(&this.observer) };
-
-        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
-        let quirks = this.quirks.clone();
-
-        // `this` is dropped here, but since it's ManuallyDrop,
-        // the inner `self` is NOT dropped, preventing double-disable
-
-        // Construct new state (no Arc ref count increase!)
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: Active(MitMode),
-        })
+        Ok(transition_piper_state(self, Active(MitMode)))
     }
 
     /// 使能位置模式
@@ -603,10 +680,11 @@ impl Piper<Standby> {
     pub fn enable_position_mode(
         self,
         config: PositionModeConfig,
-    ) -> Result<Piper<Active<PositionMode>>> {
+    ) -> Result<Piper<Active<PositionMode>, Capability>>
+    where
+        Capability: MotionCapability,
+    {
         use piper_protocol::control::*;
-        use piper_protocol::feedback::MoveMode;
-
         debug!(
             "Enabling Position mode (motion_type={:?}, speed_percent={})",
             config.motion_type, config.speed_percent
@@ -626,6 +704,7 @@ impl Piper<Standby> {
             config.poll_interval,
         )?;
         debug!("All motors enabled (debounced)");
+        let baseline = self.driver.get_robot_control();
 
         // 3. 设置位置模式
         // ✅ 修改：使用配置的 motion_type
@@ -633,52 +712,32 @@ impl Piper<Standby> {
 
         let control_cmd = ControlModeCommandFrame::new(
             ControlModeCommand::CanControl,
-            move_mode, // ✅ 使用配置的运动类型
+            move_mode,
             config.speed_percent,
-            MitMode::PositionVelocity,
+            piper_protocol::control::MitMode::PositionVelocity,
             0,
             config.install_position,
         );
         self.driver.send_reliable(control_cmd.to_frame())?;
+        self.wait_for_mode_confirmation(
+            baseline,
+            config.timeout,
+            config.poll_interval,
+            ControlMode::CanControl as u8,
+            move_mode as u8,
+        )?;
         info!("Robot enabled - Active<PositionMode>");
-
-        // === PHASE 2: No-panic zone - must not panic after this point ===
-
-        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>.
-        // We're moving it out of ManuallyDrop, which prevents the original
-        // `self` from being dropped. This is safe because:
-        // 1. `this.driver` is immediately moved into the returned Piper
-        // 2. No other access to `this.driver` occurs after this read
-        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
-        let driver = unsafe { std::ptr::read(&this.driver) };
-
-        // SAFETY: `this.observer` is a valid Arc<Observer>.
-        // Same safety reasoning as driver above.
-        let observer = unsafe { std::ptr::read(&this.observer) };
-
-        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
-        let quirks = this.quirks.clone();
-
-        // `this` is dropped here, but since it's ManuallyDrop,
-        // the inner `self` is NOT dropped, preventing double-disable
-
-        // Construct new state with send_strategy from config (no Arc ref count increase!)
         let position_mode = PositionMode::with_strategy(config.send_strategy);
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: Active(position_mode),
-        })
+        Ok(transition_piper_state(self, Active(position_mode)))
     }
 
     /// 使能全部关节并切换到 MIT 模式
     ///
     /// 这是 `enable_mit_mode` 的便捷方法，使用默认配置。
-    pub fn enable_all(self) -> Result<Piper<Active<MitMode>>> {
+    pub fn enable_all(self) -> Result<Piper<Active<MitMode>, Capability>>
+    where
+        Capability: StrictCapability,
+    {
         self.enable_mit_mode(MitModeConfig::default())
     }
 
@@ -691,7 +750,10 @@ impl Piper<Standby> {
     /// # 返回
     ///
     /// 返回 `Piper<Standby>`，因为只是部分使能，不转换到 Active 状态。
-    pub fn enable_joints(self, joints: &[Joint]) -> Result<Piper<Standby>> {
+    pub fn enable_joints(self, joints: &[Joint]) -> Result<Piper<Standby, Capability>>
+    where
+        Capability: MotionCapability,
+    {
         use piper_protocol::control::MotorEnableCommand;
 
         for &joint in joints {
@@ -713,7 +775,10 @@ impl Piper<Standby> {
     /// # 返回
     ///
     /// 返回 `Piper<Standby>`，因为只是部分使能，不转换到 Active 状态。
-    pub fn enable_joint(self, joint: Joint) -> Result<Piper<Standby>> {
+    pub fn enable_joint(self, joint: Joint) -> Result<Piper<Standby, Capability>>
+    where
+        Capability: MotionCapability,
+    {
         use piper_protocol::control::MotorEnableCommand;
 
         let cmd = MotorEnableCommand::enable(joint.index() as u8);
@@ -728,7 +793,10 @@ impl Piper<Standby> {
     /// # 返回
     ///
     /// 返回 `()`，因为失能后仍然保持 Standby 状态。
-    pub fn disable_all(&self) -> Result<()> {
+    pub fn disable_all(&self) -> Result<()>
+    where
+        Capability: MotionCapability,
+    {
         use piper_protocol::control::MotorEnableCommand;
 
         self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
@@ -744,7 +812,10 @@ impl Piper<Standby> {
     /// # 返回
     ///
     /// 返回 `()`，因为失能后仍然保持 Standby 状态。
-    pub fn disable_joints(self, joints: &[Joint]) -> Result<()> {
+    pub fn disable_joints(self, joints: &[Joint]) -> Result<()>
+    where
+        Capability: MotionCapability,
+    {
         use piper_protocol::control::MotorEnableCommand;
 
         for &joint in joints {
@@ -759,7 +830,7 @@ impl Piper<Standby> {
     /// 获取 Observer（只读）
     ///
     /// 即使在 Standby 状态，也可以读取机械臂状态。
-    pub fn observer(&self) -> &Observer {
+    pub fn observer(&self) -> &Observer<Capability> {
         &self.observer
     }
 
@@ -815,6 +886,45 @@ impl Piper<Standby> {
             let remaining = timeout.saturating_sub(start.elapsed());
             let sleep_duration = poll_interval.min(remaining);
 
+            if sleep_duration.is_zero() {
+                return Err(RobotError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+
+            std::thread::sleep(sleep_duration);
+        }
+    }
+
+    fn wait_for_mode_confirmation(
+        &self,
+        baseline: piper_driver::RobotControlState,
+        timeout: Duration,
+        poll_interval: Duration,
+        expected_control_mode: u8,
+        expected_move_mode: u8,
+    ) -> Result<()> {
+        let start = Instant::now();
+
+        loop {
+            if start.elapsed() > timeout {
+                return Err(RobotError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+
+            let current = self.driver.get_robot_control();
+            let is_fresh = current.hardware_timestamp_us > baseline.hardware_timestamp_us
+                || current.host_rx_mono_us > baseline.host_rx_mono_us;
+            let is_match = current.is_enabled
+                && current.control_mode == expected_control_mode
+                && current.move_mode == expected_move_mode;
+            if is_fresh && is_match {
+                return Ok(());
+            }
+
+            let remaining = timeout.saturating_sub(start.elapsed());
+            let sleep_duration = poll_interval.min(remaining);
             if sleep_duration.is_zero() {
                 return Err(RobotError::Timeout {
                     timeout_ms: timeout.as_millis() as u64,
@@ -1033,7 +1143,7 @@ impl Piper<Standby> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn enter_replay_mode(self) -> Result<Piper<ReplayMode>> {
+    pub fn enter_replay_mode(self) -> Result<Piper<ReplayMode, Capability>> {
         use piper_driver::mode::DriverMode;
 
         // 切换 Driver 到 Replay 模式
@@ -1041,20 +1151,7 @@ impl Piper<Standby> {
 
         tracing::info!("Entered ReplayMode - TX thread periodic sending paused");
 
-        // 状态转换：Standby -> ReplayMode
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
-        let driver = unsafe { std::ptr::read(&this.driver) };
-        let observer = unsafe { std::ptr::read(&this.observer) };
-        let quirks = this.quirks.clone();
-
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: ReplayMode,
-        })
+        Ok(transition_piper_state(self, ReplayMode))
     }
 
     /// 设置碰撞保护级别
@@ -1138,10 +1235,55 @@ impl Piper<Standby> {
     }
 }
 
+impl Piper<Standby, SoftRealtime> {
+    pub fn enable_mit_passthrough(
+        self,
+        config: MitModeConfig,
+    ) -> Result<Piper<Active<MitPassthroughMode>, SoftRealtime>> {
+        use piper_protocol::control::*;
+
+        debug!(
+            "Enabling MIT passthrough mode (speed_percent={})",
+            config.speed_percent
+        );
+
+        let enable_cmd = MotorEnableCommand::enable_all();
+        self.driver.send_reliable(enable_cmd.to_frame())?;
+        self.wait_for_enabled(
+            config.timeout,
+            config.debounce_threshold,
+            config.poll_interval,
+        )?;
+
+        let baseline = self.driver.get_robot_control();
+        let control_cmd = ControlModeCommandFrame::new(
+            ControlModeCommand::CanControl,
+            MoveMode::MoveM,
+            config.speed_percent,
+            piper_protocol::control::MitMode::Mit,
+            0,
+            InstallPosition::Invalid,
+        );
+        self.driver.send_reliable(control_cmd.to_frame())?;
+        self.wait_for_mode_confirmation(
+            baseline,
+            config.timeout,
+            config.poll_interval,
+            ControlMode::CanControl as u8,
+            MoveMode::MoveM as u8,
+        )?;
+
+        Ok(transition_piper_state(self, Active(MitPassthroughMode)))
+    }
+}
+
 // ==================== 所有状态共享的辅助方法 ====================
 
-impl<State> Piper<State> {
-    fn into_state<NextState>(self, next_state: NextState) -> Piper<NextState> {
+impl<State, Capability> Piper<State, Capability>
+where
+    Capability: CapabilityMarker,
+{
+    fn into_state<NextState>(self, next_state: NextState) -> Piper<NextState, Capability> {
         let this = std::mem::ManuallyDrop::new(self);
         let driver = unsafe { std::ptr::read(&this.driver) };
         let observer = unsafe { std::ptr::read(&this.observer) };
@@ -1271,43 +1413,14 @@ impl<State> Piper<State> {
     /// // robot 现在是 Piper<ErrorState>，无法调用 command_torques 等方法
     /// // robot.command_torques(...); // ❌ 编译错误
     /// ```
-    pub fn emergency_stop(self) -> Result<Piper<ErrorState>> {
+    pub fn emergency_stop(self) -> Result<Piper<ErrorState, Capability>> {
         self.driver.latch_fault();
         let raw_commander = RawCommander::new(&self.driver);
         let receipt =
             raw_commander.emergency_stop_enqueue(Instant::now() + Duration::from_millis(20))?;
         receipt.wait()?;
 
-        // === PHASE 2: No-panic zone - must not panic after this point ===
-
-        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>.
-        // We're moving it out of ManuallyDrop, which prevents the original
-        // `self` from being dropped. This is safe because:
-        // 1. `this.driver` is immediately moved into the returned Piper
-        // 2. No other access to `this.driver` occurs after this read
-        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
-        let driver = unsafe { std::ptr::read(&this.driver) };
-
-        // SAFETY: `this.observer` is a valid Arc<Observer>.
-        // Same safety reasoning as driver above.
-        let observer = unsafe { std::ptr::read(&this.observer) };
-
-        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
-        let quirks = this.quirks.clone();
-
-        // `this` is dropped here, but since it's ManuallyDrop,
-        // the inner `self` is NOT dropped, preventing double-disable
-
-        // Construct new state (no Arc ref count increase!)
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: ErrorState,
-        })
+        Ok(transition_piper_state(self, ErrorState))
     }
 
     /// 等待机械臂失能完成（带 Debounce 机制）
@@ -1370,12 +1483,15 @@ impl<State> Piper<State> {
 
 // ==================== Active<Mode> 状态（通用方法） ====================
 
-impl<M> Piper<Active<M>> {
+impl<M, Capability> Piper<Active<M>, Capability>
+where
+    Capability: MotionCapability,
+{
     /// 立即失能全部关节并返回 Standby。
     ///
     /// 这是急停/人工接管路径，发送 `disable_all()` 后立即转换回 Standby，
     /// 不等待 debounce 或关闭序列完成。
-    pub fn disable_all(self) -> Result<Piper<Standby>> {
+    pub fn disable_all(self) -> Result<Piper<Standby, Capability>> {
         use piper_protocol::control::MotorEnableCommand;
 
         self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
@@ -1400,7 +1516,7 @@ impl<M> Piper<Active<M>> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn shutdown(self) -> Result<Piper<Standby>> {
+    pub fn shutdown(self) -> Result<Piper<Standby, Capability>> {
         use piper_protocol::control::*;
         use std::time::Duration;
 
@@ -1742,7 +1858,10 @@ impl<M> Piper<Active<M>> {
 
 // ==================== Active<MitMode> 状态 ====================
 
-impl Piper<Active<MitMode>> {
+impl<Capability> Piper<Active<MitMode>, Capability>
+where
+    Capability: StrictCapability,
+{
     /// 发送 MIT 模式控制指令
     ///
     /// 对所有关节发送位置、速度、力矩的混合控制指令。
@@ -1858,7 +1977,7 @@ impl Piper<Active<MitMode>> {
     }
 
     /// 获取 Observer（只读）
-    pub fn observer(&self) -> &Observer {
+    pub fn observer(&self) -> &Observer<Capability> {
         &self.observer
     }
 
@@ -1877,7 +1996,7 @@ impl Piper<Active<MitMode>> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby>> {
+    pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby, Capability>> {
         use piper_protocol::control::*;
 
         debug!("Disabling robot");
@@ -1897,42 +2016,50 @@ impl Piper<Active<MitMode>> {
         )?;
         info!("Robot disabled - Standby mode");
 
-        // === PHASE 2: No-panic zone - must not panic after this point ===
+        Ok(transition_piper_state(self, Standby))
+    }
+}
 
-        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
-        let this = std::mem::ManuallyDrop::new(self);
+impl Piper<Active<MitPassthroughMode>, SoftRealtime> {
+    /// 发送原始 MIT 批命令，并等待 SoftRealtime TX 线程确认发送结果。
+    pub fn command_mit_raw_confirmed(
+        &self,
+        commands: [MitControlCommand; 6],
+        timeout: Duration,
+    ) -> Result<()> {
+        let frames = commands.map(MitControlCommand::to_frame);
+        self.driver.send_soft_realtime_package_confirmed(frames, timeout)?;
+        Ok(())
+    }
 
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>.
-        // We're moving it out of ManuallyDrop, which prevents the original
-        // `self` from being dropped. This is safe because:
-        // 1. `this.driver` is immediately moved into the returned Piper
-        // 2. No other access to `this.driver` occurs after this read
-        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
-        let driver = unsafe { std::ptr::read(&this.driver) };
+    pub fn observer(&self) -> &Observer<SoftRealtime> {
+        &self.observer
+    }
 
-        // SAFETY: `this.observer` is a valid Arc<Observer>.
-        // Same safety reasoning as driver above.
-        let observer = unsafe { std::ptr::read(&this.observer) };
+    pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby, SoftRealtime>> {
+        use piper_protocol::control::*;
 
-        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
-        let quirks = this.quirks.clone();
+        debug!("Disabling robot");
 
-        // `this` is dropped here, but since it's ManuallyDrop,
-        // the inner `self` is NOT dropped, preventing double-disable
+        let disable_cmd = MotorEnableCommand::disable_all();
+        self.driver.send_reliable(disable_cmd.to_frame())?;
+        self.wait_for_disabled(
+            config.timeout,
+            config.debounce_threshold,
+            config.poll_interval,
+        )?;
+        info!("Robot disabled - Standby mode");
 
-        // Construct new state (no Arc ref count increase!)
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: Standby,
-        })
+        Ok(transition_piper_state(self, Standby))
     }
 }
 
 // ==================== Active<PositionMode> 状态 ====================
 
-impl Piper<Active<PositionMode>> {
+impl<Capability> Piper<Active<PositionMode>, Capability>
+where
+    Capability: MotionCapability,
+{
     /// 发送位置命令（批量发送所有关节）
     ///
     /// 一次性发送所有 6 个关节的目标位置。
@@ -2137,7 +2264,7 @@ impl Piper<Active<PositionMode>> {
     }
 
     /// 获取 Observer（只读）
-    pub fn observer(&self) -> &Observer {
+    pub fn observer(&self) -> &Observer<Capability> {
         &self.observer
     }
 
@@ -2152,7 +2279,7 @@ impl Piper<Active<PositionMode>> {
     /// ```rust,ignore
     /// let robot = robot.disable(DisableConfig::default())?;
     /// ```
-    pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby>> {
+    pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby, Capability>> {
         use piper_protocol::control::*;
 
         debug!("Disabling robot");
@@ -2174,40 +2301,16 @@ impl Piper<Active<PositionMode>> {
 
         // === PHASE 2: No-panic zone - must not panic after this point ===
 
-        // Use ManuallyDrop to prevent Drop, then extract fields without cloning
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>.
-        // We're moving it out of ManuallyDrop, which prevents the original
-        // `self` from being dropped. This is safe because:
-        // 1. `this.driver` is immediately moved into the returned Piper
-        // 2. No other access to `this.driver` occurs after this read
-        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
-        let driver = unsafe { std::ptr::read(&this.driver) };
-
-        // SAFETY: `this.observer` is a valid Arc<Observer>.
-        // Same safety reasoning as driver above.
-        let observer = unsafe { std::ptr::read(&this.observer) };
-
-        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
-        let quirks = this.quirks.clone();
-
-        // `this` is dropped here, but since it's ManuallyDrop,
-        // the inner `self` is NOT dropped, preventing double-disable
-
-        // Construct new state (no Arc ref count increase!)
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: Standby,
-        })
+        Ok(transition_piper_state(self, Standby))
     }
 }
 
 // ==================== ReplayMode 状态 ====================
 
-impl Piper<ReplayMode> {
+impl<Capability> Piper<ReplayMode, Capability>
+where
+    Capability: CapabilityMarker,
+{
     /// 回放预先录制的 CAN 帧
     ///
     /// # 参数
@@ -2258,7 +2361,7 @@ impl Piper<ReplayMode> {
         self,
         recording_path: impl AsRef<std::path::Path>,
         speed_factor: f64,
-    ) -> Result<Piper<Standby>> {
+    ) -> Result<Piper<Standby, Capability>> {
         use piper_driver::mode::DriverMode;
         use piper_tools::PiperRecording;
         use std::thread;
@@ -2378,19 +2481,7 @@ impl Piper<ReplayMode> {
         tracing::info!("Exited ReplayMode - TX thread normal operation resumed");
 
         // 状态转换：ReplayMode -> Standby
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
-        let driver = unsafe { std::ptr::read(&this.driver) };
-        let observer = unsafe { std::ptr::read(&this.observer) };
-        let quirks = this.quirks.clone();
-
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: Standby,
-        })
+        Ok(transition_piper_state(self, Standby))
     }
 
     /// 回放录制（带取消支持）
@@ -2450,7 +2541,7 @@ impl Piper<ReplayMode> {
         recording_path: impl AsRef<std::path::Path>,
         speed_factor: f64,
         cancel_signal: &std::sync::atomic::AtomicBool,
-    ) -> Result<Piper<Standby>> {
+    ) -> Result<Piper<Standby, Capability>> {
         use piper_driver::mode::DriverMode;
         use piper_tools::PiperRecording;
         use std::thread;
@@ -2590,19 +2681,7 @@ impl Piper<ReplayMode> {
         tracing::info!("Exited ReplayMode - TX thread normal operation resumed");
 
         // 状态转换：ReplayMode -> Standby
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
-        let driver = unsafe { std::ptr::read(&this.driver) };
-        let observer = unsafe { std::ptr::read(&this.observer) };
-        let quirks = this.quirks.clone();
-
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: Standby,
-        })
+        Ok(transition_piper_state(self, Standby))
     }
 
     /// 退出回放模式（返回 Standby）
@@ -2626,7 +2705,7 @@ impl Piper<ReplayMode> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn stop_replay(self) -> Result<Piper<Standby>> {
+    pub fn stop_replay(self) -> Result<Piper<Standby, Capability>> {
         use piper_driver::mode::DriverMode;
 
         tracing::info!("Stopping replay - exiting ReplayMode");
@@ -2635,29 +2714,20 @@ impl Piper<ReplayMode> {
         self.driver.set_mode(DriverMode::Normal);
 
         // 状态转换：ReplayMode -> Standby
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>
-        let driver = unsafe { std::ptr::read(&this.driver) };
-        let observer = unsafe { std::ptr::read(&this.observer) };
-        let quirks = this.quirks.clone();
-
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            _state: Standby,
-        })
+        Ok(transition_piper_state(self, Standby))
     }
 }
 
 // ==================== ErrorState 状态 ====================
 
-impl Piper<ErrorState> {
+impl<Capability> Piper<ErrorState, Capability>
+where
+    Capability: CapabilityMarker,
+{
     /// 获取 Observer（只读）
     ///
     /// 即使在错误状态，也可以读取机械臂状态。
-    pub fn observer(&self) -> &Observer {
+    pub fn observer(&self) -> &Observer<Capability> {
         &self.observer
     }
 
@@ -2674,7 +2744,7 @@ impl Piper<ErrorState> {
 
 // ==================== Drop 实现（安全关闭）====================
 
-impl<State> Drop for Piper<State> {
+impl<State, Capability> Drop for Piper<State, Capability> {
     fn drop(&mut self) {
         // 尝试失能（忽略错误，因为可能已经失能）
         use piper_protocol::control::MotorEnableCommand;
@@ -2767,16 +2837,17 @@ mod tests {
     fn build_active_mit_piper(
         quirks: DeviceQuirks,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
-    ) -> Piper<Active<MitMode>> {
+    ) -> Piper<Active<MitMode>, StrictRealtime> {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
+                piper_driver::BackendCapability::StrictRealtime,
                 IdleRxAdapter,
                 RecordingTxAdapter::new(sent_frames),
                 None,
             )
             .expect("driver should start"),
         );
-        let observer = Observer::new(driver.clone());
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
 
         Piper {
             driver,
@@ -2786,8 +2857,10 @@ mod tests {
         }
     }
 
-    fn build_active_position_piper(driver: Arc<RobotPiper>) -> Piper<Active<PositionMode>> {
-        let observer = Observer::new(driver.clone());
+    fn build_active_position_piper(
+        driver: Arc<RobotPiper>,
+    ) -> Piper<Active<PositionMode>, StrictRealtime> {
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
 
         Piper {
             driver,
@@ -2867,6 +2940,7 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
+                piper_driver::BackendCapability::StrictRealtime,
                 IdleRxAdapter,
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
@@ -2888,6 +2962,7 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
+                piper_driver::BackendCapability::StrictRealtime,
                 ScriptedRxAdapter::new(vec![
                     joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, 1_000),
                     joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, 1_000),

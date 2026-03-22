@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 use piper_control::set_joint_zero_blocking;
+use piper_sdk::client::MotionConnectedPiper;
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -40,7 +41,11 @@ impl SetZeroCommand {
 
         println!("🔌 连接到机器人...");
         let standby = builder.build()?;
-        set_joint_zero_blocking(&standby, &joints)?;
+        let standby = standby.require_motion()?;
+        match &standby {
+            MotionConnectedPiper::Strict(standby) => set_joint_zero_blocking(standby, &joints)?,
+            MotionConnectedPiper::Soft(standby) => set_joint_zero_blocking(standby, &joints)?,
+        }
         println!("✅ 零点标定命令已发送");
         Ok(())
     }

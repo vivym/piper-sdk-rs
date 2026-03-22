@@ -6,8 +6,8 @@
 use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::command::ReliableCommand;
 use piper_sdk::driver::{
-    MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate, PipelineConfig, PiperContext,
-    PiperMetrics, ShutdownLane, TimingCapability, rx_loop, tx_loop_mailbox,
+    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
+    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -152,7 +152,7 @@ fn start_rx_loop(
     thread::spawn(move || {
         rx_loop(
             rx_adapter,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             ctx,
             PipelineConfig::default(),
             is_running,
@@ -179,10 +179,13 @@ fn start_tx_loop(
     let normal_send_gate = Arc::new(NormalSendGate::new());
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
+    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
+            BackendCapability::StrictRealtime,
             realtime_slot,
+            soft_realtime_rx,
             shutdown_lane,
             reliable_rx,
             is_running,

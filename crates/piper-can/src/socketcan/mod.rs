@@ -635,6 +635,10 @@ impl SplittableAdapter for SocketCanAdapter {
     type RxAdapter = SocketCanRxAdapter;
     type TxAdapter = SocketCanTxAdapter;
 
+    fn backend_capability(&self) -> crate::BackendCapability {
+        crate::BackendCapability::StrictRealtime
+    }
+
     /// 分离为独立的 RX 和 TX 适配器
     ///
     /// # 前置条件

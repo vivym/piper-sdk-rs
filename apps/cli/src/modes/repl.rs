@@ -4,9 +4,10 @@ use crate::commands::config::CliConfig;
 use crate::connection::client_builder;
 use crate::parsing::{parse_collision_levels, parse_joint_indices_arg};
 use anyhow::{Result, bail};
-use piper_client::ControlReadPolicy;
-use piper_client::Piper;
-use piper_client::state::{Active, DisableConfig, Piper as StatePiper, PositionMode, Standby};
+use piper_client::MotionConnectedPiper;
+use piper_client::state::{
+    Active, DisableConfig, Piper as StatePiper, PositionMode, SoftRealtime, Standby, StrictRealtime,
+};
 use piper_control::{
     ControlProfile, MotionExecutionOutcome, PreparedMove, TargetSpec,
     active_move_to_joint_target_with_cancel, prepare_move, query_collision_protection_blocking,
@@ -25,16 +26,20 @@ use std::sync::atomic::AtomicUsize;
 
 pub enum ReplState {
     Disconnected,
-    Standby(StatePiper<Standby>),
-    ActivePosition(StatePiper<Active<PositionMode>>),
+    StandbyStrict(StatePiper<Standby, StrictRealtime>),
+    StandbySoft(StatePiper<Standby, SoftRealtime>),
+    ActivePositionStrict(StatePiper<Active<PositionMode>, StrictRealtime>),
+    ActivePositionSoft(StatePiper<Active<PositionMode>, SoftRealtime>),
 }
 
 impl ReplState {
     pub fn description(&self) -> &str {
         match self {
             ReplState::Disconnected => "未连接",
-            ReplState::Standby(_) => "已连接 (Standby)",
-            ReplState::ActivePosition(_) => "已使能 (Position Mode)",
+            ReplState::StandbyStrict(_) | ReplState::StandbySoft(_) => "已连接 (Standby)",
+            ReplState::ActivePositionStrict(_) | ReplState::ActivePositionSoft(_) => {
+                "已使能 (Position Mode)"
+            },
         }
     }
 
@@ -82,8 +87,11 @@ impl ReplSession {
         );
 
         let builder = client_builder(&self.profile.target);
-        let robot = builder.build()?;
-        self.state = ReplState::Standby(robot);
+        let robot = builder.build()?.require_motion()?;
+        self.state = match robot {
+            MotionConnectedPiper::Strict(robot) => ReplState::StandbyStrict(robot),
+            MotionConnectedPiper::Soft(robot) => ReplState::StandbySoft(robot),
+        };
 
         println!("✅ 已连接");
         Ok(())
@@ -102,10 +110,17 @@ impl ReplSession {
 
     pub fn enable(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, ReplState::Disconnected) {
-            ReplState::Standby(robot) => {
+            ReplState::StandbyStrict(robot) => {
                 println!("⏳ 使能电机...");
                 let robot = robot.enable_position_mode(self.profile.position_mode_config())?;
-                self.state = ReplState::ActivePosition(robot);
+                self.state = ReplState::ActivePositionStrict(robot);
+                println!("✅ 已使能 Position Mode");
+                Ok(())
+            },
+            ReplState::StandbySoft(robot) => {
+                println!("⏳ 使能电机...");
+                let robot = robot.enable_position_mode(self.profile.position_mode_config())?;
+                self.state = ReplState::ActivePositionSoft(robot);
                 println!("✅ 已使能 Position Mode");
                 Ok(())
             },
@@ -113,8 +128,13 @@ impl ReplSession {
                 self.state = ReplState::Disconnected;
                 bail!("未连接，请先使用 connect 命令");
             },
-            ReplState::ActivePosition(robot) => {
-                self.state = ReplState::ActivePosition(robot);
+            ReplState::ActivePositionStrict(robot) => {
+                self.state = ReplState::ActivePositionStrict(robot);
+                println!("⚠️  已经使能");
+                Ok(())
+            },
+            ReplState::ActivePositionSoft(robot) => {
+                self.state = ReplState::ActivePositionSoft(robot);
                 println!("⚠️  已经使能");
                 Ok(())
             },
@@ -123,15 +143,27 @@ impl ReplSession {
 
     pub fn disable(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, ReplState::Disconnected) {
-            ReplState::ActivePosition(robot) => {
+            ReplState::ActivePositionStrict(robot) => {
                 println!("⏳ 去使能电机...");
                 let robot = robot.disable(DisableConfig::default())?;
-                self.state = ReplState::Standby(robot);
+                self.state = ReplState::StandbyStrict(robot);
                 println!("✅ 已去使能");
                 Ok(())
             },
-            ReplState::Standby(robot) => {
-                self.state = ReplState::Standby(robot);
+            ReplState::ActivePositionSoft(robot) => {
+                println!("⏳ 去使能电机...");
+                let robot = robot.disable(DisableConfig::default())?;
+                self.state = ReplState::StandbySoft(robot);
+                println!("✅ 已去使能");
+                Ok(())
+            },
+            ReplState::StandbyStrict(robot) => {
+                self.state = ReplState::StandbyStrict(robot);
+                println!("⚠️  未使能");
+                Ok(())
+            },
+            ReplState::StandbySoft(robot) => {
+                self.state = ReplState::StandbySoft(robot);
                 println!("⚠️  未使能");
                 Ok(())
             },
@@ -152,43 +184,65 @@ impl ReplSession {
                 self.state = ReplState::Disconnected;
                 Ok(())
             },
-            ReplState::Standby(robot) => {
+            ReplState::StandbyStrict(robot) => {
                 robot.disable_all()?;
-                self.state = ReplState::Standby(robot);
+                self.state = ReplState::StandbyStrict(robot);
                 Ok(())
             },
-            ReplState::ActivePosition(robot) => {
+            ReplState::StandbySoft(robot) => {
+                robot.disable_all()?;
+                self.state = ReplState::StandbySoft(robot);
+                Ok(())
+            },
+            ReplState::ActivePositionStrict(robot) => {
                 let robot = robot.disable_all()?;
-                self.state = ReplState::Standby(robot);
+                self.state = ReplState::StandbyStrict(robot);
+                Ok(())
+            },
+            ReplState::ActivePositionSoft(robot) => {
+                let robot = robot.disable_all()?;
+                self.state = ReplState::StandbySoft(robot);
                 Ok(())
             },
         }
     }
 
-    fn active_robot(&self) -> Result<&Piper<Active<PositionMode>>> {
+    fn active_robot(&self) -> Result<ActivePositionRef<'_>> {
         match &self.state {
-            ReplState::ActivePosition(robot) => Ok(robot),
+            ReplState::ActivePositionStrict(robot) => Ok(ActivePositionRef::Strict(robot)),
+            ReplState::ActivePositionSoft(robot) => Ok(ActivePositionRef::Soft(robot)),
             _ => bail!("电机未使能，请先使用 enable 命令"),
         }
     }
 
-    fn standby_robot(&self) -> Result<&Piper<Standby>> {
+    fn standby_robot(&self) -> Result<StandbyRef<'_>> {
         match &self.state {
-            ReplState::Standby(robot) => Ok(robot),
-            ReplState::ActivePosition(_) => bail!("请先 disable，再执行此命令"),
+            ReplState::StandbyStrict(robot) => Ok(StandbyRef::Strict(robot)),
+            ReplState::StandbySoft(robot) => Ok(StandbyRef::Soft(robot)),
+            ReplState::ActivePositionStrict(_) | ReplState::ActivePositionSoft(_) => {
+                bail!("请先 disable，再执行此命令")
+            },
             ReplState::Disconnected => bail!("未连接"),
         }
     }
 
     fn observer_positions(&self) -> Result<[f64; 6]> {
         match &self.state {
-            ReplState::Standby(robot) => {
-                let snapshot = robot.observer().control_snapshot(ControlReadPolicy::default())?;
-                Ok(std::array::from_fn(|index| snapshot.position[index].0))
+            ReplState::StandbyStrict(robot) => {
+                let positions = robot.observer().joint_positions()?;
+                Ok(std::array::from_fn(|index| positions[index].0))
             },
-            ReplState::ActivePosition(robot) => {
-                let snapshot = robot.observer().control_snapshot(ControlReadPolicy::default())?;
-                Ok(std::array::from_fn(|index| snapshot.position[index].0))
+            ReplState::StandbySoft(robot) => {
+                let positions = robot.observer().joint_positions()?;
+                Ok(std::array::from_fn(|index| positions[index].0))
+            },
+            ReplState::ActivePositionStrict(robot) => {
+                let positions = robot.observer().joint_positions()?;
+                Ok(std::array::from_fn(|index| positions[index].0))
+            },
+            ReplState::ActivePositionSoft(robot) => {
+                let positions = robot.observer().joint_positions()?;
+                Ok(std::array::from_fn(|index| positions[index].0))
             },
             ReplState::Disconnected => {
                 #[cfg(test)]
@@ -197,6 +251,57 @@ impl ReplSession {
                 }
                 bail!("未连接")
             },
+        }
+    }
+}
+
+enum ActivePositionRef<'a> {
+    Strict(&'a StatePiper<Active<PositionMode>, StrictRealtime>),
+    Soft(&'a StatePiper<Active<PositionMode>, SoftRealtime>),
+}
+
+impl<'a> ActivePositionRef<'a> {
+    fn move_with_cancel(
+        &self,
+        target: [f64; 6],
+        profile: &ControlProfile,
+        should_cancel: impl Fn() -> bool,
+    ) -> Result<MotionExecutionOutcome> {
+        match self {
+            Self::Strict(robot) => {
+                active_move_to_joint_target_with_cancel(robot, target, &profile.wait, should_cancel)
+            },
+            Self::Soft(robot) => {
+                active_move_to_joint_target_with_cancel(robot, target, &profile.wait, should_cancel)
+            },
+        }
+    }
+}
+
+enum StandbyRef<'a> {
+    Strict(&'a StatePiper<Standby, StrictRealtime>),
+    Soft(&'a StatePiper<Standby, SoftRealtime>),
+}
+
+impl<'a> StandbyRef<'a> {
+    fn set_joint_zero(&self, joints: &[usize]) -> Result<()> {
+        match self {
+            Self::Strict(robot) => set_joint_zero_blocking(robot, joints),
+            Self::Soft(robot) => set_joint_zero_blocking(robot, joints),
+        }
+    }
+
+    fn query_collision_protection(&self, profile: &ControlProfile) -> Result<[u8; 6]> {
+        match self {
+            Self::Strict(robot) => query_collision_protection_blocking(robot, &profile.wait),
+            Self::Soft(robot) => query_collision_protection_blocking(robot, &profile.wait),
+        }
+    }
+
+    fn set_collision_protection(&self, desired: [u8; 6], profile: &ControlProfile) -> Result<()> {
+        match self {
+            Self::Strict(robot) => set_collision_protection_verified(robot, desired, &profile.wait),
+            Self::Soft(robot) => set_collision_protection_verified(robot, desired, &profile.wait),
         }
     }
 }
@@ -728,12 +833,9 @@ fn handle_move(
 
     let _motion_guard = control.motion_scope();
     let robot = session.active_robot()?;
-    match active_move_to_joint_target_with_cancel(
-        robot,
-        prepared.effective_target,
-        &session.profile.wait,
-        || control.cancel_requested(),
-    )? {
+    match robot.move_with_cancel(prepared.effective_target, &session.profile, || {
+        control.cancel_requested()
+    })? {
         MotionExecutionOutcome::Reached => {
             println!("✅ 移动完成");
             Ok(CommandExecutionOutcome::Completed)
@@ -762,9 +864,7 @@ fn handle_home(
 ) -> Result<CommandExecutionOutcome> {
     let _motion_guard = control.motion_scope();
     let robot = session.active_robot()?;
-    match active_move_to_joint_target_with_cancel(robot, [0.0; 6], &session.profile.wait, || {
-        control.cancel_requested()
-    })? {
+    match robot.move_with_cancel([0.0; 6], &session.profile, || control.cancel_requested())? {
         MotionExecutionOutcome::Reached => {
             println!("✅ 回零完成");
             Ok(CommandExecutionOutcome::Completed)
@@ -779,12 +879,9 @@ fn handle_park(
 ) -> Result<CommandExecutionOutcome> {
     let _motion_guard = control.motion_scope();
     let robot = session.active_robot()?;
-    match active_move_to_joint_target_with_cancel(
-        robot,
-        session.profile.park_pose(),
-        &session.profile.wait,
-        || control.cancel_requested(),
-    )? {
+    match robot.move_with_cancel(session.profile.park_pose(), &session.profile, || {
+        control.cancel_requested()
+    })? {
         MotionExecutionOutcome::Reached => {
             println!("✅ 停靠完成");
             Ok(CommandExecutionOutcome::Completed)
@@ -799,7 +896,7 @@ fn handle_set_zero(session: &ReplSession, parts: &[&str]) -> Result<()> {
     require_repl_set_zero_force(force)?;
 
     let robot = session.standby_robot()?;
-    set_joint_zero_blocking(robot, &joints)?;
+    robot.set_joint_zero(&joints)?;
     println!("✅ 零点标定命令已发送");
     Ok(())
 }
@@ -825,7 +922,7 @@ fn handle_collision_protection(session: &ReplSession, parts: &[&str]) -> Result<
     let robot = session.standby_robot()?;
     match parts.get(1).copied() {
         Some("get") => {
-            let levels = query_collision_protection_blocking(robot, &session.profile.wait)?;
+            let levels = robot.query_collision_protection(&session.profile)?;
             println!("collision protection levels: {:?}", levels);
             Ok(())
         },
@@ -836,7 +933,7 @@ fn handle_collision_protection(session: &ReplSession, parts: &[&str]) -> Result<
                 .map_err(|_| anyhow::anyhow!("无效的 --level 值"))?;
             let levels = option_value(parts, "--levels");
             let desired = parse_collision_levels(level, levels)?;
-            set_collision_protection_verified(robot, desired, &session.profile.wait)?;
+            robot.set_collision_protection(desired, &session.profile)?;
             println!("✅ 碰撞保护等级已写入并校验: {:?}", desired);
             Ok(())
         },

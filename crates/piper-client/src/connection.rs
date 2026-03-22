@@ -1,4 +1,3 @@
-use crate::observer::Observer;
 use crate::types::{DeviceQuirks, Result, RobotError};
 use piper_driver::Piper as DriverPiper;
 use semver::Version;
@@ -6,16 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info};
 
-pub(crate) struct ConnectedDriver {
-    pub observer: Observer,
-    pub quirks: DeviceQuirks,
-}
-
 pub(crate) fn initialize_connected_driver(
     driver: Arc<DriverPiper>,
     feedback_timeout: Duration,
     firmware_timeout: Duration,
-) -> Result<ConnectedDriver> {
+) -> Result<DeviceQuirks> {
     debug!(
         "Waiting for robot feedback (timeout: {:?})",
         feedback_timeout
@@ -26,8 +20,7 @@ pub(crate) fn initialize_connected_driver(
     info!("Detected firmware version: {}", firmware_version);
 
     let quirks = resolve_device_quirks(&firmware_version)?;
-    let observer = Observer::new(driver);
-    Ok(ConnectedDriver { observer, quirks })
+    Ok(quirks)
 }
 
 pub(crate) fn parse_firmware_version(version_str: &str) -> Option<Version> {
