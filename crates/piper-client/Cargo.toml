@@ -27,6 +27,7 @@ hex = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 sha2 = { workspace = true }
+mio = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

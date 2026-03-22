@@ -1,7 +1,7 @@
 //! Reusable real-robot gravity compensation runner
 
 use crate::{GravityCompensation, GravityCompensationRunnerError, JointState, JointTorques};
-use piper_sdk::client::state::{Active, MitMode};
+use piper_sdk::client::state::{Active, MitMode, StrictCapability};
 use piper_sdk::client::types::{JointArray, NewtonMeter, Rad, Result as RobotResult};
 use piper_sdk::client::{ControlReadPolicy, ControlSnapshot, Piper, RuntimeHealthSnapshot};
 use std::thread;
@@ -28,13 +28,16 @@ pub trait GravityCompensationRobot: Send + Sync {
     ) -> RobotResult<()>;
 }
 
-impl GravityCompensationRobot for Piper<Active<MitMode>> {
+impl<Capability> GravityCompensationRobot for Piper<Active<MitMode>, Capability>
+where
+    Capability: StrictCapability,
+{
     fn control_snapshot(&self, policy: ControlReadPolicy) -> RobotResult<ControlSnapshot> {
         self.observer().control_snapshot(policy)
     }
 
     fn runtime_health(&self) -> RuntimeHealthSnapshot {
-        Piper::<Active<MitMode>>::runtime_health(self)
+        Piper::<Active<MitMode>, Capability>::runtime_health(self)
     }
 
     fn command_torques_confirmed(
@@ -46,7 +49,7 @@ impl GravityCompensationRobot for Piper<Active<MitMode>> {
         torques: &JointArray<NewtonMeter>,
         timeout: Duration,
     ) -> RobotResult<()> {
-        Piper::<Active<MitMode>>::command_torques_confirmed(
+        Piper::<Active<MitMode>, Capability>::command_torques_confirmed(
             self, positions, velocities, kp, kd, torques, timeout,
         )
     }

@@ -51,6 +51,7 @@ pub type FrameBuffer = SmallVec<[PiperFrame; 6]>;
 pub type RealtimeAck = Sender<Result<(), DriverError>>;
 pub type ReliableAck = Sender<Result<(), DriverError>>;
 pub type ShutdownAck = Sender<Result<(), DriverError>>;
+pub type SoftRealtimeAck = Sender<Result<(), DriverError>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReliableCommandKind {
@@ -189,6 +190,53 @@ pub struct ShutdownCommand {
     frame: PiperFrame,
     deadline: Instant,
     ack: ShutdownAck,
+}
+
+#[derive(Debug)]
+pub struct SoftRealtimeCommand {
+    frames: FrameBuffer,
+    deadline: Instant,
+    ack: SoftRealtimeAck,
+}
+
+impl SoftRealtimeCommand {
+    #[inline]
+    pub fn confirmed(
+        frames: impl IntoIterator<Item = PiperFrame>,
+        deadline: Instant,
+        ack: SoftRealtimeAck,
+    ) -> Self {
+        Self {
+            frames: frames.into_iter().collect(),
+            deadline,
+            ack,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    #[inline]
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    #[inline]
+    pub fn into_parts(self) -> (FrameBuffer, Instant, SoftRealtimeAck) {
+        (self.frames, self.deadline, self.ack)
+    }
+
+    #[inline]
+    pub fn complete(self, result: Result<(), DriverError>) {
+        let _ = self.ack.send(result);
+    }
 }
 
 impl ShutdownCommand {

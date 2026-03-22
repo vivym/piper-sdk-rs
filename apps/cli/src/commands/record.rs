@@ -7,6 +7,8 @@ use crate::connection::{TargetArgs, client_builder, resolved_target_spec};
 use anyhow::{Context, Result};
 use clap::Args;
 use piper_control::TargetSpec;
+use piper_sdk::client::state::{CapabilityMarker, Standby};
+use piper_sdk::client::{ConnectedPiper, Piper};
 use piper_sdk::driver::ConnectionTarget;
 use piper_sdk::{RecordingConfig, RecordingMetadata, StopCondition};
 use std::io::Write;
@@ -243,8 +245,29 @@ impl RecordCommand {
             metadata,
         };
 
-        let (standby, handle) = standby.start_recording(config)?;
+        match standby {
+            ConnectedPiper::Strict(standby) => {
+                Self::record_with_standby(standby, config, duration, running)
+            },
+            ConnectedPiper::Soft(standby) => {
+                Self::record_with_standby(standby, config, duration, running)
+            },
+            ConnectedPiper::Monitor(standby) => {
+                Self::record_with_standby(standby, config, duration, running)
+            },
+        }
+    }
 
+    fn record_with_standby<Capability>(
+        standby: Piper<Standby, Capability>,
+        config: RecordingConfig,
+        duration: u64,
+        running: Arc<AtomicBool>,
+    ) -> Result<piper_sdk::RecordingStats>
+    where
+        Capability: CapabilityMarker,
+    {
+        let (standby, handle) = standby.start_recording(config)?;
         println!("🔴 开始录制...");
         println!();
 

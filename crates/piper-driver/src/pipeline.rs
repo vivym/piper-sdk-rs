@@ -6,11 +6,14 @@ use crate::heartbeat::monotonic_micros;
 use crate::metrics::PiperMetrics;
 use crate::piper::{
     MaintenanceGate, MaintenanceGateState, NORMAL_FRAME_SEND_BUDGET, NormalSendGate,
-    RuntimeFaultKind, RuntimePhase, ShutdownDispatch, ShutdownLane,
+    RuntimeFaultKind, RuntimePhase, SOFT_CONTROL_SEND_BUDGET, SOFT_CONTROL_SEND_MIN_DEADLINE,
+    SOFT_DEADLINE_MISS_FAULT_THRESHOLD, ShutdownDispatch, ShutdownLane,
 };
 use crate::state::*;
 use crossbeam_channel::Receiver;
-use piper_can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, TimingCapability};
+use piper_can::{
+    BackendCapability, CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
+};
 use piper_protocol::config::*;
 use piper_protocol::feedback::*;
 use piper_protocol::ids::*;
@@ -271,9 +274,9 @@ fn complete_group_ready(mask: u8) -> bool {
 fn control_grade_group_ready(
     mask: u8,
     timestamps: &[u64; 3],
-    timing_capability: TimingCapability,
+    backend_capability: BackendCapability,
 ) -> bool {
-    if timing_capability != TimingCapability::RealtimeCapable || !complete_group_ready(mask) {
+    if !backend_capability.is_strict_realtime() || !complete_group_ready(mask) {
         return false;
     }
 
@@ -294,9 +297,9 @@ fn control_grade_group_ready(
 fn group_alignment_timestamp(
     frame: &PiperFrame,
     host_rx_mono_us: u64,
-    timing_capability: TimingCapability,
+    backend_capability: BackendCapability,
 ) -> u64 {
-    if timing_capability == TimingCapability::RealtimeCapable {
+    if backend_capability.is_strict_realtime() {
         frame.timestamp_us
     } else {
         host_rx_mono_us
@@ -305,10 +308,11 @@ fn group_alignment_timestamp(
 
 fn commit_pending_velocity(
     ctx: &Arc<PiperContext>,
+    backend_capability: BackendCapability,
     state: &mut ParserState,
     group_timestamp_us: u64,
     warning: Option<&'static str>,
-    strict_only: bool,
+    complete_group: bool,
     metrics: &Arc<PiperMetrics>,
 ) {
     if state.vel_update_mask == 0 {
@@ -320,12 +324,22 @@ fn commit_pending_velocity(
     state.pending_joint_dynamic.group_timestamp_us = group_timestamp_us;
     state.pending_joint_dynamic.valid_mask = commit_mask;
 
-    if strict_only {
+    if complete_group {
         ctx.publish_joint_dynamic(state.pending_joint_dynamic.clone());
         ctx.fps_stats
             .load()
             .joint_dynamic_updates
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if backend_capability.is_strict_realtime() {
+            if state.pending_joint_dynamic.group_span_us() <= STRICT_GROUP_MAX_SPAN_US {
+                ctx.publish_control_joint_dynamic(state.pending_joint_dynamic.clone());
+            } else {
+                metrics
+                    .rx_joint_dynamic_control_grade_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     } else {
         metrics.rx_joint_dynamic_groups_dropped_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -339,6 +353,7 @@ fn commit_pending_velocity(
 
 fn flush_pending_velocity_on_idle(
     ctx: &Arc<PiperContext>,
+    backend_capability: BackendCapability,
     config: &PipelineConfig,
     state: &mut ParserState,
     metrics: &Arc<PiperMetrics>,
@@ -355,6 +370,7 @@ fn flush_pending_velocity_on_idle(
     if started_at.elapsed() >= timeout {
         commit_pending_velocity(
             ctx,
+            backend_capability,
             state,
             state.last_vel_packet_time_us,
             Some("Velocity buffer timeout, dropping partial dynamic group"),
@@ -434,7 +450,13 @@ pub fn io_loop(
                 // === 检查速度帧缓冲区超时（关键：避免僵尸缓冲区） ===
                 // 使用系统时间 Instant 检查，因为硬件时间戳和系统时间戳不能直接比较
                 // 如果缓冲区不为空，且距离上次速度帧到达已经超时，强制提交或丢弃
-                flush_pending_velocity_on_idle(&ctx, &config, &mut state, &metrics);
+                flush_pending_velocity_on_idle(
+                    &ctx,
+                    BackendCapability::StrictRealtime,
+                    &config,
+                    &mut state,
+                    &metrics,
+                );
 
                 continue;
             },
@@ -452,7 +474,7 @@ pub fn io_loop(
         // ============================================================
         parse_and_update_state(
             &frame,
-            TimingCapability::RealtimeCapable,
+            BackendCapability::StrictRealtime,
             &ctx,
             &config,
             &mut state,
@@ -543,7 +565,7 @@ fn drain_tx_queue(can: &mut impl CanAdapter, cmd_rx: &Receiver<PiperFrame>) -> b
 #[allow(clippy::too_many_arguments)]
 pub fn rx_loop(
     mut rx: impl RxAdapter,
-    timing_capability: TimingCapability,
+    backend_capability: BackendCapability,
     ctx: Arc<PiperContext>,
     config: PipelineConfig,
     workers_running: Arc<AtomicBool>,
@@ -619,7 +641,13 @@ pub fn rx_loop(
                 }
 
                 // === 检查速度帧缓冲区超时 ===
-                flush_pending_velocity_on_idle(&ctx, &config, &mut state, &metrics);
+                flush_pending_velocity_on_idle(
+                    &ctx,
+                    backend_capability,
+                    &config,
+                    &mut state,
+                    &metrics,
+                );
 
                 if maintenance_gate.current_state() != MaintenanceGateState::DeniedTransportDown
                     && !ctx.connection_monitor.check_connection()
@@ -633,9 +661,16 @@ pub fn rx_loop(
                 // 检测致命错误
                 error!("RX thread: CAN receive error: {}", e);
                 metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                if matches!(e, CanError::BusOff) {
+                    metrics.rx_error_frames_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.rx_bus_off_total.fetch_add(1, Ordering::Relaxed);
+                }
 
                 // 判断是否为致命错误（设备断开、权限错误等）
-                let is_fatal = matches!(e, CanError::Device(_) | CanError::BufferOverflow);
+                let is_fatal = matches!(
+                    e,
+                    CanError::Device(_) | CanError::BufferOverflow | CanError::BusOff
+                );
 
                 if is_fatal {
                     error!("RX thread: Fatal error detected, latching runtime fault");
@@ -668,7 +703,7 @@ pub fn rx_loop(
         // 复用 io_loop 中的解析逻辑（通过调用辅助函数）
         parse_and_update_state(
             &frame,
-            timing_capability,
+            backend_capability,
             &ctx,
             &config,
             &mut state,
@@ -712,7 +747,9 @@ pub fn rx_loop(
 #[allow(clippy::too_many_arguments)]
 pub fn tx_loop_mailbox(
     mut tx: impl RealtimeTxAdapter,
+    backend_capability: BackendCapability,
     realtime_slot: Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
+    soft_realtime_rx: Receiver<crate::command::SoftRealtimeCommand>,
     shutdown_lane: Arc<ShutdownLane>,
     reliable_rx: Receiver<crate::command::ReliableCommand>,
     workers_running: Arc<AtomicBool>,
@@ -724,6 +761,13 @@ pub fn tx_loop_mailbox(
     maintenance_gate: Arc<MaintenanceGate>,
     _compat_maintenance_gate: Arc<MaintenanceGate>,
 ) {
+    let normal_send_budget = if backend_capability.is_strict_realtime() {
+        NORMAL_FRAME_SEND_BUDGET
+    } else {
+        SOFT_CONTROL_SEND_BUDGET
+    };
+    let mut soft_deadline_miss_streak = 0u32;
+
     loop {
         let phase = load_runtime_phase(&runtime_phase);
         if phase == RuntimePhase::Stopping || !workers_running.load(Ordering::Acquire) {
@@ -750,17 +794,22 @@ pub fn tx_loop_mailbox(
 
         if phase == RuntimePhase::FaultLatched {
             abort_realtime_slot_fault(&realtime_slot, &metrics);
+            drain_soft_realtime_queue(&soft_realtime_rx, &metrics, true, true);
             drain_reliable_queue(&reliable_rx, &metrics, true, true);
             spin_sleep::sleep(Duration::from_micros(50));
             continue;
         }
 
-        let realtime_command = match realtime_slot.lock() {
-            Ok(mut slot) => slot.take(),
-            Err(_) => {
-                error!("TX thread: Realtime slot lock poisoned");
-                None
-            },
+        let realtime_command = if backend_capability.is_strict_realtime() {
+            match realtime_slot.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(_) => {
+                    error!("TX thread: Realtime slot lock poisoned");
+                    None
+                },
+            }
+        } else {
+            None
         };
 
         if let Some(mut command) = realtime_command {
@@ -866,6 +915,95 @@ pub fn tx_loop_mailbox(
             }
         }
 
+        if let Ok(command) = soft_realtime_rx.try_recv() {
+            let total_frames = command.len();
+            let (frames, deadline, ack) = command.into_parts();
+            let mut sent_count = 0usize;
+            let mut send_result = Ok(());
+            let mut should_break = false;
+
+            for frame in frames {
+                let Some(permit) = normal_send_gate.acquire() else {
+                    count_fault_abort(&metrics);
+                    send_result = Err(crate::DriverError::CommandAbortedByFault);
+                    break;
+                };
+                if !permit.still_open() {
+                    count_fault_abort(&metrics);
+                    send_result = Err(crate::DriverError::CommandAbortedByFault);
+                    break;
+                }
+
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
+                    if soft_deadline_miss_streak > 0 {
+                        metrics
+                            .tx_soft_consecutive_deadline_miss_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
+                    if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
+                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                        maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+                    }
+                    send_result = Err(crate::DriverError::Timeout);
+                    break;
+                };
+
+                match tx.send_control(frame, remaining.max(SOFT_CONTROL_SEND_MIN_DEADLINE)) {
+                    Ok(_) => {
+                        sent_count += 1;
+                        soft_deadline_miss_streak = 0;
+                        metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(hooks) = ctx.hooks.try_read() {
+                            hooks.trigger_all_sent(&frame);
+                        }
+                    },
+                    Err(CanError::Timeout) => {
+                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                        metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
+                        if soft_deadline_miss_streak > 0 {
+                            metrics
+                                .tx_soft_consecutive_deadline_miss_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
+                        if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
+                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                            maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+                        }
+                        send_result = Err(crate::DriverError::Timeout);
+                        break;
+                    },
+                    Err(e) => {
+                        error!(
+                            "TX thread: Failed to send soft realtime frame {} in package: {}",
+                            sent_count, e
+                        );
+                        metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                        maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+                        send_result = Err(crate::DriverError::ReliableDeliveryFailed { source: e });
+                        should_break = true;
+                        break;
+                    },
+                }
+            }
+
+            let _ = ack.send(send_result);
+            if should_break {
+                break;
+            }
+
+            if sent_count == total_frames {
+                continue;
+            }
+            continue;
+        }
+
         if let Ok(mut command) = reliable_rx.try_recv() {
             let Some(permit) = normal_send_gate.acquire() else {
                 count_fault_abort(&metrics);
@@ -898,14 +1036,32 @@ pub fn tx_loop_mailbox(
                             "maintenance lease is no longer valid".to_string(),
                         ))
                     } else {
-                        match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
+                        match tx.send_control(frame, normal_send_budget) {
                             Ok(_) => {
+                                soft_deadline_miss_streak = 0;
                                 metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 
                                 if let Ok(hooks) = ctx.hooks.try_read() {
                                     hooks.trigger_all_sent(&frame);
                                 }
                                 Ok(())
+                            },
+                            Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
+                                metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                                metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
+                                if soft_deadline_miss_streak > 0 {
+                                    metrics
+                                        .tx_soft_consecutive_deadline_miss_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                soft_deadline_miss_streak =
+                                    soft_deadline_miss_streak.saturating_add(1);
+                                if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
+                                    record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                                    store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                                    maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+                                }
+                                Err(crate::DriverError::Timeout)
                             },
                             Err(e) => {
                                 error!("TX thread: Failed to send maintenance frame: {}", e);
@@ -927,14 +1083,31 @@ pub fn tx_loop_mailbox(
                     ))
                 }
             } else {
-                match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
+                match tx.send_control(frame, normal_send_budget) {
                     Ok(_) => {
+                        soft_deadline_miss_streak = 0;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 
                         if let Ok(hooks) = ctx.hooks.try_read() {
                             hooks.trigger_all_sent(&frame);
                         }
                         Ok(())
+                    },
+                    Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
+                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                        metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
+                        if soft_deadline_miss_streak > 0 {
+                            metrics
+                                .tx_soft_consecutive_deadline_miss_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
+                        if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
+                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
+                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
+                            maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+                        }
+                        Err(crate::DriverError::Timeout)
                     },
                     Err(e) => {
                         error!("TX thread: Failed to send reliable frame: {}", e);
@@ -981,6 +1154,7 @@ pub fn tx_loop_mailbox(
     }
     shutdown_lane.close_with(Err(crate::DriverError::ChannelClosed));
     drain_reliable_queue(&reliable_rx, &metrics, false, false);
+    drain_soft_realtime_queue(&soft_realtime_rx, &metrics, false, false);
     abort_realtime_slot_with(
         &realtime_slot,
         &metrics,
@@ -1031,6 +1205,25 @@ fn drain_reliable_queue(
             count_fault_abort(metrics);
         }
         let reason = reliable_abort_error(fault_latched);
+        command.complete(Err(reason));
+    }
+}
+
+fn drain_soft_realtime_queue(
+    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    metrics: &Arc<PiperMetrics>,
+    fault_latched: bool,
+    count_as_fault_abort: bool,
+) {
+    while let Ok(command) = soft_realtime_rx.try_recv() {
+        if count_as_fault_abort {
+            count_fault_abort(metrics);
+        }
+        let reason = if fault_latched {
+            crate::DriverError::CommandAbortedByFault
+        } else {
+            crate::DriverError::ChannelClosed
+        };
         command.complete(Err(reason));
     }
 }
@@ -1125,7 +1318,7 @@ fn maintenance_write_denial(
 #[allow(clippy::too_many_arguments)]
 fn parse_and_update_state(
     frame: &PiperFrame,
-    timing_capability: TimingCapability,
+    backend_capability: BackendCapability,
     ctx: &Arc<PiperContext>,
     config: &PipelineConfig,
     state: &mut ParserState,
@@ -1146,7 +1339,7 @@ fn parse_and_update_state(
 
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 state.pending_joint_pos[0] = feedback.j1_rad();
                 state.pending_joint_pos[1] = feedback.j2_rad();
                 state.joint_pos_frame_mask |= 1 << 0;
@@ -1170,7 +1363,7 @@ fn parse_and_update_state(
 
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 state.pending_joint_pos[2] = feedback.j3_rad();
                 state.pending_joint_pos[3] = feedback.j4_rad();
                 state.joint_pos_frame_mask |= 1 << 1;
@@ -1194,7 +1387,7 @@ fn parse_and_update_state(
 
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 state.pending_joint_pos[4] = feedback.j5_rad();
                 state.pending_joint_pos[5] = feedback.j6_rad();
                 state.joint_pos_frame_mask |= 1 << 2;
@@ -1215,7 +1408,7 @@ fn parse_and_update_state(
                     if control_grade_group_ready(
                         state.joint_pos_frame_mask,
                         &state.joint_pos_frame_timestamps,
-                        timing_capability,
+                        backend_capability,
                     ) {
                         ctx.publish_control_joint_position(new_joint_pos_state.clone());
                     } else {
@@ -1325,6 +1518,7 @@ fn parse_and_update_state(
                     if timed_out {
                         commit_pending_velocity(
                             ctx,
+                            backend_capability,
                             state,
                             state.last_vel_packet_time_us,
                             Some("Velocity buffer timeout, dropping partial dynamic group"),
@@ -1334,6 +1528,7 @@ fn parse_and_update_state(
                     } else if (state.vel_update_mask & (1 << joint_index)) != 0 {
                         commit_pending_velocity(
                             ctx,
+                            backend_capability,
                             state,
                             state.last_vel_packet_time_us,
                             Some(
@@ -1360,7 +1555,15 @@ fn parse_and_update_state(
                 state.pending_joint_dynamic.valid_mask = state.vel_update_mask;
 
                 if state.vel_update_mask == 0b111111 {
-                    commit_pending_velocity(ctx, state, frame.timestamp_us, None, true, metrics);
+                    commit_pending_velocity(
+                        ctx,
+                        backend_capability,
+                        state,
+                        frame.timestamp_us,
+                        None,
+                        true,
+                        metrics,
+                    );
                 } else {
                     ctx.publish_raw_joint_dynamic(state.pending_joint_dynamic.clone());
                 }
@@ -1649,7 +1852,7 @@ fn parse_and_update_state(
 
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 state.pending_joint_target_deg[0] = feedback.j1_deg;
                 state.pending_joint_target_deg[1] = feedback.j2_deg;
                 state.joint_control_frame_mask |= 1 << 0;
@@ -1664,7 +1867,7 @@ fn parse_and_update_state(
 
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 state.pending_joint_target_deg[2] = feedback.j3_deg;
                 state.pending_joint_target_deg[3] = feedback.j4_deg;
                 state.joint_control_frame_mask |= 1 << 1;
@@ -1679,7 +1882,7 @@ fn parse_and_update_state(
 
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
-                    group_alignment_timestamp(frame, host_rx_mono_us, timing_capability);
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 state.pending_joint_target_deg[4] = feedback.j5_deg;
                 state.pending_joint_target_deg[5] = feedback.j6_deg;
                 state.joint_control_frame_mask |= 1 << 2;

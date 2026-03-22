@@ -2,7 +2,9 @@
 //!
 //! 提供对外的 `Piper` 结构体，封装底层 IO 线程和状态同步细节。
 
-use crate::command::{CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand};
+use crate::command::{
+    CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand, SoftRealtimeCommand,
+};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
 use crate::metrics::{MetricsSnapshot, PiperMetrics};
@@ -10,7 +12,7 @@ use crate::pipeline::*;
 use crate::state::*;
 use crossbeam_channel::{Receiver, Sender};
 use piper_can::{
-    CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter, TimingCapability,
+    BackendCapability, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter,
 };
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -106,6 +108,9 @@ pub(crate) enum RuntimePhase {
 }
 
 pub(crate) const NORMAL_FRAME_SEND_BUDGET: Duration = Duration::from_micros(500);
+pub(crate) const SOFT_CONTROL_SEND_BUDGET: Duration = Duration::from_millis(5);
+pub(crate) const SOFT_CONTROL_SEND_MIN_DEADLINE: Duration = Duration::from_millis(1);
+pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
 
 #[doc(hidden)]
 #[derive(Debug, Default)]
@@ -757,6 +762,8 @@ impl RuntimePhase {
 pub struct Piper {
     /// 普通可靠命令发送通道。
     reliable_tx: ManuallyDrop<Sender<ReliableCommand>>,
+    /// SoftRealtime 原始批命令发送通道。
+    soft_realtime_tx: ManuallyDrop<Sender<SoftRealtimeCommand>>,
     /// 单飞急停通道。
     shutdown_lane: Arc<ShutdownLane>,
     /// 实时命令插槽（邮箱模式，Overwrite）
@@ -783,8 +790,8 @@ pub struct Piper {
     bus_speed: u32,
     /// Driver 工作模式（用于回放模式控制）
     driver_mode: crate::mode::AtomicDriverMode,
-    /// Timing capability of the active backend.
-    timing_capability: TimingCapability,
+    /// Capability of the active backend.
+    backend_capability: BackendCapability,
 }
 
 impl Piper {
@@ -875,19 +882,22 @@ impl Piper {
         C::RxAdapter: Send + 'static,
         C::TxAdapter: Send + 'static,
     {
+        let backend_capability = can.backend_capability();
         let (rx_adapter, tx_adapter) = can.split()?;
-        Self::new_dual_thread_parts(rx_adapter, tx_adapter, config)
+        Self::new_dual_thread_parts(backend_capability, rx_adapter, tx_adapter, config)
     }
 
     /// 使用已拆分的 RX/TX 适配器创建双线程 runtime。
     pub fn new_dual_thread_parts(
+        backend_capability: BackendCapability,
         rx_adapter: impl RxAdapter + Send + 'static,
         tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
     ) -> Result<Self, CanError> {
-        let timing_capability = rx_adapter.timing_capability();
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
+        let (soft_realtime_tx, soft_realtime_rx) =
+            crossbeam_channel::bounded::<SoftRealtimeCommand>(4);
         let shutdown_lane = Arc::new(ShutdownLane::new());
         let ctx = Arc::new(PiperContext::new());
         let workers_running = Arc::new(AtomicBool::new(true));
@@ -903,13 +913,13 @@ impl Piper {
         let metrics_clone = metrics.clone();
         let runtime_fault_rx = runtime_fault.clone();
         let config_clone = config.clone().unwrap_or_default();
-        let timing_capability_rx = timing_capability;
+        let backend_capability_rx = backend_capability;
         let maintenance_gate_rx = maintenance_gate.clone();
 
         let rx_thread = spawn(move || {
             crate::pipeline::rx_loop(
                 rx_adapter,
-                timing_capability_rx,
+                backend_capability_rx,
                 ctx_clone,
                 config_clone,
                 workers_running_clone,
@@ -930,11 +940,14 @@ impl Piper {
         let shutdown_lane_tx = shutdown_lane.clone();
         let maintenance_gate_tx = maintenance_gate.clone();
         let maintenance_gate_tx_compat = maintenance_gate.clone();
+        let backend_capability_tx = backend_capability;
 
         let tx_thread = spawn(move || {
             crate::pipeline::tx_loop_mailbox(
                 tx_adapter,
+                backend_capability_tx,
                 realtime_slot_tx,
+                soft_realtime_rx,
                 shutdown_lane_tx,
                 reliable_rx,
                 workers_running_tx,
@@ -952,6 +965,7 @@ impl Piper {
 
         Ok(Self {
             reliable_tx: ManuallyDrop::new(reliable_tx),
+            soft_realtime_tx: ManuallyDrop::new(soft_realtime_tx),
             shutdown_lane,
             realtime_slot,
             ctx,
@@ -968,12 +982,12 @@ impl Piper {
             interface: "unknown".to_string(),
             bus_speed: 1_000_000,
             driver_mode: crate::mode::AtomicDriverMode::new(crate::mode::DriverMode::Normal),
-            timing_capability,
+            backend_capability,
         })
     }
 
-    pub fn timing_capability(&self) -> TimingCapability {
-        self.timing_capability
+    pub fn backend_capability(&self) -> BackendCapability {
+        self.backend_capability
     }
 
     /// 获取运行时健康状态。
@@ -1050,6 +1064,11 @@ impl Piper {
         self.get_joint_dynamic_monitor_snapshot()
             .latest_complete_cloned()
             .unwrap_or_default()
+    }
+
+    /// 获取控制级关节动态状态。
+    pub fn get_control_joint_dynamic(&self) -> JointDynamicState {
+        self.ctx.control_joint_dynamic.load().as_ref().clone()
     }
 
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
@@ -1340,7 +1359,7 @@ impl Piper {
     /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回状态数据
     pub fn get_aligned_motion(&self, max_time_diff_us: u64) -> AlignmentResult {
         let joint_position = self.ctx.control_joint_position.load();
-        let joint_dynamic = self.get_joint_dynamic();
+        let joint_dynamic = self.get_control_joint_dynamic();
 
         let time_diff =
             joint_position.hardware_timestamp_us.abs_diff(joint_dynamic.group_timestamp_us);
@@ -1355,6 +1374,7 @@ impl Piper {
             dynamic_host_rx_mono_us: joint_dynamic.group_host_rx_mono_us,
             position_frame_valid_mask: joint_position.frame_valid_mask,
             dynamic_valid_mask: joint_dynamic.valid_mask,
+            dynamic_group_span_us: joint_dynamic.group_span_us(),
             skew_us: (joint_dynamic.group_timestamp_us as i64)
                 - (joint_position.hardware_timestamp_us as i64),
         };
@@ -1745,6 +1765,12 @@ impl Piper {
     ) -> Result<(), DriverError> {
         use crate::command::FrameBuffer;
 
+        if !self.backend_capability.is_strict_realtime() {
+            return Err(DriverError::InvalidInput(
+                "strict realtime package delivery is only available on StrictRealtime backends"
+                    .to_string(),
+            ));
+        }
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
@@ -1776,6 +1802,67 @@ impl Piper {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 Err(DriverError::RealtimeDeliveryTimeout)
             },
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(DriverError::ChannelClosed)
+            },
+        }
+    }
+
+    /// 发送 SoftRealtime 原始批命令并等待实际发送结果。
+    pub fn send_soft_realtime_package_confirmed(
+        &self,
+        frames: impl IntoIterator<Item = PiperFrame>,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        use crate::command::FrameBuffer;
+
+        if !self.backend_capability.is_soft_realtime() {
+            return Err(DriverError::InvalidInput(
+                "soft realtime batch delivery is only available on SoftRealtime backends"
+                    .to_string(),
+            ));
+        }
+        if !self.tx_thread_alive() {
+            return Err(DriverError::ChannelClosed);
+        }
+        if !self.normal_control_open() {
+            return Err(DriverError::ControlPathClosed);
+        }
+
+        let buffer: FrameBuffer = frames.into_iter().collect();
+        if buffer.is_empty() {
+            return Err(DriverError::InvalidInput(
+                "Frame package cannot be empty".to_string(),
+            ));
+        }
+        if buffer.len() > Self::MAX_REALTIME_PACKAGE_SIZE {
+            return Err(DriverError::InvalidInput(format!(
+                "Frame package too large: {} (max: {})",
+                buffer.len(),
+                Self::MAX_REALTIME_PACKAGE_SIZE
+            )));
+        }
+
+        let timeout = timeout.max(SOFT_CONTROL_SEND_MIN_DEADLINE);
+        let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let command = SoftRealtimeCommand::confirmed(buffer, deadline, ack_tx);
+
+        match self.soft_realtime_tx.try_send(command) {
+            Ok(_) => {},
+            Err(crossbeam_channel::TrySendError::Full(command)) => {
+                command.complete(Err(DriverError::ChannelFull));
+                return Err(DriverError::ChannelFull);
+            },
+            Err(crossbeam_channel::TrySendError::Disconnected(command)) => {
+                command.complete(Err(DriverError::ChannelClosed));
+                return Err(DriverError::ChannelClosed);
+            },
+        }
+
+        match ack_rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 Err(DriverError::ChannelClosed)
             },
@@ -2090,6 +2177,7 @@ impl Drop for Piper {
 
         unsafe {
             ManuallyDrop::drop(&mut self.reliable_tx);
+            ManuallyDrop::drop(&mut self.soft_realtime_tx);
         }
 
         self.clear_realtime_slot(DriverError::ChannelClosed, false);
@@ -2533,6 +2621,7 @@ mod tests {
     fn test_wait_for_feedback_uses_connection_monitor() {
         let frame = PiperFrame::new_standard(0x251, &[0; 8]);
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
             MockTxAdapter,
             None,
@@ -2570,6 +2659,7 @@ mod tests {
         let frame =
             PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"S-V1.8-1");
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
             MockTxAdapter,
             None,
@@ -2589,6 +2679,7 @@ mod tests {
             PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"S-V1.6");
         let frame_2 = PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"-3");
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             ScriptedRxAdapter::new(vec![frame_1, frame_2], Duration::from_millis(20)),
             MockTxAdapter,
             None,
@@ -2657,16 +2748,14 @@ mod tests {
             joint_pos: [0.0; 6],
             frame_valid_mask: 0b101,
         });
-        piper.ctx.joint_dynamic_monitor.store(Arc::new(
-            JointDynamicMonitorSnapshot::from_complete(JointDynamicState {
-                group_timestamp_us: 1_000,
-                group_host_rx_mono_us: 2_000,
-                joint_vel: [0.0; 6],
-                joint_current: [0.0; 6],
-                timestamps: [1_000; 6],
-                valid_mask: 0b001111,
-            }),
-        ));
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 1_000,
+            group_host_rx_mono_us: 2_000,
+            joint_vel: [0.0; 6],
+            joint_current: [0.0; 6],
+            timestamps: [1_000; 6],
+            valid_mask: 0b001111,
+        });
 
         let result = piper.get_aligned_motion(0);
         let state = match result {
@@ -2682,6 +2771,7 @@ mod tests {
     fn test_send_realtime_package_confirmed_success() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -2706,6 +2796,7 @@ mod tests {
     fn test_enqueue_shutdown_success() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -2724,7 +2815,13 @@ mod tests {
 
     #[test]
     fn test_enqueue_shutdown_channel_closed_when_tx_thread_exits() {
-        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
+        let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
+            MockRxAdapter,
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
         piper.request_stop();
         std::thread::sleep(Duration::from_millis(5));
         assert!(!piper.tx_thread_alive());
@@ -2742,6 +2839,7 @@ mod tests {
     #[test]
     fn test_enqueue_shutdown_reports_transport_failure() {
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             FailOnNthTxAdapter {
                 fail_on: 1,
@@ -2764,6 +2862,7 @@ mod tests {
     #[test]
     fn test_shutdown_receipt_times_out_waiting_for_ack() {
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             SlowTxAdapter {
                 delay: Duration::from_millis(50),
@@ -2785,6 +2884,7 @@ mod tests {
     #[test]
     fn test_shutdown_receipt_times_out_when_deadline_has_already_passed() {
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             SlowTxAdapter {
                 delay: Duration::from_millis(50),
@@ -2804,7 +2904,13 @@ mod tests {
 
     #[test]
     fn test_shutdown_receipt_returns_ready_ack_even_after_deadline_passes() {
-        let piper = Piper::new_dual_thread_parts(MockRxAdapter, MockTxAdapter, None).unwrap();
+        let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
+            MockRxAdapter,
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
         let receipt = piper
             .enqueue_shutdown(
                 PiperFrame::new_standard(0x471, &[0x01]),
@@ -2822,6 +2928,7 @@ mod tests {
     fn test_latch_fault_closes_normal_control_path_but_keeps_shutdown_lane() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -2857,6 +2964,7 @@ mod tests {
     fn test_rx_fatal_keeps_shutdown_lane_available_while_tx_is_alive() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             FatalRxAdapter { tripped: false },
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -2887,6 +2995,7 @@ mod tests {
     fn test_fault_latched_shutdown_preempts_pending_realtime_and_reliable_commands() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             RecordingTxAdapter {
                 sent_frames: sent_frames.clone(),
@@ -2926,6 +3035,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
             Piper::new_dual_thread_parts(
+                BackendCapability::StrictRealtime,
                 MockRxAdapter,
                 BlockingFirstSendTxAdapter {
                     sent_frames: sent_frames.clone(),
@@ -2979,6 +3089,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
             Piper::new_dual_thread_parts(
+                BackendCapability::StrictRealtime,
                 MockRxAdapter,
                 BlockingFirstSendTxAdapter {
                     sent_frames: sent_frames.clone(),
@@ -3107,6 +3218,7 @@ mod tests {
     #[test]
     fn test_send_realtime_package_confirmed_reports_partial_failure() {
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             FailOnNthTxAdapter {
                 fail_on: 2,
@@ -3142,6 +3254,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         drop(release_tx);
         let piper = Piper::new_dual_thread_parts(
+            BackendCapability::StrictRealtime,
             MockRxAdapter,
             CoordinatedFailTxAdapter {
                 started_tx,
@@ -3175,6 +3288,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let piper = Arc::new(
             Piper::new_dual_thread_parts(
+                BackendCapability::StrictRealtime,
                 MockRxAdapter,
                 CoordinatedFailTxAdapter {
                     started_tx,
