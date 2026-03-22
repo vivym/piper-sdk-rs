@@ -28,7 +28,9 @@ impl CycleScheduler {
         Self {
             period,
             strategy,
-            next_deadline: now,
+            // Delay the first tick by one nominal period so the first reported dt
+            // is close to the configured cycle time instead of near zero.
+            next_deadline: now + period,
             last_tick_start: now,
         }
     }
@@ -78,12 +80,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cycle_scheduler_reports_nominal_tick() {
+    fn test_cycle_scheduler_first_tick_waits_for_nominal_period() {
         let period = Duration::from_millis(20);
         let mut scheduler = CycleScheduler::new(period, SleepStrategy::Sleep);
 
         let first = scheduler.wait_next();
+        assert!(first.real_dt >= Duration::from_millis(15));
         assert_eq!(first.missed_deadlines, 0);
+        assert!(first.lag < Duration::from_millis(20));
+    }
+
+    #[test]
+    fn test_cycle_scheduler_reports_nominal_second_tick() {
+        let period = Duration::from_millis(20);
+        let mut scheduler = CycleScheduler::new(period, SleepStrategy::Sleep);
+
+        let _first = scheduler.wait_next();
 
         let second = scheduler.wait_next();
         assert!(second.real_dt >= Duration::from_millis(15));

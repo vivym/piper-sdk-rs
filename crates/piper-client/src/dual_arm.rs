@@ -161,6 +161,8 @@ impl DualArmActiveMit {
         let active = self;
         let mut report = BilateralRunReport::default();
         let mut shaping_state = OutputShapingState::default();
+        // Delay the first bilateral tick by one nominal period so startup dt is
+        // close to the configured loop period instead of near zero.
         let mut scheduler = CycleScheduler::new(
             nominal_period,
             sleep_strategy_from_loop_timing(cfg.timing_mode),
@@ -1780,12 +1782,14 @@ mod tests {
         timestamp_us: u64,
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
     ) -> Piper<Active<MitMode>, StrictRealtime> {
-        build_piper_with_tx_adapter(
+        let piper = build_piper_with_tx_adapter(
             timestamp_us,
             RecordingTxAdapter::new(sent_frames),
             Duration::from_millis(20),
             active_mit_marker(),
-        )
+        );
+        wait_for_complete_control_snapshot(&piper.observer().clone());
+        piper
     }
 
     fn build_active_mit_piper_with_delay(
@@ -1793,12 +1797,14 @@ mod tests {
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
         post_feedback_delay: Duration,
     ) -> Piper<Active<MitMode>, StrictRealtime> {
-        build_piper_with_tx_adapter(
+        let piper = build_piper_with_tx_adapter(
             timestamp_us,
             RecordingTxAdapter::new(sent_frames),
             post_feedback_delay,
             active_mit_marker(),
-        )
+        );
+        wait_for_complete_control_snapshot(&piper.observer().clone());
+        piper
     }
 
     fn build_standby_piper(
@@ -1806,12 +1812,14 @@ mod tests {
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
         post_feedback_delay: Duration,
     ) -> Piper<Standby, StrictRealtime> {
-        build_piper_with_tx_adapter(
+        let piper = build_piper_with_tx_adapter(
             timestamp_us,
             RecordingTxAdapter::new(sent_frames),
             post_feedback_delay,
             Standby,
-        )
+        );
+        wait_for_complete_control_snapshot(&piper.observer().clone());
+        piper
     }
 
     fn build_active_mit_piper_with_frames(
@@ -1830,6 +1838,29 @@ mod tests {
         // SAFETY: `Active<MitMode>` is a zero-sized state marker wrapping another
         // zero-sized type, so any bit pattern is valid.
         unsafe { std::mem::MaybeUninit::zeroed().assume_init() }
+    }
+
+    fn wait_for_complete_control_snapshot(observer: &Observer<StrictRealtime>) {
+        let start = Instant::now();
+        let policy = ControlReadPolicy {
+            max_state_skew_us: 2_000,
+            max_feedback_age: Duration::from_secs(5),
+        };
+
+        loop {
+            match observer.control_snapshot_full(policy) {
+                Ok(_) => return,
+                Err(RobotError::ControlStateIncomplete { .. })
+                | Err(RobotError::StateMisaligned { .. }) => {},
+                Err(err) => panic!("expected complete control snapshot, got {err:?}"),
+            }
+
+            assert!(
+                start.elapsed() < Duration::from_millis(200),
+                "timed out waiting for complete control snapshot",
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn wait_for_sent_frames(
@@ -2621,7 +2652,7 @@ mod tests {
                 BilateralLoopConfig {
                     warmup_cycles: 0,
                     max_iterations: Some(1),
-                    frequency_hz: 20.0,
+                    frequency_hz: 200.0,
                     gripper: GripperTeleopConfig {
                         enabled: false,
                         ..Default::default()
@@ -2864,7 +2895,9 @@ mod tests {
                     read_policy: DualArmReadPolicy {
                         per_arm: ControlReadPolicy {
                             max_state_skew_us: 2_000,
-                            max_feedback_age: Duration::from_millis(100),
+                            // The first bilateral tick now waits one full 5 Hz period,
+                            // so keep the first cycle fresh and let the second stale out.
+                            max_feedback_age: Duration::from_millis(300),
                         },
                         max_inter_arm_skew: Duration::from_secs(1),
                     },

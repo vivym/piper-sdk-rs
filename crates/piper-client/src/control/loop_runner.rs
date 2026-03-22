@@ -92,6 +92,7 @@ impl Default for LoopConfig {
 ///
 /// # 时间处理
 ///
+/// - 首次循环会先等待一个标称周期，因此首拍 `dt` 接近 `1 / frequency_hz`
 /// - 计算实际 dt
 /// - 如果 dt > max_dt，调用 `controller.on_time_jump(real_dt)`，然后钳位 dt
 /// - 使用钳位后的 dt 调用 `controller.tick()`，并传入完整 `ControlSnapshot`
@@ -204,6 +205,7 @@ where
 /// 使用 spin_sleep 的高精度控制循环
 ///
 /// 与 `run_controller()` 类似，但使用 `spin_sleep` 实现更低的延时抖动。
+/// 与 `run_controller()` 一样，首次循环会先等待一个标称周期，再进入首拍控制。
 ///
 /// ⚠️ **注意**: `spin_sleep` 会占用更多 CPU，适合对实时性要求极高的场景。
 pub fn run_controller_spin<C>(
