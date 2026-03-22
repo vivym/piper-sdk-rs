@@ -24,7 +24,7 @@ use rustls::pki_types::PrivateKeyDer;
 use rustls::server::{ServerConfig, ServerConnection, WebPkiClientVerifier};
 use rustls::{RootCertStore, StreamOwned};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::io::{Read, Write};
@@ -939,6 +939,11 @@ struct RawTapManager {
     subscription: Option<RawTapSubscription>,
 }
 
+enum RawTapUpdateError {
+    NotConnected,
+    Backend(BridgeHostError),
+}
+
 impl RawTapManager {
     fn new(allow: bool, tx: Sender<PiperFrame>) -> Self {
         Self {
@@ -957,7 +962,7 @@ impl RawTapManager {
         sessions: &SessionManager,
         backend: &Arc<dyn BridgeControllerBackend>,
     ) -> Result<(), BridgeHostError> {
-        let desired = self.allow && sessions.raw_frame_tap_subscriber_count() > 0;
+        let desired = self.allow && sessions.raw_tap_subscriber_count() > 0;
         match (desired, self.subscription.is_some()) {
             (true, false) => {
                 self.subscription = Some(
@@ -971,6 +976,47 @@ impl RawTapManager {
             },
             _ => {},
         }
+        Ok(())
+    }
+
+    fn set_session_subscription(
+        &mut self,
+        sessions: &SessionManager,
+        backend: &Arc<dyn BridgeControllerBackend>,
+        session_key: SessionKey,
+        enabled: bool,
+    ) -> Result<(), RawTapUpdateError> {
+        if sessions.active_session_by_key(session_key).is_none() {
+            return Err(RawTapUpdateError::NotConnected);
+        }
+        let already_subscribed = sessions.is_raw_tap_subscribed(session_key);
+        if already_subscribed == enabled {
+            return self.reconcile(sessions, backend).map_err(RawTapUpdateError::Backend);
+        }
+
+        let subscriber_count_before = sessions.raw_tap_subscriber_count();
+        let needs_install_first = enabled && subscriber_count_before == 0;
+        if needs_install_first {
+            self.subscription = Some(backend.install_raw_frame_tap(self.tx.clone()).map_err(
+                |err| RawTapUpdateError::Backend(BridgeHostError::Backend(err.to_string())),
+            )?);
+        }
+
+        if !sessions.set_raw_tap_subscription(session_key, enabled) {
+            if needs_install_first {
+                self.subscription = None;
+            }
+            return Err(RawTapUpdateError::NotConnected);
+        }
+
+        if let Err(err) = self.reconcile(sessions, backend) {
+            let _ = sessions.set_raw_tap_subscription(session_key, already_subscribed);
+            if needs_install_first && subscriber_count_before == 0 {
+                self.subscription = None;
+            }
+            return Err(RawTapUpdateError::Backend(err));
+        }
+
         Ok(())
     }
 }
@@ -1037,7 +1083,6 @@ struct BridgeSession {
     lifecycle: AtomicU8,
     authority_epoch: AtomicU64,
     replacement_close_queued: AtomicBool,
-    raw_frame_tap_enabled: AtomicBool,
     wake: Arc<dyn ConnectionWake>,
 }
 
@@ -1065,7 +1110,6 @@ impl BridgeSession {
             lifecycle: AtomicU8::new(SessionLifecycle::Active as u8),
             authority_epoch: AtomicU64::new(1),
             replacement_close_queued: AtomicBool::new(false),
-            raw_frame_tap_enabled: AtomicBool::new(false),
             wake,
         }
     }
@@ -1130,14 +1174,6 @@ impl BridgeSession {
 
     fn set_filters(&self, filters: Vec<CanIdFilter>) {
         *self.filters.write().unwrap() = filters;
-    }
-
-    fn raw_frame_tap_enabled(&self) -> bool {
-        self.raw_frame_tap_enabled.load(Ordering::Acquire)
-    }
-
-    fn set_raw_frame_tap_enabled(&self, enabled: bool) {
-        self.raw_frame_tap_enabled.store(enabled, Ordering::Release);
     }
 
     fn matches_filter(&self, can_id: u32) -> bool {
@@ -1253,6 +1289,7 @@ struct Registry {
     sessions: HashMap<u32, Arc<BridgeSession>>,
     token_to_session: HashMap<SessionToken, u32>,
     key_to_session: HashMap<SessionKey, u32>,
+    raw_tap_sessions: HashSet<SessionKey>,
 }
 
 struct SessionManager {
@@ -1268,6 +1305,7 @@ impl SessionManager {
                 sessions: HashMap::new(),
                 token_to_session: HashMap::new(),
                 key_to_session: HashMap::new(),
+                raw_tap_sessions: HashSet::new(),
             }),
             next_session_id: AtomicU32::new(1),
             next_session_key: AtomicU64::new(1),
@@ -1327,6 +1365,7 @@ impl SessionManager {
         let replaced =
             registry.token_to_session.remove(&prepared.session_token).and_then(|old_id| {
                 let removed = registry.sessions.remove(&old_id)?;
+                registry.raw_tap_sessions.remove(&removed.session_key());
                 if registry.key_to_session.get(&removed.session_key()).copied() == Some(old_id) {
                     registry.key_to_session.remove(&removed.session_key());
                 }
@@ -1359,6 +1398,7 @@ impl SessionManager {
         let removed = {
             let mut registry = self.registry.write().unwrap();
             let removed = registry.sessions.remove(&session_id)?;
+            registry.raw_tap_sessions.remove(&removed.session_key());
             if registry.token_to_session.get(&removed.session_token()).copied() == Some(session_id)
             {
                 registry.token_to_session.remove(&removed.session_token());
@@ -1397,21 +1437,47 @@ impl SessionManager {
         self.registry.read().unwrap().sessions.len() as u32
     }
 
-    fn raw_frame_tap_subscriber_count(&self) -> usize {
-        self.registry
-            .read()
-            .unwrap()
-            .sessions
-            .values()
-            .filter(|session| session.raw_frame_tap_enabled())
-            .count()
+    fn is_raw_tap_subscribed(&self, session_key: SessionKey) -> bool {
+        self.registry.read().unwrap().raw_tap_sessions.contains(&session_key)
+    }
+
+    fn set_raw_tap_subscription(&self, session_key: SessionKey, enabled: bool) -> bool {
+        let mut registry = self.registry.write().unwrap();
+        let Some(session_id) = registry.key_to_session.get(&session_key).copied() else {
+            return false;
+        };
+        let is_active =
+            registry.sessions.get(&session_id).is_some_and(|session| session.is_active());
+        if !is_active {
+            return false;
+        }
+        if enabled {
+            registry.raw_tap_sessions.insert(session_key);
+        } else {
+            registry.raw_tap_sessions.remove(&session_key);
+        }
+        true
+    }
+
+    fn raw_tap_subscriber_count(&self) -> usize {
+        self.registry.read().unwrap().raw_tap_sessions.len()
     }
 
     fn broadcast_frame(&self, frame: PiperFrame) -> BroadcastFrameStats {
-        let registry = self.registry.read().unwrap();
+        let sessions = {
+            let registry = self.registry.read().unwrap();
+            registry
+                .raw_tap_sessions
+                .iter()
+                .filter_map(|session_key| {
+                    let session_id = registry.key_to_session.get(session_key).copied()?;
+                    registry.sessions.get(&session_id).cloned()
+                })
+                .collect::<Vec<_>>()
+        };
         let mut stats = BroadcastFrameStats::default();
-        for session in registry.sessions.values() {
-            if !session.raw_frame_tap_enabled() || !session.matches_filter(frame.id) {
+        for session in sessions {
+            if !session.matches_filter(frame.id) {
                 continue;
             }
             match session.enqueue_frame(frame) {
@@ -2266,23 +2332,33 @@ impl PiperBridgeHost {
                                         continue;
                                     }
 
-                                    active_session.set_raw_frame_tap_enabled(enabled);
-                                    match Self::reconcile_raw_tap(
-                                        ctx.raw_tap,
+                                    match ctx.raw_tap.lock().unwrap().set_session_subscription(
                                         ctx.sessions,
                                         ctx.backend,
+                                        authority.session_key(),
+                                        enabled,
                                     ) {
                                         Ok(()) => {
                                             response_queue.push_back(QueuedMessage::response(
                                                 ServerResponse::Ok { request_id },
                                             ))
                                         },
-                                        Err(err) => Self::queue_error_response(
-                                            &mut response_queue,
-                                            request_id,
-                                            ErrorCode::DeviceError,
-                                            err.to_string(),
-                                        ),
+                                        Err(RawTapUpdateError::NotConnected) => {
+                                            Self::queue_error_response(
+                                                &mut response_queue,
+                                                request_id,
+                                                ErrorCode::NotConnected,
+                                                "bridge session was replaced or closed",
+                                            )
+                                        },
+                                        Err(RawTapUpdateError::Backend(err)) => {
+                                            Self::queue_error_response(
+                                                &mut response_queue,
+                                                request_id,
+                                                ErrorCode::DeviceError,
+                                                err.to_string(),
+                                            )
+                                        },
                                     }
                                 },
                                 ClientRequest::AcquireWriterLease {
@@ -2707,6 +2783,7 @@ fn message_kind(request: &ClientRequest) -> &'static str {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct NoopWake;
 
@@ -2716,6 +2793,98 @@ mod tests {
 
     fn token(byte: u8) -> SessionToken {
         SessionToken::new([byte; 16])
+    }
+
+    struct TestRawTapCleanup {
+        uninstalls: Arc<AtomicUsize>,
+    }
+
+    impl RawTapCleanup for TestRawTapCleanup {
+        fn uninstall(&self) {
+            self.uninstalls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct TestBridgeBackend {
+        install_fail: AtomicBool,
+        installs: Arc<AtomicUsize>,
+        uninstalls: Arc<AtomicUsize>,
+    }
+
+    impl TestBridgeBackend {
+        fn new() -> Self {
+            Self {
+                install_fail: AtomicBool::new(false),
+                installs: Arc::new(AtomicUsize::new(0)),
+                uninstalls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl BridgeControllerBackend for TestBridgeBackend {
+        fn status_snapshot(&self) -> BridgeStatusInput {
+            BridgeStatusInput {
+                health: HealthStatus {
+                    connected: true,
+                    last_feedback_age: Duration::ZERO,
+                    rx_alive: true,
+                    tx_alive: true,
+                    fault: None,
+                },
+                usb_stall_count: 0,
+                can_bus_off_count: 0,
+                can_error_passive_count: 0,
+                cpu_usage_percent: 0,
+            }
+        }
+
+        fn register_maintenance_event_sink(
+            &self,
+            _sink: Sender<MaintenanceRevocationEvent>,
+        ) -> Result<(), BridgeBackendError> {
+            Ok(())
+        }
+
+        fn acquire_maintenance_lease(
+            &self,
+            _authority: &SessionAuthority,
+            _timeout: Duration,
+        ) -> Result<LeaseAcquireResult, BridgeBackendError> {
+            Ok(LeaseAcquireResult::Denied {
+                holder_session_id: None,
+            })
+        }
+
+        fn release_maintenance_lease(
+            &self,
+            _authority: &SessionAuthority,
+        ) -> Result<bool, BridgeBackendError> {
+            Ok(false)
+        }
+
+        fn send_maintenance_frame(
+            &self,
+            _authority: &SessionAuthority,
+            _frame: PiperFrame,
+        ) -> Result<(), BridgeBackendError> {
+            Ok(())
+        }
+
+        fn install_raw_frame_tap(
+            &self,
+            _tx: Sender<PiperFrame>,
+        ) -> Result<RawTapSubscription, BridgeBackendError> {
+            if self.install_fail.load(Ordering::Relaxed) {
+                return Err(BridgeBackendError::new(
+                    ErrorCode::DeviceError,
+                    "tap install failed",
+                ));
+            }
+            self.installs.fetch_add(1, Ordering::Relaxed);
+            Ok(RawTapSubscription::new(TestRawTapCleanup {
+                uninstalls: Arc::clone(&self.uninstalls),
+            }))
+        }
     }
 
     #[test]
@@ -2772,6 +2941,30 @@ mod tests {
     }
 
     #[test]
+    fn same_token_replacement_clears_raw_tap_subscription() {
+        let manager = Arc::new(SessionManager::new());
+        let first = manager.commit_prepared(manager.prepare_session(
+            token(9),
+            BridgeRole::Observer,
+            vec![],
+            Arc::new(NoopWake),
+        ));
+        assert!(manager.set_raw_tap_subscription(first.session.session_key(), true));
+        assert_eq!(manager.raw_tap_subscriber_count(), 1);
+
+        let second = manager.commit_prepared(manager.prepare_session(
+            token(9),
+            BridgeRole::Observer,
+            vec![],
+            Arc::new(NoopWake),
+        ));
+        assert!(second.replaced.is_some());
+        assert_eq!(manager.raw_tap_subscriber_count(), 0);
+        assert!(!manager.is_raw_tap_subscribed(first.session.session_key()));
+        assert!(!manager.is_raw_tap_subscribed(second.session.session_key()));
+    }
+
+    #[test]
     fn replace_and_close_uses_priority_control_queue() {
         let (event_tx, _event_rx) = SessionManager::new_connection_queue();
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
@@ -2785,7 +2978,6 @@ mod tests {
             control_tx,
             Arc::new(NoopWake),
         );
-        session.set_raw_frame_tap_enabled(true);
 
         for _ in 0..OUTBOUND_QUEUE_CAPACITY {
             assert_eq!(
@@ -2811,7 +3003,7 @@ mod tests {
             vec![],
             Arc::new(NoopWake),
         ));
-        register.session.set_raw_frame_tap_enabled(true);
+        assert!(manager.set_raw_tap_subscription(register.session.session_key(), true));
         register.session.mark_closing();
 
         assert_eq!(
@@ -2821,5 +3013,42 @@ mod tests {
                 inactive: 1,
             }
         );
+    }
+
+    #[test]
+    fn failed_raw_tap_enable_does_not_arm_later_subscription() {
+        let manager = Arc::new(SessionManager::new());
+        let register = manager.commit_prepared(manager.prepare_session(
+            token(4),
+            BridgeRole::Observer,
+            vec![],
+            Arc::new(NoopWake),
+        ));
+        let backend = Arc::new(TestBridgeBackend::new());
+        backend.install_fail.store(true, Ordering::Relaxed);
+        let (tx, _rx) = bounded::<PiperFrame>(RAW_FRAME_TAP_QUEUE_CAPACITY);
+        let mut raw_tap = RawTapManager::new(true, tx);
+
+        assert!(matches!(
+            raw_tap.set_session_subscription(
+                &manager,
+                &(backend.clone() as Arc<dyn BridgeControllerBackend>),
+                register.session.session_key(),
+                true,
+            ),
+            Err(RawTapUpdateError::Backend(_))
+        ));
+        assert_eq!(manager.raw_tap_subscriber_count(), 0);
+        assert!(!manager.is_raw_tap_subscribed(register.session.session_key()));
+
+        backend.install_fail.store(false, Ordering::Relaxed);
+        raw_tap
+            .reconcile(
+                &manager,
+                &(backend.clone() as Arc<dyn BridgeControllerBackend>),
+            )
+            .expect("reconcile without subscribers should succeed");
+        assert_eq!(backend.installs.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.uninstalls.load(Ordering::Relaxed), 0);
     }
 }

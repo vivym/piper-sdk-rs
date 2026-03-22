@@ -187,6 +187,21 @@ impl MaintenanceGateState {
         matches!(self, Self::AllowedStandby)
     }
 
+    fn denial_message(self) -> &'static str {
+        match self {
+            Self::DeniedFaulted => {
+                "maintenance writes are disabled while a runtime fault is latched"
+            },
+            Self::DeniedActiveControl => {
+                "maintenance writes are disabled while active control is enabled"
+            },
+            Self::DeniedTransportDown => {
+                "maintenance writes are disabled while transport is disconnected"
+            },
+            Self::AllowedStandby => "maintenance allowed",
+        }
+    }
+
     fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::DeniedFaulted,
@@ -478,6 +493,32 @@ impl MaintenanceGate {
         self.holder_session_key.load(Ordering::Acquire) == session_key
             && self.lease_epoch.load(Ordering::Acquire) == lease_epoch
             && self.current_state().allows_lease()
+    }
+
+    pub fn commit_send<T, F>(
+        &self,
+        session_key: u64,
+        lease_epoch: u64,
+        send: F,
+    ) -> Result<Result<T, CanError>, DriverError>
+    where
+        F: FnOnce() -> Result<T, CanError>,
+    {
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner.state.allows_lease() {
+                return Err(DriverError::MaintenanceWriteDenied(
+                    inner.state.denial_message().to_string(),
+                ));
+            }
+            if inner.holder_session_key != Some(session_key) || inner.lease_epoch != lease_epoch {
+                return Err(DriverError::MaintenanceWriteDenied(
+                    "maintenance lease is no longer valid".to_string(),
+                ));
+            }
+        }
+
+        Ok(send())
     }
 }
 
