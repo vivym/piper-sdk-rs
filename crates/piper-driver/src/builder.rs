@@ -4,13 +4,13 @@
 
 use crate::error::DriverError;
 use crate::pipeline::PipelineConfig;
-use crate::piper::Piper;
+use crate::piper::{Piper, StartupValidationDeadline};
 #[cfg(target_os = "linux")]
 use piper_can::SocketCanAdapter;
 use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_can::gs_usb::device::GsUsbDeviceSelector;
 use piper_can::{CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 类型化的连接目标。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -214,7 +214,7 @@ impl PiperBuilder {
 
     fn build_with_factory(self, factory: &impl BackendFactory) -> Result<Piper, DriverError> {
         let receive_timeout = Duration::from_millis(self.pipeline_config.receive_timeout_ms);
-        let startup_deadline = Instant::now() + self.startup_validation_timeout;
+        let startup_deadline = StartupValidationDeadline::after(self.startup_validation_timeout);
         match &self.target {
             ConnectionTarget::AutoStrict => {
                 self.build_auto_strict(factory, receive_timeout, startup_deadline)
@@ -267,9 +267,9 @@ impl PiperBuilder {
         factory: &impl BackendFactory,
         iface: &str,
         receive_timeout: Duration,
-        startup_deadline: Instant,
+        startup_deadline: StartupValidationDeadline,
     ) -> Result<Piper, DriverError> {
-        if Instant::now() >= startup_deadline {
+        if startup_deadline.is_expired_now() {
             return Err(self.startup_deadline_expired_error(format!(
                 "before opening SocketCAN target {iface}"
             )));
@@ -298,9 +298,9 @@ impl PiperBuilder {
     fn build_backend_until_deadline(
         &self,
         backend: BuiltBackend,
-        startup_deadline: Instant,
+        startup_deadline: StartupValidationDeadline,
     ) -> Result<Piper, DriverError> {
-        if Instant::now() >= startup_deadline {
+        if startup_deadline.is_expired_now() {
             return Err(self.startup_deadline_expired_error(format!(
                 "before completing strict runtime startup for {}",
                 backend.interface
@@ -344,7 +344,7 @@ impl PiperBuilder {
         &self,
         factory: &impl BackendFactory,
         receive_timeout: Duration,
-        startup_deadline: Instant,
+        startup_deadline: StartupValidationDeadline,
     ) -> Result<Piper, Vec<(String, DriverError)>> {
         #[cfg(target_os = "linux")]
         let mut errors = Vec::new();
@@ -354,7 +354,7 @@ impl PiperBuilder {
         #[cfg(target_os = "linux")]
         {
             for iface in ["can0", "vcan0"] {
-                if Instant::now() >= startup_deadline {
+                if startup_deadline.is_expired_now() {
                     errors.push((
                         iface.to_string(),
                         self.startup_deadline_expired_error(format!(
@@ -369,7 +369,7 @@ impl PiperBuilder {
                 match result {
                     Ok(piper) => return Ok(piper),
                     Err(error) => {
-                        let deadline_expired = Instant::now() >= startup_deadline;
+                        let deadline_expired = startup_deadline.is_expired_now();
                         errors.push((iface.to_string(), error));
                         if deadline_expired {
                             break;
@@ -388,7 +388,7 @@ impl PiperBuilder {
         &self,
         factory: &impl BackendFactory,
         receive_timeout: Duration,
-        startup_deadline: Instant,
+        startup_deadline: StartupValidationDeadline,
     ) -> Result<Piper, DriverError> {
         match self.try_socketcan_candidates(factory, receive_timeout, startup_deadline) {
             Ok(piper) => Ok(piper),
@@ -414,7 +414,7 @@ impl PiperBuilder {
         &self,
         factory: &impl BackendFactory,
         receive_timeout: Duration,
-        startup_deadline: Instant,
+        startup_deadline: StartupValidationDeadline,
     ) -> Result<Piper, DriverError> {
         let strict_errors =
             match self.try_socketcan_candidates(factory, receive_timeout, startup_deadline) {

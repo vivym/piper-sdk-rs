@@ -1059,8 +1059,8 @@ pub struct PiperContext {
     ///
     /// 使用 App Start Relative Time 模式，确保时间单调性。
     pub connection_monitor: crate::heartbeat::ConnectionMonitor,
-    /// 最近一次带可信设备时间戳的反馈到达主机的单调时间（微秒）。
-    pub last_timestamped_feedback_host_rx_mono_us: AtomicU64,
+    /// 第一次带可信设备时间戳的反馈到达主机的单调时间（微秒）。
+    pub first_timestamped_feedback_host_rx_mono_us: AtomicU64,
 
     // === 钩子管理（v1.2.1）===
     /// 钩子管理器（用于运行时回调注册）
@@ -1161,7 +1161,7 @@ impl PiperContext {
             connection_monitor: crate::heartbeat::ConnectionMonitor::new(
                 std::time::Duration::from_secs(1),
             ),
-            last_timestamped_feedback_host_rx_mono_us: AtomicU64::new(0),
+            first_timestamped_feedback_host_rx_mono_us: AtomicU64::new(0),
 
             // 钩子管理器（v1.2.1）
             hooks: Arc::new(RwLock::new(HookManager::new())),
@@ -1169,12 +1169,16 @@ impl PiperContext {
     }
 
     pub fn register_timestamped_robot_feedback(&self, host_rx_mono_us: u64) {
-        self.last_timestamped_feedback_host_rx_mono_us
-            .store(host_rx_mono_us, Ordering::Release);
+        let _ = self.first_timestamped_feedback_host_rx_mono_us.compare_exchange(
+            0,
+            host_rx_mono_us,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
-    pub fn last_timestamped_feedback_host_rx_mono_us(&self) -> u64 {
-        self.last_timestamped_feedback_host_rx_mono_us.load(Ordering::Acquire)
+    pub fn first_timestamped_feedback_host_rx_mono_us(&self) -> u64 {
+        self.first_timestamped_feedback_host_rx_mono_us.load(Ordering::Acquire)
     }
 
     /// 捕获运动状态快照（逻辑原子性）
@@ -1457,6 +1461,15 @@ mod tests {
         // 测试超出范围的索引
         assert_eq!(state.get_torque(6), 0.0);
         assert_eq!(state.get_torque(100), 0.0);
+    }
+
+    #[test]
+    fn test_register_timestamped_robot_feedback_keeps_first_value() {
+        let ctx = PiperContext::new();
+        ctx.register_timestamped_robot_feedback(123);
+        ctx.register_timestamped_robot_feedback(456);
+
+        assert_eq!(ctx.first_timestamped_feedback_host_rx_mono_us(), 123);
     }
 
     #[test]

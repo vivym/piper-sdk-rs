@@ -114,6 +114,31 @@ pub(crate) const SOFT_CONTROL_SEND_MIN_DEADLINE: Duration = Duration::from_milli
 pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
 pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StartupValidationDeadline {
+    instant_deadline: Instant,
+    host_rx_deadline_mono_us: u64,
+}
+
+impl StartupValidationDeadline {
+    pub(crate) fn after(timeout: Duration) -> Self {
+        let timeout_us = timeout.as_micros().min(u64::MAX as u128) as u64;
+        Self {
+            instant_deadline: Instant::now() + timeout,
+            host_rx_deadline_mono_us: crate::heartbeat::monotonic_micros()
+                .saturating_add(timeout_us),
+        }
+    }
+
+    pub(crate) fn is_expired_now(&self) -> bool {
+        Instant::now() >= self.instant_deadline
+    }
+
+    fn host_rx_deadline_mono_us(&self) -> u64 {
+        self.host_rx_deadline_mono_us
+    }
+}
+
 pub(crate) fn strict_realtime_timestamp_error(reason: impl Into<String>) -> DriverError {
     DriverError::Can(CanError::Device(piper_can::CanDeviceError::new(
         piper_can::CanDeviceErrorKind::UnsupportedConfig,
@@ -1231,7 +1256,7 @@ impl Piper {
         C::RxAdapter: Send + 'static,
         C::TxAdapter: Send + 'static,
     {
-        let startup_deadline = Instant::now() + startup_timeout;
+        let startup_deadline = StartupValidationDeadline::after(startup_timeout);
         let (rx_adapter, tx_adapter) = can.split().map_err(DriverError::Can)?;
         Self::new_dual_thread_parts_with_startup_deadline(
             rx_adapter,
@@ -1262,7 +1287,7 @@ impl Piper {
         config: Option<PipelineConfig>,
         startup_timeout: Duration,
     ) -> Result<Self, DriverError> {
-        let startup_deadline = Instant::now() + startup_timeout;
+        let startup_deadline = StartupValidationDeadline::after(startup_timeout);
         Self::new_dual_thread_parts_with_startup_deadline(
             rx_adapter,
             tx_adapter,
@@ -1275,7 +1300,7 @@ impl Piper {
         rx_adapter: impl RxAdapter + Send + 'static,
         tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
-        startup_deadline: Instant,
+        startup_deadline: StartupValidationDeadline,
     ) -> Result<Self, DriverError> {
         let piper = Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
             .map_err(DriverError::Can)?;
@@ -1390,7 +1415,10 @@ impl Piper {
         Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
     }
 
-    fn validate_startup_until(self, startup_deadline: Instant) -> Result<Self, DriverError> {
+    fn validate_startup_until(
+        self,
+        startup_deadline: StartupValidationDeadline,
+    ) -> Result<Self, DriverError> {
         if !self.backend_capability.is_strict_realtime() {
             return Ok(self);
         }
@@ -1852,16 +1880,26 @@ impl Piper {
             ));
         }
 
-        self.wait_for_timestamped_feedback_until(Instant::now() + timeout)
+        self.wait_for_timestamped_feedback_until(StartupValidationDeadline::after(timeout))
     }
 
-    fn wait_for_timestamped_feedback_until(&self, deadline: Instant) -> Result<(), DriverError> {
+    fn wait_for_timestamped_feedback_until(
+        &self,
+        deadline: StartupValidationDeadline,
+    ) -> Result<(), DriverError> {
         loop {
-            if self.ctx.last_timestamped_feedback_host_rx_mono_us() != 0 {
-                return Ok(());
+            let first_feedback_host_rx_mono_us =
+                self.ctx.first_timestamped_feedback_host_rx_mono_us();
+            if first_feedback_host_rx_mono_us != 0 {
+                if first_feedback_host_rx_mono_us <= deadline.host_rx_deadline_mono_us() {
+                    return Ok(());
+                }
+                return Err(strict_realtime_timestamp_error(
+                    "no timestamped feedback arrived before validation deadline",
+                ));
             }
 
-            if Instant::now() >= deadline {
+            if deadline.is_expired_now() {
                 return Err(strict_realtime_timestamp_error(
                     "no timestamped feedback arrived before validation deadline",
                 ));
@@ -3561,6 +3599,64 @@ mod tests {
             },
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_wait_for_timestamped_feedback_until_rejects_late_first_feedback() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None)
+            .expect("unvalidated driver should build");
+        let deadline = StartupValidationDeadline {
+            instant_deadline: Instant::now() + Duration::from_millis(50),
+            host_rx_deadline_mono_us: crate::heartbeat::monotonic_micros(),
+        };
+
+        piper
+            .ctx
+            .register_timestamped_robot_feedback(deadline.host_rx_deadline_mono_us + 1);
+
+        let error = piper
+            .wait_for_timestamped_feedback_until(deadline)
+            .expect_err("late first feedback must not satisfy strict startup validation");
+
+        match error {
+            DriverError::Can(CanError::Device(device_error)) => {
+                assert_eq!(
+                    device_error.kind,
+                    piper_can::CanDeviceErrorKind::UnsupportedConfig
+                );
+                assert!(
+                    device_error.message.contains("validation deadline"),
+                    "unexpected error message: {device_error}"
+                );
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wait_for_timestamped_feedback_until_keeps_first_feedback_timestamp() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None)
+            .expect("unvalidated driver should build");
+        let deadline = StartupValidationDeadline {
+            instant_deadline: Instant::now() + Duration::from_millis(50),
+            host_rx_deadline_mono_us: crate::heartbeat::monotonic_micros() + 10_000,
+        };
+        let first_feedback_host_rx_mono_us = deadline.host_rx_deadline_mono_us - 1;
+
+        piper.ctx.register_timestamped_robot_feedback(first_feedback_host_rx_mono_us);
+        piper
+            .ctx
+            .register_timestamped_robot_feedback(deadline.host_rx_deadline_mono_us + 1_000);
+
+        assert_eq!(
+            piper.ctx.first_timestamped_feedback_host_rx_mono_us(),
+            first_feedback_host_rx_mono_us,
+            "later timestamped feedback must not overwrite the first strict startup witness"
+        );
+
+        piper
+            .wait_for_timestamped_feedback_until(deadline)
+            .expect("first in-deadline feedback should satisfy strict startup validation");
     }
 
     #[test]
