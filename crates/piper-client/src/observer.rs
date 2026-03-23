@@ -391,17 +391,17 @@ where
 
     /// 获取原始关节位置状态（允许部分帧组，仅供诊断）
     pub fn raw_joint_position_state(&self) -> piper_driver::JointPositionState {
-        self.driver.get_joint_position_monitor_snapshot().latest_raw().clone()
+        *self.driver.get_joint_position_monitor_snapshot().latest_raw()
     }
 
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
     pub fn raw_joint_dynamic_state(&self) -> piper_driver::JointDynamicState {
-        self.driver.get_joint_dynamic_monitor_snapshot().latest_raw().clone()
+        *self.driver.get_joint_dynamic_monitor_snapshot().latest_raw()
     }
 
     /// 获取原始末端位姿状态（允许部分帧组，仅供诊断）
     pub fn raw_end_pose_state(&self) -> piper_driver::state::EndPoseState {
-        self.driver.get_end_pose_monitor_snapshot().latest_raw().clone()
+        *self.driver.get_end_pose_monitor_snapshot().latest_raw()
     }
 
     /// 获取夹爪状态
@@ -494,7 +494,7 @@ where
         let latest_complete =
             Self::fresh_end_pose_state(&end_pose, MonitorStateSource::EndPose, policy)?;
 
-        Ok(latest_complete.clone())
+        Ok(*latest_complete)
     }
 
     /// 获取最近一份完整末端位姿监控快照（允许过期）
@@ -503,7 +503,7 @@ where
         let latest_complete =
             Self::complete_end_pose_state(&end_pose, MonitorStateSource::EndPose)?;
 
-        Ok(latest_complete.clone())
+        Ok(*latest_complete)
     }
 
     /// 检查是否全部使能（raw cached bits）

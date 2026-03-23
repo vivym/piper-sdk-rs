@@ -1796,12 +1796,12 @@ impl Piper {
 
     /// 获取控制级关节动态状态。
     pub fn get_control_joint_dynamic(&self) -> JointDynamicState {
-        self.ctx.control_joint_dynamic.load().as_ref().clone()
+        self.ctx.control_joint_dynamic.load()
     }
 
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
     pub fn get_raw_joint_dynamic(&self) -> JointDynamicState {
-        self.get_joint_dynamic_monitor_snapshot().latest_raw().clone()
+        *self.get_joint_dynamic_monitor_snapshot().latest_raw()
     }
 
     /// 获取关节动态监控快照（完整监控 + raw 诊断）
@@ -1828,7 +1828,7 @@ impl Piper {
 
     /// 获取原始关节位置状态（允许部分帧组，仅供诊断）
     pub fn get_raw_joint_position(&self) -> JointPositionState {
-        self.get_joint_position_monitor_snapshot().latest_raw().clone()
+        *self.get_joint_position_monitor_snapshot().latest_raw()
     }
 
     /// 获取关节位置监控快照（完整监控 + raw 诊断）
@@ -1855,7 +1855,7 @@ impl Piper {
 
     /// 获取原始末端位姿状态（允许部分帧组，仅供诊断）
     pub fn get_raw_end_pose(&self) -> EndPoseState {
-        self.get_end_pose_monitor_snapshot().latest_raw().clone()
+        *self.get_end_pose_monitor_snapshot().latest_raw()
     }
 
     /// 获取末端位姿监控快照（完整监控 + raw 诊断）

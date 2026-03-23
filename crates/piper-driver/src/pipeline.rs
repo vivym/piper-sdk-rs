@@ -924,7 +924,7 @@ fn commit_pending_velocity(
     state.pending_joint_dynamic.valid_mask = commit_mask;
 
     if complete_group {
-        ctx.publish_joint_dynamic(state.pending_joint_dynamic.clone());
+        ctx.publish_joint_dynamic(state.pending_joint_dynamic);
         ctx.fps_stats
             .load()
             .joint_dynamic_updates
@@ -932,7 +932,7 @@ fn commit_pending_velocity(
 
         if backend_capability.is_strict_realtime() {
             if state.pending_joint_dynamic.group_span_us() <= STRICT_GROUP_MAX_SPAN_US {
-                ctx.publish_control_joint_dynamic(state.pending_joint_dynamic.clone());
+                ctx.publish_control_joint_dynamic(state.pending_joint_dynamic);
             } else {
                 metrics
                     .rx_joint_dynamic_control_grade_rejected_total
@@ -2248,13 +2248,13 @@ fn parse_and_update_state(
                     frame_valid_mask: state.joint_pos_group.mask,
                 };
                 if complete_group_ready(state.joint_pos_group.mask) {
-                    ctx.publish_joint_position(new_joint_pos_state.clone());
+                    ctx.publish_joint_position(new_joint_pos_state);
                     ctx.fps_stats
                         .load()
                         .joint_position_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if control_grade_group_ready(&state.joint_pos_group, backend_capability) {
-                        ctx.publish_control_joint_position(new_joint_pos_state.clone());
+                        ctx.publish_control_joint_position(new_joint_pos_state);
                     } else {
                         metrics
                             .rx_joint_position_control_grade_rejected_total
@@ -2342,7 +2342,7 @@ fn parse_and_update_state(
                     frame_valid_mask: state.end_pose_group.mask,
                 };
                 if complete_group_ready(state.end_pose_group.mask) {
-                    ctx.publish_end_pose(new_end_pose_state.clone());
+                    ctx.publish_end_pose(new_end_pose_state);
                     ctx.fps_stats
                         .load()
                         .end_pose_updates
@@ -2417,7 +2417,7 @@ fn parse_and_update_state(
                         metrics,
                     );
                 } else {
-                    ctx.publish_raw_joint_dynamic(state.pending_joint_dynamic.clone());
+                    ctx.publish_raw_joint_dynamic(state.pending_joint_dynamic);
                 }
             }
         },

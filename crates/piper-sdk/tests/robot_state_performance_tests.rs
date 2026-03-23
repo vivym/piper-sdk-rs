@@ -133,7 +133,7 @@ fn test_arcswap_read_latency() {
     );
 }
 
-/// 测试 ArcSwap 写入延迟
+/// 测试热路径快照写入延迟
 #[test]
 fn test_arcswap_write_latency() {
     let ctx = Arc::new(PiperContext::new());
@@ -148,9 +148,7 @@ fn test_arcswap_write_latency() {
     };
     for _ in 0..1000 {
         ctx.joint_position_monitor
-            .store(Arc::new(JointPositionMonitorSnapshot::from_complete(
-                initial_state.clone(),
-            )));
+            .store(JointPositionMonitorSnapshot::from_complete(initial_state));
     }
 
     // 测试写入延迟
@@ -163,9 +161,7 @@ fn test_arcswap_write_latency() {
             frame_valid_mask: 0b111,
         };
         ctx.joint_position_monitor
-            .store(Arc::new(JointPositionMonitorSnapshot::from_complete(
-                new_state,
-            )));
+            .store(JointPositionMonitorSnapshot::from_complete(new_state));
     }
     let elapsed = start.elapsed();
 
@@ -390,13 +386,13 @@ fn test_state_clone_performance() {
 
     // 预热
     for _ in 0..1000 {
-        let _ = joint_pos.clone();
+        let _ = joint_pos;
     }
 
     // 测试克隆性能
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = joint_pos.clone();
+        let _ = joint_pos;
     }
     let elapsed = start.elapsed();
 

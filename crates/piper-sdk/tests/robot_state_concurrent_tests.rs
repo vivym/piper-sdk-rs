@@ -27,9 +27,9 @@ fn test_joint_position_state_concurrent_read() {
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer.joint_position_monitor.store(Arc::new(
-                JointPositionMonitorSnapshot::from_complete(new_state),
-            ));
+            ctx_writer
+                .joint_position_monitor
+                .store(JointPositionMonitorSnapshot::from_complete(new_state));
             thread::yield_now();
         }
     });
@@ -84,7 +84,7 @@ fn test_end_pose_state_concurrent_read() {
             };
             ctx_writer
                 .end_pose_monitor
-                .store(Arc::new(EndPoseMonitorSnapshot::from_complete(new_state)));
+                .store(EndPoseMonitorSnapshot::from_complete(new_state));
             thread::yield_now();
         }
     });
@@ -406,9 +406,9 @@ fn test_multiple_states_concurrent_read() {
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer.joint_position_monitor.store(Arc::new(
-                JointPositionMonitorSnapshot::from_complete(new_joint_pos),
-            ));
+            ctx_writer
+                .joint_position_monitor
+                .store(JointPositionMonitorSnapshot::from_complete(new_joint_pos));
 
             // 更新 robot_control
             let new_robot_control = RobotControlState {
@@ -509,9 +509,9 @@ fn test_no_deadlock() {
                         joint_pos: [counter as f64; 6],
                         frame_valid_mask: 0b111,
                     };
-                    ctx_clone.joint_position_monitor.store(Arc::new(
-                        JointPositionMonitorSnapshot::from_complete(new_state),
-                    ));
+                    ctx_clone
+                        .joint_position_monitor
+                        .store(JointPositionMonitorSnapshot::from_complete(new_state));
                     counter += 1;
                 }
                 thread::yield_now();

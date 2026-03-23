@@ -2,14 +2,139 @@
 
 use crate::fps_stats::FpsStatistics;
 use arc_swap::ArcSwap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+
+/// 固定槽位实时快照单元。
+///
+/// 该类型用于 500Hz 热路径的单写者、多读者发布场景：
+/// - 写者只能写入当前未发布、且没有读者持有的槽位
+/// - 读者先增加 reader count，再复核 published 槽位，确保读取稳定快照
+/// - 发布只切换槽位索引，不涉及堆分配或锁
+///
+/// # Safety
+///
+/// 内部 `unsafe` 依赖以下不变量：
+/// - 只有单个写线程调用 `store()`
+/// - 写者只会写入 `reader_count == 0` 的非已发布槽位
+/// - 读者在持有 reader count 期间，写者不会复用该槽位
+#[doc(hidden)]
+pub struct RealtimeSnapshotCell<T: Copy + Default, const N: usize = 3> {
+    slots: [UnsafeCell<T>; N],
+    reader_counts: [AtomicUsize; N],
+    published_slot: AtomicUsize,
+}
+
+impl<T: Copy + Default, const N: usize> RealtimeSnapshotCell<T, N> {
+    pub fn new(initial: T) -> Self {
+        assert!(N >= 3, "RealtimeSnapshotCell requires at least 3 slots");
+        Self {
+            slots: std::array::from_fn(|_| UnsafeCell::new(initial)),
+            reader_counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            published_slot: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn load(&self) -> T {
+        loop {
+            let slot = self.published_slot.load(Ordering::Acquire);
+            self.reader_counts[slot].fetch_add(1, Ordering::AcqRel);
+
+            if self.published_slot.load(Ordering::Acquire) == slot {
+                // SAFETY:
+                // - 读者已经持有该槽位的 reader count
+                // - 写者不会复用 reader count > 0 的槽位
+                // - T: Copy，只返回按值副本
+                let value = unsafe { *self.slots[slot].get() };
+                self.reader_counts[slot].fetch_sub(1, Ordering::AcqRel);
+                return value;
+            }
+
+            self.reader_counts[slot].fetch_sub(1, Ordering::AcqRel);
+            std::hint::spin_loop();
+        }
+    }
+
+    pub fn store(&self, value: T) {
+        loop {
+            let published = self.published_slot.load(Ordering::Acquire);
+
+            for slot in 0..N {
+                if slot == published {
+                    continue;
+                }
+                if self.reader_counts[slot].load(Ordering::Acquire) != 0 {
+                    continue;
+                }
+
+                // SAFETY:
+                // - 单写者模型下不存在并发写
+                // - 该槽位不是当前 published，新的读者无法进入
+                // - reader_count == 0，没有旧读者仍持有该槽位
+                unsafe {
+                    *self.slots[slot].get() = value;
+                }
+                self.published_slot.store(slot, Ordering::Release);
+                return;
+            }
+
+            std::hint::spin_loop();
+        }
+    }
+
+    #[cfg(test)]
+    fn published_slot_for_test(&self) -> usize {
+        self.published_slot.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn pin_slot_for_test(&self, slot: usize) -> RealtimeSnapshotSlotGuard<'_, T, N> {
+        self.reader_counts[slot].fetch_add(1, Ordering::AcqRel);
+        RealtimeSnapshotSlotGuard { cell: self, slot }
+    }
+}
+
+impl<T: Copy + Default, const N: usize> Default for RealtimeSnapshotCell<T, N> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+// SAFETY:
+// - 内部可变性仅用于受 reader count 协调保护的槽位写入
+// - 跨线程传递/共享时只暴露按值快照
+unsafe impl<T: Copy + Default + Send, const N: usize> Send for RealtimeSnapshotCell<T, N> {}
+// SAFETY:
+// - 并发访问通过 published 索引和 per-slot reader count 协调
+// - 读者不会获得内部可变引用
+unsafe impl<T: Copy + Default + Send, const N: usize> Sync for RealtimeSnapshotCell<T, N> {}
+
+#[cfg(test)]
+struct RealtimeSnapshotSlotGuard<'a, T: Copy + Default, const N: usize = 3> {
+    cell: &'a RealtimeSnapshotCell<T, N>,
+    slot: usize,
+}
+
+#[cfg(test)]
+impl<T: Copy + Default, const N: usize> RealtimeSnapshotSlotGuard<'_, T, N> {
+    fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
+#[cfg(test)]
+impl<T: Copy + Default, const N: usize> Drop for RealtimeSnapshotSlotGuard<'_, T, N> {
+    fn drop(&mut self) {
+        self.cell.reader_counts[self.slot].fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// 关节位置状态（帧组同步）
 ///
 /// 更新频率：~500Hz
 /// CAN ID：0x2A5-0x2A7
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct JointPositionState {
     /// 硬件时间戳（微秒，来自完整帧组的最后一帧）
     ///
@@ -52,7 +177,7 @@ impl JointPositionState {
 ///
 /// 更新频率：~500Hz
 /// CAN ID：0x2A2-0x2A4
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct EndPoseState {
     /// 硬件时间戳（微秒，来自完整帧组的最后一帧）
     pub hardware_timestamp_us: u64,
@@ -92,25 +217,25 @@ impl EndPoseState {
 ///
 /// 同时保存最近一份完整监控快照和当前 raw 诊断状态，
 /// 用于避免 monitor 读路径跨两份状态读取导致的竞态。
-#[derive(Debug, Clone, Default)]
-pub struct MonitorSnapshot<T: Clone + Default> {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MonitorSnapshot<T: Copy + Default> {
     /// 最近一份完整 monitor-complete 快照
-    latest_complete: Option<Arc<T>>,
+    latest_complete: Option<T>,
     /// 当前 raw 状态（允许部分帧/部分关节）
     latest_raw: T,
 }
 
-impl<T: Clone + Default> MonitorSnapshot<T> {
+impl<T: Copy + Default> MonitorSnapshot<T> {
     /// 构造同时更新 complete/raw 的监控快照
     pub fn from_complete(complete: T) -> Self {
         Self {
-            latest_complete: Some(Arc::new(complete.clone())),
+            latest_complete: Some(complete),
             latest_raw: complete,
         }
     }
 
     /// 构造保留上一份完整快照、仅更新 raw 的监控快照
-    pub fn with_raw(latest_complete: Option<Arc<T>>, latest_raw: T) -> Self {
+    pub fn with_raw(latest_complete: Option<T>, latest_raw: T) -> Self {
         Self {
             latest_complete,
             latest_raw,
@@ -119,7 +244,7 @@ impl<T: Clone + Default> MonitorSnapshot<T> {
 
     /// 返回最近一份完整监控快照。
     pub fn latest_complete(&self) -> Option<&T> {
-        self.latest_complete.as_deref()
+        self.latest_complete.as_ref()
     }
 
     /// 返回最近一份完整监控快照的副本。
@@ -144,7 +269,7 @@ pub type JointDynamicMonitorSnapshot = MonitorSnapshot<JointDynamicState>;
 ///
 /// 用于在同一时刻捕获多个运动相关状态，保证逻辑上的原子性。
 /// 这是一个栈上对象（Stack Allocated），开销极小。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MotionSnapshot {
     /// 关节位置状态
     pub joint_position: JointPositionState,
@@ -161,7 +286,7 @@ pub struct MotionSnapshot {
 /// 大小：< 150 字节，Clone 开销低
 /// 同步机制：Buffered Commit（收集 6 个关节的速度帧，集齐或超时后一次性提交）
 /// 时间同步性：通过 Group Commit 机制，保证 6 个关节数据来自同一 CAN 传输周期
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct JointDynamicState {
     /// 整个组的大致时间戳（最新一帧的时间，微秒）
     ///
@@ -1029,21 +1154,21 @@ use crate::hooks::HookManager;
 /// Piper 上下文（所有状态的聚合）
 pub struct PiperContext {
     // === 热数据（500Hz，高频运动数据）===
-    // 使用 ArcSwap，无锁读取，适合高频控制循环
+    // 使用固定槽位快照，无锁读取，适合高频控制循环
     /// 关节位置监控快照（完整监控 + raw 诊断，共享一次原子发布）
-    pub joint_position_monitor: Arc<ArcSwap<JointPositionMonitorSnapshot>>,
+    pub joint_position_monitor: Arc<RealtimeSnapshotCell<JointPositionMonitorSnapshot>>,
     /// 末端位姿监控快照（完整监控 + raw 诊断，共享一次原子发布）
-    pub end_pose_monitor: Arc<ArcSwap<EndPoseMonitorSnapshot>>,
+    pub end_pose_monitor: Arc<RealtimeSnapshotCell<EndPoseMonitorSnapshot>>,
     /// 完整监控运动状态快照（单次 load 保证逻辑原子）
-    pub motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
+    pub motion_snapshot: Arc<RealtimeSnapshotCell<MotionSnapshot>>,
     /// 控制级关节位置状态（完整帧组 + 对齐跨度约束）
-    pub control_joint_position: Arc<ArcSwap<JointPositionState>>,
+    pub control_joint_position: Arc<RealtimeSnapshotCell<JointPositionState>>,
     /// 关节动态监控快照（完整监控 + raw 诊断，共享一次原子发布）
-    pub joint_dynamic_monitor: Arc<ArcSwap<JointDynamicMonitorSnapshot>>,
+    pub joint_dynamic_monitor: Arc<RealtimeSnapshotCell<JointDynamicMonitorSnapshot>>,
     /// 控制级关节动态状态（完整 6 关节组 + 组内跨度约束）
-    pub control_joint_dynamic: Arc<ArcSwap<JointDynamicState>>,
+    pub control_joint_dynamic: Arc<RealtimeSnapshotCell<JointDynamicState>>,
     /// 原始运动状态快照（单次 load 保证逻辑原子）
-    pub raw_motion_snapshot: Arc<ArcSwap<MotionSnapshot>>,
+    pub raw_motion_snapshot: Arc<RealtimeSnapshotCell<MotionSnapshot>>,
 
     // === 温数据（200Hz，控制状态）===
     // 使用 ArcSwap，更新频率中等，但需要原子性
@@ -1138,7 +1263,7 @@ impl PiperContext {
     /// 创建新的上下文
     ///
     /// 初始化所有状态结构，包括：
-    /// - 热数据（ArcSwap）：`joint_position_monitor`, `end_pose_monitor`, `joint_dynamic_monitor`
+    /// - 热数据（固定槽位快照）：`joint_position_monitor`, `end_pose_monitor`, `joint_dynamic_monitor`
     /// - 温数据（ArcSwap）：`robot_control`, `gripper`, `joint_driver_low_speed`
     /// - 冷数据（RwLock）：`collision_protection`, `joint_limit_config`, `joint_accel_config`, `end_limit_config`
     /// - FPS 统计：`fps_stats`
@@ -1154,18 +1279,24 @@ impl PiperContext {
     /// ```
     pub fn new() -> Self {
         Self {
-            // 热数据：ArcSwap，无锁读取
-            joint_position_monitor: Arc::new(ArcSwap::from_pointee(
+            // 热数据：固定槽位快照，无锁读取
+            joint_position_monitor: Arc::new(RealtimeSnapshotCell::new(
                 JointPositionMonitorSnapshot::default(),
             )),
-            end_pose_monitor: Arc::new(ArcSwap::from_pointee(EndPoseMonitorSnapshot::default())),
-            motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
-            control_joint_position: Arc::new(ArcSwap::from_pointee(JointPositionState::default())),
-            joint_dynamic_monitor: Arc::new(ArcSwap::from_pointee(
+            end_pose_monitor: Arc::new(
+                RealtimeSnapshotCell::new(EndPoseMonitorSnapshot::default()),
+            ),
+            motion_snapshot: Arc::new(RealtimeSnapshotCell::new(MotionSnapshot::default())),
+            control_joint_position: Arc::new(RealtimeSnapshotCell::new(
+                JointPositionState::default(),
+            )),
+            joint_dynamic_monitor: Arc::new(RealtimeSnapshotCell::new(
                 JointDynamicMonitorSnapshot::default(),
             )),
-            control_joint_dynamic: Arc::new(ArcSwap::from_pointee(JointDynamicState::default())),
-            raw_motion_snapshot: Arc::new(ArcSwap::from_pointee(MotionSnapshot::default())),
+            control_joint_dynamic: Arc::new(
+                RealtimeSnapshotCell::new(JointDynamicState::default()),
+            ),
+            raw_motion_snapshot: Arc::new(RealtimeSnapshotCell::new(MotionSnapshot::default())),
 
             // 温数据：ArcSwap
             robot_control: Arc::new(ArcSwap::from_pointee(RobotControlState::default())),
@@ -1228,7 +1359,7 @@ impl PiperContext {
     ///
     /// **注意**：返回的状态可能来自不同的CAN传输周期。
     ///
-    /// **性能**：返回栈上对象，开销极小（仅包含 Arc 的克隆，不复制实际数据）
+    /// **性能**：返回栈上对象，开销极小（固定槽位读 + 按值复制）
     ///
     /// # Example
     ///
@@ -1241,116 +1372,109 @@ impl PiperContext {
     /// println!("End pose: {:?}", snapshot.end_pose.end_pose);
     /// ```
     pub fn capture_motion_snapshot(&self) -> MotionSnapshot {
-        self.motion_snapshot.load().as_ref().clone()
+        self.motion_snapshot.load()
     }
 
     /// 捕获关节位置监控快照（完整监控 + raw 诊断）
     pub fn capture_joint_position_monitor_snapshot(&self) -> JointPositionMonitorSnapshot {
-        self.joint_position_monitor.load().as_ref().clone()
+        self.joint_position_monitor.load()
     }
 
     /// 捕获末端位姿监控快照（完整监控 + raw 诊断）
     pub fn capture_end_pose_monitor_snapshot(&self) -> EndPoseMonitorSnapshot {
-        self.end_pose_monitor.load().as_ref().clone()
+        self.end_pose_monitor.load()
     }
 
     /// 捕获关节动态监控快照（完整监控 + raw 诊断）
     pub fn capture_joint_dynamic_monitor_snapshot(&self) -> JointDynamicMonitorSnapshot {
-        self.joint_dynamic_monitor.load().as_ref().clone()
+        self.joint_dynamic_monitor.load()
     }
 
     /// 捕获原始运动状态快照（允许部分帧组，仅供诊断）
     pub fn capture_raw_motion_snapshot(&self) -> MotionSnapshot {
-        self.raw_motion_snapshot.load().as_ref().clone()
+        self.raw_motion_snapshot.load()
     }
 
     /// 发布新的关节位置完整监控快照，并与当前末端位姿组合成逻辑原子快照。
     pub fn publish_joint_position(&self, joint_position: JointPositionState) {
         let end_pose = self.end_pose_monitor.load();
         self.joint_position_monitor
-            .store(Arc::new(JointPositionMonitorSnapshot::from_complete(
-                joint_position.clone(),
-            )));
-        self.motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.clone(),
-            end_pose: end_pose.latest_complete_cloned().unwrap_or_default(),
-        }));
-        self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
+            .store(JointPositionMonitorSnapshot::from_complete(joint_position));
+        self.motion_snapshot.store(MotionSnapshot {
             joint_position,
-            end_pose: end_pose.latest_raw().clone(),
-        }));
+            end_pose: end_pose.latest_complete_cloned().unwrap_or_default(),
+        });
+        self.raw_motion_snapshot.store(MotionSnapshot {
+            joint_position,
+            end_pose: *end_pose.latest_raw(),
+        });
     }
 
     /// 发布新的原始关节位置，并与当前原始末端位姿组合成逻辑原子快照。
     pub fn publish_raw_joint_position(&self, joint_position: JointPositionState) {
         let current = self.joint_position_monitor.load();
         let end_pose = self.end_pose_monitor.load();
-        self.joint_position_monitor
-            .store(Arc::new(JointPositionMonitorSnapshot::with_raw(
-                current.latest_complete.clone(),
-                joint_position.clone(),
-            )));
-        self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
+        self.joint_position_monitor.store(JointPositionMonitorSnapshot::with_raw(
+            current.latest_complete,
             joint_position,
-            end_pose: end_pose.latest_raw().clone(),
-        }));
+        ));
+        self.raw_motion_snapshot.store(MotionSnapshot {
+            joint_position,
+            end_pose: *end_pose.latest_raw(),
+        });
     }
 
     /// 发布新的末端位姿完整监控快照，并与当前关节位置组合成逻辑原子快照。
     pub fn publish_end_pose(&self, end_pose: EndPoseState) {
         let joint_position = self.joint_position_monitor.load();
-        self.end_pose_monitor.store(Arc::new(EndPoseMonitorSnapshot::from_complete(
-            end_pose.clone(),
-        )));
-        self.motion_snapshot.store(Arc::new(MotionSnapshot {
+        self.end_pose_monitor.store(EndPoseMonitorSnapshot::from_complete(end_pose));
+        self.motion_snapshot.store(MotionSnapshot {
             joint_position: joint_position.latest_complete_cloned().unwrap_or_default(),
-            end_pose: end_pose.clone(),
-        }));
-        self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.latest_raw().clone(),
             end_pose,
-        }));
+        });
+        self.raw_motion_snapshot.store(MotionSnapshot {
+            joint_position: *joint_position.latest_raw(),
+            end_pose,
+        });
     }
 
     /// 发布新的控制级关节位置。
     pub fn publish_control_joint_position(&self, joint_position: JointPositionState) {
-        self.control_joint_position.store(Arc::new(joint_position));
+        self.control_joint_position.store(joint_position);
     }
 
     /// 发布新的原始末端位姿，并与当前原始关节位置组合成逻辑原子快照。
     pub fn publish_raw_end_pose(&self, end_pose: EndPoseState) {
         let current = self.end_pose_monitor.load();
         let joint_position = self.joint_position_monitor.load();
-        self.end_pose_monitor.store(Arc::new(EndPoseMonitorSnapshot::with_raw(
-            current.latest_complete.clone(),
-            end_pose.clone(),
-        )));
-        self.raw_motion_snapshot.store(Arc::new(MotionSnapshot {
-            joint_position: joint_position.latest_raw().clone(),
+        self.end_pose_monitor.store(EndPoseMonitorSnapshot::with_raw(
+            current.latest_complete,
             end_pose,
-        }));
+        ));
+        self.raw_motion_snapshot.store(MotionSnapshot {
+            joint_position: *joint_position.latest_raw(),
+            end_pose,
+        });
     }
 
     /// 发布新的完整关节动态监控快照。
     pub fn publish_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
         self.joint_dynamic_monitor
-            .store(Arc::new(JointDynamicMonitorSnapshot::from_complete(
-                joint_dynamic,
-            )));
+            .store(JointDynamicMonitorSnapshot::from_complete(joint_dynamic));
     }
 
     /// 发布新的控制级关节动态状态。
     pub fn publish_control_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
-        self.control_joint_dynamic.store(Arc::new(joint_dynamic));
+        self.control_joint_dynamic.store(joint_dynamic);
     }
 
     /// 发布新的原始关节动态状态。
     pub fn publish_raw_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
         let current = self.joint_dynamic_monitor.load();
-        self.joint_dynamic_monitor.store(Arc::new(JointDynamicMonitorSnapshot::with_raw(
-            current.latest_complete.clone(),
+        self.joint_dynamic_monitor.store(JointDynamicMonitorSnapshot::with_raw(
+            current.latest_complete,
             joint_dynamic,
-        )));
+        ));
     }
 }
 
@@ -1417,11 +1541,135 @@ pub enum AlignmentResult {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{EndPoseState, JointPositionState, MotionSnapshot, PiperContext};
-    use std::f64::consts::PI;
+struct TestCountingAllocator;
 
-    use super::JointDynamicState;
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: TestCountingAllocator = TestCountingAllocator;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ALLOC_COUNTING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_ALLOC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_test_allocation() {
+    TEST_ALLOC_COUNTING_DEPTH.with(|depth| {
+        if depth.get() > 0 {
+            TEST_ALLOC_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        }
+    });
+}
+
+#[cfg(test)]
+unsafe impl std::alloc::GlobalAlloc for TestCountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        record_test_allocation();
+        // SAFETY: 直接委托给系统分配器。
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: 直接委托给系统分配器。
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        record_test_allocation();
+        // SAFETY: 直接委托给系统分配器。
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        record_test_allocation();
+        // SAFETY: 直接委托给系统分配器。
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[cfg(test)]
+fn count_thread_allocations<F>(f: F) -> usize
+where
+    F: FnOnce(),
+{
+    struct CountingGuard;
+
+    impl Drop for CountingGuard {
+        fn drop(&mut self) {
+            TEST_ALLOC_COUNTING_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+
+    TEST_ALLOC_COUNT.with(|count| count.set(0));
+    TEST_ALLOC_COUNTING_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    let _guard = CountingGuard;
+    f();
+    TEST_ALLOC_COUNT.with(|count| count.get())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::PI;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    #[derive(Debug, Clone, Copy)]
+    struct SequenceSnapshot {
+        seq: u64,
+        seq_complement: u64,
+    }
+
+    impl Default for SequenceSnapshot {
+        fn default() -> Self {
+            Self::new(0)
+        }
+    }
+
+    impl SequenceSnapshot {
+        fn new(seq: u64) -> Self {
+            Self {
+                seq,
+                seq_complement: !seq,
+            }
+        }
+
+        fn is_valid(self) -> bool {
+            self.seq_complement == !self.seq
+        }
+    }
+
+    fn sample_joint_position_state(seq: u64, mask: u8) -> JointPositionState {
+        JointPositionState {
+            hardware_timestamp_us: seq,
+            host_rx_mono_us: seq.saturating_add(1_000),
+            joint_pos: std::array::from_fn(|index| seq as f64 + index as f64),
+            frame_valid_mask: mask,
+        }
+    }
+
+    fn sample_end_pose_state(seq: u64, mask: u8) -> EndPoseState {
+        EndPoseState {
+            hardware_timestamp_us: seq,
+            host_rx_mono_us: seq.saturating_add(2_000),
+            end_pose: std::array::from_fn(|index| (seq + index as u64) as f64 / 10.0),
+            frame_valid_mask: mask,
+        }
+    }
+
+    fn sample_joint_dynamic_state(seq: u64, mask: u8) -> JointDynamicState {
+        JointDynamicState {
+            group_timestamp_us: seq,
+            group_host_rx_mono_us: seq.saturating_add(3_000),
+            joint_vel: std::array::from_fn(|index| seq as f64 + index as f64 * 0.1),
+            joint_current: std::array::from_fn(|index| seq as f64 + index as f64 * 0.01),
+            timestamps: std::array::from_fn(|index| seq.saturating_add(index as u64)),
+            valid_mask: mask,
+        }
+    }
 
     #[test]
     fn test_joint_dynamic_state_is_complete() {
@@ -1552,9 +1800,6 @@ mod tests {
         assert_eq!(state.get_torque(0), 0.0);
         assert_eq!(state.get_torque(5), 0.0);
     }
-
-    use super::*;
-
     #[test]
     fn test_piper_context_new() {
         let ctx = PiperContext::new();
@@ -1591,7 +1836,7 @@ mod tests {
             timestamps: [100, 200, 300, 400, 500, 600],
             valid_mask: 0b111111,
         };
-        let cloned = state.clone();
+        let cloned = state;
         assert_eq!(state.group_timestamp_us, cloned.group_timestamp_us);
         assert_eq!(state.group_host_rx_mono_us, cloned.group_host_rx_mono_us);
         assert_eq!(state.joint_vel, cloned.joint_vel);
@@ -1781,7 +2026,7 @@ mod tests {
             joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             frame_valid_mask: 0b0000_0111,
         };
-        let cloned = state.clone();
+        let cloned = state;
         assert_eq!(state.hardware_timestamp_us, cloned.hardware_timestamp_us);
         assert_eq!(state.host_rx_mono_us, cloned.host_rx_mono_us);
         assert_eq!(state.joint_pos, cloned.joint_pos);
@@ -1856,7 +2101,7 @@ mod tests {
             end_pose: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
             frame_valid_mask: 0b0000_0111,
         };
-        let cloned = state.clone();
+        let cloned = state;
         assert_eq!(state.hardware_timestamp_us, cloned.hardware_timestamp_us);
         assert_eq!(state.host_rx_mono_us, cloned.host_rx_mono_us);
         assert_eq!(state.end_pose, cloned.end_pose);
@@ -1890,7 +2135,7 @@ mod tests {
                 frame_valid_mask: 0b0000_0111,
             },
         };
-        let cloned = snapshot.clone();
+        let cloned = snapshot;
         assert_eq!(
             snapshot.joint_position.joint_pos,
             cloned.joint_position.joint_pos
@@ -1920,7 +2165,7 @@ mod tests {
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         };
-        ctx.publish_joint_position(joint_position.clone());
+        ctx.publish_joint_position(joint_position);
 
         let snapshot_after_joint = ctx.capture_motion_snapshot();
         assert_eq!(
@@ -1935,7 +2180,7 @@ mod tests {
             end_pose: [2.0; 6],
             frame_valid_mask: 0b111,
         };
-        ctx.publish_end_pose(end_pose.clone());
+        ctx.publish_end_pose(end_pose);
 
         let snapshot_after_end = ctx.capture_motion_snapshot();
         assert_eq!(
@@ -1964,7 +2209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_joint_position_monitor_snapshot_reuses_complete_arc_for_raw_updates() {
+    fn test_joint_position_monitor_snapshot_preserves_complete_on_raw_updates() {
         let ctx = PiperContext::new();
         let complete = JointPositionState {
             hardware_timestamp_us: 100,
@@ -1975,8 +2220,11 @@ mod tests {
         ctx.publish_joint_position(complete);
 
         let first = ctx.capture_joint_position_monitor_snapshot();
-        let first_complete =
-            first.latest_complete.as_ref().expect("complete snapshot should exist").clone();
+        assert_eq!(
+            first.latest_complete().expect("complete snapshot should exist").joint_pos,
+            [1.0; 6]
+        );
+        assert_eq!(first.latest_raw().joint_pos, [1.0; 6]);
 
         ctx.publish_raw_joint_position(JointPositionState {
             hardware_timestamp_us: 101,
@@ -1986,13 +2234,6 @@ mod tests {
         });
 
         let second = ctx.capture_joint_position_monitor_snapshot();
-        let second_complete = second
-            .latest_complete
-            .as_ref()
-            .expect("complete snapshot should remain")
-            .clone();
-
-        assert!(Arc::ptr_eq(&first_complete, &second_complete));
         assert_eq!(second.latest_raw().frame_valid_mask, 0b001);
         assert_eq!(
             second.latest_complete().expect("complete snapshot should remain").joint_pos,
@@ -2001,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn test_end_pose_monitor_snapshot_reuses_complete_arc_for_raw_updates() {
+    fn test_end_pose_monitor_snapshot_preserves_complete_on_raw_updates() {
         let ctx = PiperContext::new();
         let complete = EndPoseState {
             hardware_timestamp_us: 300,
@@ -2012,8 +2253,11 @@ mod tests {
         ctx.publish_end_pose(complete);
 
         let first = ctx.capture_end_pose_monitor_snapshot();
-        let first_complete =
-            first.latest_complete.as_ref().expect("complete snapshot should exist").clone();
+        assert_eq!(
+            first.latest_complete().expect("complete snapshot should exist").end_pose,
+            [1.5; 6]
+        );
+        assert_eq!(first.latest_raw().end_pose, [1.5; 6]);
 
         ctx.publish_raw_end_pose(EndPoseState {
             hardware_timestamp_us: 301,
@@ -2023,13 +2267,6 @@ mod tests {
         });
 
         let second = ctx.capture_end_pose_monitor_snapshot();
-        let second_complete = second
-            .latest_complete
-            .as_ref()
-            .expect("complete snapshot should remain")
-            .clone();
-
-        assert!(Arc::ptr_eq(&first_complete, &second_complete));
         assert_eq!(second.latest_raw().frame_valid_mask, 0b001);
         assert_eq!(
             second.latest_complete().expect("complete snapshot should remain").end_pose,
@@ -2038,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_joint_dynamic_monitor_snapshot_reuses_complete_arc_for_raw_updates() {
+    fn test_joint_dynamic_monitor_snapshot_preserves_complete_on_raw_updates() {
         let ctx = PiperContext::new();
         let complete = JointDynamicState {
             group_timestamp_us: 500,
@@ -2051,8 +2288,11 @@ mod tests {
         ctx.publish_joint_dynamic(complete);
 
         let first = ctx.capture_joint_dynamic_monitor_snapshot();
-        let first_complete =
-            first.latest_complete.as_ref().expect("complete snapshot should exist").clone();
+        assert_eq!(
+            first.latest_complete().expect("complete snapshot should exist").valid_mask,
+            0b11_1111
+        );
+        assert_eq!(first.latest_raw().valid_mask, 0b11_1111);
 
         ctx.publish_raw_joint_dynamic(JointDynamicState {
             group_timestamp_us: 501,
@@ -2064,18 +2304,165 @@ mod tests {
         });
 
         let second = ctx.capture_joint_dynamic_monitor_snapshot();
-        let second_complete = second
-            .latest_complete
-            .as_ref()
-            .expect("complete snapshot should remain")
-            .clone();
-
-        assert!(Arc::ptr_eq(&first_complete, &second_complete));
         assert_eq!(second.latest_raw().valid_mask, 0b000001);
         assert_eq!(
             second.latest_complete().expect("complete snapshot should remain").valid_mask,
             0b11_1111
         );
+    }
+
+    #[test]
+    fn test_capture_raw_motion_snapshot_tracks_partial_updates() {
+        let ctx = PiperContext::new();
+
+        ctx.publish_raw_joint_position(sample_joint_position_state(10, 0b001));
+        let snapshot_after_joint = ctx.capture_raw_motion_snapshot();
+        assert_eq!(snapshot_after_joint.joint_position.frame_valid_mask, 0b001);
+        assert_eq!(snapshot_after_joint.end_pose.frame_valid_mask, 0);
+
+        ctx.publish_raw_end_pose(sample_end_pose_state(20, 0b010));
+        let snapshot_after_end = ctx.capture_raw_motion_snapshot();
+        assert_eq!(snapshot_after_end.joint_position.frame_valid_mask, 0b001);
+        assert_eq!(snapshot_after_end.end_pose.frame_valid_mask, 0b010);
+        assert_eq!(snapshot_after_end.end_pose.hardware_timestamp_us, 20);
+    }
+
+    #[test]
+    fn test_control_grade_cells_return_latest_published_value() {
+        let ctx = PiperContext::new();
+
+        let joint_position = sample_joint_position_state(42, 0b111);
+        let joint_dynamic = sample_joint_dynamic_state(84, 0b11_1111);
+
+        ctx.publish_control_joint_position(joint_position);
+        ctx.publish_control_joint_dynamic(joint_dynamic);
+
+        assert_eq!(ctx.control_joint_position.load().hardware_timestamp_us, 42);
+        assert_eq!(ctx.control_joint_position.load().frame_valid_mask, 0b111);
+        assert_eq!(ctx.control_joint_dynamic.load().group_timestamp_us, 84);
+        assert_eq!(ctx.control_joint_dynamic.load().valid_mask, 0b11_1111);
+    }
+
+    #[test]
+    fn test_realtime_snapshot_cell_single_writer_multi_reader_stress() {
+        const WRITES: u64 = 20_000;
+        const READERS: usize = 4;
+
+        let cell = Arc::new(RealtimeSnapshotCell::<SequenceSnapshot>::default());
+        let start = Arc::new(Barrier::new(READERS + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let max_written = Arc::new(AtomicU64::new(0));
+
+        let writer_cell = Arc::clone(&cell);
+        let writer_start = Arc::clone(&start);
+        let writer_stop = Arc::clone(&stop);
+        let writer_max = Arc::clone(&max_written);
+        let writer = thread::spawn(move || {
+            writer_start.wait();
+            for seq in 1..=WRITES {
+                writer_max.store(seq, Ordering::Release);
+                writer_cell.store(SequenceSnapshot::new(seq));
+            }
+            writer_stop.store(true, Ordering::Release);
+        });
+
+        let mut readers = Vec::new();
+        for _ in 0..READERS {
+            let reader_cell = Arc::clone(&cell);
+            let reader_start = Arc::clone(&start);
+            let reader_stop = Arc::clone(&stop);
+            let reader_max = Arc::clone(&max_written);
+            readers.push(thread::spawn(move || {
+                let mut last_seen = 0;
+                reader_start.wait();
+
+                loop {
+                    let snapshot = reader_cell.load();
+                    assert!(snapshot.is_valid(), "reader observed torn snapshot");
+                    let max_seen = reader_max.load(Ordering::Acquire);
+                    assert!(
+                        snapshot.seq <= max_seen,
+                        "reader observed unpublished snapshot: {} > {}",
+                        snapshot.seq,
+                        max_seen
+                    );
+                    assert!(
+                        snapshot.seq >= last_seen,
+                        "reader observed rollback: {} < {}",
+                        snapshot.seq,
+                        last_seen
+                    );
+                    last_seen = snapshot.seq;
+
+                    if reader_stop.load(Ordering::Acquire)
+                        && last_seen >= reader_max.load(Ordering::Acquire)
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        writer.join().unwrap();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+
+        assert_eq!(cell.load().seq, WRITES);
+    }
+
+    #[test]
+    fn test_realtime_snapshot_cell_waits_for_free_slot_before_reuse() {
+        let cell = Arc::new(RealtimeSnapshotCell::<SequenceSnapshot>::default());
+
+        let held_oldest = cell.pin_slot_for_test(cell.published_slot_for_test());
+        cell.store(SequenceSnapshot::new(1));
+        let held_middle = cell.pin_slot_for_test(cell.published_slot_for_test());
+        cell.store(SequenceSnapshot::new(2));
+
+        assert_ne!(held_oldest.slot(), held_middle.slot());
+
+        let blocked_published_slot = cell.published_slot_for_test();
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let writer_cell = Arc::clone(&cell);
+        let writer_finished = Arc::clone(&finished);
+        let writer = thread::spawn(move || {
+            writer_cell.store(SequenceSnapshot::new(3));
+            writer_finished.store(true, Ordering::Release);
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "writer should wait until one spare slot is released"
+        );
+        assert_eq!(cell.published_slot_for_test(), blocked_published_slot);
+
+        drop(held_middle);
+        writer.join().unwrap();
+
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(cell.load().seq, 3);
+    }
+
+    #[test]
+    fn test_hot_publish_paths_do_not_allocate() {
+        let ctx = PiperContext::new();
+
+        ctx.publish_joint_position(sample_joint_position_state(1, 0b111));
+        ctx.publish_raw_joint_dynamic(sample_joint_dynamic_state(2, 0b000001));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(3, 0b11_1111));
+
+        let allocations = count_thread_allocations(|| {
+            for seq in 10..1_010 {
+                ctx.publish_joint_position(sample_joint_position_state(seq, 0b111));
+                ctx.publish_raw_joint_dynamic(sample_joint_dynamic_state(seq, 0b000001));
+                ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(seq, 0b11_1111));
+            }
+        });
+
+        assert_eq!(allocations, 0, "hot publish path should not allocate");
     }
 
     // ============================================================
