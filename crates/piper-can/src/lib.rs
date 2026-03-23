@@ -191,6 +191,19 @@ pub trait RxAdapter {
     fn backend_capability(&self) -> BackendCapability {
         BackendCapability::StrictRealtime
     }
+
+    /// Optional startup-time capability probe.
+    ///
+    /// Adapters that can classify realtime capability before worker threads start
+    /// should override this and cache any consumed frames for later replay from
+    /// `receive()`. The default implementation preserves the legacy behavior:
+    /// construction defers capability validation to the driver runtime.
+    fn startup_probe_until(
+        &mut self,
+        _deadline: std::time::Instant,
+    ) -> Result<Option<BackendCapability>, CanError> {
+        Ok(None)
+    }
 }
 
 impl<T> RxAdapter for Box<T>
@@ -203,6 +216,13 @@ where
 
     fn backend_capability(&self) -> BackendCapability {
         (**self).backend_capability()
+    }
+
+    fn startup_probe_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<Option<BackendCapability>, CanError> {
+        (**self).startup_probe_until(deadline)
     }
 }
 

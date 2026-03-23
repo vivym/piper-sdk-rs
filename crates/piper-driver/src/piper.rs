@@ -135,6 +135,10 @@ impl StartupValidationDeadline {
         Instant::now() >= self.instant_deadline
     }
 
+    pub(crate) fn instant_deadline(&self) -> Instant {
+        self.instant_deadline
+    }
+
     fn host_rx_deadline_mono_us(&self) -> u64 {
         self.host_rx_deadline_mono_us
     }
@@ -1465,17 +1469,34 @@ impl Piper {
         config: Option<PipelineConfig>,
         startup_deadline: StartupValidationDeadline,
     ) -> Result<Self, DriverError> {
-        let piper = Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
+        let mut rx_adapter = rx_adapter;
+        let probed_capability = rx_adapter
+            .startup_probe_until(startup_deadline.instant_deadline())
             .map_err(DriverError::Can)?;
-        piper.validate_startup_until(startup_deadline)
+        let backend_capability =
+            probed_capability.unwrap_or_else(|| rx_adapter.backend_capability());
+        let startup_validated = probed_capability.is_some();
+
+        let piper = Self::new_dual_thread_parts_internal(
+            rx_adapter,
+            tx_adapter,
+            config,
+            backend_capability,
+        )
+        .map_err(DriverError::Can)?;
+        if startup_validated {
+            Ok(piper)
+        } else {
+            piper.validate_startup_until(startup_deadline)
+        }
     }
 
     fn new_dual_thread_parts_internal(
         rx_adapter: impl RxAdapter + Send + 'static,
         tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
+        backend_capability: BackendCapability,
     ) -> Result<Self, CanError> {
-        let backend_capability = rx_adapter.backend_capability();
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
         let (soft_realtime_tx, soft_realtime_rx) =
@@ -1580,7 +1601,8 @@ impl Piper {
         tx_adapter: impl RealtimeTxAdapter + Send + 'static,
         config: Option<PipelineConfig>,
     ) -> Result<Self, CanError> {
-        Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config)
+        let backend_capability = rx_adapter.backend_capability();
+        Self::new_dual_thread_parts_internal(rx_adapter, tx_adapter, config, backend_capability)
     }
 
     fn validate_startup_until(
@@ -3125,6 +3147,45 @@ mod tests {
         }
     }
 
+    struct ProbedBootstrapRxAdapter {
+        capability: BackendCapability,
+        bootstrap: VecDeque<PiperFrame>,
+    }
+
+    impl ProbedBootstrapRxAdapter {
+        fn new(capability: BackendCapability, frame: PiperFrame) -> Self {
+            let mut bootstrap = VecDeque::new();
+            bootstrap.push_back(frame);
+            Self {
+                capability,
+                bootstrap,
+            }
+        }
+    }
+
+    impl piper_can::RxAdapter for ProbedBootstrapRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            self.bootstrap.pop_front().ok_or(CanError::Timeout)
+        }
+
+        fn backend_capability(&self) -> BackendCapability {
+            self.capability
+        }
+
+        fn startup_probe_until(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<Option<BackendCapability>, CanError> {
+            if Instant::now() > deadline {
+                return Err(CanError::Device(piper_can::CanDeviceError::new(
+                    piper_can::CanDeviceErrorKind::UnsupportedConfig,
+                    "startup validation deadline elapsed before startup probe completed",
+                )));
+            }
+            Ok(Some(self.capability))
+        }
+    }
+
     struct SoftRxAdapter;
 
     impl piper_can::RxAdapter for SoftRxAdapter {
@@ -4304,6 +4365,26 @@ mod tests {
             },
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_public_new_dual_thread_parts_accepts_soft_probed_backend_and_replays_bootstrap_feedback()
+     {
+        let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
+        frame.timestamp_us = 123;
+
+        let piper = Piper::new_dual_thread_parts(
+            ProbedBootstrapRxAdapter::new(BackendCapability::SoftRealtime, frame),
+            MockTxAdapter,
+            None,
+        )
+        .expect("soft startup probe should admit the runtime");
+
+        assert_eq!(piper.backend_capability(), BackendCapability::SoftRealtime);
+        piper
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("bootstrap replayed feedback should satisfy wait_for_feedback");
+        assert!(piper.health().connected);
     }
 
     #[test]

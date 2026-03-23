@@ -38,6 +38,12 @@ enum GsUsbSelectorSpec {
     BusAddress { bus: u8, address: u8 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketCanRequirement {
+    StrictOnly,
+    MotionCapable,
+}
+
 struct BuiltBackend {
     rx: Box<dyn RxAdapter + Send>,
     tx: Box<dyn RealtimeTxAdapter + Send>,
@@ -345,6 +351,7 @@ impl PiperBuilder {
         factory: &impl BackendFactory,
         receive_timeout: Duration,
         startup_deadline: StartupValidationDeadline,
+        requirement: SocketCanRequirement,
     ) -> Result<Piper, Vec<(String, DriverError)>> {
         #[cfg(target_os = "linux")]
         let mut errors = Vec::new();
@@ -367,7 +374,38 @@ impl PiperBuilder {
                 let result =
                     self.build_socketcan_backend(factory, iface, receive_timeout, startup_deadline);
                 match result {
-                    Ok(piper) => return Ok(piper),
+                    Ok(piper) => {
+                        let capability = piper.backend_capability();
+                        let accepted = match requirement {
+                            SocketCanRequirement::StrictOnly => capability.is_strict_realtime(),
+                            SocketCanRequirement::MotionCapable => {
+                                capability.supports_motion_control()
+                            },
+                        };
+                        if accepted {
+                            return Ok(piper);
+                        }
+                        let requirement_error = match requirement {
+                            SocketCanRequirement::StrictOnly => {
+                                crate::piper::strict_realtime_timestamp_error(format!(
+                                    "SocketCAN candidate {iface} only exposed {capability:?} during startup probing"
+                                ))
+                            },
+                            SocketCanRequirement::MotionCapable => {
+                                DriverError::Can(CanError::Device(CanDeviceError::new(
+                                    CanDeviceErrorKind::UnsupportedConfig,
+                                    format!(
+                                        "SocketCAN candidate {iface} resolved to {capability:?}, which does not support motion control"
+                                    ),
+                                )))
+                            },
+                        };
+                        let deadline_expired = startup_deadline.is_expired_now();
+                        errors.push((iface.to_string(), requirement_error));
+                        if deadline_expired {
+                            break;
+                        }
+                    },
                     Err(error) => {
                         let deadline_expired = startup_deadline.is_expired_now();
                         errors.push((iface.to_string(), error));
@@ -379,7 +417,7 @@ impl PiperBuilder {
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (factory, receive_timeout, startup_deadline);
+        let _ = (factory, receive_timeout, startup_deadline, requirement);
 
         Err(errors)
     }
@@ -390,7 +428,12 @@ impl PiperBuilder {
         receive_timeout: Duration,
         startup_deadline: StartupValidationDeadline,
     ) -> Result<Piper, DriverError> {
-        match self.try_socketcan_candidates(factory, receive_timeout, startup_deadline) {
+        match self.try_socketcan_candidates(
+            factory,
+            receive_timeout,
+            startup_deadline,
+            SocketCanRequirement::StrictOnly,
+        ) {
             Ok(piper) => Ok(piper),
             Err(errors) if errors.is_empty() => {
                 Err(DriverError::Can(CanError::Device(CanDeviceError::new(
@@ -416,11 +459,15 @@ impl PiperBuilder {
         receive_timeout: Duration,
         startup_deadline: StartupValidationDeadline,
     ) -> Result<Piper, DriverError> {
-        let strict_errors =
-            match self.try_socketcan_candidates(factory, receive_timeout, startup_deadline) {
-                Ok(piper) => return Ok(piper),
-                Err(errors) => errors,
-            };
+        let strict_errors = match self.try_socketcan_candidates(
+            factory,
+            receive_timeout,
+            startup_deadline,
+            SocketCanRequirement::MotionCapable,
+        ) {
+            Ok(piper) => return Ok(piper),
+            Err(errors) => errors,
+        };
 
         match factory.open_gs_usb(GsUsbSelectorSpec::Auto, self.baud_rate, receive_timeout) {
             Ok(backend) => self.build_backend(backend, self.startup_validation_timeout),
@@ -488,6 +535,59 @@ mod tests {
                 return Ok(frame);
             }
             Err(CanError::Timeout)
+        }
+
+        fn startup_probe_until(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<Option<piper_can::BackendCapability>, CanError> {
+            if Instant::now() > deadline {
+                return Err(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::UnsupportedConfig,
+                    "startup validation deadline elapsed before strict probe completed",
+                )));
+            }
+            Ok(Some(piper_can::BackendCapability::StrictRealtime))
+        }
+    }
+
+    struct SoftBootstrapRxAdapter {
+        bootstrap: Option<piper_can::PiperFrame>,
+    }
+
+    impl SoftBootstrapRxAdapter {
+        fn new() -> Self {
+            let mut frame = piper_can::PiperFrame::new_standard(0x251, &[0; 8]);
+            frame.timestamp_us = 1;
+            Self {
+                bootstrap: Some(frame),
+            }
+        }
+    }
+
+    impl RxAdapter for SoftBootstrapRxAdapter {
+        fn receive(&mut self) -> Result<piper_can::PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
+            Err(CanError::Timeout)
+        }
+
+        fn backend_capability(&self) -> piper_can::BackendCapability {
+            piper_can::BackendCapability::SoftRealtime
+        }
+
+        fn startup_probe_until(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<Option<piper_can::BackendCapability>, CanError> {
+            if Instant::now() > deadline {
+                return Err(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::UnsupportedConfig,
+                    "startup validation deadline elapsed before soft probe completed",
+                )));
+            }
+            Ok(Some(piper_can::BackendCapability::SoftRealtime))
         }
     }
 
@@ -594,6 +694,69 @@ mod tests {
             match iface {
                 "can0" => Ok(BuiltBackend::new(
                     StrictNoTimestampRxAdapter,
+                    TestTxAdapter,
+                    format!("socketcan:{iface}"),
+                    baud_rate,
+                )),
+                "vcan0" => Ok(BuiltBackend::new(
+                    StrictBootstrapRxAdapter::new(),
+                    TestTxAdapter,
+                    format!("socketcan:{iface}"),
+                    baud_rate,
+                )),
+                other => Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::NotFound,
+                    format!("unexpected SocketCAN candidate: {other}"),
+                )))),
+            }
+        }
+
+        fn open_gs_usb(
+            &self,
+            selector: GsUsbSelectorSpec,
+            baud_rate: u32,
+            _receive_timeout: Duration,
+        ) -> Result<BuiltBackend, DriverError> {
+            let label = match selector {
+                GsUsbSelectorSpec::Auto => "gs-usb:auto".to_string(),
+                GsUsbSelectorSpec::Serial(serial) => format!("gs-usb:serial:{serial}"),
+                GsUsbSelectorSpec::BusAddress { bus, address } => {
+                    format!("gs-usb:bus-address:{bus}:{address}")
+                },
+            };
+            self.calls.lock().unwrap().push(label.clone());
+            Ok(BuiltBackend::new(
+                TestRxAdapter,
+                TestTxAdapter,
+                label,
+                baud_rate,
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct ProbedSocketCanFactory {
+        openable_socketcan: Vec<String>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl BackendFactory for ProbedSocketCanFactory {
+        fn open_socketcan(
+            &self,
+            iface: &str,
+            baud_rate: u32,
+            _receive_timeout: Duration,
+        ) -> Result<BuiltBackend, DriverError> {
+            self.calls.lock().unwrap().push(format!("socketcan:{iface}"));
+            if !self.openable_socketcan.iter().any(|item| item == iface) {
+                return Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                    CanDeviceErrorKind::NotFound,
+                    format!("unexpected SocketCAN candidate: {iface}"),
+                ))));
+            }
+            match iface {
+                "can0" => Ok(BuiltBackend::new(
+                    SoftBootstrapRxAdapter::new(),
                     TestTxAdapter,
                     format!("socketcan:{iface}"),
                     baud_rate,
@@ -774,6 +937,68 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         {
             assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_auto_strict_skips_soft_socketcan_candidate_and_continues_to_strict_one() {
+        let factory = ProbedSocketCanFactory {
+            openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let result = PiperBuilder::new()
+            .target(ConnectionTarget::AutoStrict)
+            .startup_validation_timeout(Duration::from_millis(20))
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            let piper =
+                result.expect("AutoStrict should skip soft candidate and accept strict one");
+            assert_eq!(
+                piper.backend_capability(),
+                piper_can::BackendCapability::StrictRealtime
+            );
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string(), "socketcan:vcan0".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_auto_any_prefers_soft_socketcan_candidate_without_gs_usb_fallback() {
+        let factory = ProbedSocketCanFactory {
+            openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let result = PiperBuilder::new()
+            .target(ConnectionTarget::AutoAny)
+            .startup_validation_timeout(Duration::from_millis(20))
+            .build_with_factory(&factory);
+
+        #[cfg(target_os = "linux")]
+        {
+            let piper =
+                result.expect("AutoAny should accept the first soft-realtime SocketCAN candidate");
+            assert_eq!(
+                piper.backend_capability(),
+                piper_can::BackendCapability::SoftRealtime
+            );
+            assert_eq!(
+                factory.calls.lock().unwrap().as_slice(),
+                &["socketcan:can0".to_string()]
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            result.expect("non-Linux AutoAny should go straight to GS-USB");
         }
     }
 

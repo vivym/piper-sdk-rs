@@ -120,86 +120,14 @@ impl Default for LoopConfig {
 /// ```
 pub fn run_controller<C>(
     piper: Piper<Active<MitMode>, StrictRealtime>,
-    mut controller: C,
+    controller: C,
     config: LoopConfig,
 ) -> Result<(), RobotError>
 where
     C: Controller,
     RobotError: From<C::Error>,
 {
-    ensure_realtime_control_supported(&piper)?;
-
-    // ✅ 输入验证
-    if config.frequency_hz <= 0.0 {
-        return Err(RobotError::ConfigError(format!(
-            "Invalid frequency_hz: {} (must be > 0)",
-            config.frequency_hz
-        )));
-    }
-    if config.frequency_hz > 10000.0 {
-        tracing::warn!(
-            "Very high control frequency: {} Hz. This may cause performance issues.",
-            config.frequency_hz
-        );
-    }
-    if config.dt_clamp_multiplier <= 0.0 {
-        return Err(RobotError::ConfigError(format!(
-            "Invalid dt_clamp_multiplier: {} (must be > 0)",
-            config.dt_clamp_multiplier
-        )));
-    }
-
-    // 计算标称周期和最大 dt
-    let nominal_period = Duration::from_secs_f64(1.0 / config.frequency_hz);
-    let max_dt = nominal_period.mul_f64(config.dt_clamp_multiplier);
-
-    let mut scheduler = CycleScheduler::new(nominal_period, SleepStrategy::Sleep);
-    let mut iteration = 0;
-
-    loop {
-        // 检查是否达到最大迭代次数
-        if let Some(max_iter) = config.max_iterations
-            && iteration >= max_iter
-        {
-            return Ok(());
-        }
-
-        // 1. 计算 dt
-        let cycle = scheduler.wait_next();
-        let real_dt = cycle.real_dt;
-        let mut dt = real_dt;
-
-        // 2. dt 钳位
-        if real_dt > max_dt {
-            // 调用 on_time_jump 处理异常
-            controller.on_time_jump(real_dt).map_err(RobotError::from)?;
-
-            // 钳位 dt
-            dt = max_dt;
-        }
-
-        // 3. 读取当前状态
-        let snapshot = piper.observer().control_snapshot(config.read_policy)?;
-
-        // 4. 调用控制器（只返回力矩）
-        let torques = tick_controller(&mut controller, &snapshot, dt)?;
-
-        // 5. 发送命令（使用纯力矩模式，kp/kd=0）
-        let zero_positions = crate::types::JointArray::from([crate::types::Rad(0.0); 6]);
-        let zero_velocities = crate::types::JointArray::from([0.0; 6]);
-        let zero_kp = crate::types::JointArray::from([0.0; 6]);
-        let zero_kd = crate::types::JointArray::from([0.0; 6]);
-        piper.command_torques(
-            &zero_positions,
-            &zero_velocities,
-            &zero_kp,
-            &zero_kd,
-            &torques,
-        )?;
-
-        // 6. 更新时间
-        iteration += 1;
-    }
+    run_controller_with_strategy(piper, controller, config, default_sleep_strategy())
 }
 
 /// 使用 spin_sleep 的高精度控制循环
@@ -210,15 +138,21 @@ where
 /// ⚠️ **注意**: `spin_sleep` 会占用更多 CPU，适合对实时性要求极高的场景。
 pub fn run_controller_spin<C>(
     piper: Piper<Active<MitMode>, StrictRealtime>,
-    mut controller: C,
+    controller: C,
     config: LoopConfig,
 ) -> Result<(), RobotError>
 where
     C: Controller,
     RobotError: From<C::Error>,
 {
-    ensure_realtime_control_supported(&piper)?;
+    run_controller_with_strategy(piper, controller, config, SleepStrategy::Spin)
+}
 
+fn default_sleep_strategy() -> SleepStrategy {
+    SleepStrategy::Spin
+}
+
+fn validate_loop_config(config: &LoopConfig) -> Result<(), RobotError> {
     // ✅ 输入验证
     if config.frequency_hz <= 0.0 {
         return Err(RobotError::ConfigError(format!(
@@ -238,11 +172,31 @@ where
             config.dt_clamp_multiplier
         )));
     }
+    Ok(())
+}
 
+fn run_controller_with_strategy<C>(
+    piper: Piper<Active<MitMode>, StrictRealtime>,
+    mut controller: C,
+    config: LoopConfig,
+    strategy: SleepStrategy,
+) -> Result<(), RobotError>
+where
+    C: Controller,
+    RobotError: From<C::Error>,
+{
+    ensure_realtime_control_supported(&piper)?;
+    validate_loop_config(&config)?;
+
+    // 计算标称周期和最大 dt
     let nominal_period = Duration::from_secs_f64(1.0 / config.frequency_hz);
     let max_dt = nominal_period.mul_f64(config.dt_clamp_multiplier);
-    let mut scheduler = CycleScheduler::new(nominal_period, SleepStrategy::Spin);
+    let mut scheduler = CycleScheduler::new(nominal_period, strategy);
     let mut iteration = 0;
+    let zero_positions = crate::types::JointArray::from([crate::types::Rad(0.0); 6]);
+    let zero_velocities = crate::types::JointArray::from([0.0; 6]);
+    let zero_kp = crate::types::JointArray::from([0.0; 6]);
+    let zero_kd = crate::types::JointArray::from([0.0; 6]);
 
     loop {
         if let Some(max_iter) = config.max_iterations
@@ -263,10 +217,6 @@ where
         let snapshot = piper.observer().control_snapshot(config.read_policy)?;
         let torques = tick_controller(&mut controller, &snapshot, dt)?;
 
-        let zero_positions = crate::types::JointArray::from([crate::types::Rad(0.0); 6]);
-        let zero_velocities = crate::types::JointArray::from([0.0; 6]);
-        let zero_kp = crate::types::JointArray::from([0.0; 6]);
-        let zero_kd = crate::types::JointArray::from([0.0; 6]);
         piper.command_torques(
             &zero_positions,
             &zero_velocities,
@@ -381,5 +331,10 @@ mod tests {
 
         assert_eq!(controller.seen_snapshot, Some(snapshot));
         assert_eq!(torques, JointArray::splat(NewtonMeter(0.0)));
+    }
+
+    #[test]
+    fn test_run_controller_defaults_to_spin_strategy() {
+        assert_eq!(default_sleep_strategy(), SleepStrategy::Spin);
     }
 }

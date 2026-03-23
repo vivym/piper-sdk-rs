@@ -130,6 +130,29 @@ pub const ID_GRIPPER_TEACH_PARAMS: u32 = 0x47D;
 /// 夹爪/示教器参数反馈
 pub const ID_GRIPPER_TEACH_PARAMS_FEEDBACK: u32 = 0x47E;
 
+/// Returns whether a CAN ID represents robot-originated feedback/state traffic.
+///
+/// This intentionally includes feedback-style control/config echoes that the driver
+/// treats as robot feedback for connection monitoring and startup validation.
+pub const fn is_robot_feedback_id(id: u32) -> bool {
+    matches!(
+        id,
+        0x2A1..=0x2A8
+            | 0x251..=0x256
+            | 0x261..=0x266
+            | 0x4AF
+            | ID_COLLISION_PROTECTION_LEVEL_FEEDBACK
+            | ID_MOTOR_LIMIT_FEEDBACK
+            | ID_MOTOR_MAX_ACCEL_FEEDBACK
+            | ID_END_VELOCITY_ACCEL_FEEDBACK
+            | ID_CONTROL_MODE
+            | ID_JOINT_CONTROL_12
+            | ID_JOINT_CONTROL_34
+            | ID_JOINT_CONTROL_56
+            | ID_GRIPPER_CONTROL
+    )
+}
+
 // ============================================================================
 // ID 分类枚举
 // ============================================================================
@@ -213,5 +236,22 @@ mod tests {
         assert_eq!(ID_ROBOT_STATUS, 0x2A1);
         assert_eq!(ID_EMERGENCY_STOP, 0x150);
         assert_eq!(ID_MOTOR_ENABLE, 0x471);
+    }
+
+    #[test]
+    fn test_is_robot_feedback_id_matches_driver_feedback_surface() {
+        assert!(is_robot_feedback_id(ID_ROBOT_STATUS));
+        assert!(is_robot_feedback_id(ID_JOINT_FEEDBACK_12));
+        assert!(is_robot_feedback_id(ID_JOINT_DRIVER_HIGH_SPEED_BASE + 5));
+        assert!(is_robot_feedback_id(ID_JOINT_DRIVER_LOW_SPEED_BASE + 5));
+        assert!(is_robot_feedback_id(ID_MOTOR_LIMIT_FEEDBACK));
+        assert!(is_robot_feedback_id(ID_CONTROL_MODE));
+        assert!(is_robot_feedback_id(ID_JOINT_CONTROL_56));
+        assert!(is_robot_feedback_id(ID_GRIPPER_CONTROL));
+
+        assert!(!is_robot_feedback_id(ID_EMERGENCY_STOP));
+        assert!(!is_robot_feedback_id(ID_MOTOR_ENABLE));
+        assert!(!is_robot_feedback_id(ID_SET_END_VELOCITY_ACCEL));
+        assert!(!is_robot_feedback_id(ID_GRIPPER_TEACH_PARAMS_FEEDBACK));
     }
 }

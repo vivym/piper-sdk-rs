@@ -28,10 +28,12 @@ use crate::{
 };
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
+use piper_protocol::ids::is_robot_feedback_id;
 use socketcan::{
     BlockingCan, CanError as SocketCanError, CanErrorFrame, CanFilter, CanFrame, CanSocket,
     EmbeddedFrame, ExtendedId, Frame, Socket, SocketOptions, StandardId,
 };
+use std::collections::VecDeque;
 use std::io::IoSliceMut;
 use std::mem;
 use std::os::fd::BorrowedFd;
@@ -89,6 +91,40 @@ fn dup_socket(socket: &CanSocket) -> Result<CanSocket, CanError> {
     Ok(CanSocket::from(owned))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimestampSource {
+    None,
+    Software,
+    Hardware,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimestampInfo {
+    timestamp_us: u64,
+    source: TimestampSource,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReceivedFrame {
+    frame: PiperFrame,
+    timestamp_source: TimestampSource,
+}
+
+fn classify_startup_probe_frame(
+    frame: &PiperFrame,
+    timestamp_source: TimestampSource,
+) -> Option<BackendCapability> {
+    if !is_robot_feedback_id(frame.id) {
+        return None;
+    }
+
+    match timestamp_source {
+        TimestampSource::Hardware => Some(BackendCapability::StrictRealtime),
+        TimestampSource::Software => Some(BackendCapability::SoftRealtime),
+        TimestampSource::None => None,
+    }
+}
+
 /// 只读适配器（用于 RX 线程）
 ///
 /// 独立的 RX 适配器，持有 `CanSocket` 的克隆，
@@ -106,6 +142,11 @@ pub struct SocketCanRxAdapter {
     timestamping_enabled: bool,
     /// 是否检测到硬件时间戳支持（运行时检测）
     hw_timestamp_available: bool,
+    /// Startup probe drains frames before worker threads exist; replay them first once RX starts.
+    bootstrap_frames: VecDeque<PiperFrame>,
+    /// Final capability resolved by startup probing. Defaults to the safe soft-realtime posture.
+    backend_capability: BackendCapability,
+    startup_probe_resolved: bool,
 }
 
 impl SocketCanRxAdapter {
@@ -155,6 +196,9 @@ impl SocketCanRxAdapter {
             read_timeout,
             timestamping_enabled,
             hw_timestamp_available,
+            bootstrap_frames: VecDeque::new(),
+            backend_capability: BackendCapability::SoftRealtime,
+            startup_probe_resolved: false,
         })
     }
 
@@ -239,16 +283,13 @@ impl SocketCanRxAdapter {
         self.read_timeout = timeout;
         Ok(())
     }
-}
 
-impl RxAdapter for SocketCanRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive_live(&mut self, timeout: Duration) -> Result<ReceivedFrame, CanError> {
         loop {
             let fd = self.socket.as_raw_fd();
 
-            // 使用 poll 实现超时（与 SocketCanAdapter::receive_with_timestamp 一致）
             let pollfd = PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, PollFlags::POLLIN);
-            let timeout_ms = self.read_timeout.as_millis().min(65535) as u16;
+            let timeout_ms = timeout.as_millis().min(65535) as u16;
             match poll(&mut [pollfd], PollTimeout::from(timeout_ms)) {
                 Ok(0) => {
                     return Err(CanError::Timeout);
@@ -266,7 +307,7 @@ impl RxAdapter for SocketCanRxAdapter {
             let mut frame_buf = [0u8; CAN_FRAME_LEN];
             let mut cmsg_buf = [0u8; 1024];
 
-            let (msg_bytes, timestamp_us) = {
+            let (msg_bytes, timestamp_info) = {
                 let mut iov = [IoSliceMut::new(&mut frame_buf)];
 
                 let msg = match recvmsg::<SockaddrStorage>(
@@ -287,8 +328,8 @@ impl RxAdapter for SocketCanRxAdapter {
                     },
                 };
 
-                let timestamp_us = self.extract_timestamp_from_cmsg(&msg)?;
-                (msg.bytes, timestamp_us)
+                let timestamp_info = self.extract_timestamp_from_cmsg(&msg)?;
+                (msg.bytes, timestamp_info)
             };
 
             if msg_bytes < CAN_FRAME_LEN {
@@ -333,28 +374,129 @@ impl RxAdapter for SocketCanRxAdapter {
                 }
             }
 
-            return Ok(PiperFrame {
-                id: can_frame.raw_id(),
-                data: {
-                    let mut data = [0u8; 8];
-                    let frame_data = can_frame.data();
-                    let len = frame_data.len().min(8);
-                    data[..len].copy_from_slice(&frame_data[..len]);
-                    data
+            return Ok(ReceivedFrame {
+                frame: PiperFrame {
+                    id: can_frame.raw_id(),
+                    data: {
+                        let mut data = [0u8; 8];
+                        let frame_data = can_frame.data();
+                        let len = frame_data.len().min(8);
+                        data[..len].copy_from_slice(&frame_data[..len]);
+                        data
+                    },
+                    len: can_frame.dlc() as u8,
+                    is_extended: can_frame.is_extended(),
+                    timestamp_us: timestamp_info.timestamp_us,
                 },
-                len: can_frame.dlc() as u8,
-                is_extended: can_frame.is_extended(),
-                timestamp_us,
+                timestamp_source: timestamp_info.source,
             });
         }
     }
 
-    fn backend_capability(&self) -> BackendCapability {
-        if self.timestamping_enabled {
-            BackendCapability::StrictRealtime
-        } else {
-            BackendCapability::MonitorOnly
+    fn startup_probe_error(reason: impl Into<String>) -> CanError {
+        CanError::Device(CanDeviceError::new(
+            CanDeviceErrorKind::UnsupportedConfig,
+            format!(
+                "SocketCAN startup validation failed: {}; strict realtime requires trusted CAN timestamps",
+                reason.into()
+            ),
+        ))
+    }
+}
+
+impl RxAdapter for SocketCanRxAdapter {
+    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        if let Some(frame) = self.bootstrap_frames.pop_front() {
+            return Ok(frame);
         }
+
+        self.receive_live(self.read_timeout).map(|received| received.frame)
+    }
+
+    fn backend_capability(&self) -> BackendCapability {
+        self.backend_capability
+    }
+
+    fn startup_probe_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Option<BackendCapability>, CanError> {
+        if self.startup_probe_resolved {
+            return Ok(Some(self.backend_capability));
+        }
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Self::startup_probe_error(
+                    "no robot feedback with usable SocketCAN timestamps arrived before the validation deadline",
+                ));
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let timeout = remaining.min(self.read_timeout.max(Duration::from_millis(1)));
+            match self.receive_live(timeout) {
+                Ok(received) => {
+                    let frame = received.frame;
+                    self.bootstrap_frames.push_back(frame);
+                    let Some(capability) =
+                        classify_startup_probe_frame(&frame, received.timestamp_source)
+                    else {
+                        continue;
+                    };
+                    self.backend_capability = capability;
+                    self.startup_probe_resolved = true;
+                    return Ok(Some(capability));
+                },
+                Err(CanError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        return Err(Self::startup_probe_error(
+                            "no robot feedback with usable SocketCAN timestamps arrived before the validation deadline",
+                        ));
+                    }
+                },
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use piper_protocol::ids::{ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34};
+
+    #[test]
+    fn test_classify_startup_probe_frame_accepts_hardware_timestamped_robot_feedback() {
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
+        assert_eq!(
+            classify_startup_probe_frame(&frame, TimestampSource::Hardware),
+            Some(BackendCapability::StrictRealtime)
+        );
+    }
+
+    #[test]
+    fn test_classify_startup_probe_frame_accepts_software_timestamped_robot_feedback() {
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_34 as u16, &[0; 8]);
+        assert_eq!(
+            classify_startup_probe_frame(&frame, TimestampSource::Software),
+            Some(BackendCapability::SoftRealtime)
+        );
+    }
+
+    #[test]
+    fn test_classify_startup_probe_frame_rejects_noise_and_missing_timestamps() {
+        let robot_frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
+        let noise_frame = PiperFrame::new_standard(0x7FF, &[0; 8]);
+
+        assert_eq!(
+            classify_startup_probe_frame(&robot_frame, TimestampSource::None),
+            None
+        );
+        assert_eq!(
+            classify_startup_probe_frame(&noise_frame, TimestampSource::Hardware),
+            None
+        );
     }
 }
 
@@ -367,7 +509,7 @@ impl SocketCanRxAdapter {
     /// - `msg`: `recvmsg` 返回的消息对象，包含 CMSG 控制消息
     ///
     /// # 返回值
-    /// - `Ok(u64)`: 时间戳（微秒），如果不可用则返回 `0`
+    /// - `Ok(TimestampInfo)`: 时间戳（微秒）与来源，如果不可用则返回 `0/None`
     ///
     /// # 时间戳优先级
     /// 1. `timestamps.hw_trans` (Hardware-Transformed) - 首选（硬件时间同步到系统时钟）
@@ -376,9 +518,12 @@ impl SocketCanRxAdapter {
     fn extract_timestamp_from_cmsg(
         &mut self,
         msg: &nix::sys::socket::RecvMsg<'_, '_, SockaddrStorage>,
-    ) -> Result<u64, CanError> {
+    ) -> Result<TimestampInfo, CanError> {
         if !self.timestamping_enabled {
-            return Ok(0); // 未启用时间戳
+            return Ok(TimestampInfo {
+                timestamp_us: 0,
+                source: TimestampSource::None,
+            });
         }
 
         // 遍历所有 CMSG
@@ -398,7 +543,10 @@ impl SocketCanRxAdapter {
                                 hw_trans_ts.tv_sec(),
                                 hw_trans_ts.tv_nsec(),
                             );
-                            return Ok(timestamp_us);
+                            return Ok(TimestampInfo {
+                                timestamp_us,
+                                source: TimestampSource::Hardware,
+                            });
                         }
 
                         // ✅ 优先级 2：软件时间戳（系统中断时间）
@@ -412,7 +560,10 @@ impl SocketCanRxAdapter {
 
                             let timestamp_us =
                                 Self::timespec_to_micros(sw_ts.tv_sec(), sw_ts.tv_nsec());
-                            return Ok(timestamp_us);
+                            return Ok(TimestampInfo {
+                                timestamp_us,
+                                source: TimestampSource::Software,
+                            });
                         }
                     }
                 }
@@ -420,12 +571,18 @@ impl SocketCanRxAdapter {
             Err(e) => {
                 // CMSG 解析失败（如缓冲区截断），返回 0 而非错误
                 warn!("Failed to parse CMSG: {}, returning timestamp 0", e);
-                return Ok(0);
+                return Ok(TimestampInfo {
+                    timestamp_us: 0,
+                    source: TimestampSource::None,
+                });
             },
         }
 
         // 没有找到时间戳
-        Ok(0)
+        Ok(TimestampInfo {
+            timestamp_us: 0,
+            source: TimestampSource::None,
+        })
     }
 
     /// 将 timespec (秒+纳秒) 转换为微秒（u64）

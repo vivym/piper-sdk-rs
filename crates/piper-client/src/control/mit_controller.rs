@@ -149,6 +149,34 @@ pub struct MitController {
     config: MitControllerConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TickSchedule {
+    sleep_duration: Option<Duration>,
+    next_cycle_deadline: Instant,
+    overrun_lateness: Duration,
+}
+
+fn finalize_tick_schedule(now: Instant, cycle_deadline: Instant, period: Duration) -> TickSchedule {
+    if cycle_deadline > now {
+        TickSchedule {
+            sleep_duration: Some(cycle_deadline.duration_since(now)),
+            next_cycle_deadline: cycle_deadline + period,
+            overrun_lateness: Duration::ZERO,
+        }
+    } else {
+        let overrun_lateness = now.saturating_duration_since(cycle_deadline);
+        let mut next_cycle_deadline = cycle_deadline + period;
+        while next_cycle_deadline <= now {
+            next_cycle_deadline += period;
+        }
+        TickSchedule {
+            sleep_duration: None,
+            next_cycle_deadline,
+            overrun_lateness,
+        }
+    }
+}
+
 impl MitController {
     /// 创建新的 MIT 控制器
     ///
@@ -242,16 +270,13 @@ impl MitController {
 
         // 使用绝对时间锚点机制消除累积漂移，保证精确的 200Hz 控制频率
         let period = Duration::from_secs_f64(1.0 / self.config.control_rate); // 5ms @ 200Hz
-        let mut next_tick = Instant::now();
+        let mut next_tick = Instant::now() + period;
 
         // 提取 piper 引用（避免每次都解 Option）
         let _piper = self.piper.as_ref().ok_or(ControlError::AlreadyParked)?;
 
         while start.elapsed() < timeout {
-            // 1. 设定下一个锚点（绝对时间）
-            next_tick += period;
-
-            // 2. 发送命令 & 检查状态（耗时操作）
+            // 1. 发送命令 & 检查状态（耗时操作）
             match self.command_joints(JointArray::from(target), None) {
                 Ok(_) => {
                     error_count = 0; // 重置计数器
@@ -287,25 +312,18 @@ impl MitController {
                 return Ok(true);
             }
 
-            // 4. 睡眠到下一个锚点（自动扣除耗时操作的时间）
+            // 3. 睡眠到当前锚点，或在 overrun 时推进到下一个未来锚点
             let now = Instant::now();
-            if next_tick > now {
-                // 还有剩余时间，睡眠到下一个锚点
-                spin_sleep::sleep(next_tick - now);
+            let schedule = finalize_tick_schedule(now, next_tick, period);
+            if let Some(sleep_duration) = schedule.sleep_duration {
+                spin_sleep::sleep(sleep_duration);
             } else {
-                // ⚠️ 任务超时（Overrun）：耗时操作超过了预期周期
                 warn!(
-                    "Control loop overrun: operation took {:?}, \
-                     but next tick was {:?} from now (expected {:?}). \
-                     Skipping sleep to catch up.",
-                    now.duration_since(next_tick - period),
-                    next_tick.duration_since(now),
-                    period
+                    "Control loop overrun: operation missed deadline by {:?} (period {:?}); skipping sleep and preserving anchored schedule.",
+                    schedule.overrun_lateness, period,
                 );
-                // 追赶锚点：不睡眠，直接进入下一帧
-                // 重置锚点到当前时间，避免后续累积延迟
-                next_tick = now;
             }
+            next_tick = schedule.next_cycle_deadline;
         }
 
         Ok(false)
@@ -462,5 +480,35 @@ mod tests {
         assert!(config.rest_position.is_none());
         assert_eq!(config.control_rate, 200.0);
         assert_eq!(config.read_policy, ControlReadPolicy::default());
+    }
+
+    #[test]
+    fn test_finalize_tick_schedule_sleeps_until_future_deadline() {
+        let now = Instant::now();
+        let period = Duration::from_millis(5);
+        let deadline = now + Duration::from_millis(2);
+
+        let schedule = finalize_tick_schedule(now, deadline, period);
+
+        assert_eq!(schedule.sleep_duration, Some(Duration::from_millis(2)));
+        assert_eq!(schedule.next_cycle_deadline, deadline + period);
+        assert_eq!(schedule.overrun_lateness, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_finalize_tick_schedule_advances_without_rephasing_after_overrun() {
+        let now = Instant::now();
+        let period = Duration::from_millis(5);
+        let deadline = now - Duration::from_millis(7);
+
+        let schedule = finalize_tick_schedule(now, deadline, period);
+
+        assert!(schedule.sleep_duration.is_none());
+        assert!(schedule.overrun_lateness >= Duration::from_millis(7));
+        assert!(schedule.next_cycle_deadline > now);
+        assert_eq!(
+            schedule.next_cycle_deadline.duration_since(deadline).as_millis() % 5,
+            0
+        );
     }
 }

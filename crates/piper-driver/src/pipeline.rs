@@ -29,6 +29,7 @@ use tracing::{debug, error, trace, warn};
 use spin_sleep;
 
 const STRICT_GROUP_MAX_SPAN_US: u64 = 2_000;
+const MOTION_GROUP_RESET_MAX_SPAN_US: u64 = 2_200;
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -466,6 +467,85 @@ impl Default for PipelineConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingFrameGroup<const N: usize> {
+    mask: u8,
+    alignment_timestamps: [u64; N],
+    host_rx_mono_us: [u64; N],
+    started_at: Option<Instant>,
+}
+
+impl<const N: usize> PendingFrameGroup<N> {
+    fn new() -> Self {
+        Self {
+            mask: 0,
+            alignment_timestamps: [0; N],
+            host_rx_mono_us: [0; N],
+            started_at: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.mask = 0;
+        self.alignment_timestamps = [0; N];
+        self.host_rx_mono_us = [0; N];
+        self.started_at = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.mask == 0
+    }
+
+    fn contains_slot(&self, slot: usize) -> bool {
+        (self.mask & (1 << slot)) != 0
+    }
+
+    fn timed_out(&self, timeout: Duration) -> bool {
+        self.started_at
+            .map(|started_at| started_at.elapsed() >= timeout)
+            .unwrap_or(false)
+    }
+
+    fn write_slot(&mut self, slot: usize, alignment_timestamp_us: u64, host_rx_mono_us: u64) {
+        if self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+        }
+        self.mask |= 1 << slot;
+        self.alignment_timestamps[slot] = alignment_timestamp_us;
+        self.host_rx_mono_us[slot] = host_rx_mono_us;
+    }
+
+    fn max_alignment_timestamp_us(&self) -> u64 {
+        self.alignment_timestamps.iter().copied().max().unwrap_or(0)
+    }
+
+    fn min_alignment_timestamp_us(&self) -> u64 {
+        self.alignment_timestamps
+            .iter()
+            .copied()
+            .filter(|timestamp| *timestamp != 0)
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn max_host_rx_mono_us(&self) -> u64 {
+        self.host_rx_mono_us.iter().copied().max().unwrap_or(0)
+    }
+}
+
+impl<const N: usize> Default for PendingFrameGroup<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameGroupResetReason {
+    TimedOut,
+    DuplicateSlot,
+    SpanExceeded,
+}
+
 /// 帧解析器状态
 ///
 /// 封装 CAN 帧解析过程中的所有临时状态，包括：
@@ -490,16 +570,14 @@ pub struct ParserState<'a> {
     // === 关节位置状态：帧组同步（0x2A5-0x2A7） ===
     /// 待提交的关节位置数据（6个关节，单位：弧度）
     pub pending_joint_pos: [f64; 6],
-    /// 关节位置帧组掩码（Bit 0-2 对应 0x2A5, 0x2A6, 0x2A7）
-    pub joint_pos_frame_mask: u8,
-    /// 关节位置各帧时间戳（用于严格组装判定）
-    pub joint_pos_frame_timestamps: [u64; 3],
+    /// 关节位置帧组元数据（mask、每槽位时间戳、组起始时间）
+    joint_pos_group: PendingFrameGroup<3>,
 
     // === 末端位姿状态：帧组同步（0x2A2-0x2A4） ===
     /// 待提交的末端位姿数据（6个自由度：x, y, z, rx, ry, rz）
     pub pending_end_pose: [f64; 6],
-    /// 末端位姿帧组掩码（Bit 0-2 对应 0x2A2, 0x2A3, 0x2A4）
-    pub end_pose_frame_mask: u8,
+    /// 末端位姿帧组元数据（mask、每槽位时间戳、组起始时间）
+    end_pose_group: PendingFrameGroup<3>,
 
     // === 关节动态状态：缓冲提交（关键改进） ===
     /// 待提交的关节动态状态
@@ -514,10 +592,8 @@ pub struct ParserState<'a> {
     // === 主从模式关节控制指令状态：帧组同步（0x155-0x157） ===
     /// 待提交的主从模式关节目标角度（度）
     pub pending_joint_target_deg: [i32; 6],
-    /// 主从模式关节控制帧组掩码（Bit 0-2 对应 0x155, 0x156, 0x157）
-    pub joint_control_frame_mask: u8,
-    /// 主从模式关节控制各帧时间戳
-    pub joint_control_frame_timestamps: [u64; 3],
+    /// 主从模式关节控制帧组元数据（mask、每槽位时间戳、组起始时间）
+    joint_control_group: PendingFrameGroup<3>,
 
     // === PhantomData 用于生命周期标记 ===
     /// 生命周期标记（内部使用，无需手动设置）
@@ -536,17 +612,15 @@ impl<'a> ParserState<'a> {
     pub fn new() -> Self {
         Self {
             pending_joint_pos: [0.0; 6],
-            joint_pos_frame_mask: 0,
-            joint_pos_frame_timestamps: [0; 3],
+            joint_pos_group: PendingFrameGroup::new(),
             pending_end_pose: [0.0; 6],
-            end_pose_frame_mask: 0,
+            end_pose_group: PendingFrameGroup::new(),
             pending_joint_dynamic: JointDynamicState::default(),
             vel_update_mask: 0,
             pending_velocity_started_at: None,
             last_vel_packet_time_us: 0,
             pending_joint_target_deg: [0; 6],
-            joint_control_frame_mask: 0,
-            joint_control_frame_timestamps: [0; 3],
+            joint_control_group: PendingFrameGroup::new(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -567,19 +641,17 @@ fn reset_pending_velocity(state: &mut ParserState) {
 
 fn reset_pending_joint_position(state: &mut ParserState) {
     state.pending_joint_pos = [0.0; 6];
-    state.joint_pos_frame_mask = 0;
-    state.joint_pos_frame_timestamps = [0; 3];
+    state.joint_pos_group.reset();
 }
 
 fn reset_pending_end_pose(state: &mut ParserState) {
     state.pending_end_pose = [0.0; 6];
-    state.end_pose_frame_mask = 0;
+    state.end_pose_group.reset();
 }
 
 fn reset_pending_joint_control(state: &mut ParserState) {
     state.pending_joint_target_deg = [0; 6];
-    state.joint_control_frame_mask = 0;
-    state.joint_control_frame_timestamps = [0; 3];
+    state.joint_control_group.reset();
 }
 
 fn complete_group_ready(mask: u8) -> bool {
@@ -588,17 +660,16 @@ fn complete_group_ready(mask: u8) -> bool {
 
 #[inline]
 fn control_grade_group_ready(
-    mask: u8,
-    timestamps: &[u64; 3],
+    group: &PendingFrameGroup<3>,
     backend_capability: BackendCapability,
 ) -> bool {
-    if !backend_capability.is_strict_realtime() || !complete_group_ready(mask) {
+    if !backend_capability.is_strict_realtime() || !complete_group_ready(group.mask) {
         return false;
     }
 
     let mut min_ts = u64::MAX;
     let mut max_ts = 0;
-    for timestamp in timestamps {
+    for timestamp in &group.alignment_timestamps {
         if *timestamp == 0 {
             return false;
         }
@@ -619,6 +690,110 @@ fn group_alignment_timestamp(
         frame.timestamp_us
     } else {
         host_rx_mono_us
+    }
+}
+
+fn pending_group_reset_reason<const N: usize>(
+    group: &PendingFrameGroup<N>,
+    slot: usize,
+    timeout: Duration,
+    alignment_timestamp_us: u64,
+) -> Option<FrameGroupResetReason> {
+    if group.is_empty() {
+        return None;
+    }
+    if group.timed_out(timeout) {
+        return Some(FrameGroupResetReason::TimedOut);
+    }
+    if group.contains_slot(slot) {
+        return Some(FrameGroupResetReason::DuplicateSlot);
+    }
+    let min_alignment = group.min_alignment_timestamp_us();
+    if alignment_timestamp_us != 0
+        && min_alignment != 0
+        && alignment_timestamp_us.saturating_sub(min_alignment) > MOTION_GROUP_RESET_MAX_SPAN_US
+    {
+        return Some(FrameGroupResetReason::SpanExceeded);
+    }
+    None
+}
+
+fn maybe_reset_joint_position_group(
+    state: &mut ParserState,
+    metrics: &Arc<PiperMetrics>,
+    timeout: Duration,
+    slot: usize,
+    alignment_timestamp_us: u64,
+) {
+    if pending_group_reset_reason(
+        &state.joint_pos_group,
+        slot,
+        timeout,
+        alignment_timestamp_us,
+    )
+    .is_some()
+    {
+        metrics
+            .rx_joint_position_incomplete_groups_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+        reset_pending_joint_position(state);
+    }
+}
+
+fn maybe_reset_end_pose_group(
+    state: &mut ParserState,
+    metrics: &Arc<PiperMetrics>,
+    timeout: Duration,
+    slot: usize,
+    alignment_timestamp_us: u64,
+) {
+    if pending_group_reset_reason(&state.end_pose_group, slot, timeout, alignment_timestamp_us)
+        .is_some()
+    {
+        metrics
+            .rx_end_pose_incomplete_groups_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+        reset_pending_end_pose(state);
+    }
+}
+
+fn maybe_reset_joint_control_group(
+    state: &mut ParserState,
+    timeout: Duration,
+    slot: usize,
+    alignment_timestamp_us: u64,
+) {
+    if pending_group_reset_reason(
+        &state.joint_control_group,
+        slot,
+        timeout,
+        alignment_timestamp_us,
+    )
+    .is_some()
+    {
+        reset_pending_joint_control(state);
+    }
+}
+
+fn drop_timed_out_motion_groups(
+    state: &mut ParserState,
+    timeout: Duration,
+    metrics: &Arc<PiperMetrics>,
+) {
+    if state.joint_pos_group.timed_out(timeout) {
+        metrics
+            .rx_joint_position_incomplete_groups_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+        reset_pending_joint_position(state);
+    }
+    if state.end_pose_group.timed_out(timeout) {
+        metrics
+            .rx_end_pose_incomplete_groups_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+        reset_pending_end_pose(state);
+    }
+    if state.joint_control_group.timed_out(timeout) {
+        reset_pending_joint_control(state);
     }
 }
 
@@ -720,7 +895,6 @@ pub(crate) fn io_loop(
     // 说明：receive_timeout 现在已在 PiperBuilder::build() 中应用到各 adapter
     // 这里只使用 frame_group_timeout 进行帧组超时检查
     let frame_group_timeout = Duration::from_millis(config.frame_group_timeout_ms);
-    let mut last_frame_time = std::time::Instant::now();
 
     loop {
         // ============================================================
@@ -739,31 +913,7 @@ pub(crate) fn io_loop(
             Err(CanError::Timeout) => {
                 // 超时是正常情况，检查各个 pending 状态的年龄
 
-                // === 检查关节位置/末端位姿帧组超时 ===
-                // 使用系统时间 Instant，因为它们不依赖硬件时间戳
-                let elapsed = last_frame_time.elapsed();
-                if elapsed > frame_group_timeout {
-                    // Reset pending buffers (any frame arriving between timeout check and here
-                    // will be processed in next iteration)
-                    warn!(
-                        "Frame group timeout after {:?}, resetting pending buffers",
-                        elapsed
-                    );
-                    if state.joint_pos_frame_mask != 0 {
-                        metrics
-                            .rx_joint_position_incomplete_groups_dropped_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    if state.end_pose_frame_mask != 0 {
-                        metrics
-                            .rx_end_pose_incomplete_groups_dropped_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    reset_pending_joint_position(&mut state);
-                    reset_pending_end_pose(&mut state);
-                    reset_pending_joint_control(&mut state);
-                    last_frame_time = Instant::now();
-                }
+                drop_timed_out_motion_groups(&mut state, frame_group_timeout, &metrics);
 
                 // === 检查速度帧缓冲区超时（关键：避免僵尸缓冲区） ===
                 // 使用系统时间 Instant 检查，因为硬件时间戳和系统时间戳不能直接比较
@@ -784,8 +934,6 @@ pub(crate) fn io_loop(
                 continue;
             },
         };
-
-        last_frame_time = std::time::Instant::now();
 
         // ============================================================
         // 2. 根据 CAN ID 解析帧并更新状态
@@ -924,7 +1072,6 @@ pub fn rx_loop(
     let mut state = ParserState::new();
 
     let frame_group_timeout = Duration::from_millis(config.frame_group_timeout_ms);
-    let mut last_frame_time = std::time::Instant::now();
 
     loop {
         // 检查运行标志
@@ -946,24 +1093,7 @@ pub fn rx_loop(
                 // 超时是正常情况，检查各个 pending 状态的年龄
                 metrics.rx_timeouts.fetch_add(1, Ordering::Relaxed);
 
-                // === 检查关节位置/末端位姿帧组超时 ===
-                let elapsed = last_frame_time.elapsed();
-                if elapsed > frame_group_timeout {
-                    // 重置 pending 缓存（避免数据过期）
-                    if state.joint_pos_frame_mask != 0 {
-                        metrics
-                            .rx_joint_position_incomplete_groups_dropped_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    if state.end_pose_frame_mask != 0 {
-                        metrics
-                            .rx_end_pose_incomplete_groups_dropped_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    reset_pending_joint_position(&mut state);
-                    reset_pending_end_pose(&mut state);
-                    reset_pending_joint_control(&mut state);
-                }
+                drop_timed_out_motion_groups(&mut state, frame_group_timeout, &metrics);
 
                 // === 检查速度帧缓冲区超时 ===
                 flush_pending_velocity_on_idle(
@@ -1011,7 +1141,6 @@ pub fn rx_loop(
             },
         };
 
-        last_frame_time = std::time::Instant::now();
         metrics.rx_frames_valid.fetch_add(1, Ordering::Relaxed);
 
         // ============================================================
@@ -1876,31 +2005,31 @@ fn parse_and_update_state(
     last_fault: &Arc<AtomicU8>,
 ) -> ParsedFeedbackOutcome {
     let mut outcome = ParsedFeedbackOutcome::default();
+    let frame_group_timeout = Duration::from_millis(config.frame_group_timeout_ms);
 
     match frame.id {
         ID_JOINT_FEEDBACK_12 => {
             if let Ok(feedback) = JointFeedback12::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.joint_pos_frame_mask != 0 {
-                    metrics
-                        .rx_joint_position_incomplete_groups_dropped_total
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                reset_pending_joint_position(state);
-
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_joint_position_group(
+                    state,
+                    metrics,
+                    frame_group_timeout,
+                    0,
+                    alignment_timestamp_us,
+                );
                 state.pending_joint_pos[0] = feedback.j1_rad();
                 state.pending_joint_pos[1] = feedback.j2_rad();
-                state.joint_pos_frame_mask |= 1 << 0;
-                state.joint_pos_frame_timestamps[0] = alignment_timestamp_us;
+                state.joint_pos_group.write_slot(0, alignment_timestamp_us, host_rx_mono_us);
 
                 ctx.publish_raw_joint_position(JointPositionState {
-                    hardware_timestamp_us: frame.timestamp_us,
+                    hardware_timestamp_us: state.joint_pos_group.max_alignment_timestamp_us(),
                     host_rx_mono_us,
                     joint_pos: state.pending_joint_pos,
-                    frame_valid_mask: state.joint_pos_frame_mask,
+                    frame_valid_mask: state.joint_pos_group.mask,
                 });
             } else {
                 warn!("Failed to parse JointFeedback12: CAN ID 0x{:X}", frame.id);
@@ -1909,23 +2038,25 @@ fn parse_and_update_state(
         ID_JOINT_FEEDBACK_34 => {
             if let Ok(feedback) = JointFeedback34::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.joint_pos_frame_mask == 0 {
-                    reset_pending_joint_position(state);
-                }
-
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_joint_position_group(
+                    state,
+                    metrics,
+                    frame_group_timeout,
+                    1,
+                    alignment_timestamp_us,
+                );
                 state.pending_joint_pos[2] = feedback.j3_rad();
                 state.pending_joint_pos[3] = feedback.j4_rad();
-                state.joint_pos_frame_mask |= 1 << 1;
-                state.joint_pos_frame_timestamps[1] = alignment_timestamp_us;
+                state.joint_pos_group.write_slot(1, alignment_timestamp_us, host_rx_mono_us);
 
                 ctx.publish_raw_joint_position(JointPositionState {
-                    hardware_timestamp_us: frame.timestamp_us,
+                    hardware_timestamp_us: state.joint_pos_group.max_alignment_timestamp_us(),
                     host_rx_mono_us,
                     joint_pos: state.pending_joint_pos,
-                    frame_valid_mask: state.joint_pos_frame_mask,
+                    frame_valid_mask: state.joint_pos_group.mask,
                 });
             } else {
                 warn!("Failed to parse JointFeedback34: CAN ID 0x{:X}", frame.id);
@@ -1934,49 +2065,43 @@ fn parse_and_update_state(
         ID_JOINT_FEEDBACK_56 => {
             if let Ok(feedback) = JointFeedback56::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.joint_pos_frame_mask == 0 {
-                    reset_pending_joint_position(state);
-                }
-
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_joint_position_group(
+                    state,
+                    metrics,
+                    frame_group_timeout,
+                    2,
+                    alignment_timestamp_us,
+                );
                 state.pending_joint_pos[4] = feedback.j5_rad();
                 state.pending_joint_pos[5] = feedback.j6_rad();
-                state.joint_pos_frame_mask |= 1 << 2;
-                state.joint_pos_frame_timestamps[2] = alignment_timestamp_us;
+                state.joint_pos_group.write_slot(2, alignment_timestamp_us, host_rx_mono_us);
 
                 let new_joint_pos_state = JointPositionState {
-                    hardware_timestamp_us: frame.timestamp_us,
-                    host_rx_mono_us,
+                    hardware_timestamp_us: state.joint_pos_group.max_alignment_timestamp_us(),
+                    host_rx_mono_us: state.joint_pos_group.max_host_rx_mono_us(),
                     joint_pos: state.pending_joint_pos,
-                    frame_valid_mask: state.joint_pos_frame_mask,
+                    frame_valid_mask: state.joint_pos_group.mask,
                 };
-                if complete_group_ready(state.joint_pos_frame_mask) {
+                if complete_group_ready(state.joint_pos_group.mask) {
                     ctx.publish_joint_position(new_joint_pos_state.clone());
                     ctx.fps_stats
                         .load()
                         .joint_position_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if control_grade_group_ready(
-                        state.joint_pos_frame_mask,
-                        &state.joint_pos_frame_timestamps,
-                        backend_capability,
-                    ) {
+                    if control_grade_group_ready(&state.joint_pos_group, backend_capability) {
                         ctx.publish_control_joint_position(new_joint_pos_state.clone());
                     } else {
                         metrics
                             .rx_joint_position_control_grade_rejected_total
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    reset_pending_joint_position(state);
                 } else {
-                    ctx.publish_raw_joint_position(new_joint_pos_state.clone());
-                    metrics
-                        .rx_joint_position_incomplete_groups_dropped_total
-                        .fetch_add(1, Ordering::Relaxed);
+                    ctx.publish_raw_joint_position(new_joint_pos_state);
                 }
-
-                reset_pending_joint_position(state);
             } else {
                 warn!("Failed to parse JointFeedback56: CAN ID 0x{:X}", frame.id);
             }
@@ -1984,78 +2109,86 @@ fn parse_and_update_state(
         ID_END_POSE_1 => {
             if let Ok(feedback) = EndPoseFeedback1::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.end_pose_frame_mask != 0 {
-                    metrics
-                        .rx_end_pose_incomplete_groups_dropped_total
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                reset_pending_end_pose(state);
-
                 let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_end_pose_group(
+                    state,
+                    metrics,
+                    frame_group_timeout,
+                    0,
+                    alignment_timestamp_us,
+                );
                 state.pending_end_pose[0] = feedback.x() / 1000.0;
                 state.pending_end_pose[1] = feedback.y() / 1000.0;
-                state.end_pose_frame_mask |= 1 << 0;
+                state.end_pose_group.write_slot(0, alignment_timestamp_us, host_rx_mono_us);
 
                 ctx.publish_raw_end_pose(EndPoseState {
-                    hardware_timestamp_us: frame.timestamp_us,
+                    hardware_timestamp_us: state.end_pose_group.max_alignment_timestamp_us(),
                     host_rx_mono_us,
                     end_pose: state.pending_end_pose,
-                    frame_valid_mask: state.end_pose_frame_mask,
+                    frame_valid_mask: state.end_pose_group.mask,
                 });
             }
         },
         ID_END_POSE_2 => {
             if let Ok(feedback) = EndPoseFeedback2::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.end_pose_frame_mask == 0 {
-                    reset_pending_end_pose(state);
-                }
-
                 let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_end_pose_group(
+                    state,
+                    metrics,
+                    frame_group_timeout,
+                    1,
+                    alignment_timestamp_us,
+                );
                 state.pending_end_pose[2] = feedback.z() / 1000.0;
                 state.pending_end_pose[3] = feedback.rx_rad();
-                state.end_pose_frame_mask |= 1 << 1;
+                state.end_pose_group.write_slot(1, alignment_timestamp_us, host_rx_mono_us);
 
                 ctx.publish_raw_end_pose(EndPoseState {
-                    hardware_timestamp_us: frame.timestamp_us,
+                    hardware_timestamp_us: state.end_pose_group.max_alignment_timestamp_us(),
                     host_rx_mono_us,
                     end_pose: state.pending_end_pose,
-                    frame_valid_mask: state.end_pose_frame_mask,
+                    frame_valid_mask: state.end_pose_group.mask,
                 });
             }
         },
         ID_END_POSE_3 => {
             if let Ok(feedback) = EndPoseFeedback3::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.end_pose_frame_mask == 0 {
-                    reset_pending_end_pose(state);
-                }
-
                 let host_rx_mono_us = host_rx_mono_us();
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_end_pose_group(
+                    state,
+                    metrics,
+                    frame_group_timeout,
+                    2,
+                    alignment_timestamp_us,
+                );
                 state.pending_end_pose[4] = feedback.ry_rad();
                 state.pending_end_pose[5] = feedback.rz_rad();
-                state.end_pose_frame_mask |= 1 << 2;
+                state.end_pose_group.write_slot(2, alignment_timestamp_us, host_rx_mono_us);
 
                 let new_end_pose_state = EndPoseState {
-                    hardware_timestamp_us: frame.timestamp_us,
-                    host_rx_mono_us,
+                    hardware_timestamp_us: state.end_pose_group.max_alignment_timestamp_us(),
+                    host_rx_mono_us: state.end_pose_group.max_host_rx_mono_us(),
                     end_pose: state.pending_end_pose,
-                    frame_valid_mask: state.end_pose_frame_mask,
+                    frame_valid_mask: state.end_pose_group.mask,
                 };
-                if complete_group_ready(state.end_pose_frame_mask) {
+                if complete_group_ready(state.end_pose_group.mask) {
                     ctx.publish_end_pose(new_end_pose_state.clone());
                     ctx.fps_stats
                         .load()
                         .end_pose_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    reset_pending_end_pose(state);
                 } else {
-                    ctx.publish_raw_end_pose(new_end_pose_state.clone());
-                    metrics
-                        .rx_end_pose_incomplete_groups_dropped_total
-                        .fetch_add(1, Ordering::Relaxed);
+                    ctx.publish_raw_end_pose(new_end_pose_state);
                 }
-
-                reset_pending_end_pose(state);
             }
         },
         id if (ID_JOINT_DRIVER_HIGH_SPEED_BASE..=ID_JOINT_DRIVER_HIGH_SPEED_BASE + 5)
@@ -2413,56 +2546,61 @@ fn parse_and_update_state(
         ID_JOINT_CONTROL_12 => {
             if let Ok(feedback) = JointControl12Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.joint_control_frame_mask != 0 {
-                    reset_pending_joint_control(state);
-                }
-
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_joint_control_group(
+                    state,
+                    frame_group_timeout,
+                    0,
+                    alignment_timestamp_us,
+                );
                 state.pending_joint_target_deg[0] = feedback.j1_deg;
                 state.pending_joint_target_deg[1] = feedback.j2_deg;
-                state.joint_control_frame_mask |= 1 << 0;
-                state.joint_control_frame_timestamps[0] = alignment_timestamp_us;
+                state.joint_control_group.write_slot(0, alignment_timestamp_us, host_rx_mono_us);
             }
         },
         ID_JOINT_CONTROL_34 => {
             if let Ok(feedback) = JointControl34Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.joint_control_frame_mask == 0 {
-                    reset_pending_joint_control(state);
-                }
-
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_joint_control_group(
+                    state,
+                    frame_group_timeout,
+                    1,
+                    alignment_timestamp_us,
+                );
                 state.pending_joint_target_deg[2] = feedback.j3_deg;
                 state.pending_joint_target_deg[3] = feedback.j4_deg;
-                state.joint_control_frame_mask |= 1 << 1;
-                state.joint_control_frame_timestamps[1] = alignment_timestamp_us;
+                state.joint_control_group.write_slot(1, alignment_timestamp_us, host_rx_mono_us);
             }
         },
         ID_JOINT_CONTROL_56 => {
             if let Ok(feedback) = JointControl56Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                if state.joint_control_frame_mask == 0 {
-                    reset_pending_joint_control(state);
-                }
-
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
+                maybe_reset_joint_control_group(
+                    state,
+                    frame_group_timeout,
+                    2,
+                    alignment_timestamp_us,
+                );
                 state.pending_joint_target_deg[4] = feedback.j5_deg;
                 state.pending_joint_target_deg[5] = feedback.j6_deg;
-                state.joint_control_frame_mask |= 1 << 2;
-                state.joint_control_frame_timestamps[2] = alignment_timestamp_us;
+                state.joint_control_group.write_slot(2, alignment_timestamp_us, host_rx_mono_us);
 
-                if complete_group_ready(state.joint_control_frame_mask) {
+                if complete_group_ready(state.joint_control_group.mask) {
                     let new_state = MasterSlaveJointControlState {
-                        hardware_timestamp_us: frame.timestamp_us,
-                        host_rx_mono_us,
+                        hardware_timestamp_us: state
+                            .joint_control_group
+                            .max_alignment_timestamp_us(),
+                        host_rx_mono_us: state.joint_control_group.max_host_rx_mono_us(),
                         joint_target_deg: state.pending_joint_target_deg,
-                        frame_valid_mask: state.joint_control_frame_mask,
+                        frame_valid_mask: state.joint_control_group.mask,
                     };
 
                     ctx.master_slave_joint_control.store(Arc::new(new_state));
@@ -2470,9 +2608,8 @@ fn parse_and_update_state(
                         .load()
                         .master_slave_joint_control_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    reset_pending_joint_control(state);
                 }
-
-                reset_pending_joint_control(state);
             }
         },
         ID_GRIPPER_CONTROL => {
@@ -2575,6 +2712,50 @@ mod tests {
         data[0..4].copy_from_slice(&j1_raw.to_be_bytes());
         data[4..8].copy_from_slice(&j2_raw.to_be_bytes());
         data
+    }
+
+    fn create_end_pose_frame_data(first: f64, second: f64) -> [u8; 8] {
+        let first_raw = (first * 1000.0) as i32;
+        let second_raw = (second * 1000.0) as i32;
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&first_raw.to_be_bytes());
+        data[4..8].copy_from_slice(&second_raw.to_be_bytes());
+        data
+    }
+
+    fn joint_feedback_frame(id: u16, jx_deg: f64, jy_deg: f64, timestamp_us: u64) -> PiperFrame {
+        let mut frame =
+            PiperFrame::new_standard(id, &create_joint_feedback_frame_data(jx_deg, jy_deg));
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn end_pose_frame(id: u16, first: f64, second: f64, timestamp_us: u64) -> PiperFrame {
+        let mut frame = PiperFrame::new_standard(id, &create_end_pose_frame_data(first, second));
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn parse_frame_for_test(
+        ctx: &Arc<PiperContext>,
+        state: &mut ParserState,
+        metrics: &Arc<PiperMetrics>,
+        config: &PipelineConfig,
+        frame: PiperFrame,
+    ) {
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+        parse_and_update_state(
+            &frame,
+            BackendCapability::StrictRealtime,
+            ctx,
+            config,
+            state,
+            metrics,
+            None,
+            &runtime_phase,
+            &last_fault,
+        );
     }
 
     #[test]
@@ -2683,5 +2864,241 @@ mod tests {
         // 验证命令帧已被发送（通过 MockCanAdapter 的 sent_frames）
         // 注意：由于 mock_can 被移动到线程中，我们无法直接检查
         // 这个测试主要验证不会崩溃
+    }
+
+    #[test]
+    fn test_joint_position_group_rejects_stale_partial_after_missing_first_frame() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 10.0, 20.0, 1_000),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 30.0, 40.0, 3_600),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 50.0, 60.0, 3_700),
+        );
+
+        let snapshot = ctx.capture_joint_position_monitor_snapshot();
+        assert!(snapshot.latest_complete().is_none());
+        assert_eq!(snapshot.latest_raw().frame_valid_mask, 0b110);
+        assert_eq!(snapshot.latest_raw().joint_pos[0], 0.0);
+        assert_eq!(
+            metrics
+                .rx_joint_position_incomplete_groups_dropped_total
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_joint_position_group_drops_old_partial_on_duplicate_slot() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 1.0, 2.0, 1_000),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 3.0, 4.0, 1_100),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 11.0, 12.0, 1_200),
+        );
+
+        let snapshot = ctx.capture_joint_position_monitor_snapshot();
+        assert!(snapshot.latest_complete().is_none());
+        assert_eq!(snapshot.latest_raw().frame_valid_mask, 0b001);
+        assert!((snapshot.latest_raw().joint_pos[0] - 11.0_f64.to_radians()).abs() < 1e-9);
+        assert_eq!(
+            metrics
+                .rx_joint_position_incomplete_groups_dropped_total
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_joint_position_group_accepts_out_of_order_completion() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 30.0, 40.0, 1_000),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 10.0, 20.0, 1_500),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 50.0, 60.0, 1_600),
+        );
+
+        let complete = ctx
+            .capture_joint_position_monitor_snapshot()
+            .latest_complete_cloned()
+            .expect("out-of-order but same-cycle group should publish complete snapshot");
+        assert_eq!(complete.frame_valid_mask, 0b111);
+        assert!((complete.joint_pos[0] - 10.0_f64.to_radians()).abs() < 1e-9);
+        assert!((complete.joint_pos[5] - 60.0_f64.to_radians()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_joint_position_control_grade_requires_tighter_span_than_monitor_complete() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 10.0, 20.0, 1_000),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 30.0, 40.0, 3_050),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 50.0, 60.0, 3_100),
+        );
+
+        assert!(
+            ctx.capture_joint_position_monitor_snapshot().latest_complete().is_some(),
+            "monitor-complete snapshot should still be published"
+        );
+        assert_eq!(ctx.control_joint_position.load().hardware_timestamp_us, 0);
+        assert_eq!(
+            metrics.rx_joint_position_control_grade_rejected_total.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_end_pose_group_accepts_out_of_order_completion() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            end_pose_frame(ID_END_POSE_2 as u16, 300.0, 40.0, 1_000),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            end_pose_frame(ID_END_POSE_1 as u16, 100.0, 200.0, 1_100),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            end_pose_frame(ID_END_POSE_3 as u16, 50.0, 60.0, 1_150),
+        );
+
+        let complete = ctx
+            .capture_end_pose_monitor_snapshot()
+            .latest_complete_cloned()
+            .expect("out-of-order end-pose group should publish complete snapshot");
+        assert_eq!(complete.frame_valid_mask, 0b111);
+        assert!((complete.end_pose[0] - 0.1).abs() < 1e-9);
+        assert!((complete.end_pose[2] - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_end_pose_group_rejects_stale_partial_after_missing_first_frame() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            end_pose_frame(ID_END_POSE_1 as u16, 100.0, 200.0, 1_000),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            end_pose_frame(ID_END_POSE_2 as u16, 300.0, 40.0, 3_600),
+        );
+        parse_frame_for_test(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            end_pose_frame(ID_END_POSE_3 as u16, 50.0, 60.0, 3_700),
+        );
+
+        let snapshot = ctx.capture_end_pose_monitor_snapshot();
+        assert!(snapshot.latest_complete().is_none());
+        assert_eq!(snapshot.latest_raw().frame_valid_mask, 0b110);
+        assert_eq!(
+            metrics.rx_end_pose_incomplete_groups_dropped_total.load(Ordering::Relaxed),
+            1
+        );
     }
 }

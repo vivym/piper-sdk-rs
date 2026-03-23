@@ -6,8 +6,8 @@
 //!
 //! - 基于 Linux SocketCAN 子系统，性能优异
 //! - 支持标准帧和扩展帧
-//! - 支持硬件时间戳（默认开启，优先使用硬件时间戳）
-//! - 支持软件时间戳（硬件不可用时自动降级）
+//! - 支持硬件时间戳（启动探测到 `hw_trans` 后才暴露 StrictRealtime）
+//! - 支持软件时间戳（仅作为 SoftRealtime 时间基线）
 //! - 自动过滤错误帧
 //!
 //! ## 依赖
@@ -628,7 +628,7 @@ impl SplittableAdapter for SocketCanAdapter {
 
     fn backend_capability(&self) -> crate::BackendCapability {
         if self.timestamping_enabled {
-            BackendCapability::StrictRealtime
+            BackendCapability::SoftRealtime
         } else {
             BackendCapability::MonitorOnly
         }
