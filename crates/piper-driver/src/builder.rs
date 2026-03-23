@@ -869,6 +869,7 @@ mod tests {
             receive_timeout_ms: 5,
             frame_group_timeout_ms: 20,
             velocity_buffer_timeout_us: 15_000,
+            low_speed_drive_state_freshness_ms: 150,
         };
         let builder = PiperBuilder::new()
             .gs_usb_bus_address(1, 12)

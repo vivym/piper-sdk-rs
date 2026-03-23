@@ -144,21 +144,31 @@ pub enum BridgeMaintenanceState {
     DeniedActiveControl,
     DeniedTransportDown,
     AllowedStandby,
+    DeniedDriveStateUnknown,
 }
 
 impl BridgeMaintenanceState {
     fn denial_message(self) -> &'static str {
         match self {
-            Self::DeniedFaulted => {
-                "maintenance writes are disabled while a runtime fault is latched"
+            Self::DeniedFaulted => MaintenanceGateState::DeniedFaulted.denial_message(),
+            Self::DeniedActiveControl => MaintenanceGateState::DeniedActiveControl.denial_message(),
+            Self::DeniedTransportDown => MaintenanceGateState::DeniedTransportDown.denial_message(),
+            Self::AllowedStandby => MaintenanceGateState::AllowedStandby.denial_message(),
+            Self::DeniedDriveStateUnknown => {
+                MaintenanceGateState::DeniedDriveStateUnknown.denial_message()
             },
-            Self::DeniedActiveControl => {
-                "maintenance writes are disabled while active control is enabled"
-            },
-            Self::DeniedTransportDown => {
-                "maintenance writes are disabled while transport is disconnected"
-            },
-            Self::AllowedStandby => "maintenance allowed",
+        }
+    }
+}
+
+impl From<MaintenanceGateState> for BridgeMaintenanceState {
+    fn from(value: MaintenanceGateState) -> Self {
+        match value {
+            MaintenanceGateState::DeniedFaulted => Self::DeniedFaulted,
+            MaintenanceGateState::DeniedActiveControl => Self::DeniedActiveControl,
+            MaintenanceGateState::DeniedTransportDown => Self::DeniedTransportDown,
+            MaintenanceGateState::AllowedStandby => Self::AllowedStandby,
+            MaintenanceGateState::DeniedDriveStateUnknown => Self::DeniedDriveStateUnknown,
         }
     }
 }
@@ -2556,16 +2566,7 @@ impl MaintenanceBroker {
                 Ok(LeaseAcquireResult::Denied { holder_session_id })
             },
             MaintenanceLeaseAcquireResult::DeniedState { state } => {
-                let current_state = match state {
-                    MaintenanceGateState::DeniedFaulted => BridgeMaintenanceState::DeniedFaulted,
-                    MaintenanceGateState::DeniedActiveControl => {
-                        BridgeMaintenanceState::DeniedActiveControl
-                    },
-                    MaintenanceGateState::DeniedTransportDown => {
-                        BridgeMaintenanceState::DeniedTransportDown
-                    },
-                    MaintenanceGateState::AllowedStandby => BridgeMaintenanceState::AllowedStandby,
-                };
+                let current_state = BridgeMaintenanceState::from(state);
                 Err(BridgeBackendError::new(
                     ErrorCode::PermissionDenied,
                     current_state.denial_message(),
@@ -2890,6 +2891,22 @@ mod tests {
                 uninstalls: Arc::clone(&self.uninstalls),
             }))
         }
+    }
+
+    #[test]
+    fn bridge_maintenance_state_maps_driver_unknown_state() {
+        assert_eq!(
+            BridgeMaintenanceState::from(MaintenanceGateState::DeniedDriveStateUnknown),
+            BridgeMaintenanceState::DeniedDriveStateUnknown
+        );
+    }
+
+    #[test]
+    fn bridge_maintenance_denial_message_matches_driver_unknown_state() {
+        assert_eq!(
+            BridgeMaintenanceState::DeniedDriveStateUnknown.denial_message(),
+            MaintenanceGateState::DeniedDriveStateUnknown.denial_message()
+        );
     }
 
     #[test]

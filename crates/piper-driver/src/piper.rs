@@ -434,6 +434,7 @@ pub enum MaintenanceGateState {
     DeniedActiveControl = 1,
     DeniedTransportDown = 2,
     AllowedStandby = 3,
+    DeniedDriveStateUnknown = 4,
 }
 
 impl MaintenanceGateState {
@@ -441,10 +442,29 @@ impl MaintenanceGateState {
         matches!(self, Self::AllowedStandby)
     }
 
+    pub fn denial_message(self) -> &'static str {
+        match self {
+            Self::DeniedFaulted => {
+                "maintenance writes are disabled while a runtime fault is latched"
+            },
+            Self::DeniedActiveControl => {
+                "maintenance writes are disabled while active control is enabled"
+            },
+            Self::DeniedTransportDown => {
+                "maintenance writes are disabled while transport is disconnected"
+            },
+            Self::AllowedStandby => "maintenance allowed",
+            Self::DeniedDriveStateUnknown => {
+                "maintenance writes are disabled until joint driver enable state is confirmed"
+            },
+        }
+    }
+
     fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::DeniedFaulted,
             1 => Self::DeniedActiveControl,
+            4 => Self::DeniedDriveStateUnknown,
             3 => Self::AllowedStandby,
             _ => Self::DeniedTransportDown,
         }
@@ -3156,6 +3176,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
 
+    const TEST_MAINTENANCE_FRESHNESS_MS: u64 = 5_000;
+
     struct MockCanAdapter;
 
     impl CanAdapter for MockCanAdapter {
@@ -3182,6 +3204,23 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         crate::pipeline::install_tx_loop_dispatch_barrier(reached_tx, release_rx);
         (reached_rx, release_tx)
+    }
+
+    fn maintenance_ready_config() -> PipelineConfig {
+        PipelineConfig {
+            low_speed_drive_state_freshness_ms: TEST_MAINTENANCE_FRESHNESS_MS,
+            ..PipelineConfig::default()
+        }
+    }
+
+    fn mark_maintenance_standby_confirmed(piper: &Piper) {
+        piper.ctx.connection_monitor.register_feedback();
+        piper.ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
+            host_rx_mono_us: crate::heartbeat::monotonic_micros(),
+            valid_mask: 0b11_1111,
+            ..JointDriverLowSpeedState::default()
+        }));
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
     }
 
     fn install_fault_latch_barrier() -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
@@ -4128,15 +4167,14 @@ mod tests {
                 RecordingTxAdapter {
                     sent_frames: sent_frames.clone(),
                 },
-                None,
+                Some(maintenance_ready_config()),
             )
             .unwrap(),
         );
         let session_key = 99;
         let maintenance_frame = PiperFrame::new_standard(0x158, &[0xD8]);
 
-        piper.ctx.connection_monitor.register_feedback();
-        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        mark_maintenance_standby_confirmed(&piper);
         let lease_epoch = match piper
             .acquire_maintenance_lease_gate(9, session_key, Duration::from_millis(10))
             .expect("maintenance acquire should succeed")
@@ -5901,14 +5939,13 @@ mod tests {
                     release_rx,
                     sends: 0,
                 },
-                None,
+                Some(maintenance_ready_config()),
             )
             .unwrap(),
         );
 
         let session_key = 77;
-        piper.ctx.connection_monitor.register_feedback();
-        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        mark_maintenance_standby_confirmed(&piper);
         let lease_epoch = match piper
             .acquire_maintenance_lease_gate(7, session_key, Duration::from_millis(10))
             .expect("maintenance acquire should reach TX control lane")
@@ -5990,14 +6027,13 @@ mod tests {
                     release_rx,
                     sends: 0,
                 },
-                None,
+                Some(maintenance_ready_config()),
             )
             .unwrap(),
         );
 
         let session_key = 88;
-        piper.ctx.connection_monitor.register_feedback();
-        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        mark_maintenance_standby_confirmed(&piper);
         let lease_epoch = match piper
             .acquire_maintenance_lease_gate(8, session_key, Duration::from_millis(10))
             .expect("maintenance acquire should reach TX control lane")
@@ -6066,14 +6102,13 @@ mod tests {
                     release_rx,
                     sends: 0,
                 },
-                None,
+                Some(maintenance_ready_config()),
             )
             .unwrap(),
         );
 
         let session_key = 98;
-        piper.ctx.connection_monitor.register_feedback();
-        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        mark_maintenance_standby_confirmed(&piper);
         let lease_epoch = match piper
             .acquire_maintenance_lease_gate(9, session_key, Duration::from_millis(10))
             .expect("maintenance acquire should reach TX control lane")
@@ -6124,14 +6159,13 @@ mod tests {
                     release_rx,
                     sends: 0,
                 },
-                None,
+                Some(maintenance_ready_config()),
             )
             .unwrap(),
         );
 
         let holder_session_key = 77;
-        piper.ctx.connection_monitor.register_feedback();
-        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        mark_maintenance_standby_confirmed(&piper);
         let holder_lease_epoch = match piper
             .acquire_maintenance_lease_gate(7, holder_session_key, Duration::from_millis(10))
             .expect("initial maintenance acquire should reach TX control lane")

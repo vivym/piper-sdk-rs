@@ -327,6 +327,7 @@ fn reject_replay_mode_dispatches(
 fn derive_maintenance_gate_state(
     runtime_phase: &Arc<AtomicU8>,
     ctx: &Arc<PiperContext>,
+    config: &PipelineConfig,
     last_fault: &Arc<AtomicU8>,
 ) -> MaintenanceGateState {
     let phase = load_runtime_phase(runtime_phase);
@@ -342,21 +343,43 @@ fn derive_maintenance_gate_state(
     if !ctx.connection_monitor.check_connection() {
         return MaintenanceGateState::DeniedTransportDown;
     }
-    if ctx.robot_control.load().any_drive_enabled {
+    let Some(driver_enabled_mask) = confirmed_low_speed_drive_enabled_mask(ctx, config) else {
+        return MaintenanceGateState::DeniedDriveStateUnknown;
+    };
+    if driver_enabled_mask != 0 {
         return MaintenanceGateState::DeniedActiveControl;
     }
     MaintenanceGateState::AllowedStandby
+}
+
+fn confirmed_low_speed_drive_enabled_mask(
+    ctx: &Arc<PiperContext>,
+    config: &PipelineConfig,
+) -> Option<u8> {
+    let driver_state = ctx.joint_driver_low_speed.load();
+    if driver_state.valid_mask != ALL_DRIVES_ENABLED_MASK || driver_state.host_rx_mono_us == 0 {
+        return None;
+    }
+
+    let freshness_window_us = config.low_speed_drive_state_freshness_ms.saturating_mul(1_000);
+    if host_rx_mono_us().saturating_sub(driver_state.host_rx_mono_us) > freshness_window_us {
+        return None;
+    }
+
+    Some(driver_state.driver_enabled_mask)
 }
 
 fn refresh_maintenance_gate_state(
     maintenance_gate: &Arc<MaintenanceGate>,
     runtime_phase: &Arc<AtomicU8>,
     ctx: &Arc<PiperContext>,
+    config: &PipelineConfig,
     last_fault: &Arc<AtomicU8>,
 ) {
     let _ = maintenance_gate.set_state_synced(derive_maintenance_gate_state(
         runtime_phase,
         ctx,
+        config,
         last_fault,
     ));
 }
@@ -381,19 +404,7 @@ impl MaintenanceTxState {
 }
 
 fn maintenance_state_denial(state: MaintenanceGateState) -> crate::DriverError {
-    let message = match state {
-        MaintenanceGateState::DeniedFaulted => {
-            "maintenance writes are disabled while a runtime fault is latched"
-        },
-        MaintenanceGateState::DeniedActiveControl => {
-            "maintenance writes are disabled while active control is enabled"
-        },
-        MaintenanceGateState::DeniedTransportDown => {
-            "maintenance writes are disabled while transport is disconnected"
-        },
-        MaintenanceGateState::AllowedStandby => "maintenance allowed",
-    };
-    crate::DriverError::MaintenanceWriteDenied(message.to_string())
+    crate::DriverError::MaintenanceWriteDenied(state.denial_message().to_string())
 }
 
 fn apply_maintenance_control_op(state: &mut MaintenanceTxState, op: MaintenanceControlOp) {
@@ -541,6 +552,7 @@ fn refresh_local_maintenance_tx_state(
 ///     receive_timeout_ms: 5,
 ///     frame_group_timeout_ms: 20,
 ///     velocity_buffer_timeout_us: 20_000,
+///     low_speed_drive_state_freshness_ms: 100,
 /// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -553,6 +565,9 @@ pub struct PipelineConfig {
     /// 速度帧缓冲区超时（微秒）
     /// 如果收到部分速度帧后，超过此时间未收到完整帧组，则强制提交
     pub velocity_buffer_timeout_us: u64,
+    /// 低速驱动状态新鲜度窗口（毫秒）
+    /// 只有在收到完整且新鲜的 6 轴低速反馈后，maintenance gate 才会认为驱动使能状态已确认
+    pub low_speed_drive_state_freshness_ms: u64,
 }
 
 impl Default for PipelineConfig {
@@ -561,6 +576,7 @@ impl Default for PipelineConfig {
             receive_timeout_ms: 2,
             frame_group_timeout_ms: 10,
             velocity_buffer_timeout_us: 10_000, // 10ms (consistent with frame group timeout)
+            low_speed_drive_state_freshness_ms: 100,
         }
     }
 }
@@ -1203,12 +1219,14 @@ pub fn rx_loop(
                     &metrics,
                 );
 
-                if load_runtime_phase(&runtime_phase) == RuntimePhase::Running
-                    && maintenance_gate.current_state() != MaintenanceGateState::DeniedTransportDown
-                    && !ctx.connection_monitor.check_connection()
-                {
-                    let _ = maintenance_gate
-                        .set_state_synced(MaintenanceGateState::DeniedTransportDown);
+                if load_runtime_phase(&runtime_phase) == RuntimePhase::Running {
+                    refresh_maintenance_gate_state(
+                        &maintenance_gate,
+                        &runtime_phase,
+                        &ctx,
+                        &config,
+                        &last_fault,
+                    );
                 }
 
                 continue;
@@ -1283,7 +1301,13 @@ pub fn rx_loop(
             ctx.connection_monitor.register_feedback();
         }
         if maintenance_gate.current_state() == MaintenanceGateState::DeniedTransportDown {
-            refresh_maintenance_gate_state(&maintenance_gate, &runtime_phase, &ctx, &last_fault);
+            refresh_maintenance_gate_state(
+                &maintenance_gate,
+                &runtime_phase,
+                &ctx,
+                &config,
+                &last_fault,
+            );
         }
     }
 
@@ -2450,13 +2474,9 @@ fn parse_and_update_state(
                     feedback_counter: 0,
                 };
 
-                let previous = ctx.robot_control.load();
-                let previous_any_drive_enabled = previous.any_drive_enabled;
                 ctx.robot_control.store(Arc::new(new_robot_control_state.clone()));
-                if previous_any_drive_enabled != new_robot_control_state.any_drive_enabled
-                    && let Some(gate) = maintenance_gate
-                {
-                    refresh_maintenance_gate_state(gate, runtime_phase, ctx, last_fault);
+                if let Some(gate) = maintenance_gate {
+                    refresh_maintenance_gate_state(gate, runtime_phase, ctx, config, last_fault);
                 }
                 ctx.fps_stats
                     .load()
@@ -2562,7 +2582,6 @@ fn parse_and_update_state(
                     let any_drive_enabled = driver_enabled_mask != 0;
                     let is_enabled = driver_enabled_mask == ALL_DRIVES_ENABLED_MASK;
                     let previous = ctx.robot_control.load();
-                    let previous_any_drive_enabled = previous.any_drive_enabled;
                     if previous.driver_enabled_mask != driver_enabled_mask
                         || previous.any_drive_enabled != any_drive_enabled
                         || previous.is_enabled != is_enabled
@@ -2573,10 +2592,14 @@ fn parse_and_update_state(
                         next.is_enabled = is_enabled;
                         ctx.robot_control.store(Arc::new(next));
                     }
-                    if previous_any_drive_enabled != any_drive_enabled
-                        && let Some(gate) = maintenance_gate
-                    {
-                        refresh_maintenance_gate_state(gate, runtime_phase, ctx, last_fault);
+                    if let Some(gate) = maintenance_gate {
+                        refresh_maintenance_gate_state(
+                            gate,
+                            runtime_phase,
+                            ctx,
+                            config,
+                            last_fault,
+                        );
                     }
 
                     ctx.fps_stats
@@ -2867,6 +2890,7 @@ mod tests {
         let config = PipelineConfig::default();
         assert_eq!(config.receive_timeout_ms, 2);
         assert_eq!(config.frame_group_timeout_ms, 10);
+        assert_eq!(config.low_speed_drive_state_freshness_ms, 100);
     }
 
     #[test]
@@ -2875,10 +2899,12 @@ mod tests {
             receive_timeout_ms: 5,
             frame_group_timeout_ms: 20,
             velocity_buffer_timeout_us: 10_000,
+            low_speed_drive_state_freshness_ms: 250,
         };
         assert_eq!(config.receive_timeout_ms, 5);
         assert_eq!(config.frame_group_timeout_ms, 20);
         assert_eq!(config.velocity_buffer_timeout_us, 10_000);
+        assert_eq!(config.low_speed_drive_state_freshness_ms, 250);
     }
 
     #[test]
@@ -2886,9 +2912,10 @@ mod tests {
         let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::FaultLatched as u8));
         let last_fault = Arc::new(AtomicU8::new(0));
         let ctx = Arc::new(PiperContext::new());
+        let config = PipelineConfig::default();
 
         assert_eq!(
-            derive_maintenance_gate_state(&runtime_phase, &ctx, &last_fault),
+            derive_maintenance_gate_state(&runtime_phase, &ctx, &config, &last_fault),
             MaintenanceGateState::DeniedFaulted
         );
     }
@@ -2982,6 +3009,29 @@ mod tests {
         frame
     }
 
+    fn robot_status_frame_with_status(
+        control_mode: ControlMode,
+        robot_status: RobotStatus,
+        move_mode: MoveMode,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut frame = PiperFrame::new_standard(
+            ID_ROBOT_STATUS as u16,
+            &[
+                control_mode as u8,
+                robot_status as u8,
+                move_mode as u8,
+                TeachStatus::Closed as u8,
+                MotionStatus::Arrived as u8,
+                0,
+                0,
+                0,
+            ],
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
     fn parse_frame_for_test(
         ctx: &Arc<PiperContext>,
         state: &mut ParserState,
@@ -3005,7 +3055,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn parse_frame_for_test_with_maintenance(
+    fn parse_frame_for_test_with_maintenance_refresh(
         ctx: &Arc<PiperContext>,
         state: &mut ParserState,
         metrics: &Arc<PiperMetrics>,
@@ -3015,7 +3065,7 @@ mod tests {
         runtime_phase: &Arc<AtomicU8>,
         last_fault: &Arc<AtomicU8>,
     ) {
-        parse_and_update_state(
+        let parsed = parse_and_update_state(
             &frame,
             BackendCapability::StrictRealtime,
             ctx,
@@ -3026,6 +3076,50 @@ mod tests {
             runtime_phase,
             last_fault,
         );
+
+        if parsed.counts_as_robot_feedback {
+            ctx.connection_monitor.register_feedback();
+        }
+        if maintenance_gate.current_state() == MaintenanceGateState::DeniedTransportDown {
+            refresh_maintenance_gate_state(
+                maintenance_gate,
+                runtime_phase,
+                ctx,
+                config,
+                last_fault,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn feed_joint_driver_low_speed_cycle(
+        ctx: &Arc<PiperContext>,
+        state: &mut ParserState,
+        metrics: &Arc<PiperMetrics>,
+        config: &PipelineConfig,
+        maintenance_gate: &Arc<MaintenanceGate>,
+        runtime_phase: &Arc<AtomicU8>,
+        last_fault: &Arc<AtomicU8>,
+        enabled_mask: u8,
+        start_timestamp_us: u64,
+    ) {
+        for joint_index in 1..=6 {
+            let enabled = (enabled_mask & (1u8 << (joint_index - 1))) != 0;
+            parse_frame_for_test_with_maintenance_refresh(
+                ctx,
+                state,
+                metrics,
+                config,
+                joint_driver_low_speed_frame(
+                    joint_index,
+                    enabled,
+                    start_timestamp_us + u64::from(joint_index),
+                ),
+                maintenance_gate,
+                runtime_phase,
+                last_fault,
+            );
+        }
     }
 
     #[test]
@@ -3257,7 +3351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_maintenance_gate_denies_when_any_drive_is_enabled() {
+    fn test_maintenance_gate_stays_unknown_after_robot_status_until_low_speed_state_is_confirmed() {
         let ctx = Arc::new(PiperContext::new());
         let metrics = Arc::new(PiperMetrics::new());
         let config = PipelineConfig::default();
@@ -3266,14 +3360,54 @@ mod tests {
         let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
         let last_fault = Arc::new(AtomicU8::new(0));
 
-        ctx.connection_monitor.register_feedback();
+        parse_frame_for_test_with_maintenance_refresh(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            robot_status_frame_with_status(
+                ControlMode::CanControl,
+                RobotStatus::Normal,
+                MoveMode::MoveJ,
+                1_000,
+            ),
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+        );
 
-        parse_frame_for_test_with_maintenance(
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedDriveStateUnknown
+        );
+    }
+
+    #[test]
+    fn test_maintenance_gate_stays_unknown_with_partial_low_speed_feedback() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+
+        parse_frame_for_test_with_maintenance_refresh(
             &ctx,
             &mut state,
             &metrics,
             &config,
             joint_driver_low_speed_frame(1, true, 1_000),
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+        );
+        parse_frame_for_test_with_maintenance_refresh(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_driver_low_speed_frame(2, false, 1_001),
             &maintenance_gate,
             &runtime_phase,
             &last_fault,
@@ -3285,18 +3419,30 @@ mod tests {
         assert!(!robot_control.is_enabled);
         assert_eq!(
             maintenance_gate.current_state(),
-            MaintenanceGateState::DeniedActiveControl
+            MaintenanceGateState::DeniedDriveStateUnknown
         );
+    }
 
-        parse_frame_for_test_with_maintenance(
+    #[test]
+    fn test_maintenance_gate_allows_standby_only_after_full_fresh_disabled_low_speed_feedback() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+
+        feed_joint_driver_low_speed_cycle(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_driver_low_speed_frame(1, false, 1_100),
             &maintenance_gate,
             &runtime_phase,
             &last_fault,
+            0,
+            1_000,
         );
 
         let robot_control = ctx.robot_control.load();
@@ -3306,6 +3452,103 @@ mod tests {
         assert_eq!(
             maintenance_gate.current_state(),
             MaintenanceGateState::AllowedStandby
+        );
+    }
+
+    #[test]
+    fn test_maintenance_gate_denies_when_any_drive_is_enabled() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+
+        feed_joint_driver_low_speed_cycle(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+            0b000001,
+            1_000,
+        );
+
+        let robot_control = ctx.robot_control.load();
+        assert_eq!(robot_control.driver_enabled_mask, 0b000001);
+        assert!(robot_control.any_drive_enabled);
+        assert!(!robot_control.is_enabled);
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedActiveControl
+        );
+
+        feed_joint_driver_low_speed_cycle(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+            0,
+            2_000,
+        );
+
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::AllowedStandby
+        );
+    }
+
+    #[test]
+    fn test_maintenance_gate_returns_to_unknown_when_low_speed_state_stales() {
+        let ctx = Arc::new(PiperContext::new());
+        let config = PipelineConfig::default();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+
+        ctx.connection_monitor.register_feedback();
+        ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
+            host_rx_mono_us: host_rx_mono_us(),
+            valid_mask: ALL_DRIVES_ENABLED_MASK,
+            ..JointDriverLowSpeedState::default()
+        }));
+
+        refresh_maintenance_gate_state(
+            &maintenance_gate,
+            &runtime_phase,
+            &ctx,
+            &config,
+            &last_fault,
+        );
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::AllowedStandby
+        );
+
+        let stale_host_rx_mono_us = host_rx_mono_us()
+            .saturating_sub((config.low_speed_drive_state_freshness_ms + 50).saturating_mul(1_000));
+        ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
+            host_rx_mono_us: stale_host_rx_mono_us,
+            valid_mask: ALL_DRIVES_ENABLED_MASK,
+            ..JointDriverLowSpeedState::default()
+        }));
+
+        refresh_maintenance_gate_state(
+            &maintenance_gate,
+            &runtime_phase,
+            &ctx,
+            &config,
+            &last_fault,
+        );
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedDriveStateUnknown
         );
     }
 
