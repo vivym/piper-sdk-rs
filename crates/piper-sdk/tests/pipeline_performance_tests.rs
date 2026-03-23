@@ -192,6 +192,7 @@ fn start_tx_loop(
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,

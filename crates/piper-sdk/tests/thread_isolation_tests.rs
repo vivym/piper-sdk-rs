@@ -238,6 +238,7 @@ fn test_rx_unaffected_by_tx_timeout() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,
@@ -382,6 +383,7 @@ fn test_tx_detects_rx_failure() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,
@@ -517,6 +519,7 @@ fn test_thread_lifecycle_linkage() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,

@@ -173,6 +173,7 @@ fn test_priority_scheduling() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,
@@ -332,6 +333,7 @@ fn test_reliable_command_not_dropped() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,
@@ -494,6 +496,7 @@ fn test_realtime_overwrite_strategy() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,

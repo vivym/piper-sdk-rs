@@ -667,6 +667,7 @@ fn test_tx_latency_benchmark() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot_tx,
             soft_realtime_rx,
             shutdown_lane,
@@ -797,6 +798,7 @@ fn test_send_duration_benchmark() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot_tx,
             soft_realtime_rx,
             shutdown_lane,

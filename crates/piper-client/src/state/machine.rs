@@ -4256,6 +4256,64 @@ mod tests {
     }
 
     #[test]
+    fn active_request_disable_all_reopens_driver_when_disabled_feedback_arrives_before_send_returns()
+     {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let frames = disabled_joint_frames(Duration::from_millis(1), 100);
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(frames),
+                BlockingFirstControlTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver.clone(),
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let disable_handle = thread::spawn(move || active.request_disable_all());
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("disable frame should enter the adapter before the release gate opens");
+        wait_until(
+            Duration::from_millis(200),
+            || driver.get_robot_control().confirmed_driver_enabled_mask == Some(0),
+            "disabled low-speed feedback should land before the control send is released",
+        );
+
+        release_tx.send(()).expect("blocked control send should release cleanly");
+        let maintenance = disable_handle
+            .join()
+            .expect("disable request thread should finish")
+            .expect("disable request should still enter maintenance");
+
+        let standby = maintenance
+            .wait_until_disabled(DisableConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+            })
+            .expect("already-confirmed disabled feedback should still converge to standby");
+
+        assert!(matches!(standby._state, Standby));
+        driver
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x0B]))
+            .expect(
+                "driver should not remain stuck in StateTransitionClosed after request_disable_all returns against already-confirmed disabled feedback",
+            );
+    }
+
+    #[test]
     fn maintenance_partial_joint_power_commands_send_expected_frames() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone());

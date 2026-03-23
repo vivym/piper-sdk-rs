@@ -1856,11 +1856,13 @@ impl Piper {
         let maintenance_gate_tx = maintenance_gate.clone();
         let backend_capability_tx = backend_capability;
         let driver_mode_tx = driver_mode.clone();
+        let config_tx = pipeline_config.clone();
 
         let tx_thread = spawn(move || {
             crate::pipeline::tx_loop_mailbox(
                 tx_adapter,
                 backend_capability_tx,
+                config_tx,
                 realtime_slot_tx,
                 soft_realtime_rx,
                 shutdown_lane_tx,

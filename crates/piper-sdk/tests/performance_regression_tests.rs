@@ -427,6 +427,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,
@@ -629,6 +630,7 @@ fn test_command_priority_performance() {
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot,
             soft_realtime_rx,
             shutdown_lane,
@@ -699,6 +701,7 @@ fn test_command_priority_performance() {
         tx_loop_mailbox(
             tx_adapter2,
             BackendCapability::StrictRealtime,
+            PipelineConfig::default(),
             realtime_slot2,
             soft_realtime_rx2,
             shutdown_lane2,

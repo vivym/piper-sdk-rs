@@ -551,6 +551,8 @@ fn settle_state_transition_dispatch_after_result(
     driver_mode: &Arc<crate::mode::AtomicDriverMode>,
     maintenance_gate: &Arc<MaintenanceGate>,
     maintenance_tx_state: &mut MaintenanceTxState,
+    ctx: &Arc<PiperContext>,
+    config: &PipelineConfig,
 ) {
     if dispatch.state_transition_completion.is_none() {
         return;
@@ -568,6 +570,14 @@ fn settle_state_transition_dispatch_after_result(
         },
         (Some(crate::piper::StateTransitionCompletion::HoldUntilDisableConfirmed), Ok(())) => {
             normal_send_gate.arm_disable_confirmation_pending();
+            maybe_finalize_disable_confirmation_after_low_speed_refresh(
+                normal_send_gate,
+                runtime_phase,
+                last_fault,
+                driver_mode,
+                ctx,
+                config,
+            );
         },
         (None, Ok(())) => {},
         (
@@ -1417,6 +1427,7 @@ pub fn rx_loop(
 pub fn tx_loop_mailbox(
     mut tx: impl RealtimeTxAdapter,
     backend_capability: BackendCapability,
+    config: PipelineConfig,
     realtime_slot: Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
     soft_realtime_rx: Receiver<crate::command::SoftRealtimeCommand>,
     shutdown_lane: Arc<ShutdownLane>,
@@ -1700,6 +1711,8 @@ pub fn tx_loop_mailbox(
                 &driver_mode,
                 &maintenance_gate,
                 &mut maintenance_tx_state,
+                &ctx,
+                &config,
             );
             finish_maintenance_dispatch(&dispatch, send_result);
             if should_break {
@@ -3934,6 +3947,90 @@ mod tests {
         assert_eq!(
             ctx.robot_control.load().confirmed_driver_enabled_mask,
             Some(0),
+        );
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::AllowedStandby
+        );
+    }
+
+    #[test]
+    fn test_state_transition_disable_rechecks_already_confirmed_disabled_feedback_on_send_success()
+    {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+        let normal_send_gate = Arc::new(NormalSendGate::new());
+        let driver_mode = Arc::new(crate::mode::AtomicDriverMode::new(
+            crate::mode::DriverMode::Normal,
+        ));
+        let mut maintenance_tx_state =
+            MaintenanceTxState::from_snapshot(maintenance_gate.snapshot());
+        let (ack_tx, _ack_rx) = crossbeam_channel::bounded(2);
+        let dispatch = MaintenanceLaneDispatch {
+            frame: MotorEnableCommand::disable_all().to_frame(),
+            meta: None,
+            deadline: Instant::now() + Duration::from_millis(50),
+            ack: ack_tx,
+            state_transition_completion: Some(
+                crate::piper::StateTransitionCompletion::HoldUntilDisableConfirmed,
+            ),
+        };
+
+        normal_send_gate.close_for_state_transition();
+        feed_joint_driver_low_speed_cycle(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+            0,
+            5_000,
+        );
+
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::AllowedStandby
+        );
+        assert_eq!(
+            ctx.robot_control.load().confirmed_driver_enabled_mask,
+            Some(0)
+        );
+        assert_eq!(
+            normal_send_gate.state(),
+            NormalSendGateState::StateTransitionClosed
+        );
+        assert!(!normal_send_gate.disable_confirmation_pending());
+
+        settle_state_transition_dispatch_after_result(
+            &dispatch,
+            &Ok(()),
+            &normal_send_gate,
+            &runtime_phase,
+            &last_fault,
+            &driver_mode,
+            &maintenance_gate,
+            &mut maintenance_tx_state,
+            &ctx,
+            &config,
+        );
+
+        assert_eq!(
+            normal_send_gate.state(),
+            NormalSendGateState::Open,
+            "successful disable dispatch should immediately reopen when fresh disabled feedback already landed",
+        );
+        assert!(
+            !normal_send_gate.disable_confirmation_pending(),
+            "disable confirmation should not stay pending once current low-speed state already proves all drives are off",
         );
         assert_eq!(
             maintenance_gate.current_state(),
