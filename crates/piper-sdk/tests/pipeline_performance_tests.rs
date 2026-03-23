@@ -150,6 +150,9 @@ fn start_rx_loop(
 ) -> thread::JoinHandle<()> {
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let normal_send_gate = Arc::new(NormalSendGate::new());
+    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     thread::spawn(move || {
         rx_loop(
             rx_adapter,
@@ -159,6 +162,7 @@ fn start_rx_loop(
             is_running,
             runtime_phase,
             normal_send_gate,
+            driver_mode,
             metrics,
             fault,
             maintenance_state_signal,

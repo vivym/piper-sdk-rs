@@ -192,6 +192,9 @@ fn test_rx_unaffected_by_tx_timeout() {
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
+    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -200,6 +203,7 @@ fn test_rx_unaffected_by_tx_timeout() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
+    let driver_mode_rx = driver_mode.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -212,6 +216,7 @@ fn test_rx_unaffected_by_tx_timeout() {
             is_running_rx,
             runtime_phase_rx,
             normal_send_gate_rx,
+            driver_mode_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,
@@ -331,6 +336,9 @@ fn test_tx_detects_rx_failure() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
+    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -339,6 +347,7 @@ fn test_tx_detects_rx_failure() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
+    let driver_mode_rx = driver_mode.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -351,6 +360,7 @@ fn test_tx_detects_rx_failure() {
             is_running_rx,
             runtime_phase_rx,
             normal_send_gate_rx,
+            driver_mode_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,
@@ -461,6 +471,9 @@ fn test_thread_lifecycle_linkage() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
+    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
@@ -469,6 +482,7 @@ fn test_thread_lifecycle_linkage() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
+    let driver_mode_rx = driver_mode.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -481,6 +495,7 @@ fn test_thread_lifecycle_linkage() {
             is_running_rx,
             runtime_phase_rx,
             normal_send_gate_rx,
+            driver_mode_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,

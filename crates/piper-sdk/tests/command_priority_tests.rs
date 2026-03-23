@@ -125,6 +125,9 @@ fn test_priority_scheduling() {
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
+    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
@@ -136,6 +139,7 @@ fn test_priority_scheduling() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
+    let driver_mode_rx = driver_mode.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -148,6 +152,7 @@ fn test_priority_scheduling() {
             is_running_rx,
             runtime_phase_rx,
             normal_send_gate_rx,
+            driver_mode_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,

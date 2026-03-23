@@ -432,6 +432,9 @@ fn test_500hz_realtime_benchmark() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
+    let driver_mode_rx = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -444,6 +447,7 @@ fn test_500hz_realtime_benchmark() {
             is_running_rx,
             runtime_phase_rx,
             normal_send_gate_rx,
+            driver_mode_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,
@@ -537,6 +541,9 @@ fn test_1khz_realtime_benchmark() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
+    let driver_mode_rx = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -549,6 +556,7 @@ fn test_1khz_realtime_benchmark() {
             is_running_rx,
             runtime_phase_rx,
             normal_send_gate_rx,
+            driver_mode_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,
@@ -893,6 +901,9 @@ fn test_usb_fault_simulation() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
+    let driver_mode_rx = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -905,6 +916,7 @@ fn test_usb_fault_simulation() {
             is_running_rx,
             runtime_phase_rx,
             normal_send_gate_rx,
+            driver_mode_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,

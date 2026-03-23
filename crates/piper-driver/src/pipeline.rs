@@ -44,7 +44,7 @@ fn tx_idle_backoff(min_us: u64, current: u64, max_us: u64) -> (Duration, u64) {
 
 #[inline]
 fn host_rx_mono_us() -> u64 {
-    monotonic_micros()
+    monotonic_micros().max(1)
 }
 
 fn record_fault(slot: &AtomicU8, fault: RuntimeFaultKind) {
@@ -306,6 +306,28 @@ fn refresh_maintenance_gate_state(
     ));
 }
 
+fn maybe_finalize_disable_confirmation_after_low_speed_refresh(
+    normal_send_gate: &Arc<NormalSendGate>,
+    runtime_phase: &Arc<AtomicU8>,
+    last_fault: &Arc<AtomicU8>,
+    driver_mode: &Arc<crate::mode::AtomicDriverMode>,
+    ctx: &Arc<PiperContext>,
+    config: &PipelineConfig,
+) {
+    if !normal_send_gate.disable_confirmation_pending() {
+        return;
+    }
+    if confirmed_low_speed_drive_enabled_mask(ctx, config) != Some(0) {
+        return;
+    }
+
+    normal_send_gate.finalize_disable_confirmation(
+        load_runtime_phase(runtime_phase),
+        RuntimeFaultKind::from_raw(last_fault.load(Ordering::Acquire)),
+        driver_mode.get(Ordering::Acquire),
+    );
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MaintenanceTxState {
     state: MaintenanceGateState,
@@ -380,7 +402,7 @@ struct MaintenanceLaneDispatch {
     meta: Option<crate::command::MaintenanceCommandMeta>,
     deadline: Instant,
     ack: crossbeam_channel::Sender<MaintenanceSendPhase>,
-    restore_after_state_transition: bool,
+    state_transition_completion: Option<crate::piper::StateTransitionCompletion>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -427,7 +449,7 @@ fn drain_maintenance_lane(
                     meta: Some(meta),
                     deadline,
                     ack,
-                    restore_after_state_transition: false,
+                    state_transition_completion: None,
                 });
             },
             MaintenanceLaneCommand::LocalSend {
@@ -440,13 +462,14 @@ fn drain_maintenance_lane(
                     meta: None,
                     deadline,
                     ack,
-                    restore_after_state_transition: false,
+                    state_transition_completion: None,
                 });
             },
             MaintenanceLaneCommand::StateTransitionLocalSend {
                 frame,
                 deadline,
                 ack,
+                completion,
             } => {
                 abort_pending_normal_control_for_state_transition(
                     realtime_slot,
@@ -461,7 +484,7 @@ fn drain_maintenance_lane(
                     meta: None,
                     deadline,
                     ack,
-                    restore_after_state_transition: true,
+                    state_transition_completion: Some(completion),
                 });
             },
         }
@@ -508,7 +531,7 @@ fn restore_state_transition_gate_after_dispatch(
     last_fault: &Arc<AtomicU8>,
     driver_mode: &Arc<crate::mode::AtomicDriverMode>,
 ) {
-    if !dispatch.restore_after_state_transition {
+    if dispatch.state_transition_completion.is_none() {
         return;
     }
 
@@ -530,20 +553,29 @@ fn settle_state_transition_dispatch_after_result(
     maintenance_gate: &Arc<MaintenanceGate>,
     maintenance_tx_state: &mut MaintenanceTxState,
 ) {
-    if !dispatch.restore_after_state_transition {
+    if dispatch.state_transition_completion.is_none() {
         return;
     }
 
-    match send_result {
-        Ok(()) => restore_state_transition_gate_after_dispatch(
-            dispatch,
-            normal_send_gate,
-            runtime_phase,
-            last_fault,
-            driver_mode,
-        ),
-        Err(crate::DriverError::Timeout)
-        | Err(crate::DriverError::ReliableDeliveryFailed { .. }) => {
+    match (dispatch.state_transition_completion, send_result) {
+        (Some(crate::piper::StateTransitionCompletion::RestoreAfterDispatch), Ok(())) => {
+            restore_state_transition_gate_after_dispatch(
+                dispatch,
+                normal_send_gate,
+                runtime_phase,
+                last_fault,
+                driver_mode,
+            )
+        },
+        (Some(crate::piper::StateTransitionCompletion::HoldUntilDisableConfirmed), Ok(())) => {
+            normal_send_gate.arm_disable_confirmation_pending();
+        },
+        (None, Ok(())) => {},
+        (
+            _,
+            Err(crate::DriverError::Timeout)
+            | Err(crate::DriverError::ReliableDeliveryFailed { .. }),
+        ) => {
             latch_runtime_fault_with_maintenance(
                 runtime_phase,
                 normal_send_gate,
@@ -553,7 +585,7 @@ fn settle_state_transition_dispatch_after_result(
                 Some(maintenance_tx_state),
             );
         },
-        Err(_) => restore_state_transition_gate_after_dispatch(
+        (_, Err(_)) => restore_state_transition_gate_after_dispatch(
             dispatch,
             normal_send_gate,
             runtime_phase,
@@ -1190,6 +1222,7 @@ pub fn rx_loop(
     workers_running: Arc<AtomicBool>,
     runtime_phase: Arc<AtomicU8>,
     normal_send_gate: Arc<NormalSendGate>,
+    driver_mode: Arc<crate::mode::AtomicDriverMode>,
     metrics: Arc<PiperMetrics>,
     last_fault: Arc<AtomicU8>,
     maintenance_gate: Arc<MaintenanceGate>,
@@ -1340,6 +1373,16 @@ pub fn rx_loop(
                 &last_fault,
             );
         }
+        if parsed.low_speed_drive_state_updated {
+            maybe_finalize_disable_confirmation_after_low_speed_refresh(
+                &normal_send_gate,
+                &runtime_phase,
+                &last_fault,
+                &driver_mode,
+                &ctx,
+                &config,
+            );
+        }
     }
 
     if workers_running.load(Ordering::Acquire)
@@ -1458,7 +1501,7 @@ pub fn tx_loop_mailbox(
                 finish_maintenance_dispatch(&dispatch, Err(crate::DriverError::ReplayModeActive));
                 continue;
             }
-            let send_result = if dispatch.restore_after_state_transition {
+            let send_result = if dispatch.state_transition_completion.is_some() {
                 match normal_send_gate.state() {
                     crate::piper::NormalSendGateState::ReplayPaused => {
                         Err(crate::DriverError::ReplayModeActive)
@@ -2440,6 +2483,7 @@ fn send_shutdown_dispatch(
 struct ParsedFeedbackOutcome {
     counts_as_robot_feedback: bool,
     maintenance_gate_may_have_changed: bool,
+    low_speed_drive_state_updated: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2796,6 +2840,7 @@ fn parse_and_update_state(
                 if joint_idx < 6 {
                     outcome.counts_as_robot_feedback = true;
                     outcome.maintenance_gate_may_have_changed = true;
+                    outcome.low_speed_drive_state_updated = true;
                     let host_rx_mono_us = host_rx_mono_us();
 
                     ctx.joint_driver_low_speed.rcu(|old| {
@@ -3133,6 +3178,7 @@ fn parse_and_update_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::piper::NormalSendGateState;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::thread;
@@ -3384,6 +3430,37 @@ mod tests {
         runtime_phase: &Arc<AtomicU8>,
         last_fault: &Arc<AtomicU8>,
     ) {
+        let normal_send_gate = Arc::new(NormalSendGate::new());
+        let driver_mode = Arc::new(crate::mode::AtomicDriverMode::new(
+            crate::mode::DriverMode::Normal,
+        ));
+        parse_frame_for_test_with_disable_barrier_refresh(
+            ctx,
+            state,
+            metrics,
+            config,
+            frame,
+            maintenance_gate,
+            runtime_phase,
+            last_fault,
+            &normal_send_gate,
+            &driver_mode,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parse_frame_for_test_with_disable_barrier_refresh(
+        ctx: &Arc<PiperContext>,
+        state: &mut ParserState,
+        metrics: &Arc<PiperMetrics>,
+        config: &PipelineConfig,
+        frame: PiperFrame,
+        maintenance_gate: &Arc<MaintenanceGate>,
+        runtime_phase: &Arc<AtomicU8>,
+        last_fault: &Arc<AtomicU8>,
+        normal_send_gate: &Arc<NormalSendGate>,
+        driver_mode: &Arc<crate::mode::AtomicDriverMode>,
+    ) {
         let parsed = parse_and_update_state(
             &frame,
             BackendCapability::StrictRealtime,
@@ -3405,6 +3482,16 @@ mod tests {
                 ctx,
                 config,
                 last_fault,
+            );
+        }
+        if parsed.low_speed_drive_state_updated {
+            maybe_finalize_disable_confirmation_after_low_speed_refresh(
+                normal_send_gate,
+                runtime_phase,
+                last_fault,
+                driver_mode,
+                ctx,
+                config,
             );
         }
     }
@@ -3771,6 +3858,104 @@ mod tests {
         assert_eq!(
             maintenance_gate.current_state(),
             MaintenanceGateState::AllowedStandby
+        );
+    }
+
+    #[test]
+    fn test_disable_confirmation_reopens_gate_only_after_full_fresh_disabled_low_speed_feedback() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+        let normal_send_gate = Arc::new(NormalSendGate::new());
+        let driver_mode = Arc::new(crate::mode::AtomicDriverMode::new(
+            crate::mode::DriverMode::Normal,
+        ));
+        normal_send_gate.close_for_state_transition();
+        normal_send_gate.arm_disable_confirmation_pending();
+
+        for joint_index in 1..=5 {
+            parse_frame_for_test_with_disable_barrier_refresh(
+                &ctx,
+                &mut state,
+                &metrics,
+                &config,
+                joint_driver_low_speed_frame(joint_index, false, 1_000 + u64::from(joint_index)),
+                &maintenance_gate,
+                &runtime_phase,
+                &last_fault,
+                &normal_send_gate,
+                &driver_mode,
+            );
+            assert_eq!(
+                normal_send_gate.state(),
+                NormalSendGateState::StateTransitionClosed
+            );
+            assert!(normal_send_gate.disable_confirmation_pending());
+        }
+
+        parse_frame_for_test_with_disable_barrier_refresh(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_driver_low_speed_frame(6, false, 1_006),
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+            &normal_send_gate,
+            &driver_mode,
+        );
+
+        assert_eq!(normal_send_gate.state(), NormalSendGateState::Open);
+        assert!(!normal_send_gate.disable_confirmation_pending());
+        assert_eq!(
+            ctx.robot_control.load().confirmed_driver_enabled_mask,
+            Some(0),
+        );
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::AllowedStandby
+        );
+    }
+
+    #[test]
+    fn test_disable_confirmation_pending_stays_closed_when_any_drive_remains_enabled() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+        let normal_send_gate = Arc::new(NormalSendGate::new());
+
+        normal_send_gate.close_for_state_transition();
+        normal_send_gate.arm_disable_confirmation_pending();
+
+        feed_joint_driver_low_speed_cycle(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+            0b000001,
+            2_000,
+        );
+
+        assert_eq!(
+            normal_send_gate.state(),
+            NormalSendGateState::StateTransitionClosed
+        );
+        assert!(normal_send_gate.disable_confirmation_pending());
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedActiveControl
         );
     }
 

@@ -390,6 +390,9 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
+    let driver_mode_rx = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+        piper_sdk::driver::DriverMode::Normal,
+    ));
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -402,6 +405,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             is_running_rx,
             runtime_phase_rx,
             normal_send_gate_rx,
+            driver_mode_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,

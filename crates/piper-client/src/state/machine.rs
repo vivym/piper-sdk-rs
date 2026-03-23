@@ -4213,6 +4213,49 @@ mod tests {
     }
 
     #[test]
+    fn active_request_disable_all_keeps_shared_driver_control_closed_until_disabled_feedback() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = (1..=6)
+            .map(|joint_index| TimedFrame {
+                delay: Duration::from_millis(3),
+                frame: joint_driver_disabled_frame(joint_index, joint_index as u64),
+            })
+            .collect();
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(frames),
+                RecordingTxAdapter::new(sent_frames),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver.clone(),
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let maintenance =
+            active.request_disable_all().expect("disable request should enter maintenance");
+
+        assert!(matches!(
+            maintenance.driver.send_reliable(PiperFrame::new_standard(0x151, &[0x09])),
+            Err(piper_driver::DriverError::ControlPathClosed)
+        ));
+
+        maintenance
+            .wait_until_disabled(DisableConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+            })
+            .expect("fresh disabled feedback should eventually reopen the control path");
+
+        driver
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x0A]))
+            .expect("shared driver should reopen once disabled feedback is confirmed");
+    }
+
+    #[test]
     fn maintenance_partial_joint_power_commands_send_expected_frames() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone());

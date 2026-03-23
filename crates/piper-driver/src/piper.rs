@@ -261,6 +261,7 @@ pub struct NormalSendGate {
     state: AtomicU8,
     epoch: AtomicU64,
     inflight_normal_sends: AtomicUsize,
+    disable_confirmation_pending: AtomicBool,
     #[cfg(test)]
     fault_latch_barrier: Mutex<Option<FaultLatchBarrier>>,
     #[cfg(test)]
@@ -319,6 +320,7 @@ impl NormalSendGate {
             state: AtomicU8::new(NormalSendGateState::Open as u8),
             epoch: AtomicU64::new(0),
             inflight_normal_sends: AtomicUsize::new(0),
+            disable_confirmation_pending: AtomicBool::new(false),
             #[cfg(test)]
             fault_latch_barrier: Mutex::new(None),
             #[cfg(test)]
@@ -386,6 +388,7 @@ impl NormalSendGate {
     }
 
     pub(crate) fn close_for_fault(&self) {
+        self.disable_confirmation_pending.store(false, Ordering::Release);
         if self.state() != NormalSendGateState::StoppingClosed {
             self.set_state(NormalSendGateState::FaultClosed);
         }
@@ -460,6 +463,7 @@ impl NormalSendGate {
     pub(crate) fn maybe_wait_test_state_transition_barrier(&self) {}
 
     pub(crate) fn close_for_stop(&self) {
+        self.disable_confirmation_pending.store(false, Ordering::Release);
         self.set_state(NormalSendGateState::StoppingClosed);
     }
 
@@ -467,6 +471,26 @@ impl NormalSendGate {
         if self.state() == NormalSendGateState::Open {
             self.set_state(NormalSendGateState::StateTransitionClosed);
         }
+    }
+
+    pub(crate) fn arm_disable_confirmation_pending(&self) {
+        self.disable_confirmation_pending.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn disable_confirmation_pending(&self) -> bool {
+        self.disable_confirmation_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn finalize_disable_confirmation(
+        &self,
+        runtime_phase: RuntimePhase,
+        runtime_fault: Option<RuntimeFaultKind>,
+        driver_mode: crate::mode::DriverMode,
+    ) {
+        if !self.disable_confirmation_pending.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.restore_after_state_transition(runtime_phase, runtime_fault, driver_mode);
     }
 
     pub(crate) fn restore_after_state_transition(
@@ -658,7 +682,15 @@ pub enum MaintenanceLaneCommand {
         frame: PiperFrame,
         deadline: Instant,
         ack: Sender<MaintenanceSendPhase>,
+        completion: StateTransitionCompletion,
     },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateTransitionCompletion {
+    RestoreAfterDispatch,
+    HoldUntilDisableConfirmed,
 }
 
 impl MaintenanceLaneCommand {
@@ -703,11 +735,13 @@ impl MaintenanceLaneCommand {
         frame: PiperFrame,
         deadline: Instant,
         ack: Sender<MaintenanceSendPhase>,
+        completion: StateTransitionCompletion,
     ) -> Self {
         Self::StateTransitionLocalSend {
             frame,
             deadline,
             ack,
+            completion,
         }
     }
 
@@ -1794,6 +1828,7 @@ impl Piper {
         let backend_capability_rx = backend_capability;
         let maintenance_gate_rx = maintenance_gate.clone();
         let normal_send_gate_rx = normal_send_gate.clone();
+        let driver_mode_rx = driver_mode.clone();
 
         let rx_thread = spawn(move || {
             crate::pipeline::rx_loop(
@@ -1804,6 +1839,7 @@ impl Piper {
                 workers_running_clone,
                 runtime_phase_rx,
                 normal_send_gate_rx,
+                driver_mode_rx,
                 metrics_clone,
                 runtime_fault_rx,
                 maintenance_gate_rx,
@@ -3474,7 +3510,10 @@ impl Piper {
             if self
                 .maintenance_lane_tx
                 .send(MaintenanceLaneCommand::state_transition_local_send(
-                    frame, deadline, ack_tx,
+                    frame,
+                    deadline,
+                    ack_tx,
+                    StateTransitionCompletion::HoldUntilDisableConfirmed,
                 ))
                 .is_err()
             {
@@ -7046,6 +7085,12 @@ mod tests {
             .expect("state-transition sender thread should finish")
             .expect("state-transition disable should complete");
 
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::StateTransitionClosed,
+            "disable dispatch must keep the front door closed until drives are confirmed disabled",
+        );
+
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(
             sent.as_slice(),
@@ -7392,6 +7437,12 @@ mod tests {
             .send(())
             .expect("state-transition barrier should release cleanly");
         drop_handle.join().expect("drop-time disable thread should join cleanly");
+
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::StateTransitionClosed,
+            "drop-time disable must also keep the front door closed until disabled feedback arrives",
+        );
 
         wait_until(
             Duration::from_millis(200),
