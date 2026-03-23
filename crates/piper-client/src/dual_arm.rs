@@ -3447,14 +3447,17 @@ mod tests {
     fn test_run_bilateral_runtime_manual_fault_is_reported_separately() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
-        let left = build_active_mit_piper(1_000, left_sent);
+        let left = build_active_mit_piper(1_000, left_sent.clone());
         let left_driver = left.driver.clone();
+        let left_sent_for_latch = Arc::clone(&left_sent);
         let arms = DualArmActiveMit {
             left,
             right: build_active_mit_piper(1_000, right_sent),
         };
-
-        left_driver.latch_fault();
+        let latch_handle = thread::spawn(move || {
+            wait_for_sent_frames(&left_sent_for_latch, 1);
+            left_driver.latch_fault();
+        });
 
         let exit = arms
             .run_bilateral(
@@ -3478,6 +3481,7 @@ mod tests {
                 },
             )
             .expect("manual runtime latch should converge to faulted exit");
+        latch_handle.join().expect("manual fault latch thread should finish cleanly");
 
         match exit {
             DualArmLoopExit::Standby { .. } => panic!("expected faulted exit"),

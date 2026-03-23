@@ -3041,8 +3041,16 @@ impl Piper {
     }
 
     #[doc(hidden)]
+    /// Returns whether the current maintenance lease is still valid under runtime-open semantics.
+    ///
+    /// This check applies the same runtime fail-closed override as
+    /// `maintenance_lease_snapshot()`: Replay, fault latch, RX death, and TX death all
+    /// invalidate an otherwise matching cached lease immediately.
     pub fn maintenance_lease_is_valid(&self, session_key: u64, lease_epoch: u64) -> bool {
-        self.maintenance_gate.is_valid(session_key, lease_epoch)
+        let snapshot = self.maintenance_lease_snapshot();
+        snapshot.state() == MaintenanceGateState::AllowedStandby
+            && snapshot.holder_session_key() == Some(session_key)
+            && snapshot.lease_epoch() == lease_epoch
     }
 
     #[doc(hidden)]
@@ -3230,6 +3238,7 @@ impl Drop for Piper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DriverMode;
     use piper_can::{CanAdapter, PiperFrame, SplittableAdapter};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
@@ -3272,7 +3281,7 @@ mod tests {
     }
 
     fn mark_maintenance_standby_confirmed(piper: &Piper) {
-        let now = crate::heartbeat::monotonic_micros();
+        let now = crate::heartbeat::monotonic_micros().max(1);
         piper.ctx.connection_monitor.register_feedback();
         piper.ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
             host_rx_mono_us: now,
@@ -5931,6 +5940,79 @@ mod tests {
             MaintenanceLeaseAcquireResult::DeniedState {
                 state: MaintenanceGateState::DeniedFaulted,
             }
+        );
+    }
+
+    #[test]
+    fn test_maintenance_lease_is_valid_returns_true_only_while_runtime_is_open() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            MockTxAdapter,
+            Some(maintenance_ready_config()),
+        )
+        .unwrap();
+
+        let session_key = 55;
+        mark_maintenance_standby_confirmed(&piper);
+        wait_until(
+            Duration::from_millis(200),
+            || piper.maintenance_lease_snapshot().state() == MaintenanceGateState::AllowedStandby,
+            "maintenance runtime should expose standby before lease acquisition",
+        );
+        let lease_epoch = match piper
+            .acquire_maintenance_lease_gate(5, session_key, Duration::from_millis(10))
+            .expect("maintenance acquire should succeed while runtime is open")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected maintenance acquire result: {other:?}"),
+        };
+
+        assert!(
+            piper.maintenance_lease_is_valid(session_key, lease_epoch),
+            "matching holder and epoch should be valid while runtime remains open"
+        );
+
+        piper
+            .try_set_mode(DriverMode::Replay, Duration::from_millis(50))
+            .expect("replay mode switch should succeed");
+
+        assert!(
+            !piper.maintenance_lease_is_valid(session_key, lease_epoch),
+            "replay isolation must invalidate a previously granted maintenance lease"
+        );
+    }
+
+    #[test]
+    fn test_maintenance_lease_is_valid_returns_false_after_manual_fault_latch() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            MockTxAdapter,
+            Some(maintenance_ready_config()),
+        )
+        .unwrap();
+
+        let session_key = 66;
+        mark_maintenance_standby_confirmed(&piper);
+        wait_until(
+            Duration::from_millis(200),
+            || piper.maintenance_lease_snapshot().state() == MaintenanceGateState::AllowedStandby,
+            "maintenance runtime should expose standby before lease acquisition",
+        );
+        let lease_epoch = match piper
+            .acquire_maintenance_lease_gate(6, session_key, Duration::from_millis(10))
+            .expect("maintenance acquire should succeed before manual fault latch")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected maintenance acquire result: {other:?}"),
+        };
+
+        assert!(piper.maintenance_lease_is_valid(session_key, lease_epoch));
+
+        piper.latch_fault();
+
+        assert!(
+            !piper.maintenance_lease_is_valid(session_key, lease_epoch),
+            "manual fault latch must invalidate the cached maintenance lease immediately"
         );
     }
 

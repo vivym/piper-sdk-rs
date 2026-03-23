@@ -1075,6 +1075,25 @@ mod tests {
         (driver, observer)
     }
 
+    fn wait_for_confirmed_joint_enabled_mask(
+        observer: &Observer<StrictRealtime>,
+        expected: Option<u8>,
+        timeout: Duration,
+    ) {
+        let start = std::time::Instant::now();
+        loop {
+            let current = observer.joint_enabled_mask_confirmed();
+            if current == expected {
+                return;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "timed out waiting for confirmed joint enable mask {expected:?}, got {current:?}",
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn test_gripper_state_structure() {
         let gripper = GripperState {
@@ -1144,6 +1163,11 @@ mod tests {
         driver
             .wait_for_feedback(Duration::from_millis(200))
             .expect("full low-speed feedback should arrive");
+        wait_for_confirmed_joint_enabled_mask(
+            &observer,
+            Some(0b11_1111),
+            Duration::from_millis(200),
+        );
 
         assert_eq!(observer.joint_enabled_mask_confirmed(), Some(0b11_1111));
         assert_eq!(observer.is_joint_enabled_confirmed(5), Some(true));
@@ -1167,6 +1191,7 @@ mod tests {
         driver
             .wait_for_feedback(Duration::from_millis(200))
             .expect("low-speed feedback should arrive");
+        wait_for_confirmed_joint_enabled_mask(&observer, Some(0), Duration::from_millis(200));
         assert_eq!(observer.joint_enabled_mask_confirmed(), Some(0));
         assert!(observer.is_all_disabled_confirmed());
 
