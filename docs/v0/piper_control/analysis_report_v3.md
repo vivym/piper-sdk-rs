@@ -115,7 +115,7 @@
 ```rust
 impl MitController {
     pub fn park(mut self) -> Result<(), Error> {
-        // 移动到 rest_position...
+        // 如需回位，应由调用方先显式调用 move_to_rest()
         self.piper.disable()?;
         // ⚠️ 问题：self 被消耗，Piper 被 drop
         Ok(())
@@ -137,14 +137,14 @@ pub struct MitController {
 }
 
 impl MitController {
-    pub fn park(mut self) -> Result<Piper<Standby>, Error> {
+    pub fn park(mut self, config: DisableConfig) -> Result<Piper<Standby>, Error> {
         // 1. 安全提取 piper
         let piper = self.piper.take().expect("Piper should exist");
 
         // 2. park() 只负责 disable；显式回位应由 move_to_rest() 单独完成
 
         // 3. 切换到 Standby 状态
-        let piper_standby = piper.into_standby()?;
+        let piper_standby = piper.disable(config)?;
 
         // 4. 返还所有权
         Ok(piper_standby)
@@ -155,7 +155,7 @@ impl MitController {
 **用户收益**：
 ```rust
 // ✅ v3: 支持状态流转
-let piper_standby = controller.park()?;
+let piper_standby = controller.park(DisableConfig::default())?;
 let piper_position = piper_standby.into_position_mode()?;
 
 // 继续使用...
@@ -635,11 +635,11 @@ bins/
 
 ```rust
 // ✅ v3: 返还所有权，支持流转
-let piper_standby = controller.park()?;
+let piper_standby = controller.park(DisableConfig::default())?;
 let piper_position = piper_standby.into_position_mode()?;
 
-// ❌ v2: 直接消耗，无法继续
-controller.park()?;  // Piper 被 drop
+// ❌ v2: 直接消耗，无法继续流转
+let _ = controller.park(DisableConfig::default())?;  // 返还值被丢弃，无法继续使用 Piper
 ```
 
 ### 6.2 高精度循环

@@ -614,6 +614,9 @@ pub trait GripperController {
 
 ### 3.2 MIT 控制器实现
 
+> 历史设计说明：本节是早期控制器草案。当前运行时合同是 `rest_position` 仅作为显式回位目标；
+> 需要回位时先调用 `move_to_rest()`，再调用 `park()`；`park()` 和 `Drop` 都不执行任何隐式回位运动。
+
 ```rust
 // src/robot/controller/mit_controller.rs
 
@@ -763,10 +766,7 @@ impl<'a> JointPositionController for MitJointController<'a> {
             return Ok(());
         }
 
-        // 如需回到休息位置，应显式调用 move_to_rest()
-        if let Some(rest_pos) = self.rest_position {
-            let _ = self.move_to_position(&rest_pos, 0.1, Duration::from_secs(2));
-        }
+        // stop() 只负责停止控制；如需回到休息位置，应在 stop() 前显式调用 move_to_rest()
 
         // 放松关节
         self.relax_joints(Duration::from_secs(2))?;
@@ -814,7 +814,7 @@ impl<'a> JointPositionController for MitJointController<'a> {
 
 impl<'a> Drop for MitJointController<'a> {
     fn drop(&mut self) {
-        // 自动清理：返回休息位置并停止
+        // 自动清理：停止控制，不执行任何隐式回位运动
         let _ = self.stop();
     }
 }
@@ -919,10 +919,7 @@ impl<'a> JointPositionController for BuiltinJointController<'a> {
             return Ok(());
         }
 
-        // 如需回到休息位置，应显式调用 move_to_rest()
-        if let Some(rest_pos) = self.rest_position {
-            let _ = self.move_to_position(&rest_pos, 0.01, Duration::from_secs(3));
-        }
+        // stop() 只负责停止控制；如需回到休息位置，应在 stop() 前显式调用 move_to_rest()
 
         self.started = false;
         Ok(())

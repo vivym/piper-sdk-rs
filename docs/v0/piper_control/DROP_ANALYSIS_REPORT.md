@@ -38,7 +38,7 @@ impl Drop for MitController {
     fn drop(&mut self) {
         if let Some(piper) = self.piper.take() {
             // ⚠️ 不阻塞，只发送失能命令
-            // 如果需要移动到 rest_position，用户应该显式调用 park()
+            // 如果需要移动到 rest_position，用户应先显式调用 move_to_rest()，回位完成后再 park()
             let _ = piper.disable(DisableConfig::default());
             warn!("MitController dropped without park(). Motors disabled.");
         }
@@ -192,7 +192,8 @@ impl MitController {
     /// # use piper_client::state::*;
     /// let mut controller: MitController = ...;
     ///
-    /// // 方式 1：显式停车（推荐）
+    /// // 方式 1：如需回位，先显式回位，再显式停车（推荐）
+    /// let _reached_rest = controller.move_to_rest(Rad(0.01), Duration::from_secs(3))?;
     /// let piper_standby = controller.park(DisableConfig::default())?;
     ///
     /// // 方式 2：直接丢弃（触发 Drop 自动失能）

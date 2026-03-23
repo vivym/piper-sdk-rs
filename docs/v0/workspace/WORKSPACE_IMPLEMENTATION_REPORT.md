@@ -219,7 +219,7 @@ edition = "2024"  # ✅ 已升级到 Rust 2024
 **错误**:
 ```rust
 // ❌ 错误代码（第51行）
-let piper_standby = controller.park()?;
+let piper_standby = controller.park(DisableConfig::default())?;
 ```
 
 **问题**: `park()` 需要 `DisableConfig` 参数

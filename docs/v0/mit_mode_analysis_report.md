@@ -416,7 +416,7 @@ let threshold = JointArray::from([
 controller.move_to_position(&target, &threshold, Duration::from_secs(5))?;
 
 // 返回 Standby
-let robot = controller.park()?;
+let robot = controller.park(DisableConfig::default())?;
 ```
 
 ---
@@ -629,8 +629,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Relax joints
     controller.relax_joints()?;
 
-    // Park (return to Standby)
-    let robot = controller.park()?;
+    // Park (disable only, return to Standby)
+    let robot = controller.park(DisableConfig::default())?;
 
     Ok(())
 }

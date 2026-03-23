@@ -272,7 +272,7 @@ _MIN_KD_GAIN = 0.0
 **已实现**：
 - ✅ `MitController` 高层控制器
 - ✅ `move_to_position()` 阻塞式位置控制
-- ✅ `park()` 自动停车机制
+- ✅ `park()` 显式失能并返还 `Piper<Standby>`
 - ✅ 循环锚点机制（精确 200Hz）
 - ✅ 容错性（允许 5 帧丢帧）
 

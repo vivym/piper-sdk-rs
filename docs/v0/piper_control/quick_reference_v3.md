@@ -152,8 +152,9 @@ controller.move_to_position(
     Duration::from_secs(5.0),
 )?;
 
-// 显式停车（返还 Piper<Standby>）
-let piper_standby = controller.park()?;
+// 如需回位，先显式 move_to_rest()，再显式停车（只失能）
+let _reached_rest = controller.move_to_rest(Rad(0.01), Duration::from_secs(3))?;
+let piper_standby = controller.park(DisableConfig::default())?;
 ```
 
 ---
@@ -178,9 +179,10 @@ let piper_standby = controller.park()?;
 - [ ] **MitController (2-3 天)** ⚠️ **v3.2 锚点修正**
   - [ ] Option<Piper> 结构
   - [ ] `move_to_position()`（⚠️ **绝对时间锚点**）
-  - [ ] `park()`（返还 Piper<Standby>）
+  - [ ] `move_to_rest()`（显式回位）
+  - [ ] `park()`（只失能并返还 Piper<Standby>）
   - [ ] `relax_joints()`（软降级）
-  - [ ] `Drop`（Option 模式）
+  - [ ] `Drop`（bounded disable safety net）
   - [ ] 单元测试（⚠️ **频率测试**）
 
 - [ ] **ZeroingConfirmToken (0.5 天)**
