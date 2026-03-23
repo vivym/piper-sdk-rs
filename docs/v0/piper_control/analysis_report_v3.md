@@ -267,6 +267,12 @@ impl Drop for MitController {
 }
 ```
 
+**当前正确合同**：
+- `rest_position` 只是显式回位目标，不是析构配置
+- 如需回位，必须先显式调用 `move_to_rest(...)`
+- `park()` 只做 disable，并返还 `Piper<Standby>`
+- 非预期析构只剩 `Piper<Active>::drop()` 的 bounded disable safety net
+
 **用户反馈**：
 > "如果 `MitController` 包含其他需要清理的资源（比如 log handle、metrics channel），`forget` 会导致这些资源泄漏。采用 **Option Dance** 模式更符合 Rust 惯用法。"
 
@@ -486,6 +492,7 @@ impl MitController {
 > 历史说明：下面这段代码块描述的是 v3 文档中的过渡方案。
 > 当前运行时已经不再实现 `MitController::Drop`，如需回位必须显式调用
 > `move_to_rest(...)`，随后再 `park(DisableConfig::default())`。
+> 下方 `impl Drop for MitController` 仅保留为历史背景，不代表当前实现。
 >
 ```rust
 pub struct MitController {

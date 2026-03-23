@@ -1,5 +1,9 @@
 # MitController Drop 实现分析报告
 
+> 历史说明：这是一份 v0 设计分析文档。当前运行时已经落地“方案 C”，
+> 即移除 `MitController::Drop`，统一为显式 `move_to_rest(...)`（可选）
+> -> `park(DisableConfig::default())`，直接析构只触发 bounded disable safety net。
+
 **日期**: 2026-01-26
 **问题**: MitController 应该实现 Drop 吗？Piper 已经实现 Drop 了
 
@@ -285,35 +289,35 @@ let mut controller = MitController::new(piper, config)?;
 
 ## 🎯 总结
 
-| 方面 | 当前实现 | 推荐实现 |
+| 方面 | 历史实现 | 当前实现 |
 |------|----------|----------|
-| **Drop 实现** | ❌ MitController 有 Drop | ✅ 移除 Drop |
+| **Drop 实现** | ❌ MitController 有 Drop | ✅ 已移除 `MitController::Drop` |
 | **双重 Drop** | ❌ 是 | ✅ 否 |
 | **阻塞操作** | ❌ disable() 在 Drop 中 | ✅ 无阻塞 |
-| **失败处理** | ⚠️ Drop 中可能失败 | ✅ 无需处理 |
-| **park() 行为** | ✅ 返还 Piper<Standby> | ✅ 返还 Piper<Standby> |
-| **忘记 park()** | ⚠️ 阻塞 disable | ✅ 快速 disable |
+| **失败处理** | ⚠️ Drop 中可能失败 | ✅ 无需在 `MitController` 层处理 |
+| **park() 行为** | ✅ 返还 Piper<Standby> | ✅ disable-only，并返还 `Piper<Standby>` |
+| **忘记 park()** | ⚠️ 阻塞 disable | ✅ bounded disable safety net |
 | **最佳实践** | ❌ 违反 | ✅ 遵循 |
 
-### 最终结论
+### 当前结论
 
-**✅ 应该移除 MitController 的 Drop 实现**
+**✅ `MitController::Drop` 已在当前实现中移除**
 
-**理由**：
-1. ✅ 避免双重 drop
-2. ✅ 遵循 Rust Drop 最佳实践
-3. ✅ 简化代码，减少复杂性
-4. ✅ Option 模式已经提供了安全保证
-5. ✅ Piper 的 Drop 已经足够好
+**当前合同**：
+1. ✅ `rest_position` 只是显式回位目标
+2. ✅ 如需回位，先 `move_to_rest(...)`，再 `park(...)`
+3. ✅ `park()` 只做 disable，不执行回位
+4. ✅ `Piper<Active>::drop()` 只作为 bounded disable safety net
+5. ✅ 历史 Drop 方案仅保留为背景分析
 
 **保留**：
 - ✅ `park()` 方法（显式停车）
 - ✅ `Option<Piper>` 模式（安全提取）
-- ✅ Piper 的自动 Drop（安全网）
+- ✅ `Piper` 的自动 Drop 安全网
 
 ---
 
-**最后更新**: 2026-01-26
+**最后更新**: 2026-03-24
 **作者**: Claude (Anthropic)
 **版本**: 1.0
-**状态**: ✅ 推荐实施
+**状态**: ✅ 历史分析，当前实现已按方案 C 收敛
