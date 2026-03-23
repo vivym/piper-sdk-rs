@@ -1,6 +1,6 @@
 //! 状态结构并发测试
 //!
-//! 测试新状态结构在多线程环境下的并发安全性，特别是 `ArcSwap` 的 Wait-Free 特性。
+//! 测试新状态结构在多线程环境下的并发安全性，特别是热路径固定槽位快照的无锁读取特性。
 
 use piper_sdk::driver::*;
 use std::collections::HashSet;
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// 测试 `JointPositionState` 的并发读取
 ///
-/// 验证多个线程同时读取 `ArcSwap` 包装的状态时不会阻塞。
+/// 验证多个线程同时读取热路径监控快照时不会阻塞。
 #[test]
 fn test_joint_position_state_concurrent_read() {
     let ctx = Arc::new(PiperContext::new());
@@ -27,9 +27,7 @@ fn test_joint_position_state_concurrent_read() {
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer
-                .joint_position_monitor
-                .store(JointPositionMonitorSnapshot::from_complete(new_state));
+            ctx_writer.publish_joint_position(new_state);
             thread::yield_now();
         }
     });
@@ -41,7 +39,7 @@ fn test_joint_position_state_concurrent_read() {
         let handle = thread::spawn(move || {
             let mut last_timestamp = 0u64;
             for _ in 0..reads_per_thread {
-                let state = ctx_reader.joint_position_monitor.load();
+                let state = ctx_reader.capture_joint_position_monitor_snapshot();
                 // 验证状态是递增的（或至少不倒退太多）
                 if let Some(complete) = state.latest_complete()
                     && complete.hardware_timestamp_us >= last_timestamp
@@ -82,9 +80,7 @@ fn test_end_pose_state_concurrent_read() {
                 end_pose: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer
-                .end_pose_monitor
-                .store(EndPoseMonitorSnapshot::from_complete(new_state));
+            ctx_writer.publish_end_pose(new_state);
             thread::yield_now();
         }
     });
@@ -94,7 +90,7 @@ fn test_end_pose_state_concurrent_read() {
         let ctx_reader = ctx.clone();
         let handle = thread::spawn(move || {
             for _ in 0..reads_per_thread {
-                let state = ctx_reader.end_pose_monitor.load();
+                let state = ctx_reader.capture_end_pose_monitor_snapshot();
                 assert!(
                     state.latest_complete().map(|s| s.end_pose.len()) == Some(6)
                         || state.latest_complete().is_none()
@@ -388,7 +384,7 @@ fn test_collision_protection_state_concurrent_read() {
 
 /// 测试多个状态同时并发读取
 ///
-/// 验证多个 `ArcSwap` 包装的状态可以同时被多个线程读取，不会相互阻塞。
+/// 验证热路径快照与温数据状态可以同时被多个线程读取，不会相互阻塞。
 #[test]
 fn test_multiple_states_concurrent_read() {
     let ctx = Arc::new(PiperContext::new());
@@ -406,9 +402,7 @@ fn test_multiple_states_concurrent_read() {
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
-            ctx_writer
-                .joint_position_monitor
-                .store(JointPositionMonitorSnapshot::from_complete(new_joint_pos));
+            ctx_writer.publish_joint_position(new_joint_pos);
 
             // 更新 robot_control
             let new_robot_control = RobotControlState {
@@ -452,7 +446,7 @@ fn test_multiple_states_concurrent_read() {
         let handle = thread::spawn(move || {
             for _ in 0..reads_per_thread {
                 // 同时读取多个状态
-                let joint_pos = ctx_reader.joint_position_monitor.load();
+                let joint_pos = ctx_reader.capture_joint_position_monitor_snapshot();
                 let robot_control = ctx_reader.robot_control.load();
                 let gripper = ctx_reader.gripper.load();
 
@@ -498,7 +492,7 @@ fn test_no_deadlock() {
                 // 交替进行读写操作
                 if i % 2 == 0 {
                     // 读取操作
-                    let _ = ctx_clone.joint_position_monitor.load();
+                    let _ = ctx_clone.capture_joint_position_monitor_snapshot();
                     let _ = ctx_clone.robot_control.load();
                     let _ = ctx_clone.gripper.load();
                 } else {
@@ -509,9 +503,7 @@ fn test_no_deadlock() {
                         joint_pos: [counter as f64; 6],
                         frame_valid_mask: 0b111,
                     };
-                    ctx_clone
-                        .joint_position_monitor
-                        .store(JointPositionMonitorSnapshot::from_complete(new_state));
+                    ctx_clone.publish_joint_position(new_state);
                     counter += 1;
                 }
                 thread::yield_now();

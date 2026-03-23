@@ -160,6 +160,13 @@ fn maybe_wait_mode_switch_replay_barrier() {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct FaultLatchBarrier {
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StartupValidationDeadline {
     instant_deadline: Instant,
@@ -276,6 +283,8 @@ pub struct NormalSendGate {
     state: AtomicU8,
     epoch: AtomicU64,
     inflight_normal_sends: AtomicUsize,
+    #[cfg(test)]
+    fault_latch_barrier: Mutex<Option<FaultLatchBarrier>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +335,8 @@ impl NormalSendGate {
             state: AtomicU8::new(NormalSendGateState::Open as u8),
             epoch: AtomicU64::new(0),
             inflight_normal_sends: AtomicUsize::new(0),
+            #[cfg(test)]
+            fault_latch_barrier: Mutex::new(None),
         }
     }
 
@@ -388,6 +399,36 @@ impl NormalSendGate {
             self.set_state(NormalSendGateState::FaultClosed);
         }
     }
+
+    #[cfg(test)]
+    fn install_fault_latch_barrier(
+        &self,
+        reached_tx: std::sync::mpsc::Sender<()>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut guard =
+            self.fault_latch_barrier.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(FaultLatchBarrier {
+            reached_tx,
+            release_rx,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maybe_wait_test_fault_latch_barrier(&self) {
+        let barrier = self
+            .fault_latch_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.reached_tx.send(());
+            let _ = barrier.release_rx.recv();
+        }
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn maybe_wait_test_fault_latch_barrier(&self) {}
 
     pub(crate) fn close_for_stop(&self) {
         self.set_state(NormalSendGateState::StoppingClosed);
@@ -1785,8 +1826,8 @@ impl Piper {
     /// 包含关节速度和电流（独立帧 + Buffered Commit）。
     ///
     /// # 性能
-    /// - 无锁读取（ArcSwap::load）
-    /// - 返回快照副本（Clone 开销低，< 150 字节）
+    /// - 无锁读取（固定槽位快照单元）
+    /// - 返回快照副本（按值复制，< 150 字节）
     /// - 适合 500Hz 控制循环
     pub fn get_joint_dynamic(&self) -> JointDynamicState {
         self.get_joint_dynamic_monitor_snapshot()
@@ -1796,7 +1837,7 @@ impl Piper {
 
     /// 获取控制级关节动态状态。
     pub fn get_control_joint_dynamic(&self) -> JointDynamicState {
-        self.ctx.control_joint_dynamic.load()
+        self.ctx.capture_control_joint_dynamic()
     }
 
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
@@ -1814,8 +1855,8 @@ impl Piper {
     /// 包含6个关节的位置信息（500Hz更新）。
     ///
     /// # 性能
-    /// - 无锁读取（ArcSwap::load）
-    /// - 返回快照副本（Clone 开销低）
+    /// - 无锁读取（固定槽位快照单元）
+    /// - 返回快照副本（按值复制）
     /// - 适合 500Hz 控制循环
     ///
     /// # 注意
@@ -1841,8 +1882,8 @@ impl Piper {
     /// 包含末端执行器的位置和姿态信息（500Hz更新）。
     ///
     /// # 性能
-    /// - 无锁读取（ArcSwap::load）
-    /// - 返回快照副本（Clone 开销低）
+    /// - 无锁读取（固定槽位快照单元）
+    /// - 返回快照副本（按值复制）
     /// - 适合 500Hz 控制循环
     ///
     /// # 注意
@@ -1869,7 +1910,7 @@ impl Piper {
     /// 虽然这两个状态在硬件上不是同时更新的，但此方法保证逻辑上的原子性。
     ///
     /// # 性能
-    /// - 无锁读取（单次 ArcSwap::load）
+    /// - 无锁读取（单次固定槽位快照读取）
     /// - 返回快照副本
     /// - 适合需要同时使用关节位置和末端位姿的场景
     ///
@@ -2092,7 +2133,7 @@ impl Piper {
     /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内
     /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回状态数据
     pub fn get_aligned_motion(&self, max_time_diff_us: u64) -> AlignmentResult {
-        let joint_position = self.ctx.control_joint_position.load();
+        let joint_position = self.ctx.capture_control_joint_position();
         let joint_dynamic = self.get_control_joint_dynamic();
 
         let time_diff =
@@ -3292,10 +3333,10 @@ mod tests {
         piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
     }
 
-    fn install_fault_latch_barrier() -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    fn install_fault_latch_barrier(piper: &Piper) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        crate::pipeline::install_fault_latch_barrier(reached_tx, release_rx);
+        piper.normal_send_gate.install_fault_latch_barrier(reached_tx, release_rx);
         (reached_rx, release_tx)
     }
 
@@ -5771,7 +5812,7 @@ mod tests {
         );
         let reliable_frame = PiperFrame::new_standard(0x472, &[0x0A]);
         let realtime_frame = PiperFrame::new_standard(0x155, &[0x0B]);
-        let (reached_rx, release_tx) = install_fault_latch_barrier();
+        let (reached_rx, release_tx) = install_fault_latch_barrier(piper.as_ref());
 
         let piper_fault = Arc::clone(&piper);
         let fault_handle = std::thread::spawn(move || piper_fault.latch_fault());

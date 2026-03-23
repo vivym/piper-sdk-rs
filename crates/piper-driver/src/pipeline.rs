@@ -45,24 +45,8 @@ static TX_LOOP_DISPATCH_BARRIER: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
-#[derive(Debug)]
-struct FaultLatchBarrier {
-    reached_tx: std::sync::mpsc::Sender<()>,
-    release_rx: std::sync::mpsc::Receiver<()>,
-}
-
-#[cfg(test)]
-static FAULT_LATCH_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<FaultLatchBarrier>>> =
-    std::sync::OnceLock::new();
-
-#[cfg(test)]
 fn tx_loop_dispatch_barrier_slot() -> &'static std::sync::Mutex<Option<TxLoopDispatchBarrier>> {
     TX_LOOP_DISPATCH_BARRIER.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-fn fault_latch_barrier_slot() -> &'static std::sync::Mutex<Option<FaultLatchBarrier>> {
-    FAULT_LATCH_BARRIER.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 #[cfg(test)]
@@ -80,34 +64,8 @@ pub(crate) fn install_tx_loop_dispatch_barrier(
 }
 
 #[cfg(test)]
-pub(crate) fn install_fault_latch_barrier(
-    reached_tx: std::sync::mpsc::Sender<()>,
-    release_rx: std::sync::mpsc::Receiver<()>,
-) {
-    let mut guard = fault_latch_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some(FaultLatchBarrier {
-        reached_tx,
-        release_rx,
-    });
-}
-
-#[cfg(test)]
 fn maybe_wait_tx_loop_dispatch_barrier() {
     let barrier = tx_loop_dispatch_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(barrier) = barrier {
-        let _ = barrier.reached_tx.send(());
-        let _ = barrier.release_rx.recv();
-    }
-}
-
-#[cfg(test)]
-fn maybe_wait_fault_latch_barrier() {
-    let barrier = fault_latch_barrier_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
@@ -138,8 +96,7 @@ pub(crate) fn latch_runtime_fault_state(
 ) -> RuntimePhase {
     record_fault(last_fault, fault);
     normal_send_gate.close_for_fault();
-    #[cfg(test)]
-    maybe_wait_fault_latch_barrier();
+    normal_send_gate.maybe_wait_test_fault_latch_barrier();
 
     let mut previous = load_runtime_phase(runtime_phase);
     while previous == RuntimePhase::Running {
@@ -3164,7 +3121,7 @@ mod tests {
 
         // 验证状态已更新（由于需要完整帧组，可能需要多次迭代）
         // 至少验证可以正常处理帧而不崩溃
-        let joint_pos = ctx.joint_position_monitor.load();
+        let joint_pos = ctx.capture_joint_position_monitor_snapshot();
         // 如果帧组完整，应该有时间戳更新
         // 但由于异步性，可能需要多次尝试或调整测试策略
         assert!(joint_pos.latest_complete().is_none_or(|state| {
@@ -3636,7 +3593,10 @@ mod tests {
             ctx.capture_joint_position_monitor_snapshot().latest_complete().is_some(),
             "monitor-complete snapshot should still be published"
         );
-        assert_eq!(ctx.control_joint_position.load().hardware_timestamp_us, 0);
+        assert_eq!(
+            ctx.capture_control_joint_position().hardware_timestamp_us,
+            0
+        );
         assert_eq!(
             metrics.rx_joint_position_control_grade_rejected_total.load(Ordering::Relaxed),
             1

@@ -6,7 +6,7 @@
 //! # 设计目标
 //!
 //! - **零延迟**: 直接从 `driver::Piper` 读取，无缓存层
-//! - **零拷贝**: 使用 ArcSwap 的 wait-free 读取
+//! - **低开销读取**: 热路径走固定槽位快照，温路径走 ArcSwap 无锁读取
 //! - **类型安全**: 返回强类型单位（Rad, RadPerSecond, NewtonMeter）
 //! - **控制安全**: 提供 `control_snapshot()`，只返回对齐且新鲜的控制状态
 //!

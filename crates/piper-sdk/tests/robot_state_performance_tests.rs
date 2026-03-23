@@ -2,8 +2,8 @@
 //!
 //! 测试新状态结构的性能指标，包括：
 //! - 内存占用对比（位掩码优化效果）
-//! - 读取延迟（ArcSwap vs RwLock）
-//! - 写入延迟（ArcSwap vs RwLock）
+//! - 热路径快照读取延迟（固定槽位快照 vs RwLock）
+//! - 热路径快照写入延迟（固定槽位快照 vs RwLock）
 
 use piper_sdk::driver::*;
 use std::sync::Arc;
@@ -95,26 +95,26 @@ fn test_state_struct_sizes() {
     );
 }
 
-/// 测试 ArcSwap 读取延迟
+/// 测试热路径快照读取延迟
 #[test]
-fn test_arcswap_read_latency() {
+fn test_hot_snapshot_read_latency() {
     let ctx = Arc::new(PiperContext::new());
     let iterations = 1_000_000;
 
     // 预热
     for _ in 0..1000 {
-        let _ = ctx.joint_position_monitor.load();
+        let _ = ctx.capture_joint_position_monitor_snapshot();
     }
 
     // 测试读取延迟
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = ctx.joint_position_monitor.load();
+        let _ = ctx.capture_joint_position_monitor_snapshot();
     }
     let elapsed = start.elapsed();
 
     let avg_ns = elapsed.as_nanos() / iterations as u128;
-    println!("\n=== ArcSwap 读取延迟 ===");
+    println!("\n=== 热路径快照读取延迟 ===");
     println!("迭代次数: {}", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns", avg_ns);
@@ -122,12 +122,11 @@ fn test_arcswap_read_latency() {
         println!("检测到CI环境，使用放宽的阈值");
     }
 
-    // ArcSwap::load() 应该是纳秒级的（通常 < 100ns）
-    // 在CI环境中，阈值会放宽
+    // 固定槽位快照读取应该是纳秒级的。
     let threshold = adjust_threshold_ns(1000);
     assert!(
         avg_ns < threshold,
-        "ArcSwap 读取延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        "热路径快照读取延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
         threshold,
         avg_ns
     );
@@ -135,7 +134,7 @@ fn test_arcswap_read_latency() {
 
 /// 测试热路径快照写入延迟
 #[test]
-fn test_arcswap_write_latency() {
+fn test_hot_snapshot_write_latency() {
     let ctx = Arc::new(PiperContext::new());
     let iterations = 100_000;
 
@@ -147,8 +146,7 @@ fn test_arcswap_write_latency() {
         frame_valid_mask: 0b111,
     };
     for _ in 0..1000 {
-        ctx.joint_position_monitor
-            .store(JointPositionMonitorSnapshot::from_complete(initial_state));
+        ctx.publish_joint_position(initial_state);
     }
 
     // 测试写入延迟
@@ -160,13 +158,12 @@ fn test_arcswap_write_latency() {
             joint_pos: [i as f64; 6],
             frame_valid_mask: 0b111,
         };
-        ctx.joint_position_monitor
-            .store(JointPositionMonitorSnapshot::from_complete(new_state));
+        ctx.publish_joint_position(new_state);
     }
     let elapsed = start.elapsed();
 
     let avg_ns = elapsed.as_nanos() / iterations as u128;
-    println!("\n=== ArcSwap 写入延迟 ===");
+    println!("\n=== 热路径快照写入延迟 ===");
     println!("迭代次数: {}", iterations);
     println!("总耗时: {:?}", elapsed);
     println!("平均延迟: {} ns", avg_ns);
@@ -174,12 +171,11 @@ fn test_arcswap_write_latency() {
         println!("检测到CI环境，使用放宽的阈值");
     }
 
-    // ArcSwap::store() 应该是纳秒级的（通常 < 200ns）
-    // 在CI环境中，阈值会放宽
+    // 固定槽位快照发布应该仍然是纳秒级的。
     let threshold = adjust_threshold_ns(2000);
     assert!(
         avg_ns < threshold,
-        "ArcSwap 写入延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
+        "热路径快照写入延迟应该小于 {}ns (CI环境已放宽), 实际: {}ns",
         threshold,
         avg_ns
     );
@@ -212,7 +208,7 @@ fn test_rwlock_read_latency() {
         println!("检测到CI环境，使用放宽的阈值");
     }
 
-    // RwLock::read() 通常比 ArcSwap::load() 稍慢，但应该仍然很快
+    // RwLock::read() 通常比热路径快照读取稍慢，但应该仍然很快。
     // 在CI环境中，阈值会放宽
     let threshold = adjust_threshold_ns(2000);
     assert!(
@@ -256,7 +252,7 @@ fn test_rwlock_write_latency() {
         println!("检测到CI环境，使用放宽的阈值");
     }
 
-    // RwLock::write() 通常比 ArcSwap::store() 稍慢
+    // RwLock::write() 通常比热路径快照发布稍慢。
     // 在CI环境中，阈值会放宽
     let threshold = adjust_threshold_ns(5000);
     assert!(
@@ -424,7 +420,7 @@ fn test_multiple_states_read_performance() {
 
     // 预热
     for _ in 0..1000 {
-        let _ = ctx.joint_position_monitor.load();
+        let _ = ctx.capture_joint_position_monitor_snapshot();
         let _ = ctx.robot_control.load();
         let _ = ctx.gripper.load();
         let _ = ctx.joint_driver_low_speed.load();
@@ -433,7 +429,7 @@ fn test_multiple_states_read_performance() {
     // 测试多个状态同时读取的性能
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = ctx.joint_position_monitor.load();
+        let _ = ctx.capture_joint_position_monitor_snapshot();
         let _ = ctx.robot_control.load();
         let _ = ctx.gripper.load();
         let _ = ctx.joint_driver_low_speed.load();

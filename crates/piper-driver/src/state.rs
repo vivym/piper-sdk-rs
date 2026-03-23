@@ -19,15 +19,14 @@ use std::sync::{Arc, RwLock};
 /// - 只有单个写线程调用 `store()`
 /// - 写者只会写入 `reader_count == 0` 的非已发布槽位
 /// - 读者在持有 reader count 期间，写者不会复用该槽位
-#[doc(hidden)]
-pub struct RealtimeSnapshotCell<T: Copy + Default, const N: usize = 3> {
+struct RealtimeSnapshotCell<T: Copy + Default, const N: usize = 3> {
     slots: [UnsafeCell<T>; N],
     reader_counts: [AtomicUsize; N],
     published_slot: AtomicUsize,
 }
 
 impl<T: Copy + Default, const N: usize> RealtimeSnapshotCell<T, N> {
-    pub fn new(initial: T) -> Self {
+    fn new(initial: T) -> Self {
         assert!(N >= 3, "RealtimeSnapshotCell requires at least 3 slots");
         Self {
             slots: std::array::from_fn(|_| UnsafeCell::new(initial)),
@@ -36,7 +35,7 @@ impl<T: Copy + Default, const N: usize> RealtimeSnapshotCell<T, N> {
         }
     }
 
-    pub fn load(&self) -> T {
+    fn load(&self) -> T {
         loop {
             let slot = self.published_slot.load(Ordering::Acquire);
             self.reader_counts[slot].fetch_add(1, Ordering::AcqRel);
@@ -56,7 +55,7 @@ impl<T: Copy + Default, const N: usize> RealtimeSnapshotCell<T, N> {
         }
     }
 
-    pub fn store(&self, value: T) {
+    fn store(&self, value: T) {
         loop {
             let published = self.published_slot.load(Ordering::Acquire);
 
@@ -1156,19 +1155,19 @@ pub struct PiperContext {
     // === 热数据（500Hz，高频运动数据）===
     // 使用固定槽位快照，无锁读取，适合高频控制循环
     /// 关节位置监控快照（完整监控 + raw 诊断，共享一次原子发布）
-    pub joint_position_monitor: Arc<RealtimeSnapshotCell<JointPositionMonitorSnapshot>>,
+    joint_position_monitor: Arc<RealtimeSnapshotCell<JointPositionMonitorSnapshot>>,
     /// 末端位姿监控快照（完整监控 + raw 诊断，共享一次原子发布）
-    pub end_pose_monitor: Arc<RealtimeSnapshotCell<EndPoseMonitorSnapshot>>,
+    end_pose_monitor: Arc<RealtimeSnapshotCell<EndPoseMonitorSnapshot>>,
     /// 完整监控运动状态快照（单次 load 保证逻辑原子）
-    pub motion_snapshot: Arc<RealtimeSnapshotCell<MotionSnapshot>>,
+    motion_snapshot: Arc<RealtimeSnapshotCell<MotionSnapshot>>,
     /// 控制级关节位置状态（完整帧组 + 对齐跨度约束）
-    pub control_joint_position: Arc<RealtimeSnapshotCell<JointPositionState>>,
+    control_joint_position: Arc<RealtimeSnapshotCell<JointPositionState>>,
     /// 关节动态监控快照（完整监控 + raw 诊断，共享一次原子发布）
-    pub joint_dynamic_monitor: Arc<RealtimeSnapshotCell<JointDynamicMonitorSnapshot>>,
+    joint_dynamic_monitor: Arc<RealtimeSnapshotCell<JointDynamicMonitorSnapshot>>,
     /// 控制级关节动态状态（完整 6 关节组 + 组内跨度约束）
-    pub control_joint_dynamic: Arc<RealtimeSnapshotCell<JointDynamicState>>,
+    control_joint_dynamic: Arc<RealtimeSnapshotCell<JointDynamicState>>,
     /// 原始运动状态快照（单次 load 保证逻辑原子）
-    pub raw_motion_snapshot: Arc<RealtimeSnapshotCell<MotionSnapshot>>,
+    raw_motion_snapshot: Arc<RealtimeSnapshotCell<MotionSnapshot>>,
 
     // === 温数据（200Hz，控制状态）===
     // 使用 ArcSwap，更新频率中等，但需要原子性
@@ -1274,7 +1273,7 @@ impl PiperContext {
     /// use piper_driver::PiperContext;
     ///
     /// let ctx = PiperContext::new();
-    /// let joint_pos = ctx.joint_position_monitor.load();
+    /// let joint_pos = ctx.capture_joint_position_monitor_snapshot();
     /// assert!(joint_pos.latest_complete().is_none());
     /// ```
     pub fn new() -> Self {
@@ -1393,6 +1392,14 @@ impl PiperContext {
     /// 捕获原始运动状态快照（允许部分帧组，仅供诊断）
     pub fn capture_raw_motion_snapshot(&self) -> MotionSnapshot {
         self.raw_motion_snapshot.load()
+    }
+
+    pub(crate) fn capture_control_joint_position(&self) -> JointPositionState {
+        self.control_joint_position.load()
+    }
+
+    pub(crate) fn capture_control_joint_dynamic(&self) -> JointDynamicState {
+        self.control_joint_dynamic.load()
     }
 
     /// 发布新的关节位置完整监控快照，并与当前末端位姿组合成逻辑原子快照。
@@ -1803,16 +1810,16 @@ mod tests {
     #[test]
     fn test_piper_context_new() {
         let ctx = PiperContext::new();
-        // 验证所有 Arc/ArcSwap 都已初始化
-        let joint_pos = ctx.joint_position_monitor.load();
+        // 验证热路径快照、温数据和冷数据都已初始化
+        let joint_pos = ctx.capture_joint_position_monitor_snapshot();
         assert!(joint_pos.latest_complete().is_none());
         assert_eq!(joint_pos.latest_raw().hardware_timestamp_us, 0);
 
-        let end_pose = ctx.end_pose_monitor.load();
+        let end_pose = ctx.capture_end_pose_monitor_snapshot();
         assert!(end_pose.latest_complete().is_none());
         assert_eq!(end_pose.latest_raw().hardware_timestamp_us, 0);
 
-        let joint_dynamic = ctx.joint_dynamic_monitor.load();
+        let joint_dynamic = ctx.capture_joint_dynamic_monitor_snapshot();
         assert!(joint_dynamic.latest_complete().is_none());
         assert_eq!(joint_dynamic.latest_raw().group_timestamp_us, 0);
 
@@ -2199,11 +2206,11 @@ mod tests {
         let ctx = PiperContext::new();
 
         // 验证新状态字段存在且为默认值
-        let joint_pos = ctx.joint_position_monitor.load();
+        let joint_pos = ctx.capture_joint_position_monitor_snapshot();
         assert!(joint_pos.latest_complete().is_none());
         assert_eq!(joint_pos.latest_raw().hardware_timestamp_us, 0);
 
-        let end_pose = ctx.end_pose_monitor.load();
+        let end_pose = ctx.capture_end_pose_monitor_snapshot();
         assert!(end_pose.latest_complete().is_none());
         assert_eq!(end_pose.latest_raw().hardware_timestamp_us, 0);
     }
@@ -2337,10 +2344,13 @@ mod tests {
         ctx.publish_control_joint_position(joint_position);
         ctx.publish_control_joint_dynamic(joint_dynamic);
 
-        assert_eq!(ctx.control_joint_position.load().hardware_timestamp_us, 42);
-        assert_eq!(ctx.control_joint_position.load().frame_valid_mask, 0b111);
-        assert_eq!(ctx.control_joint_dynamic.load().group_timestamp_us, 84);
-        assert_eq!(ctx.control_joint_dynamic.load().valid_mask, 0b11_1111);
+        assert_eq!(
+            ctx.capture_control_joint_position().hardware_timestamp_us,
+            42
+        );
+        assert_eq!(ctx.capture_control_joint_position().frame_valid_mask, 0b111);
+        assert_eq!(ctx.capture_control_joint_dynamic().group_timestamp_us, 84);
+        assert_eq!(ctx.capture_control_joint_dynamic().valid_mask, 0b11_1111);
     }
 
     #[test]
