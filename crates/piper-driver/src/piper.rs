@@ -76,6 +76,7 @@ pub enum RuntimeFaultKind {
     RxExited = 1,
     TxExited = 2,
     TransportError = 3,
+    ManualFault = 4,
 }
 
 impl RuntimeFaultKind {
@@ -84,6 +85,7 @@ impl RuntimeFaultKind {
             1 => Some(Self::RxExited),
             2 => Some(Self::TxExited),
             3 => Some(Self::TransportError),
+            4 => Some(Self::ManualFault),
             _ => None,
         }
     }
@@ -1368,17 +1370,8 @@ impl Piper {
         RuntimePhase::from_raw(self.runtime_phase.load(Ordering::Acquire))
     }
 
-    fn record_runtime_fault_once(&self, fault: RuntimeFaultKind) {
-        let _ = self.runtime_fault.compare_exchange(
-            0,
-            fault as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
     fn normal_control_open(&self) -> bool {
-        self.runtime_phase() == RuntimePhase::Running
+        self.runtime_phase() == RuntimePhase::Running && self.rx_thread_alive()
     }
 
     fn replay_mode_active(&self) -> bool {
@@ -1705,27 +1698,39 @@ impl Piper {
         self.runtime_phase() == RuntimePhase::Running
     }
 
-    /// 锁存故障并关闭正常控制路径。
+    /// 锁存手动故障并关闭正常控制路径。
     ///
     /// 进入故障锁存后：
     /// - 新的 realtime / normal reliable 控制命令会被拒绝
     /// - TX 线程会主动清空 pending realtime slot 和 normal reliable queue
     /// - shutdown lane 仍然保持可用，用于 bounded stop attempt
+    /// - `health().fault` 会稳定返回 `Some(RuntimeFaultKind::ManualFault)`
     pub fn latch_fault(&self) {
-        let previous = RuntimePhase::from_raw(
-            self.runtime_phase.swap(RuntimePhase::FaultLatched as u8, Ordering::AcqRel),
+        let previous = latch_runtime_fault_state(
+            &self.runtime_phase,
+            &self.normal_send_gate,
+            &self.runtime_fault,
+            RuntimeFaultKind::ManualFault,
         );
         if previous == RuntimePhase::Stopping {
             return;
         }
-        self.normal_send_gate.close_for_fault();
         self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
         let _ = self.maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
     }
 
     fn latch_fault_with_kind(&self, fault: RuntimeFaultKind) {
-        self.record_runtime_fault_once(fault);
-        self.latch_fault();
+        let previous = latch_runtime_fault_state(
+            &self.runtime_phase,
+            &self.normal_send_gate,
+            &self.runtime_fault,
+            fault,
+        );
+        if previous == RuntimePhase::Stopping {
+            return;
+        }
+        self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
+        let _ = self.maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
     }
 
     /// 请求 worker 停止并关闭所有命令通路。
@@ -2971,6 +2976,7 @@ impl Piper {
     #[doc(hidden)]
     pub fn maintenance_runtime_open(&self) -> bool {
         self.runtime_phase() == RuntimePhase::Running
+            && self.rx_thread_alive()
             && !self.replay_mode_active()
             && !self.replay_barrier_active()
     }
@@ -3178,6 +3184,13 @@ mod tests {
         (reached_rx, release_tx)
     }
 
+    fn install_fault_latch_barrier() -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        crate::pipeline::install_fault_latch_barrier(reached_tx, release_rx);
+        (reached_rx, release_tx)
+    }
+
     fn install_mode_switch_barrier() -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -3348,6 +3361,14 @@ mod tests {
                 return Err(CanError::BufferOverflow);
             }
             Err(CanError::Timeout)
+        }
+    }
+
+    struct PanickingRxAdapter;
+
+    impl piper_can::RxAdapter for PanickingRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            panic!("rx panic injected by test");
         }
     }
 
@@ -5539,7 +5560,17 @@ mod tests {
         let stop_frame = PiperFrame::new_standard(0x471, &[0x09]);
 
         piper.latch_fault();
+        let health = piper.health();
 
+        assert_eq!(health.fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
         assert!(matches!(
             piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01])),
             Err(DriverError::ControlPathClosed)
@@ -5558,6 +5589,81 @@ mod tests {
         assert_eq!(metrics.tx_shutdown_requests_total, 1);
         assert_eq!(metrics.tx_shutdown_sent_total, 1);
         assert_eq!(metrics.tx_frames_sent_total, 1);
+    }
+
+    #[test]
+    fn test_fault_latch_barrier_prevents_new_normal_sends_after_gate_closes() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let reliable_frame = PiperFrame::new_standard(0x472, &[0x0A]);
+        let realtime_frame = PiperFrame::new_standard(0x155, &[0x0B]);
+        let (reached_rx, release_tx) = install_fault_latch_barrier();
+
+        let piper_fault = Arc::clone(&piper);
+        let fault_handle = std::thread::spawn(move || piper_fault.latch_fault());
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("fault latch should close the normal gate before publishing the phase");
+
+        assert!(matches!(
+            piper.normal_send_gate.acquire_normal(),
+            Err(NormalSendGateDenyReason::FaultClosed)
+        ));
+
+        let piper_reliable = Arc::clone(&piper);
+        let reliable_handle = std::thread::spawn(move || {
+            piper_reliable
+                .send_reliable_package_confirmed([reliable_frame], Duration::from_millis(200))
+        });
+        let piper_realtime = Arc::clone(&piper);
+        let realtime_handle = std::thread::spawn(move || {
+            piper_realtime
+                .send_realtime_package_confirmed([realtime_frame], Duration::from_millis(200))
+        });
+
+        let _ = release_tx.send(());
+        fault_handle.join().expect("fault latch thread should finish cleanly");
+
+        let reliable_error = reliable_handle
+            .join()
+            .expect("reliable sender thread should finish")
+            .expect_err("reliable command must not be sent once fault latch closes the gate");
+        assert!(matches!(
+            reliable_error,
+            DriverError::CommandAbortedByFault | DriverError::ControlPathClosed
+        ));
+
+        let realtime_error = realtime_handle
+            .join()
+            .expect("realtime sender thread should finish")
+            .expect_err("realtime command must not be sent once fault latch closes the gate");
+        assert!(matches!(
+            realtime_error,
+            DriverError::CommandAbortedByFault
+                | DriverError::ControlPathClosed
+                | DriverError::RealtimeDeliveryAbortedByFault { sent: 0, total: 1 }
+        ));
+
+        std::thread::sleep(Duration::from_millis(20));
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert!(
+            sent.is_empty(),
+            "no new normal frame may enter tx.send_control once the fault latch closes the gate",
+        );
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
     }
 
     #[test]
@@ -5596,6 +5702,32 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[stop_frame]);
+    }
+
+    #[test]
+    fn test_rx_panic_closes_normal_control_front_door() {
+        let piper =
+            Piper::new_dual_thread_parts_unvalidated(PanickingRxAdapter, MockTxAdapter, None)
+                .unwrap();
+
+        wait_until(
+            Duration::from_millis(200),
+            || !piper.health().rx_alive,
+            "RX panic should make the RX worker appear dead",
+        );
+
+        let health = piper.health();
+        assert!(!health.rx_alive);
+        assert_eq!(health.fault, Some(RuntimeFaultKind::RxExited));
+        assert!(matches!(
+            piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01])),
+            Err(DriverError::ControlPathClosed)
+        ));
+        assert!(matches!(
+            piper.send_reliable(PiperFrame::new_standard(0x472, &[0x02])),
+            Err(DriverError::ControlPathClosed)
+        ));
+        assert!(!piper.maintenance_runtime_open());
     }
 
     #[test]

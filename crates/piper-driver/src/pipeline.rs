@@ -45,8 +45,24 @@ static TX_LOOP_DISPATCH_BARRIER: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
+#[derive(Debug)]
+struct FaultLatchBarrier {
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static FAULT_LATCH_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<FaultLatchBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
 fn tx_loop_dispatch_barrier_slot() -> &'static std::sync::Mutex<Option<TxLoopDispatchBarrier>> {
     TX_LOOP_DISPATCH_BARRIER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn fault_latch_barrier_slot() -> &'static std::sync::Mutex<Option<FaultLatchBarrier>> {
+    FAULT_LATCH_BARRIER.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 #[cfg(test)]
@@ -64,8 +80,34 @@ pub(crate) fn install_tx_loop_dispatch_barrier(
 }
 
 #[cfg(test)]
+pub(crate) fn install_fault_latch_barrier(
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+) {
+    let mut guard = fault_latch_barrier_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(FaultLatchBarrier {
+        reached_tx,
+        release_rx,
+    });
+}
+
+#[cfg(test)]
 fn maybe_wait_tx_loop_dispatch_barrier() {
     let barrier = tx_loop_dispatch_barrier_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(barrier) = barrier {
+        let _ = barrier.reached_tx.send(());
+        let _ = barrier.release_rx.recv();
+    }
+}
+
+#[cfg(test)]
+fn maybe_wait_fault_latch_barrier() {
+    let barrier = fault_latch_barrier_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
@@ -88,28 +130,42 @@ fn load_runtime_phase(slot: &AtomicU8) -> RuntimePhase {
     RuntimePhase::from_raw(slot.load(Ordering::Acquire))
 }
 
-fn store_runtime_phase(slot: &AtomicU8, phase: RuntimePhase) {
-    slot.store(phase as u8, Ordering::Release);
-}
-
-fn latch_transport_fault(
+pub(crate) fn latch_runtime_fault_state(
     runtime_phase: &Arc<AtomicU8>,
     normal_send_gate: &Arc<NormalSendGate>,
     last_fault: &Arc<AtomicU8>,
-) {
-    record_fault(last_fault, RuntimeFaultKind::TransportError);
-    store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
+    fault: RuntimeFaultKind,
+) -> RuntimePhase {
+    record_fault(last_fault, fault);
     normal_send_gate.close_for_fault();
+    #[cfg(test)]
+    maybe_wait_fault_latch_barrier();
+
+    let mut previous = load_runtime_phase(runtime_phase);
+    while previous == RuntimePhase::Running {
+        match runtime_phase.compare_exchange(
+            RuntimePhase::Running as u8,
+            RuntimePhase::FaultLatched as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return RuntimePhase::Running,
+            Err(observed) => previous = RuntimePhase::from_raw(observed),
+        }
+    }
+
+    previous
 }
 
-fn latch_transport_fault_with_maintenance(
+fn latch_runtime_fault_with_maintenance(
     runtime_phase: &Arc<AtomicU8>,
     normal_send_gate: &Arc<NormalSendGate>,
     last_fault: &Arc<AtomicU8>,
+    fault: RuntimeFaultKind,
     maintenance_gate: &Arc<MaintenanceGate>,
     maintenance_tx_state: Option<&mut MaintenanceTxState>,
 ) {
-    latch_transport_fault(runtime_phase, normal_send_gate, last_fault);
+    let _ = latch_runtime_fault_state(runtime_phase, normal_send_gate, last_fault, fault);
 
     if let Some(maintenance_tx_state) = maintenance_tx_state {
         refresh_local_maintenance_tx_state(
@@ -157,10 +213,11 @@ fn record_soft_deadline_miss(
     }
     *soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
     if *soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
-        latch_transport_fault_with_maintenance(
+        latch_runtime_fault_with_maintenance(
             runtime_phase,
             normal_send_gate,
             last_fault,
+            RuntimeFaultKind::TransportError,
             maintenance_gate,
             Some(maintenance_tx_state),
         );
@@ -274,11 +331,7 @@ fn derive_maintenance_gate_state(
 ) -> MaintenanceGateState {
     let phase = load_runtime_phase(runtime_phase);
     if phase == RuntimePhase::FaultLatched {
-        return if last_fault.load(Ordering::Acquire) != 0 {
-            MaintenanceGateState::DeniedFaulted
-        } else {
-            MaintenanceGateState::DeniedTransportDown
-        };
+        return MaintenanceGateState::DeniedFaulted;
     }
     if phase != RuntimePhase::Running {
         return MaintenanceGateState::DeniedTransportDown;
@@ -1177,10 +1230,11 @@ pub fn rx_loop(
 
                 if is_fatal {
                     error!("RX thread: Fatal error detected, latching runtime fault");
-                    latch_transport_fault_with_maintenance(
+                    latch_runtime_fault_with_maintenance(
                         &runtime_phase,
                         &normal_send_gate,
                         &last_fault,
+                        RuntimeFaultKind::TransportError,
                         &maintenance_gate,
                         None,
                     );
@@ -1236,8 +1290,14 @@ pub fn rx_loop(
     if workers_running.load(Ordering::Acquire)
         && load_runtime_phase(&runtime_phase) == RuntimePhase::Running
     {
-        record_fault(&last_fault, RuntimeFaultKind::RxExited);
-        let _ = maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
+        latch_runtime_fault_with_maintenance(
+            &runtime_phase,
+            &normal_send_gate,
+            &last_fault,
+            RuntimeFaultKind::RxExited,
+            &maintenance_gate,
+            None,
+        );
     }
     trace!("RX thread: loop exited");
 }
@@ -1370,10 +1430,11 @@ pub fn tx_loop_mailbox(
                         }
                         soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
                         if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
-                            latch_transport_fault_with_maintenance(
+                            latch_runtime_fault_with_maintenance(
                                 &runtime_phase,
                                 &normal_send_gate,
                                 &last_fault,
+                                RuntimeFaultKind::TransportError,
                                 &maintenance_gate,
                                 Some(&mut maintenance_tx_state),
                             );
@@ -1387,10 +1448,11 @@ pub fn tx_loop_mailbox(
                         } else {
                             metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                         }
-                        latch_transport_fault_with_maintenance(
+                        latch_runtime_fault_with_maintenance(
                             &runtime_phase,
                             &normal_send_gate,
                             &last_fault,
+                            RuntimeFaultKind::TransportError,
                             &maintenance_gate,
                             Some(&mut maintenance_tx_state),
                         );
@@ -1515,10 +1577,11 @@ pub fn tx_loop_mailbox(
                         } else {
                             metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                         }
-                        latch_transport_fault_with_maintenance(
+                        latch_runtime_fault_with_maintenance(
                             &runtime_phase,
                             &normal_send_gate,
                             &last_fault,
+                            RuntimeFaultKind::TransportError,
                             &maintenance_gate,
                             Some(&mut maintenance_tx_state),
                         );
@@ -1603,10 +1666,11 @@ pub fn tx_loop_mailbox(
                         deadline_missed = true;
                         send_result = Err(crate::DriverError::Timeout);
                     } else {
-                        latch_transport_fault_with_maintenance(
+                        latch_runtime_fault_with_maintenance(
                             &runtime_phase,
                             &normal_send_gate,
                             &last_fault,
+                            RuntimeFaultKind::TransportError,
                             &maintenance_gate,
                             Some(&mut maintenance_tx_state),
                         );
@@ -1633,10 +1697,11 @@ pub fn tx_loop_mailbox(
                             deadline_missed = true;
                             send_result = Err(crate::DriverError::Timeout);
                         } else {
-                            latch_transport_fault_with_maintenance(
+                            latch_runtime_fault_with_maintenance(
                                 &runtime_phase,
                                 &normal_send_gate,
                                 &last_fault,
+                                RuntimeFaultKind::TransportError,
                                 &maintenance_gate,
                                 Some(&mut maintenance_tx_state),
                             );
@@ -1654,10 +1719,11 @@ pub fn tx_loop_mailbox(
                             sent_count, e
                         );
                         metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                        latch_transport_fault_with_maintenance(
+                        latch_runtime_fault_with_maintenance(
                             &runtime_phase,
                             &normal_send_gate,
                             &last_fault,
+                            RuntimeFaultKind::TransportError,
                             &maintenance_gate,
                             Some(&mut maintenance_tx_state),
                         );
@@ -1786,10 +1852,11 @@ pub fn tx_loop_mailbox(
                                 total: total_frames,
                             });
                             if backend_capability.is_strict_realtime() {
-                                latch_transport_fault_with_maintenance(
+                                latch_runtime_fault_with_maintenance(
                                     &runtime_phase,
                                     &normal_send_gate,
                                     &last_fault,
+                                    RuntimeFaultKind::TransportError,
                                     &maintenance_gate,
                                     Some(&mut maintenance_tx_state),
                                 );
@@ -1799,10 +1866,11 @@ pub fn tx_loop_mailbox(
                             deadline_missed = true;
                             send_result = Err(crate::DriverError::Timeout);
                         } else {
-                            latch_transport_fault_with_maintenance(
+                            latch_runtime_fault_with_maintenance(
                                 &runtime_phase,
                                 &normal_send_gate,
                                 &last_fault,
+                                RuntimeFaultKind::TransportError,
                                 &maintenance_gate,
                                 Some(&mut maintenance_tx_state),
                             );
@@ -1819,10 +1887,11 @@ pub fn tx_loop_mailbox(
                             sent_count, e
                         );
                         metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                        latch_transport_fault_with_maintenance(
+                        latch_runtime_fault_with_maintenance(
                             &runtime_phase,
                             &normal_send_gate,
                             &last_fault,
+                            RuntimeFaultKind::TransportError,
                             &maintenance_gate,
                             Some(&mut maintenance_tx_state),
                         );
@@ -2020,20 +2089,22 @@ fn send_shutdown_dispatch(
             error!("{}: {}", error_prefix, e);
             if matches!(e, CanError::Timeout) {
                 metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                latch_transport_fault_with_maintenance(
+                latch_runtime_fault_with_maintenance(
                     runtime_phase,
                     normal_send_gate,
                     last_fault,
+                    RuntimeFaultKind::TransportError,
                     maintenance_gate,
                     Some(maintenance_tx_state),
                 );
                 Err(crate::DriverError::Timeout)
             } else {
                 metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                latch_transport_fault_with_maintenance(
+                latch_runtime_fault_with_maintenance(
                     runtime_phase,
                     normal_send_gate,
                     last_fault,
+                    RuntimeFaultKind::TransportError,
                     maintenance_gate,
                     Some(maintenance_tx_state),
                 );
@@ -2808,6 +2879,58 @@ mod tests {
         assert_eq!(config.receive_timeout_ms, 5);
         assert_eq!(config.frame_group_timeout_ms, 20);
         assert_eq!(config.velocity_buffer_timeout_us, 10_000);
+    }
+
+    #[test]
+    fn test_derive_maintenance_gate_state_keeps_fault_latched_runtime_faulted() {
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::FaultLatched as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+        let ctx = Arc::new(PiperContext::new());
+
+        assert_eq!(
+            derive_maintenance_gate_state(&runtime_phase, &ctx, &last_fault),
+            MaintenanceGateState::DeniedFaulted
+        );
+    }
+
+    #[test]
+    fn test_latch_runtime_fault_with_maintenance_closes_gate_and_marks_rx_exited() {
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let normal_send_gate = Arc::new(NormalSendGate::new());
+        let last_fault = Arc::new(AtomicU8::new(0));
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let mut maintenance_tx_state =
+            MaintenanceTxState::from_snapshot(maintenance_gate.snapshot());
+
+        latch_runtime_fault_with_maintenance(
+            &runtime_phase,
+            &normal_send_gate,
+            &last_fault,
+            RuntimeFaultKind::RxExited,
+            &maintenance_gate,
+            Some(&mut maintenance_tx_state),
+        );
+
+        assert_eq!(
+            load_runtime_phase(&runtime_phase),
+            RuntimePhase::FaultLatched
+        );
+        assert_eq!(
+            last_fault.load(Ordering::Acquire),
+            RuntimeFaultKind::RxExited as u8
+        );
+        assert!(matches!(
+            normal_send_gate.acquire_normal(),
+            Err(NormalSendGateDenyReason::FaultClosed)
+        ));
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
+        assert_eq!(
+            maintenance_tx_state.state,
+            MaintenanceGateState::DeniedFaulted
+        );
     }
 
     // 辅助函数：创建关节位置反馈帧的数据（度转原始值）
