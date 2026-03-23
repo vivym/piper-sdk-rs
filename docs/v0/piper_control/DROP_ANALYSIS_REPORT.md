@@ -29,9 +29,14 @@ impl<State> Drop for Piper<State> {
 
 ---
 
-### 2. MitController 当前的 Drop 实现
+### 2. MitController 历史 Drop 实现（当前运行时已移除）
 
-**位置**: `crates/piper-client/src/control/mit_controller.rs:399-407`
+**历史位置**: `crates/piper-client/src/control/mit_controller.rs:399-407`
+
+> 历史说明：下面的 `impl Drop for MitController` 代码块只用于解释当时的设计问题。
+> 当前运行时已经移除 `MitController::Drop`；显式停机流程固定为
+> `move_to_rest(...)`（可选） -> `park(DisableConfig::default())`，
+> 非预期析构只会落到 `Piper<Active>::drop()` 的 bounded disable safety net。
 
 ```rust
 impl Drop for MitController {
@@ -46,7 +51,7 @@ impl Drop for MitController {
 }
 ```
 
-**特点**：
+**历史代码特征**：
 - ✅ 使用 `Option::take()` 安全提取
 - ✅ 调用 `piper.disable()` 等待完成
 - ⚠️ 返回的 `Piper<Standby>` 被丢弃，触发 Piper 的 Drop
@@ -98,11 +103,11 @@ Piper<Standby>::drop() 被调用
 
 ---
 
-## ✅ 推荐方案：移除 MitController 的 Drop 实现
+## ✅ 当前方案：移除 MitController 的 Drop 实现
 
 ### 方案对比
 
-#### ❌ 方案 A：保留当前实现（双重 Drop）
+#### ❌ 方案 A：保留历史实现（双重 Drop）
 
 ```rust
 impl Drop for MitController {
@@ -120,7 +125,7 @@ impl Drop for MitController {
 - ❌ 阻塞操作违反 Drop 最佳实践
 - ❌ 可能失败的代码在 Drop 中
 
-#### ⚠️ 方案 B：只发送命令（部分解决）
+#### ⚠️ 方案 B：历史备选方案（部分解决）
 
 ```rust
 impl Drop for MitController {
@@ -142,7 +147,7 @@ impl Drop for MitController {
 - ⚠️ 仍然在 Drop 中做了操作
 - ⚠️ 违反"Drop 应该最小化"原则
 
-#### ✅ 方案 C：完全移除 Drop（推荐）
+#### ✅ 方案 C：完全移除 Drop（当前实现）
 
 ```rust
 // 不为 MitController 实现 Drop
@@ -154,10 +159,10 @@ impl MitController {
     }
 }
 
-// 当 MitController 被 drop 时：
+// 当前实现下，当 MitController 被 drop 时：
 // 1. self.piper 是 Some(Piper<Active>)
-// 2. Piper<Active>::drop() 被调用
-// 3. 发送一次 disable 命令 ✅
+// 2. Rust 自动 drop 内部的 Piper<Active>
+// 3. 触发 bounded disable safety net（仅安全失能，不执行回位）
 ```
 
 **优点**：
@@ -181,9 +186,10 @@ impl MitController {
     /// - ✅ 返还 `Piper<Standby>`，支持继续使用
     /// - ✅ 使用 Option 模式，安全提取 Piper
     ///
-    /// **安全保证**：
-    /// - 如果忘记调用 park()，Drop 会自动失能
-    /// - 如果调用 park()，不会触发 Drop（Option 已是 None）
+    /// **当前安全合同**：
+    /// - 如需回位，必须先显式调用 `move_to_rest()`
+    /// - `park()` 只做 disable，不会移动到 `rest_position`
+    /// - 如果忘记调用 `park()`，底层只会触发 bounded disable safety net
     ///
     /// # 示例
     ///
@@ -196,8 +202,8 @@ impl MitController {
     /// let _reached_rest = controller.move_to_rest(Rad(0.01), Duration::from_secs(3))?;
     /// let piper_standby = controller.park(DisableConfig::default())?;
     ///
-    /// // 方式 2：直接丢弃（触发 Drop 自动失能）
-    /// // drop(controller);  // 自动调用 Piper::drop()
+    /// // 方式 2：直接丢弃（只触发 bounded disable safety net，不回位）
+    /// // drop(controller);  // Rust 会自动 drop 内部的 Piper<Active>
     /// ```
     pub fn park(mut self, config: DisableConfig) -> crate::types::Result<Piper<Standby>> {
         let piper = self.piper.take().expect("Piper should exist");
@@ -262,18 +268,18 @@ let mut controller = MitController::new(piper, config)?;
 
 ## 📋 实施检查清单
 
-### 需要修改的文件
+### 历史实施检查清单（当前实现已完成）
 
-- [ ] `crates/piper-client/src/control/mit_controller.rs`
-  - [ ] 删除 `impl Drop for MitController`
-  - [ ] 更新 `park()` 文档说明安全保证
-  - [ ] 添加使用示例说明两种场景
+- [x] `crates/piper-client/src/control/mit_controller.rs`
+  - [x] 删除 `impl Drop for MitController`
+  - [x] 更新 `park()` 文档说明安全保证
+  - [x] 添加使用示例说明两种场景
 
 ### 需要更新的文档
 
-- [ ] `docs/v0/piper_control/实施指南_v3.2.md`
-  - [ ] 更新 Drop 部分的说明
-  - [ ] 添加显式停车 vs 自动 drop 的对比
+- [x] `docs/v0/piper_control/实施指南_v3.2.md`
+  - [x] 更新 Drop 部分的说明
+  - [x] 添加显式停车 vs 自动 drop 的对比
 
 ---
 

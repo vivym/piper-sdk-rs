@@ -126,9 +126,15 @@ impl MitController {
 **用户反馈**：
 > "`park()` 应该消耗 `MitController`，但 **返还** 降级后的 `Piper` 实例。这完美契合 Rust 的 Type State Pattern 链式调用。"
 
-#### v3 解决方案
+#### 历史 v3 解决方案（当前运行时已不采用）
 
 **新设计**：
+> 历史说明：下面这段 `impl Drop for MitController` 代码是 v3 分析阶段的方案，不代表当前运行时实现。
+> 当前实现已经移除 `MitController::Drop`，并统一为：
+> 1. `rest_position` 只作为显式 `move_to_rest()` 的目标
+> 2. `park()` 只做 disable，并返还 `Piper<Standby>`
+> 3. 非预期析构只剩 `Piper<Active>::drop()` 的 bounded disable safety net，不执行任何回位运动
+>
 ```rust
 pub struct MitController {
     piper: Option<Piper<Active<MitMode>>>,  // ⚠️ Option 包装
@@ -162,7 +168,7 @@ let piper_position = piper_standby.into_position_mode()?;
 piper_position.command_joint_positions(...)?;
 ```
 
-#### 技术优势
+#### 历史方案的设计目标
 
 1. **符合 Type State Pattern**: 状态转换是类型系统的编译期保证
 2. **零成本抽象**: 无需重新连接硬件
@@ -264,9 +270,14 @@ impl Drop for MitController {
 **用户反馈**：
 > "如果 `MitController` 包含其他需要清理的资源（比如 log handle、metrics channel），`forget` 会导致这些资源泄漏。采用 **Option Dance** 模式更符合 Rust 惯用法。"
 
-#### v3 解决方案
+#### 历史 v3 解决方案（当前运行时已不采用）
 
 **新设计**：
+> 历史说明：下面这段 `impl Drop for MitController` 代码是当时的过渡设计，
+> 当前运行时已经移除 `MitController::Drop`。当前正确流程固定为：
+> `move_to_rest(...)`（可选） -> `park(DisableConfig::default())`，
+> 直接析构只会触发 bounded disable safety net，不执行任何回位运动。
+>
 ```rust
 pub struct MitController {
     // ⚠️ 使用 Option 包装
@@ -302,12 +313,12 @@ impl Drop for MitController {
 }
 ```
 
-#### 技术优势
+#### 历史方案的设计目标
 
-1. **无资源泄漏**: Drop 只在需要时执行
-2. **异常安全**: `park()` 失败时仍会正确清理
-3. **符合 Rust 惯用法**: Option 模式优于 forget
-4. **代码清晰**: 意图明确，易于维护
+1. **避免 `mem::forget`**: 通过 Option 模式管理所有权
+2. **让 `park()` 消费自身**: 返还 `Piper<Standby>` 支持状态流转
+3. **把显式停车做成主路径**: 减少调用方误用
+4. **为后续移除 `MitController::Drop` 铺路**: 当前实现已经完成这一步
 
 ---
 
@@ -457,7 +468,7 @@ impl MitController {
 
 ### 3.1 高层控制抽象
 
-#### 3.1.1 ⭐⭐⭐⭐⭐ MitController（v3 最终版）
+#### 3.1.1 ⭐⭐⭐⭐⭐ MitController（v3 历史方案）
 
 **功能**: MIT 模式关节位置控制器，提供 PD 增益控制和前馈力矩。
 
@@ -469,8 +480,13 @@ impl MitController {
   - ⚠️ 使用 `semver` 检查固件版本（≥ 1.7-3）
 - **⚠️ 显式 `park()` 方法**：返还 `Piper<Standby>`，支持状态流转
 - **⚠️ Option 模式**：避免 `mem::forget`，防止资源泄漏
+- **当前实现补充**：已经移除 `MitController::Drop`，析构安全网下沉到 `Piper<Active>::drop()`
 
 **实现要点**：
+> 历史说明：下面这段代码块描述的是 v3 文档中的过渡方案。
+> 当前运行时已经不再实现 `MitController::Drop`，如需回位必须显式调用
+> `move_to_rest(...)`，随后再 `park(DisableConfig::default())`。
+>
 ```rust
 pub struct MitController {
     piper: Option<Piper<Active<MitMode>>>,  // ⚠️ Option 包装
@@ -498,9 +514,14 @@ impl Drop for MitController {
 }
 ```
 
+**当前正确合同**：
+- `rest_position` 只是显式回位目标，不是析构配置
+- `park()` 只失能，不隐式移动到 `rest_position`
+- 直接丢弃 controller 只会触发 bounded disable safety net，不保证位置变化
+
 **优先级**: ⭐⭐⭐⭐⭐ 最高
 **工作量**: 中等 (~2-3 天)
-**影响**: 显著改善用户体验，完全符合 Rust 最佳实践
+**影响**: 当时用于改善用户体验；当前实现已进一步收敛 Drop 语义
 
 ---
 
