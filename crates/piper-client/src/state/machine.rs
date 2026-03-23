@@ -4327,10 +4327,10 @@ mod tests {
             error,
             RobotError::Infrastructure(piper_driver::DriverError::Timeout)
         ));
-        wait_until(
-            Duration::from_millis(200),
-            || driver.health().fault == Some(RuntimeFaultKind::TransportError),
-            "shutdown timeout must latch a transport fault before returning control to the caller",
+        assert_eq!(
+            driver.health().fault,
+            Some(RuntimeFaultKind::TransportError),
+            "shutdown timeout must latch a transport fault before returning control",
         );
         assert!(matches!(
             driver.send_reliable(PiperFrame::new_standard(0x151, &[0x08])),
@@ -4369,9 +4369,9 @@ mod tests {
             error,
             RobotError::Infrastructure(piper_driver::DriverError::Timeout)
         ));
-        wait_until(
-            Duration::from_millis(200),
-            || driver.health().fault == Some(RuntimeFaultKind::TransportError),
+        assert_eq!(
+            driver.health().fault,
+            Some(RuntimeFaultKind::TransportError),
             "disable request timeout must latch a transport fault before returning control",
         );
         assert!(matches!(

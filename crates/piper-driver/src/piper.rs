@@ -1962,15 +1962,28 @@ impl Piper {
         let _ = self.maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
     }
 
-    fn latch_state_transition_timeout_fault_if_running(&self) {
-        let _mode_switch_guard =
-            self.mode_switch_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if self.runtime_phase() != RuntimePhase::Running || self.runtime_fault_kind().is_some() {
-            return;
+    fn latch_state_transition_timeout_fault_fast(&self) {
+        if self
+            .runtime_phase
+            .compare_exchange(
+                RuntimePhase::Running as u8,
+                RuntimePhase::FaultLatched as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let _ = self.runtime_fault.compare_exchange(
+                0,
+                RuntimeFaultKind::TransportError as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.normal_send_gate.close_for_fault();
+            self.normal_send_gate.maybe_wait_test_fault_latch_barrier();
+            self.clear_realtime_slot(DriverError::CommandAbortedByFault, true);
+            let _ = self.maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
         }
-
-        self.latch_fault_with_kind(RuntimeFaultKind::TransportError);
     }
 
     /// 请求 worker 停止并关闭所有命令通路。
@@ -2861,6 +2874,11 @@ impl Piper {
                 let deadline = Instant::now() + timeout;
 
                 while self.normal_send_gate.inflight_normal_sends() > 0 {
+                    if self.runtime_phase() != RuntimePhase::Running
+                        || self.runtime_fault_kind().is_some()
+                    {
+                        return Err(DriverError::ControlPathClosed);
+                    }
                     if !self.tx_thread_alive() {
                         self.normal_send_gate.resume_from_replay();
                         return Err(DriverError::ChannelClosed);
@@ -2879,13 +2897,15 @@ impl Piper {
 
                 self.maybe_wait_test_mode_switch_replay_barrier();
 
-                match self.runtime_phase() {
-                    RuntimePhase::Running => {
+                match (self.runtime_phase(), self.runtime_fault_kind()) {
+                    (RuntimePhase::Running, None) => {
                         self.driver_mode.set(mode, std::sync::atomic::Ordering::Release);
                         Ok(())
                     },
-                    RuntimePhase::FaultLatched => Err(DriverError::ControlPathClosed),
-                    RuntimePhase::Stopping => Err(DriverError::ChannelClosed),
+                    (RuntimePhase::Stopping, _) => Err(DriverError::ChannelClosed),
+                    (RuntimePhase::Running, Some(_)) | (RuntimePhase::FaultLatched, _) => {
+                        Err(DriverError::ControlPathClosed)
+                    },
                 }
             },
             crate::mode::DriverMode::Normal => {
@@ -3456,7 +3476,7 @@ impl Piper {
         self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
         let result = wait_for_maintenance_send_result(ack_rx, deadline);
         if matches!(result, Err(DriverError::Timeout)) {
-            self.latch_state_transition_timeout_fault_if_running();
+            self.latch_state_transition_timeout_fault_fast();
         }
         result
     }
@@ -6962,6 +6982,100 @@ mod tests {
             piper.send_reliable(PiperFrame::new_standard(0x151, &[0x01])),
             Err(DriverError::ControlPathClosed)
         ));
+    }
+
+    #[test]
+    fn test_state_transition_timeout_returns_within_own_budget_even_if_mode_switch_holds_lock() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .expect("driver should start"),
+        );
+
+        let inflight_frame = PiperFrame::new_standard(0x301, &[0x01]);
+        piper
+            .send_frame(inflight_frame)
+            .expect("reliable frame should enter the blocked in-flight send");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("reliable frame should begin sending");
+
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+        let piper_disable = Arc::clone(&piper);
+        let disable_handle = std::thread::spawn(move || {
+            let started_at = Instant::now();
+            let result = piper_disable.send_local_state_transition_frame_confirmed(
+                disable_frame,
+                Duration::from_millis(20),
+            );
+            (started_at.elapsed(), result)
+        });
+
+        wait_until(
+            Duration::from_millis(100),
+            || piper.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed,
+            "state-transition disable should close the front door before timeout",
+        );
+
+        let piper_mode = Arc::clone(&piper);
+        let replay_handle = std::thread::spawn(move || {
+            piper_mode.try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(200))
+        });
+
+        let (disable_elapsed, disable_result) =
+            disable_handle.join().expect("state-transition sender thread should finish");
+        let disable_error =
+            disable_result.expect_err("state-transition disable must still time out");
+
+        assert!(matches!(disable_error, DriverError::Timeout));
+        assert!(
+            disable_elapsed < Duration::from_millis(120),
+            "disable timeout should return close to its own budget, got {disable_elapsed:?}"
+        );
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
+        assert!(matches!(
+            piper.send_frame(PiperFrame::new_standard(0x302, &[0x02])),
+            Err(DriverError::ControlPathClosed)
+        ));
+
+        release_tx.send(()).expect("blocked adapter should release cleanly");
+        let replay_error = replay_handle
+            .join()
+            .expect("replay mode switch thread should finish")
+            .expect_err("fault-latched mode switch must not publish Replay");
+        assert!(matches!(
+            replay_error,
+            DriverError::ControlPathClosed | DriverError::Timeout
+        ));
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.as_slice(),
+            &[inflight_frame],
+            "timed-out state-transition disable must not commit after returning timeout",
+        );
     }
 
     #[test]
