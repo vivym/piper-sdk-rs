@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default.
 - `MonitorReadPolicy::default()` remains 50ms; callers that depended on the previous
   50ms control default must now pass an explicit `ControlReadPolicy`.
+- `MitControllerConfig::rest_position` is now an explicit `move_to_rest()` target only;
+  `park()` and `Drop` no longer imply any automatic return-to-rest motion.
+- `recover_from_emergency_stop(timeout)` now treats `timeout` as a total budget covering
+  resume enqueue/ack plus post-resume fresh-feedback confirmation.
+
+### Fixed
+
+- Driver TX dispatch test barriers are now scoped per Piper instance instead of using a
+  process-global barrier, eliminating cross-test interference in state-transition and
+  drop-time preemption coverage.
 
 ### 🎬 Recording and Replay System (2026-01-27)
 

@@ -139,12 +139,9 @@ pub struct MitController {
 impl MitController {
     pub fn park(mut self) -> Result<Piper<Standby>, Error> {
         // 1. 安全提取 piper
-        let mut piper = self.piper.take().expect("Piper should exist");
+        let piper = self.piper.take().expect("Piper should exist");
 
-        // 2. 执行停车逻辑...
-        if let Some(rest) = self.config.rest_position {
-            // move_to_position...
-        }
+        // 2. park() 只负责 disable；显式回位应由 move_to_rest() 单独完成
 
         // 3. 切换到 Standby 状态
         let piper_standby = piper.into_standby()?;

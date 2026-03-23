@@ -1213,6 +1213,8 @@ impl MasterSlaveGripperControlState {
 /// }
 /// ```
 use crate::hooks::HookManager;
+#[cfg(test)]
+use std::sync::{Mutex, mpsc};
 
 /// Piper 上下文（所有状态的聚合）
 pub struct PiperContext {
@@ -1293,6 +1295,10 @@ pub struct PiperContext {
     /// 第一次带可信设备时间戳的反馈到达主机的单调时间（微秒）。
     pub first_timestamped_feedback_host_rx_mono_us: AtomicU64,
 
+    /// Test-only barrier that pauses one Piper instance at the top of its TX dispatch loop.
+    #[cfg(test)]
+    tx_loop_dispatch_barrier: Mutex<Option<TxLoopDispatchBarrier>>,
+
     // === 钩子管理（v1.2.1）===
     /// 钩子管理器（用于运行时回调注册）
     ///
@@ -1323,6 +1329,13 @@ pub struct PiperContext {
     /// }
     /// ```
     pub hooks: Arc<RwLock<HookManager>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TxLoopDispatchBarrier {
+    reached_tx: mpsc::Sender<()>,
+    release_rx: mpsc::Receiver<()>,
 }
 
 impl PiperContext {
@@ -1400,9 +1413,40 @@ impl PiperContext {
                 std::time::Duration::from_secs(1),
             ),
             first_timestamped_feedback_host_rx_mono_us: AtomicU64::new(0),
+            #[cfg(test)]
+            tx_loop_dispatch_barrier: Mutex::new(None),
 
             // 钩子管理器（v1.2.1）
             hooks: Arc::new(RwLock::new(HookManager::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_tx_loop_dispatch_barrier(
+        &self,
+        reached_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
+    ) {
+        let mut guard = self
+            .tx_loop_dispatch_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(TxLoopDispatchBarrier {
+            reached_tx,
+            release_rx,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maybe_wait_test_tx_loop_dispatch_barrier(&self) {
+        let barrier = self
+            .tx_loop_dispatch_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.reached_tx.send(());
+            let _ = barrier.release_rx.recv();
         }
     }
 

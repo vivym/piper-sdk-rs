@@ -3761,10 +3761,10 @@ mod tests {
         }
     }
 
-    fn install_tx_loop_barrier() -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    fn install_tx_loop_barrier(piper: &Piper) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        crate::pipeline::install_tx_loop_dispatch_barrier(reached_tx, release_rx);
+        piper.ctx.install_tx_loop_dispatch_barrier(reached_tx, release_rx);
         (reached_rx, release_tx)
     }
 
@@ -4565,7 +4565,7 @@ mod tests {
         )
         .unwrap();
         let replay_frame = PiperFrame::new_standard(0x155, &[0xA5]);
-        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
 
         reached_rx
             .recv_timeout(Duration::from_millis(200))
@@ -4645,7 +4645,7 @@ mod tests {
         )
         .unwrap();
         let realtime_frame = PiperFrame::new_standard(0x156, &[0xB6]);
-        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
 
         piper
             .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
@@ -4684,7 +4684,7 @@ mod tests {
         )
         .unwrap();
         let reliable_frame = PiperFrame::new_standard(0x157, &[0xC7]);
-        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
 
         piper
             .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
@@ -4793,7 +4793,7 @@ mod tests {
         piper
             .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
             .expect("entering Replay should succeed");
-        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
         reached_rx
             .recv_timeout(Duration::from_millis(200))
             .expect("TX loop should hit dispatch barrier");
@@ -6690,7 +6690,7 @@ mod tests {
             .unwrap(),
         );
 
-        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
         reached_rx
             .recv_timeout(Duration::from_millis(200))
             .expect("tx loop should reach the installed dispatch barrier");
@@ -6740,6 +6740,11 @@ mod tests {
             )
         });
 
+        wait_until(
+            Duration::from_millis(200),
+            || piper.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed,
+            "state-transition disable should close the normal-control gate before TX resumes",
+        );
         release_tx.send(()).expect("tx loop barrier should release cleanly");
         state_reached_rx
             .recv_timeout(Duration::from_millis(200))
@@ -6873,7 +6878,7 @@ mod tests {
             .unwrap(),
         );
 
-        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
         reached_rx
             .recv_timeout(Duration::from_millis(200))
             .expect("tx loop should reach the installed dispatch barrier");

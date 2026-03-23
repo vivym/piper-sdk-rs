@@ -42,49 +42,6 @@ fn tx_idle_backoff(min_us: u64, current: u64, max_us: u64) -> (Duration, u64) {
     (Duration::from_micros(sleep_us), next_us)
 }
 
-#[cfg(test)]
-#[derive(Debug)]
-struct TxLoopDispatchBarrier {
-    reached_tx: std::sync::mpsc::Sender<()>,
-    release_rx: std::sync::mpsc::Receiver<()>,
-}
-
-#[cfg(test)]
-static TX_LOOP_DISPATCH_BARRIER: std::sync::OnceLock<
-    std::sync::Mutex<Option<TxLoopDispatchBarrier>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-fn tx_loop_dispatch_barrier_slot() -> &'static std::sync::Mutex<Option<TxLoopDispatchBarrier>> {
-    TX_LOOP_DISPATCH_BARRIER.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-pub(crate) fn install_tx_loop_dispatch_barrier(
-    reached_tx: std::sync::mpsc::Sender<()>,
-    release_rx: std::sync::mpsc::Receiver<()>,
-) {
-    let mut guard = tx_loop_dispatch_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some(TxLoopDispatchBarrier {
-        reached_tx,
-        release_rx,
-    });
-}
-
-#[cfg(test)]
-fn maybe_wait_tx_loop_dispatch_barrier() {
-    let barrier = tx_loop_dispatch_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(barrier) = barrier {
-        let _ = barrier.reached_tx.send(());
-        let _ = barrier.release_rx.recv();
-    }
-}
-
 #[inline]
 fn host_rx_mono_us() -> u64 {
     monotonic_micros()
@@ -1405,7 +1362,7 @@ pub fn tx_loop_mailbox(
         #[cfg(test)]
         {
             let _ = driver_mode.get(Ordering::Acquire);
-            maybe_wait_tx_loop_dispatch_barrier();
+            ctx.maybe_wait_test_tx_loop_dispatch_barrier();
         }
         if phase == RuntimePhase::Stopping || !workers_running.load(Ordering::Acquire) {
             trace!("TX thread: stopping runtime, exiting");

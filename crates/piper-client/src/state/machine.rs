@@ -3072,7 +3072,8 @@ where
     /// 4. 仅在拿到 fresh confirmed mask 后，driver 才清除 fault latch 并重新打开 normal gate
     /// 5. `mask == 0` 返回 `Standby`，否则返回 `Maintenance`
     ///
-    /// 如果在 `timeout` 内拿不到 fresh post-resume 反馈，则保持 fault latched 并返回超时错误。
+    /// `timeout` 覆盖 resume 发送、确认以及 fresh post-resume 反馈等待的总预算。
+    /// 如果在预算内拿不到 fresh post-resume 反馈，则保持 fault latched 并返回超时错误。
     pub fn recover_from_emergency_stop(
         self,
         timeout: Duration,
@@ -3089,15 +3090,25 @@ where
             ));
         }
 
+        let deadline = Instant::now() + timeout;
         let raw_commander = RawCommander::new(&self.driver);
-        let receipt = raw_commander
-            .emergency_stop_resume_enqueue(Instant::now() + EMERGENCY_STOP_LANE_TIMEOUT)?;
-        receipt.wait()?;
+        let receipt = raw_commander.emergency_stop_resume_enqueue(deadline)?;
+        match receipt.wait() {
+            Ok(()) => {},
+            Err(DriverError::Timeout) => {
+                return Err(RobotError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            },
+            Err(error) => return Err(error.into()),
+        }
 
-        let recovery = match self
-            .driver
-            .complete_manual_fault_recovery_after_resume(timeout, RECOVERY_STATE_POLL_INTERVAL)
-        {
+        let remaining_budget = deadline.saturating_duration_since(Instant::now());
+
+        let recovery = match self.driver.complete_manual_fault_recovery_after_resume(
+            remaining_budget,
+            RECOVERY_STATE_POLL_INTERVAL,
+        ) {
             Ok(recovery) => recovery,
             Err(DriverError::Timeout) => {
                 return Err(RobotError::Timeout {
@@ -3145,6 +3156,7 @@ impl<State, Capability> Drop for Piper<State, Capability> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::{ControlError, MitController, MitControllerConfig};
     use crate::observer::CollisionProtectionSnapshot;
     use crate::observer::Observer;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
@@ -3253,6 +3265,13 @@ mod tests {
 
     struct FailSendTxAdapter;
 
+    struct DelayOnNthShutdownTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+        shutdown_sends: usize,
+        delay_on: usize,
+        delay: Duration,
+    }
+
     impl RealtimeTxAdapter for FailSendTxAdapter {
         fn send_control(
             &mut self,
@@ -3289,6 +3308,36 @@ mod tests {
             frame: PiperFrame,
             deadline: std::time::Instant,
         ) -> std::result::Result<(), CanError> {
+            if deadline <= std::time::Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
+    impl RealtimeTxAdapter for DelayOnNthShutdownTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: std::time::Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: std::time::Instant,
+        ) -> std::result::Result<(), CanError> {
+            self.shutdown_sends += 1;
+            if self.shutdown_sends == self.delay_on && !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
             if deadline <= std::time::Instant::now() {
                 return Err(CanError::Timeout);
             }
@@ -4221,6 +4270,58 @@ mod tests {
     }
 
     #[test]
+    fn mit_controller_move_to_rest_requires_explicit_rest_position() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames.clone(),
+        );
+        let mut controller = MitController::new(active, MitControllerConfig::default())
+            .expect("strict realtime driver should support MitController");
+
+        let error = controller
+            .move_to_rest(Rad(0.01), Duration::from_millis(50))
+            .expect_err("move_to_rest must fail closed when rest_position is absent");
+
+        assert!(matches!(error, ControlError::RestPositionNotConfigured));
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "missing rest_position must not emit any motion command",
+        );
+    }
+
+    #[test]
+    fn mit_controller_drop_with_rest_position_only_sends_disable_all() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames.clone(),
+        );
+        let controller = MitController::new(
+            active,
+            MitControllerConfig {
+                rest_position: Some([Rad(0.0), Rad(0.1), Rad(-0.2), Rad(0.3), Rad(0.4), Rad(0.5)]),
+                ..MitControllerConfig::default()
+            },
+        )
+        .expect("strict realtime driver should support MitController");
+
+        drop(controller);
+
+        wait_until(
+            Duration::from_millis(200),
+            || !sent_frames.lock().expect("sent frames lock").is_empty(),
+            "dropping MitController should still emit the bounded disable safety net",
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![piper_protocol::control::MotorEnableCommand::disable_all().to_frame()]
+        );
+    }
+
+    #[test]
     fn recover_from_emergency_stop_returns_standby_after_resume() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
@@ -4301,6 +4402,51 @@ mod tests {
                 piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame(),
                 piper_protocol::control::EmergencyStopCommand::resume().to_frame(),
             ]
+        );
+    }
+
+    #[test]
+    fn recover_from_emergency_stop_treats_timeout_as_total_budget() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                DelayOnNthShutdownTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    shutdown_sends: 0,
+                    delay_on: 2,
+                    delay: Duration::from_millis(15),
+                },
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
+        let driver = Arc::clone(&error.driver);
+        let recover_error = match error.recover_from_emergency_stop(Duration::from_millis(5)) {
+            Ok(_) => panic!("resume ack beyond the caller budget must time out"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            recover_error,
+            RobotError::Timeout { timeout_ms: 5 }
+        ));
+        assert_eq!(driver.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(
+            driver.maintenance_lease_snapshot().state(),
+            piper_driver::MaintenanceGateState::DeniedFaulted
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame()]
         );
     }
 

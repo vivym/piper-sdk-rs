@@ -51,6 +51,9 @@
 //! # //     Duration::from_secs(5),
 //! # // )?;
 //!
+//! // 可选：先显式回位，再显式停车
+//! # // let reached_rest = controller.move_to_rest(Rad(0.01), Duration::from_secs(3))?;
+//!
 //! // 显式停车（返还 Piper<Standby>）
 //! # // let piper_standby = controller.park(DisableConfig::default())?;
 //! # Ok(())
@@ -81,9 +84,10 @@ pub struct MitControllerConfig {
     /// 典型值：0.3 - 1.5
     pub kd_gains: [f64; 6],
 
-    /// 休息位置（Drop 时自动移动到此位置）
+    /// 显式回位使用的休息位置目标
     ///
-    /// `None` 表示不自动移动（仅失能）
+    /// `None` 表示未配置休息位置；调用 `move_to_rest()` 时会返回错误。
+    /// `park()` 和 `Drop` 都不会隐式移动到该位置。
     pub rest_position: Option<[Rad; 6]>,
 
     /// 控制循环频率（Hz）
@@ -116,6 +120,12 @@ pub enum ControlError {
     /// Controller was already parked
     #[error("Controller was already parked, cannot execute commands")]
     AlreadyParked,
+
+    /// 休息位置未配置
+    #[error(
+        "Rest position is not configured; call move_to_position() explicitly or set MitControllerConfig::rest_position"
+    )]
+    RestPositionNotConfigured,
 
     /// 连续错误超过阈值
     #[error("Consecutive CAN failures: {count}, last error: {last_error}")]
@@ -362,6 +372,19 @@ impl MitController {
         Ok(false)
     }
 
+    /// 阻塞式运动到配置中的休息位置
+    ///
+    /// 此方法只负责显式回位，不会自动失能；如果需要安全停机，
+    /// 应在回位成功后继续调用 `park()`。
+    pub fn move_to_rest(
+        &mut self,
+        threshold: Rad,
+        timeout: Duration,
+    ) -> core::result::Result<bool, ControlError> {
+        let target = self.config.rest_position.ok_or(ControlError::RestPositionNotConfigured)?;
+        self.move_to_position(target, threshold, timeout)
+    }
+
     /// 发送关节命令（MIT 模式 PD 控制）
     ///
     /// 直接传递每个关节的 kp/kd 增益到固件，让固件进行 PD 计算，
@@ -441,7 +464,7 @@ impl MitController {
         }
     }
 
-    /// 停车（失能并返还 `Piper<Standby>`）
+    /// 停车（只失能并返还 `Piper<Standby>`）
     ///
     /// **资源管理**：
     /// - ✅ 返还 `Piper<Standby>`，支持继续使用
@@ -453,10 +476,11 @@ impl MitController {
     /// - 提取 Piper，调用 disable()，等待完成
     /// - 返回 `Piper<Standby>` 可继续使用
     /// - 不会触发 Piper 的 Drop
+    /// - 不会自动移动到 `rest_position`
     ///
     /// **忘记调用 park()**（安全网）：
     /// - MitController 被 drop 时，`Piper<Active>::drop()` 自动触发
-    /// - 发送 disable 命令（不等待确认）
+    /// - 只发送 bounded disable 命令，不执行任何回位运动
     /// - 电机被安全失能
     ///
     /// # 示例
@@ -467,7 +491,8 @@ impl MitController {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut controller: MitController = unsafe { std::mem::zeroed() };
     ///
-    /// // 方式 1：显式停车（推荐）
+    /// // 方式 1：先显式回位，再显式停车
+    /// let _reached_rest = controller.move_to_rest(Rad(0.01), std::time::Duration::from_secs(3))?;
     /// let piper_standby = controller.park(DisableConfig::default())?;
     /// // 现在 piper_standby 可以重新使能或做其他操作
     ///

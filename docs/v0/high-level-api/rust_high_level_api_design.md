@@ -763,7 +763,7 @@ impl<'a> JointPositionController for MitJointController<'a> {
             return Ok(());
         }
 
-        // 返回休息位置
+        // 如需回到休息位置，应显式调用 move_to_rest()
         if let Some(rest_pos) = self.rest_position {
             let _ = self.move_to_position(&rest_pos, 0.1, Duration::from_secs(2));
         }
@@ -919,7 +919,7 @@ impl<'a> JointPositionController for BuiltinJointController<'a> {
             return Ok(());
         }
 
-        // 返回休息位置
+        // 如需回到休息位置，应显式调用 move_to_rest()
         if let Some(rest_pos) = self.rest_position {
             let _ = self.move_to_position(&rest_pos, 0.01, Duration::from_secs(3));
         }
@@ -1480,4 +1480,3 @@ pub trait RobotState {
 **报告生成日期**: 2026-01-23
 **报告作者**: AI Assistant
 **版本**: v2.0
-

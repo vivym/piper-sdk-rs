@@ -99,7 +99,7 @@ semver = "1.0"
 # 1. Context Manager 支持
 with MitJointPositionController(piper, kp_gains=5.0, kd_gains=0.8) as controller:
     controller.move_to_position(target, timeout=5.0)
-# 退出时自动停车到 rest_position
+# 如需回到 rest_position，应显式调用 move_to_rest() 后再 park()
 
 # 2. 阻塞式位置控制
 def move_to_position(target, threshold=0.001, timeout=1.0) -> bool:
