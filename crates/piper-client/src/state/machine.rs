@@ -894,9 +894,7 @@ where
             }
 
             // ✅ 直接从 Observer 读取状态（View 模式，零延迟）
-            let enabled_mask = self.observer.joint_enabled_mask();
-
-            if enabled_mask == 0b111111 {
+            if self.observer.is_all_enabled_confirmed() {
                 // ✅ Debounce：连续 N 次读到 Enabled 才认为成功
                 stable_count += 1;
                 if stable_count >= debounce_threshold {
@@ -942,7 +940,7 @@ where
             let is_robot_state_fresh = current.hardware_timestamp_us
                 > baseline.robot_control.hardware_timestamp_us
                 || current.host_rx_mono_us > baseline.robot_control.host_rx_mono_us;
-            let is_robot_state_match = current.is_enabled
+            let is_robot_state_match = current.is_fully_enabled_confirmed()
                 && current.robot_status == RobotStatus::Normal as u8
                 && current.control_mode == expected.control_mode
                 && current.move_mode == expected.move_mode;
@@ -1536,9 +1534,7 @@ where
                 });
             }
 
-            let enabled_mask = self.observer.joint_enabled_mask();
-
-            if enabled_mask == 0 {
+            if self.observer.is_all_disabled_confirmed() {
                 stable_count += 1;
                 if stable_count >= debounce_threshold {
                     return Ok(());
@@ -3160,6 +3156,13 @@ mod tests {
             )
             .expect("driver should start"),
         );
+        build_active_mit_piper_with_driver(driver, quirks)
+    }
+
+    fn build_active_mit_piper_with_driver(
+        driver: Arc<RobotPiper>,
+        quirks: DeviceQuirks,
+    ) -> Piper<Active<MitMode>, StrictRealtime> {
         let observer = Observer::<StrictRealtime>::new(driver.clone());
 
         Piper {
@@ -3204,11 +3207,22 @@ mod tests {
     where
         R: RxAdapter + Send + 'static,
     {
+        build_standby_piper_with_config(rx_adapter, sent_frames, None)
+    }
+
+    fn build_standby_piper_with_config<R>(
+        rx_adapter: R,
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+        config: Option<piper_driver::PipelineConfig>,
+    ) -> Piper<Standby, StrictRealtime>
+    where
+        R: RxAdapter + Send + 'static,
+    {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 rx_adapter,
                 RecordingTxAdapter::new(sent_frames),
-                None,
+                config,
             )
             .expect("driver should start"),
         );
@@ -3289,17 +3303,25 @@ mod tests {
         frame
     }
 
-    fn joint_driver_enabled_frame(joint_index: u8, timestamp_us: u64) -> PiperFrame {
+    fn joint_driver_state_frame(joint_index: u8, enabled: bool, timestamp_us: u64) -> PiperFrame {
         let id = piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_BASE + (joint_index as u32) - 1;
         let mut data = [0u8; 8];
         data[0..2].copy_from_slice(&240u16.to_be_bytes());
         data[2..4].copy_from_slice(&45i16.to_be_bytes());
         data[4] = 50;
-        data[5] = 0x40;
+        data[5] = if enabled { 0x40 } else { 0x00 };
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
         let mut frame = PiperFrame::new_standard(id as u16, &data);
         frame.timestamp_us = timestamp_us;
         frame
+    }
+
+    fn joint_driver_enabled_frame(joint_index: u8, timestamp_us: u64) -> PiperFrame {
+        joint_driver_state_frame(joint_index, true, timestamp_us)
+    }
+
+    fn joint_driver_disabled_frame(joint_index: u8, timestamp_us: u64) -> PiperFrame {
+        joint_driver_state_frame(joint_index, false, timestamp_us)
     }
 
     fn robot_status_frame_with_status(
@@ -3519,6 +3541,99 @@ mod tests {
             .expect("fresh matching 0x2A1 + 0x151 should allow Active<MitMode>");
 
         assert!(active.observer().is_all_enabled());
+        assert!(active.observer().is_all_enabled_confirmed());
+    }
+
+    #[test]
+    fn enable_mit_mode_rejects_stale_historical_enabled_feedback_before_confirmation() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames();
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(80),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(5),
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveM,
+                80,
+                piper_protocol::control::MitMode::Mit,
+                InstallPosition::Invalid,
+                101,
+            ),
+        });
+
+        let standby = build_standby_piper_with_config(
+            PacedRxAdapter::new(frames),
+            sent_frames,
+            Some(piper_driver::PipelineConfig {
+                low_speed_drive_state_freshness_ms: 20,
+                ..piper_driver::PipelineConfig::default()
+            }),
+        );
+        wait_until(
+            Duration::from_millis(100),
+            || standby.observer().joint_enabled_mask() == 0b11_1111,
+            "historical enabled frames should arrive before staleness check",
+        );
+        thread::sleep(Duration::from_millis(40));
+
+        let error = match standby.enable_mit_mode(MitModeConfig {
+            timeout: Duration::from_millis(120),
+            debounce_threshold: 1,
+            poll_interval: Duration::from_millis(1),
+            speed_percent: 80,
+        }) {
+            Ok(_) => panic!("stale historical enabled bits must not satisfy wait_for_enabled"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
+    }
+
+    #[test]
+    fn enable_mit_mode_rejects_stale_enabled_state_during_mode_confirmation() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames();
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(40),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(5),
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveM,
+                80,
+                piper_protocol::control::MitMode::Mit,
+                InstallPosition::Invalid,
+                101,
+            ),
+        });
+
+        let standby = build_standby_piper_with_config(
+            PacedRxAdapter::new(frames),
+            sent_frames,
+            Some(piper_driver::PipelineConfig {
+                low_speed_drive_state_freshness_ms: 20,
+                ..piper_driver::PipelineConfig::default()
+            }),
+        );
+
+        let error = match standby.enable_mit_mode(MitModeConfig {
+            timeout: Duration::from_millis(120),
+            debounce_threshold: 1,
+            poll_interval: Duration::from_millis(1),
+            speed_percent: 80,
+        }) {
+            Ok(_) => panic!(
+                "stale enabled bits must not satisfy wait_for_mode_confirmation after wait_for_enabled"
+            ),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
     }
 
     #[test]
@@ -3591,6 +3706,57 @@ mod tests {
             .expect("fresh matching 0x2A1 + 0x151 should allow MIT passthrough");
 
         assert!(matches!(active._state, Active(MitPassthroughMode)));
+    }
+
+    #[test]
+    fn disable_rejects_unknown_drive_state_without_confirmed_feedback() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames,
+        );
+
+        let error = match active.disable(DisableConfig {
+            timeout: Duration::from_millis(30),
+            debounce_threshold: 1,
+            poll_interval: Duration::from_millis(1),
+        }) {
+            Ok(_) => panic!("unknown low-speed disable state must not satisfy wait_for_disabled"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
+    }
+
+    #[test]
+    fn disable_succeeds_with_fresh_confirmed_disabled_feedback() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = (1..=6)
+            .map(|joint_index| TimedFrame {
+                delay: Duration::from_millis(2),
+                frame: joint_driver_disabled_frame(joint_index, joint_index as u64),
+            })
+            .collect();
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(frames),
+                RecordingTxAdapter::new(sent_frames),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        active
+            .disable(DisableConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+            })
+            .expect("fresh confirmed disabled feedback should allow disable transition");
     }
 
     #[test]

@@ -357,16 +357,10 @@ fn confirmed_low_speed_drive_enabled_mask(
     config: &PipelineConfig,
 ) -> Option<u8> {
     let driver_state = ctx.joint_driver_low_speed.load();
-    if driver_state.valid_mask != ALL_DRIVES_ENABLED_MASK || driver_state.host_rx_mono_us == 0 {
-        return None;
-    }
-
-    let freshness_window_us = config.low_speed_drive_state_freshness_ms.saturating_mul(1_000);
-    if host_rx_mono_us().saturating_sub(driver_state.host_rx_mono_us) > freshness_window_us {
-        return None;
-    }
-
-    Some(driver_state.driver_enabled_mask)
+    driver_state.confirmed_driver_enabled_mask(
+        host_rx_mono_us(),
+        config.low_speed_drive_state_freshness_ms.saturating_mul(1_000),
+    )
 }
 
 fn refresh_maintenance_gate_state(
@@ -1000,8 +994,6 @@ pub(crate) fn io_loop(
     ctx: Arc<PiperContext>,
     config: PipelineConfig,
 ) {
-    let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
-    let last_fault = Arc::new(AtomicU8::new(0));
     // === 帧解析器状态（封装所有临时状态） ===
     let mut state = ParserState::new();
     let metrics = Arc::new(PiperMetrics::new());
@@ -1059,9 +1051,6 @@ pub(crate) fn io_loop(
             &config,
             &mut state,
             &metrics,
-            None,
-            &runtime_phase,
-            &last_fault,
         );
 
         if parsed.counts_as_robot_feedback && frame.timestamp_us > 0 {
@@ -1286,9 +1275,6 @@ pub fn rx_loop(
             &config,
             &mut state,
             &metrics,
-            Some(&maintenance_gate),
-            &runtime_phase,
-            &last_fault,
         );
 
         if parsed.counts_as_robot_feedback && frame.timestamp_us > 0 {
@@ -1300,7 +1286,9 @@ pub fn rx_loop(
         if parsed.counts_as_robot_feedback {
             ctx.connection_monitor.register_feedback();
         }
-        if maintenance_gate.current_state() == MaintenanceGateState::DeniedTransportDown {
+        if parsed.maintenance_gate_may_have_changed
+            || maintenance_gate.current_state() == MaintenanceGateState::DeniedTransportDown
+        {
             refresh_maintenance_gate_state(
                 &maintenance_gate,
                 &runtime_phase,
@@ -2166,6 +2154,7 @@ fn send_shutdown_dispatch(
 #[derive(Debug, Clone, Copy, Default)]
 struct ParsedFeedbackOutcome {
     counts_as_robot_feedback: bool,
+    maintenance_gate_may_have_changed: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2176,9 +2165,6 @@ fn parse_and_update_state(
     config: &PipelineConfig,
     state: &mut ParserState,
     metrics: &Arc<PiperMetrics>,
-    maintenance_gate: Option<&Arc<MaintenanceGate>>,
-    runtime_phase: &Arc<AtomicU8>,
-    last_fault: &Arc<AtomicU8>,
 ) -> ParsedFeedbackOutcome {
     let mut outcome = ParsedFeedbackOutcome::default();
     let frame_group_timeout = Duration::from_millis(config.frame_group_timeout_ms);
@@ -2438,6 +2424,7 @@ fn parse_and_update_state(
         ID_ROBOT_STATUS => {
             if let Ok(feedback) = RobotStatusFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
+                outcome.maintenance_gate_may_have_changed = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 let fault_angle_limit_mask = feedback.fault_code_angle_limit.joint1_limit() as u8
@@ -2455,8 +2442,13 @@ fn parse_and_update_state(
                     | (feedback.fault_code_comm_error.joint5_comm_error() as u8) << 4
                     | (feedback.fault_code_comm_error.joint6_comm_error() as u8) << 5;
 
-                let driver_enabled_mask = ctx.joint_driver_low_speed.load().driver_enabled_mask;
+                let driver_state = ctx.joint_driver_low_speed.load();
+                let driver_enabled_mask = driver_state.driver_enabled_mask;
                 let any_drive_enabled = driver_enabled_mask != 0;
+                let confirmed_driver_enabled_mask = driver_state.confirmed_driver_enabled_mask(
+                    host_rx_mono_us,
+                    config.low_speed_drive_state_freshness_ms.saturating_mul(1_000),
+                );
                 let new_robot_control_state = RobotControlState {
                     hardware_timestamp_us: frame.timestamp_us,
                     host_rx_mono_us,
@@ -2471,13 +2463,11 @@ fn parse_and_update_state(
                     driver_enabled_mask,
                     any_drive_enabled,
                     is_enabled: driver_enabled_mask == ALL_DRIVES_ENABLED_MASK,
+                    confirmed_driver_enabled_mask,
                     feedback_counter: 0,
                 };
 
                 ctx.robot_control.store(Arc::new(new_robot_control_state.clone()));
-                if let Some(gate) = maintenance_gate {
-                    refresh_maintenance_gate_state(gate, runtime_phase, ctx, config, last_fault);
-                }
                 ctx.fps_stats
                     .load()
                     .robot_control_updates
@@ -2520,6 +2510,7 @@ fn parse_and_update_state(
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
                     outcome.counts_as_robot_feedback = true;
+                    outcome.maintenance_gate_may_have_changed = true;
                     let host_rx_mono_us = host_rx_mono_us();
 
                     ctx.joint_driver_low_speed.rcu(|old| {
@@ -2578,28 +2569,26 @@ fn parse_and_update_state(
                         Arc::new(new)
                     });
 
-                    let driver_enabled_mask = ctx.joint_driver_low_speed.load().driver_enabled_mask;
+                    let driver_state = ctx.joint_driver_low_speed.load();
+                    let driver_enabled_mask = driver_state.driver_enabled_mask;
                     let any_drive_enabled = driver_enabled_mask != 0;
                     let is_enabled = driver_enabled_mask == ALL_DRIVES_ENABLED_MASK;
+                    let confirmed_driver_enabled_mask = driver_state.confirmed_driver_enabled_mask(
+                        host_rx_mono_us,
+                        config.low_speed_drive_state_freshness_ms.saturating_mul(1_000),
+                    );
                     let previous = ctx.robot_control.load();
                     if previous.driver_enabled_mask != driver_enabled_mask
                         || previous.any_drive_enabled != any_drive_enabled
                         || previous.is_enabled != is_enabled
+                        || previous.confirmed_driver_enabled_mask != confirmed_driver_enabled_mask
                     {
                         let mut next = previous.as_ref().clone();
                         next.driver_enabled_mask = driver_enabled_mask;
                         next.any_drive_enabled = any_drive_enabled;
                         next.is_enabled = is_enabled;
+                        next.confirmed_driver_enabled_mask = confirmed_driver_enabled_mask;
                         ctx.robot_control.store(Arc::new(next));
-                    }
-                    if let Some(gate) = maintenance_gate {
-                        refresh_maintenance_gate_state(
-                            gate,
-                            runtime_phase,
-                            ctx,
-                            config,
-                            last_fault,
-                        );
                     }
 
                     ctx.fps_stats
@@ -3039,8 +3028,6 @@ mod tests {
         config: &PipelineConfig,
         frame: PiperFrame,
     ) {
-        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
-        let last_fault = Arc::new(AtomicU8::new(0));
         parse_and_update_state(
             &frame,
             BackendCapability::StrictRealtime,
@@ -3048,9 +3035,6 @@ mod tests {
             config,
             state,
             metrics,
-            None,
-            &runtime_phase,
-            &last_fault,
         );
     }
 
@@ -3072,15 +3056,14 @@ mod tests {
             config,
             state,
             metrics,
-            Some(maintenance_gate),
-            runtime_phase,
-            last_fault,
         );
 
         if parsed.counts_as_robot_feedback {
             ctx.connection_monitor.register_feedback();
         }
-        if maintenance_gate.current_state() == MaintenanceGateState::DeniedTransportDown {
+        if parsed.maintenance_gate_may_have_changed
+            || maintenance_gate.current_state() == MaintenanceGateState::DeniedTransportDown
+        {
             refresh_maintenance_gate_state(
                 maintenance_gate,
                 runtime_phase,
@@ -3449,6 +3432,7 @@ mod tests {
         assert_eq!(robot_control.driver_enabled_mask, 0);
         assert!(!robot_control.any_drive_enabled);
         assert!(!robot_control.is_enabled);
+        assert_eq!(robot_control.confirmed_driver_enabled_mask, Some(0));
         assert_eq!(
             maintenance_gate.current_state(),
             MaintenanceGateState::AllowedStandby
@@ -3481,6 +3465,7 @@ mod tests {
         assert_eq!(robot_control.driver_enabled_mask, 0b000001);
         assert!(robot_control.any_drive_enabled);
         assert!(!robot_control.is_enabled);
+        assert_eq!(robot_control.confirmed_driver_enabled_mask, Some(0b000001));
         assert_eq!(
             maintenance_gate.current_state(),
             MaintenanceGateState::DeniedActiveControl
@@ -3505,6 +3490,69 @@ mod tests {
     }
 
     #[test]
+    fn test_maintenance_gate_requires_all_joints_to_stay_fresh_after_historical_full_snapshot() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+
+        feed_joint_driver_low_speed_cycle(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+            0,
+            1_000,
+        );
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::AllowedStandby
+        );
+
+        let stale_timestamp = host_rx_mono_us()
+            .saturating_sub((config.low_speed_drive_state_freshness_ms + 50).saturating_mul(1_000));
+        ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
+            driver_enabled_mask: 0,
+            host_rx_mono_us: stale_timestamp,
+            host_rx_mono_timestamps: [stale_timestamp; 6],
+            valid_mask: ALL_DRIVES_ENABLED_MASK,
+            ..JointDriverLowSpeedState::default()
+        }));
+        ctx.robot_control.store(Arc::new(RobotControlState {
+            driver_enabled_mask: 0,
+            any_drive_enabled: false,
+            is_enabled: false,
+            confirmed_driver_enabled_mask: None,
+            ..RobotControlState::default()
+        }));
+
+        parse_frame_for_test_with_maintenance_refresh(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_driver_low_speed_frame(1, false, 2_000),
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+        );
+
+        let robot_control = ctx.robot_control.load();
+        assert_eq!(robot_control.driver_enabled_mask, 0);
+        assert_eq!(robot_control.confirmed_driver_enabled_mask, None);
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedDriveStateUnknown
+        );
+    }
+
+    #[test]
     fn test_maintenance_gate_returns_to_unknown_when_low_speed_state_stales() {
         let ctx = Arc::new(PiperContext::new());
         let config = PipelineConfig::default();
@@ -3513,8 +3561,10 @@ mod tests {
         let last_fault = Arc::new(AtomicU8::new(0));
 
         ctx.connection_monitor.register_feedback();
+        let fresh_host_rx_mono_us = host_rx_mono_us();
         ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
-            host_rx_mono_us: host_rx_mono_us(),
+            host_rx_mono_us: fresh_host_rx_mono_us,
+            host_rx_mono_timestamps: [fresh_host_rx_mono_us; 6],
             valid_mask: ALL_DRIVES_ENABLED_MASK,
             ..JointDriverLowSpeedState::default()
         }));
@@ -3535,6 +3585,7 @@ mod tests {
             .saturating_sub((config.low_speed_drive_state_freshness_ms + 50).saturating_mul(1_000));
         ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
             host_rx_mono_us: stale_host_rx_mono_us,
+            host_rx_mono_timestamps: [stale_host_rx_mono_us; 6],
             valid_mask: ALL_DRIVES_ENABLED_MASK,
             ..JointDriverLowSpeedState::default()
         }));

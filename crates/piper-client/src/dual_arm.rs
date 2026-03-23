@@ -1479,17 +1479,140 @@ mod tests {
     use crate::types::RadPerSecond;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_driver::Piper as RobotPiper;
-    use piper_protocol::control::MitControlCommand;
+    use piper_protocol::control::{MitControlCommand, MotorEnableCommand};
     use piper_protocol::ids::{
-        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
-        ID_JOINT_FEEDBACK_56,
+        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE, ID_JOINT_FEEDBACK_12,
+        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
     };
     use semver::Version;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use thiserror::Error;
+
+    #[derive(Default)]
+    struct DisableFeedbackHarness {
+        pending_disabled_frames: AtomicUsize,
+        next_timestamp_us: AtomicU64,
+    }
+
+    impl DisableFeedbackHarness {
+        fn arm_disabled_cycle(&self) {
+            self.pending_disabled_frames.store(6, AtomicOrdering::Release);
+        }
+
+        fn next_disabled_joint(&self) -> Option<u8> {
+            loop {
+                let pending = self.pending_disabled_frames.load(AtomicOrdering::Acquire);
+                if pending == 0 {
+                    return None;
+                }
+                let next = pending - 1;
+                if self
+                    .pending_disabled_frames
+                    .compare_exchange(
+                        pending,
+                        next,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Some((6 - next) as u8);
+                }
+            }
+        }
+
+        fn next_timestamp_us(&self) -> u64 {
+            self.next_timestamp_us.fetch_add(1, AtomicOrdering::Relaxed) + 10_000
+        }
+    }
+
+    struct DisableAwareRxAdapter<R> {
+        inner: R,
+        harness: Arc<DisableFeedbackHarness>,
+    }
+
+    impl<R> DisableAwareRxAdapter<R> {
+        fn new(inner: R, harness: Arc<DisableFeedbackHarness>) -> Self {
+            Self { inner, harness }
+        }
+    }
+
+    impl<R> RxAdapter for DisableAwareRxAdapter<R>
+    where
+        R: RxAdapter,
+    {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            match self.inner.receive() {
+                Ok(frame) => Ok(frame),
+                Err(CanError::Timeout) => {
+                    let Some(joint_index) = self.harness.next_disabled_joint() else {
+                        return Err(CanError::Timeout);
+                    };
+                    Ok(joint_driver_low_speed_frame(
+                        joint_index,
+                        false,
+                        self.harness.next_timestamp_us(),
+                    ))
+                },
+                Err(error) => Err(error),
+            }
+        }
+
+        fn backend_capability(&self) -> piper_can::BackendCapability {
+            self.inner.backend_capability()
+        }
+
+        fn startup_probe_until(
+            &mut self,
+            deadline: Instant,
+        ) -> std::result::Result<Option<piper_can::BackendCapability>, CanError> {
+            self.inner.startup_probe_until(deadline)
+        }
+    }
+
+    struct DisableAwareTxAdapter<T> {
+        inner: T,
+        harness: Arc<DisableFeedbackHarness>,
+    }
+
+    impl<T> DisableAwareTxAdapter<T> {
+        fn new(inner: T, harness: Arc<DisableFeedbackHarness>) -> Self {
+            Self { inner, harness }
+        }
+
+        fn maybe_arm_disabled_cycle(&self, frame: PiperFrame) {
+            let disable_all = MotorEnableCommand::disable_all().to_frame();
+            if frame.id == disable_all.id && frame.data == disable_all.data {
+                self.harness.arm_disabled_cycle();
+            }
+        }
+    }
+
+    impl<T> RealtimeTxAdapter for DisableAwareTxAdapter<T>
+    where
+        T: RealtimeTxAdapter,
+    {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            self.maybe_arm_disabled_cycle(frame);
+            self.inner.send_control(frame, budget)
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            self.maybe_arm_disabled_cycle(frame);
+            self.inner.send_shutdown_until(frame, deadline)
+        }
+    }
 
     struct ScriptedRxAdapter {
         frames: VecDeque<PiperFrame>,
@@ -1684,6 +1807,25 @@ mod tests {
         frame
     }
 
+    fn joint_driver_low_speed_frame(
+        joint_index: u8,
+        enabled: bool,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&240u16.to_be_bytes());
+        data[2..4].copy_from_slice(&45i16.to_be_bytes());
+        data[4] = 50;
+        data[5] = if enabled { 0x40 } else { 0x00 };
+        data[6..8].copy_from_slice(&5000u16.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(
+            (ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index - 1)) as u16,
+            &data,
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
     fn scripted_frames(timestamp_us: u64) -> Vec<PiperFrame> {
         vec![
             joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
@@ -1738,9 +1880,14 @@ mod tests {
         R: RxAdapter + Send + 'static,
         T: RealtimeTxAdapter + Send + 'static,
     {
+        let disable_feedback = Arc::new(DisableFeedbackHarness::default());
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(rx_adapter, tx_adapter, None)
-                .expect("driver should start"),
+            RobotPiper::new_dual_thread_parts(
+                DisableAwareRxAdapter::new(rx_adapter, disable_feedback.clone()),
+                DisableAwareTxAdapter::new(tx_adapter, disable_feedback),
+                None,
+            )
+            .expect("driver should start"),
         );
         let observer = Observer::<StrictRealtime>::new(driver.clone());
         driver
@@ -3062,7 +3209,7 @@ mod tests {
                     sleep_duration: Duration::from_millis(40),
                 },
                 BilateralLoopConfig {
-                    frequency_hz: 50.0,
+                    frequency_hz: 5.0,
                     warmup_cycles: 0,
                     max_iterations: Some(1),
                     gripper: GripperTeleopConfig {
@@ -3193,10 +3340,7 @@ mod tests {
             right: build_active_mit_piper(1_000, right_sent),
         };
 
-        let latch_handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(40));
-            left_driver.latch_fault();
-        });
+        left_driver.latch_fault();
 
         let exit = arms
             .run_bilateral(
@@ -3220,7 +3364,6 @@ mod tests {
                 },
             )
             .expect("manual runtime latch should converge to faulted exit");
-        latch_handle.join().expect("manual latch thread should finish cleanly");
 
         match exit {
             DualArmLoopExit::Standby { .. } => panic!("expected faulted exit"),

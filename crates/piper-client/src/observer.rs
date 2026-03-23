@@ -430,15 +430,33 @@ where
     }
 
     /// 获取使能掩码（Bit 0-5 对应 J1-J6）
+    /// 获取驱动器使能位掩码（raw cached bits，不保证完整或新鲜）。
+    ///
+    /// 该接口只适合诊断和兼容旧逻辑；安全门控请使用 confirmed API。
     pub fn joint_enabled_mask(&self) -> u8 {
         let driver_state = self.driver.get_joint_driver_low_speed();
         driver_state.driver_enabled_mask
     }
 
-    /// 检查指定关节是否使能
+    /// 获取已确认的驱动器使能位掩码。
+    ///
+    /// 只有在完整且新鲜的 6 轴低速反馈可用时才返回 `Some(mask)`。
+    pub fn joint_enabled_mask_confirmed(&self) -> Option<u8> {
+        self.driver.get_robot_control().confirmed_driver_enabled_mask
+    }
+
+    /// 检查指定关节是否使能（raw cached bits）
     pub fn is_joint_enabled(&self, joint_index: usize) -> bool {
         let driver_state = self.driver.get_joint_driver_low_speed();
         (driver_state.driver_enabled_mask & (1 << joint_index)) != 0
+    }
+
+    /// 检查指定关节是否已确认使能。
+    pub fn is_joint_enabled_confirmed(&self, joint_index: usize) -> Option<bool> {
+        if joint_index >= 6 {
+            return None;
+        }
+        self.joint_enabled_mask_confirmed().map(|mask| (mask & (1 << joint_index)) != 0)
     }
 
     /// 获取末端位姿（完整且新鲜的监控快照，可能与其他状态有时间偏斜）
@@ -488,14 +506,24 @@ where
         Ok(latest_complete.clone())
     }
 
-    /// 检查是否全部使能
+    /// 检查是否全部使能（raw cached bits）
     pub fn is_all_enabled(&self) -> bool {
         self.joint_enabled_mask() == 0b111111
     }
 
-    /// 检查是否全部失能
+    /// 检查是否全部失能（raw cached bits）
     pub fn is_all_disabled(&self) -> bool {
         self.joint_enabled_mask() == 0
+    }
+
+    /// 检查是否已确认 6 轴全部使能。
+    pub fn is_all_enabled_confirmed(&self) -> bool {
+        self.joint_enabled_mask_confirmed() == Some(0b11_1111)
+    }
+
+    /// 检查是否已确认 6 轴全部失能。
+    pub fn is_all_disabled_confirmed(&self) -> bool {
+        self.joint_enabled_mask_confirmed() == Some(0)
     }
 
     /// 检查是否部分使能
@@ -759,11 +787,11 @@ mod tests {
     use super::*;
     use crate::state::{MonitorOnly, StrictRealtime};
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-    use piper_driver::BackendCapability;
+    use piper_driver::{BackendCapability, PipelineConfig};
     use piper_protocol::ids::{
         ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_GRIPPER_FEEDBACK,
-        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
-        ID_JOINT_FEEDBACK_56,
+        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE, ID_JOINT_FEEDBACK_12,
+        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
     };
     use std::collections::VecDeque;
     use std::thread;
@@ -962,6 +990,23 @@ mod tests {
         frame
     }
 
+    fn joint_driver_low_speed_frame(
+        joint_index: u8,
+        enabled: bool,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let id = ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index.saturating_sub(1));
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&240u16.to_be_bytes());
+        data[2..4].copy_from_slice(&45i16.to_be_bytes());
+        data[4] = 50;
+        data[5] = if enabled { 0x40 } else { 0x00 };
+        data[6..8].copy_from_slice(&5000u16.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(id as u16, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
     fn bootstrap_timestamp_frame() -> PiperFrame {
         let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
         frame.timestamp_us = 1;
@@ -985,9 +1030,20 @@ mod tests {
     fn start_observer_with_frames(
         frames: Vec<PiperFrame>,
     ) -> (Arc<RobotPiper>, Observer<StrictRealtime>) {
+        start_observer_with_frames_and_config(frames, None)
+    }
+
+    fn start_observer_with_frames_and_config(
+        frames: Vec<PiperFrame>,
+        config: Option<PipelineConfig>,
+    ) -> (Arc<RobotPiper>, Observer<StrictRealtime>) {
         let driver = Arc::new(
-            RobotPiper::new_dual_thread_parts(ScriptedRxAdapter::new(frames), IdleTxAdapter, None)
-                .expect("driver should start"),
+            RobotPiper::new_dual_thread_parts(
+                ScriptedRxAdapter::new(frames),
+                IdleTxAdapter,
+                config,
+            )
+            .expect("driver should start"),
         );
         let observer = Observer::<StrictRealtime>::new(driver.clone());
         (driver, observer)
@@ -1060,6 +1116,66 @@ mod tests {
         assert_eq!(gripper.position, 0.5);
         assert_eq!(gripper.effort, 1.0);
         assert!(gripper.enabled);
+    }
+
+    #[test]
+    fn test_confirmed_enable_state_requires_complete_low_speed_feedback() {
+        let (driver, observer) =
+            start_observer_with_frames(vec![joint_driver_low_speed_frame(1, true, 1_000)]);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("partial low-speed feedback should arrive");
+
+        assert_eq!(observer.joint_enabled_mask(), 0b000001);
+        assert_eq!(observer.joint_enabled_mask_confirmed(), None);
+        assert_eq!(observer.is_joint_enabled_confirmed(0), None);
+        assert!(!observer.is_all_enabled_confirmed());
+        assert!(!observer.is_all_disabled_confirmed());
+    }
+
+    #[test]
+    fn test_confirmed_enable_state_reports_full_fresh_snapshot() {
+        let frames = (1..=6)
+            .map(|joint_index| joint_driver_low_speed_frame(joint_index, true, joint_index as u64))
+            .collect();
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("full low-speed feedback should arrive");
+
+        assert_eq!(observer.joint_enabled_mask_confirmed(), Some(0b11_1111));
+        assert_eq!(observer.is_joint_enabled_confirmed(5), Some(true));
+        assert!(observer.is_all_enabled_confirmed());
+        assert!(!observer.is_all_disabled_confirmed());
+    }
+
+    #[test]
+    fn test_confirmed_enable_state_expires_without_new_feedback() {
+        let frames = (1..=6)
+            .map(|joint_index| joint_driver_low_speed_frame(joint_index, false, joint_index as u64))
+            .collect();
+        let (driver, observer) = start_observer_with_frames_and_config(
+            frames,
+            Some(PipelineConfig {
+                low_speed_drive_state_freshness_ms: 20,
+                ..PipelineConfig::default()
+            }),
+        );
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("low-speed feedback should arrive");
+        assert_eq!(observer.joint_enabled_mask_confirmed(), Some(0));
+        assert!(observer.is_all_disabled_confirmed());
+
+        thread::sleep(Duration::from_millis(40));
+
+        assert_eq!(observer.joint_enabled_mask(), 0);
+        assert_eq!(observer.joint_enabled_mask_confirmed(), None);
+        assert_eq!(observer.is_joint_enabled_confirmed(0), None);
+        assert!(!observer.is_all_disabled_confirmed());
     }
 
     #[test]

@@ -360,6 +360,9 @@ pub struct RobotControlState {
     /// 使能状态（6 轴驱动器全部使能）
     pub is_enabled: bool,
 
+    /// 已确认的驱动器使能位掩码（完整且新鲜的 6 轴低速反馈）
+    pub confirmed_driver_enabled_mask: Option<u8>,
+
     /// 反馈指令计数器（如果协议支持，用于检测链路卡死）
     ///
     /// **注意**：如果协议中没有循环计数器，此字段为 0
@@ -381,6 +384,16 @@ impl RobotControlState {
             return false;
         }
         (self.fault_comm_error_mask >> joint_index) & 1 == 1
+    }
+
+    /// 检查是否已确认 6 轴全部使能。
+    pub fn is_fully_enabled_confirmed(&self) -> bool {
+        self.confirmed_driver_enabled_mask == Some(0b11_1111)
+    }
+
+    /// 检查是否已确认 6 轴全部失能。
+    pub fn is_fully_disabled_confirmed(&self) -> bool {
+        self.confirmed_driver_enabled_mask == Some(0)
     }
 }
 
@@ -529,6 +542,27 @@ impl JointDriverLowSpeedState {
     /// 获取未更新的关节索引（用于调试）
     pub fn missing_joints(&self) -> Vec<usize> {
         (0..6).filter(|&i| (self.valid_mask & (1 << i)) == 0).collect()
+    }
+
+    /// 返回已确认的 6 轴驱动器使能掩码。
+    ///
+    /// 只有当全部 6 个关节都收到过低速反馈，且每个关节的 host monotonic
+    /// 时间戳都仍在 freshness 窗口内时，才认为整组使能状态已确认。
+    pub(crate) fn confirmed_driver_enabled_mask(
+        &self,
+        now_host_mono_us: u64,
+        freshness_window_us: u64,
+    ) -> Option<u8> {
+        for timestamp in self.host_rx_mono_timestamps {
+            if timestamp == 0 {
+                return None;
+            }
+            if now_host_mono_us.saturating_sub(timestamp) > freshness_window_us {
+                return None;
+            }
+        }
+
+        Some(self.driver_enabled_mask)
     }
 
     /// 检查指定关节是否电压过低
@@ -2185,6 +2219,9 @@ mod tests {
         assert!(!state.any_drive_enabled);
         assert_eq!(state.feedback_counter, 0);
         assert!(!state.is_enabled);
+        assert_eq!(state.confirmed_driver_enabled_mask, None);
+        assert!(!state.is_fully_enabled_confirmed());
+        assert!(!state.is_fully_disabled_confirmed());
     }
 
     #[test]
@@ -2258,6 +2295,7 @@ mod tests {
             driver_enabled_mask: 0b11_1111,
             any_drive_enabled: true,
             is_enabled: true,
+            confirmed_driver_enabled_mask: Some(0b11_1111),
             feedback_counter: 5,
         };
         let cloned = state.clone();
@@ -2268,8 +2306,13 @@ mod tests {
         assert_eq!(state.driver_enabled_mask, cloned.driver_enabled_mask);
         assert_eq!(state.any_drive_enabled, cloned.any_drive_enabled);
         assert_eq!(state.is_enabled, cloned.is_enabled);
+        assert_eq!(
+            state.confirmed_driver_enabled_mask,
+            cloned.confirmed_driver_enabled_mask
+        );
         assert_eq!(state.is_angle_limit(0), cloned.is_angle_limit(0));
         assert_eq!(state.is_comm_error(2), cloned.is_comm_error(2));
+        assert!(cloned.is_fully_enabled_confirmed());
     }
 
     #[test]
@@ -2437,6 +2480,46 @@ mod tests {
         assert_eq!(state.valid_mask, cloned.valid_mask);
         assert_eq!(state.is_fully_valid(), cloned.is_fully_valid());
         assert_eq!(state.is_voltage_low(0), cloned.is_voltage_low(0));
+    }
+
+    #[test]
+    fn test_joint_driver_low_speed_state_confirmed_driver_enabled_mask_requires_all_fresh_joints() {
+        let now_host_mono_us = 20_000;
+        let freshness_window_us = 5_000;
+        let state = JointDriverLowSpeedState {
+            driver_enabled_mask: 0b11_1111,
+            host_rx_mono_timestamps: [19_500, 19_600, 19_700, 19_800, 19_900, 20_000],
+            valid_mask: 0b11_1111,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.confirmed_driver_enabled_mask(now_host_mono_us, freshness_window_us),
+            Some(0b11_1111)
+        );
+
+        let partial_refresh_only = JointDriverLowSpeedState {
+            driver_enabled_mask: 0b11_1111,
+            host_rx_mono_timestamps: [19_500, 10_000, 10_000, 10_000, 10_000, 10_000],
+            valid_mask: 0b11_1111,
+            ..Default::default()
+        };
+        assert_eq!(
+            partial_refresh_only
+                .confirmed_driver_enabled_mask(now_host_mono_us, freshness_window_us),
+            None
+        );
+    }
+
+    #[test]
+    fn test_joint_driver_low_speed_state_confirmed_driver_enabled_mask_requires_all_timestamps() {
+        let state = JointDriverLowSpeedState {
+            driver_enabled_mask: 0,
+            host_rx_mono_timestamps: [1_000, 1_100, 1_200, 1_300, 1_400, 0],
+            ..Default::default()
+        };
+
+        assert_eq!(state.confirmed_driver_enabled_mask(2_000, 2_000), None);
     }
 
     #[test]

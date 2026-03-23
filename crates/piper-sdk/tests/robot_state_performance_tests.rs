@@ -326,6 +326,7 @@ fn test_bitmask_access_performance() {
         driver_enabled_mask: 0b11_1111,
         any_drive_enabled: true,
         is_enabled: true,
+        confirmed_driver_enabled_mask: Some(0b11_1111),
         feedback_counter: 0,
     };
 

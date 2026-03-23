@@ -195,6 +195,7 @@ fn test_robot_control_state_concurrent_read() {
                 driver_enabled_mask: if i % 2 == 0 { 0b11_1111 } else { 0 },
                 any_drive_enabled: i % 2 == 0,
                 is_enabled: i % 2 == 0,
+                confirmed_driver_enabled_mask: None,
                 feedback_counter: (i % 256) as u8,
             };
             ctx_writer.robot_control.store(Arc::new(new_state));
@@ -424,6 +425,7 @@ fn test_multiple_states_concurrent_read() {
                 driver_enabled_mask: if i % 2 == 0 { 0b11_1111 } else { 0 },
                 any_drive_enabled: i % 2 == 0,
                 is_enabled: i % 2 == 0,
+                confirmed_driver_enabled_mask: None,
                 feedback_counter: (i % 256) as u8,
             };
             ctx_writer.robot_control.store(Arc::new(new_robot_control));

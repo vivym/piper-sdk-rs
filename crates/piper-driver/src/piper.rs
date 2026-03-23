@@ -1324,6 +1324,8 @@ pub struct Piper {
     metrics: Arc<PiperMetrics>,
     /// 最近一次运行时故障。
     runtime_fault: Arc<AtomicU8>,
+    /// Pipeline 配置（用于按当前时刻重算 safety-grade 状态）。
+    pipeline_config: PipelineConfig,
     /// Controller-owned maintenance gate used by bridge integrations.
     maintenance_gate: Arc<MaintenanceGate>,
     /// CAN 接口名称（用于录制元数据）
@@ -1392,6 +1394,10 @@ impl Piper {
 
     fn normal_control_open(&self) -> bool {
         self.runtime_phase() == RuntimePhase::Running && self.rx_thread_alive()
+    }
+
+    fn low_speed_drive_state_freshness_window_us(&self) -> u64 {
+        self.pipeline_config.low_speed_drive_state_freshness_ms.saturating_mul(1_000)
     }
 
     fn replay_mode_active(&self) -> bool {
@@ -1555,6 +1561,7 @@ impl Piper {
         config: Option<PipelineConfig>,
         backend_capability: BackendCapability,
     ) -> Result<Self, CanError> {
+        let pipeline_config = config.unwrap_or_default();
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
         let (soft_realtime_tx, soft_realtime_rx) =
@@ -1579,7 +1586,7 @@ impl Piper {
         let runtime_phase_rx = runtime_phase.clone();
         let metrics_clone = metrics.clone();
         let runtime_fault_rx = runtime_fault.clone();
-        let config_clone = config.clone().unwrap_or_default();
+        let config_clone = pipeline_config.clone();
         let backend_capability_rx = backend_capability;
         let maintenance_gate_rx = maintenance_gate.clone();
         let normal_send_gate_rx = normal_send_gate.clone();
@@ -1647,6 +1654,7 @@ impl Piper {
             normal_send_gate,
             metrics,
             runtime_fault,
+            pipeline_config,
             maintenance_gate,
             interface: "unknown".to_string(),
             bus_speed: 1_000_000,
@@ -1892,7 +1900,13 @@ impl Piper {
     /// - 无锁读取（ArcSwap::load）
     /// - 返回快照副本
     pub fn get_robot_control(&self) -> RobotControlState {
-        self.ctx.robot_control.load().as_ref().clone()
+        let mut control = self.ctx.robot_control.load().as_ref().clone();
+        let driver_state = self.ctx.joint_driver_low_speed.load();
+        control.confirmed_driver_enabled_mask = driver_state.confirmed_driver_enabled_mask(
+            crate::heartbeat::monotonic_micros(),
+            self.low_speed_drive_state_freshness_window_us(),
+        );
+        control
     }
 
     /// 获取夹爪状态（无锁）
@@ -3256,9 +3270,11 @@ mod tests {
     }
 
     fn mark_maintenance_standby_confirmed(piper: &Piper) {
+        let now = crate::heartbeat::monotonic_micros();
         piper.ctx.connection_monitor.register_feedback();
         piper.ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
-            host_rx_mono_us: crate::heartbeat::monotonic_micros(),
+            host_rx_mono_us: now,
+            host_rx_mono_timestamps: [now; 6],
             valid_mask: 0b11_1111,
             ..JointDriverLowSpeedState::default()
         }));
@@ -4797,6 +4813,48 @@ mod tests {
         assert_eq!(control.hardware_timestamp_us, 0);
         assert_eq!(control.control_mode, 0);
         assert!(!control.is_enabled);
+        assert_eq!(control.confirmed_driver_enabled_mask, None);
+    }
+
+    #[test]
+    fn test_get_robot_control_recomputes_confirmed_drive_state_from_current_time() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            MockTxAdapter,
+            Some(PipelineConfig {
+                low_speed_drive_state_freshness_ms: 10,
+                ..PipelineConfig::default()
+            }),
+        )
+        .expect("driver should start");
+
+        let now = crate::heartbeat::monotonic_micros();
+        piper.ctx.robot_control.store(Arc::new(RobotControlState {
+            driver_enabled_mask: 0b11_1111,
+            any_drive_enabled: true,
+            is_enabled: true,
+            confirmed_driver_enabled_mask: Some(0b11_1111),
+            ..RobotControlState::default()
+        }));
+        piper.ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
+            driver_enabled_mask: 0b11_1111,
+            host_rx_mono_us: now,
+            host_rx_mono_timestamps: [now; 6],
+            valid_mask: 0b11_1111,
+            ..JointDriverLowSpeedState::default()
+        }));
+
+        assert_eq!(
+            piper.get_robot_control().confirmed_driver_enabled_mask,
+            Some(0b11_1111)
+        );
+
+        std::thread::sleep(Duration::from_millis(25));
+
+        assert_eq!(
+            piper.get_robot_control().confirmed_driver_enabled_mask,
+            None
+        );
     }
 
     #[test]
