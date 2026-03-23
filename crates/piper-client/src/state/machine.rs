@@ -3108,10 +3108,8 @@ where
             Err(error) => return Err(error.into()),
         }
 
-        let remaining_budget = deadline.saturating_duration_since(Instant::now());
-
-        let recovery = match self.driver.complete_manual_fault_recovery_after_resume(
-            remaining_budget,
+        let recovery = match self.driver.complete_manual_fault_recovery_after_resume_until(
+            deadline,
             RECOVERY_STATE_POLL_INTERVAL,
         ) {
             Ok(recovery) => recovery,
@@ -4562,6 +4560,79 @@ mod tests {
         assert_eq!(
             sent,
             vec![piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame()]
+        );
+    }
+
+    #[test]
+    fn recover_from_emergency_stop_deadline_expiry_wins_over_ready_feedback_after_resume() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(vec![
+                    TimedFrame {
+                        delay: Duration::from_millis(20),
+                        frame: joint_driver_disabled_frame(1, 1_000),
+                    },
+                    TimedFrame {
+                        delay: Duration::ZERO,
+                        frame: joint_driver_disabled_frame(2, 1_001),
+                    },
+                    TimedFrame {
+                        delay: Duration::ZERO,
+                        frame: joint_driver_disabled_frame(3, 1_002),
+                    },
+                    TimedFrame {
+                        delay: Duration::ZERO,
+                        frame: joint_driver_disabled_frame(4, 1_003),
+                    },
+                    TimedFrame {
+                        delay: Duration::ZERO,
+                        frame: joint_driver_disabled_frame(5, 1_004),
+                    },
+                    TimedFrame {
+                        delay: Duration::ZERO,
+                        frame: joint_driver_disabled_frame(6, 1_005),
+                    },
+                ]),
+                DelayOnNthShutdownTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    shutdown_sends: 0,
+                    delay_on: 2,
+                    delay: Duration::from_millis(15),
+                },
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
+        let driver = Arc::clone(&error.driver);
+        let recover_error = match error.recover_from_emergency_stop(Duration::from_millis(20)) {
+            Ok(_) => panic!("expired total budget must win over ready feedback"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            recover_error,
+            RobotError::Timeout { timeout_ms: 20 }
+        ));
+        assert_eq!(driver.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(
+            driver.maintenance_lease_snapshot().state(),
+            piper_driver::MaintenanceGateState::DeniedFaulted
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![
+                piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame(),
+                piper_protocol::control::EmergencyStopCommand::resume().to_frame(),
+            ]
         );
     }
 

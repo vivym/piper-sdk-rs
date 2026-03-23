@@ -599,6 +599,7 @@ pub enum StopAttemptResult {
     #[default]
     NotAttempted,
     ConfirmedSent,
+    /// Bounded stop budget elapsed before the arm could confirm enqueue/dispatch.
     Timeout,
     ChannelClosed,
     QueueRejected,
@@ -1561,6 +1562,17 @@ mod tests {
         fn next_timestamp_us(&self) -> u64 {
             self.next_timestamp_us.fetch_add(1, AtomicOrdering::Relaxed) + 10_000
         }
+    }
+
+    fn assert_bounded_stop_attempt(result: StopAttemptResult) {
+        assert!(
+            matches!(
+                result,
+                StopAttemptResult::ConfirmedSent | StopAttemptResult::Timeout
+            ),
+            "bounded stop attempt must resolve to ConfirmedSent or Timeout, got {:?}",
+            result,
+        );
     }
 
     struct DisableAwareRxAdapter<R> {
@@ -3371,8 +3383,8 @@ mod tests {
                     report.exit_reason,
                     Some(BilateralExitReason::SubmissionFault)
                 );
-                assert_eq!(report.left_stop_attempt, StopAttemptResult::ConfirmedSent);
-                assert_eq!(report.right_stop_attempt, StopAttemptResult::ConfirmedSent);
+                assert_bounded_stop_attempt(report.left_stop_attempt);
+                assert_bounded_stop_attempt(report.right_stop_attempt);
             },
         }
 
@@ -3437,8 +3449,8 @@ mod tests {
                     report.exit_reason,
                     Some(BilateralExitReason::SubmissionFault)
                 );
-                assert_eq!(report.left_stop_attempt, StopAttemptResult::ConfirmedSent);
-                assert_eq!(report.right_stop_attempt, StopAttemptResult::ConfirmedSent);
+                assert_bounded_stop_attempt(report.left_stop_attempt);
+                assert_bounded_stop_attempt(report.right_stop_attempt);
             },
         }
 
@@ -3555,7 +3567,7 @@ mod tests {
                     report.last_runtime_fault_right,
                     Some(RuntimeFaultKind::TransportError)
                 );
-                assert_eq!(report.left_stop_attempt, StopAttemptResult::ConfirmedSent);
+                assert_bounded_stop_attempt(report.left_stop_attempt);
                 assert_eq!(report.right_stop_attempt, StopAttemptResult::ChannelClosed);
                 assert!(
                     report

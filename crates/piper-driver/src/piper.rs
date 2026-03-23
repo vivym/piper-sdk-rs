@@ -2066,18 +2066,22 @@ impl Piper {
     }
 
     #[doc(hidden)]
-    pub fn complete_manual_fault_recovery_after_resume(
+    pub fn complete_manual_fault_recovery_after_resume_until(
         &self,
-        timeout: Duration,
+        deadline: Instant,
         poll_interval: Duration,
     ) -> Result<ManualFaultRecoveryResult, DriverError> {
         self.validate_manual_fault_recovery_preconditions()?;
 
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros();
-        let start = Instant::now();
 
         loop {
             self.validate_manual_fault_recovery_preconditions()?;
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(DriverError::Timeout);
+            }
 
             let driver_state = self.get_joint_driver_low_speed();
             let now_host_mono_us = crate::heartbeat::monotonic_micros();
@@ -2091,11 +2095,7 @@ impl Piper {
                 return self.finalize_manual_fault_recovery(confirmed_mask);
             }
 
-            if start.elapsed() >= timeout {
-                return Err(DriverError::Timeout);
-            }
-
-            std::thread::sleep(poll_interval.min(timeout.saturating_sub(start.elapsed())));
+            std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
         }
     }
 
@@ -6355,8 +6355,8 @@ mod tests {
         });
 
         let recovery = piper
-            .complete_manual_fault_recovery_after_resume(
-                Duration::from_millis(200),
+            .complete_manual_fault_recovery_after_resume_until(
+                Instant::now() + Duration::from_millis(200),
                 Duration::from_millis(1),
             )
             .expect("manual fault recovery should reopen the runtime");
@@ -6394,8 +6394,8 @@ mod tests {
         piper.latch_fault();
 
         let error = piper
-            .complete_manual_fault_recovery_after_resume(
-                Duration::from_millis(20),
+            .complete_manual_fault_recovery_after_resume_until(
+                Instant::now() + Duration::from_millis(20),
                 Duration::from_millis(1),
             )
             .expect_err("manual fault recovery must fail closed without fresh feedback");
@@ -6409,6 +6409,34 @@ mod tests {
         assert_eq!(
             piper.maintenance_lease_snapshot().state(),
             MaintenanceGateState::DeniedFaulted
+        );
+    }
+
+    #[test]
+    fn test_manual_fault_recovery_expired_deadline_wins_over_ready_feedback() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            MockTxAdapter,
+            Some(maintenance_ready_config()),
+        )
+        .unwrap();
+
+        mark_maintenance_standby_confirmed(&piper);
+        piper.latch_fault();
+        publish_confirmed_driver_mask(&piper, 0);
+
+        let error = piper
+            .complete_manual_fault_recovery_after_resume_until(
+                Instant::now(),
+                Duration::from_millis(1),
+            )
+            .expect_err("expired deadline must fail even if ready feedback is already visible");
+        assert!(matches!(error, DriverError::Timeout));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(piper.runtime_phase(), RuntimePhase::FaultLatched);
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
         );
     }
 
