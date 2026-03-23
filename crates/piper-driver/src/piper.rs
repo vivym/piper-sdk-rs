@@ -125,42 +125,6 @@ struct ModeSwitchBarrier {
 }
 
 #[cfg(test)]
-static MODE_SWITCH_REPLAY_BARRIER: std::sync::OnceLock<
-    std::sync::Mutex<Option<ModeSwitchBarrier>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-fn mode_switch_replay_barrier_slot() -> &'static std::sync::Mutex<Option<ModeSwitchBarrier>> {
-    MODE_SWITCH_REPLAY_BARRIER.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-pub(crate) fn install_mode_switch_replay_barrier(
-    reached_tx: std::sync::mpsc::Sender<()>,
-    release_rx: std::sync::mpsc::Receiver<()>,
-) {
-    let mut guard = mode_switch_replay_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some(ModeSwitchBarrier {
-        reached_tx,
-        release_rx,
-    });
-}
-
-#[cfg(test)]
-fn maybe_wait_mode_switch_replay_barrier() {
-    let barrier = mode_switch_replay_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(barrier) = barrier {
-        let _ = barrier.reached_tx.send(());
-        let _ = barrier.release_rx.recv();
-    }
-}
-
-#[cfg(test)]
 #[derive(Debug)]
 struct FaultLatchBarrier {
     reached_tx: std::sync::mpsc::Sender<()>,
@@ -1401,6 +1365,9 @@ pub struct Piper {
     driver_mode: Arc<crate::mode::AtomicDriverMode>,
     /// 线性化 Driver 模式切换，避免 gate/mode 交错留下混合状态。
     mode_switch_lock: Mutex<()>,
+    /// Test-only barrier that lets one Piper instance pause Replay mode publication.
+    #[cfg(test)]
+    mode_switch_replay_barrier: Mutex<Option<ModeSwitchBarrier>>,
     /// Capability of the active backend.
     backend_capability: BackendCapability,
 }
@@ -1472,6 +1439,38 @@ impl Piper {
     fn replay_barrier_active(&self) -> bool {
         self.normal_send_gate.is_replay_paused()
     }
+
+    #[cfg(test)]
+    fn install_mode_switch_replay_barrier(
+        &self,
+        reached_tx: std::sync::mpsc::Sender<()>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut guard = self
+            .mode_switch_replay_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(ModeSwitchBarrier {
+            reached_tx,
+            release_rx,
+        });
+    }
+
+    #[cfg(test)]
+    fn maybe_wait_test_mode_switch_replay_barrier(&self) {
+        let barrier = self
+            .mode_switch_replay_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.reached_tx.send(());
+            let _ = barrier.release_rx.recv();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_wait_test_mode_switch_replay_barrier(&self) {}
 
     fn ensure_mode_allows_reliable_kind(
         &self,
@@ -1725,6 +1724,8 @@ impl Piper {
             bus_speed: 1_000_000,
             driver_mode,
             mode_switch_lock: Mutex::new(()),
+            #[cfg(test)]
+            mode_switch_replay_barrier: Mutex::new(None),
             backend_capability,
         })
     }
@@ -2540,8 +2541,7 @@ impl Piper {
                     return Err(DriverError::ChannelClosed);
                 }
 
-                #[cfg(test)]
-                maybe_wait_mode_switch_replay_barrier();
+                self.maybe_wait_test_mode_switch_replay_barrier();
 
                 match self.runtime_phase() {
                     RuntimePhase::Running => {
@@ -3416,10 +3416,10 @@ mod tests {
         (reached_rx, release_tx)
     }
 
-    fn install_mode_switch_barrier() -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    fn install_mode_switch_barrier(piper: &Piper) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        install_mode_switch_replay_barrier(reached_tx, release_rx);
+        piper.install_mode_switch_replay_barrier(reached_tx, release_rx);
         (reached_rx, release_tx)
     }
 
@@ -4535,6 +4535,11 @@ mod tests {
         let piper_mode = Arc::clone(&piper);
         let mode_handle =
             std::thread::spawn(move || piper_mode.set_mode(crate::mode::DriverMode::Replay));
+        wait_until(
+            Duration::from_millis(200),
+            || piper.replay_barrier_active(),
+            "Replay switch should pause the normal gate before the in-flight frame is released",
+        );
         let _ = release_tx.send(());
         mode_handle
             .join()
@@ -4729,7 +4734,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (reached_rx, release_tx) = install_mode_switch_barrier();
+        let (reached_rx, release_tx) = install_mode_switch_barrier(piper.as_ref());
 
         let piper_replay = Arc::clone(&piper);
         let replay_handle = std::thread::spawn(move || {
@@ -4805,7 +4810,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (reached_rx, release_tx) = install_mode_switch_barrier();
+        let (reached_rx, release_tx) = install_mode_switch_barrier(piper.as_ref());
 
         let piper_replay = Arc::clone(&piper);
         let replay_handle = std::thread::spawn(move || {
