@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 use piper_control::home_zero_blocking;
-use piper_sdk::client::MotionConnectedPiper;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -24,11 +24,15 @@ impl HomeCommand {
         let standby = standby.require_motion()?;
         println!("⏳ 发送零关节目标...");
         match standby {
-            MotionConnectedPiper::Strict(standby) => {
+            MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
                 let _standby = home_zero_blocking(standby, &profile)?;
             },
-            MotionConnectedPiper::Soft(standby) => {
+            MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
                 let _standby = home_zero_blocking(standby, &profile)?;
+            },
+            MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+            | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+                anyhow::bail!("机械臂当前不在确认全失能的 Standby，请先执行 stop")
             },
         }
         println!("✅ 回零完成");

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::connection::initialize_connected_driver;
+use crate::connection::{InitialMotionState, InitializedConnection, initialize_connected_driver};
 use crate::state::capability::{
     CapabilityMarker, MonitorOnly, MotionCapability, SoftRealtime, StrictCapability,
     StrictRealtime, UnspecifiedCapability,
@@ -23,6 +23,9 @@ use tracing::{debug, info, trace};
 const COLLISION_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ZERO_SETTING_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const ZERO_SETTING_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const STATE_TRANSITION_SEND_TIMEOUT: Duration = Duration::from_millis(50);
+const STOP_PROPAGATION_GRACE: Duration = Duration::from_millis(100);
+const STOP_PROPAGATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 // ==================== 状态类型（零大小类型）====================
 
@@ -386,8 +389,8 @@ pub(crate) enum DriverModeDropPolicy {
 }
 
 pub enum ConnectedPiper {
-    Strict(Piper<Standby, StrictRealtime>),
-    Soft(Piper<Standby, SoftRealtime>),
+    Strict(MotionConnectedState<StrictRealtime>),
+    Soft(MotionConnectedState<SoftRealtime>),
     Monitor(Piper<Standby, MonitorOnly>),
 }
 
@@ -402,7 +405,7 @@ impl ConnectedPiper {
 
     pub fn require_strict(self) -> Result<Piper<Standby, StrictRealtime>> {
         match self {
-            Self::Strict(piper) => Ok(piper),
+            Self::Strict(state) => state.require_standby(),
             Self::Soft(_) | Self::Monitor(_) => Err(RobotError::realtime_unsupported(
                 "this connection is not StrictRealtime; match on ConnectedPiper or request AutoStrict",
             )),
@@ -411,8 +414,8 @@ impl ConnectedPiper {
 
     pub fn require_motion(self) -> Result<MotionConnectedPiper> {
         match self {
-            Self::Strict(piper) => Ok(MotionConnectedPiper::Strict(piper)),
-            Self::Soft(piper) => Ok(MotionConnectedPiper::Soft(piper)),
+            Self::Strict(state) => Ok(MotionConnectedPiper::Strict(state)),
+            Self::Soft(state) => Ok(MotionConnectedPiper::Soft(state)),
             Self::Monitor(_) => Err(RobotError::realtime_unsupported(
                 "monitor-only connections cannot enter motion control states",
             )),
@@ -420,9 +423,45 @@ impl ConnectedPiper {
     }
 }
 
+pub enum MotionConnectedState<Capability>
+where
+    Capability: MotionCapability,
+{
+    Standby(Piper<Standby, Capability>),
+    Maintenance(Piper<Maintenance, Capability>),
+}
+
+impl<Capability> MotionConnectedState<Capability>
+where
+    Capability: MotionCapability,
+{
+    pub fn observer(&self) -> &Observer<Capability> {
+        match self {
+            Self::Standby(piper) => piper.observer(),
+            Self::Maintenance(piper) => piper.observer(),
+        }
+    }
+
+    pub fn require_standby(self) -> Result<Piper<Standby, Capability>> {
+        match self {
+            Self::Standby(piper) => Ok(piper),
+            Self::Maintenance(piper) => Err(RobotError::maintenance_required(
+                piper.observer().joint_enabled_mask_confirmed(),
+            )),
+        }
+    }
+
+    pub fn into_maintenance(self) -> Piper<Maintenance, Capability> {
+        match self {
+            Self::Standby(piper) => piper.into_maintenance(),
+            Self::Maintenance(piper) => piper,
+        }
+    }
+}
+
 pub enum MotionConnectedPiper {
-    Strict(Piper<Standby, StrictRealtime>),
-    Soft(Piper<Standby, SoftRealtime>),
+    Strict(MotionConnectedState<StrictRealtime>),
+    Soft(MotionConnectedState<SoftRealtime>),
 }
 
 impl<State, Capability> Piper<State, Capability>
@@ -525,35 +564,71 @@ where
     }
 }
 
-pub(crate) fn connected_piper_from_driver(
+fn build_motion_connected_state<Capability>(
     driver: Arc<piper_driver::Piper>,
     quirks: DeviceQuirks,
-) -> ConnectedPiper {
+    initial_state: InitialMotionState,
+) -> MotionConnectedState<Capability>
+where
+    Capability: MotionCapability,
+{
+    match initial_state {
+        InitialMotionState::Standby => MotionConnectedState::Standby(Piper {
+            observer: Observer::<Capability>::new(driver.clone()),
+            driver,
+            quirks,
+            drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
+            _state: Standby,
+        }),
+        InitialMotionState::Maintenance { .. } => MotionConnectedState::Maintenance(Piper {
+            observer: Observer::<Capability>::new(driver.clone()),
+            driver,
+            quirks,
+            drop_policy: DropPolicy::DisableAll,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
+            _state: Maintenance,
+        }),
+    }
+}
+
+pub(crate) fn connected_piper_from_driver(
+    driver: Arc<piper_driver::Piper>,
+    initialized: InitializedConnection,
+) -> Result<ConnectedPiper> {
+    let InitializedConnection {
+        quirks,
+        initial_state,
+    } = initialized;
+
     match driver.backend_capability() {
-        BackendCapability::StrictRealtime => ConnectedPiper::Strict(Piper {
-            observer: Observer::<StrictRealtime>::new(driver.clone()),
-            driver,
-            quirks,
-            drop_policy: DropPolicy::Noop,
-            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
-            _state: Standby,
-        }),
-        BackendCapability::SoftRealtime => ConnectedPiper::Soft(Piper {
-            observer: Observer::<SoftRealtime>::new(driver.clone()),
-            driver,
-            quirks,
-            drop_policy: DropPolicy::Noop,
-            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
-            _state: Standby,
-        }),
-        BackendCapability::MonitorOnly => ConnectedPiper::Monitor(Piper {
-            observer: Observer::<MonitorOnly>::new(driver.clone()),
-            driver,
-            quirks,
-            drop_policy: DropPolicy::Noop,
-            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
-            _state: Standby,
-        }),
+        BackendCapability::StrictRealtime => {
+            Ok(ConnectedPiper::Strict(build_motion_connected_state::<
+                StrictRealtime,
+            >(
+                driver, quirks, initial_state
+            )))
+        },
+        BackendCapability::SoftRealtime => {
+            Ok(ConnectedPiper::Soft(build_motion_connected_state::<
+                SoftRealtime,
+            >(
+                driver, quirks, initial_state
+            )))
+        },
+        BackendCapability::MonitorOnly => match initial_state {
+            InitialMotionState::Standby => Ok(ConnectedPiper::Monitor(Piper {
+                observer: Observer::<MonitorOnly>::new(driver.clone()),
+                driver,
+                quirks,
+                drop_policy: DropPolicy::Noop,
+                driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
+                _state: Standby,
+            })),
+            InitialMotionState::Maintenance { .. } => Err(RobotError::maintenance_required(
+                initial_state.confirmed_mask(),
+            )),
+        },
     }
 }
 
@@ -609,13 +684,13 @@ impl Piper<Disconnected, UnspecifiedCapability> {
             None,
             config.feedback_timeout,
         )?);
-        let quirks = initialize_connected_driver(
+        let initialized = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
             config.firmware_timeout,
         )?;
 
-        Ok(connected_piper_from_driver(driver, quirks))
+        connected_piper_from_driver(driver, initialized)
     }
 
     /// 重新连接到机械臂（用于连接丢失后重新建立连接）
@@ -660,7 +735,7 @@ impl Piper<Disconnected, UnspecifiedCapability> {
             None,
             config.feedback_timeout,
         )?);
-        let quirks = initialize_connected_driver(
+        let initialized = initialize_connected_driver(
             driver.clone(),
             config.feedback_timeout,
             config.firmware_timeout,
@@ -668,7 +743,7 @@ impl Piper<Disconnected, UnspecifiedCapability> {
 
         // 5. 返回到 Standby 状态
         info!("Reconnection successful");
-        Ok(connected_piper_from_driver(driver, quirks))
+        connected_piper_from_driver(driver, initialized)
     }
 }
 
@@ -1465,8 +1540,27 @@ where
     fn send_disable_request(&self) -> Result<()> {
         use piper_protocol::control::MotorEnableCommand;
 
-        self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
+        self.driver
+            .abort_pending_normal_control_for_state_transition(STATE_TRANSITION_SEND_TIMEOUT)?;
+        self.driver.send_local_maintenance_frame_confirmed(
+            MotorEnableCommand::disable_all().to_frame(),
+            STATE_TRANSITION_SEND_TIMEOUT,
+        )?;
         Ok(())
+    }
+
+    fn wait_stop_propagation_grace(&self, grace: Duration, poll_interval: Duration) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            self.ensure_runtime_health_healthy()?;
+
+            let elapsed = start.elapsed();
+            if elapsed >= grace {
+                return Ok(());
+            }
+
+            std::thread::sleep(poll_interval.min(grace.saturating_sub(elapsed)));
+        }
     }
 
     fn into_state<NextState>(
@@ -1729,9 +1823,6 @@ where
     /// # }
     /// ```
     pub fn shutdown(self) -> Result<Piper<Standby, Capability>> {
-        use piper_protocol::control::*;
-        use std::time::Duration;
-
         info!("Starting graceful robot shutdown");
 
         // === PHASE 1: All operations that can panic ===
@@ -1751,12 +1842,11 @@ where
         // - 我们需要确保硬件达到安全状态
         // - 替代方案（轮询"已停止"状态）不可靠
         trace!("Waiting for robot to stop (allowing CAN command propagation)");
-        std::thread::sleep(Duration::from_millis(100));
+        self.wait_stop_propagation_grace(STOP_PROPAGATION_GRACE, STOP_PROPAGATION_POLL_INTERVAL)?;
 
         // 3. 失能电机
         trace!("Disabling motors");
-        let disable_cmd = MotorEnableCommand::disable_all();
-        self.driver.send_reliable(disable_cmd.to_frame())?;
+        self.send_disable_request()?;
 
         // 4. 等待失能确认
         trace!("Waiting for disable confirmation");
@@ -1817,7 +1907,7 @@ where
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
     /// # use piper_client::state::{MotionCapability, Piper, Standby};
     /// # fn run_example<C: MotionCapability>(
     /// #     standby: Piper<Standby, C>,
@@ -1839,8 +1929,12 @@ where
     ///     .build()?;
     ///
     /// match robot.require_motion()? {
-    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
-    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+    ///     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+    ///         return Err("robot is not in confirmed Standby".into());
+    ///     }
     /// }
     ///
     /// // 真实代码里，active 仍然可以正常使用
@@ -2816,7 +2910,7 @@ where
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
     /// # use piper_client::state::{MotionCapability, Piper, Standby};
     /// # use std::sync::atomic::{AtomicBool, Ordering};
     /// # use std::sync::Arc;
@@ -2842,8 +2936,12 @@ where
     ///     .build()?;
     ///
     /// match robot.require_motion()? {
-    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
-    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+    ///     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+    ///         return Err("robot is not in confirmed Standby".into());
+    ///     }
     /// }
     /// # Ok(())
     /// # }
@@ -4029,6 +4127,49 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_fails_fast_when_runtime_fault_latches_during_stop_grace() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames.clone(),
+        );
+        let driver = Arc::clone(&active.driver);
+        let latch_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            driver.latch_fault();
+        });
+
+        let start = Instant::now();
+        let error = match active.shutdown() {
+            Ok(_) => panic!("runtime fault should fail graceful shutdown during stop grace"),
+            Err(error) => error,
+        };
+        let elapsed = start.elapsed();
+        latch_handle.join().expect("fault latch helper should finish cleanly");
+
+        assert!(matches!(
+            error,
+            RobotError::RuntimeHealthUnhealthy {
+                fault: Some(RuntimeFaultKind::ManualFault),
+                ..
+            }
+        ));
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "shutdown should fail fast instead of blindly waiting 100ms (elapsed: {:?})",
+            elapsed
+        );
+        let disable_all = piper_protocol::control::MotorEnableCommand::disable_all().to_frame();
+        assert!(
+            !sent_frames
+                .lock()
+                .expect("sent frames lock")
+                .contains(&disable_all),
+            "fail-fast shutdown must not enqueue a disable request after the runtime becomes unhealthy",
+        );
+    }
+
+    #[test]
     fn set_joint_zero_positions_waits_for_confirmed_setting_response() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let standby = build_standby_piper(
@@ -4256,8 +4397,12 @@ mod tests {
         );
         let monitor = connected_piper_from_driver(
             monitor_driver,
-            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
-        );
+            InitializedConnection {
+                quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+                initial_state: InitialMotionState::Standby,
+            },
+        )
+        .expect("monitor connection should initialize as standby");
         match monitor {
             ConnectedPiper::Monitor(piper) => {
                 let monitor_driver = piper.driver.clone();
@@ -4288,14 +4433,78 @@ mod tests {
         );
         let connected = connected_piper_from_driver(
             driver,
-            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
-        );
+            InitializedConnection {
+                quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+                initial_state: InitialMotionState::Standby,
+            },
+        )
+        .expect("monitor connection should initialize");
 
         let error = match connected.require_motion() {
             Ok(_) => panic!("monitor-only connection must remain read-only"),
             Err(error) => error,
         };
         assert!(matches!(error, RobotError::RealtimeUnsupported { .. }));
+    }
+
+    #[test]
+    fn strict_connection_returns_maintenance_when_initial_mask_is_not_fully_disabled() {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                RecordingTxAdapter::new(Arc::new(Mutex::new(Vec::new()))),
+                None,
+            )
+            .expect("strict driver should start"),
+        );
+        let connected = connected_piper_from_driver(
+            driver,
+            InitializedConnection {
+                quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+                initial_state: InitialMotionState::Maintenance {
+                    confirmed_mask: Some(0b000001),
+                },
+            },
+        )
+        .expect("strict connection should expose maintenance instead of failing");
+
+        match connected {
+            ConnectedPiper::Strict(MotionConnectedState::Maintenance(piper)) => {
+                assert_eq!(piper.observer().joint_enabled_mask_confirmed(), None);
+            },
+            _ => panic!("expected strict maintenance connection"),
+        }
+    }
+
+    #[test]
+    fn monitor_connection_requires_confirmed_standby() {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                MonitorCapabilityRx::new(IdleRxAdapter::new()),
+                RecordingTxAdapter::new(Arc::new(Mutex::new(Vec::new()))),
+                None,
+            )
+            .expect("monitor driver should start"),
+        );
+        let error = match connected_piper_from_driver(
+            driver,
+            InitializedConnection {
+                quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+                initial_state: InitialMotionState::Maintenance {
+                    confirmed_mask: None,
+                },
+            },
+        ) {
+            Ok(_) => panic!("monitor connection must reject non-standby initial state"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RobotError::MaintenanceRequired {
+                confirmed_mask: None
+            }
+        ));
     }
 
     #[test]

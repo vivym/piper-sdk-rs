@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use clap::Args;
-use piper_sdk::client::MotionConnectedPiper;
 use piper_sdk::client::state::DisableConfig;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -24,17 +24,25 @@ impl StopCommand {
         let robot = robot.require_motion()?;
         println!("🛑 发送急停命令（失能所有关节）...");
         match robot {
-            MotionConnectedPiper::Strict(robot) => {
+            MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => {
                 let _ = robot
                     .into_maintenance()
                     .request_disable_all()?
                     .wait_until_disabled(DisableConfig::default())?;
             },
-            MotionConnectedPiper::Soft(robot) => {
+            MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(robot)) => {
+                let _ =
+                    robot.request_disable_all()?.wait_until_disabled(DisableConfig::default())?;
+            },
+            MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => {
                 let _ = robot
                     .into_maintenance()
                     .request_disable_all()?
                     .wait_until_disabled(DisableConfig::default())?;
+            },
+            MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(robot)) => {
+                let _ =
+                    robot.request_disable_all()?.wait_until_disabled(DisableConfig::default())?;
             },
         }
         println!("✅ 急停完成");

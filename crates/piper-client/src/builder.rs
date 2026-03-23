@@ -77,13 +77,13 @@ impl PiperBuilder {
                 .build()?,
         );
 
-        let quirks = initialize_connected_driver(
+        let initialized = initialize_connected_driver(
             driver.clone(),
             self.feedback_timeout,
             self.firmware_timeout,
         )?;
 
-        Ok(machine::connected_piper_from_driver(driver, quirks))
+        machine::connected_piper_from_driver(driver, initialized)
     }
 }
 

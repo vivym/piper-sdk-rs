@@ -20,9 +20,9 @@
 //! ```
 
 use clap::Parser;
-use piper_sdk::client::MotionConnectedPiper;
 use piper_sdk::client::state::MotionCapability;
 use piper_sdk::client::state::*;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 use piper_sdk::prelude::*;
 use std::time::{Duration, Instant};
 
@@ -76,8 +76,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let robot = robot.require_motion()?;
     match robot {
-        MotionConnectedPiper::Strict(robot) => run_demo(robot)?,
-        MotionConnectedPiper::Soft(robot) => run_demo(robot)?,
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => run_demo(robot)?,
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => run_demo(robot)?,
+        MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+            return Err("robot is not in confirmed Standby; run stop first".into());
+        },
     }
 
     Ok(())

@@ -27,13 +27,13 @@ impl PositionCommand {
         println!("🔌 连接到机器人...");
         let robot = builder.build()?;
         let (positions, end_pose) = match &robot {
-            ConnectedPiper::Strict(robot) => (
-                robot.observer().joint_positions()?,
-                robot.observer().end_pose()?,
+            ConnectedPiper::Strict(state) => (
+                state.observer().joint_positions()?,
+                state.observer().end_pose()?,
             ),
-            ConnectedPiper::Soft(robot) => (
-                robot.observer().joint_positions()?,
-                robot.observer().end_pose()?,
+            ConnectedPiper::Soft(state) => (
+                state.observer().joint_positions()?,
+                state.observer().end_pose()?,
             ),
             ConnectedPiper::Monitor(robot) => (
                 robot.observer().joint_positions()?,

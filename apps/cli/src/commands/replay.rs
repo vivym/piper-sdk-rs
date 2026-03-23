@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::Args;
 use piper_control::TargetSpec;
 use piper_sdk::client::state::{MotionCapability, Standby};
-use piper_sdk::client::{MotionConnectedPiper, Piper};
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState, Piper};
 use piper_sdk::driver::ConnectionTarget;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -199,11 +199,17 @@ impl ReplayCommand {
         // === 进入回放模式 ===
 
         match standby {
-            MotionConnectedPiper::Strict(standby) => {
+            MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
                 Self::replay_with_standby(standby, &input, speed, &running)
             },
-            MotionConnectedPiper::Soft(standby) => {
+            MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
                 Self::replay_with_standby(standby, &input, speed, &running)
+            },
+            MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+            | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+                Err(anyhow::anyhow!(
+                    "机械臂当前不在确认全失能的 Standby，请先执行 stop 或手动进入维护流程"
+                ))
             },
         }
     }

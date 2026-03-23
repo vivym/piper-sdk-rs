@@ -114,6 +114,7 @@ pub use client::{
     MonitorOnly,
     MonitorReadPolicy,
     MotionConnectedPiper,
+    MotionConnectedState,
     Observer,
     PiperBridgeClient,
     PiperBridgeHost,

@@ -119,6 +119,10 @@ pub enum DriverError {
     #[error("Command aborted because runtime fault latched")]
     CommandAbortedByFault,
 
+    /// 命令因本地状态切换被主动清理
+    #[error("Command aborted by local state transition")]
+    CommandAbortedByStateTransition,
+
     /// 维护写入在发送点被运行时状态拒绝
     #[error("Maintenance write denied: {0}")]
     MaintenanceWriteDenied(String),
@@ -215,6 +219,10 @@ mod tests {
         };
         let msg = format!("{}", driver_error);
         assert!(msg.contains("Reliable delivery failed"));
+
+        let driver_error = DriverError::CommandAbortedByStateTransition;
+        let msg = format!("{}", driver_error);
+        assert!(msg.contains("state transition"));
 
         let driver_error = DriverError::ReliablePackageDeliveryFailed {
             sent: 2,

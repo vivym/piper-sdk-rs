@@ -416,7 +416,7 @@ fn apply_maintenance_control_op(state: &mut MaintenanceTxState, op: MaintenanceC
 
 struct MaintenanceLaneDispatch {
     frame: PiperFrame,
-    meta: crate::command::MaintenanceCommandMeta,
+    meta: Option<crate::command::MaintenanceCommandMeta>,
     deadline: Instant,
     ack: crossbeam_channel::Sender<MaintenanceSendPhase>,
 }
@@ -424,6 +424,11 @@ struct MaintenanceLaneDispatch {
 fn drain_maintenance_lane(
     maintenance_lane_rx: &Receiver<MaintenanceLaneCommand>,
     maintenance_tx_state: &mut MaintenanceTxState,
+    realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
+    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    reliable_rx: &Receiver<crate::command::ReliableCommand>,
+    pending_reliable_commands: &mut VecDeque<crate::command::ReliableCommand>,
+    metrics: &Arc<PiperMetrics>,
 ) -> VecDeque<MaintenanceLaneDispatch> {
     let mut pending_sends = VecDeque::new();
     loop {
@@ -437,6 +442,16 @@ fn drain_maintenance_lane(
                     let _ = ack.send(());
                 }
             },
+            MaintenanceLaneCommand::AbortPendingNormalControl { ack } => {
+                abort_pending_normal_control_for_state_transition(
+                    realtime_slot,
+                    soft_realtime_rx,
+                    reliable_rx,
+                    pending_reliable_commands,
+                    metrics,
+                );
+                let _ = ack.send(());
+            },
             MaintenanceLaneCommand::Send {
                 frame,
                 meta,
@@ -445,7 +460,19 @@ fn drain_maintenance_lane(
             } => {
                 pending_sends.push_back(MaintenanceLaneDispatch {
                     frame,
-                    meta,
+                    meta: Some(meta),
+                    deadline,
+                    ack,
+                });
+            },
+            MaintenanceLaneCommand::LocalSend {
+                frame,
+                deadline,
+                ack,
+            } => {
+                pending_sends.push_front(MaintenanceLaneDispatch {
+                    frame,
+                    meta: None,
                     deadline,
                     ack,
                 });
@@ -1321,6 +1348,7 @@ pub fn tx_loop_mailbox(
     let mut soft_deadline_miss_streak = 0u32;
     let mut maintenance_tx_state = MaintenanceTxState::from_snapshot(maintenance_gate.snapshot());
     let mut pending_maintenance_sends = VecDeque::new();
+    let mut pending_reliable_commands = VecDeque::new();
     let mut running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
     let mut fault_latched_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
 
@@ -1361,6 +1389,11 @@ pub fn tx_loop_mailbox(
         pending_maintenance_sends.extend(drain_maintenance_lane(
             &maintenance_lane_rx,
             &mut maintenance_tx_state,
+            &realtime_slot,
+            &soft_realtime_rx,
+            &reliable_rx,
+            &mut pending_reliable_commands,
+            &metrics,
         ));
 
         if let Some(dispatch) = pending_maintenance_sends.pop_front() {
@@ -1387,8 +1420,9 @@ pub fn tx_loop_mailbox(
 
             let send_result = if Instant::now() >= dispatch.deadline {
                 Err(crate::DriverError::Timeout)
-            } else if let Some(denied) =
-                maintenance_send_denial(&maintenance_tx_state, dispatch.meta)
+            } else if let Some(denied) = dispatch
+                .meta
+                .and_then(|meta| maintenance_send_denial(&maintenance_tx_state, meta))
             {
                 Err(denied)
             } else {
@@ -1461,7 +1495,13 @@ pub fn tx_loop_mailbox(
         if phase == RuntimePhase::FaultLatched {
             abort_realtime_slot_fault(&realtime_slot, &metrics);
             drain_soft_realtime_queue(&soft_realtime_rx, &metrics, true, true);
-            drain_reliable_queue(&reliable_rx, &metrics, true, true);
+            drain_reliable_queue(
+                &reliable_rx,
+                &mut pending_reliable_commands,
+                &metrics,
+                true,
+                true,
+            );
             let (sleep_duration, next_backoff_us) = tx_idle_backoff(
                 TX_IDLE_BACKOFF_MIN_US,
                 fault_latched_idle_backoff_us,
@@ -1754,7 +1794,9 @@ pub fn tx_loop_mailbox(
             continue;
         }
 
-        if let Ok(command) = reliable_rx.try_recv() {
+        if let Some(command) =
+            pending_reliable_commands.pop_front().or_else(|| reliable_rx.try_recv().ok())
+        {
             running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
             let total_frames = command.len();
             let package_command = total_frames > 1;
@@ -1985,7 +2027,13 @@ pub fn tx_loop_mailbox(
         maintenance_gate.local_set_state(MaintenanceGateState::DeniedFaulted);
     }
     shutdown_lane.close_with(Err(crate::DriverError::ChannelClosed));
-    drain_reliable_queue(&reliable_rx, &metrics, false, false);
+    drain_reliable_queue(
+        &reliable_rx,
+        &mut pending_reliable_commands,
+        &metrics,
+        false,
+        false,
+    );
     drain_soft_realtime_queue(&soft_realtime_rx, &metrics, false, false);
     abort_realtime_slot_with(
         &realtime_slot,
@@ -2026,19 +2074,56 @@ fn abort_realtime_slot_with(
     }
 }
 
+fn drain_reliable_queue_with<F>(
+    reliable_rx: &Receiver<crate::command::ReliableCommand>,
+    pending_reliable_commands: &mut VecDeque<crate::command::ReliableCommand>,
+    metrics: &Arc<PiperMetrics>,
+    count_as_fault_abort: bool,
+    mut should_abort: F,
+    reason: impl Fn() -> crate::DriverError,
+) where
+    F: FnMut(&crate::command::ReliableCommand) -> bool,
+{
+    let mut survivors = VecDeque::new();
+    while let Some(command) = pending_reliable_commands.pop_front() {
+        if should_abort(&command) {
+            if count_as_fault_abort {
+                count_fault_abort(metrics);
+            }
+            command.complete(Err(reason()));
+        } else {
+            survivors.push_back(command);
+        }
+    }
+    pending_reliable_commands.extend(survivors);
+
+    while let Ok(command) = reliable_rx.try_recv() {
+        if should_abort(&command) {
+            if count_as_fault_abort {
+                count_fault_abort(metrics);
+            }
+            command.complete(Err(reason()));
+        } else {
+            pending_reliable_commands.push_back(command);
+        }
+    }
+}
+
 fn drain_reliable_queue(
     reliable_rx: &Receiver<crate::command::ReliableCommand>,
+    pending_reliable_commands: &mut VecDeque<crate::command::ReliableCommand>,
     metrics: &Arc<PiperMetrics>,
     fault_latched: bool,
     count_as_fault_abort: bool,
 ) {
-    while let Ok(command) = reliable_rx.try_recv() {
-        if count_as_fault_abort {
-            count_fault_abort(metrics);
-        }
-        let reason = reliable_abort_error(fault_latched);
-        command.complete(Err(reason));
-    }
+    drain_reliable_queue_with(
+        reliable_rx,
+        pending_reliable_commands,
+        metrics,
+        count_as_fault_abort,
+        |_| true,
+        move || reliable_abort_error(fault_latched),
+    );
 }
 
 fn drain_soft_realtime_queue(
@@ -2047,17 +2132,54 @@ fn drain_soft_realtime_queue(
     fault_latched: bool,
     count_as_fault_abort: bool,
 ) {
-    while let Ok(command) = soft_realtime_rx.try_recv() {
-        if count_as_fault_abort {
-            count_fault_abort(metrics);
-        }
-        let reason = if fault_latched {
-            crate::DriverError::CommandAbortedByFault
-        } else {
-            crate::DriverError::ChannelClosed
-        };
-        command.complete(Err(reason));
-    }
+    drain_soft_realtime_queue_with_reason(
+        soft_realtime_rx,
+        metrics,
+        move || {
+            if fault_latched {
+                crate::DriverError::CommandAbortedByFault
+            } else {
+                crate::DriverError::ChannelClosed
+            }
+        },
+        count_as_fault_abort,
+    );
+}
+
+fn reliable_command_contains_normal_control(command: &crate::command::ReliableCommand) -> bool {
+    command.kind() == crate::command::ReliableCommandKind::Standard
+        && command
+            .iter()
+            .any(|frame| (CONTROL_BASE_ID..=CONTROL_END_ID).contains(&frame.id))
+}
+
+fn abort_pending_normal_control_for_state_transition(
+    realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
+    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    reliable_rx: &Receiver<crate::command::ReliableCommand>,
+    pending_reliable_commands: &mut VecDeque<crate::command::ReliableCommand>,
+    metrics: &Arc<PiperMetrics>,
+) {
+    abort_realtime_slot_with(
+        realtime_slot,
+        metrics,
+        crate::DriverError::CommandAbortedByStateTransition,
+        false,
+    );
+    drain_soft_realtime_queue_with_reason(
+        soft_realtime_rx,
+        metrics,
+        || crate::DriverError::CommandAbortedByStateTransition,
+        false,
+    );
+    drain_reliable_queue_with(
+        reliable_rx,
+        pending_reliable_commands,
+        metrics,
+        false,
+        reliable_command_contains_normal_control,
+        || crate::DriverError::CommandAbortedByStateTransition,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

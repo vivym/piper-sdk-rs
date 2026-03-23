@@ -167,6 +167,15 @@ pub enum RobotError {
         reason: String,
     },
 
+    /// 当前连接未能证明“确认全关节失能”，需要显式进入 Maintenance 处理
+    #[error(
+        "Maintenance required before entering Standby-only API (confirmed joint-enabled mask: {confirmed_mask:?})"
+    )]
+    MaintenanceRequired {
+        /// 已确认的关节使能掩码；`None` 表示连接期未收齐足够低速反馈
+        confirmed_mask: Option<u8>,
+    },
+
     /// 运行时健康状态异常
     #[error("Runtime health unhealthy: rx_alive={rx_alive}, tx_alive={tx_alive}, fault={fault:?}")]
     RuntimeHealthUnhealthy {
@@ -347,7 +356,10 @@ impl RobotError {
     pub fn is_config_error(&self) -> bool {
         matches!(
             self,
-            Self::ConfigError(_) | Self::InvalidParameter { .. } | Self::RealtimeUnsupported { .. }
+            Self::ConfigError(_)
+                | Self::InvalidParameter { .. }
+                | Self::RealtimeUnsupported { .. }
+                | Self::MaintenanceRequired { .. }
         )
     }
 
@@ -457,6 +469,11 @@ impl RobotError {
         Self::RealtimeUnsupported {
             reason: reason.into(),
         }
+    }
+
+    /// 创建需要显式 Maintenance 处理的错误
+    pub fn maintenance_required(confirmed_mask: Option<u8>) -> Self {
+        Self::MaintenanceRequired { confirmed_mask }
     }
 
     /// 创建运行时健康异常错误

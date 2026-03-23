@@ -1,8 +1,8 @@
 //! 脚本系统
 
 use anyhow::{Context, Result};
-use piper_client::MotionConnectedPiper;
 use piper_client::state::{DisableConfig, MotionCapability, Piper, Standby};
+use piper_client::{MotionConnectedPiper, MotionConnectedState};
 use piper_control::{
     ControlProfile, home_zero_blocking, move_to_joint_target_blocking, park_blocking, prepare_move,
     set_joint_zero_blocking,
@@ -101,24 +101,44 @@ impl ScriptExecutor {
         println!("✅ 已连接\n");
 
         match connected {
-            MotionConnectedPiper::Strict(standby) => self.execute_motion_script(standby, script, || {
-                match client_builder(&reconnect_target).build()?.require_motion()? {
-                    MotionConnectedPiper::Strict(standby) => Ok(standby),
-                    MotionConnectedPiper::Soft(_) => Err(anyhow::anyhow!(
-                        "reconnect changed backend capability from StrictRealtime to SoftRealtime"
-                    )),
-                }
-            })
-            .await,
-            MotionConnectedPiper::Soft(standby) => self.execute_motion_script(standby, script, || {
-                match client_builder(&reconnect_target).build()?.require_motion()? {
-                    MotionConnectedPiper::Soft(standby) => Ok(standby),
-                    MotionConnectedPiper::Strict(_) => Err(anyhow::anyhow!(
-                        "reconnect changed backend capability from SoftRealtime to StrictRealtime"
-                    )),
-                }
-            })
-            .await,
+            MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => self
+                .execute_motion_script(standby, script, || {
+                    match client_builder(&reconnect_target).build()?.require_motion()? {
+                        MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
+                            Ok(standby)
+                        },
+                        MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_)) => Err(
+                            anyhow::anyhow!(
+                                "reconnect returned Maintenance instead of confirmed Standby"
+                            ),
+                        ),
+                        MotionConnectedPiper::Soft(_) => Err(anyhow::anyhow!(
+                            "reconnect changed backend capability from StrictRealtime to SoftRealtime"
+                        )),
+                    }
+                })
+                .await,
+            MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => self
+                .execute_motion_script(standby, script, || {
+                    match client_builder(&reconnect_target).build()?.require_motion()? {
+                        MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
+                            Ok(standby)
+                        },
+                        MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => Err(
+                            anyhow::anyhow!(
+                                "reconnect returned Maintenance instead of confirmed Standby"
+                            ),
+                        ),
+                        MotionConnectedPiper::Strict(_) => Err(anyhow::anyhow!(
+                            "reconnect changed backend capability from SoftRealtime to StrictRealtime"
+                        )),
+                    }
+                })
+                .await,
+            MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+            | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => Err(
+                anyhow::anyhow!("机械臂当前不在确认全失能的 Standby，请先执行 stop"),
+            ),
         }
     }
 

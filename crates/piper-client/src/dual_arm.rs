@@ -2967,7 +2967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_bilateral_with_compensation_adds_model_torque() {
+    fn test_run_bilateral_with_compensation_preempts_final_cycle_before_disable() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let arms = DualArmActiveMit {
@@ -3020,23 +3020,24 @@ mod tests {
             },
         }
 
-        let right_frames = wait_for_sent_frames(&right_sent, 7);
-        let left_frames = wait_for_sent_frames(&left_sent, 7);
+        let right_frames = wait_for_sent_frames(&right_sent, 1);
+        let left_frames = wait_for_sent_frames(&left_sent, 1);
         let expected_slave = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.6)
             .expect("expected slave command")
             .to_frame();
         let expected_master = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.4)
             .expect("expected master command")
             .to_frame();
+        let disable_all = piper_protocol::control::MotorEnableCommand::disable_all().to_frame();
         assert!(
-            right_frames.iter().any(|frame| {
-                frame.id == expected_slave.id && frame.data == expected_slave.data
-            })
+            right_frames[0] == expected_slave || right_frames[0] == disable_all,
+            "expected either a single committed slave MIT frame or immediate disable, got {:?}",
+            right_frames[0]
         );
         assert!(
-            left_frames.iter().any(|frame| {
-                frame.id == expected_master.id && frame.data == expected_master.data
-            })
+            left_frames[0] == expected_master || left_frames[0] == disable_all,
+            "expected either a single committed master MIT frame or immediate disable, got {:?}",
+            left_frames[0]
         );
     }
 
@@ -3265,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_bilateral_warmup_uses_anchor_hold() {
+    fn test_run_bilateral_warmup_cycle_is_preempted_by_disable_on_clean_exit() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let arms = DualArmActiveMit {
@@ -3300,14 +3301,9 @@ mod tests {
             DualArmLoopExit::Faulted { .. } => panic!("expected standby exit"),
         }
 
+        let disable_all = piper_protocol::control::MotorEnableCommand::disable_all().to_frame();
         let left_frames = wait_for_sent_frames(&left_sent, 1);
-        let hold = MitControlCommand::try_new(1, 0.0, 0.0, 5.0, 0.8, 0.0)
-            .expect("expected hold command")
-            .to_frame();
-        assert!(
-            left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
-            "expected warmup hold command",
-        );
+        assert_eq!(left_frames[0], disable_all);
     }
 
     #[test]
@@ -3772,7 +3768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_bilateral_executes_single_iteration_and_returns_standby() {
+    fn test_run_bilateral_executes_single_iteration_and_preempts_final_cycle_before_disable() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let arms = DualArmActiveMit {
@@ -3813,8 +3809,19 @@ mod tests {
             },
         }
 
-        let left_frames = wait_for_sent_frames(&left_sent, 7);
-        assert_eq!(left_frames[0].id, 0x15A);
+        let left_frames = wait_for_sent_frames(&left_sent, 1);
+        let right_frames = wait_for_sent_frames(&right_sent, 1);
+        let disable_all = piper_protocol::control::MotorEnableCommand::disable_all().to_frame();
+        assert!(
+            left_frames[0].id == 0x15A || left_frames[0] == disable_all,
+            "expected either one committed MIT frame or immediate disable, got {:?}",
+            left_frames[0]
+        );
+        assert!(
+            right_frames[0].id == 0x15A || right_frames[0] == disable_all,
+            "expected either one committed MIT frame or immediate disable, got {:?}",
+            right_frames[0]
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::safety::confirm_prepared_move;
 use anyhow::{Context, Result};
 use clap::Args;
 use piper_control::{move_to_joint_target_blocking, prepare_move};
-use piper_sdk::client::MotionConnectedPiper;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 #[derive(Args, Debug, Clone)]
 pub struct MoveCommand {
@@ -78,13 +78,17 @@ impl MoveCommand {
         }
 
         match standby {
-            MotionConnectedPiper::Strict(standby) => {
+            MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
                 let _standby =
                     move_to_joint_target_blocking(standby, &profile, prepared.effective_target)?;
             },
-            MotionConnectedPiper::Soft(standby) => {
+            MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
                 let _standby =
                     move_to_joint_target_blocking(standby, &profile, prepared.effective_target)?;
+            },
+            MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+            | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+                anyhow::bail!("机械臂当前不在确认全失能的 Standby，请先执行 stop")
             },
         }
         println!("✅ 移动完成");
@@ -94,8 +98,8 @@ impl MoveCommand {
 
 fn current_positions(standby: &MotionConnectedPiper) -> Result<[f64; 6]> {
     let positions = match standby {
-        MotionConnectedPiper::Strict(standby) => standby.observer().joint_positions()?,
-        MotionConnectedPiper::Soft(standby) => standby.observer().joint_positions()?,
+        MotionConnectedPiper::Strict(state) => state.observer().joint_positions()?,
+        MotionConnectedPiper::Soft(state) => state.observer().joint_positions()?,
     };
     Ok(std::array::from_fn(|index| positions[index].0))
 }

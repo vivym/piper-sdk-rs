@@ -46,7 +46,7 @@
 //! ## 基础使用
 //!
 //! ```rust,no_run
-//! use piper_client::{MotionConnectedPiper, PiperBuilder};
+//! use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
 //! use piper_client::state::{MotionCapability, Piper, Standby};
 //! use piper_driver::recording::AsyncRecordingHook;
 //! use std::sync::Arc;
@@ -80,8 +80,12 @@
 //!     .build()?;
 //!
 //! match robot.require_motion()? {
-//!     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
-//!     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+//!     MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+//!     MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+//!     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+//!     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+//!         return Err("robot is not in confirmed Standby".into());
+//!     }
 //! }
 //! # Ok(())
 //! # }
@@ -90,7 +94,7 @@
 //! ## 跨线程长期持有
 //!
 //! ```rust,no_run
-//! use piper_client::{MotionConnectedPiper, PiperBuilder};
+//! use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
 //! use piper_client::state::{MotionCapability, Piper, Standby};
 //! use std::thread;
 //!
@@ -122,8 +126,12 @@
 //!     .build()?;
 //!
 //! match robot.require_motion()? {
-//!     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
-//!     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+//!     MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+//!     MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+//!     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+//!     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+//!         return Err("robot is not in confirmed Standby".into());
+//!     }
 //! }
 //!
 //! # Ok(())
@@ -182,7 +190,7 @@ impl PiperDiagnostics {
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
     /// # use piper_client::state::{MotionCapability, Piper, Standby};
     /// # use piper_driver::recording::AsyncRecordingHook;
     /// # use std::sync::Arc;
@@ -202,8 +210,12 @@ impl PiperDiagnostics {
     ///     .build()?;
     ///
     /// match robot.require_motion()? {
-    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
-    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+    ///     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+    ///         return Err("robot is not in confirmed Standby".into());
+    ///     }
     /// }
     /// # Ok(())
     /// # }
@@ -240,7 +252,7 @@ impl PiperDiagnostics {
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
     /// # use piper_client::state::{MotionCapability, Piper, Standby};
     /// # use piper_can::PiperFrame;
     /// # fn run_example<C: MotionCapability>(
@@ -266,8 +278,12 @@ impl PiperDiagnostics {
     ///     .build()?;
     ///
     /// match robot.require_motion()? {
-    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
-    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+    ///     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+    ///         return Err("robot is not in confirmed Standby".into());
+    ///     }
     /// }
     /// # Ok(())
     /// # }
@@ -301,7 +317,7 @@ impl PiperDiagnostics {
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
     /// # use piper_client::state::{MotionCapability, Piper, Standby};
     /// # fn run_example<C: MotionCapability>(
     /// #     standby: Piper<Standby, C>,
@@ -323,8 +339,12 @@ impl PiperDiagnostics {
     ///     .build()?;
     ///
     /// match robot.require_motion()? {
-    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
-    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+    ///     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+    ///     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+    ///         return Err("robot is not in confirmed Standby".into());
+    ///     }
     /// }
     /// # Ok(())
     /// # }

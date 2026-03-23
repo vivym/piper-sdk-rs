@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 use piper_control::set_joint_zero_blocking;
-use piper_sdk::client::MotionConnectedPiper;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -43,8 +43,16 @@ impl SetZeroCommand {
         let standby = builder.build()?;
         let standby = standby.require_motion()?;
         match &standby {
-            MotionConnectedPiper::Strict(standby) => set_joint_zero_blocking(standby, &joints)?,
-            MotionConnectedPiper::Soft(standby) => set_joint_zero_blocking(standby, &joints)?,
+            MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
+                set_joint_zero_blocking(standby, &joints)?
+            },
+            MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
+                set_joint_zero_blocking(standby, &joints)?
+            },
+            MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+            | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+                anyhow::bail!("机械臂当前不在确认全失能的 Standby，请先执行 stop")
+            },
         }
         println!("✅ 零点标定命令已发送");
         Ok(())

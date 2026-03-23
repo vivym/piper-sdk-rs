@@ -4,10 +4,10 @@ use crate::commands::config::CliConfig;
 use crate::connection::client_builder;
 use crate::parsing::{parse_collision_levels, parse_joint_indices_arg};
 use anyhow::{Result, bail};
-use piper_client::MotionConnectedPiper;
 use piper_client::state::{
     Active, DisableConfig, Piper as StatePiper, PositionMode, SoftRealtime, Standby, StrictRealtime,
 };
+use piper_client::{MotionConnectedPiper, MotionConnectedState};
 use piper_control::{
     ControlProfile, MotionExecutionOutcome, PreparedMove, TargetSpec,
     active_move_to_joint_target_with_cancel, prepare_move, query_collision_protection_blocking,
@@ -89,8 +89,16 @@ impl ReplSession {
         let builder = client_builder(&self.profile.target);
         let robot = builder.build()?.require_motion()?;
         self.state = match robot {
-            MotionConnectedPiper::Strict(robot) => ReplState::StandbyStrict(robot),
-            MotionConnectedPiper::Soft(robot) => ReplState::StandbySoft(robot),
+            MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => {
+                ReplState::StandbyStrict(robot)
+            },
+            MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => {
+                ReplState::StandbySoft(robot)
+            },
+            MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+            | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+                bail!("机械臂当前不在确认全失能的 Standby，请先执行 stop")
+            },
         };
 
         println!("✅ 已连接");

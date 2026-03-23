@@ -6,7 +6,7 @@
 use clap::Parser;
 use piper_sdk::{
     BridgeHostConfig, BridgeRole, BridgeTlsClientPolicy, BridgeTlsServerConfig,
-    BridgeUdsListenerConfig, ConnectedPiper, PiperBuilder,
+    BridgeUdsListenerConfig, ConnectedPiper, MotionConnectedState, PiperBuilder,
 };
 use std::path::PathBuf;
 
@@ -120,8 +120,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_raw_frame_tap: args.allow_raw_frame_tap,
     };
     let host = match piper {
-        ConnectedPiper::Strict(piper) => piper.attach_bridge_host(host_config.clone()),
-        ConnectedPiper::Soft(piper) => piper.attach_bridge_host(host_config.clone()),
+        ConnectedPiper::Strict(MotionConnectedState::Standby(piper)) => {
+            piper.attach_bridge_host(host_config.clone())
+        },
+        ConnectedPiper::Strict(MotionConnectedState::Maintenance(piper)) => {
+            piper.attach_bridge_host(host_config.clone())
+        },
+        ConnectedPiper::Soft(MotionConnectedState::Standby(piper)) => {
+            piper.attach_bridge_host(host_config.clone())
+        },
+        ConnectedPiper::Soft(MotionConnectedState::Maintenance(piper)) => {
+            piper.attach_bridge_host(host_config.clone())
+        },
         ConnectedPiper::Monitor(piper) => piper.attach_bridge_host(host_config),
     };
 

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use piper_control::{query_collision_protection_blocking, set_collision_protection_verified};
-use piper_sdk::client::MotionConnectedPiper;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 use crate::commands::config::CliConfig;
 use crate::connection::{TargetArgs, client_builder};
@@ -43,15 +43,19 @@ impl CollisionProtectionCommand {
                 let builder = client_builder(&profile.target);
                 let standby = builder.build()?.require_motion()?;
                 match &standby {
-                    MotionConnectedPiper::Strict(standby) => {
+                    MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
                         print_collision_protection_levels(|| {
                             query_collision_protection_blocking(standby, &profile.wait)
                         })
                     },
-                    MotionConnectedPiper::Soft(standby) => {
+                    MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
                         print_collision_protection_levels(|| {
                             query_collision_protection_blocking(standby, &profile.wait)
                         })
+                    },
+                    MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+                    | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+                        anyhow::bail!("机械臂当前不在确认全失能的 Standby，请先执行 stop")
                     },
                 }
             },
@@ -65,11 +69,15 @@ impl CollisionProtectionCommand {
                 let builder = client_builder(&profile.target);
                 let standby = builder.build()?.require_motion()?;
                 match &standby {
-                    MotionConnectedPiper::Strict(standby) => {
+                    MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
                         set_collision_protection_verified(standby, desired, &profile.wait)?
                     },
-                    MotionConnectedPiper::Soft(standby) => {
+                    MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
                         set_collision_protection_verified(standby, desired, &profile.wait)?
+                    },
+                    MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+                    | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+                        anyhow::bail!("机械臂当前不在确认全失能的 Standby，请先执行 stop")
                     },
                 }
                 println!("✅ 碰撞保护等级已写入并校验: {:?}", desired);

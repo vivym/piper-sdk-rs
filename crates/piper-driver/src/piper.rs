@@ -576,9 +576,17 @@ pub enum MaintenanceLaneCommand {
         op: MaintenanceControlOp,
         ack: Option<Sender<()>>,
     },
+    AbortPendingNormalControl {
+        ack: Sender<()>,
+    },
     Send {
         frame: PiperFrame,
         meta: MaintenanceCommandMeta,
+        deadline: Instant,
+        ack: Sender<MaintenanceSendPhase>,
+    },
+    LocalSend {
+        frame: PiperFrame,
         deadline: Instant,
         ack: Sender<MaintenanceSendPhase>,
     },
@@ -612,6 +620,19 @@ impl MaintenanceLaneCommand {
             deadline,
             ack,
         }
+    }
+
+    fn local_send(frame: PiperFrame, deadline: Instant, ack: Sender<MaintenanceSendPhase>) -> Self {
+        Self::LocalSend {
+            frame,
+            deadline,
+            ack,
+        }
+    }
+
+    fn blocking_abort_pending_normal_control() -> (Self, Receiver<()>) {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        (Self::AbortPendingNormalControl { ack: ack_tx }, ack_rx)
     }
 }
 
@@ -1268,6 +1289,9 @@ fn clone_driver_error(error: &DriverError) -> DriverError {
             }
         },
         DriverError::CommandAbortedByFault => DriverError::CommandAbortedByFault,
+        DriverError::CommandAbortedByStateTransition => {
+            DriverError::CommandAbortedByStateTransition
+        },
         DriverError::MaintenanceWriteDenied(message) => {
             DriverError::MaintenanceWriteDenied(message.clone())
         },
@@ -3008,6 +3032,47 @@ impl Piper {
     }
 
     #[doc(hidden)]
+    pub fn abort_pending_normal_control_for_state_transition(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        if !self.tx_thread_alive() {
+            return Err(DriverError::ChannelClosed);
+        }
+
+        let deadline = Instant::now() + timeout;
+        let (command, ack_rx) = MaintenanceLaneCommand::blocking_abort_pending_normal_control();
+        self.maintenance_lane_tx.send(command).map_err(|_| DriverError::ChannelClosed)?;
+        MaintenanceGate::wait_control_ack_until(ack_rx, deadline)
+    }
+
+    #[doc(hidden)]
+    pub fn send_local_maintenance_frame_confirmed(
+        &self,
+        frame: PiperFrame,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        if !self.tx_thread_alive() {
+            return Err(DriverError::ChannelClosed);
+        }
+        if self.replay_mode_active() || self.replay_barrier_active() {
+            return Err(DriverError::ReplayModeActive);
+        }
+        if !self.normal_control_open() {
+            return Err(DriverError::ControlPathClosed);
+        }
+
+        let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+        self.maintenance_lane_tx
+            .send(MaintenanceLaneCommand::local_send(frame, deadline, ack_tx))
+            .map_err(|_| DriverError::ChannelClosed)?;
+        self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
+
+        wait_for_maintenance_send_result(ack_rx, deadline)
+    }
+
+    #[doc(hidden)]
     /// Returns a runtime-level maintenance denial override for external observers.
     ///
     /// RX death, TX death, fault latch, and Replay isolation all make the maintenance path
@@ -3630,7 +3695,11 @@ mod tests {
                             let _ = ack.send(());
                         }
                     },
-                    MaintenanceLaneCommand::Send { ack, .. } => {
+                    MaintenanceLaneCommand::AbortPendingNormalControl { ack } => {
+                        let _ = ack.send(());
+                    },
+                    MaintenanceLaneCommand::Send { ack, .. }
+                    | MaintenanceLaneCommand::LocalSend { ack, .. } => {
                         let _ = ack.send(MaintenanceSendPhase::Finished(Err(
                             DriverError::ChannelClosed,
                         )));
@@ -3655,7 +3724,11 @@ mod tests {
                             let _ = ack.send(());
                         }
                     },
-                    MaintenanceLaneCommand::Send { ack, .. } => {
+                    MaintenanceLaneCommand::AbortPendingNormalControl { ack } => {
+                        let _ = ack.send(());
+                    },
+                    MaintenanceLaneCommand::Send { ack, .. }
+                    | MaintenanceLaneCommand::LocalSend { ack, .. } => {
                         let _ = ack.send(MaintenanceSendPhase::Finished(Err(
                             DriverError::ChannelClosed,
                         )));
@@ -3688,7 +3761,11 @@ mod tests {
                             let _ = ack.send(());
                         }
                     },
-                    MaintenanceLaneCommand::Send { ack, .. } => {
+                    MaintenanceLaneCommand::AbortPendingNormalControl { ack } => {
+                        let _ = ack.send(());
+                    },
+                    MaintenanceLaneCommand::Send { ack, .. }
+                    | MaintenanceLaneCommand::LocalSend { ack, .. } => {
                         let _ = ack.send(MaintenanceSendPhase::Finished(Err(
                             DriverError::ChannelClosed,
                         )));
@@ -6113,6 +6190,126 @@ mod tests {
         let metrics = piper.get_metrics();
         assert_eq!(metrics.tx_reliable_queue_full_total, 0);
         assert_eq!(metrics.tx_fault_aborts_total, 2);
+    }
+
+    #[test]
+    fn test_state_transition_abort_preempts_pending_normal_control_before_local_disable() {
+        use crate::command::DeliveryPhase;
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("tx loop should reach the installed dispatch barrier");
+
+        let stale_realtime = PiperFrame::new_standard(0x155, &[0x01]);
+        let stale_soft = PiperFrame::new_standard(0x156, &[0x02]);
+        let stale_reliable = PiperFrame::new_standard(0x151, &[0x03]);
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let (realtime_ack_tx, realtime_ack_rx) = crossbeam_channel::bounded(2);
+        {
+            let mut slot = piper.realtime_slot.lock().expect("realtime slot lock");
+            slot.replace(RealtimeCommand::confirmed(
+                [stale_realtime],
+                deadline,
+                realtime_ack_tx,
+            ));
+        }
+
+        let (soft_ack_tx, soft_ack_rx) = crossbeam_channel::bounded(1);
+        piper
+            .soft_realtime_tx
+            .try_send(SoftRealtimeCommand::confirmed(
+                [stale_soft],
+                deadline,
+                soft_ack_tx,
+            ))
+            .expect("stale soft realtime command should queue");
+
+        let (reliable_ack_tx, reliable_ack_rx) = crossbeam_channel::bounded(2);
+        piper
+            .reliable_tx
+            .try_send(ReliableCommand::confirmed(
+                stale_reliable,
+                deadline,
+                reliable_ack_tx,
+            ))
+            .expect("stale reliable command should queue");
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let (abort_command, abort_ack_rx) =
+            MaintenanceLaneCommand::blocking_abort_pending_normal_control();
+        piper
+            .maintenance_lane_tx
+            .send(abort_command)
+            .expect("abort command should enter maintenance lane");
+        release_tx.send(()).expect("tx loop barrier should release cleanly");
+
+        MaintenanceGate::wait_control_ack_until(abort_ack_rx, deadline)
+            .expect("abort helper should clear pending normal control");
+        piper
+            .send_local_maintenance_frame_confirmed(disable_frame, Duration::from_millis(200))
+            .expect("local maintenance disable should be sent after abort");
+
+        wait_until(
+            Duration::from_millis(200),
+            || !sent_frames.lock().expect("sent frames lock").is_empty(),
+            "disable frame should be the only transmitted frame",
+        );
+
+        let realtime_error = match realtime_ack_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("realtime waiter should receive an abort result")
+        {
+            DeliveryPhase::Finished(result) => result.expect_err("realtime command must abort"),
+            DeliveryPhase::Committed => panic!("stale realtime command must not commit"),
+        };
+        assert!(matches!(
+            realtime_error,
+            DriverError::CommandAbortedByStateTransition
+        ));
+
+        let soft_error = soft_ack_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("soft realtime waiter should receive an abort result")
+            .expect_err("soft realtime command must abort");
+        assert!(matches!(
+            soft_error,
+            DriverError::CommandAbortedByStateTransition
+        ));
+
+        let reliable_error = match reliable_ack_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("reliable waiter should receive an abort result")
+        {
+            DeliveryPhase::Finished(result) => result.expect_err("reliable command must abort"),
+            DeliveryPhase::Committed => panic!("stale reliable command must not commit"),
+        };
+        assert!(matches!(
+            reliable_error,
+            DriverError::CommandAbortedByStateTransition
+        ));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.as_slice(),
+            &[disable_frame],
+            "state transition abort must prevent stale normal-control frames from being transmitted",
+        );
     }
 
     #[test]

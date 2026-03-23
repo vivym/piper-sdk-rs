@@ -16,7 +16,7 @@ use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter};
 use piper_sdk::client::ControlReadPolicy;
 use piper_sdk::client::types::{Joint, NewtonMeter, Rad};
 use piper_sdk::prelude::JointArray;
-use piper_sdk::{ConnectedPiper, MotionConnectedPiper};
+use piper_sdk::{ConnectedPiper, MotionConnectedPiper, MotionConnectedState};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -155,12 +155,20 @@ fn test_enable_joints() {
     if let Ok(robot) = Piper::connect(adapter, config) {
         let joints = [Joint::J1, Joint::J2];
         match robot.require_motion() {
-            Ok(MotionConnectedPiper::Strict(robot)) => {
+            Ok(MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot))) => {
                 let result = robot.into_maintenance().enable_joints(&joints);
                 assert!(result.is_ok() || result.is_err());
             },
-            Ok(MotionConnectedPiper::Soft(robot)) => {
+            Ok(MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot))) => {
                 let result = robot.into_maintenance().enable_joints(&joints);
+                assert!(result.is_ok() || result.is_err());
+            },
+            Ok(MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(robot))) => {
+                let result = robot.enable_joints(&joints);
+                assert!(result.is_ok() || result.is_err());
+            },
+            Ok(MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(robot))) => {
+                let result = robot.enable_joints(&joints);
                 assert!(result.is_ok() || result.is_err());
             },
             Err(error) => panic!("motion-capable mock connection expected: {error}"),
@@ -202,7 +210,7 @@ fn test_enable_position_mode() {
     if let Ok(robot) = Piper::connect(adapter, config).and_then(|robot| robot.require_motion()) {
         let pos_config = PositionModeConfig::default();
         match robot {
-            MotionConnectedPiper::Strict(robot) => {
+            MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => {
                 let result = robot.enable_position_mode(pos_config.clone());
                 assert!(result.is_ok() || result.is_err());
                 if let Ok(active_robot) = result {
@@ -214,7 +222,7 @@ fn test_enable_position_mode() {
                     assert!(result.is_ok() || result.is_err());
                 }
             },
-            MotionConnectedPiper::Soft(robot) => {
+            MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => {
                 let result = robot.enable_position_mode(pos_config);
                 assert!(result.is_ok() || result.is_err());
                 if let Ok(active_robot) = result {
@@ -226,6 +234,8 @@ fn test_enable_position_mode() {
                     assert!(result.is_ok() || result.is_err());
                 }
             },
+            MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+            | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {},
         }
     }
 }
@@ -275,8 +285,8 @@ fn test_observer() {
 
     if let Ok(robot) = Piper::connect(adapter, config) {
         match robot {
-            ConnectedPiper::Strict(robot) => {
-                let observer = robot.observer();
+            ConnectedPiper::Strict(state) => {
+                let observer = state.observer();
                 let _positions = observer.joint_positions();
                 let _velocities = observer.joint_velocities();
                 let _torques = observer.joint_torques();
@@ -285,8 +295,8 @@ fn test_observer() {
                 let _enabled = observer.is_arm_enabled();
                 let _observer2 = observer.clone();
             },
-            ConnectedPiper::Soft(robot) => {
-                let observer = robot.observer();
+            ConnectedPiper::Soft(state) => {
+                let observer = state.observer();
                 let _positions = observer.joint_positions();
                 let _velocities = observer.joint_velocities();
                 let _torques = observer.joint_torques();

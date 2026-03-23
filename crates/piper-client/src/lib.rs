@@ -67,7 +67,7 @@ pub use recording::{
     RecordingConfig, RecordingHandle, RecordingMetadata, RecordingStats, StopCondition,
 };
 pub use state::{
-    ConnectedPiper, Maintenance, MonitorOnly, MotionConnectedPiper, Piper, SoftRealtime,
-    StrictRealtime,
+    ConnectedPiper, Maintenance, MonitorOnly, MotionConnectedPiper, MotionConnectedState, Piper,
+    SoftRealtime, StrictRealtime,
 }; // Type State Pattern 的状态机与能力分层入口
 pub use types::*;

@@ -72,6 +72,7 @@ pub use machine::{
     MitModeConfig,
     MitPassthroughMode,
     MotionConnectedPiper,
+    MotionConnectedState,
     Piper,
     PositionMode,
     PositionModeConfig,

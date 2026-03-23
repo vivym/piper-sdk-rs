@@ -410,6 +410,11 @@ impl ReliableCommand {
     }
 
     #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &PiperFrame> {
+        self.frames.iter()
+    }
+
+    #[inline]
     pub fn into_parts(
         self,
     ) -> (

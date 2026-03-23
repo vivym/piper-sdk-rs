@@ -2487,6 +2487,7 @@ fn bridge_backend_error_from_driver(error: &DriverError) -> BridgeBackendError {
         DriverError::ControlPathClosed
         | DriverError::ReplayModeActive
         | DriverError::CommandAbortedByFault
+        | DriverError::CommandAbortedByStateTransition
         | DriverError::RealtimeDeliveryAbortedByFault { .. } => ErrorCode::PermissionDenied,
         DriverError::MaintenanceWriteDenied(_) => ErrorCode::PermissionDenied,
         DriverError::ChannelClosed

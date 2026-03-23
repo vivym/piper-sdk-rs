@@ -11,7 +11,7 @@
 //! # 使用示例
 //!
 //! ```rust,no_run
-//! use piper_client::{MotionConnectedPiper, PiperBuilder, recording::{RecordingConfig, RecordingMetadata, StopCondition}};
+//! use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder, recording::{RecordingConfig, RecordingMetadata, StopCondition}};
 //! use piper_client::state::{MotionCapability, Piper, Standby};
 //!
 //! # fn run_example<C: MotionCapability>(
@@ -43,8 +43,12 @@
 //!     .build()?;
 //!
 //! match robot.require_motion()? {
-//!     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
-//!     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+//!     MotionConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+//!     MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => run_example(standby)?,
+//!     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+//!     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+//!         return Err("robot is not in confirmed Standby".into());
+//!     }
 //! }
 //! # Ok(())
 //! # }

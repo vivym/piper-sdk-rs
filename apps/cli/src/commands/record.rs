@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use piper_control::TargetSpec;
 use piper_sdk::client::state::{CapabilityMarker, Standby};
-use piper_sdk::client::{ConnectedPiper, Piper};
+use piper_sdk::client::{ConnectedPiper, MotionConnectedState, Piper};
 use piper_sdk::driver::ConnectionTarget;
 use piper_sdk::{RecordingConfig, RecordingMetadata, StopCondition};
 use std::io::Write;
@@ -246,12 +246,16 @@ impl RecordCommand {
         };
 
         match standby {
-            ConnectedPiper::Strict(standby) => {
+            ConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
                 Self::record_with_standby(standby, config, duration, running)
             },
-            ConnectedPiper::Soft(standby) => {
+            ConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
                 Self::record_with_standby(standby, config, duration, running)
             },
+            ConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+            | ConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => Err(anyhow::anyhow!(
+                "机械臂当前不在确认全失能的 Standby，请先执行 stop"
+            )),
             ConnectedPiper::Monitor(standby) => {
                 Self::record_with_standby(standby, config, duration, running)
             },
