@@ -212,57 +212,76 @@ impl EndPoseState {
     }
 }
 
-/// 单次原子可见的监控快照
-///
-/// 同时保存最近一份完整监控快照和当前 raw 诊断状态，
-/// 用于避免 monitor 读路径跨两份状态读取导致的竞态。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MonitorSnapshot<T: Copy + Default> {
-    /// 最近一份完整 monitor-complete 快照
-    latest_complete: Option<T>,
-    /// 当前 raw 状态（允许部分帧/部分关节）
-    latest_raw: T,
+macro_rules! define_monitor_snapshot {
+    ($(#[$meta:meta])* $name:ident, $state:ty) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct $name {
+            latest_complete: Option<$state>,
+            latest_raw: $state,
+        }
+
+        impl $name {
+            /// 构造同时更新 complete/raw 的监控快照
+            pub fn from_complete(complete: $state) -> Self {
+                Self {
+                    latest_complete: Some(complete),
+                    latest_raw: complete,
+                }
+            }
+
+            /// 构造保留上一份完整快照、仅更新 raw 的监控快照
+            pub fn with_raw(latest_complete: Option<$state>, latest_raw: $state) -> Self {
+                Self {
+                    latest_complete,
+                    latest_raw,
+                }
+            }
+
+            /// 返回最近一份完整监控快照。
+            pub fn latest_complete(&self) -> Option<&$state> {
+                self.latest_complete.as_ref()
+            }
+
+            /// 返回最近一份完整监控快照的副本。
+            pub fn latest_complete_cloned(&self) -> Option<$state> {
+                self.latest_complete().copied()
+            }
+
+            /// 返回当前 raw 诊断状态。
+            pub fn latest_raw(&self) -> &$state {
+                &self.latest_raw
+            }
+        }
+    };
 }
 
-impl<T: Copy + Default> MonitorSnapshot<T> {
-    /// 构造同时更新 complete/raw 的监控快照
-    pub fn from_complete(complete: T) -> Self {
-        Self {
-            latest_complete: Some(complete),
-            latest_raw: complete,
-        }
-    }
+define_monitor_snapshot!(
+    /// 单次原子可见的关节位置监控快照。
+    ///
+    /// 同时保存最近一份完整关节位置快照和当前 raw 诊断状态，
+    /// 用于避免 monitor 读路径跨两份状态读取导致的竞态。
+    JointPositionMonitorSnapshot,
+    JointPositionState
+);
 
-    /// 构造保留上一份完整快照、仅更新 raw 的监控快照
-    pub fn with_raw(latest_complete: Option<T>, latest_raw: T) -> Self {
-        Self {
-            latest_complete,
-            latest_raw,
-        }
-    }
+define_monitor_snapshot!(
+    /// 单次原子可见的末端位姿监控快照。
+    ///
+    /// 同时保存最近一份完整末端位姿快照和当前 raw 诊断状态，
+    /// 用于避免 monitor 读路径跨两份状态读取导致的竞态。
+    EndPoseMonitorSnapshot,
+    EndPoseState
+);
 
-    /// 返回最近一份完整监控快照。
-    pub fn latest_complete(&self) -> Option<&T> {
-        self.latest_complete.as_ref()
-    }
-
-    /// 返回最近一份完整监控快照的副本。
-    pub fn latest_complete_cloned(&self) -> Option<T> {
-        self.latest_complete().cloned()
-    }
-
-    /// 返回当前 raw 诊断状态。
-    pub fn latest_raw(&self) -> &T {
-        &self.latest_raw
-    }
-}
-
-/// 关节位置监控快照
-pub type JointPositionMonitorSnapshot = MonitorSnapshot<JointPositionState>;
-/// 末端位姿监控快照
-pub type EndPoseMonitorSnapshot = MonitorSnapshot<EndPoseState>;
-/// 关节动态监控快照
-pub type JointDynamicMonitorSnapshot = MonitorSnapshot<JointDynamicState>;
+define_monitor_snapshot!(
+    /// 单次原子可见的关节动态监控快照。
+    ///
+    /// 同时保存最近一份完整关节动态快照和当前 raw 诊断状态，
+    /// 用于避免 monitor 读路径跨两份状态读取导致的竞态。
+    JointDynamicMonitorSnapshot,
+    JointDynamicState
+);
 
 /// 运动状态快照（逻辑原子性）
 ///
@@ -2240,6 +2259,67 @@ mod tests {
         let end_pose = ctx.capture_end_pose_monitor_snapshot();
         assert!(end_pose.latest_complete().is_none());
         assert_eq!(end_pose.latest_raw().hardware_timestamp_us, 0);
+    }
+
+    #[test]
+    fn test_concrete_monitor_snapshot_public_api() {
+        let joint_position = sample_joint_position_state(11, 0b111);
+        let joint_position_raw = sample_joint_position_state(12, 0b001);
+        let end_pose = sample_end_pose_state(21, 0b111);
+        let end_pose_raw = sample_end_pose_state(22, 0b010);
+        let joint_dynamic = sample_joint_dynamic_state(31, 0b11_1111);
+        let joint_dynamic_raw = sample_joint_dynamic_state(32, 0b000001);
+
+        let joint_snapshot = JointPositionMonitorSnapshot::from_complete(joint_position);
+        assert_eq!(
+            joint_snapshot
+                .latest_complete()
+                .expect("joint complete snapshot should exist")
+                .hardware_timestamp_us,
+            11
+        );
+        assert_eq!(
+            JointPositionMonitorSnapshot::with_raw(
+                joint_snapshot.latest_complete_cloned(),
+                joint_position_raw
+            )
+            .latest_raw()
+            .hardware_timestamp_us,
+            12
+        );
+
+        let end_snapshot = EndPoseMonitorSnapshot::from_complete(end_pose);
+        assert_eq!(
+            end_snapshot
+                .latest_complete()
+                .expect("end pose complete snapshot should exist")
+                .hardware_timestamp_us,
+            21
+        );
+        assert_eq!(
+            EndPoseMonitorSnapshot::with_raw(end_snapshot.latest_complete_cloned(), end_pose_raw)
+                .latest_raw()
+                .hardware_timestamp_us,
+            22
+        );
+
+        let dynamic_snapshot = JointDynamicMonitorSnapshot::from_complete(joint_dynamic);
+        assert_eq!(
+            dynamic_snapshot
+                .latest_complete()
+                .expect("joint dynamic complete snapshot should exist")
+                .group_timestamp_us,
+            31
+        );
+        assert_eq!(
+            JointDynamicMonitorSnapshot::with_raw(
+                dynamic_snapshot.latest_complete_cloned(),
+                joint_dynamic_raw
+            )
+            .latest_raw()
+            .group_timestamp_us,
+            32
+        );
     }
 
     #[test]
