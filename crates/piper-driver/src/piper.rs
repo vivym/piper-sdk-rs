@@ -1962,6 +1962,17 @@ impl Piper {
         let _ = self.maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
     }
 
+    fn latch_state_transition_timeout_fault_if_running(&self) {
+        let _mode_switch_guard =
+            self.mode_switch_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if self.runtime_phase() != RuntimePhase::Running || self.runtime_fault_kind().is_some() {
+            return;
+        }
+
+        self.latch_fault_with_kind(RuntimeFaultKind::TransportError);
+    }
+
     /// 请求 worker 停止并关闭所有命令通路。
     pub fn request_stop(&self) {
         self.runtime_phase.store(RuntimePhase::Stopping as u8, Ordering::Release);
@@ -3443,7 +3454,11 @@ impl Piper {
         }
 
         self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
-        wait_for_maintenance_send_result(ack_rx, deadline)
+        let result = wait_for_maintenance_send_result(ack_rx, deadline);
+        if matches!(result, Err(DriverError::Timeout)) {
+            self.latch_state_transition_timeout_fault_if_running();
+        }
+        result
     }
 
     #[doc(hidden)]
@@ -6858,6 +6873,119 @@ mod tests {
             sent.as_slice(),
             &[disable_frame],
             "state-transition barrier must not allow new commands to slip ahead of disable",
+        );
+    }
+
+    #[test]
+    fn test_state_transition_timeout_before_commit_latches_transport_fault_and_never_reopens() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+        let reliable_frame = PiperFrame::new_standard(0x151, &[0x07]);
+        let (reached_rx, release_tx) = install_state_transition_barrier(piper.as_ref());
+
+        let piper_for_disable = Arc::clone(&piper);
+        let disable_handle = std::thread::spawn(move || {
+            piper_for_disable.send_local_state_transition_frame_confirmed(
+                disable_frame,
+                Duration::from_millis(20),
+            )
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("state-transition send should reach the pre-commit barrier");
+        thread::sleep(Duration::from_millis(30));
+        release_tx.send(()).expect("state-transition barrier should release cleanly");
+
+        let error = disable_handle
+            .join()
+            .expect("state-transition sender thread should finish cleanly")
+            .expect_err("deadline-expired state-transition disable must time out");
+        assert!(matches!(error, DriverError::Timeout));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
+        assert!(matches!(
+            piper.send_reliable_package_confirmed([reliable_frame], Duration::from_millis(50)),
+            Err(DriverError::ControlPathClosed)
+        ));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert!(
+            sent.is_empty(),
+            "expired state-transition disable must not commit to the bus later",
+        );
+    }
+
+    #[test]
+    fn test_state_transition_send_control_timeout_latches_transport_fault_immediately() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let piper = Piper::new_dual_thread_parts(SoftRxAdapter, AlwaysTimeoutTxAdapter, None)
+            .expect("driver should start");
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+
+        let error = piper
+            .send_local_state_transition_frame_confirmed(disable_frame, Duration::from_millis(50))
+            .expect_err("state-transition disable must fail closed on a single send timeout");
+
+        assert!(matches!(error, DriverError::Timeout));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
+        assert!(matches!(
+            piper.send_reliable(PiperFrame::new_standard(0x151, &[0x01])),
+            Err(DriverError::ControlPathClosed)
+        ));
+    }
+
+    #[test]
+    fn test_state_transition_send_control_timeout_returns_timeout_on_strict_backend() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let piper =
+            Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, AlwaysTimeoutTxAdapter, None)
+                .expect("driver should start");
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+
+        let error = piper
+            .send_local_state_transition_frame_confirmed(disable_frame, Duration::from_millis(50))
+            .expect_err("strict-backend state-transition timeout must still surface as Timeout");
+
+        assert!(matches!(error, DriverError::Timeout));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
         );
     }
 

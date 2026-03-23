@@ -1782,6 +1782,8 @@ where
     /// 请求立即失能全部关节，并进入 Maintenance。
     ///
     /// 这是急停/人工接管路径：只发送 disable 请求，不伪装成已确认失能的 Standby。
+    /// 如果 state-transition disable 在进入 TX commit 前或发送点超时，
+    /// 调用会返回错误，同时底层 driver 会 fail-closed 锁存 `TransportError`。
     pub fn request_disable_all(self) -> Result<Piper<Maintenance, Capability>> {
         self.send_disable_request()?;
         Ok(self.into_state(
@@ -1798,6 +1800,9 @@ where
     /// 2. 线性化发送 `disable_all`
     /// 3. 等待失能确认
     /// 4. 返回到 Standby 状态
+    ///
+    /// 如果第 2 步在进入 TX commit 前或发送点超时，调用会立即返回错误，
+    /// 同时底层 driver 会 fail-closed 锁存 `TransportError`，后续普通控制会被拒绝。
     ///
     /// # 示例
     ///
@@ -3272,6 +3277,10 @@ mod tests {
         delay: Duration,
     }
 
+    struct TimeoutControlTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    }
+
     impl RealtimeTxAdapter for FailSendTxAdapter {
         fn send_control(
             &mut self,
@@ -3338,6 +3347,28 @@ mod tests {
             if self.shutdown_sends == self.delay_on && !self.delay.is_zero() {
                 thread::sleep(self.delay);
             }
+            if deadline <= std::time::Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
+    impl RealtimeTxAdapter for TimeoutControlTxAdapter {
+        fn send_control(
+            &mut self,
+            _frame: PiperFrame,
+            _budget: std::time::Duration,
+        ) -> std::result::Result<(), CanError> {
+            Err(CanError::Timeout)
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: std::time::Instant,
+        ) -> std::result::Result<(), CanError> {
             if deadline <= std::time::Instant::now() {
                 return Err(CanError::Timeout);
             }
@@ -4266,6 +4297,90 @@ mod tests {
                 &piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame()
             ),
             "normal shutdown must not emit emergency-stop semantics",
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_latches_transport_fault_and_closes_control_path() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                TimeoutControlTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver.clone(),
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = match active.shutdown() {
+            Ok(_) => panic!("state-transition disable timeout must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RobotError::Infrastructure(piper_driver::DriverError::Timeout)
+        ));
+        wait_until(
+            Duration::from_millis(200),
+            || driver.health().fault == Some(RuntimeFaultKind::TransportError),
+            "shutdown timeout must latch a transport fault before returning control to the caller",
+        );
+        assert!(matches!(
+            driver.send_reliable(PiperFrame::new_standard(0x151, &[0x08])),
+            Err(piper_driver::DriverError::ControlPathClosed)
+        ));
+        assert_eq!(
+            driver.maintenance_lease_snapshot().state(),
+            piper_driver::MaintenanceGateState::DeniedFaulted
+        );
+    }
+
+    #[test]
+    fn request_disable_all_timeout_latches_transport_fault_and_closes_control_path() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                TimeoutControlTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver.clone(),
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = match active.request_disable_all() {
+            Ok(_) => panic!("disable request timeout must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RobotError::Infrastructure(piper_driver::DriverError::Timeout)
+        ));
+        wait_until(
+            Duration::from_millis(200),
+            || driver.health().fault == Some(RuntimeFaultKind::TransportError),
+            "disable request timeout must latch a transport fault before returning control",
+        );
+        assert!(matches!(
+            driver.send_reliable(PiperFrame::new_standard(0x151, &[0x09])),
+            Err(piper_driver::DriverError::ControlPathClosed)
+        ));
+        assert_eq!(
+            driver.maintenance_lease_snapshot().state(),
+            piper_driver::MaintenanceGateState::DeniedFaulted
         );
     }
 
