@@ -11,7 +11,7 @@
 //! - **Option 模式**：使用 `Option<Piper<Active<MitMode>>>` 允许安全提取
 //! - **状态流转**：`park()` 返还 `Piper<Standby>`，支持继续使用
 //! - **循环锚点**：使用绝对时间锚点，消除累积漂移
-//! - **容错性**：允许最多连续 5 帧丢帧（25ms @ 200Hz）
+//! - **容错性**：允许最多连续 5 个失败控制周期（25ms @ 200Hz）
 //!
 //! # 使用示例
 //!
@@ -136,7 +136,7 @@ pub enum ControlError {
 /// **核心特性**：
 /// - ✅ Option 模式：允许安全提取 Piper
 /// - ✅ 循环锚点：消除累积漂移，保证精确 200Hz
-/// - ✅ 容错性：允许最多连续 5 帧丢帧
+/// - ✅ 容错性：允许最多连续 5 个失败控制周期
 /// - ✅ 状态流转：`park()` 返还 `Piper<Standby>`
 pub struct MitController {
     /// ⚠️ Option 包装，允许 park() 时安全提取
@@ -154,6 +154,13 @@ struct TickSchedule {
     sleep_duration: Option<Duration>,
     next_cycle_deadline: Instant,
     overrun_lateness: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandCycleDisposition {
+    CheckReached { next_error_count: u32 },
+    MissedCycle { next_error_count: u32 },
+    Abort { failure_count: u32 },
 }
 
 fn finalize_tick_schedule(now: Instant, cycle_deadline: Instant, period: Duration) -> TickSchedule {
@@ -175,6 +182,40 @@ fn finalize_tick_schedule(now: Instant, cycle_deadline: Instant, period: Duratio
             overrun_lateness,
         }
     }
+}
+
+fn classify_command_cycle(
+    command_succeeded: bool,
+    error_count: u32,
+    max_tolerance: u32,
+) -> CommandCycleDisposition {
+    if command_succeeded {
+        return CommandCycleDisposition::CheckReached {
+            next_error_count: 0,
+        };
+    }
+
+    let failure_count = error_count.saturating_add(1);
+    if failure_count > max_tolerance {
+        CommandCycleDisposition::Abort { failure_count }
+    } else {
+        CommandCycleDisposition::MissedCycle {
+            next_error_count: failure_count,
+        }
+    }
+}
+
+fn run_cycle_epilogue(next_tick: &mut Instant, period: Duration) {
+    let schedule = finalize_tick_schedule(Instant::now(), *next_tick, period);
+    if let Some(sleep_duration) = schedule.sleep_duration {
+        spin_sleep::sleep(sleep_duration);
+    } else {
+        warn!(
+            "Control loop overrun: operation missed deadline by {:?} (period {:?}); skipping sleep and preserving anchored schedule.",
+            schedule.overrun_lateness, period,
+        );
+    }
+    *next_tick = schedule.next_cycle_deadline;
 }
 
 impl MitController {
@@ -228,7 +269,7 @@ impl MitController {
     ///
     /// # 容错性
     ///
-    /// 控制循环具有**容错性**：允许偶尔的 CAN 通信错误（最多连续 5 帧）。
+    /// 控制循环具有**容错性**：允许偶尔的 CAN 通信错误（最多连续 5 个失败控制周期）。
     ///
     /// # 参数
     ///
@@ -263,7 +304,7 @@ impl MitController {
         threshold: Rad,
         timeout: Duration,
     ) -> core::result::Result<bool, ControlError> {
-        const MAX_TOLERANCE: u32 = 5; // 允许连续丢 5 帧（25ms @ 200Hz）
+        const MAX_TOLERANCE: u32 = 5; // 允许连续 5 个失败控制周期（25ms @ 200Hz）
         let mut error_count = 0;
 
         let start = Instant::now();
@@ -276,54 +317,43 @@ impl MitController {
         let _piper = self.piper.as_ref().ok_or(ControlError::AlreadyParked)?;
 
         while start.elapsed() < timeout {
-            // 1. 发送命令 & 检查状态（耗时操作）
-            match self.command_joints(JointArray::from(target), None) {
-                Ok(_) => {
-                    error_count = 0; // 重置计数器
-                },
-                Err(e) => {
-                    error_count += 1;
-                    if error_count > MAX_TOLERANCE {
-                        error!(
-                            "Consecutive CAN failures ({}): {:?}. Aborting motion.",
-                            error_count, e
-                        );
-                        return Err(ControlError::ConsecutiveFailures {
-                            count: error_count,
-                            last_error: Box::new(e),
-                        });
+            let command_result = self.command_joints(JointArray::from(target), None);
+            let cycle_disposition =
+                classify_command_cycle(command_result.is_ok(), error_count, MAX_TOLERANCE);
+
+            match (command_result, cycle_disposition) {
+                (Ok(()), CommandCycleDisposition::CheckReached { next_error_count }) => {
+                    error_count = next_error_count;
+
+                    let current = self.observer.control_snapshot(self.config.read_policy)?.position;
+                    let reached =
+                        current.iter().zip(target.iter()).all(|(c, t)| (*c - *t).abs() < threshold);
+
+                    if reached {
+                        return Ok(true);
                     }
+                },
+                (Err(e), CommandCycleDisposition::MissedCycle { next_error_count }) => {
+                    error_count = next_error_count;
                     warn!(
-                        "Transient CAN error ({}): {:?}, skipping frame. \
-                         This is acceptable as long as errors don't occur consecutively.",
+                        "Transient CAN error ({}): {:?}, marking this tick as a missed control cycle and preserving anchored schedule.",
                         error_count, e
                     );
-                    // 跳过本帧，继续循环
-                    continue;
                 },
+                (Err(e), CommandCycleDisposition::Abort { failure_count }) => {
+                    error!(
+                        "Consecutive CAN failures ({}): {:?}. Aborting motion.",
+                        failure_count, e
+                    );
+                    return Err(ControlError::ConsecutiveFailures {
+                        count: failure_count,
+                        last_error: Box::new(e),
+                    });
+                },
+                _ => unreachable!("command result classification must stay consistent"),
             }
 
-            // 3. 检查是否到达
-            let current = self.observer.control_snapshot(self.config.read_policy)?.position;
-            let reached =
-                current.iter().zip(target.iter()).all(|(c, t)| (*c - *t).abs() < threshold);
-
-            if reached {
-                return Ok(true);
-            }
-
-            // 3. 睡眠到当前锚点，或在 overrun 时推进到下一个未来锚点
-            let now = Instant::now();
-            let schedule = finalize_tick_schedule(now, next_tick, period);
-            if let Some(sleep_duration) = schedule.sleep_duration {
-                spin_sleep::sleep(sleep_duration);
-            } else {
-                warn!(
-                    "Control loop overrun: operation missed deadline by {:?} (period {:?}); skipping sleep and preserving anchored schedule.",
-                    schedule.overrun_lateness, period,
-                );
-            }
-            next_tick = schedule.next_cycle_deadline;
+            run_cycle_epilogue(&mut next_tick, period);
         }
 
         Ok(false)
@@ -509,6 +539,41 @@ mod tests {
         assert_eq!(
             schedule.next_cycle_deadline.duration_since(deadline).as_millis() % 5,
             0
+        );
+    }
+
+    #[test]
+    fn test_classify_command_cycle_resets_error_count_after_success() {
+        assert_eq!(
+            classify_command_cycle(true, 4, 5),
+            CommandCycleDisposition::CheckReached {
+                next_error_count: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_transient_failure_cycle_still_advances_anchored_deadline() {
+        let now = Instant::now();
+        let period = Duration::from_millis(5);
+        let deadline = now + Duration::from_millis(2);
+
+        assert_eq!(
+            classify_command_cycle(false, 0, 5),
+            CommandCycleDisposition::MissedCycle {
+                next_error_count: 1
+            }
+        );
+
+        let schedule = finalize_tick_schedule(now, deadline, period);
+        assert_eq!(schedule.next_cycle_deadline, deadline + period);
+    }
+
+    #[test]
+    fn test_classify_command_cycle_aborts_on_sixth_consecutive_failure() {
+        assert_eq!(
+            classify_command_cycle(false, 5, 5),
+            CommandCycleDisposition::Abort { failure_count: 6 }
         );
     }
 }
