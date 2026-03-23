@@ -4161,10 +4161,7 @@ mod tests {
         );
         let disable_all = piper_protocol::control::MotorEnableCommand::disable_all().to_frame();
         assert!(
-            !sent_frames
-                .lock()
-                .expect("sent frames lock")
-                .contains(&disable_all),
+            !sent_frames.lock().expect("sent frames lock").contains(&disable_all),
             "fail-fast shutdown must not enqueue a disable request after the runtime becomes unhealthy",
         );
     }
