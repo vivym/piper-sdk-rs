@@ -364,6 +364,12 @@ impl NormalSendGate {
         }
     }
 
+    pub(crate) fn reopen_after_fault(&self) {
+        if self.state() == NormalSendGateState::FaultClosed {
+            self.set_state(NormalSendGateState::Open);
+        }
+    }
+
     #[cfg(test)]
     fn install_fault_latch_barrier(
         &self,
@@ -1424,8 +1430,14 @@ impl Piper {
         RuntimePhase::from_raw(self.runtime_phase.load(Ordering::Acquire))
     }
 
+    fn runtime_fault_kind(&self) -> Option<RuntimeFaultKind> {
+        RuntimeFaultKind::from_raw(self.runtime_fault.load(Ordering::Acquire))
+    }
+
     fn normal_control_open(&self) -> bool {
-        self.runtime_phase() == RuntimePhase::Running && self.rx_thread_alive()
+        self.runtime_phase() == RuntimePhase::Running
+            && self.runtime_fault.load(Ordering::Acquire) == 0
+            && self.rx_thread_alive()
     }
 
     fn low_speed_drive_state_freshness_window_us(&self) -> u64 {
@@ -1766,7 +1778,7 @@ impl Piper {
         let tx_alive = self.tx_thread_alive();
         let connected = self.is_connected();
         let last_feedback_age = self.connection_age();
-        let runtime_fault = RuntimeFaultKind::from_raw(self.runtime_fault.load(Ordering::Acquire));
+        let runtime_fault = self.runtime_fault_kind();
 
         let fault = if runtime_fault.is_some() {
             runtime_fault
@@ -1785,11 +1797,6 @@ impl Piper {
             tx_alive,
             fault,
         }
-    }
-
-    #[doc(hidden)]
-    pub fn auto_disable_on_drop_allowed(&self) -> bool {
-        self.runtime_phase() == RuntimePhase::Running
     }
 
     /// 锁存手动故障并关闭正常控制路径。
@@ -1837,6 +1844,119 @@ impl Piper {
         let _ = self
             .maintenance_gate
             .set_state_synced(MaintenanceGateState::DeniedTransportDown);
+    }
+
+    fn maintenance_state_after_manual_fault_recovery(&self) -> MaintenanceGateState {
+        if !self.ctx.connection_monitor.check_connection() {
+            return MaintenanceGateState::DeniedTransportDown;
+        }
+
+        match self.get_robot_control().confirmed_driver_enabled_mask {
+            Some(0) => MaintenanceGateState::AllowedStandby,
+            Some(_) => MaintenanceGateState::DeniedActiveControl,
+            None => MaintenanceGateState::DeniedDriveStateUnknown,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn clear_manual_fault_after_resume(&self) -> Result<MaintenanceGateState, DriverError> {
+        let _mode_switch_guard =
+            self.mode_switch_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if !self.rx_thread_alive() || !self.tx_thread_alive() {
+            return Err(DriverError::ChannelClosed);
+        }
+        if self.replay_mode_active() || self.replay_barrier_active() {
+            return Err(DriverError::ReplayModeActive);
+        }
+        if self.runtime_phase() != RuntimePhase::FaultLatched {
+            return Err(DriverError::ControlPathClosed);
+        }
+        if self.runtime_fault_kind() != Some(RuntimeFaultKind::ManualFault) {
+            return Err(DriverError::InvalidInput(
+                "manual fault recovery requires a latched ManualFault".to_string(),
+            ));
+        }
+
+        let maintenance_state = self.maintenance_state_after_manual_fault_recovery();
+        self.maintenance_gate.set_state_synced(maintenance_state)?;
+
+        match self.runtime_phase.compare_exchange(
+            RuntimePhase::FaultLatched as u8,
+            RuntimePhase::Running as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.normal_send_gate.reopen_after_fault();
+                self.runtime_fault.store(0, Ordering::Release);
+                Ok(maintenance_state)
+            },
+            Err(observed) => match RuntimePhase::from_raw(observed) {
+                RuntimePhase::Stopping => Err(DriverError::ChannelClosed),
+                RuntimePhase::Running | RuntimePhase::FaultLatched => {
+                    Err(DriverError::ControlPathClosed)
+                },
+            },
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn best_effort_disable_or_shutdown_on_drop(&self, shutdown_timeout: Duration) {
+        use piper_protocol::control::{EmergencyStopCommand, MotorEnableCommand};
+
+        match self.runtime_phase() {
+            RuntimePhase::Running => {
+                if !self.tx_thread_alive() {
+                    warn!("Drop auto-disable skipped because TX worker is no longer alive");
+                    return;
+                }
+
+                if let Err(error) = self.send_reliable(MotorEnableCommand::disable_all().to_frame())
+                {
+                    warn!("Drop auto-disable failed: {error}");
+                }
+            },
+            RuntimePhase::FaultLatched => {
+                if !self.tx_thread_alive() {
+                    self.metrics.tx_drop_shutdown_skipped_total.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Drop fault shutdown skipped because runtime is fault-latched but TX worker is no longer alive"
+                    );
+                    return;
+                }
+
+                self.metrics.tx_drop_shutdown_attempt_total.fetch_add(1, Ordering::Relaxed);
+
+                let frame = EmergencyStopCommand::emergency_stop().to_frame();
+                match self
+                    .enqueue_shutdown(frame, Instant::now() + shutdown_timeout)
+                    .and_then(|receipt| receipt.wait())
+                {
+                    Ok(()) => {
+                        self.metrics.tx_drop_shutdown_success_total.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "Drop fault shutdown sent bounded emergency stop through shutdown lane"
+                        );
+                    },
+                    Err(DriverError::Timeout) => {
+                        self.metrics.tx_drop_shutdown_timeout_total.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "Drop fault shutdown timed out after {:?} while waiting for shutdown-lane confirmation",
+                            shutdown_timeout
+                        );
+                    },
+                    Err(error) => {
+                        self.metrics.tx_drop_shutdown_skipped_total.fetch_add(1, Ordering::Relaxed);
+                        warn!("Drop fault shutdown failed before completion: {error}");
+                    },
+                }
+            },
+            RuntimePhase::Stopping => {
+                self.metrics.tx_drop_shutdown_skipped_total.fetch_add(1, Ordering::Relaxed);
+                warn!("Drop auto-disable skipped because runtime is already stopping");
+            },
+        }
     }
 
     /// 获取性能指标快照
@@ -3178,6 +3298,7 @@ impl Piper {
     #[doc(hidden)]
     pub fn maintenance_runtime_open(&self) -> bool {
         self.runtime_phase() == RuntimePhase::Running
+            && self.runtime_fault.load(Ordering::Acquire) == 0
             && self.rx_thread_alive()
             && self.tx_thread_alive()
             && !self.replay_mode_active()
@@ -5899,6 +6020,45 @@ mod tests {
         assert_eq!(metrics.tx_shutdown_requests_total, 1);
         assert_eq!(metrics.tx_shutdown_sent_total, 1);
         assert_eq!(metrics.tx_frames_sent_total, 1);
+    }
+
+    #[test]
+    fn test_clear_manual_fault_after_resume_reopens_normal_control_and_restores_maintenance() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            Some(maintenance_ready_config()),
+        )
+        .unwrap();
+        let reliable_frame = PiperFrame::new_standard(0x472, &[0x0C]);
+
+        mark_maintenance_standby_confirmed(&piper);
+        piper.latch_fault();
+
+        let maintenance_state = piper
+            .clear_manual_fault_after_resume()
+            .expect("manual fault recovery should reopen the runtime");
+
+        assert_eq!(maintenance_state, MaintenanceGateState::AllowedStandby);
+        assert!(piper.health().fault.is_none());
+        assert_eq!(piper.runtime_phase(), RuntimePhase::Running);
+        assert_eq!(piper.normal_send_gate.state(), NormalSendGateState::Open);
+        assert_eq!(
+            piper.maintenance_lease_snapshot().state(),
+            MaintenanceGateState::AllowedStandby
+        );
+
+        piper
+            .send_reliable(reliable_frame)
+            .expect("normal reliable control must reopen after manual fault recovery");
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").contains(&reliable_frame),
+            "recovered runtime should send normal reliable frames again",
+        );
     }
 
     #[test]

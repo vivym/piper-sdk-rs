@@ -151,17 +151,14 @@ impl<'a> RawCommander<'a> {
         Ok(self.driver.enqueue_shutdown(frame, deadline)?)
     }
 
-    /// 停止运动（用于优雅关闭）
-    ///
-    /// 发送停止运动命令，用于优雅关闭序列。与急停不同，此方法更平滑地停止机器人。
-    pub(crate) fn stop_motion(&self) -> Result<()> {
-        // 使用急停命令停止运动
-        // 注意：当前协议没有单独的"平滑停止"命令，急停是最接近的选项
-        let cmd = EmergencyStopCommand::emergency_stop();
+    /// 将急停恢复命令加入 shutdown lane，并返回确认句柄。
+    pub(crate) fn emergency_stop_resume_enqueue(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<piper_driver::ShutdownReceipt> {
+        let cmd = EmergencyStopCommand::resume();
         let frame = cmd.to_frame();
-
-        self.driver.send_reliable(frame)?;
-        Ok(())
+        Ok(self.driver.enqueue_shutdown(frame, deadline)?)
     }
 
     /// 内部辅助：构建末端位姿的 3 个 CAN 帧

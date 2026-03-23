@@ -15,7 +15,7 @@ use crate::{
     observer::{CollisionProtectionSnapshot, MonitorReadPolicy, Observer, RuntimeHealthSnapshot},
     raw_commander::RawCommander,
 };
-use piper_driver::{BackendCapability, SettingResponseState};
+use piper_driver::{BackendCapability, RuntimeFaultKind, SettingResponseState};
 use piper_protocol::control::{InstallPosition, MitControlCommand, MitMode as ProtocolMitMode};
 use piper_protocol::feedback::{ControlMode, MoveMode, RobotStatus};
 use tracing::{debug, info, trace};
@@ -24,8 +24,8 @@ const COLLISION_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ZERO_SETTING_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const ZERO_SETTING_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STATE_TRANSITION_SEND_TIMEOUT: Duration = Duration::from_millis(50);
-const STOP_PROPAGATION_GRACE: Duration = Duration::from_millis(100);
-const STOP_PROPAGATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const EMERGENCY_STOP_LANE_TIMEOUT: Duration = Duration::from_millis(20);
+const RECOVERY_STATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 // ==================== 状态类型（零大小类型）====================
 
@@ -589,6 +589,18 @@ where
             driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Maintenance,
         }),
+    }
+}
+
+fn initial_motion_state_from_confirmed_mask(confirmed_mask: Option<u8>) -> InitialMotionState {
+    match confirmed_mask {
+        Some(0) => InitialMotionState::Standby,
+        Some(mask) => InitialMotionState::Maintenance {
+            confirmed_mask: Some(mask),
+        },
+        None => InitialMotionState::Maintenance {
+            confirmed_mask: None,
+        },
     }
 }
 
@@ -1549,20 +1561,6 @@ where
         Ok(())
     }
 
-    fn wait_stop_propagation_grace(&self, grace: Duration, poll_interval: Duration) -> Result<()> {
-        let start = Instant::now();
-        loop {
-            self.ensure_runtime_health_healthy()?;
-
-            let elapsed = start.elapsed();
-            if elapsed >= grace {
-                return Ok(());
-            }
-
-            std::thread::sleep(poll_interval.min(grace.saturating_sub(elapsed)));
-        }
-    }
-
     fn into_state<NextState>(
         self,
         next_state: NextState,
@@ -1609,6 +1607,36 @@ where
                 return Err(RobotError::Timeout {
                     timeout_ms: timeout.as_millis() as u64,
                 });
+            }
+
+            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
+        }
+    }
+
+    fn wait_for_motion_connected_state(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<InitialMotionState> {
+        let start = Instant::now();
+
+        loop {
+            self.ensure_runtime_health_healthy()?;
+
+            let state = initial_motion_state_from_confirmed_mask(
+                self.observer.joint_enabled_mask_confirmed(),
+            );
+            match state {
+                InitialMotionState::Standby => return Ok(state),
+                InitialMotionState::Maintenance {
+                    confirmed_mask: Some(_),
+                } => return Ok(state),
+                InitialMotionState::Maintenance {
+                    confirmed_mask: None,
+                } if start.elapsed() >= timeout => return Ok(state),
+                InitialMotionState::Maintenance {
+                    confirmed_mask: None,
+                } => {},
             }
 
             self.sleep_with_fail_fast(start, timeout, poll_interval)?;
@@ -1726,7 +1754,7 @@ where
         self.driver.latch_fault();
         let raw_commander = RawCommander::new(&self.driver);
         let receipt =
-            raw_commander.emergency_stop_enqueue(Instant::now() + Duration::from_millis(20))?;
+            raw_commander.emergency_stop_enqueue(Instant::now() + EMERGENCY_STOP_LANE_TIMEOUT)?;
         receipt.wait()?;
 
         Ok(transition_piper_state(
@@ -1806,12 +1834,11 @@ where
 
     /// 优雅关闭机械臂
     ///
-    /// 执行完整的关闭序列：
-    /// 1. 停止运动
-    /// 2. 等待机器人停止（允许 CAN 命令传播）
-    /// 3. 失能电机
-    /// 4. 等待失能确认
-    /// 5. 返回到 Standby 状态
+    /// 执行受控的 disable-only 关闭序列：
+    /// 1. 终止待发送的普通控制命令
+    /// 2. 线性化发送 `disable_all`
+    /// 3. 等待失能确认
+    /// 4. 返回到 Standby 状态
     ///
     /// # 示例
     ///
@@ -1825,30 +1852,10 @@ where
     pub fn shutdown(self) -> Result<Piper<Standby, Capability>> {
         info!("Starting graceful robot shutdown");
 
-        // === PHASE 1: All operations that can panic ===
-
-        // 1. 停止运动
-        trace!("Sending stop command");
-        let raw = RawCommander::new(&self.driver);
-        raw.stop_motion()?;
-
-        // 2. 等待机器人停止
-        //
-        // ⚠️ INTENTIONAL HARD WAIT:
-        // 这 100ms 的 sleep 允许 CAN 命令通过总线传播，
-        // 并让机器人硬件处理停止命令，然后我们才失能电机。
-        // 在关闭上下文中，硬等待是可接受的，因为：
-        // - 关闭不是性能关键路径
-        // - 我们需要确保硬件达到安全状态
-        // - 替代方案（轮询"已停止"状态）不可靠
-        trace!("Waiting for robot to stop (allowing CAN command propagation)");
-        self.wait_stop_propagation_grace(STOP_PROPAGATION_GRACE, STOP_PROPAGATION_POLL_INTERVAL)?;
-
-        // 3. 失能电机
         trace!("Disabling motors");
         self.send_disable_request()?;
 
-        // 4. 等待失能确认
+        // 2. 等待失能确认
         trace!("Waiting for disable confirmation");
         self.wait_for_disabled(
             Duration::from_secs(1),
@@ -1857,35 +1864,7 @@ where
         )?;
 
         info!("Robot shutdown complete");
-
-        // === PHASE 2: No-panic zone - must not panic after this point ===
-
-        // 使用 ManuallyDrop 模式转换到 Standby 状态
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: `this.driver` is a valid Arc<piper_driver::Piper>.
-        // We're moving it out of ManuallyDrop, which prevents the original
-        // `self` from being dropped. This is safe because:
-        // 1. `this.driver` is immediately moved into the returned Piper
-        // 2. No other access to `this.driver` occurs after this read
-        // 3. The original `self` is never dropped (ManuallyDrop guarantees this)
-        let driver = unsafe { std::ptr::read(&this.driver) };
-
-        // SAFETY: `this.observer` is a valid Arc<Observer>.
-        // Same safety reasoning as driver above.
-        let observer = unsafe { std::ptr::read(&this.observer) };
-
-        // SAFETY: `this.quirks` is a valid DeviceQuirks (Copy type).
-        let quirks = this.quirks.clone();
-
-        Ok(Piper {
-            driver,
-            observer,
-            quirks,
-            drop_policy: DropPolicy::Noop,
-            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
-            _state: Standby,
-        })
+        Ok(self.into_state(Standby, DropPolicy::Noop, DriverModeDropPolicy::Preserve))
     }
 
     /// 获取诊断接口（逃生舱）
@@ -3121,6 +3100,58 @@ where
     // 如果需要恢复，可以添加 `recover()` 方法返回 `Piper<Standby>`
 }
 
+impl<Capability> Piper<ErrorState, Capability>
+where
+    Capability: MotionCapability,
+{
+    /// 从手动急停中恢复，重新打开正常控制路径。
+    ///
+    /// 恢复序列固定为：
+    /// 1. 验证当前 runtime fault 确实是 `ManualFault`
+    /// 2. 通过 shutdown lane 发送 `0x150 resume`
+    /// 3. 在 driver 内部清除 fault latch，重新打开 normal gate
+    /// 4. 按当前已确认的低速驱动状态返回 `Standby` 或 `Maintenance`
+    pub fn recover_from_emergency_stop(
+        self,
+        timeout: Duration,
+    ) -> Result<MotionConnectedState<Capability>> {
+        let health = self.runtime_health();
+        if health.fault != Some(RuntimeFaultKind::ManualFault)
+            || !health.rx_alive
+            || !health.tx_alive
+        {
+            return Err(RobotError::runtime_health_unhealthy(
+                health.rx_alive,
+                health.tx_alive,
+                health.fault,
+            ));
+        }
+
+        let raw_commander = RawCommander::new(&self.driver);
+        let receipt = raw_commander
+            .emergency_stop_resume_enqueue(Instant::now() + EMERGENCY_STOP_LANE_TIMEOUT)?;
+        receipt.wait()?;
+        self.driver.clear_manual_fault_after_resume()?;
+
+        let next_state =
+            self.wait_for_motion_connected_state(timeout, RECOVERY_STATE_POLL_INTERVAL)?;
+        Ok(match next_state {
+            InitialMotionState::Standby => MotionConnectedState::Standby(self.into_state(
+                Standby,
+                DropPolicy::Noop,
+                DriverModeDropPolicy::Preserve,
+            )),
+            InitialMotionState::Maintenance { .. } => {
+                MotionConnectedState::Maintenance(self.into_state(
+                    Maintenance,
+                    DropPolicy::DisableAll,
+                    DriverModeDropPolicy::Preserve,
+                ))
+            },
+        })
+    }
+}
+
 // ==================== Drop 实现（安全关闭）====================
 
 impl<State, Capability> Drop for Piper<State, Capability> {
@@ -3129,17 +3160,11 @@ impl<State, Capability> Drop for Piper<State, Capability> {
             self.driver.set_mode(piper_driver::mode::DriverMode::Normal);
         }
 
-        if self.drop_policy != DropPolicy::DisableAll || !self.driver.auto_disable_on_drop_allowed()
-        {
+        if self.drop_policy != DropPolicy::DisableAll {
             return;
         }
 
-        // 尝试失能（忽略错误，因为可能已经失能）
-        use piper_protocol::control::MotorEnableCommand;
-        let _ = self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame());
-
-        // 注意：HeartbeatManager 已确认不需要（根据 HEARTBEAT_ANALYSIS_REPORT.md）
-        // StateMonitor 已移除
+        self.driver.best_effort_disable_or_shutdown_on_drop(EMERGENCY_STOP_LANE_TIMEOUT);
     }
 }
 
@@ -3649,6 +3674,18 @@ mod tests {
             .collect()
     }
 
+    fn disabled_joint_frames(delay: Duration, timestamp_base: u64) -> Vec<TimedFrame> {
+        (1..=6)
+            .map(|joint_index| TimedFrame {
+                delay,
+                frame: joint_driver_disabled_frame(
+                    joint_index,
+                    timestamp_base + joint_index as u64,
+                ),
+            })
+            .collect()
+    }
+
     #[test]
     fn test_state_type_sizes() {
         // 大部分状态类型是 ZST（零大小类型）
@@ -4127,43 +4164,170 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_fails_fast_when_runtime_fault_latches_during_stop_grace() {
+    fn shutdown_only_sends_disable_all_for_active_mit() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(disabled_joint_frames(Duration::from_millis(2), 10)),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        active
+            .shutdown()
+            .expect("shutdown should succeed once disabled feedback is confirmed");
+
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![piper_protocol::control::MotorEnableCommand::disable_all().to_frame()]
+        );
+        assert!(
+            !sent.contains(
+                &piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame()
+            ),
+            "normal shutdown must not emit emergency-stop semantics",
+        );
+    }
+
+    #[test]
+    fn shutdown_only_sends_disable_all_for_active_position() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(disabled_joint_frames(Duration::from_millis(2), 40)),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_position_piper(driver);
+
+        active
+            .shutdown()
+            .expect("position-mode shutdown should succeed once disabled feedback is confirmed");
+
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![piper_protocol::control::MotorEnableCommand::disable_all().to_frame()]
+        );
+        assert!(
+            !sent.contains(
+                &piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame()
+            ),
+            "normal shutdown must not emit emergency-stop semantics",
+        );
+    }
+
+    #[test]
+    fn recover_from_emergency_stop_returns_standby_after_resume() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(disabled_joint_frames(Duration::from_millis(2), 100)),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
+        let recovered = error
+            .recover_from_emergency_stop(Duration::from_millis(200))
+            .expect("manual emergency stop should be recoverable");
+
+        match recovered {
+            MotionConnectedState::Standby(standby) => {
+                assert!(standby.runtime_health().fault.is_none());
+                assert!(standby.observer().is_all_disabled_confirmed());
+            },
+            MotionConnectedState::Maintenance(_) => {
+                panic!("confirmed disabled feedback should recover into Standby")
+            },
+        }
+
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![
+                piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame(),
+                piper_protocol::control::EmergencyStopCommand::resume().to_frame(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recover_from_emergency_stop_returns_maintenance_when_drive_state_is_unknown() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let active = build_active_mit_piper(
             DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
             sent_frames.clone(),
         );
-        let driver = Arc::clone(&active.driver);
-        let latch_handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
-            driver.latch_fault();
-        });
 
-        let start = Instant::now();
-        let error = match active.shutdown() {
-            Ok(_) => panic!("runtime fault should fail graceful shutdown during stop grace"),
+        let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
+        let recovered = error
+            .recover_from_emergency_stop(Duration::from_millis(20))
+            .expect("resume should reopen the runtime even without fresh drive confirmation");
+
+        match recovered {
+            MotionConnectedState::Maintenance(maintenance) => {
+                assert!(maintenance.runtime_health().fault.is_none());
+                assert_eq!(maintenance.observer().joint_enabled_mask_confirmed(), None);
+            },
+            MotionConnectedState::Standby(_) => {
+                panic!("missing confirmed drive state should fall back to Maintenance")
+            },
+        }
+
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![
+                piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame(),
+                piper_protocol::control::EmergencyStopCommand::resume().to_frame(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recover_from_emergency_stop_rejects_when_runtime_is_no_longer_healthy() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames,
+        );
+        let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
+        let driver = Arc::clone(&error.driver);
+        driver.request_stop();
+        wait_until(
+            Duration::from_millis(200),
+            || !driver.health().tx_alive,
+            "request_stop should eventually stop the TX worker",
+        );
+
+        let recover_error = match error.recover_from_emergency_stop(Duration::from_millis(20)) {
+            Ok(_) => panic!("resume must fail once the runtime is no longer healthy"),
             Err(error) => error,
         };
-        let elapsed = start.elapsed();
-        latch_handle.join().expect("fault latch helper should finish cleanly");
 
         assert!(matches!(
-            error,
+            recover_error,
             RobotError::RuntimeHealthUnhealthy {
-                fault: Some(RuntimeFaultKind::ManualFault),
+                tx_alive: false,
                 ..
             }
         ));
-        assert!(
-            elapsed < Duration::from_millis(80),
-            "shutdown should fail fast instead of blindly waiting 100ms (elapsed: {:?})",
-            elapsed
-        );
-        let disable_all = piper_protocol::control::MotorEnableCommand::disable_all().to_frame();
-        assert!(
-            !sent_frames.lock().expect("sent frames lock").contains(&disable_all),
-            "fail-fast shutdown must not enqueue a disable request after the runtime becomes unhealthy",
-        );
     }
 
     #[test]
@@ -4416,6 +4580,67 @@ mod tests {
             monitor_sent.lock().expect("monitor sent frames lock").is_empty(),
             "dropping monitor handle must not disable motors"
         );
+    }
+
+    #[test]
+    fn active_drop_fault_latched_sends_bounded_shutdown_lane_emergency_stop() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames.clone(),
+        );
+        let driver = Arc::clone(&active.driver);
+        driver.latch_fault();
+
+        drop(active);
+        wait_until(
+            Duration::from_millis(200),
+            || !sent_frames.lock().expect("sent frames lock").is_empty(),
+            "fault-latched drop should issue a bounded shutdown command",
+        );
+
+        assert_eq!(
+            sent_frames.lock().expect("sent frames lock").as_slice(),
+            &[piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame()],
+            "fault-latched drop must use the shutdown lane emergency-stop path",
+        );
+
+        let metrics = driver.get_metrics();
+        assert_eq!(metrics.tx_drop_shutdown_attempt_total, 1);
+        assert_eq!(metrics.tx_drop_shutdown_success_total, 1);
+        assert_eq!(metrics.tx_drop_shutdown_timeout_total, 0);
+        assert_eq!(metrics.tx_drop_shutdown_skipped_total, 0);
+    }
+
+    #[test]
+    fn active_drop_skips_fault_shutdown_when_runtime_is_already_stopping() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames.clone(),
+        );
+        let driver = Arc::clone(&active.driver);
+        driver.latch_fault();
+        driver.request_stop();
+        wait_until(
+            Duration::from_millis(200),
+            || !driver.health().tx_alive,
+            "request_stop should eventually stop the TX worker",
+        );
+
+        drop(active);
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "stopping runtime must not attempt a second drop-time shutdown",
+        );
+
+        let metrics = driver.get_metrics();
+        assert_eq!(metrics.tx_drop_shutdown_attempt_total, 0);
+        assert_eq!(metrics.tx_drop_shutdown_success_total, 0);
+        assert_eq!(metrics.tx_drop_shutdown_timeout_total, 0);
+        assert_eq!(metrics.tx_drop_shutdown_skipped_total, 1);
     }
 
     #[test]

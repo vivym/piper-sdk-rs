@@ -72,6 +72,14 @@ pub struct PiperMetrics {
 
     /// TX 停机命令成功发送到底层适配器的总次数
     pub tx_shutdown_sent_total: AtomicU64,
+    /// fault-latched Drop 路径发起 bounded shutdown 的次数
+    pub tx_drop_shutdown_attempt_total: AtomicU64,
+    /// fault-latched Drop 路径 bounded shutdown 成功的次数
+    pub tx_drop_shutdown_success_total: AtomicU64,
+    /// fault-latched Drop 路径 bounded shutdown 超时的次数
+    pub tx_drop_shutdown_timeout_total: AtomicU64,
+    /// fault-latched Drop 路径因 TX 不可用或 runtime 已停止而跳过的次数
+    pub tx_drop_shutdown_skipped_total: AtomicU64,
 
     /// 因故障锁存或停止阶段而被主动中止的普通控制命令总次数
     pub tx_fault_aborts_total: AtomicU64,
@@ -140,6 +148,18 @@ impl PiperMetrics {
             tx_shutdown_coalesced_total: self.tx_shutdown_coalesced_total.load(Ordering::Relaxed),
             tx_shutdown_conflicts_total: self.tx_shutdown_conflicts_total.load(Ordering::Relaxed),
             tx_shutdown_sent_total: self.tx_shutdown_sent_total.load(Ordering::Relaxed),
+            tx_drop_shutdown_attempt_total: self
+                .tx_drop_shutdown_attempt_total
+                .load(Ordering::Relaxed),
+            tx_drop_shutdown_success_total: self
+                .tx_drop_shutdown_success_total
+                .load(Ordering::Relaxed),
+            tx_drop_shutdown_timeout_total: self
+                .tx_drop_shutdown_timeout_total
+                .load(Ordering::Relaxed),
+            tx_drop_shutdown_skipped_total: self
+                .tx_drop_shutdown_skipped_total
+                .load(Ordering::Relaxed),
             tx_fault_aborts_total: self.tx_fault_aborts_total.load(Ordering::Relaxed),
             device_errors: self.device_errors.load(Ordering::Relaxed),
             rx_timeouts: self.rx_timeouts.load(Ordering::Relaxed),
@@ -193,6 +213,10 @@ impl PiperMetrics {
         self.tx_shutdown_coalesced_total.store(0, Ordering::Relaxed);
         self.tx_shutdown_conflicts_total.store(0, Ordering::Relaxed);
         self.tx_shutdown_sent_total.store(0, Ordering::Relaxed);
+        self.tx_drop_shutdown_attempt_total.store(0, Ordering::Relaxed);
+        self.tx_drop_shutdown_success_total.store(0, Ordering::Relaxed);
+        self.tx_drop_shutdown_timeout_total.store(0, Ordering::Relaxed);
+        self.tx_drop_shutdown_skipped_total.store(0, Ordering::Relaxed);
         self.tx_fault_aborts_total.store(0, Ordering::Relaxed);
         self.device_errors.store(0, Ordering::Relaxed);
         self.rx_timeouts.store(0, Ordering::Relaxed);
@@ -247,6 +271,14 @@ pub struct MetricsSnapshot {
     pub tx_shutdown_conflicts_total: u64,
     /// TX 停机命令发送总次数
     pub tx_shutdown_sent_total: u64,
+    /// fault-latched Drop 路径发起 bounded shutdown 的次数
+    pub tx_drop_shutdown_attempt_total: u64,
+    /// fault-latched Drop 路径 bounded shutdown 成功的次数
+    pub tx_drop_shutdown_success_total: u64,
+    /// fault-latched Drop 路径 bounded shutdown 超时的次数
+    pub tx_drop_shutdown_timeout_total: u64,
+    /// fault-latched Drop 路径因 TX 不可用或 runtime 已停止而跳过的次数
+    pub tx_drop_shutdown_skipped_total: u64,
     /// 因故障锁存或停止阶段被主动中止的普通控制命令总次数
     pub tx_fault_aborts_total: u64,
     /// 设备错误次数

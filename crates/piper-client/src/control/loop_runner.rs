@@ -130,6 +130,8 @@ where
     run_controller_with_strategy(piper, controller, config, default_sleep_strategy())
 }
 
+/// `run_controller()` 默认采用 hybrid 调度：
+/// 先用 `thread::sleep` 让出 CPU，再用短自旋收尾以降低尾部抖动。
 /// 使用 spin_sleep 的高精度控制循环
 ///
 /// 与 `run_controller()` 类似，但使用 `spin_sleep` 实现更低的延时抖动。
@@ -145,10 +147,14 @@ where
     C: Controller,
     RobotError: From<C::Error>,
 {
-    run_controller_with_strategy(piper, controller, config, SleepStrategy::Spin)
+    run_controller_with_strategy(piper, controller, config, spin_sleep_strategy())
 }
 
 fn default_sleep_strategy() -> SleepStrategy {
+    SleepStrategy::Hybrid
+}
+
+fn spin_sleep_strategy() -> SleepStrategy {
     SleepStrategy::Spin
 }
 
@@ -334,7 +340,12 @@ mod tests {
     }
 
     #[test]
-    fn test_run_controller_defaults_to_spin_strategy() {
-        assert_eq!(default_sleep_strategy(), SleepStrategy::Spin);
+    fn test_run_controller_defaults_to_hybrid_strategy() {
+        assert_eq!(default_sleep_strategy(), SleepStrategy::Hybrid);
+    }
+
+    #[test]
+    fn test_run_controller_spin_remains_explicit_full_spin() {
+        assert_eq!(spin_sleep_strategy(), SleepStrategy::Spin);
     }
 }

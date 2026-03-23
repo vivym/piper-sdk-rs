@@ -3,8 +3,11 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SleepStrategy {
     Sleep,
+    Hybrid,
     Spin,
 }
+
+const HYBRID_SPIN_WINDOW: Duration = Duration::from_micros(200);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CycleTick {
@@ -71,7 +74,24 @@ fn sleep_until(strategy: SleepStrategy, deadline: Instant) {
     let sleep_duration = deadline - now;
     match strategy {
         SleepStrategy::Sleep => std::thread::sleep(sleep_duration),
+        SleepStrategy::Hybrid => {
+            let (sleep_phase, spin_phase) = hybrid_sleep_plan(sleep_duration, HYBRID_SPIN_WINDOW);
+            if let Some(duration) = sleep_phase {
+                std::thread::sleep(duration);
+            }
+            if !spin_phase.is_zero() {
+                spin_sleep::SpinSleeper::default().sleep(spin_phase);
+            }
+        },
         SleepStrategy::Spin => spin_sleep::SpinSleeper::default().sleep(sleep_duration),
+    }
+}
+
+fn hybrid_sleep_plan(total: Duration, spin_window: Duration) -> (Option<Duration>, Duration) {
+    if total > spin_window {
+        (Some(total - spin_window), spin_window)
+    } else {
+        (None, total)
     }
 }
 
@@ -115,7 +135,7 @@ mod tests {
     #[test]
     fn test_cycle_scheduler_catches_up_after_overrun() {
         let period = Duration::from_millis(10);
-        let mut scheduler = CycleScheduler::new(period, SleepStrategy::Sleep);
+        let mut scheduler = CycleScheduler::new(period, SleepStrategy::Hybrid);
 
         scheduler.next_deadline = Instant::now() - Duration::from_millis(25);
         scheduler.last_tick_start = Instant::now() - Duration::from_millis(35);
@@ -125,5 +145,23 @@ mod tests {
         assert!(tick.lag >= Duration::from_millis(20));
         assert!(tick.missed_deadlines >= 1);
         assert!(scheduler.next_deadline > tick.tick_start);
+    }
+
+    #[test]
+    fn test_hybrid_sleep_plan_reserves_spin_tail() {
+        let (sleep_phase, spin_phase) =
+            hybrid_sleep_plan(Duration::from_micros(1_000), HYBRID_SPIN_WINDOW);
+
+        assert_eq!(sleep_phase, Some(Duration::from_micros(800)));
+        assert_eq!(spin_phase, HYBRID_SPIN_WINDOW);
+    }
+
+    #[test]
+    fn test_hybrid_sleep_plan_spins_entire_short_deadline() {
+        let (sleep_phase, spin_phase) =
+            hybrid_sleep_plan(Duration::from_micros(150), HYBRID_SPIN_WINDOW);
+
+        assert_eq!(sleep_phase, None);
+        assert_eq!(spin_phase, Duration::from_micros(150));
     }
 }
