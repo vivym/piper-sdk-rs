@@ -16,7 +16,10 @@ use thiserror::Error;
 
 use crate::builder::PiperBuilder;
 use crate::control::scheduler::{CycleScheduler, SleepStrategy};
-use crate::observer::{ControlReadPolicy, ControlSnapshotFull, Observer, RuntimeHealthSnapshot};
+use crate::observer::{
+    ControlReadPolicy, ControlSnapshotFull, DEFAULT_CONTROL_MAX_FEEDBACK_AGE, Observer,
+    RuntimeHealthSnapshot,
+};
 use crate::raw_commander::RawCommander;
 use crate::state::machine::ErrorState;
 use crate::state::{Active, DisableConfig, MitMode, MitModeConfig, Piper, Standby, StrictRealtime};
@@ -539,7 +542,7 @@ impl Default for DualArmReadPolicy {
         Self {
             per_arm: ControlReadPolicy {
                 max_state_skew_us: 2_000,
-                max_feedback_age: Duration::from_millis(15),
+                max_feedback_age: DEFAULT_CONTROL_MAX_FEEDBACK_AGE,
             },
             max_inter_arm_skew: Duration::from_millis(10),
         }

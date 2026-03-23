@@ -36,7 +36,7 @@
 //!     kd_gains: [0.8; 6],  // Nm/(rad/s)
 //!     rest_position: None,
 //!     control_rate: 200.0,
-//!     read_policy: ControlReadPolicy::default(),
+//!     read_policy: ControlReadPolicy::default(), // 默认严格控制级新鲜度（15ms）
 //! };
 //! # // let mut controller = MitController::new(piper, config);
 //!
@@ -93,6 +93,8 @@ pub struct MitControllerConfig {
     pub control_rate: f64,
 
     /// 控制闭环读取策略
+    ///
+    /// 默认建议使用 `ControlReadPolicy::default()`，其最大反馈年龄为 15ms。
     pub read_policy: ControlReadPolicy,
 }
 
@@ -511,6 +513,10 @@ mod tests {
         assert!(config.rest_position.is_none());
         assert_eq!(config.control_rate, 200.0);
         assert_eq!(config.read_policy, ControlReadPolicy::default());
+        assert_eq!(
+            config.read_policy.max_feedback_age,
+            crate::observer::DEFAULT_CONTROL_MAX_FEEDBACK_AGE
+        );
     }
 
     #[test]

@@ -21,7 +21,8 @@
 //! let positions = observer.joint_positions()?;
 //! println!("J1 position: {}", positions[Joint::J1].to_deg());
 //!
-//! // 使用 control_snapshot 获取可直接用于闭环控制的数据
+//! // 使用 control_snapshot 获取可直接用于闭环控制的数据。
+//! // ControlReadPolicy::default() 采用严格控制默认值：反馈最大年龄 15ms。
 //! let snapshot = observer.control_snapshot(ControlReadPolicy::default())?;
 //! println!("Position: {:?}, Velocity: {:?}", snapshot.position, snapshot.velocity);
 //!
@@ -51,6 +52,8 @@ use piper_protocol::constants::*;
 
 const COMPLETE_COLD_GROUP_MASK: u8 = 0b111;
 const COMPLETE_DYNAMIC_GROUP_MASK: u8 = 0b11_1111;
+pub(crate) const DEFAULT_CONTROL_MAX_FEEDBACK_AGE: Duration = Duration::from_millis(15);
+const DEFAULT_MONITOR_MAX_FEEDBACK_AGE: Duration = Duration::from_millis(50);
 
 /// 状态观察器（只读接口，View 模式）
 ///
@@ -92,6 +95,9 @@ impl From<piper_driver::CollisionProtectionState> for CollisionProtectionSnapsho
 }
 
 /// 高频控制读取策略
+///
+/// `Default` 面向实时闭环控制，要求反馈年龄不超过 15ms。
+/// 如果调用方需要比默认值更宽松的窗口，必须显式构造 `ControlReadPolicy`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlReadPolicy {
     /// 允许的位置/动态状态最大时间偏差（微秒）
@@ -104,7 +110,7 @@ impl Default for ControlReadPolicy {
     fn default() -> Self {
         Self {
             max_state_skew_us: 5_000,
-            max_feedback_age: Duration::from_millis(50),
+            max_feedback_age: DEFAULT_CONTROL_MAX_FEEDBACK_AGE,
         }
     }
 }
@@ -119,7 +125,7 @@ pub struct MonitorReadPolicy {
 impl Default for MonitorReadPolicy {
     fn default() -> Self {
         Self {
-            max_feedback_age: Duration::from_millis(50),
+            max_feedback_age: DEFAULT_MONITOR_MAX_FEEDBACK_AGE,
         }
     }
 }
@@ -1092,6 +1098,21 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn test_control_read_policy_default_is_strict_for_control_loops() {
+        let policy = ControlReadPolicy::default();
+
+        assert_eq!(policy.max_state_skew_us, 5_000);
+        assert_eq!(policy.max_feedback_age, DEFAULT_CONTROL_MAX_FEEDBACK_AGE);
+    }
+
+    #[test]
+    fn test_monitor_read_policy_default_remains_50ms() {
+        let policy = MonitorReadPolicy::default();
+
+        assert_eq!(policy.max_feedback_age, DEFAULT_MONITOR_MAX_FEEDBACK_AGE);
     }
 
     #[test]

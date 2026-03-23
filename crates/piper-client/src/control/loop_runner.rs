@@ -19,7 +19,7 @@
 //! let config = LoopConfig {
 //!     frequency_hz: 100.0,              // 100Hz 控制频率
 //!     dt_clamp_multiplier: 2.0,         // dt 最大为 2x 标称值
-//!     read_policy: ControlReadPolicy::default(),
+//!     read_policy: ControlReadPolicy::default(), // 默认严格控制级新鲜度（15ms）
 //!     max_iterations: Some(1000),       // 运行 1000 次后停止
 //! };
 //!
@@ -53,6 +53,8 @@ pub struct LoopConfig {
     pub dt_clamp_multiplier: f64,
 
     /// 高频控制读取策略
+    ///
+    /// 默认建议使用 `ControlReadPolicy::default()`，其最大反馈年龄为 15ms。
     pub read_policy: ControlReadPolicy,
 
     /// 最大迭代次数（None 表示无限循环）
@@ -110,7 +112,7 @@ impl Default for LoopConfig {
 /// let config = LoopConfig {
 ///     frequency_hz: 200.0,  // 200Hz 高频控制
 ///     dt_clamp_multiplier: 1.5,
-///     read_policy: ControlReadPolicy::default(),
+///     read_policy: ControlReadPolicy::default(), // 默认严格控制级新鲜度（15ms）
 ///     max_iterations: Some(2000),  // 运行 10 秒后停止
 /// };
 ///
@@ -299,6 +301,11 @@ mod tests {
         let config = LoopConfig::default();
         assert_eq!(config.frequency_hz, 100.0);
         assert_eq!(config.dt_clamp_multiplier, 2.0);
+        assert_eq!(config.read_policy, ControlReadPolicy::default());
+        assert_eq!(
+            config.read_policy.max_feedback_age,
+            crate::observer::DEFAULT_CONTROL_MAX_FEEDBACK_AGE
+        );
         assert_eq!(config.max_iterations, None);
     }
 
