@@ -2958,7 +2958,7 @@ impl Piper {
     #[doc(hidden)]
     /// Returns a runtime-level maintenance denial override for external observers.
     ///
-    /// RX death, fault latch, and Replay isolation all make the maintenance path
+    /// RX death, TX death, fault latch, and Replay isolation all make the maintenance path
     /// unavailable even if the underlying lease gate has not been refreshed yet.
     fn maintenance_runtime_override_state(&self) -> Option<MaintenanceGateState> {
         (!self.maintenance_runtime_open()).then_some(MaintenanceGateState::DeniedFaulted)
@@ -2967,9 +2967,10 @@ impl Piper {
     #[doc(hidden)]
     /// Returns the maintenance lease snapshot with runtime-level availability applied.
     ///
-    /// When the runtime is not maintenance-open (fault latched, RX dead, Replay active,
-    /// or Replay barrier engaged), the exposed state is forced to `DeniedFaulted` while
-    /// preserving the underlying holder identifiers and lease epoch for diagnostics.
+    /// When the runtime is not maintenance-open (fault latched, RX dead, TX dead,
+    /// Replay active, or Replay barrier engaged), the exposed state is forced to
+    /// `DeniedFaulted` while preserving the underlying holder identifiers and lease
+    /// epoch for diagnostics.
     pub fn maintenance_lease_snapshot(&self) -> MaintenanceLeaseSnapshot {
         let snapshot = self.maintenance_gate.snapshot();
         let Some(state) = self.maintenance_runtime_override_state() else {
@@ -2992,7 +2993,7 @@ impl Piper {
     #[doc(hidden)]
     /// Acquires the maintenance lease only when the runtime is maintenance-open.
     ///
-    /// RX death, fault latch, and Replay isolation all deny acquisition as
+    /// RX death, TX death, fault latch, and Replay isolation all deny acquisition as
     /// `DeniedFaulted` even if the underlying lease gate still reflects a stale
     /// standby state.
     pub fn acquire_maintenance_lease_gate(
@@ -3053,6 +3054,7 @@ impl Piper {
     pub fn maintenance_runtime_open(&self) -> bool {
         self.runtime_phase() == RuntimePhase::Running
             && self.rx_thread_alive()
+            && self.tx_thread_alive()
             && !self.replay_mode_active()
             && !self.replay_barrier_active()
     }
@@ -3466,6 +3468,22 @@ mod tests {
     impl piper_can::RxAdapter for PanickingRxAdapter {
         fn receive(&mut self) -> Result<PiperFrame, CanError> {
             panic!("rx panic injected by test");
+        }
+    }
+
+    struct PanickingTxAdapter;
+
+    impl piper_can::RealtimeTxAdapter for PanickingTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, _budget: Duration) -> Result<(), CanError> {
+            panic!("tx panic injected by test");
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            _deadline: Instant,
+        ) -> Result<(), CanError> {
+            panic!("tx panic injected by test");
         }
     }
 
@@ -5875,6 +5893,41 @@ mod tests {
             piper
                 .acquire_maintenance_lease_gate(11, 22, Duration::from_millis(10))
                 .expect("maintenance acquire should expose runtime fault to observers"),
+            MaintenanceLeaseAcquireResult::DeniedState {
+                state: MaintenanceGateState::DeniedFaulted,
+            }
+        );
+    }
+
+    #[test]
+    fn test_tx_panic_closes_maintenance_runtime_observers() {
+        let piper =
+            Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, PanickingTxAdapter, None)
+                .unwrap();
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+        piper
+            .send_reliable(PiperFrame::new_standard(0x472, &[0x09]))
+            .expect("reliable send should enqueue before the tx worker panics");
+
+        wait_until(
+            Duration::from_millis(200),
+            || !piper.tx_thread_alive(),
+            "TX panic should make the TX worker appear dead",
+        );
+
+        let health = piper.health();
+        assert!(health.rx_alive);
+        assert!(!health.tx_alive);
+        assert_eq!(health.fault, Some(RuntimeFaultKind::TxExited));
+        assert!(!piper.maintenance_runtime_open());
+        assert_eq!(
+            piper.maintenance_lease_snapshot().state(),
+            MaintenanceGateState::DeniedFaulted
+        );
+        assert_eq!(
+            piper
+                .acquire_maintenance_lease_gate(12, 34, Duration::from_millis(10))
+                .expect("maintenance acquire should expose tx-dead runtime to observers"),
             MaintenanceLeaseAcquireResult::DeniedState {
                 state: MaintenanceGateState::DeniedFaulted,
             }

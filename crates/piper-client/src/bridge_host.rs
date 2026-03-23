@@ -2587,6 +2587,12 @@ impl MaintenanceBroker {
     ) -> Result<(u32, u64, u64), BridgeBackendError> {
         self.ensure_current(authority)?;
         let snapshot = self.driver.maintenance_lease_snapshot();
+        if snapshot.state() != MaintenanceGateState::AllowedStandby {
+            return Err(BridgeBackendError::new(
+                ErrorCode::PermissionDenied,
+                BridgeMaintenanceState::from(snapshot.state()).denial_message(),
+            ));
+        }
         if snapshot.holder_session_key() != Some(authority.session_key().raw()) {
             return Err(BridgeBackendError::new(
                 ErrorCode::PermissionDenied,
@@ -2789,6 +2795,8 @@ fn message_kind(request: &ClientRequest) -> &'static str {
 mod tests {
     use super::*;
     use piper_can::{BackendCapability, CanError, RealtimeTxAdapter, RxAdapter};
+    use piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_BASE;
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -2906,6 +2914,37 @@ mod tests {
         }
     }
 
+    fn joint_driver_low_speed_frame(
+        joint_index: u8,
+        enabled: bool,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let id = ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index.saturating_sub(1));
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&240u16.to_be_bytes());
+        data[2..4].copy_from_slice(&45i16.to_be_bytes());
+        data[4] = 50;
+        data[5] = if enabled { 0x40 } else { 0x00 };
+        data[6..8].copy_from_slice(&5000u16.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(id as u16, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    struct BootstrappedFeedbackRxAdapter {
+        frames: VecDeque<PiperFrame>,
+    }
+
+    impl RxAdapter for BootstrappedFeedbackRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            self.frames.pop_front().ok_or(CanError::Timeout)
+        }
+
+        fn backend_capability(&self) -> BackendCapability {
+            BackendCapability::SoftRealtime
+        }
+    }
+
     struct NoopTxAdapter;
 
     impl RealtimeTxAdapter for NoopTxAdapter {
@@ -2978,6 +3017,67 @@ mod tests {
         let err = broker
             .acquire(&authority, Duration::from_millis(10))
             .expect_err("RX-dead runtime must deny maintenance lease acquisition");
+
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            BridgeMaintenanceState::DeniedFaulted.denial_message()
+        );
+    }
+
+    #[test]
+    fn maintenance_broker_send_fails_closed_when_runtime_closes_after_lease_grant() {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                BootstrappedFeedbackRxAdapter {
+                    frames: (1..=6)
+                        .map(|joint_index| {
+                            joint_driver_low_speed_frame(joint_index, false, joint_index as u64)
+                        })
+                        .collect(),
+                },
+                NoopTxAdapter,
+                None,
+            )
+            .expect("driver should start without strict startup validation"),
+        );
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while driver.maintenance_lease_snapshot().state() != MaintenanceGateState::AllowedStandby {
+            assert!(
+                Instant::now() < deadline,
+                "bootstrap low-speed feedback should make maintenance standby confirmed before acquiring lease"
+            );
+            std::thread::yield_now();
+        }
+
+        let manager = Arc::new(SessionManager::new());
+        let register = manager.commit_prepared(manager.prepare_session(
+            token(8),
+            BridgeRole::WriterCandidate,
+            vec![],
+            Arc::new(NoopWake),
+        ));
+        let authority = SessionAuthority::new(register.session, &manager);
+        let broker = MaintenanceBroker::new(Arc::clone(&driver));
+
+        assert_eq!(
+            broker
+                .acquire(&authority, Duration::from_millis(10))
+                .expect("initial maintenance acquire should succeed"),
+            LeaseAcquireResult::Granted
+        );
+
+        driver.set_mode(piper_driver::DriverMode::Replay);
+        let snapshot = driver.maintenance_lease_snapshot();
+        assert_eq!(snapshot.state(), MaintenanceGateState::DeniedFaulted);
+        assert_eq!(
+            snapshot.holder_session_key(),
+            Some(authority.session_key().raw())
+        );
+
+        let err = broker
+            .send(&authority, PiperFrame::new_standard(0x321, &[0x01]))
+            .expect_err("runtime-closed maintenance send must be rejected before driver send");
 
         assert_eq!(err.code(), ErrorCode::PermissionDenied);
         assert_eq!(
