@@ -3163,7 +3163,7 @@ mod tests {
     use crate::observer::CollisionProtectionSnapshot;
     use crate::observer::Observer;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-    use piper_driver::{Piper as RobotPiper, RuntimeFaultKind};
+    use piper_driver::{DriverMode, Piper as RobotPiper, RuntimeFaultKind};
     use piper_protocol::control::MitControlCommand;
     use piper_protocol::ids::{ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56};
     use piper_tools::{PiperRecording, RecordingMetadata, TimestampSource, TimestampedFrame};
@@ -3171,7 +3171,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
@@ -3279,6 +3279,13 @@ mod tests {
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
     }
 
+    struct BlockingFirstControlTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+        started_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
+        sends: usize,
+    }
+
     impl RealtimeTxAdapter for FailSendTxAdapter {
         fn send_control(
             &mut self,
@@ -3360,6 +3367,37 @@ mod tests {
             _budget: std::time::Duration,
         ) -> std::result::Result<(), CanError> {
             Err(CanError::Timeout)
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: std::time::Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= std::time::Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
+    impl RealtimeTxAdapter for BlockingFirstControlTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: std::time::Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sends += 1;
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            if self.sends == 1 {
+                let _ = self.started_tx.send(());
+                let _ = self.release_rx.recv();
+            }
+            Ok(())
         }
 
         fn send_shutdown_until(
@@ -4711,6 +4749,145 @@ mod tests {
                 piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame(),
                 piper_protocol::control::EmergencyStopCommand::resume().to_frame(),
             ]
+        );
+    }
+
+    #[test]
+    fn recover_from_emergency_stop_times_out_on_host_late_stale_post_resume_feedback() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let stale_frames = vec![
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(1, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(2, 1_001),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(3, 1_002),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(4, 1_003),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(5, 1_004),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(6, 1_005),
+            },
+            TimedFrame {
+                delay: Duration::from_millis(15),
+                frame: joint_driver_disabled_frame(1, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(2, 1_001),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(3, 1_002),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(4, 1_003),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(5, 1_004),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(6, 1_005),
+            },
+        ];
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(stale_frames),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver.clone(),
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
+        let driver = Arc::clone(&error.driver);
+        wait_until(
+            Duration::from_millis(200),
+            || driver.get_joint_driver_low_speed().hardware_timestamps[5] == 1_005,
+            "pre-resume low-speed feedback should establish the hardware timestamp baseline",
+        );
+
+        let recover_error = match error.recover_from_emergency_stop(Duration::from_millis(40)) {
+            Ok(_) => panic!("host-late stale post-resume feedback must not reopen control"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(recover_error, RobotError::Timeout { .. }));
+        assert_eq!(driver.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(
+            driver.maintenance_lease_snapshot().state(),
+            piper_driver::MaintenanceGateState::DeniedFaulted
+        );
+    }
+
+    #[test]
+    fn enter_replay_mode_is_rejected_while_driver_disable_is_in_flight() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let standby = build_standby_piper_with_tx(
+            IdleRxAdapter::new(),
+            BlockingFirstControlTxAdapter {
+                sent_frames: sent_frames.clone(),
+                started_tx,
+                release_rx,
+                sends: 0,
+            },
+        );
+        let driver = Arc::clone(&standby.driver);
+        let disable_frame = piper_protocol::control::MotorEnableCommand::disable_all().to_frame();
+
+        let driver_for_disable = Arc::clone(&driver);
+        let disable_handle = thread::spawn(move || {
+            driver_for_disable.send_local_state_transition_frame_confirmed(
+                disable_frame,
+                Duration::from_millis(200),
+            )
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("disable frame should enter the adapter while state transition is in flight");
+
+        let replay_error = match standby.enter_replay_mode() {
+            Ok(_) => panic!("Replay must fail while a safety disable is in flight"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            replay_error,
+            RobotError::Infrastructure(piper_driver::DriverError::ControlPathClosed)
+        ));
+
+        release_tx.send(()).expect("blocked control send should release cleanly");
+        disable_handle
+            .join()
+            .expect("disable sender thread should finish")
+            .expect("disable frame must still complete after Replay is rejected");
+
+        assert_eq!(driver.mode(), DriverMode::Normal);
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![piper_protocol::control::MotorEnableCommand::disable_all().to_frame()]
         );
     }
 

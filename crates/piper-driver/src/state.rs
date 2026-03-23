@@ -730,6 +730,45 @@ impl JointDriverLowSpeedState {
         Some(self.driver_enabled_mask)
     }
 
+    /// 返回“resume 之后的新样本”对应的已确认 6 轴驱动器使能掩码。
+    ///
+    /// 若当前 6 轴低速反馈都带有硬件时间戳，则优先要求每轴硬件时间戳都严格大于
+    /// `baseline_hardware_timestamps`，并同时满足 host freshness 窗口。
+    /// 若任一轴硬件时间戳缺失，则回退到 host monotonic 判新。
+    pub(crate) fn confirmed_driver_enabled_mask_after_post_resume_feedback(
+        &self,
+        baseline_hardware_timestamps: [u64; 6],
+        baseline_host_mono_us: u64,
+        now_host_mono_us: u64,
+        freshness_window_us: u64,
+    ) -> Option<u8> {
+        if self.hardware_timestamps.iter().all(|&timestamp| timestamp != 0) {
+            for (joint_idx, baseline_hardware_timestamp) in
+                baseline_hardware_timestamps.iter().enumerate()
+            {
+                let hardware_timestamp = self.hardware_timestamps[joint_idx];
+                let host_timestamp = self.host_rx_mono_timestamps[joint_idx];
+                if hardware_timestamp <= *baseline_hardware_timestamp {
+                    return None;
+                }
+                if host_timestamp == 0 {
+                    return None;
+                }
+                if now_host_mono_us.saturating_sub(host_timestamp) > freshness_window_us {
+                    return None;
+                }
+            }
+
+            return Some(self.driver_enabled_mask);
+        }
+
+        self.confirmed_driver_enabled_mask_after_host_mono(
+            baseline_host_mono_us,
+            now_host_mono_us,
+            freshness_window_us,
+        )
+    }
+
     /// 检查指定关节是否电压过低
     pub fn is_voltage_low(&self, joint_index: usize) -> bool {
         if joint_index >= 6 {
@@ -3090,6 +3129,51 @@ mod tests {
         };
 
         assert_eq!(state.confirmed_driver_enabled_mask(2_000, 2_000), None);
+    }
+
+    #[test]
+    fn test_joint_driver_low_speed_state_post_resume_mask_prefers_hardware_timestamp_order() {
+        let state = JointDriverLowSpeedState {
+            driver_enabled_mask: 0,
+            hardware_timestamps: [100, 101, 102, 103, 104, 105],
+            host_rx_mono_timestamps: [2_000, 2_001, 2_002, 2_003, 2_004, 2_005],
+            valid_mask: 0b11_1111,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.confirmed_driver_enabled_mask_after_post_resume_feedback(
+                [100, 101, 102, 103, 104, 105],
+                1_000,
+                2_100,
+                500,
+            ),
+            None,
+            "host-late stale feedback must not count as post-resume fresh when hardware timestamps did not advance",
+        );
+    }
+
+    #[test]
+    fn test_joint_driver_low_speed_state_post_resume_mask_falls_back_to_host_time_when_hardware_missing()
+     {
+        let state = JointDriverLowSpeedState {
+            driver_enabled_mask: 0b11_1111,
+            hardware_timestamps: [0; 6],
+            host_rx_mono_timestamps: [2_000, 2_001, 2_002, 2_003, 2_004, 2_005],
+            valid_mask: 0b11_1111,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.confirmed_driver_enabled_mask_after_post_resume_feedback(
+                [900, 901, 902, 903, 904, 905],
+                1_000,
+                2_100,
+                500,
+            ),
+            Some(0b11_1111),
+            "missing hardware timestamps should fall back to host-monotonic freshness",
+        );
     }
 
     #[test]

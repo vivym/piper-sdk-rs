@@ -2073,6 +2073,8 @@ impl Piper {
     ) -> Result<ManualFaultRecoveryResult, DriverError> {
         self.validate_manual_fault_recovery_preconditions()?;
 
+        let baseline_driver_state = self.get_joint_driver_low_speed();
+        let baseline_hardware_timestamps = baseline_driver_state.hardware_timestamps;
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros();
 
         loop {
@@ -2086,7 +2088,8 @@ impl Piper {
             let driver_state = self.get_joint_driver_low_speed();
             let now_host_mono_us = crate::heartbeat::monotonic_micros();
             if let Some(confirmed_mask) = driver_state
-                .confirmed_driver_enabled_mask_after_host_mono(
+                .confirmed_driver_enabled_mask_after_post_resume_feedback(
+                    baseline_hardware_timestamps,
                     baseline_host_mono_us,
                     now_host_mono_us,
                     self.low_speed_drive_state_freshness_window_us(),
@@ -2870,10 +2873,17 @@ impl Piper {
                     RuntimePhase::Stopping => return Err(DriverError::ChannelClosed),
                 }
 
+                if self.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed {
+                    return Err(DriverError::ControlPathClosed);
+                }
+
                 self.normal_send_gate.pause_for_replay();
                 let deadline = Instant::now() + timeout;
 
                 while self.normal_send_gate.inflight_normal_sends() > 0 {
+                    if self.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed {
+                        return Err(DriverError::ControlPathClosed);
+                    }
                     if self.runtime_phase() != RuntimePhase::Running
                         || self.runtime_fault_kind().is_some()
                     {
@@ -2896,6 +2906,10 @@ impl Piper {
                 }
 
                 self.maybe_wait_test_mode_switch_replay_barrier();
+
+                if self.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed {
+                    return Err(DriverError::ControlPathClosed);
+                }
 
                 match (self.runtime_phase(), self.runtime_fault_kind()) {
                     (RuntimePhase::Running, None) => {
@@ -6921,6 +6935,60 @@ mod tests {
             sent.as_slice(),
             &[disable_frame],
             "state-transition barrier must not allow new commands to slip ahead of disable",
+        );
+    }
+
+    #[test]
+    fn test_try_set_mode_replay_is_rejected_while_state_transition_disable_is_pending() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+        let (reached_rx, release_tx) = install_state_transition_barrier(piper.as_ref());
+        let piper_for_disable = Arc::clone(&piper);
+        let disable_handle = std::thread::spawn(move || {
+            piper_for_disable.send_local_state_transition_frame_confirmed(
+                disable_frame,
+                Duration::from_millis(200),
+            )
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("state-transition disable should reach the pre-dispatch barrier");
+
+        let replay_error = piper
+            .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(50))
+            .expect_err("Replay mode must not overtake a pending safety disable");
+        assert!(matches!(replay_error, DriverError::ControlPathClosed));
+        assert_eq!(
+            piper.mode(),
+            crate::mode::DriverMode::Normal,
+            "failed Replay switch must not publish Replay mode while disable is pending",
+        );
+
+        release_tx.send(()).expect("state-transition barrier should release cleanly");
+        disable_handle
+            .join()
+            .expect("state-transition sender thread should finish")
+            .expect("pending disable must still complete after Replay is rejected");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.as_slice(),
+            &[disable_frame],
+            "Replay rejection must not cancel the pending disable frame",
         );
     }
 
