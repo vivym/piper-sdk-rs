@@ -115,6 +115,49 @@ pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
 pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_MODE_SWITCH_TIMEOUT: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
+#[derive(Debug)]
+struct ModeSwitchBarrier {
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static MODE_SWITCH_REPLAY_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<ModeSwitchBarrier>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn mode_switch_replay_barrier_slot() -> &'static std::sync::Mutex<Option<ModeSwitchBarrier>> {
+    MODE_SWITCH_REPLAY_BARRIER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_mode_switch_replay_barrier(
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+) {
+    let mut guard = mode_switch_replay_barrier_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(ModeSwitchBarrier {
+        reached_tx,
+        release_rx,
+    });
+}
+
+#[cfg(test)]
+fn maybe_wait_mode_switch_replay_barrier() {
+    let barrier = mode_switch_replay_barrier_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(barrier) = barrier {
+        let _ = barrier.reached_tx.send(());
+        let _ = barrier.release_rx.recv();
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StartupValidationDeadline {
     instant_deadline: Instant,
@@ -1267,6 +1310,8 @@ pub struct Piper {
     bus_speed: u32,
     /// Driver 工作模式（用于回放模式控制）
     driver_mode: Arc<crate::mode::AtomicDriverMode>,
+    /// 线性化 Driver 模式切换，避免 gate/mode 交错留下混合状态。
+    mode_switch_lock: Mutex<()>,
     /// Capability of the active backend.
     backend_capability: BackendCapability,
 }
@@ -1591,6 +1636,7 @@ impl Piper {
             interface: "unknown".to_string(),
             bus_speed: 1_000_000,
             driver_mode,
+            mode_switch_lock: Mutex::new(()),
             backend_capability,
         })
     }
@@ -2331,11 +2377,17 @@ impl Piper {
     }
 
     /// 尝试在有界时间内设置 Driver 模式。
+    ///
+    /// 此操作在 driver 内部串行化。成功返回后，`driver_mode` 与
+    /// `normal_send_gate` 一定处于一致的模式语义。
     pub fn try_set_mode(
         &self,
         mode: crate::mode::DriverMode,
         timeout: Duration,
     ) -> Result<(), DriverError> {
+        let _mode_switch_guard =
+            self.mode_switch_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
         match mode {
             crate::mode::DriverMode::Replay => {
                 if self.driver_mode.get(std::sync::atomic::Ordering::Acquire).is_replay() {
@@ -2367,6 +2419,9 @@ impl Piper {
                     self.normal_send_gate.resume_from_replay();
                     return Err(DriverError::ChannelClosed);
                 }
+
+                #[cfg(test)]
+                maybe_wait_mode_switch_replay_barrier();
 
                 match self.runtime_phase() {
                     RuntimePhase::Running => {
@@ -2422,6 +2477,10 @@ impl Piper {
     /// robot.set_mode(DriverMode::Normal);
     /// # }
     /// ```
+    ///
+    /// 这是一个串行化且有界等待的兼容包装：
+    /// - `Replay` 切换成功返回后，普通控制路径一定已被隔离
+    /// - `Normal` 切换不会与正在进行的 `Replay` 切换交错出混合状态
     pub fn set_mode(&self, mode: crate::mode::DriverMode) {
         match self.try_set_mode(mode, DEFAULT_MODE_SWITCH_TIMEOUT) {
             Ok(()) => tracing::info!("Driver mode set to: {:?}", mode),
@@ -3110,6 +3169,13 @@ mod tests {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         crate::pipeline::install_tx_loop_dispatch_barrier(reached_tx, release_rx);
+        (reached_rx, release_tx)
+    }
+
+    fn install_mode_switch_barrier() -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        install_mode_switch_replay_barrier(reached_tx, release_rx);
         (reached_rx, release_tx)
     }
 
@@ -4226,6 +4292,210 @@ mod tests {
             Duration::from_millis(200),
             || sent_frames.lock().expect("sent frames lock").len() == 1,
             "in-flight frame should finish after releasing the blocked adapter",
+        );
+        assert!(
+            !(piper.mode().is_replay()
+                && piper.normal_send_gate.state() == NormalSendGateState::Open),
+            "timeout path must not leave Replay mode published with an open normal-send gate"
+        );
+    }
+
+    #[test]
+    fn test_try_set_mode_serializes_concurrent_replay_and_normal_switches() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let (reached_rx, release_tx) = install_mode_switch_barrier();
+
+        let piper_replay = Arc::clone(&piper);
+        let replay_handle = std::thread::spawn(move || {
+            piper_replay.try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("Replay switch should block at the mode-switch barrier");
+
+        let piper_normal = Arc::clone(&piper);
+        let normal_handle = std::thread::spawn(move || {
+            piper_normal.try_set_mode(crate::mode::DriverMode::Normal, Duration::from_millis(100))
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !normal_handle.is_finished(),
+            "Normal mode switch must wait until the in-flight Replay switch releases the lock"
+        );
+
+        let _ = release_tx.send(());
+        replay_handle
+            .join()
+            .expect("Replay switch thread should finish")
+            .expect("Replay switch should complete before the queued Normal restore");
+        normal_handle
+            .join()
+            .expect("Normal switch thread should finish")
+            .expect("Normal restore should succeed after Replay switch completes");
+
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
+        assert_ne!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::ReplayPaused,
+            "serialized mode switches must not leave the gate stuck in ReplayPaused"
+        );
+        assert!(
+            !piper.replay_barrier_active(),
+            "serialized mode switches must not leave the replay barrier engaged"
+        );
+
+        let reliable_frame = PiperFrame::new_standard(0x320, &[0x01]);
+        let realtime_frame = PiperFrame::new_standard(0x321, &[0x02]);
+        piper
+            .send_frame(reliable_frame)
+            .expect("normal reliable send should work after returning to Normal");
+        piper
+            .send_realtime(realtime_frame)
+            .expect("normal realtime send should work after returning to Normal");
+        assert!(matches!(
+            piper.send_replay_frame(PiperFrame::new_standard(0x322, &[0x03])),
+            Err(DriverError::InvalidInput(_))
+        ));
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 2,
+            "normal sends should reach the TX thread after serialized mode switches",
+        );
+    }
+
+    #[test]
+    fn test_set_mode_normal_wrapper_does_not_interleave_with_replay_switch() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let (reached_rx, release_tx) = install_mode_switch_barrier();
+
+        let piper_replay = Arc::clone(&piper);
+        let replay_handle = std::thread::spawn(move || {
+            piper_replay.try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("Replay switch should block at the mode-switch barrier");
+
+        let piper_normal = Arc::clone(&piper);
+        let normal_handle = std::thread::spawn(move || {
+            piper_normal.set_mode(crate::mode::DriverMode::Normal);
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !normal_handle.is_finished(),
+            "set_mode(Normal) wrapper must also serialize behind the Replay switch"
+        );
+
+        let _ = release_tx.send(());
+        replay_handle
+            .join()
+            .expect("Replay switch thread should finish")
+            .expect("Replay switch should complete before the wrapper restore");
+        normal_handle.join().expect("Normal wrapper thread should finish");
+
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
+        assert_ne!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::ReplayPaused,
+            "wrapper restore must not leave the gate stuck in ReplayPaused"
+        );
+        assert!(
+            !piper.replay_barrier_active(),
+            "wrapper restore must not leave the replay barrier engaged"
+        );
+
+        let reliable_frame = PiperFrame::new_standard(0x330, &[0x01]);
+        let realtime_frame = PiperFrame::new_standard(0x331, &[0x02]);
+        piper
+            .send_frame(reliable_frame)
+            .expect("normal reliable send should work after wrapper restore");
+        piper
+            .send_realtime(realtime_frame)
+            .expect("normal realtime send should work after wrapper restore");
+        assert!(matches!(
+            piper.send_replay_frame(PiperFrame::new_standard(0x332, &[0x03])),
+            Err(DriverError::InvalidInput(_))
+        ));
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 2,
+            "normal sends should reach the TX thread after wrapper restore",
+        );
+    }
+
+    #[test]
+    fn test_try_set_mode_channel_closed_does_not_leave_replay_mode_with_open_gate() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                CoordinatedFailTxAdapter {
+                    started_tx,
+                    release_rx,
+                    first_send: false,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        piper
+            .send_frame(PiperFrame::new_standard(0x340, &[0x01]))
+            .expect("first reliable frame should queue");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first reliable frame should begin sending");
+
+        let piper_mode = Arc::clone(&piper);
+        let mode_handle = std::thread::spawn(move || {
+            piper_mode.try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(500))
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = release_tx.send(());
+
+        let error = mode_handle
+            .join()
+            .expect("mode switch thread should finish")
+            .expect_err("Replay switch should fail once the TX thread exits");
+        assert!(
+            matches!(
+                error,
+                DriverError::ChannelClosed | DriverError::ControlPathClosed
+            ),
+            "mode switch should report channel/runtme closure after the TX worker exits, got {error:?}"
+        );
+        assert!(
+            !(piper.mode().is_replay()
+                && piper.normal_send_gate.state() == NormalSendGateState::Open),
+            "ChannelClosed path must not leave Replay mode published with an open normal-send gate"
         );
     }
 
