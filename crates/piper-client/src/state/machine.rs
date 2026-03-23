@@ -3073,12 +3073,14 @@ where
     /// 恢复序列固定为：
     /// 1. 验证当前 runtime fault 确实是 `ManualFault`
     /// 2. 通过 shutdown lane 发送 `0x150 resume`
-    /// 3. 等待一份严格新于 resume 发送确认时刻的完整 6 轴低速反馈
-    /// 4. 仅在拿到 fresh confirmed mask 后，driver 才清除 fault latch 并重新打开 normal gate
-    /// 5. `mask == 0` 返回 `Standby`，否则返回 `Maintenance`
+    /// 3. 要求 resume 时已经持有一份完整的 pre-resume 6 轴低速基线
+    /// 4. 等待一份严格新于 resume 发送确认时刻的完整 6 轴低速反馈
+    /// 5. 仅在拿到 fresh confirmed mask 后，driver 才清除 fault latch 并重新打开 normal gate
+    /// 6. `mask == 0` 返回 `Standby`，否则返回 `Maintenance`
     ///
     /// `timeout` 覆盖 resume 发送、确认以及 fresh post-resume 反馈等待的总预算。
-    /// 如果在预算内拿不到 fresh post-resume 反馈，则保持 fault latched 并返回超时错误。
+    /// 如果缺少完整 pre-resume 基线，或在预算内拿不到 fresh post-resume 反馈，
+    /// 则保持 fault latched 并返回超时错误。
     pub fn recover_from_emergency_stop(
         self,
         timeout: Duration,
@@ -4475,22 +4477,30 @@ mod tests {
     #[test]
     fn recover_from_emergency_stop_returns_standby_after_resume() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut low_speed_frames =
+            delayed_joint_state_frames(false, Duration::ZERO, Duration::ZERO, 100);
+        low_speed_frames.extend(delayed_joint_state_frames(
+            false,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            200,
+        ));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                PacedRxAdapter::new(delayed_joint_state_frames(
-                    false,
-                    Duration::from_millis(50),
-                    Duration::from_millis(1),
-                    100,
-                )),
+                PacedRxAdapter::new(low_speed_frames),
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
             )
             .expect("driver should start"),
         );
         let active = build_active_mit_piper_with_driver(
-            driver,
+            driver.clone(),
             DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+        wait_until(
+            Duration::from_millis(200),
+            || driver.get_joint_driver_low_speed().hardware_timestamps[5] == 106,
+            "pre-resume low-speed feedback should establish the disabled hardware baseline",
         );
 
         let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
@@ -4707,22 +4717,30 @@ mod tests {
     #[test]
     fn recover_from_emergency_stop_returns_maintenance_after_resume_with_fresh_enabled_feedback() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut low_speed_frames =
+            delayed_joint_state_frames(true, Duration::ZERO, Duration::ZERO, 200);
+        low_speed_frames.extend(delayed_joint_state_frames(
+            true,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            300,
+        ));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                PacedRxAdapter::new(delayed_joint_state_frames(
-                    true,
-                    Duration::from_millis(50),
-                    Duration::from_millis(1),
-                    200,
-                )),
+                PacedRxAdapter::new(low_speed_frames),
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
             )
             .expect("driver should start"),
         );
         let active = build_active_mit_piper_with_driver(
-            driver,
+            driver.clone(),
             DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+        wait_until(
+            Duration::from_millis(200),
+            || driver.get_joint_driver_low_speed().hardware_timestamps[5] == 206,
+            "pre-resume low-speed feedback should establish the enabled hardware baseline",
         );
 
         let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
@@ -4828,6 +4846,66 @@ mod tests {
 
         let recover_error = match error.recover_from_emergency_stop(Duration::from_millis(40)) {
             Ok(_) => panic!("host-late stale post-resume feedback must not reopen control"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(recover_error, RobotError::Timeout { .. }));
+        assert_eq!(driver.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(
+            driver.maintenance_lease_snapshot().state(),
+            piper_driver::MaintenanceGateState::DeniedFaulted
+        );
+    }
+
+    #[test]
+    fn recover_from_emergency_stop_times_out_without_pre_resume_low_speed_baseline() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let post_resume_frames = vec![
+            TimedFrame {
+                delay: Duration::from_millis(15),
+                frame: joint_driver_disabled_frame(1, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(2, 1_001),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(3, 1_002),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(4, 1_003),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(5, 1_004),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_disabled_frame(6, 1_005),
+            },
+        ];
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(post_resume_frames),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver.clone(),
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
+        let driver = Arc::clone(&error.driver);
+
+        let recover_error = match error.recover_from_emergency_stop(Duration::from_millis(40)) {
+            Ok(_) => panic!(
+                "recovery must fail closed when no complete pre-resume low-speed baseline exists"
+            ),
             Err(error) => error,
         };
 

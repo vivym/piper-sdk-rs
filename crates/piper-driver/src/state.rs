@@ -676,6 +676,13 @@ pub struct JointDriverLowSpeedState {
     pub valid_mask: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostResumeFeedbackBaseline {
+    HardwareBaseline([u64; 6]),
+    HostFallbackBaseline,
+    BaselineUnavailable,
+}
+
 impl JointDriverLowSpeedState {
     /// 检查所有关节是否都已更新（`valid_mask == 0x3F`）
     pub fn is_fully_valid(&self) -> bool {
@@ -730,43 +737,69 @@ impl JointDriverLowSpeedState {
         Some(self.driver_enabled_mask)
     }
 
+    /// 返回 recovery 可用的 pre-resume baseline 类型。
+    ///
+    /// 只有当低速状态已经具备完整的历史 6 轴反馈时，才允许 recovery 使用该基线：
+    /// - `HardwareBaseline`: 6 轴 host/hardware 时间戳都可用，优先按硬件时间戳判新
+    /// - `HostFallbackBaseline`: 6 轴 host 时间戳完整，但至少一轴缺少硬件时间戳
+    /// - `BaselineUnavailable`: 基线不完整，recovery 必须 fail-closed
+    pub(crate) fn post_resume_feedback_baseline(&self) -> PostResumeFeedbackBaseline {
+        if !self.is_fully_valid() || self.host_rx_mono_timestamps.contains(&0) {
+            return PostResumeFeedbackBaseline::BaselineUnavailable;
+        }
+
+        if self.hardware_timestamps.iter().all(|&timestamp| timestamp != 0) {
+            PostResumeFeedbackBaseline::HardwareBaseline(self.hardware_timestamps)
+        } else {
+            PostResumeFeedbackBaseline::HostFallbackBaseline
+        }
+    }
+
     /// 返回“resume 之后的新样本”对应的已确认 6 轴驱动器使能掩码。
     ///
-    /// 若当前 6 轴低速反馈都带有硬件时间戳，则优先要求每轴硬件时间戳都严格大于
-    /// `baseline_hardware_timestamps`，并同时满足 host freshness 窗口。
-    /// 若任一轴硬件时间戳缺失，则回退到 host monotonic 判新。
+    /// 只有在 recovery 启动时已经持有完整的 pre-resume baseline 时，才允许继续判新：
+    /// - `HardwareBaseline`: 要求当前 6 轴硬件时间戳都严格大于 pre-resume baseline
+    /// - `HostFallbackBaseline`: 回退到 host monotonic 判新
+    /// - `BaselineUnavailable`: 永远 fail-closed
     pub(crate) fn confirmed_driver_enabled_mask_after_post_resume_feedback(
         &self,
-        baseline_hardware_timestamps: [u64; 6],
+        baseline: PostResumeFeedbackBaseline,
         baseline_host_mono_us: u64,
         now_host_mono_us: u64,
         freshness_window_us: u64,
     ) -> Option<u8> {
-        if self.hardware_timestamps.iter().all(|&timestamp| timestamp != 0) {
-            for (joint_idx, baseline_hardware_timestamp) in
-                baseline_hardware_timestamps.iter().enumerate()
-            {
-                let hardware_timestamp = self.hardware_timestamps[joint_idx];
-                let host_timestamp = self.host_rx_mono_timestamps[joint_idx];
-                if hardware_timestamp <= *baseline_hardware_timestamp {
+        match baseline {
+            PostResumeFeedbackBaseline::HardwareBaseline(baseline_hardware_timestamps) => {
+                if self.hardware_timestamps.contains(&0) {
                     return None;
                 }
-                if host_timestamp == 0 {
-                    return None;
-                }
-                if now_host_mono_us.saturating_sub(host_timestamp) > freshness_window_us {
-                    return None;
-                }
-            }
 
-            return Some(self.driver_enabled_mask);
+                for (joint_idx, baseline_hardware_timestamp) in
+                    baseline_hardware_timestamps.iter().enumerate()
+                {
+                    let hardware_timestamp = self.hardware_timestamps[joint_idx];
+                    let host_timestamp = self.host_rx_mono_timestamps[joint_idx];
+                    if hardware_timestamp <= *baseline_hardware_timestamp {
+                        return None;
+                    }
+                    if host_timestamp == 0 {
+                        return None;
+                    }
+                    if now_host_mono_us.saturating_sub(host_timestamp) > freshness_window_us {
+                        return None;
+                    }
+                }
+
+                Some(self.driver_enabled_mask)
+            },
+            PostResumeFeedbackBaseline::HostFallbackBaseline => self
+                .confirmed_driver_enabled_mask_after_host_mono(
+                    baseline_host_mono_us,
+                    now_host_mono_us,
+                    freshness_window_us,
+                ),
+            PostResumeFeedbackBaseline::BaselineUnavailable => None,
         }
-
-        self.confirmed_driver_enabled_mask_after_host_mono(
-            baseline_host_mono_us,
-            now_host_mono_us,
-            freshness_window_us,
-        )
     }
 
     /// 检查指定关节是否电压过低
@@ -793,7 +826,7 @@ impl JointDriverLowSpeedState {
         (self.driver_over_current_mask >> joint_index) & 1 == 1
     }
 
-    /// 检查指定关节是否驱动器过温
+    /// 检查指定关节驱动器是否过温
     pub fn is_driver_over_temp(&self, joint_index: usize) -> bool {
         if joint_index >= 6 {
             return false;
@@ -3143,13 +3176,85 @@ mod tests {
 
         assert_eq!(
             state.confirmed_driver_enabled_mask_after_post_resume_feedback(
-                [100, 101, 102, 103, 104, 105],
+                PostResumeFeedbackBaseline::HardwareBaseline([100, 101, 102, 103, 104, 105]),
                 1_000,
                 2_100,
                 500,
             ),
             None,
             "host-late stale feedback must not count as post-resume fresh when hardware timestamps did not advance",
+        );
+    }
+
+    #[test]
+    fn test_joint_driver_low_speed_state_post_resume_mask_requires_available_baseline() {
+        let state = JointDriverLowSpeedState {
+            driver_enabled_mask: 0,
+            hardware_timestamps: [100, 101, 102, 103, 104, 105],
+            host_rx_mono_timestamps: [2_000, 2_001, 2_002, 2_003, 2_004, 2_005],
+            valid_mask: 0b11_1111,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.confirmed_driver_enabled_mask_after_post_resume_feedback(
+                PostResumeFeedbackBaseline::BaselineUnavailable,
+                1_000,
+                2_100,
+                500,
+            ),
+            None,
+            "an unavailable pre-resume baseline must fail closed instead of accepting the first full batch",
+        );
+    }
+
+    #[test]
+    fn test_joint_driver_low_speed_state_post_resume_baseline_is_unavailable_when_incomplete() {
+        let state = JointDriverLowSpeedState {
+            hardware_timestamps: [100, 101, 102, 0, 0, 0],
+            host_rx_mono_timestamps: [2_000, 2_001, 2_002, 0, 0, 0],
+            valid_mask: 0b000111,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.post_resume_feedback_baseline(),
+            PostResumeFeedbackBaseline::BaselineUnavailable,
+            "a partial pre-resume baseline must be classified as unavailable",
+        );
+    }
+
+    #[test]
+    fn test_joint_driver_low_speed_state_post_resume_baseline_is_unavailable_when_host_timestamp_missing()
+     {
+        let state = JointDriverLowSpeedState {
+            hardware_timestamps: [100, 101, 102, 103, 104, 105],
+            host_rx_mono_timestamps: [2_000, 2_001, 2_002, 2_003, 2_004, 0],
+            valid_mask: 0b11_1111,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.post_resume_feedback_baseline(),
+            PostResumeFeedbackBaseline::BaselineUnavailable,
+            "missing pre-resume host timestamps must fail closed even if hardware timestamps exist",
+        );
+    }
+
+    #[test]
+    fn test_joint_driver_low_speed_state_post_resume_baseline_falls_back_to_host_when_hardware_missing()
+     {
+        let state = JointDriverLowSpeedState {
+            hardware_timestamps: [0; 6],
+            host_rx_mono_timestamps: [2_000, 2_001, 2_002, 2_003, 2_004, 2_005],
+            valid_mask: 0b11_1111,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.post_resume_feedback_baseline(),
+            PostResumeFeedbackBaseline::HostFallbackBaseline,
+            "a complete pre-resume baseline without hardware timestamps should use host fallback",
         );
     }
 
@@ -3166,7 +3271,7 @@ mod tests {
 
         assert_eq!(
             state.confirmed_driver_enabled_mask_after_post_resume_feedback(
-                [900, 901, 902, 903, 904, 905],
+                PostResumeFeedbackBaseline::HostFallbackBaseline,
                 1_000,
                 2_100,
                 500,

@@ -2074,7 +2074,7 @@ impl Piper {
         self.validate_manual_fault_recovery_preconditions()?;
 
         let baseline_driver_state = self.get_joint_driver_low_speed();
-        let baseline_hardware_timestamps = baseline_driver_state.hardware_timestamps;
+        let post_resume_baseline = baseline_driver_state.post_resume_feedback_baseline();
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros();
 
         loop {
@@ -2089,7 +2089,7 @@ impl Piper {
             let now_host_mono_us = crate::heartbeat::monotonic_micros();
             if let Some(confirmed_mask) = driver_state
                 .confirmed_driver_enabled_mask_after_post_resume_feedback(
-                    baseline_hardware_timestamps,
+                    post_resume_baseline,
                     baseline_host_mono_us,
                     now_host_mono_us,
                     self.low_speed_drive_state_freshness_window_us(),
@@ -6427,6 +6427,62 @@ mod tests {
     }
 
     #[test]
+    fn test_manual_fault_recovery_times_out_without_pre_resume_baseline_even_if_full_batch_arrives()
+    {
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                MockTxAdapter,
+                Some(maintenance_ready_config()),
+            )
+            .unwrap(),
+        );
+
+        mark_maintenance_standby_confirmed(&piper);
+        piper.latch_fault();
+        piper
+            .ctx
+            .joint_driver_low_speed
+            .store(Arc::new(JointDriverLowSpeedState::default()));
+
+        let piper_for_feedback = Arc::clone(&piper);
+        let feedback_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            let now = crate::heartbeat::monotonic_micros().max(1);
+            piper_for_feedback.ctx.connection_monitor.register_feedback();
+            piper_for_feedback.ctx.joint_driver_low_speed.store(Arc::new(
+                JointDriverLowSpeedState {
+                    host_rx_mono_us: now + 5,
+                    host_rx_mono_timestamps: [now, now + 1, now + 2, now + 3, now + 4, now + 5],
+                    hardware_timestamp_us: 105,
+                    hardware_timestamps: [100, 101, 102, 103, 104, 105],
+                    driver_enabled_mask: 0,
+                    valid_mask: 0b11_1111,
+                    ..JointDriverLowSpeedState::default()
+                },
+            ));
+        });
+
+        let error = piper
+            .complete_manual_fault_recovery_after_resume_until(
+                Instant::now() + Duration::from_millis(25),
+                Duration::from_millis(1),
+            )
+            .expect_err(
+                "recovery must fail closed when no complete pre-resume low-speed baseline exists",
+            );
+        feedback_thread.join().expect("feedback thread should join");
+
+        assert!(matches!(error, DriverError::Timeout));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(piper.runtime_phase(), RuntimePhase::FaultLatched);
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+    }
+
+    #[test]
     fn test_manual_fault_recovery_expired_deadline_wins_over_ready_feedback() {
         let piper = Piper::new_dual_thread_parts_unvalidated(
             MockRxAdapter,
@@ -6445,6 +6501,66 @@ mod tests {
                 Duration::from_millis(1),
             )
             .expect_err("expired deadline must fail even if ready feedback is already visible");
+        assert!(matches!(error, DriverError::Timeout));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(piper.runtime_phase(), RuntimePhase::FaultLatched);
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+    }
+
+    #[test]
+    fn test_manual_fault_recovery_times_out_with_partial_pre_resume_baseline() {
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                MockTxAdapter,
+                Some(maintenance_ready_config()),
+            )
+            .unwrap(),
+        );
+
+        mark_maintenance_standby_confirmed(&piper);
+        piper.latch_fault();
+
+        let baseline_now = crate::heartbeat::monotonic_micros().max(1);
+        piper.ctx.connection_monitor.register_feedback();
+        piper.ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
+            hardware_timestamps: [100, 101, 102, 0, 0, 0],
+            host_rx_mono_timestamps: [baseline_now, baseline_now + 1, baseline_now + 2, 0, 0, 0],
+            valid_mask: 0b000111,
+            ..JointDriverLowSpeedState::default()
+        }));
+
+        let piper_for_feedback = Arc::clone(&piper);
+        let feedback_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            let now = crate::heartbeat::monotonic_micros().max(1);
+            piper_for_feedback.ctx.connection_monitor.register_feedback();
+            piper_for_feedback.ctx.joint_driver_low_speed.store(Arc::new(
+                JointDriverLowSpeedState {
+                    host_rx_mono_us: now + 5,
+                    host_rx_mono_timestamps: [now, now + 1, now + 2, now + 3, now + 4, now + 5],
+                    hardware_timestamp_us: 205,
+                    hardware_timestamps: [200, 201, 202, 203, 204, 205],
+                    driver_enabled_mask: 0,
+                    valid_mask: 0b11_1111,
+                    ..JointDriverLowSpeedState::default()
+                },
+            ));
+        });
+
+        let error = piper
+            .complete_manual_fault_recovery_after_resume_until(
+                Instant::now() + Duration::from_millis(25),
+                Duration::from_millis(1),
+            )
+            .expect_err(
+                "recovery must fail closed when pre-resume low-speed baseline was incomplete",
+            );
+        feedback_thread.join().expect("feedback thread should join");
+
         assert!(matches!(error, DriverError::Timeout));
         assert_eq!(piper.health().fault, Some(RuntimeFaultKind::ManualFault));
         assert_eq!(piper.runtime_phase(), RuntimePhase::FaultLatched);
