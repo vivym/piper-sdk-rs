@@ -2788,6 +2788,7 @@ fn message_kind(request: &ClientRequest) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_can::{BackendCapability, CanError, RealtimeTxAdapter, RxAdapter};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -2893,6 +2894,44 @@ mod tests {
         }
     }
 
+    struct PanickingRxAdapter;
+
+    impl RxAdapter for PanickingRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            panic!("test rx panic")
+        }
+
+        fn backend_capability(&self) -> BackendCapability {
+            BackendCapability::SoftRealtime
+        }
+    }
+
+    struct NoopTxAdapter;
+
+    impl RealtimeTxAdapter for NoopTxAdapter {
+        fn send_control(
+            &mut self,
+            _frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn bridge_maintenance_state_maps_driver_unknown_state() {
         assert_eq!(
@@ -2906,6 +2945,44 @@ mod tests {
         assert_eq!(
             BridgeMaintenanceState::DeniedDriveStateUnknown.denial_message(),
             MaintenanceGateState::DeniedDriveStateUnknown.denial_message()
+        );
+    }
+
+    #[test]
+    fn maintenance_broker_reports_denied_faulted_after_rx_panic() {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(PanickingRxAdapter, NoopTxAdapter, None)
+                .expect("driver should start without strict startup validation"),
+        );
+        driver.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while driver.health().rx_alive {
+            assert!(
+                Instant::now() < deadline,
+                "RX panic should become visible before broker acquire test begins"
+            );
+            std::thread::yield_now();
+        }
+
+        let manager = Arc::new(SessionManager::new());
+        let register = manager.commit_prepared(manager.prepare_session(
+            token(7),
+            BridgeRole::WriterCandidate,
+            vec![],
+            Arc::new(NoopWake),
+        ));
+        let authority = SessionAuthority::new(register.session, &manager);
+        let broker = MaintenanceBroker::new(Arc::clone(&driver));
+
+        let err = broker
+            .acquire(&authority, Duration::from_millis(10))
+            .expect_err("RX-dead runtime must deny maintenance lease acquisition");
+
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            BridgeMaintenanceState::DeniedFaulted.denial_message()
         );
     }
 

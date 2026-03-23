@@ -250,8 +250,8 @@ impl DualArmActiveMit {
             // Steady-state MIT commands stay unconfirmed to minimize loop jitter.
             // Real TX/transport failures are expected to surface here on the next cycle.
             let health = active.observer().runtime_health();
-            if classify_runtime_transport_fault(health) {
-                report.exit_reason = Some(BilateralExitReason::RuntimeTransportFault);
+            if let Some(exit_reason) = classify_runtime_fault_exit_reason(health) {
+                report.exit_reason = Some(exit_reason);
                 report.last_runtime_fault_left = health.left.fault;
                 report.last_runtime_fault_right = health.right.fault;
                 report.last_error = Some(format_runtime_health_error(health));
@@ -578,7 +578,10 @@ pub enum BilateralExitReason {
     ControllerFault,
     CompensationFault,
     SubmissionFault,
+    /// Driver/runtime transport or worker-health fault detected from runtime health.
     RuntimeTransportFault,
+    /// Explicit manual `driver.latch_fault()` observed from runtime health.
+    RuntimeManualFault,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1243,13 +1246,22 @@ fn format_runtime_health_error(health: DualArmRuntimeHealth) -> String {
     )
 }
 
-fn classify_runtime_transport_fault(health: DualArmRuntimeHealth) -> bool {
-    !health.left.rx_alive
+fn classify_runtime_fault_exit_reason(health: DualArmRuntimeHealth) -> Option<BilateralExitReason> {
+    if matches!(health.left.fault, Some(RuntimeFaultKind::ManualFault))
+        || matches!(health.right.fault, Some(RuntimeFaultKind::ManualFault))
+    {
+        Some(BilateralExitReason::RuntimeManualFault)
+    } else if !health.left.rx_alive
         || !health.left.tx_alive
         || !health.right.rx_alive
         || !health.right.tx_alive
         || health.left.fault.is_some()
         || health.right.fault.is_some()
+    {
+        Some(BilateralExitReason::RuntimeTransportFault)
+    } else {
+        None
+    }
 }
 
 fn stop_attempt_from_driver_error(err: &DriverError) -> StopAttemptResult {
@@ -3168,6 +3180,66 @@ mod tests {
             !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
             "runtime unhealthy exit should not inject an extra hold",
         );
+    }
+
+    #[test]
+    fn test_run_bilateral_runtime_manual_fault_is_reported_separately() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let left = build_active_mit_piper(1_000, left_sent);
+        let left_driver = left.driver.clone();
+        let arms = DualArmActiveMit {
+            left,
+            right: build_active_mit_piper(1_000, right_sent),
+        };
+
+        let latch_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            left_driver.latch_fault();
+        });
+
+        let exit = arms
+            .run_bilateral(
+                ForwardingController::default(),
+                BilateralLoopConfig {
+                    frequency_hz: 50.0,
+                    warmup_cycles: 0,
+                    max_iterations: Some(50),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_secs(1),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("manual runtime latch should converge to faulted exit");
+        latch_handle.join().expect("manual latch thread should finish cleanly");
+
+        match exit {
+            DualArmLoopExit::Standby { .. } => panic!("expected faulted exit"),
+            DualArmLoopExit::Faulted { report, .. } => {
+                assert_eq!(report.submission_faults, 0);
+                assert_eq!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::RuntimeManualFault)
+                );
+                assert_eq!(
+                    report.last_runtime_fault_left,
+                    Some(RuntimeFaultKind::ManualFault)
+                );
+                assert_ne!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::RuntimeTransportFault)
+                );
+            },
+        }
     }
 
     #[test]

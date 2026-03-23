@@ -2942,8 +2942,32 @@ impl Piper {
     }
 
     #[doc(hidden)]
+    /// Returns a runtime-level maintenance denial override for external observers.
+    ///
+    /// RX death, fault latch, and Replay isolation all make the maintenance path
+    /// unavailable even if the underlying lease gate has not been refreshed yet.
+    fn maintenance_runtime_override_state(&self) -> Option<MaintenanceGateState> {
+        (!self.maintenance_runtime_open()).then_some(MaintenanceGateState::DeniedFaulted)
+    }
+
+    #[doc(hidden)]
+    /// Returns the maintenance lease snapshot with runtime-level availability applied.
+    ///
+    /// When the runtime is not maintenance-open (fault latched, RX dead, Replay active,
+    /// or Replay barrier engaged), the exposed state is forced to `DeniedFaulted` while
+    /// preserving the underlying holder identifiers and lease epoch for diagnostics.
     pub fn maintenance_lease_snapshot(&self) -> MaintenanceLeaseSnapshot {
-        self.maintenance_gate.snapshot()
+        let snapshot = self.maintenance_gate.snapshot();
+        let Some(state) = self.maintenance_runtime_override_state() else {
+            return snapshot;
+        };
+
+        MaintenanceLeaseSnapshot {
+            state,
+            holder_session_id: snapshot.holder_session_id,
+            holder_session_key: snapshot.holder_session_key,
+            lease_epoch: snapshot.lease_epoch,
+        }
     }
 
     #[doc(hidden)]
@@ -2952,13 +2976,31 @@ impl Piper {
     }
 
     #[doc(hidden)]
+    /// Acquires the maintenance lease only when the runtime is maintenance-open.
+    ///
+    /// RX death, fault latch, and Replay isolation all deny acquisition as
+    /// `DeniedFaulted` even if the underlying lease gate still reflects a stale
+    /// standby state.
     pub fn acquire_maintenance_lease_gate(
         &self,
         session_id: u32,
         session_key: u64,
         timeout: Duration,
     ) -> Result<MaintenanceLeaseAcquireResult, DriverError> {
-        self.maintenance_gate.acquire_blocking(session_id, session_key, timeout)
+        if let Some(state) = self.maintenance_runtime_override_state() {
+            return Ok(MaintenanceLeaseAcquireResult::DeniedState { state });
+        }
+
+        let result = self.maintenance_gate.acquire_blocking(session_id, session_key, timeout)?;
+
+        if matches!(result, MaintenanceLeaseAcquireResult::Granted { .. })
+            && let Some(state) = self.maintenance_runtime_override_state()
+        {
+            let _ = self.release_maintenance_lease_gate_if_holder(session_key);
+            return Ok(MaintenanceLeaseAcquireResult::DeniedState { state });
+        }
+
+        Ok(result)
     }
 
     #[doc(hidden)]
@@ -5757,6 +5799,7 @@ mod tests {
         let health = piper.health();
         assert!(!health.rx_alive);
         assert_eq!(health.fault, Some(RuntimeFaultKind::RxExited));
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
         assert!(matches!(
             piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01])),
             Err(DriverError::ControlPathClosed)
@@ -5766,6 +5809,18 @@ mod tests {
             Err(DriverError::ControlPathClosed)
         ));
         assert!(!piper.maintenance_runtime_open());
+        assert_eq!(
+            piper.maintenance_lease_snapshot().state(),
+            MaintenanceGateState::DeniedFaulted
+        );
+        assert_eq!(
+            piper
+                .acquire_maintenance_lease_gate(11, 22, Duration::from_millis(10))
+                .expect("maintenance acquire should expose runtime fault to observers"),
+            MaintenanceLeaseAcquireResult::DeniedState {
+                state: MaintenanceGateState::DeniedFaulted,
+            }
+        );
     }
 
     #[test]
