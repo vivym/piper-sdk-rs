@@ -185,22 +185,28 @@ impl ReplSession {
                 Ok(())
             },
             ReplState::StandbyStrict(robot) => {
-                robot.disable_all()?;
+                let robot = robot
+                    .into_maintenance()
+                    .request_disable_all()?
+                    .wait_until_disabled(DisableConfig::default())?;
                 self.state = ReplState::StandbyStrict(robot);
                 Ok(())
             },
             ReplState::StandbySoft(robot) => {
-                robot.disable_all()?;
+                let robot = robot
+                    .into_maintenance()
+                    .request_disable_all()?
+                    .wait_until_disabled(DisableConfig::default())?;
                 self.state = ReplState::StandbySoft(robot);
                 Ok(())
             },
             ReplState::ActivePositionStrict(robot) => {
-                let robot = robot.disable_all()?;
+                let robot = robot.disable(DisableConfig::default())?;
                 self.state = ReplState::StandbyStrict(robot);
                 Ok(())
             },
             ReplState::ActivePositionSoft(robot) => {
-                let robot = robot.disable_all()?;
+                let robot = robot.disable(DisableConfig::default())?;
                 self.state = ReplState::StandbySoft(robot);
                 Ok(())
             },
@@ -582,7 +588,7 @@ impl ReplExecutor {
 
         if let Some(stop_result) = completion.post_command_stop {
             match stop_result {
-                Ok(()) => println!("✅ 已执行 disable_all()，连接保持在 {}", self.status()),
+                Ok(()) => println!("✅ 已确认失能全部关节，连接保持在 {}", self.status()),
                 Err(error) => eprintln!("❌ Emergency stop failed: {error}"),
             }
         }
@@ -625,7 +631,7 @@ pub async fn run_repl() -> Result<()> {
     println!();
     println!("💡 提示: 使用 'connect' 连接到机器人，然后 'enable' 使能电机");
     println!("💡 提示: 连接目标使用和 CLI 一样的 target spec，例如 socketcan:can0");
-    println!("💡 提示: `stop` 或 Ctrl+C 会发送 disable_all()，但保持连接在 Standby");
+    println!("💡 提示: `stop` 或 Ctrl+C 会请求并确认全关节失能，然后保持连接在 Standby");
     println!("💡 提示: 命令执行期间只接受 `stop` / Ctrl+C / exit");
     println!("💡 提示: shell 不做交互式确认；高风险 move / set-zero 请显式加 --force");
     println!();
@@ -970,11 +976,11 @@ fn print_help() {
     println!("  set-zero [--joints 1,2,3] [--force]   写入零点标定");
     println!("  collision-protection get              主动查询碰撞保护等级");
     println!("  collision-protection set --level 5    设置统一碰撞保护等级");
-    println!("  stop                                  急停（disable_all，保持连接）");
+    println!("  stop                                  急停（确认全关节失能，保持连接）");
     println!("  status                                显示连接状态");
     println!("  help                                  显示帮助");
     println!("  exit / quit                           退出");
-    println!("  Ctrl+C                                急停（disable_all，保持连接）");
+    println!("  Ctrl+C                                急停（确认全关节失能，保持连接）");
     println!("  Ctrl+D                                退出 shell");
     println!("  忙碌时                                仅接受 stop / Ctrl+C / exit");
     println!("  需要确认的操作                        shell 中必须显式加 --force");

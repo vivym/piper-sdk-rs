@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use piper_client::MotionConnectedPiper;
-use piper_client::state::{MotionCapability, Piper, Standby};
+use piper_client::state::{DisableConfig, MotionCapability, Piper, Standby};
 use piper_control::{
     ControlProfile, home_zero_blocking, move_to_joint_target_blocking, park_blocking, prepare_move,
     set_joint_zero_blocking,
@@ -282,8 +282,12 @@ impl ScriptExecutor {
             },
             ScriptCommand::Stop => {
                 println!("  🛑 急停");
-                if let Err(error) = standby.disable_all() {
-                    return Err(CommandFailure::recoverable(error, standby));
+                if let Err(error) = standby
+                    .into_maintenance()
+                    .request_disable_all()
+                    .and_then(|robot| robot.wait_until_disabled(DisableConfig::default()))
+                {
+                    return Err(CommandFailure::lost_standby(error));
                 }
                 Ok(ExecutionOutcome::Stop)
             },

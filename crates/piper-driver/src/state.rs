@@ -777,6 +777,29 @@ pub struct CollisionProtectionState {
     pub protection_levels: [u8; 6],
 }
 
+/// 设置指令应答状态（冷数据）
+///
+/// 更新频率：按需查询（通常由配置/维护类操作触发）
+/// CAN ID：0x476
+/// 同步机制：RwLock（更新频率极低）
+#[derive(Debug, Clone, Default)]
+pub struct SettingResponseState {
+    /// 硬件时间戳（微秒，来自 CAN 帧）
+    pub hardware_timestamp_us: u64,
+
+    /// 系统接收时间戳（微秒）
+    pub host_rx_mono_us: u64,
+
+    /// 应答指令索引（例如 0x75 对应 0x475）
+    pub response_index: u8,
+
+    /// 零点设置是否成功
+    pub zero_point_success: bool,
+
+    /// 是否已经收到过有效应答
+    pub is_valid: bool,
+}
+
 /// 关节限制配置状态（冷数据）
 ///
 /// 更新频率：按需查询（需要查询6次，每个关节一次）
@@ -1187,6 +1210,9 @@ pub struct PiperContext {
     /// 碰撞保护状态（按需查询：0x47B）
     pub collision_protection: Arc<RwLock<CollisionProtectionState>>,
 
+    /// 设置指令应答状态（按需查询：0x476）
+    pub setting_response: Arc<RwLock<SettingResponseState>>,
+
     /// 关节限制配置状态（按需查询：0x473）
     pub joint_limit_config: Arc<RwLock<JointLimitConfigState>>,
 
@@ -1306,6 +1332,7 @@ impl PiperContext {
 
             // 冷数据：RwLock
             collision_protection: Arc::new(RwLock::new(CollisionProtectionState::default())),
+            setting_response: Arc::new(RwLock::new(SettingResponseState::default())),
             joint_limit_config: Arc::new(RwLock::new(JointLimitConfigState::default())),
             joint_accel_config: Arc::new(RwLock::new(JointAccelConfigState::default())),
             end_limit_config: Arc::new(RwLock::new(EndLimitConfigState::default())),
@@ -2982,6 +3009,45 @@ mod tests {
         assert_eq!(state.hardware_timestamp_us, 0);
         assert_eq!(state.host_rx_mono_us, 0);
         assert_eq!(state.protection_levels, [0; 6]);
+    }
+
+    #[test]
+    fn test_setting_response_state_default() {
+        let state = SettingResponseState::default();
+        assert_eq!(state.hardware_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
+        assert_eq!(state.response_index, 0);
+        assert!(!state.zero_point_success);
+        assert!(!state.is_valid);
+    }
+
+    #[test]
+    fn test_setting_response_state_clone() {
+        let state = SettingResponseState {
+            hardware_timestamp_us: 1000,
+            host_rx_mono_us: 2000,
+            response_index: 0x75,
+            zero_point_success: true,
+            is_valid: true,
+        };
+        let cloned = state.clone();
+        assert_eq!(state.hardware_timestamp_us, cloned.hardware_timestamp_us);
+        assert_eq!(state.host_rx_mono_us, cloned.host_rx_mono_us);
+        assert_eq!(state.response_index, cloned.response_index);
+        assert_eq!(state.zero_point_success, cloned.zero_point_success);
+        assert_eq!(state.is_valid, cloned.is_valid);
+    }
+
+    #[test]
+    fn test_piper_context_setting_response() {
+        let ctx = PiperContext::new();
+
+        let state = ctx.setting_response.read().unwrap();
+        assert_eq!(state.hardware_timestamp_us, 0);
+        assert_eq!(state.host_rx_mono_us, 0);
+        assert_eq!(state.response_index, 0);
+        assert!(!state.zero_point_success);
+        assert!(!state.is_valid);
     }
 
     // ============================================================

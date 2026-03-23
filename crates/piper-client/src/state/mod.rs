@@ -66,6 +66,7 @@ pub use machine::{
     // 状态类型
     Disconnected,
     ErrorState,
+    Maintenance,
     // 控制模式
     MitMode,
     MitModeConfig,

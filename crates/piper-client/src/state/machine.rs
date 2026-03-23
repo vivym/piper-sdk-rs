@@ -15,12 +15,14 @@ use crate::{
     observer::{CollisionProtectionSnapshot, MonitorReadPolicy, Observer, RuntimeHealthSnapshot},
     raw_commander::RawCommander,
 };
-use piper_driver::BackendCapability;
+use piper_driver::{BackendCapability, SettingResponseState};
 use piper_protocol::control::{InstallPosition, MitControlCommand, MitMode as ProtocolMitMode};
 use piper_protocol::feedback::{ControlMode, MoveMode, RobotStatus};
 use tracing::{debug, info, trace};
 
 const COLLISION_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ZERO_SETTING_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+const ZERO_SETTING_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 // ==================== 状态类型（零大小类型）====================
 
@@ -33,6 +35,11 @@ pub struct Disconnected;
 ///
 /// 已连接但未使能。可以读取状态，但不能发送运动命令。
 pub struct Standby;
+
+/// 维护状态
+///
+/// 已连接但不保证全关节失能，允许执行局部使能/失能等维护操作。
+pub struct Maintenance;
 
 /// 活动状态（带控制模式）
 ///
@@ -129,6 +136,33 @@ struct ModeConfirmationExpectation {
 struct ModeConfirmationBaseline {
     robot_control: piper_driver::RobotControlState,
     mode_echo: piper_driver::MasterSlaveControlModeState,
+}
+
+#[derive(Clone, Copy)]
+struct SettingResponseSnapshot {
+    hardware_timestamp_us: u64,
+    host_rx_mono_us: u64,
+    response_index: u8,
+    zero_point_success: bool,
+    is_valid: bool,
+}
+
+impl SettingResponseSnapshot {
+    fn is_newer_than(self, hardware_timestamp_us: u64, host_rx_mono_us: u64) -> bool {
+        self.hardware_timestamp_us > hardware_timestamp_us || self.host_rx_mono_us > host_rx_mono_us
+    }
+}
+
+impl From<SettingResponseState> for SettingResponseSnapshot {
+    fn from(value: SettingResponseState) -> Self {
+        Self {
+            hardware_timestamp_us: value.hardware_timestamp_us,
+            host_rx_mono_us: value.host_rx_mono_us,
+            response_index: value.response_index,
+            zero_point_success: value.zero_point_success,
+            is_valid: value.is_valid,
+        }
+    }
 }
 
 // ==================== 运动类型 ====================
@@ -404,6 +438,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn wait_for_fresh_collision_protection_update<SendQuery, ReadCached>(
     timeout: Duration,
     poll_interval: Duration,
@@ -424,6 +459,51 @@ where
     loop {
         let state = read_cached()?;
         if state.is_newer_than(baseline_hw, baseline_sys) {
+            return Ok(state);
+        }
+
+        if start.elapsed() > timeout {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let sleep_duration = poll_interval.min(remaining);
+        if sleep_duration.is_zero() {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        std::thread::sleep(sleep_duration);
+    }
+}
+
+fn wait_for_fresh_setting_response<ReadCached, CheckHealth>(
+    timeout: Duration,
+    poll_interval: Duration,
+    baseline: Option<SettingResponseSnapshot>,
+    expected_response_index: u8,
+    mut read_cached: ReadCached,
+    mut check_health: CheckHealth,
+) -> Result<SettingResponseSnapshot>
+where
+    ReadCached: FnMut() -> Result<SettingResponseSnapshot>,
+    CheckHealth: FnMut() -> Result<()>,
+{
+    let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
+    let baseline_sys = baseline.as_ref().map_or(0, |state| state.host_rx_mono_us);
+    let start = Instant::now();
+
+    loop {
+        check_health()?;
+
+        let state = read_cached()?;
+        if state.is_valid
+            && state.response_index == expected_response_index
+            && state.is_newer_than(baseline_hw, baseline_sys)
+        {
             return Ok(state);
         }
 
@@ -766,90 +846,19 @@ where
         self.enable_mit_mode(MitModeConfig::default())
     }
 
-    /// 使能指定关节（保持 Standby 状态）
+    /// 进入维护状态。
     ///
-    /// # 参数
-    ///
-    /// - `joints`: 要使能的关节列表
-    ///
-    /// # 返回
-    ///
-    /// 返回 `Piper<Standby>`，因为只是部分使能，不转换到 Active 状态。
-    pub fn enable_joints(self, joints: &[Joint]) -> Result<Piper<Standby, Capability>>
+    /// Maintenance 明确表示当前连接不再承诺“全关节确认失能”。
+    pub fn into_maintenance(self) -> Piper<Maintenance, Capability>
     where
         Capability: MotionCapability,
     {
-        use piper_protocol::control::MotorEnableCommand;
-
-        for &joint in joints {
-            let cmd = MotorEnableCommand::enable(joint.index() as u8);
-            let frame = cmd.to_frame();
-            self.driver.send_reliable(frame)?;
-        }
-
-        // 不转换状态，仍保持 Standby（部分使能）
-        Ok(self)
-    }
-
-    /// 使能单个关节（保持 Standby 状态）
-    ///
-    /// # 参数
-    ///
-    /// - `joint`: 要使能的关节
-    ///
-    /// # 返回
-    ///
-    /// 返回 `Piper<Standby>`，因为只是部分使能，不转换到 Active 状态。
-    pub fn enable_joint(self, joint: Joint) -> Result<Piper<Standby, Capability>>
-    where
-        Capability: MotionCapability,
-    {
-        use piper_protocol::control::MotorEnableCommand;
-
-        let cmd = MotorEnableCommand::enable(joint.index() as u8);
-        let frame = cmd.to_frame();
-        self.driver.send_reliable(frame)?;
-
-        Ok(self)
-    }
-
-    /// 失能全部关节
-    ///
-    /// # 返回
-    ///
-    /// 返回 `()`，因为失能后仍然保持 Standby 状态。
-    pub fn disable_all(&self) -> Result<()>
-    where
-        Capability: MotionCapability,
-    {
-        use piper_protocol::control::MotorEnableCommand;
-
-        self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
-        Ok(())
-    }
-
-    /// 失能指定关节
-    ///
-    /// # 参数
-    ///
-    /// - `joints`: 要失能的关节列表
-    ///
-    /// # 返回
-    ///
-    /// 返回 `()`，因为失能后仍然保持 Standby 状态。
-    pub fn disable_joints(self, joints: &[Joint]) -> Result<()>
-    where
-        Capability: MotionCapability,
-    {
-        use piper_protocol::control::MotorEnableCommand;
-
-        for &joint in joints {
-            let cmd = MotorEnableCommand::disable(joint.index() as u8);
-            let frame = cmd.to_frame();
-            self.driver.send_reliable(frame)?;
-        }
-
-        Ok(())
+        transition_piper_state(
+            self,
+            Maintenance,
+            DropPolicy::DisableAll,
+            DriverModeDropPolicy::Preserve,
+        )
     }
 
     /// 获取 Observer（只读）
@@ -886,6 +895,8 @@ where
         let mut stable_count = 0;
 
         loop {
+            self.ensure_runtime_health_healthy()?;
+
             // 细粒度超时检查
             if start.elapsed() > timeout {
                 return Err(RobotError::Timeout {
@@ -905,17 +916,7 @@ where
                 stable_count = 0;
             }
 
-            // 检查剩余时间，避免不必要的 sleep
-            let remaining = timeout.saturating_sub(start.elapsed());
-            let sleep_duration = poll_interval.min(remaining);
-
-            if sleep_duration.is_zero() {
-                return Err(RobotError::Timeout {
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-
-            std::thread::sleep(sleep_duration);
+            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
         }
     }
 
@@ -929,6 +930,8 @@ where
         let start = Instant::now();
 
         loop {
+            self.ensure_runtime_health_healthy()?;
+
             if start.elapsed() > timeout {
                 return Err(RobotError::Timeout {
                     timeout_ms: timeout.as_millis() as u64,
@@ -961,15 +964,7 @@ where
                 return Ok(());
             }
 
-            let remaining = timeout.saturating_sub(start.elapsed());
-            let sleep_duration = poll_interval.min(remaining);
-            if sleep_duration.is_zero() {
-                return Err(RobotError::Timeout {
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-
-            std::thread::sleep(sleep_duration);
+            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
         }
     }
 
@@ -1269,17 +1264,105 @@ where
     /// // 注意：确保 J1 已移动到预期的零点位置
     /// standby.set_joint_zero_positions(&[0])?;
     ///
-    /// // 设置多个关节的零位
-    /// standby.set_joint_zero_positions(&[0, 1, 2])?;
-    ///
     /// // 设置所有关节的零位
     /// standby.set_joint_zero_positions(&[0, 1, 2, 3, 4, 5])?;
+    ///
+    /// // 注意：任意 2~5 个关节的子集批量回零会被拒绝，
+    /// // 因为协议没有提供原子确认语义。
     /// # Ok(())
     /// # }
     /// ```
     pub fn set_joint_zero_positions(&self, joints: &[usize]) -> Result<()> {
+        if joints.is_empty() {
+            return Ok(());
+        }
+
+        let baseline = self.setting_response_cached_inner().ok();
         let raw = RawCommander::new(&self.driver);
-        raw.set_joint_zero_positions(joints)
+        raw.request_joint_zero_positions(joints)?;
+
+        let response = wait_for_fresh_setting_response(
+            ZERO_SETTING_CONFIRM_TIMEOUT,
+            ZERO_SETTING_POLL_INTERVAL,
+            baseline,
+            0x75,
+            || self.setting_response_cached_inner(),
+            || self.ensure_runtime_health_healthy(),
+        )?;
+
+        if response.zero_point_success {
+            Ok(())
+        } else {
+            Err(RobotError::ConfigError(
+                "controller rejected joint zero-point setting".to_string(),
+            ))
+        }
+    }
+}
+
+impl<Capability> Piper<Maintenance, Capability>
+where
+    Capability: MotionCapability,
+{
+    /// 获取 Observer（只读）
+    pub fn observer(&self) -> &Observer<Capability> {
+        &self.observer
+    }
+
+    /// 使能指定关节，并保持在 Maintenance。
+    pub fn enable_joints(self, joints: &[Joint]) -> Result<Piper<Maintenance, Capability>> {
+        use piper_protocol::control::MotorEnableCommand;
+
+        for &joint in joints {
+            let cmd = MotorEnableCommand::enable((joint.index() + 1) as u8);
+            self.driver.send_reliable(cmd.to_frame())?;
+        }
+
+        Ok(self)
+    }
+
+    /// 使能单个关节，并保持在 Maintenance。
+    pub fn enable_joint(self, joint: Joint) -> Result<Piper<Maintenance, Capability>> {
+        self.enable_joints(&[joint])
+    }
+
+    /// 失能指定关节，并保持在 Maintenance。
+    pub fn disable_joints(self, joints: &[Joint]) -> Result<Piper<Maintenance, Capability>> {
+        use piper_protocol::control::MotorEnableCommand;
+
+        for &joint in joints {
+            let cmd = MotorEnableCommand::disable((joint.index() + 1) as u8);
+            self.driver.send_reliable(cmd.to_frame())?;
+        }
+
+        Ok(self)
+    }
+
+    /// 失能单个关节，并保持在 Maintenance。
+    pub fn disable_joint(self, joint: Joint) -> Result<Piper<Maintenance, Capability>> {
+        self.disable_joints(&[joint])
+    }
+
+    /// 请求全关节失能，但仍保持在 Maintenance，直到确认完成。
+    pub fn request_disable_all(self) -> Result<Piper<Maintenance, Capability>> {
+        self.send_disable_request()?;
+        Ok(self)
+    }
+
+    /// 等待确认全关节失能，并返回 Standby。
+    pub fn wait_until_disabled(self, config: DisableConfig) -> Result<Piper<Standby, Capability>> {
+        self.wait_for_disabled(
+            config.timeout,
+            config.debounce_threshold,
+            config.poll_interval,
+        )?;
+
+        Ok(transition_piper_state(
+            self,
+            Standby,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        ))
     }
 }
 
@@ -1349,6 +1432,43 @@ where
         }
     }
 
+    fn ensure_runtime_health_healthy(&self) -> Result<()> {
+        let health = self.runtime_health();
+        if health.fault.is_some() || !health.rx_alive || !health.tx_alive {
+            return Err(RobotError::runtime_health_unhealthy(
+                health.rx_alive,
+                health.tx_alive,
+                health.fault,
+            ));
+        }
+        Ok(())
+    }
+
+    fn sleep_with_fail_fast(
+        &self,
+        start: Instant,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let sleep_duration = poll_interval.min(remaining);
+        if sleep_duration.is_zero() {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        std::thread::sleep(sleep_duration);
+        Ok(())
+    }
+
+    fn send_disable_request(&self) -> Result<()> {
+        use piper_protocol::control::MotorEnableCommand;
+
+        self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
+        Ok(())
+    }
+
     fn into_state<NextState>(
         self,
         next_state: NextState,
@@ -1377,19 +1497,41 @@ where
     ) -> Result<CollisionProtectionSnapshot> {
         let baseline = self.collision_protection_cached_inner().ok();
         let raw = RawCommander::new(&self.driver);
-        wait_for_fresh_collision_protection_update(
-            timeout,
-            poll_interval,
-            baseline,
-            || raw.query_collision_protection(),
-            || self.collision_protection_cached_inner(),
-        )
+        let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
+        let baseline_sys = baseline.as_ref().map_or(0, |state| state.host_rx_mono_us);
+
+        raw.query_collision_protection()?;
+
+        let start = Instant::now();
+        loop {
+            self.ensure_runtime_health_healthy()?;
+
+            let state = self.collision_protection_cached_inner()?;
+            if state.is_newer_than(baseline_hw, baseline_sys) {
+                return Ok(state);
+            }
+
+            if start.elapsed() > timeout {
+                return Err(RobotError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+
+            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
+        }
     }
 
     fn collision_protection_cached_inner(&self) -> Result<CollisionProtectionSnapshot> {
         self.driver
             .get_collision_protection()
             .map(CollisionProtectionSnapshot::from)
+            .map_err(Into::into)
+    }
+
+    fn setting_response_cached_inner(&self) -> Result<SettingResponseSnapshot> {
+        self.driver
+            .get_setting_response()
+            .map(SettingResponseSnapshot::from)
             .map_err(Into::into)
     }
 
@@ -1528,6 +1670,8 @@ where
         let mut stable_count = 0;
 
         loop {
+            self.ensure_runtime_health_healthy()?;
+
             if start.elapsed() > timeout {
                 return Err(RobotError::Timeout {
                     timeout_ms: timeout.as_millis() as u64,
@@ -1543,16 +1687,7 @@ where
                 stable_count = 0;
             }
 
-            let remaining = timeout.saturating_sub(start.elapsed());
-            let sleep_duration = poll_interval.min(remaining);
-
-            if sleep_duration.is_zero() {
-                return Err(RobotError::Timeout {
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-
-            std::thread::sleep(sleep_duration);
+            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
         }
     }
 }
@@ -1563,15 +1698,16 @@ impl<M, Capability> Piper<Active<M>, Capability>
 where
     Capability: MotionCapability,
 {
-    /// 立即失能全部关节并返回 Standby。
+    /// 请求立即失能全部关节，并进入 Maintenance。
     ///
-    /// 这是急停/人工接管路径，发送 `disable_all()` 后立即转换回 Standby，
-    /// 不等待 debounce 或关闭序列完成。
-    pub fn disable_all(self) -> Result<Piper<Standby, Capability>> {
-        use piper_protocol::control::MotorEnableCommand;
-
-        self.driver.send_reliable(MotorEnableCommand::disable_all().to_frame())?;
-        Ok(self.into_state(Standby, DropPolicy::Noop, DriverModeDropPolicy::Preserve))
+    /// 这是急停/人工接管路径：只发送 disable 请求，不伪装成已确认失能的 Standby。
+    pub fn request_disable_all(self) -> Result<Piper<Maintenance, Capability>> {
+        self.send_disable_request()?;
+        Ok(self.into_state(
+            Maintenance,
+            DropPolicy::DisableAll,
+            DriverModeDropPolicy::Preserve,
+        ))
     }
 
     /// 优雅关闭机械臂
@@ -1681,13 +1817,12 @@ where
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::{Piper, PiperBuilder};
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let robot = PiperBuilder::new()
-    ///     .socketcan("can0")
-    ///     .build()?;
-    ///
-    /// let active = robot.enable_position_mode(Default::default())?;
+    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::state::{MotionCapability, Piper, Standby};
+    /// # fn run_example<C: MotionCapability>(
+    /// #     standby: Piper<Standby, C>,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// let active = standby.enable_position_mode(Default::default())?;
     ///
     /// // 获取诊断接口
     /// let diag = active.diagnostics();
@@ -1696,8 +1831,19 @@ where
     /// std::thread::spawn(move || {
     ///     // 在这里使用 diag...
     /// });
+    /// # Ok(())
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let robot = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
     ///
-    /// // active 仍然可以正常使用
+    /// match robot.require_motion()? {
+    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    /// }
+    ///
+    /// // 真实代码里，active 仍然可以正常使用
     /// # Ok(())
     /// # }
     /// ```
@@ -2075,15 +2221,12 @@ where
     /// # }
     /// ```
     pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby, Capability>> {
-        use piper_protocol::control::*;
-
         debug!("Disabling robot");
 
         // === PHASE 1: All operations that can panic ===
 
         // 1. 失能机械臂
-        let disable_cmd = MotorEnableCommand::disable_all();
-        self.driver.send_reliable(disable_cmd.to_frame())?;
+        self.send_disable_request()?;
         debug!("Motor disable command sent");
 
         // 2. 等待失能完成（带 Debounce）
@@ -2123,12 +2266,9 @@ impl Piper<Active<MitPassthroughMode>, SoftRealtime> {
     }
 
     pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby, SoftRealtime>> {
-        use piper_protocol::control::*;
-
         debug!("Disabling robot");
 
-        let disable_cmd = MotorEnableCommand::disable_all();
-        self.driver.send_reliable(disable_cmd.to_frame())?;
+        self.send_disable_request()?;
         self.wait_for_disabled(
             config.timeout,
             config.debounce_threshold,
@@ -2394,15 +2534,12 @@ where
     /// let robot = robot.disable(DisableConfig::default())?;
     /// ```
     pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby, Capability>> {
-        use piper_protocol::control::*;
-
         debug!("Disabling robot");
 
         // === PHASE 1: All operations that can panic ===
 
         // 1. 失能机械臂
-        let disable_cmd = MotorEnableCommand::disable_all();
-        self.driver.send_reliable(disable_cmd.to_frame())?;
+        self.send_disable_request()?;
         debug!("Motor disable command sent");
 
         // 2. 等待失能完成（带 Debounce）
@@ -2679,15 +2816,14 @@ where
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::PiperBuilder;
+    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::state::{MotionCapability, Piper, Standby};
     /// # use std::sync::atomic::{AtomicBool, Ordering};
     /// # use std::sync::Arc;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let robot = PiperBuilder::new()
-    ///     .socketcan("can0")
-    ///     .build()?;
-    ///
-    /// let replay = robot.enter_replay_mode()?;
+    /// # fn run_example<C: MotionCapability>(
+    /// #     standby: Piper<Standby, C>,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// let replay = standby.enter_replay_mode()?;
     ///
     /// // 创建停止信号
     /// let running = Arc::new(AtomicBool::new(true));
@@ -2696,11 +2832,19 @@ where
     /// // running.store(false, Ordering::SeqCst);
     ///
     /// // 回放（可被取消）
-    /// let standby = replay.replay_recording_with_cancel(
-    ///     "recording.bin",
-    ///     1.0,
-    ///     &running
-    /// )?;
+    /// let standby = replay.replay_recording_with_cancel("recording.bin", 1.0, &running)?;
+    /// # let _ = standby;
+    /// # Ok(())
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let robot = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
+    ///
+    /// match robot.require_motion()? {
+    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    /// }
     /// # Ok(())
     /// # }
     /// ```
@@ -2909,7 +3053,7 @@ mod tests {
     use crate::observer::CollisionProtectionSnapshot;
     use crate::observer::Observer;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-    use piper_driver::Piper as RobotPiper;
+    use piper_driver::{Piper as RobotPiper, RuntimeFaultKind};
     use piper_protocol::control::MitControlCommand;
     use piper_protocol::ids::{ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56};
     use piper_tools::{PiperRecording, RecordingMetadata, TimestampSource, TimestampedFrame};
@@ -3355,6 +3499,28 @@ mod tests {
         robot_status_frame_with_status(control_mode, RobotStatus::Normal, move_mode, timestamp_us)
     }
 
+    fn setting_response_frame(
+        response_index: u8,
+        zero_point_success: bool,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut frame = PiperFrame::new_standard(
+            piper_protocol::ids::ID_SETTING_RESPONSE as u16,
+            &[
+                response_index,
+                if zero_point_success { 0x01 } else { 0x00 },
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
     fn control_mode_echo_frame(
         control_mode: piper_protocol::control::ControlModeCommand,
         move_mode: MoveMode,
@@ -3757,6 +3923,187 @@ mod tests {
                 poll_interval: Duration::from_millis(1),
             })
             .expect("fresh confirmed disabled feedback should allow disable transition");
+    }
+
+    #[test]
+    fn active_request_disable_all_transitions_via_maintenance_to_standby() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let frames = (1..=6)
+            .map(|joint_index| TimedFrame {
+                delay: Duration::from_millis(2),
+                frame: joint_driver_disabled_frame(joint_index, joint_index as u64),
+            })
+            .collect();
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(frames),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let maintenance =
+            active.request_disable_all().expect("disable request should enter maintenance");
+        let standby = maintenance
+            .wait_until_disabled(DisableConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+            })
+            .expect("fresh disabled feedback should converge to standby");
+
+        assert!(matches!(standby._state, Standby));
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.first().copied(),
+            Some(piper_protocol::control::MotorEnableCommand::disable_all().to_frame())
+        );
+    }
+
+    #[test]
+    fn maintenance_partial_joint_power_commands_send_expected_frames() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone());
+
+        let maintenance = standby
+            .into_maintenance()
+            .enable_joint(Joint::J2)
+            .expect("maintenance enable should succeed");
+        let _maintenance = maintenance
+            .disable_joint(Joint::J2)
+            .expect("maintenance disable should succeed");
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() >= 2,
+            "maintenance partial power commands should be sent",
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent,
+            vec![
+                piper_protocol::control::MotorEnableCommand::enable(2).to_frame(),
+                piper_protocol::control::MotorEnableCommand::disable(2).to_frame(),
+            ]
+        );
+    }
+
+    #[test]
+    fn maintenance_wait_until_disabled_fails_fast_when_runtime_fault_latches() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames,
+        );
+        let maintenance =
+            active.request_disable_all().expect("disable request should enter maintenance");
+        let driver = Arc::clone(&maintenance.driver);
+        let latch_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            driver.latch_fault();
+        });
+
+        let error = match maintenance.wait_until_disabled(DisableConfig {
+            timeout: Duration::from_millis(200),
+            debounce_threshold: 1,
+            poll_interval: Duration::from_millis(1),
+        }) {
+            Ok(_) => panic!("runtime fault should fail fast during disable wait"),
+            Err(error) => error,
+        };
+        latch_handle.join().expect("fault latch helper should finish cleanly");
+
+        assert!(matches!(
+            error,
+            RobotError::RuntimeHealthUnhealthy {
+                fault: Some(RuntimeFaultKind::ManualFault),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn set_joint_zero_positions_waits_for_confirmed_setting_response() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(
+            PacedRxAdapter::new(vec![TimedFrame {
+                delay: Duration::from_millis(5),
+                frame: setting_response_frame(0x75, true, 10),
+            }]),
+            sent_frames.clone(),
+        );
+
+        standby
+            .set_joint_zero_positions(&[0])
+            .expect("single-joint zeroing should wait for 0x476 confirmation");
+
+        wait_until(
+            Duration::from_millis(200),
+            || !sent_frames.lock().expect("sent frames lock").is_empty(),
+            "zero-point request frame should be sent",
+        );
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent[0],
+            piper_protocol::config::JointSettingCommand::set_zero_point(1).to_frame()
+        );
+    }
+
+    #[test]
+    fn set_joint_zero_positions_supports_all_joint_broadcast_confirmation() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(
+            PacedRxAdapter::new(vec![TimedFrame {
+                delay: Duration::from_millis(5),
+                frame: setting_response_frame(0x75, true, 10),
+            }]),
+            sent_frames.clone(),
+        );
+
+        standby
+            .set_joint_zero_positions(&[0, 1, 2, 3, 4, 5])
+            .expect("all-joint zeroing should use broadcast confirmation");
+
+        wait_until(
+            Duration::from_millis(200),
+            || !sent_frames.lock().expect("sent frames lock").is_empty(),
+            "broadcast zero-point request frame should be sent",
+        );
+        let sent = sent_frames.lock().expect("sent frames lock").clone();
+        assert_eq!(
+            sent[0],
+            piper_protocol::config::JointSettingCommand::set_zero_point(7).to_frame()
+        );
+    }
+
+    #[test]
+    fn set_joint_zero_positions_fails_fast_when_runtime_fault_latches() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let driver = Arc::clone(&standby.driver);
+        let latch_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            driver.latch_fault();
+        });
+
+        let error = standby
+            .set_joint_zero_positions(&[0])
+            .expect_err("runtime fault should fail zero-point confirmation wait fast");
+        latch_handle.join().expect("fault latch helper should finish cleanly");
+
+        assert!(matches!(
+            error,
+            RobotError::RuntimeHealthUnhealthy {
+                fault: Some(RuntimeFaultKind::ManualFault),
+                ..
+            }
+        ));
     }
 
     #[test]

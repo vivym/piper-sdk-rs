@@ -16,6 +16,7 @@
 //! # 使用示例
 //!
 //! ```rust,no_run
+//! use piper_client::ControlReadPolicy;
 //! use piper_client::control::MitController;
 //! use piper_client::control::MitControllerConfig;
 //! use piper_client::state::*;

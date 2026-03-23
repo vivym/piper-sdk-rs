@@ -13,10 +13,10 @@
 //! # 使用示例
 //!
 //! ```rust,no_run
-//! # use piper_client::observer::Observer;
-//! # use piper_client::observer::ControlReadPolicy;
+//! # use piper_client::{Result, StrictRealtime};
+//! # use piper_client::observer::{ControlReadPolicy, Observer};
 //! # use piper_client::types::*;
-//! # fn example(observer: Observer) -> Result<()> {
+//! # fn example(observer: Observer<StrictRealtime>) -> Result<()> {
 //! // 读取关节位置
 //! let positions = observer.joint_positions()?;
 //! println!("J1 position: {}", positions[Joint::J1].to_deg());
@@ -473,8 +473,8 @@ where
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::observer::Observer;
-    /// # fn example(observer: Observer) -> Result<()> {
+    /// # use piper_client::{Observer, Result, StrictRealtime};
+    /// # fn example(observer: Observer<StrictRealtime>) -> Result<()> {
     /// let end_pose = observer.end_pose()?;
     /// println!("Position: X={:.4}, Y={:.4}, Z={:.4}",
     ///     end_pose.end_pose[0], end_pose.end_pose[1], end_pose.end_pose[2]);
@@ -1145,6 +1145,11 @@ mod tests {
         driver
             .wait_for_feedback(Duration::from_millis(200))
             .expect("partial low-speed feedback should arrive");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline && observer.joint_enabled_mask() != 0b000001 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         assert_eq!(observer.joint_enabled_mask(), 0b000001);
         assert_eq!(observer.joint_enabled_mask_confirmed(), None);

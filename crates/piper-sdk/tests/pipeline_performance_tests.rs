@@ -245,7 +245,7 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
     let is_running = Arc::new(AtomicBool::new(true));
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let fault = Arc::new(AtomicU8::new(0));
-    let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(2));
+    let tx_adapter = RecordingTxAdapter::new(Duration::from_micros(200));
     let sent_frames = tx_adapter.sent_frames.clone();
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
@@ -294,7 +294,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
     let is_running = Arc::new(AtomicBool::new(true));
     let runtime_phase = Arc::new(AtomicU8::new(0));
     let fault = Arc::new(AtomicU8::new(0));
-    let tx_adapter = RecordingTxAdapter::new(Duration::from_millis(1));
+    let tx_adapter = RecordingTxAdapter::new(Duration::from_micros(300));
     let sent_frames = tx_adapter.sent_frames.clone();
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
@@ -325,7 +325,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
             let frame = PiperFrame::new_standard((0x400 + i) as u16, &[i as u8; 8]);
             *realtime_slot_writer.lock().unwrap() =
                 Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_micros(50));
         }
     });
 

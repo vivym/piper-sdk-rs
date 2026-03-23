@@ -11,14 +11,13 @@
 //! # 使用示例
 //!
 //! ```rust,no_run
-//! use piper_client::{PiperBuilder, recording::{RecordingConfig, RecordingMetadata, StopCondition}};
+//! use piper_client::{MotionConnectedPiper, PiperBuilder, recording::{RecordingConfig, RecordingMetadata, StopCondition}};
+//! use piper_client::state::{MotionCapability, Piper, Standby};
 //!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let robot = PiperBuilder::new()
-//!     .socketcan("can0")
-//!     .build()?;
-//!
-//! let active = robot.enable_position_mode(Default::default())?;
+//! # fn run_example<C: MotionCapability>(
+//! #     standby: Piper<Standby, C>,
+//! # ) -> Result<(), Box<dyn std::error::Error>> {
+//! let active = standby.enable_position_mode(Default::default())?;
 //!
 //! // 启动录制（Active 状态）
 //! let (active, handle) = active.start_recording(RecordingConfig {
@@ -35,6 +34,18 @@
 //!
 //! // 停止录制并保存
 //! let _active = active.stop_recording(handle)?;
+//! # Ok(())
+//! # }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let robot = PiperBuilder::new()
+//!     .socketcan("can0")
+//!     .build()?;
+//!
+//! match robot.require_motion()? {
+//!     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
+//!     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+//! }
 //! # Ok(())
 //! # }
 //! ```

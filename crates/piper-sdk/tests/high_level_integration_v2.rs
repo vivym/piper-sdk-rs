@@ -156,11 +156,11 @@ fn test_enable_joints() {
         let joints = [Joint::J1, Joint::J2];
         match robot.require_motion() {
             Ok(MotionConnectedPiper::Strict(robot)) => {
-                let result = robot.enable_joints(&joints);
+                let result = robot.into_maintenance().enable_joints(&joints);
                 assert!(result.is_ok() || result.is_err());
             },
             Ok(MotionConnectedPiper::Soft(robot)) => {
-                let result = robot.enable_joints(&joints);
+                let result = robot.into_maintenance().enable_joints(&joints);
                 assert!(result.is_ok() || result.is_err());
             },
             Err(error) => panic!("motion-capable mock connection expected: {error}"),

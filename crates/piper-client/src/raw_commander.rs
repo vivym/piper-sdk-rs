@@ -341,9 +341,9 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
-    /// 设置关节零位
+    /// 请求设置关节零位
     ///
-    /// 设置指定关节的当前位置为零点。
+    /// 请求将指定关节的当前位置设为零点。
     ///
     /// # 参数
     ///
@@ -353,17 +353,19 @@ impl<'a> RawCommander<'a> {
     ///
     /// ```ignore
     /// // 设置 J1 的当前位置为零点
-    /// raw_commander.set_joint_zero_positions(&[0])?;
-    ///
-    /// // 设置多个关节的零位
-    /// raw_commander.set_joint_zero_positions(&[0, 1, 2])?;
+    /// raw_commander.request_joint_zero_positions(&[0])?;
     ///
     /// // 设置所有关节的零位
-    /// raw_commander.set_joint_zero_positions(&[0, 1, 2, 3, 4, 5])?;
+    /// raw_commander.request_joint_zero_positions(&[0, 1, 2, 3, 4, 5])?;
     /// ```
-    pub(crate) fn set_joint_zero_positions(&self, joints: &[usize]) -> Result<()> {
+    pub(crate) fn request_joint_zero_positions(&self, joints: &[usize]) -> Result<()> {
         use piper_protocol::config::JointSettingCommand;
 
+        if joints.is_empty() {
+            return Ok(());
+        }
+
+        let mut joint_mask = 0u8;
         for &joint_index in joints {
             if joint_index > 5 {
                 return Err(RobotError::ConfigError(format!(
@@ -371,12 +373,20 @@ impl<'a> RawCommander<'a> {
                     joint_index
                 )));
             }
-
-            // joint_index 是 0-based，需要转换为 1-based（J1=0 -> 1）
-            let cmd = JointSettingCommand::set_zero_point((joint_index + 1) as u8);
-            self.driver.send_reliable(cmd.to_frame())?;
+            joint_mask |= 1 << joint_index;
         }
 
+        let cmd = match joints.len() {
+            1 => JointSettingCommand::set_zero_point((joints[0] + 1) as u8),
+            6 if joint_mask == 0b11_1111 => JointSettingCommand::set_zero_point(7),
+            _ => {
+                return Err(RobotError::ConfigError(
+                    "joint zeroing only supports a single joint or all six joints".to_string(),
+                ));
+            },
+        };
+
+        self.driver.send_reliable(cmd.to_frame())?;
         Ok(())
     }
 }
@@ -555,5 +565,52 @@ mod tests {
             "query type must be collision protection"
         );
         assert_eq!(frame.data[1], 0x00, "set type must remain unset");
+    }
+
+    #[test]
+    fn test_request_joint_zero_positions_single_joint_uses_direct_index() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+
+        commander
+            .request_joint_zero_positions(&[0])
+            .expect("single-joint zeroing request should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 1);
+        assert_eq!(
+            frames[0],
+            piper_protocol::config::JointSettingCommand::set_zero_point(1).to_frame()
+        );
+    }
+
+    #[test]
+    fn test_request_joint_zero_positions_all_joints_uses_broadcast_index() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+
+        commander
+            .request_joint_zero_positions(&[0, 1, 2, 3, 4, 5])
+            .expect("all-joint zeroing request should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 1);
+        assert_eq!(
+            frames[0],
+            piper_protocol::config::JointSettingCommand::set_zero_point(7).to_frame()
+        );
+    }
+
+    #[test]
+    fn test_request_joint_zero_positions_rejects_partial_multi_joint_subset() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames);
+        let commander = RawCommander::new(&driver);
+
+        let error = commander
+            .request_joint_zero_positions(&[0, 1])
+            .expect_err("2-5 joint subsets should be rejected without partial submission");
+
+        assert!(matches!(error, RobotError::ConfigError(_)));
     }
 }

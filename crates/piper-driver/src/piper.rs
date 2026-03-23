@@ -2063,6 +2063,17 @@ impl Piper {
             .map_err(|_| DriverError::PoisonedLock)
     }
 
+    /// 获取最近一次设置指令应答（读锁）
+    ///
+    /// 包含设置指令索引及零点设置结果（按需查询）。
+    pub fn get_setting_response(&self) -> Result<SettingResponseState, DriverError> {
+        self.ctx
+            .setting_response
+            .read()
+            .map(|guard| guard.clone())
+            .map_err(|_| DriverError::PoisonedLock)
+    }
+
     /// 获取关节限制配置状态（读锁）
     ///
     /// 包含关节角度限制和速度限制（按需查询）。
@@ -4942,6 +4953,17 @@ mod tests {
 
         let limits = piper.get_joint_limit_config().unwrap();
         assert_eq!(limits.joint_limits_max, [0.0; 6]);
+    }
+
+    #[test]
+    fn test_get_setting_response() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+
+        let response = piper.get_setting_response().unwrap();
+        assert_eq!(response.response_index, 0);
+        assert!(!response.zero_point_success);
+        assert!(!response.is_valid);
     }
 
     #[test]

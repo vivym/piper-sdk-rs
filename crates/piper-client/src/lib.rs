@@ -56,6 +56,7 @@ pub use dual_arm::{
     DualArmHoldAnchor, DualArmLoopExit, DualArmObserver, DualArmReadPolicy, DualArmRuntimeHealth,
     DualArmSafetyConfig, DualArmSnapshot, GripperTeleopConfig, JointMirrorMap,
     JointSpaceBilateralController, LoopTimingMode, MasterFollowerController, StopAttemptResult,
+    SubmissionArm,
 };
 pub use observer::{
     CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, ControlSnapshotFull,
@@ -66,6 +67,7 @@ pub use recording::{
     RecordingConfig, RecordingHandle, RecordingMetadata, RecordingStats, StopCondition,
 };
 pub use state::{
-    ConnectedPiper, MonitorOnly, MotionConnectedPiper, Piper, SoftRealtime, StrictRealtime,
+    ConnectedPiper, Maintenance, MonitorOnly, MotionConnectedPiper, Piper, SoftRealtime,
+    StrictRealtime,
 }; // Type State Pattern 的状态机与能力分层入口
 pub use types::*;

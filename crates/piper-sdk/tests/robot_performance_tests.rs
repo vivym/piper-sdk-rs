@@ -4,6 +4,7 @@
 
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter};
 use piper_sdk::driver::*;
+use piper_sdk::protocol::ids::ID_JOINT_FEEDBACK_12;
 use std::time::Instant;
 
 /// 检测是否在CI环境中运行
@@ -17,7 +18,15 @@ fn is_ci_env() -> bool {
 }
 
 // Mock CanAdapter 用于性能测试
-struct MockCanAdapter;
+fn bootstrap_timestamp_frame() -> PiperFrame {
+    let mut frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
+    frame.timestamp_us = 1;
+    frame
+}
+
+struct MockCanAdapter {
+    bootstrap_emitted: bool,
+}
 
 impl CanAdapter for MockCanAdapter {
     fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
@@ -25,14 +34,24 @@ impl CanAdapter for MockCanAdapter {
     }
 
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        if !self.bootstrap_emitted {
+            self.bootstrap_emitted = true;
+            return Ok(bootstrap_timestamp_frame());
+        }
         Err(CanError::Timeout)
     }
 }
 
-struct MockRxAdapter;
+struct MockRxAdapter {
+    bootstrap_emitted: bool,
+}
 
 impl piper_sdk::can::RxAdapter for MockRxAdapter {
     fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        if !self.bootstrap_emitted {
+            self.bootstrap_emitted = true;
+            return Ok(bootstrap_timestamp_frame());
+        }
         Err(CanError::Timeout)
     }
 }
@@ -68,7 +87,12 @@ impl SplittableAdapter for MockCanAdapter {
     type TxAdapter = MockTxAdapter;
 
     fn split(self) -> Result<(Self::RxAdapter, Self::TxAdapter), CanError> {
-        Ok((MockRxAdapter, MockTxAdapter))
+        Ok((
+            MockRxAdapter {
+                bootstrap_emitted: false,
+            },
+            MockTxAdapter,
+        ))
     }
 }
 
@@ -77,7 +101,9 @@ impl SplittableAdapter for MockCanAdapter {
 /// 验证能够达到至少 450 Hz（允许 10% 误差）
 #[test]
 fn test_high_frequency_read_performance() {
-    let mock_can = MockCanAdapter;
+    let mock_can = MockCanAdapter {
+        bootstrap_emitted: false,
+    };
     let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
     let start = Instant::now();
@@ -115,7 +141,9 @@ fn test_high_frequency_read_performance() {
 /// 测试无锁读取性能（ArcSwap）
 #[test]
 fn test_lock_free_read_performance() {
-    let mock_can = MockCanAdapter;
+    let mock_can = MockCanAdapter {
+        bootstrap_emitted: false,
+    };
     let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
     let start = Instant::now();

@@ -31,6 +31,16 @@ use spin_sleep;
 const STRICT_GROUP_MAX_SPAN_US: u64 = 2_000;
 const MOTION_GROUP_RESET_MAX_SPAN_US: u64 = 2_200;
 const ALL_DRIVES_ENABLED_MASK: u8 = 0b11_1111;
+const TX_IDLE_BACKOFF_MIN_US: u64 = 50;
+const TX_IDLE_BACKOFF_RUNNING_MAX_US: u64 = 200;
+const TX_IDLE_BACKOFF_FAULT_LATCHED_MAX_US: u64 = 1_000;
+
+#[inline]
+fn tx_idle_backoff(min_us: u64, current: u64, max_us: u64) -> (Duration, u64) {
+    let sleep_us = current.clamp(min_us, max_us);
+    let next_us = sleep_us.saturating_mul(2).min(max_us);
+    (Duration::from_micros(sleep_us), next_us)
+}
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -1311,6 +1321,8 @@ pub fn tx_loop_mailbox(
     let mut soft_deadline_miss_streak = 0u32;
     let mut maintenance_tx_state = MaintenanceTxState::from_snapshot(maintenance_gate.snapshot());
     let mut pending_maintenance_sends = VecDeque::new();
+    let mut running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
+    let mut fault_latched_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
 
     loop {
         let phase = load_runtime_phase(&runtime_phase);
@@ -1341,6 +1353,8 @@ pub fn tx_loop_mailbox(
             if should_break {
                 break;
             }
+            running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
+            fault_latched_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
             continue;
         }
 
@@ -1439,6 +1453,8 @@ pub fn tx_loop_mailbox(
             if should_break {
                 break;
             }
+            running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
+            fault_latched_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
             continue;
         }
 
@@ -1446,9 +1462,17 @@ pub fn tx_loop_mailbox(
             abort_realtime_slot_fault(&realtime_slot, &metrics);
             drain_soft_realtime_queue(&soft_realtime_rx, &metrics, true, true);
             drain_reliable_queue(&reliable_rx, &metrics, true, true);
-            spin_sleep::sleep(Duration::from_micros(50));
+            let (sleep_duration, next_backoff_us) = tx_idle_backoff(
+                TX_IDLE_BACKOFF_MIN_US,
+                fault_latched_idle_backoff_us,
+                TX_IDLE_BACKOFF_FAULT_LATCHED_MAX_US,
+            );
+            spin_sleep::sleep(sleep_duration);
+            fault_latched_idle_backoff_us = next_backoff_us;
             continue;
         }
+
+        fault_latched_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
 
         if driver_mode.get(Ordering::Acquire).is_replay() {
             reject_replay_mode_dispatches(&realtime_slot, &soft_realtime_rx, &metrics);
@@ -1467,6 +1491,7 @@ pub fn tx_loop_mailbox(
         };
 
         if let Some(mut command) = realtime_command {
+            running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
             let deadline = command.deadline();
             let mut ack = command.take_ack();
             let frames = command.into_frames();
@@ -1608,6 +1633,7 @@ pub fn tx_loop_mailbox(
         }
 
         if let Ok(command) = soft_realtime_rx.try_recv() {
+            running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
             let total_frames = command.len();
             let (frames, deadline, ack) = command.into_parts();
             let mut sent_count = 0usize;
@@ -1729,6 +1755,7 @@ pub fn tx_loop_mailbox(
         }
 
         if let Ok(command) = reliable_rx.try_recv() {
+            running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
             let total_frames = command.len();
             let package_command = total_frames > 1;
             let (frames, mut ack, kind, maintenance, deadline) = command.into_parts();
@@ -1942,10 +1969,13 @@ pub fn tx_loop_mailbox(
         }
 
         // 都没有数据，避免忙等待
-        // 使用短暂的 sleep（50μs）降低 CPU 占用
-        // 注意：这里的延迟不会影响控制循环，因为控制循环在另一个线程
-        // 使用 spin_sleep 而非 thread::sleep 以获得微秒级精度（相比 thread::sleep 的 1-2ms）
-        spin_sleep::sleep(Duration::from_micros(50));
+        let (sleep_duration, next_backoff_us) = tx_idle_backoff(
+            TX_IDLE_BACKOFF_MIN_US,
+            running_idle_backoff_us,
+            TX_IDLE_BACKOFF_RUNNING_MAX_US,
+        );
+        spin_sleep::sleep(sleep_duration);
+        running_idle_backoff_us = next_backoff_us;
     }
 
     if workers_running.load(Ordering::Acquire)
@@ -2572,6 +2602,20 @@ fn parse_and_update_state(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         },
+        ID_SETTING_RESPONSE => {
+            if let Ok(feedback) = SettingResponse::try_from(*frame) {
+                outcome.counts_as_robot_feedback = true;
+                let host_rx_mono_us = host_rx_mono_us();
+
+                if let Ok(mut setting_response) = ctx.setting_response.write() {
+                    setting_response.hardware_timestamp_us = frame.timestamp_us;
+                    setting_response.host_rx_mono_us = host_rx_mono_us;
+                    setting_response.response_index = feedback.response_index;
+                    setting_response.zero_point_success = feedback.zero_point_success;
+                    setting_response.is_valid = true;
+                }
+            }
+        },
         ID_MOTOR_LIMIT_FEEDBACK => {
             if let Ok(feedback) = MotorLimitFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
@@ -2851,6 +2895,42 @@ mod tests {
         assert_eq!(config.frame_group_timeout_ms, 20);
         assert_eq!(config.velocity_buffer_timeout_us, 10_000);
         assert_eq!(config.low_speed_drive_state_freshness_ms, 250);
+    }
+
+    #[test]
+    fn test_tx_idle_backoff_grows_and_saturates() {
+        let mut current = TX_IDLE_BACKOFF_MIN_US;
+
+        for _ in 0..8 {
+            let (sleep, next) = tx_idle_backoff(
+                TX_IDLE_BACKOFF_MIN_US,
+                current,
+                TX_IDLE_BACKOFF_RUNNING_MAX_US,
+            );
+            assert!(sleep.as_micros() as u64 >= TX_IDLE_BACKOFF_MIN_US);
+            assert!(sleep.as_micros() as u64 <= TX_IDLE_BACKOFF_RUNNING_MAX_US);
+            current = next;
+        }
+
+        assert_eq!(current, TX_IDLE_BACKOFF_RUNNING_MAX_US);
+    }
+
+    #[test]
+    fn test_tx_idle_backoff_fault_latched_cap_is_larger() {
+        let (_, running_next) = tx_idle_backoff(
+            TX_IDLE_BACKOFF_MIN_US,
+            TX_IDLE_BACKOFF_RUNNING_MAX_US,
+            TX_IDLE_BACKOFF_RUNNING_MAX_US,
+        );
+        let (_, fault_next) = tx_idle_backoff(
+            TX_IDLE_BACKOFF_MIN_US,
+            TX_IDLE_BACKOFF_FAULT_LATCHED_MAX_US,
+            TX_IDLE_BACKOFF_FAULT_LATCHED_MAX_US,
+        );
+
+        assert_eq!(running_next, TX_IDLE_BACKOFF_RUNNING_MAX_US);
+        assert_eq!(fault_next, TX_IDLE_BACKOFF_FAULT_LATCHED_MAX_US);
+        assert!(fault_next > running_next);
     }
 
     #[test]

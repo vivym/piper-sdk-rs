@@ -115,6 +115,9 @@ impl DualArmActiveMit {
     where
         C: BilateralController,
     {
+        // 顺序固定为 right/slave -> left/master。
+        // 不承诺跨总线原子提交，报告中的 peer_command_may_have_applied 会显式记录
+        // “另一臂本周期命令可能已先落地”的窗口。
         self.run_bilateral_inner(controller, None, cfg)
     }
 
@@ -383,6 +386,8 @@ impl DualArmActiveMit {
                 &final_torques.slave,
             ) {
                 report.submission_faults += 1;
+                report.last_submission_failed_arm = Some(SubmissionArm::Right);
+                report.peer_command_may_have_applied = false;
                 report.exit_reason = Some(BilateralExitReason::SubmissionFault);
                 report.last_error = Some(err.to_string());
                 let (arms, shutdown) = active.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
@@ -400,6 +405,8 @@ impl DualArmActiveMit {
                 &final_torques.master,
             ) {
                 report.submission_faults += 1;
+                report.last_submission_failed_arm = Some(SubmissionArm::Left);
+                report.peer_command_may_have_applied = true;
                 report.exit_reason = Some(BilateralExitReason::SubmissionFault);
                 report.last_error = Some(err.to_string());
                 let (arms, shutdown) = active.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
@@ -595,6 +602,12 @@ pub enum StopAttemptResult {
     TransportFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionArm {
+    Left,
+    Right,
+}
+
 /// 双臂安全策略
 #[derive(Debug, Clone)]
 pub struct DualArmSafetyConfig {
@@ -694,6 +707,10 @@ pub struct BilateralRunReport {
     pub iterations: usize,
     pub read_faults: u32,
     pub submission_faults: u32,
+    /// 最后一次提交失败发生在哪一臂。
+    pub last_submission_failed_arm: Option<SubmissionArm>,
+    /// 当第二次顺序提交失败时，先提交的一臂本周期命令可能已经生效。
+    pub peer_command_may_have_applied: bool,
     pub deadline_misses: u64,
     pub max_inter_arm_skew: Duration,
     pub max_real_dt: Duration,
@@ -718,6 +735,8 @@ impl Default for BilateralRunReport {
             iterations: 0,
             read_faults: 0,
             submission_faults: 0,
+            last_submission_failed_arm: None,
+            peer_command_may_have_applied: false,
             deadline_misses: 0,
             max_inter_arm_skew: Duration::ZERO,
             max_real_dt: Duration::ZERO,
@@ -1843,6 +1862,17 @@ mod tests {
             joint_dynamic_frame(4, 0, 0, timestamp_us),
             joint_dynamic_frame(5, 0, 0, timestamp_us),
             joint_dynamic_frame(6, 0, 0, timestamp_us),
+            // Feed a second complete cycle so strict control snapshots remain stable
+            // even when the first cold-group commit races the test harness startup.
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(1, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(2, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(3, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(4, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(5, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(6, 0, 0, timestamp_us + 1),
         ]
     }
 
@@ -2255,6 +2285,38 @@ mod tests {
                 slave_kd: JointArray::splat(0.0),
                 slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
                 master_position: snapshot.left.state.position,
+                master_velocity: JointArray::splat(0.0),
+                master_kp: JointArray::splat(0.0),
+                master_kd: JointArray::splat(0.0),
+                master_interaction_torque: JointArray::splat(NewtonMeter::ZERO),
+            })
+        }
+    }
+
+    struct InvalidMasterPositionController;
+
+    impl BilateralController for InvalidMasterPositionController {
+        type Error = Infallible;
+
+        fn tick(
+            &mut self,
+            _snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            Ok(BilateralCommand {
+                slave_position: JointArray::splat(Rad(0.0)),
+                slave_velocity: JointArray::splat(0.0),
+                slave_kp: JointArray::splat(0.0),
+                slave_kd: JointArray::splat(0.0),
+                slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
+                master_position: JointArray::from([
+                    Rad(100.0),
+                    Rad(0.0),
+                    Rad(0.0),
+                    Rad(0.0),
+                    Rad(0.0),
+                    Rad(0.0),
+                ]),
                 master_velocity: JointArray::splat(0.0),
                 master_kp: JointArray::splat(0.0),
                 master_kd: JointArray::splat(0.0),
@@ -3290,6 +3352,11 @@ mod tests {
             DualArmLoopExit::Faulted { report, .. } => {
                 assert_eq!(report.submission_faults, 1);
                 assert_eq!(
+                    report.last_submission_failed_arm,
+                    Some(SubmissionArm::Right)
+                );
+                assert!(!report.peer_command_may_have_applied);
+                assert_eq!(
                     report.exit_reason,
                     Some(BilateralExitReason::SubmissionFault)
                 );
@@ -3351,6 +3418,11 @@ mod tests {
             DualArmLoopExit::Faulted { report, .. } => {
                 assert_eq!(report.submission_faults, 1);
                 assert_eq!(
+                    report.last_submission_failed_arm,
+                    Some(SubmissionArm::Right)
+                );
+                assert!(!report.peer_command_may_have_applied);
+                assert_eq!(
                     report.exit_reason,
                     Some(BilateralExitReason::SubmissionFault)
                 );
@@ -3366,6 +3438,58 @@ mod tests {
         assert!(
             !left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
             "expired anchor must not trigger best-effort hold",
+        );
+    }
+
+    #[test]
+    fn test_run_bilateral_second_submission_failure_reports_peer_may_have_applied() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper(1_000, left_sent),
+            right: build_active_mit_piper(1_000, right_sent.clone()),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                InvalidMasterPositionController,
+                BilateralLoopConfig {
+                    frequency_hz: 50.0,
+                    warmup_cycles: 0,
+                    max_iterations: Some(1),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_secs(1),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("invalid master command should converge to faulted exit");
+
+        match exit {
+            DualArmLoopExit::Standby { .. } => panic!("expected faulted exit"),
+            DualArmLoopExit::Faulted { report, .. } => {
+                assert_eq!(report.submission_faults, 1);
+                assert_eq!(report.last_submission_failed_arm, Some(SubmissionArm::Left));
+                assert!(report.peer_command_may_have_applied);
+                assert_eq!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::SubmissionFault)
+                );
+            },
+        }
+
+        let right_frames = wait_for_sent_frames(&right_sent, 1);
+        assert!(
+            !right_frames.is_empty(),
+            "slave/right command should have been submitted before left-side validation failed",
         );
     }
 

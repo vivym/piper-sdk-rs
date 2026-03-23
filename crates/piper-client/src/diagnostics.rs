@@ -46,16 +46,15 @@
 //! ## 基础使用
 //!
 //! ```rust,no_run
-//! use piper_client::{PiperBuilder};
+//! use piper_client::{MotionConnectedPiper, PiperBuilder};
+//! use piper_client::state::{MotionCapability, Piper, Standby};
 //! use piper_driver::recording::AsyncRecordingHook;
 //! use std::sync::Arc;
 //!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let robot = PiperBuilder::new()
-//!     .socketcan("can0")
-//!     .build()?;
-//!
-//! let active = robot.enable_position_mode(Default::default())?;
+//! # fn run_example<C: MotionCapability>(
+//! #     standby: Piper<Standby, C>,
+//! # ) -> Result<(), Box<dyn std::error::Error>> {
+//! let active = standby.enable_position_mode(Default::default())?;
 //!
 //! // 获取诊断接口（持有 Arc，独立生命周期）
 //! let diag = active.diagnostics();
@@ -74,20 +73,31 @@
 //! });
 //! # Ok(())
 //! # }
-//! ```
-//!
-//! ## 跨线程长期持有
-//!
-//! ```rust,no_run
-//! use piper_client::{PiperBuilder};
-//! use std::thread;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let robot = PiperBuilder::new()
 //!     .socketcan("can0")
 //!     .build()?;
 //!
-//! let active = robot.enable_position_mode(Default::default())?;
+//! match robot.require_motion()? {
+//!     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
+//!     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## 跨线程长期持有
+//!
+//! ```rust,no_run
+//! use piper_client::{MotionConnectedPiper, PiperBuilder};
+//! use piper_client::state::{MotionCapability, Piper, Standby};
+//! use std::thread;
+//!
+//! # fn run_example<C: MotionCapability>(
+//! #     standby: Piper<Standby, C>,
+//! # ) -> Result<(), Box<dyn std::error::Error>> {
+//! let active = standby.enable_position_mode(Default::default())?;
 //!
 //! // 获取诊断接口（可以安全地移动到其他线程）
 //! let diag = active.diagnostics();
@@ -103,6 +113,18 @@
 //!
 //! // 主线程可以继续使用 active
 //! // active.send_position_command(&target)?;
+//! # Ok(())
+//! # }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let robot = PiperBuilder::new()
+//!     .socketcan("can0")
+//!     .build()?;
+//!
+//! match robot.require_motion()? {
+//!     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
+//!     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+//! }
 //!
 //! # Ok(())
 //! # }
@@ -160,19 +182,29 @@ impl PiperDiagnostics {
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::PiperBuilder;
+    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::state::{MotionCapability, Piper, Standby};
     /// # use piper_driver::recording::AsyncRecordingHook;
     /// # use std::sync::Arc;
+    /// # fn run_example<C: MotionCapability>(
+    /// #     standby: Piper<Standby, C>,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// let active = standby.enable_position_mode(Default::default())?;
+    /// let diag = active.diagnostics();
+    ///
+    /// let (hook, _rx) = AsyncRecordingHook::new();
+    /// diag.register_callback(Arc::new(hook))?;
+    /// # Ok(())
+    /// # }
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let robot = PiperBuilder::new()
     ///     .socketcan("can0")
     ///     .build()?;
     ///
-    /// let active = robot.enable_position_mode(Default::default())?;
-    /// let diag = active.diagnostics();
-    ///
-    /// let (hook, _rx) = AsyncRecordingHook::new();
-    /// diag.register_callback(Arc::new(hook))?;
+    /// match robot.require_motion()? {
+    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    /// }
     /// # Ok(())
     /// # }
     /// ```
@@ -208,14 +240,13 @@ impl PiperDiagnostics {
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::PiperBuilder;
+    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::state::{MotionCapability, Piper, Standby};
     /// # use piper_can::PiperFrame;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let robot = PiperBuilder::new()
-    ///     .socketcan("can0")
-    ///     .build()?;
-    ///
-    /// let active = robot.enable_position_mode(Default::default())?;
+    /// # fn run_example<C: MotionCapability>(
+    /// #     standby: Piper<Standby, C>,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// let active = standby.enable_position_mode(Default::default())?;
     /// let diag = active.diagnostics();
     ///
     /// // 发送配置帧（安全）
@@ -227,6 +258,17 @@ impl PiperDiagnostics {
     ///     timestamp_us: 0,
     /// };
     /// diag.send_frame(&frame)?;
+    /// # Ok(())
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let robot = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
+    ///
+    /// match robot.require_motion()? {
+    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    /// }
     /// # Ok(())
     /// # }
     /// ```
@@ -259,13 +301,12 @@ impl PiperDiagnostics {
     /// # 示例
     ///
     /// ```rust,no_run
-    /// # use piper_client::PiperBuilder;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let robot = PiperBuilder::new()
-    ///     .socketcan("can0")
-    ///     .build()?;
-    ///
-    /// let active = robot.enable_position_mode(Default::default())?;
+    /// # use piper_client::{MotionConnectedPiper, PiperBuilder};
+    /// # use piper_client::state::{MotionCapability, Piper, Standby};
+    /// # fn run_example<C: MotionCapability>(
+    /// #     standby: Piper<Standby, C>,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// let active = standby.enable_position_mode(Default::default())?;
     /// let diag = active.diagnostics();
     ///
     /// // 获取完全访问权限（仅在极端特殊场景使用）
@@ -273,6 +314,18 @@ impl PiperDiagnostics {
     ///
     /// // 访问底层 hooks
     /// let hooks = driver.hooks();
+    /// # let _ = hooks;
+    /// # Ok(())
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let robot = PiperBuilder::new()
+    ///     .socketcan("can0")
+    ///     .build()?;
+    ///
+    /// match robot.require_motion()? {
+    ///     MotionConnectedPiper::Strict(standby) => run_example(standby)?,
+    ///     MotionConnectedPiper::Soft(standby) => run_example(standby)?,
+    /// }
     /// # Ok(())
     /// # }
     /// ```

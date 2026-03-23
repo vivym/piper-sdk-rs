@@ -2,8 +2,8 @@
 //!
 //! 验证双线程架构的核心价值：
 //! 1. RX 线程不受 TX 故障影响
-//! 2. TX 线程能感知 RX 故障并退出
-//! 3. 线程生命周期联动机制正常工作
+//! 2. TX 线程能感知 RX 故障并 fault-latch
+//! 3. 外部 shutdown 请求仍能有序回收线程
 
 use piper_sdk::can::{
     CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
@@ -11,7 +11,8 @@ use piper_sdk::can::{
 use piper_sdk::driver::command::ReliableCommand;
 use piper_sdk::driver::{
     BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
-    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
+    PipelineConfig, PiperContext, PiperMetrics, RuntimeFaultKind, ShutdownLane, rx_loop,
+    tx_loop_mailbox,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -306,7 +307,8 @@ fn test_rx_unaffected_by_tx_timeout() {
 
 #[test]
 fn test_tx_detects_rx_failure() {
-    // 测试场景：RX 线程遇到致命错误，TX 线程应在 100ms 内感知并退出
+    // 测试场景：RX 线程遇到致命错误，TX 线程应快速进入 fault-latched，
+    // 关闭正常控制路径，但不要求立刻退出，以保留 shutdown lane。
 
     let ctx = Arc::new(PiperContext::new());
     let config = PipelineConfig::default();
@@ -394,54 +396,49 @@ fn test_tx_detects_rx_failure() {
     // 模拟 RX 故障：设置 should_fail = true
     rx_should_fail.store(true, Ordering::Relaxed);
 
-    // 记录开始时间
+    // 等待 TX 线程观测到故障并进入 fault-latched
     let start = Instant::now();
-
-    // 等待 TX 线程退出（应该通过 is_running 标志感知）
-    let _tx_exit_timeout = Duration::from_millis(200);
-    let mut tx_exited = false;
-
-    // 轮询检查 TX 线程是否退出
-    for _ in 0..20 {
-        if tx_handle.is_finished() {
-            tx_exited = true;
+    let mut fault_latched = false;
+    for _ in 0..30 {
+        if runtime_phase.load(Ordering::Relaxed) == 1
+            && last_fault.load(Ordering::Relaxed) == RuntimeFaultKind::TransportError as u8
+        {
+            fault_latched = true;
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
-
     let elapsed = start.elapsed();
 
-    // 验证：TX 线程应该在 100ms 内退出（CI环境会放宽）
+    // 验证：TX 线程应快速进入 fault-latched，而不是继续开放正常控制路径
     let threshold = adjust_threshold_ms(200);
     assert!(
-        tx_exited,
-        "TX thread should exit within {:?} after RX failure (CI环境已放宽). Elapsed: {:?}",
+        fault_latched,
+        "TX thread should latch the runtime fault within {:?} after RX failure. Elapsed: {:?}",
         threshold, elapsed
     );
-
     assert!(
         elapsed < threshold,
-        "TX thread should detect RX failure quickly (< {:?}, CI环境已放宽). Elapsed: {:?}",
+        "TX thread should observe RX failure quickly (< {:?}, CI环境已放宽). Elapsed: {:?}",
         threshold,
         elapsed
     );
 
-    // 验证：is_running 标志应该被设置为 false
     assert!(
-        !is_running.load(Ordering::Relaxed),
-        "is_running flag should be false after RX failure"
+        !tx_handle.is_finished(),
+        "TX thread should remain alive after RX failure so the shutdown lane can still run"
     );
 
     // 清理
+    is_running.store(false, Ordering::Relaxed);
     let _ = rx_handle.join();
     let _ = tx_handle.join();
 }
 
 #[test]
 fn test_thread_lifecycle_linkage() {
-    // 测试场景：验证线程生命周期联动机制
-    // 一个线程崩溃，另一个应在 100ms 内退出
+    // 测试场景：RX 线程故障后，运行时先 fault-latch 保留 TX；
+    // 外部再关闭 workers_running 时，两个线程都应有序退出。
 
     let ctx = Arc::new(PiperContext::new());
     let config = PipelineConfig::default();
@@ -529,13 +526,16 @@ fn test_thread_lifecycle_linkage() {
     // 模拟 RX 致命错误
     rx_should_fail.store(true, Ordering::Relaxed);
 
-    // 等待两个线程都退出
+    // 先等待 RX 线程退出且运行时进入 fault-latched
     let start = Instant::now();
-    let mut both_exited = false;
+    let mut runtime_fault_latched = false;
 
     for _ in 0..30 {
-        if rx_handle.is_finished() && tx_handle.is_finished() {
-            both_exited = true;
+        if rx_handle.is_finished()
+            && runtime_phase.load(Ordering::Relaxed) == 1
+            && last_fault.load(Ordering::Relaxed) == RuntimeFaultKind::TransportError as u8
+        {
+            runtime_fault_latched = true;
             break;
         }
         thread::sleep(Duration::from_millis(10));
@@ -543,29 +543,41 @@ fn test_thread_lifecycle_linkage() {
 
     let elapsed = start.elapsed();
 
-    // 验证：两个线程都应该退出
     assert!(
-        both_exited,
-        "Both threads should exit after RX failure. Elapsed: {:?}",
+        runtime_fault_latched,
+        "RX failure should terminate RX and latch runtime fault before external shutdown. Elapsed: {:?}",
         elapsed
     );
 
-    // 验证：退出时间应该在合理范围内（< 300ms，CI环境会放宽）
     let threshold = adjust_threshold_ms(300);
     assert!(
         elapsed < threshold,
-        "Threads should exit quickly (< {:?}, CI环境已放宽). Elapsed: {:?}",
+        "RX failure should surface quickly (< {:?}, CI环境已放宽). Elapsed: {:?}",
         threshold,
         elapsed
     );
 
-    // 验证：is_running 标志应该被设置为 false
     assert!(
-        !is_running.load(Ordering::Relaxed),
-        "is_running flag should be false after thread failure"
+        !tx_handle.is_finished(),
+        "TX worker should remain alive on the fault-latch path until external shutdown"
     );
 
-    // 清理
+    is_running.store(false, Ordering::Relaxed);
+    let shutdown_start = Instant::now();
+    let mut both_exited = false;
+    for _ in 0..30 {
+        if rx_handle.is_finished() && tx_handle.is_finished() {
+            both_exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        both_exited,
+        "Both workers should exit after external shutdown request. Elapsed after shutdown: {:?}",
+        shutdown_start.elapsed()
+    );
+
     let _ = rx_handle.join();
     let _ = tx_handle.join();
 }

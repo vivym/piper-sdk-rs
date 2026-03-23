@@ -267,7 +267,7 @@ fn test_reliable_command_not_dropped() {
     impl SlowTxAdapter {
         fn new() -> Self {
             Self {
-                send_delay: Duration::from_millis(20), // 20ms 发送延迟（慢）
+                send_delay: Duration::from_micros(200), // 保持在严格实时 500us budget 内
                 sent_count: Arc::new(AtomicU64::new(0)),
             }
         }
@@ -372,9 +372,8 @@ fn test_reliable_command_not_dropped() {
 
     println!("Sent {} reliable commands successfully", sent_successfully);
 
-    // 等待处理完成。SlowTxAdapter 每帧 20ms，CI 环境（尤其 macOS）调度可能很慢，预留充足时间。
-    // 按 15 倍单帧延迟估算 + 至少 2.5s，避免超时后 is_running=false 导致 channel 未排空即退出。
-    let min_wait_ms = (sent_successfully as u64).saturating_mul(20 * 15).max(2500);
+    // 等待处理完成。这里验证的是“在 send budget 内时 reliable 队列不会无故掉帧”。
+    let min_wait_ms = (sent_successfully as u64).saturating_mul(2).max(200);
     let deadline = std::time::Instant::now() + Duration::from_millis(min_wait_ms);
     while std::time::Instant::now() < deadline {
         let processed = sent_count.load(Ordering::Relaxed);
@@ -433,7 +432,7 @@ fn test_realtime_overwrite_strategy() {
     impl SlowTxAdapter {
         fn new() -> Self {
             Self {
-                send_delay: Duration::from_millis(10),
+                send_delay: Duration::from_micros(400),
                 sent_frames: Arc::new(Mutex::new(VecDeque::new())),
             }
         }
@@ -517,7 +516,7 @@ fn test_realtime_overwrite_strategy() {
         // 写入 realtime slot（会覆盖之前的值）
         *realtime_slot_clone.lock().unwrap() =
             Some(piper_sdk::driver::command::RealtimeCommand::single(*frame));
-        thread::sleep(Duration::from_millis(2));
+        thread::sleep(Duration::from_micros(50));
     }
 
     // 等待处理完成
@@ -536,13 +535,19 @@ fn test_realtime_overwrite_strategy() {
         sent.len()
     );
 
-    // 验证：metrics 中的覆盖次数应该 > 0
-    let snapshot = metrics.snapshot();
     println!(
-        "Realtime overwrites: {}",
-        snapshot.tx_realtime_overwrites_total
+        "Realtime frames sent: {:?}",
+        sent.iter().map(|frame| frame.id).collect::<Vec<_>>()
     );
-    // 注意：由于并发，覆盖次数可能不是精确的，但应该 > 0
+    assert!(
+        sent.len() < realtime_commands.len(),
+        "mailbox overwrite should collapse some realtime commands under producer pressure",
+    );
+    assert_eq!(
+        sent.last().map(|frame| frame.id),
+        realtime_commands.last().map(|frame| frame.id),
+        "last-write-wins mailbox should preserve the newest realtime command",
+    );
 }
 
 #[test]
