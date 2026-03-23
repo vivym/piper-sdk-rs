@@ -4247,7 +4247,7 @@ mod tests {
             .recover_from_emergency_stop(Duration::from_millis(200))
             .expect("manual emergency stop should be recoverable");
 
-        match recovered {
+        match &recovered {
             MotionConnectedState::Standby(standby) => {
                 assert!(standby.runtime_health().fault.is_none());
                 assert!(standby.observer().is_all_disabled_confirmed());
@@ -4280,7 +4280,7 @@ mod tests {
             .recover_from_emergency_stop(Duration::from_millis(20))
             .expect("resume should reopen the runtime even without fresh drive confirmation");
 
-        match recovered {
+        match &recovered {
             MotionConnectedState::Maintenance(maintenance) => {
                 assert!(maintenance.runtime_health().fault.is_none());
                 assert_eq!(maintenance.observer().joint_enabled_mask_confirmed(), None);

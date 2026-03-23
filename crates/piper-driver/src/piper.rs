@@ -1903,7 +1903,7 @@ impl Piper {
 
     #[doc(hidden)]
     pub fn best_effort_disable_or_shutdown_on_drop(&self, shutdown_timeout: Duration) {
-        use piper_protocol::control::{EmergencyStopCommand, MotorEnableCommand};
+        use piper_protocol::control::MotorEnableCommand;
 
         match self.runtime_phase() {
             RuntimePhase::Running => {
@@ -1912,49 +1912,93 @@ impl Piper {
                     return;
                 }
 
-                if let Err(error) = self.send_reliable(MotorEnableCommand::disable_all().to_frame())
-                {
-                    warn!("Drop auto-disable failed: {error}");
-                }
-            },
-            RuntimePhase::FaultLatched => {
-                if !self.tx_thread_alive() {
-                    self.metrics.tx_drop_shutdown_skipped_total.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "Drop fault shutdown skipped because runtime is fault-latched but TX worker is no longer alive"
-                    );
-                    return;
-                }
+                let disable_frame = MotorEnableCommand::disable_all().to_frame();
+                let deadline = Instant::now() + shutdown_timeout;
+                let send_disable = || -> Result<(), DriverError> {
+                    // Drop-time disable must preempt already queued normal control so stale
+                    // business commands cannot continue ahead of the stop frame.
+                    self.abort_pending_normal_control_for_state_transition(shutdown_timeout)?;
 
-                self.metrics.tx_drop_shutdown_attempt_total.fetch_add(1, Ordering::Relaxed);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(DriverError::Timeout);
+                    }
 
-                let frame = EmergencyStopCommand::emergency_stop().to_frame();
-                match self
-                    .enqueue_shutdown(frame, Instant::now() + shutdown_timeout)
-                    .and_then(|receipt| receipt.wait())
-                {
-                    Ok(()) => {
-                        self.metrics.tx_drop_shutdown_success_total.fetch_add(1, Ordering::Relaxed);
-                        info!(
-                            "Drop fault shutdown sent bounded emergency stop through shutdown lane"
+                    self.send_local_maintenance_frame_confirmed(disable_frame, remaining)
+                };
+
+                match send_disable() {
+                    Ok(()) => {},
+                    Err(DriverError::ControlPathClosed)
+                        if self.runtime_phase() == RuntimePhase::FaultLatched =>
+                    {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            warn!(
+                                "Drop auto-disable raced with a fault latch and exhausted the {:?} budget before fallback shutdown could run",
+                                shutdown_timeout
+                            );
+                            return;
+                        }
+
+                        warn!(
+                            "Drop auto-disable raced with a fault latch; falling back to bounded shutdown-lane emergency stop"
                         );
+                        self.best_effort_fault_shutdown_on_drop(remaining);
                     },
                     Err(DriverError::Timeout) => {
-                        self.metrics.tx_drop_shutdown_timeout_total.fetch_add(1, Ordering::Relaxed);
                         warn!(
-                            "Drop fault shutdown timed out after {:?} while waiting for shutdown-lane confirmation",
+                            "Drop auto-disable timed out after {:?} while aborting pending normal control or waiting for maintenance confirmation",
                             shutdown_timeout
                         );
                     },
                     Err(error) => {
-                        self.metrics.tx_drop_shutdown_skipped_total.fetch_add(1, Ordering::Relaxed);
-                        warn!("Drop fault shutdown failed before completion: {error}");
+                        warn!("Drop auto-disable failed: {error}");
                     },
                 }
+            },
+            RuntimePhase::FaultLatched => {
+                self.best_effort_fault_shutdown_on_drop(shutdown_timeout);
             },
             RuntimePhase::Stopping => {
                 self.metrics.tx_drop_shutdown_skipped_total.fetch_add(1, Ordering::Relaxed);
                 warn!("Drop auto-disable skipped because runtime is already stopping");
+            },
+        }
+    }
+
+    fn best_effort_fault_shutdown_on_drop(&self, shutdown_timeout: Duration) {
+        use piper_protocol::control::EmergencyStopCommand;
+
+        if !self.tx_thread_alive() {
+            self.metrics.tx_drop_shutdown_skipped_total.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "Drop fault shutdown skipped because runtime is fault-latched but TX worker is no longer alive"
+            );
+            return;
+        }
+
+        self.metrics.tx_drop_shutdown_attempt_total.fetch_add(1, Ordering::Relaxed);
+
+        let frame = EmergencyStopCommand::emergency_stop().to_frame();
+        match self
+            .enqueue_shutdown(frame, Instant::now() + shutdown_timeout)
+            .and_then(|receipt| receipt.wait())
+        {
+            Ok(()) => {
+                self.metrics.tx_drop_shutdown_success_total.fetch_add(1, Ordering::Relaxed);
+                info!("Drop fault shutdown sent bounded emergency stop through shutdown lane");
+            },
+            Err(DriverError::Timeout) => {
+                self.metrics.tx_drop_shutdown_timeout_total.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "Drop fault shutdown timed out after {:?} while waiting for shutdown-lane confirmation",
+                    shutdown_timeout
+                );
+            },
+            Err(error) => {
+                self.metrics.tx_drop_shutdown_skipped_total.fetch_add(1, Ordering::Relaxed);
+                warn!("Drop fault shutdown failed before completion: {error}");
             },
         }
     }
@@ -3480,6 +3524,7 @@ mod tests {
     use piper_can::{CanAdapter, PiperFrame, SplittableAdapter};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
 
     const TEST_MAINTENANCE_FRESHNESS_MS: u64 = 5_000;
 
@@ -6474,6 +6519,119 @@ mod tests {
             sent.as_slice(),
             &[disable_frame],
             "state transition abort must prevent stale normal-control frames from being transmitted",
+        );
+    }
+
+    #[test]
+    fn test_drop_running_disable_preempts_pending_normal_control_before_disable() {
+        use crate::command::DeliveryPhase;
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let (reached_rx, release_tx) = install_tx_loop_barrier();
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("tx loop should reach the installed dispatch barrier");
+
+        let stale_realtime = PiperFrame::new_standard(0x155, &[0x01]);
+        let stale_soft = PiperFrame::new_standard(0x156, &[0x02]);
+        let stale_reliable = PiperFrame::new_standard(0x151, &[0x03]);
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let (realtime_ack_tx, realtime_ack_rx) = crossbeam_channel::bounded(2);
+        {
+            let mut slot = piper.realtime_slot.lock().expect("realtime slot lock");
+            slot.replace(RealtimeCommand::confirmed(
+                [stale_realtime],
+                deadline,
+                realtime_ack_tx,
+            ));
+        }
+
+        let (soft_ack_tx, soft_ack_rx) = crossbeam_channel::bounded(1);
+        piper
+            .soft_realtime_tx
+            .try_send(SoftRealtimeCommand::confirmed(
+                [stale_soft],
+                deadline,
+                soft_ack_tx,
+            ))
+            .expect("stale soft realtime command should queue");
+
+        let (reliable_ack_tx, reliable_ack_rx) = crossbeam_channel::bounded(2);
+        piper
+            .reliable_tx
+            .try_send(ReliableCommand::confirmed(
+                stale_reliable,
+                deadline,
+                reliable_ack_tx,
+            ))
+            .expect("stale reliable command should queue");
+
+        let release_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            release_tx.send(()).expect("tx loop barrier should release cleanly");
+        });
+
+        piper.best_effort_disable_or_shutdown_on_drop(Duration::from_millis(200));
+        release_handle.join().expect("release thread should join");
+
+        wait_until(
+            Duration::from_millis(200),
+            || !sent_frames.lock().expect("sent frames lock").is_empty(),
+            "drop-time disable should be transmitted after preempting stale normal control",
+        );
+
+        let realtime_error = match realtime_ack_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("realtime waiter should receive an abort result")
+        {
+            DeliveryPhase::Finished(result) => result.expect_err("realtime command must abort"),
+            DeliveryPhase::Committed => panic!("stale realtime command must not commit"),
+        };
+        assert!(matches!(
+            realtime_error,
+            DriverError::CommandAbortedByStateTransition
+        ));
+
+        let soft_error = soft_ack_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("soft realtime waiter should receive an abort result")
+            .expect_err("soft realtime command must abort");
+        assert!(matches!(
+            soft_error,
+            DriverError::CommandAbortedByStateTransition
+        ));
+
+        let reliable_error = match reliable_ack_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("reliable waiter should receive an abort result")
+        {
+            DeliveryPhase::Finished(result) => result.expect_err("reliable command must abort"),
+            DeliveryPhase::Committed => panic!("stale reliable command must not commit"),
+        };
+        assert!(matches!(
+            reliable_error,
+            DriverError::CommandAbortedByStateTransition
+        ));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.as_slice(),
+            &[disable_frame],
+            "drop-time disable must preempt stale normal-control traffic and reach the bus first",
         );
     }
 
