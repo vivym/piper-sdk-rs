@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Tightened the default control-loop feedback freshness window from 50ms to 15ms for
+  `piper_client::observer::ControlReadPolicy::default()`.
+- `LoopConfig::default()`, `MitControllerConfig::default()`, and
+  `DualArmReadPolicy::default().per_arm` now inherit the same 15ms control-grade
+  default.
+- `MonitorReadPolicy::default()` remains 50ms; callers that depended on the previous
+  50ms control default must now pass an explicit `ControlReadPolicy`.
+
 ### 🎬 Recording and Replay System (2026-01-27)
 
 #### Added

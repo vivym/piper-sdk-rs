@@ -1496,7 +1496,7 @@ fn update_report_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observer::Observer;
+    use crate::observer::{DEFAULT_CONTROL_MAX_FEEDBACK_AGE, Observer};
     use crate::state::StrictRealtime;
     use crate::types::RadPerSecond;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
@@ -1512,6 +1512,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use thiserror::Error;
+
+    #[test]
+    fn test_dual_arm_read_policy_default_uses_control_default_feedback_freshness() {
+        let policy = DualArmReadPolicy::default();
+
+        assert_eq!(policy.per_arm.max_state_skew_us, 2_000);
+        assert_eq!(
+            policy.per_arm.max_feedback_age,
+            DEFAULT_CONTROL_MAX_FEEDBACK_AGE
+        );
+        assert_eq!(policy.max_inter_arm_skew, Duration::from_millis(10));
+    }
 
     #[derive(Default)]
     struct DisableFeedbackHarness {
