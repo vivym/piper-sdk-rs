@@ -225,6 +225,7 @@ fn maintenance_gate_abort_error(reason: NormalSendGateDenyReason) -> crate::Driv
         NormalSendGateDenyReason::ReplayPaused => crate::DriverError::ReplayModeActive,
         NormalSendGateDenyReason::FaultClosed => crate::DriverError::CommandAbortedByFault,
         NormalSendGateDenyReason::StoppingClosed => crate::DriverError::ChannelClosed,
+        NormalSendGateDenyReason::StateTransitionClosed => crate::DriverError::ControlPathClosed,
     }
 }
 
@@ -237,6 +238,7 @@ fn realtime_gate_abort_error(
         NormalSendGateDenyReason::ReplayPaused => crate::DriverError::ReplayModeActive,
         NormalSendGateDenyReason::FaultClosed => realtime_abort_error(sent, total),
         NormalSendGateDenyReason::StoppingClosed => crate::DriverError::ChannelClosed,
+        NormalSendGateDenyReason::StateTransitionClosed => crate::DriverError::ControlPathClosed,
     }
 }
 
@@ -245,6 +247,7 @@ fn soft_gate_abort_error(reason: NormalSendGateDenyReason) -> crate::DriverError
         NormalSendGateDenyReason::ReplayPaused => crate::DriverError::ReplayModeActive,
         NormalSendGateDenyReason::FaultClosed => crate::DriverError::CommandAbortedByFault,
         NormalSendGateDenyReason::StoppingClosed => crate::DriverError::ChannelClosed,
+        NormalSendGateDenyReason::StateTransitionClosed => crate::DriverError::ControlPathClosed,
     }
 }
 
@@ -253,6 +256,7 @@ fn reliable_gate_abort_error(reason: NormalSendGateDenyReason) -> crate::DriverE
         NormalSendGateDenyReason::ReplayPaused => crate::DriverError::ReplayModeActive,
         NormalSendGateDenyReason::FaultClosed => crate::DriverError::CommandAbortedByFault,
         NormalSendGateDenyReason::StoppingClosed => crate::DriverError::ChannelClosed,
+        NormalSendGateDenyReason::StateTransitionClosed => crate::DriverError::ControlPathClosed,
     }
 }
 
@@ -419,11 +423,14 @@ struct MaintenanceLaneDispatch {
     meta: Option<crate::command::MaintenanceCommandMeta>,
     deadline: Instant,
     ack: crossbeam_channel::Sender<MaintenanceSendPhase>,
+    restore_after_state_transition: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_maintenance_lane(
     maintenance_lane_rx: &Receiver<MaintenanceLaneCommand>,
     maintenance_tx_state: &mut MaintenanceTxState,
+    normal_send_gate: &Arc<NormalSendGate>,
     realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
     soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
     reliable_rx: &Receiver<crate::command::ReliableCommand>,
@@ -463,6 +470,7 @@ fn drain_maintenance_lane(
                     meta: Some(meta),
                     deadline,
                     ack,
+                    restore_after_state_transition: false,
                 });
             },
             MaintenanceLaneCommand::LocalSend {
@@ -475,6 +483,28 @@ fn drain_maintenance_lane(
                     meta: None,
                     deadline,
                     ack,
+                    restore_after_state_transition: false,
+                });
+            },
+            MaintenanceLaneCommand::StateTransitionLocalSend {
+                frame,
+                deadline,
+                ack,
+            } => {
+                abort_pending_normal_control_for_state_transition(
+                    realtime_slot,
+                    soft_realtime_rx,
+                    reliable_rx,
+                    pending_reliable_commands,
+                    metrics,
+                );
+                normal_send_gate.maybe_wait_test_state_transition_barrier();
+                pending_sends.push_front(MaintenanceLaneDispatch {
+                    frame,
+                    meta: None,
+                    deadline,
+                    ack,
+                    restore_after_state_transition: true,
                 });
             },
         }
@@ -512,6 +542,24 @@ fn finish_maintenance_dispatch(
     result: Result<(), crate::DriverError>,
 ) {
     let _ = dispatch.ack.send(MaintenanceSendPhase::Finished(result));
+}
+
+fn restore_state_transition_gate_after_dispatch(
+    dispatch: &MaintenanceLaneDispatch,
+    normal_send_gate: &Arc<NormalSendGate>,
+    runtime_phase: &Arc<AtomicU8>,
+    last_fault: &Arc<AtomicU8>,
+    driver_mode: &Arc<crate::mode::AtomicDriverMode>,
+) {
+    if !dispatch.restore_after_state_transition {
+        return;
+    }
+
+    normal_send_gate.restore_after_state_transition(
+        load_runtime_phase(runtime_phase),
+        RuntimeFaultKind::from_raw(last_fault.load(Ordering::Acquire)),
+        driver_mode.get(Ordering::Acquire),
+    );
 }
 
 fn refresh_local_maintenance_tx_state(
@@ -1389,6 +1437,7 @@ pub fn tx_loop_mailbox(
         pending_maintenance_sends.extend(drain_maintenance_lane(
             &maintenance_lane_rx,
             &mut maintenance_tx_state,
+            &normal_send_gate,
             &realtime_slot,
             &soft_realtime_rx,
             &reliable_rx,
@@ -1398,55 +1447,182 @@ pub fn tx_loop_mailbox(
 
         if let Some(dispatch) = pending_maintenance_sends.pop_front() {
             if driver_mode.get(Ordering::Acquire).is_replay() {
+                restore_state_transition_gate_after_dispatch(
+                    &dispatch,
+                    &normal_send_gate,
+                    &runtime_phase,
+                    &last_fault,
+                    &driver_mode,
+                );
                 finish_maintenance_dispatch(&dispatch, Err(crate::DriverError::ReplayModeActive));
                 continue;
             }
-            let permit = match normal_send_gate.acquire_normal() {
-                Ok(permit) => permit,
-                Err(reason) => {
+            let send_result = if dispatch.restore_after_state_transition {
+                match normal_send_gate.state() {
+                    crate::piper::NormalSendGateState::ReplayPaused => {
+                        Err(crate::DriverError::ReplayModeActive)
+                    },
+                    crate::piper::NormalSendGateState::FaultClosed => {
+                        count_gate_fault_abort(
+                            &metrics,
+                            NormalSendGateDenyReason::FaultClosed,
+                            false,
+                        );
+                        Err(crate::DriverError::CommandAbortedByFault)
+                    },
+                    crate::piper::NormalSendGateState::StoppingClosed => {
+                        Err(crate::DriverError::ChannelClosed)
+                    },
+                    crate::piper::NormalSendGateState::Open
+                    | crate::piper::NormalSendGateState::StateTransitionClosed => {
+                        if Instant::now() >= dispatch.deadline {
+                            Err(crate::DriverError::Timeout)
+                        } else if let Some(denied) = dispatch
+                            .meta
+                            .and_then(|meta| maintenance_send_denial(&maintenance_tx_state, meta))
+                        {
+                            Err(denied)
+                        } else {
+                            maintenance_dispatch_committed(&dispatch);
+                            match tx.send_control(dispatch.frame, normal_send_budget) {
+                                Ok(_) => {
+                                    soft_deadline_miss_streak = 0;
+                                    metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+
+                                    if let Ok(hooks) = ctx.hooks.try_read() {
+                                        hooks.trigger_all_sent(&dispatch.frame);
+                                    }
+                                    Ok(())
+                                },
+                                Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
+                                    metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                                    metrics
+                                        .tx_soft_deadline_miss_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if soft_deadline_miss_streak > 0 {
+                                        metrics
+                                            .tx_soft_consecutive_deadline_miss_total
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    soft_deadline_miss_streak =
+                                        soft_deadline_miss_streak.saturating_add(1);
+                                    if soft_deadline_miss_streak
+                                        >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD
+                                    {
+                                        latch_runtime_fault_with_maintenance(
+                                            &runtime_phase,
+                                            &normal_send_gate,
+                                            &last_fault,
+                                            RuntimeFaultKind::TransportError,
+                                            &maintenance_gate,
+                                            Some(&mut maintenance_tx_state),
+                                        );
+                                    }
+                                    Err(crate::DriverError::Timeout)
+                                },
+                                Err(e) => {
+                                    error!("TX thread: Failed to send maintenance frame: {}", e);
+                                    if matches!(e, CanError::Timeout) {
+                                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    latch_runtime_fault_with_maintenance(
+                                        &runtime_phase,
+                                        &normal_send_gate,
+                                        &last_fault,
+                                        RuntimeFaultKind::TransportError,
+                                        &maintenance_gate,
+                                        Some(&mut maintenance_tx_state),
+                                    );
+                                    Err(crate::DriverError::ReliableDeliveryFailed { source: e })
+                                },
+                            }
+                        }
+                    },
+                }
+            } else {
+                let permit = match normal_send_gate.acquire_normal() {
+                    Ok(permit) => permit,
+                    Err(reason) => {
+                        count_gate_fault_abort(&metrics, reason, false);
+                        restore_state_transition_gate_after_dispatch(
+                            &dispatch,
+                            &normal_send_gate,
+                            &runtime_phase,
+                            &last_fault,
+                            &driver_mode,
+                        );
+                        finish_maintenance_dispatch(
+                            &dispatch,
+                            Err(maintenance_gate_abort_error(reason)),
+                        );
+                        continue;
+                    },
+                };
+                if let Err(reason) = permit.send_allowed() {
                     count_gate_fault_abort(&metrics, reason, false);
+                    restore_state_transition_gate_after_dispatch(
+                        &dispatch,
+                        &normal_send_gate,
+                        &runtime_phase,
+                        &last_fault,
+                        &driver_mode,
+                    );
                     finish_maintenance_dispatch(
                         &dispatch,
                         Err(maintenance_gate_abort_error(reason)),
                     );
                     continue;
-                },
-            };
-            if let Err(reason) = permit.send_allowed() {
-                count_gate_fault_abort(&metrics, reason, false);
-                finish_maintenance_dispatch(&dispatch, Err(maintenance_gate_abort_error(reason)));
-                continue;
-            }
+                }
 
-            let send_result = if Instant::now() >= dispatch.deadline {
-                Err(crate::DriverError::Timeout)
-            } else if let Some(denied) = dispatch
-                .meta
-                .and_then(|meta| maintenance_send_denial(&maintenance_tx_state, meta))
-            {
-                Err(denied)
-            } else {
-                maintenance_dispatch_committed(&dispatch);
-                match tx.send_control(dispatch.frame, normal_send_budget) {
-                    Ok(_) => {
-                        soft_deadline_miss_streak = 0;
-                        metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+                if Instant::now() >= dispatch.deadline {
+                    Err(crate::DriverError::Timeout)
+                } else if let Some(denied) = dispatch
+                    .meta
+                    .and_then(|meta| maintenance_send_denial(&maintenance_tx_state, meta))
+                {
+                    Err(denied)
+                } else {
+                    maintenance_dispatch_committed(&dispatch);
+                    match tx.send_control(dispatch.frame, normal_send_budget) {
+                        Ok(_) => {
+                            soft_deadline_miss_streak = 0;
+                            metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
 
-                        if let Ok(hooks) = ctx.hooks.try_read() {
-                            hooks.trigger_all_sent(&dispatch.frame);
-                        }
-                        Ok(())
-                    },
-                    Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
-                        metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                        metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
-                        if soft_deadline_miss_streak > 0 {
-                            metrics
-                                .tx_soft_consecutive_deadline_miss_total
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
-                        if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
+                            if let Ok(hooks) = ctx.hooks.try_read() {
+                                hooks.trigger_all_sent(&dispatch.frame);
+                            }
+                            Ok(())
+                        },
+                        Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
+                            metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                            metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
+                            if soft_deadline_miss_streak > 0 {
+                                metrics
+                                    .tx_soft_consecutive_deadline_miss_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
+                            if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
+                                latch_runtime_fault_with_maintenance(
+                                    &runtime_phase,
+                                    &normal_send_gate,
+                                    &last_fault,
+                                    RuntimeFaultKind::TransportError,
+                                    &maintenance_gate,
+                                    Some(&mut maintenance_tx_state),
+                                );
+                            }
+                            Err(crate::DriverError::Timeout)
+                        },
+                        Err(e) => {
+                            error!("TX thread: Failed to send maintenance frame: {}", e);
+                            if matches!(e, CanError::Timeout) {
+                                metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                metrics.device_errors.fetch_add(1, Ordering::Relaxed);
+                            }
                             latch_runtime_fault_with_maintenance(
                                 &runtime_phase,
                                 &normal_send_gate,
@@ -1455,26 +1631,9 @@ pub fn tx_loop_mailbox(
                                 &maintenance_gate,
                                 Some(&mut maintenance_tx_state),
                             );
-                        }
-                        Err(crate::DriverError::Timeout)
-                    },
-                    Err(e) => {
-                        error!("TX thread: Failed to send maintenance frame: {}", e);
-                        if matches!(e, CanError::Timeout) {
-                            metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        latch_runtime_fault_with_maintenance(
-                            &runtime_phase,
-                            &normal_send_gate,
-                            &last_fault,
-                            RuntimeFaultKind::TransportError,
-                            &maintenance_gate,
-                            Some(&mut maintenance_tx_state),
-                        );
-                        Err(crate::DriverError::ReliableDeliveryFailed { source: e })
-                    },
+                            Err(crate::DriverError::ReliableDeliveryFailed { source: e })
+                        },
+                    }
                 }
             };
 
@@ -1482,6 +1641,13 @@ pub fn tx_loop_mailbox(
                 &send_result,
                 Err(crate::DriverError::ReliableDeliveryFailed { .. })
                     | Err(crate::DriverError::ChannelClosed)
+            );
+            restore_state_transition_gate_after_dispatch(
+                &dispatch,
+                &normal_send_gate,
+                &runtime_phase,
+                &last_fault,
+                &driver_mode,
             );
             finish_maintenance_dispatch(&dispatch, send_result);
             if should_break {

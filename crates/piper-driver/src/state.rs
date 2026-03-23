@@ -708,6 +708,28 @@ impl JointDriverLowSpeedState {
         Some(self.driver_enabled_mask)
     }
 
+    /// 返回“严格新于某个 host monotonic 基线”的已确认 6 轴驱动器使能掩码。
+    ///
+    /// 只有当全部 6 个关节都收到过低速反馈、每个关节的 host monotonic 时间戳
+    /// 既新于 `baseline_host_mono_us` 又仍在 freshness 窗口内时，才返回 `Some(mask)`。
+    pub(crate) fn confirmed_driver_enabled_mask_after_host_mono(
+        &self,
+        baseline_host_mono_us: u64,
+        now_host_mono_us: u64,
+        freshness_window_us: u64,
+    ) -> Option<u8> {
+        for timestamp in self.host_rx_mono_timestamps {
+            if timestamp <= baseline_host_mono_us {
+                return None;
+            }
+            if now_host_mono_us.saturating_sub(timestamp) > freshness_window_us {
+                return None;
+            }
+        }
+
+        Some(self.driver_enabled_mask)
+    }
+
     /// 检查指定关节是否电压过低
     pub fn is_voltage_low(&self, joint_index: usize) -> bool {
         if joint_index >= 6 {

@@ -37,8 +37,8 @@ pub use pipeline::{PipelineConfig, rx_loop, tx_loop_mailbox};
 pub use piper::{
     HealthStatus, MaintenanceGate, MaintenanceGateState, MaintenanceLeaseAcquireResult,
     MaintenanceLeaseGate, MaintenanceLeaseSnapshot, MaintenanceRevocationEvent,
-    MaintenanceRevocationReason, MaintenanceStateSignal, NormalSendGate, Piper, RuntimeFaultKind,
-    ShutdownLane, ShutdownReceipt,
+    MaintenanceRevocationReason, MaintenanceStateSignal, ManualFaultRecoveryResult, NormalSendGate,
+    Piper, RuntimeFaultKind, ShutdownLane, ShutdownReceipt,
 };
 pub use piper_can::BackendCapability;
 pub use recording::{AsyncRecordingHook, TimestampedFrame};

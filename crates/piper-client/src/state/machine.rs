@@ -15,7 +15,10 @@ use crate::{
     observer::{CollisionProtectionSnapshot, MonitorReadPolicy, Observer, RuntimeHealthSnapshot},
     raw_commander::RawCommander,
 };
-use piper_driver::{BackendCapability, RuntimeFaultKind, SettingResponseState};
+use piper_driver::{
+    BackendCapability, DriverError, ManualFaultRecoveryResult, RuntimeFaultKind,
+    SettingResponseState,
+};
 use piper_protocol::control::{InstallPosition, MitControlCommand, MitMode as ProtocolMitMode};
 use piper_protocol::feedback::{ControlMode, MoveMode, RobotStatus};
 use tracing::{debug, info, trace};
@@ -589,18 +592,6 @@ where
             driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
             _state: Maintenance,
         }),
-    }
-}
-
-fn initial_motion_state_from_confirmed_mask(confirmed_mask: Option<u8>) -> InitialMotionState {
-    match confirmed_mask {
-        Some(0) => InitialMotionState::Standby,
-        Some(mask) => InitialMotionState::Maintenance {
-            confirmed_mask: Some(mask),
-        },
-        None => InitialMotionState::Maintenance {
-            confirmed_mask: None,
-        },
     }
 }
 
@@ -1552,9 +1543,7 @@ where
     fn send_disable_request(&self) -> Result<()> {
         use piper_protocol::control::MotorEnableCommand;
 
-        self.driver
-            .abort_pending_normal_control_for_state_transition(STATE_TRANSITION_SEND_TIMEOUT)?;
-        self.driver.send_local_maintenance_frame_confirmed(
+        self.driver.send_local_state_transition_frame_confirmed(
             MotorEnableCommand::disable_all().to_frame(),
             STATE_TRANSITION_SEND_TIMEOUT,
         )?;
@@ -1607,36 +1596,6 @@ where
                 return Err(RobotError::Timeout {
                     timeout_ms: timeout.as_millis() as u64,
                 });
-            }
-
-            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
-        }
-    }
-
-    fn wait_for_motion_connected_state(
-        &self,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<InitialMotionState> {
-        let start = Instant::now();
-
-        loop {
-            self.ensure_runtime_health_healthy()?;
-
-            let state = initial_motion_state_from_confirmed_mask(
-                self.observer.joint_enabled_mask_confirmed(),
-            );
-            match state {
-                InitialMotionState::Standby => return Ok(state),
-                InitialMotionState::Maintenance {
-                    confirmed_mask: Some(_),
-                } => return Ok(state),
-                InitialMotionState::Maintenance {
-                    confirmed_mask: None,
-                } if start.elapsed() >= timeout => return Ok(state),
-                InitialMotionState::Maintenance {
-                    confirmed_mask: None,
-                } => {},
             }
 
             self.sleep_with_fail_fast(start, timeout, poll_interval)?;
@@ -3104,13 +3063,16 @@ impl<Capability> Piper<ErrorState, Capability>
 where
     Capability: MotionCapability,
 {
-    /// 从手动急停中恢复，重新打开正常控制路径。
+    /// 从手动急停中恢复。
     ///
     /// 恢复序列固定为：
     /// 1. 验证当前 runtime fault 确实是 `ManualFault`
     /// 2. 通过 shutdown lane 发送 `0x150 resume`
-    /// 3. 在 driver 内部清除 fault latch，重新打开 normal gate
-    /// 4. 按当前已确认的低速驱动状态返回 `Standby` 或 `Maintenance`
+    /// 3. 等待一份严格新于 resume 发送确认时刻的完整 6 轴低速反馈
+    /// 4. 仅在拿到 fresh confirmed mask 后，driver 才清除 fault latch 并重新打开 normal gate
+    /// 5. `mask == 0` 返回 `Standby`，否则返回 `Maintenance`
+    ///
+    /// 如果在 `timeout` 内拿不到 fresh post-resume 反馈，则保持 fault latched 并返回超时错误。
     pub fn recover_from_emergency_stop(
         self,
         timeout: Duration,
@@ -3131,17 +3093,27 @@ where
         let receipt = raw_commander
             .emergency_stop_resume_enqueue(Instant::now() + EMERGENCY_STOP_LANE_TIMEOUT)?;
         receipt.wait()?;
-        self.driver.clear_manual_fault_after_resume()?;
 
-        let next_state =
-            self.wait_for_motion_connected_state(timeout, RECOVERY_STATE_POLL_INTERVAL)?;
-        Ok(match next_state {
-            InitialMotionState::Standby => MotionConnectedState::Standby(self.into_state(
+        let recovery = match self
+            .driver
+            .complete_manual_fault_recovery_after_resume(timeout, RECOVERY_STATE_POLL_INTERVAL)
+        {
+            Ok(recovery) => recovery,
+            Err(DriverError::Timeout) => {
+                return Err(RobotError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            },
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(match recovery {
+            ManualFaultRecoveryResult::Standby => MotionConnectedState::Standby(self.into_state(
                 Standby,
                 DropPolicy::Noop,
                 DriverModeDropPolicy::Preserve,
             )),
-            InitialMotionState::Maintenance { .. } => {
+            ManualFaultRecoveryResult::Maintenance { .. } => {
                 MotionConnectedState::Maintenance(self.into_state(
                     Maintenance,
                     DropPolicy::DisableAll,
@@ -3682,6 +3654,28 @@ mod tests {
                     joint_index,
                     timestamp_base + joint_index as u64,
                 ),
+            })
+            .collect()
+    }
+
+    fn delayed_joint_state_frames(
+        enabled: bool,
+        first_delay: Duration,
+        inter_frame_delay: Duration,
+        timestamp_base: u64,
+    ) -> Vec<TimedFrame> {
+        (1..=6)
+            .map(|joint_index| TimedFrame {
+                delay: if joint_index == 1 {
+                    first_delay
+                } else {
+                    inter_frame_delay
+                },
+                frame: if enabled {
+                    joint_driver_enabled_frame(joint_index, timestamp_base + joint_index as u64)
+                } else {
+                    joint_driver_disabled_frame(joint_index, timestamp_base + joint_index as u64)
+                },
             })
             .collect()
     }
@@ -4231,7 +4225,12 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                PacedRxAdapter::new(disabled_joint_frames(Duration::from_millis(2), 100)),
+                PacedRxAdapter::new(delayed_joint_state_frames(
+                    false,
+                    Duration::from_millis(50),
+                    Duration::from_millis(1),
+                    100,
+                )),
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
             )
@@ -4268,7 +4267,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_from_emergency_stop_returns_maintenance_when_drive_state_is_unknown() {
+    fn recover_from_emergency_stop_times_out_without_fresh_post_resume_drive_state() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let active = build_active_mit_piper(
             DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
@@ -4276,19 +4275,24 @@ mod tests {
         );
 
         let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
-        let recovered = error
-            .recover_from_emergency_stop(Duration::from_millis(20))
-            .expect("resume should reopen the runtime even without fresh drive confirmation");
+        let driver = Arc::clone(&error.driver);
+        let recover_error = match error.recover_from_emergency_stop(Duration::from_millis(20)) {
+            Ok(_) => {
+                panic!("resume must fail closed without fresh post-resume drive confirmation")
+            },
+            Err(error) => error,
+        };
 
-        match &recovered {
-            MotionConnectedState::Maintenance(maintenance) => {
-                assert!(maintenance.runtime_health().fault.is_none());
-                assert_eq!(maintenance.observer().joint_enabled_mask_confirmed(), None);
-            },
-            MotionConnectedState::Standby(_) => {
-                panic!("missing confirmed drive state should fall back to Maintenance")
-            },
-        }
+        assert!(matches!(recover_error, RobotError::Timeout { .. }));
+        assert_eq!(driver.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(
+            driver.maintenance_lease_snapshot().state(),
+            piper_driver::MaintenanceGateState::DeniedFaulted
+        );
+        assert!(matches!(
+            driver.send_reliable(PiperFrame::new_standard(0x472, &[0x02])),
+            Err(piper_driver::DriverError::ControlPathClosed)
+        ));
 
         let sent = sent_frames.lock().expect("sent frames lock").clone();
         assert_eq!(
@@ -4328,6 +4332,54 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn recover_from_emergency_stop_returns_maintenance_after_resume_with_fresh_enabled_feedback() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(delayed_joint_state_frames(
+                    true,
+                    Duration::from_millis(50),
+                    Duration::from_millis(1),
+                    200,
+                )),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+
+        let error = active.emergency_stop().expect("manual emergency stop should enter ErrorState");
+        let sent = match error
+            .recover_from_emergency_stop(Duration::from_millis(200))
+            .expect("fresh enabled feedback should recover into Maintenance")
+        {
+            MotionConnectedState::Maintenance(maintenance) => {
+                assert!(maintenance.runtime_health().fault.is_none());
+                assert_eq!(
+                    maintenance.observer().joint_enabled_mask_confirmed(),
+                    Some(0b11_1111)
+                );
+                sent_frames.lock().expect("sent frames lock").clone()
+            },
+            MotionConnectedState::Standby(_) => {
+                panic!("fresh enabled feedback should not recover into Standby")
+            },
+        };
+
+        assert_eq!(
+            sent,
+            vec![
+                piper_protocol::control::EmergencyStopCommand::emergency_stop().to_frame(),
+                piper_protocol::control::EmergencyStopCommand::resume().to_frame(),
+            ]
+        );
     }
 
     #[test]

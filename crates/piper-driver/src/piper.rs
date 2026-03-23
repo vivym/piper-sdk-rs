@@ -80,7 +80,7 @@ pub enum RuntimeFaultKind {
 }
 
 impl RuntimeFaultKind {
-    fn from_raw(raw: u8) -> Option<Self> {
+    pub(crate) fn from_raw(raw: u8) -> Option<Self> {
         match raw {
             1 => Some(Self::RxExited),
             2 => Some(Self::TxExited),
@@ -129,6 +129,20 @@ struct ModeSwitchBarrier {
 struct FaultLatchBarrier {
     reached_tx: std::sync::mpsc::Sender<()>,
     release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct StateTransitionBarrier {
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualFaultRecoveryResult {
+    Standby,
+    Maintenance { confirmed_mask: u8 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -249,6 +263,8 @@ pub struct NormalSendGate {
     inflight_normal_sends: AtomicUsize,
     #[cfg(test)]
     fault_latch_barrier: Mutex<Option<FaultLatchBarrier>>,
+    #[cfg(test)]
+    state_transition_barrier: Mutex<Option<StateTransitionBarrier>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +274,7 @@ pub(crate) enum NormalSendGateState {
     ReplayPaused = 1,
     FaultClosed = 2,
     StoppingClosed = 3,
+    StateTransitionClosed = 4,
 }
 
 impl NormalSendGateState {
@@ -266,7 +283,8 @@ impl NormalSendGateState {
             0 => Self::Open,
             1 => Self::ReplayPaused,
             2 => Self::FaultClosed,
-            _ => Self::StoppingClosed,
+            3 => Self::StoppingClosed,
+            _ => Self::StateTransitionClosed,
         }
     }
 
@@ -276,6 +294,7 @@ impl NormalSendGateState {
             Self::ReplayPaused => Some(NormalSendGateDenyReason::ReplayPaused),
             Self::FaultClosed => Some(NormalSendGateDenyReason::FaultClosed),
             Self::StoppingClosed => Some(NormalSendGateDenyReason::StoppingClosed),
+            Self::StateTransitionClosed => Some(NormalSendGateDenyReason::StateTransitionClosed),
         }
     }
 }
@@ -285,6 +304,7 @@ pub(crate) enum NormalSendGateDenyReason {
     ReplayPaused,
     FaultClosed,
     StoppingClosed,
+    StateTransitionClosed,
 }
 
 #[derive(Debug)]
@@ -301,10 +321,12 @@ impl NormalSendGate {
             inflight_normal_sends: AtomicUsize::new(0),
             #[cfg(test)]
             fault_latch_barrier: Mutex::new(None),
+            #[cfg(test)]
+            state_transition_barrier: Mutex::new(None),
         }
     }
 
-    fn state(&self) -> NormalSendGateState {
+    pub(crate) fn state(&self) -> NormalSendGateState {
         NormalSendGateState::from_raw(self.state.load(Ordering::Acquire))
     }
 
@@ -317,6 +339,10 @@ impl NormalSendGate {
 
     pub(crate) fn is_replay_paused(&self) -> bool {
         self.state() == NormalSendGateState::ReplayPaused
+    }
+
+    pub(crate) fn accepts_front_door_submissions(&self) -> bool {
+        self.state() == NormalSendGateState::Open
     }
 
     pub(crate) fn acquire_normal(&self) -> Result<NormalSendPermit<'_>, NormalSendGateDenyReason> {
@@ -348,7 +374,8 @@ impl NormalSendGate {
             NormalSendGateState::Open => self.set_state(NormalSendGateState::ReplayPaused),
             NormalSendGateState::ReplayPaused
             | NormalSendGateState::FaultClosed
-            | NormalSendGateState::StoppingClosed => {},
+            | NormalSendGateState::StoppingClosed
+            | NormalSendGateState::StateTransitionClosed => {},
         }
     }
 
@@ -400,8 +427,72 @@ impl NormalSendGate {
     #[cfg(not(test))]
     pub(crate) fn maybe_wait_test_fault_latch_barrier(&self) {}
 
+    #[cfg(test)]
+    fn install_state_transition_barrier(
+        &self,
+        reached_tx: std::sync::mpsc::Sender<()>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut guard = self
+            .state_transition_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(StateTransitionBarrier {
+            reached_tx,
+            release_rx,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maybe_wait_test_state_transition_barrier(&self) {
+        let barrier = self
+            .state_transition_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.reached_tx.send(());
+            let _ = barrier.release_rx.recv();
+        }
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn maybe_wait_test_state_transition_barrier(&self) {}
+
     pub(crate) fn close_for_stop(&self) {
         self.set_state(NormalSendGateState::StoppingClosed);
+    }
+
+    pub(crate) fn close_for_state_transition(&self) {
+        if self.state() == NormalSendGateState::Open {
+            self.set_state(NormalSendGateState::StateTransitionClosed);
+        }
+    }
+
+    pub(crate) fn restore_after_state_transition(
+        &self,
+        runtime_phase: RuntimePhase,
+        runtime_fault: Option<RuntimeFaultKind>,
+        driver_mode: crate::mode::DriverMode,
+    ) {
+        if self.state() != NormalSendGateState::StateTransitionClosed {
+            return;
+        }
+
+        let next_state = match runtime_phase {
+            RuntimePhase::Stopping => NormalSendGateState::StoppingClosed,
+            RuntimePhase::FaultLatched => NormalSendGateState::FaultClosed,
+            RuntimePhase::Running => {
+                if runtime_fault.is_some() {
+                    NormalSendGateState::FaultClosed
+                } else if driver_mode.is_replay() {
+                    NormalSendGateState::ReplayPaused
+                } else {
+                    NormalSendGateState::Open
+                }
+            },
+        };
+        self.set_state(next_state);
     }
 
     pub fn inflight_normal_sends(&self) -> usize {
@@ -433,6 +524,9 @@ impl NormalSendPermit<'_> {
             NormalSendGateState::Open | NormalSendGateState::ReplayPaused => Ok(()),
             NormalSendGateState::FaultClosed => Err(NormalSendGateDenyReason::FaultClosed),
             NormalSendGateState::StoppingClosed => Err(NormalSendGateDenyReason::StoppingClosed),
+            NormalSendGateState::StateTransitionClosed => {
+                Err(NormalSendGateDenyReason::StateTransitionClosed)
+            },
         }
     }
 }
@@ -560,6 +654,11 @@ pub enum MaintenanceLaneCommand {
         deadline: Instant,
         ack: Sender<MaintenanceSendPhase>,
     },
+    StateTransitionLocalSend {
+        frame: PiperFrame,
+        deadline: Instant,
+        ack: Sender<MaintenanceSendPhase>,
+    },
 }
 
 impl MaintenanceLaneCommand {
@@ -594,6 +693,18 @@ impl MaintenanceLaneCommand {
 
     fn local_send(frame: PiperFrame, deadline: Instant, ack: Sender<MaintenanceSendPhase>) -> Self {
         Self::LocalSend {
+            frame,
+            deadline,
+            ack,
+        }
+    }
+
+    fn state_transition_local_send(
+        frame: PiperFrame,
+        deadline: Instant,
+        ack: Sender<MaintenanceSendPhase>,
+    ) -> Self {
+        Self::StateTransitionLocalSend {
             frame,
             deadline,
             ack,
@@ -1438,6 +1549,23 @@ impl Piper {
         self.runtime_phase() == RuntimePhase::Running
             && self.runtime_fault.load(Ordering::Acquire) == 0
             && self.rx_thread_alive()
+            && self.normal_send_gate.accepts_front_door_submissions()
+    }
+
+    fn reliable_front_door_open(&self, kind: ReliableCommandKind) -> bool {
+        if self.runtime_phase() != RuntimePhase::Running
+            || self.runtime_fault.load(Ordering::Acquire) != 0
+            || !self.rx_thread_alive()
+        {
+            return false;
+        }
+
+        match kind {
+            ReliableCommandKind::Replay => true,
+            ReliableCommandKind::Standard | ReliableCommandKind::Maintenance => {
+                self.normal_send_gate.accepts_front_door_submissions()
+            },
+        }
     }
 
     fn low_speed_drive_state_freshness_window_us(&self) -> u64 {
@@ -1846,23 +1974,7 @@ impl Piper {
             .set_state_synced(MaintenanceGateState::DeniedTransportDown);
     }
 
-    fn maintenance_state_after_manual_fault_recovery(&self) -> MaintenanceGateState {
-        if !self.ctx.connection_monitor.check_connection() {
-            return MaintenanceGateState::DeniedTransportDown;
-        }
-
-        match self.get_robot_control().confirmed_driver_enabled_mask {
-            Some(0) => MaintenanceGateState::AllowedStandby,
-            Some(_) => MaintenanceGateState::DeniedActiveControl,
-            None => MaintenanceGateState::DeniedDriveStateUnknown,
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn clear_manual_fault_after_resume(&self) -> Result<MaintenanceGateState, DriverError> {
-        let _mode_switch_guard =
-            self.mode_switch_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
+    fn validate_manual_fault_recovery_preconditions(&self) -> Result<(), DriverError> {
         if !self.rx_thread_alive() || !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
@@ -1877,8 +1989,36 @@ impl Piper {
                 "manual fault recovery requires a latched ManualFault".to_string(),
             ));
         }
+        Ok(())
+    }
 
-        let maintenance_state = self.maintenance_state_after_manual_fault_recovery();
+    fn manual_fault_recovery_result_from_confirmed_mask(
+        confirmed_mask: u8,
+    ) -> (ManualFaultRecoveryResult, MaintenanceGateState) {
+        if confirmed_mask == 0 {
+            (
+                ManualFaultRecoveryResult::Standby,
+                MaintenanceGateState::AllowedStandby,
+            )
+        } else {
+            (
+                ManualFaultRecoveryResult::Maintenance { confirmed_mask },
+                MaintenanceGateState::DeniedActiveControl,
+            )
+        }
+    }
+
+    fn finalize_manual_fault_recovery(
+        &self,
+        confirmed_mask: u8,
+    ) -> Result<ManualFaultRecoveryResult, DriverError> {
+        let _mode_switch_guard =
+            self.mode_switch_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        self.validate_manual_fault_recovery_preconditions()?;
+
+        let (result, maintenance_state) =
+            Self::manual_fault_recovery_result_from_confirmed_mask(confirmed_mask);
         self.maintenance_gate.set_state_synced(maintenance_state)?;
 
         match self.runtime_phase.compare_exchange(
@@ -1890,7 +2030,7 @@ impl Piper {
             Ok(_) => {
                 self.normal_send_gate.reopen_after_fault();
                 self.runtime_fault.store(0, Ordering::Release);
-                Ok(maintenance_state)
+                Ok(result)
             },
             Err(observed) => match RuntimePhase::from_raw(observed) {
                 RuntimePhase::Stopping => Err(DriverError::ChannelClosed),
@@ -1898,6 +2038,40 @@ impl Piper {
                     Err(DriverError::ControlPathClosed)
                 },
             },
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn complete_manual_fault_recovery_after_resume(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<ManualFaultRecoveryResult, DriverError> {
+        self.validate_manual_fault_recovery_preconditions()?;
+
+        let baseline_host_mono_us = crate::heartbeat::monotonic_micros();
+        let start = Instant::now();
+
+        loop {
+            self.validate_manual_fault_recovery_preconditions()?;
+
+            let driver_state = self.get_joint_driver_low_speed();
+            let now_host_mono_us = crate::heartbeat::monotonic_micros();
+            if let Some(confirmed_mask) = driver_state
+                .confirmed_driver_enabled_mask_after_host_mono(
+                    baseline_host_mono_us,
+                    now_host_mono_us,
+                    self.low_speed_drive_state_freshness_window_us(),
+                )
+            {
+                return self.finalize_manual_fault_recovery(confirmed_mask);
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(DriverError::Timeout);
+            }
+
+            std::thread::sleep(poll_interval.min(timeout.saturating_sub(start.elapsed())));
         }
     }
 
@@ -1913,26 +2087,13 @@ impl Piper {
                 }
 
                 let disable_frame = MotorEnableCommand::disable_all().to_frame();
-                let deadline = Instant::now() + shutdown_timeout;
-                let send_disable = || -> Result<(), DriverError> {
-                    // Drop-time disable must preempt already queued normal control so stale
-                    // business commands cannot continue ahead of the stop frame.
-                    self.abort_pending_normal_control_for_state_transition(shutdown_timeout)?;
-
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(DriverError::Timeout);
-                    }
-
-                    self.send_local_maintenance_frame_confirmed(disable_frame, remaining)
-                };
-
-                match send_disable() {
+                let disable_start = Instant::now();
+                match self
+                    .send_local_state_transition_frame_confirmed(disable_frame, shutdown_timeout)
+                {
                     Ok(()) => {},
-                    Err(DriverError::ControlPathClosed)
-                        if self.runtime_phase() == RuntimePhase::FaultLatched =>
-                    {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
+                    Err(error) if self.runtime_phase() == RuntimePhase::FaultLatched => {
+                        let remaining = shutdown_timeout.saturating_sub(disable_start.elapsed());
                         if remaining.is_zero() {
                             warn!(
                                 "Drop auto-disable raced with a fault latch and exhausted the {:?} budget before fallback shutdown could run",
@@ -1942,7 +2103,7 @@ impl Piper {
                         }
 
                         warn!(
-                            "Drop auto-disable raced with a fault latch; falling back to bounded shutdown-lane emergency stop"
+                            "Drop auto-disable raced with a fault latch ({error}); falling back to bounded shutdown-lane emergency stop"
                         );
                         self.best_effort_fault_shutdown_on_drop(remaining);
                     },
@@ -3237,6 +3398,55 @@ impl Piper {
     }
 
     #[doc(hidden)]
+    pub fn send_local_state_transition_frame_confirmed(
+        &self,
+        frame: PiperFrame,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        if !self.tx_thread_alive() {
+            return Err(DriverError::ChannelClosed);
+        }
+
+        let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+
+        {
+            let _mode_switch_guard =
+                self.mode_switch_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if !self.tx_thread_alive() {
+                return Err(DriverError::ChannelClosed);
+            }
+            if self.replay_mode_active() || self.replay_barrier_active() {
+                return Err(DriverError::ReplayModeActive);
+            }
+            if !self.normal_control_open() {
+                return Err(DriverError::ControlPathClosed);
+            }
+
+            self.normal_send_gate.close_for_state_transition();
+
+            if self
+                .maintenance_lane_tx
+                .send(MaintenanceLaneCommand::state_transition_local_send(
+                    frame, deadline, ack_tx,
+                ))
+                .is_err()
+            {
+                self.normal_send_gate.restore_after_state_transition(
+                    self.runtime_phase(),
+                    self.runtime_fault_kind(),
+                    self.mode(),
+                );
+                return Err(DriverError::ChannelClosed);
+            }
+        }
+
+        self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
+        wait_for_maintenance_send_result(ack_rx, deadline)
+    }
+
+    #[doc(hidden)]
     /// Returns a runtime-level maintenance denial override for external observers.
     ///
     /// RX death, TX death, fault latch, and Replay isolation all make the maintenance path
@@ -3404,15 +3614,16 @@ impl Piper {
     }
 
     fn enqueue_reliable(&self, command: ReliableCommand) -> Result<(), DriverError> {
+        let kind = command.kind();
         if !self.tx_thread_alive() {
             command.complete(Err(DriverError::ChannelClosed));
             return Err(DriverError::ChannelClosed);
         }
-        if let Err(error) = self.ensure_mode_allows_reliable_kind(command.kind()) {
+        if let Err(error) = self.ensure_mode_allows_reliable_kind(kind) {
             command.complete(Err(clone_driver_error(&error)));
             return Err(error);
         }
-        if !self.normal_control_open() {
+        if !self.reliable_front_door_open(kind) {
             command.complete(Err(DriverError::ControlPathClosed));
             return Err(DriverError::ControlPathClosed);
         }
@@ -3446,15 +3657,16 @@ impl Piper {
         command: ReliableCommand,
         deadline: Instant,
     ) -> Result<(), DriverError> {
+        let kind = command.kind();
         if !self.tx_thread_alive() {
             command.complete(Err(DriverError::ChannelClosed));
             return Err(DriverError::ChannelClosed);
         }
-        if let Err(error) = self.ensure_mode_allows_reliable_kind(command.kind()) {
+        if let Err(error) = self.ensure_mode_allows_reliable_kind(kind) {
             command.complete(Err(clone_driver_error(&error)));
             return Err(error);
         }
-        if !self.normal_control_open() {
+        if !self.reliable_front_door_open(kind) {
             command.complete(Err(DriverError::ControlPathClosed));
             return Err(DriverError::ControlPathClosed);
         }
@@ -3564,21 +3776,33 @@ mod tests {
     }
 
     fn mark_maintenance_standby_confirmed(piper: &Piper) {
+        publish_confirmed_driver_mask(piper, 0);
+        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
+    }
+
+    fn publish_confirmed_driver_mask(piper: &Piper, driver_enabled_mask: u8) {
         let now = crate::heartbeat::monotonic_micros().max(1);
         piper.ctx.connection_monitor.register_feedback();
         piper.ctx.joint_driver_low_speed.store(Arc::new(JointDriverLowSpeedState {
             host_rx_mono_us: now,
             host_rx_mono_timestamps: [now; 6],
+            driver_enabled_mask,
             valid_mask: 0b11_1111,
             ..JointDriverLowSpeedState::default()
         }));
-        piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
     }
 
     fn install_fault_latch_barrier(piper: &Piper) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         piper.normal_send_gate.install_fault_latch_barrier(reached_tx, release_rx);
+        (reached_rx, release_tx)
+    }
+
+    fn install_state_transition_barrier(piper: &Piper) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        piper.normal_send_gate.install_state_transition_barrier(reached_tx, release_rx);
         (reached_rx, release_tx)
     }
 
@@ -3865,7 +4089,8 @@ mod tests {
                         let _ = ack.send(());
                     },
                     MaintenanceLaneCommand::Send { ack, .. }
-                    | MaintenanceLaneCommand::LocalSend { ack, .. } => {
+                    | MaintenanceLaneCommand::LocalSend { ack, .. }
+                    | MaintenanceLaneCommand::StateTransitionLocalSend { ack, .. } => {
                         let _ = ack.send(MaintenanceSendPhase::Finished(Err(
                             DriverError::ChannelClosed,
                         )));
@@ -3894,7 +4119,8 @@ mod tests {
                         let _ = ack.send(());
                     },
                     MaintenanceLaneCommand::Send { ack, .. }
-                    | MaintenanceLaneCommand::LocalSend { ack, .. } => {
+                    | MaintenanceLaneCommand::LocalSend { ack, .. }
+                    | MaintenanceLaneCommand::StateTransitionLocalSend { ack, .. } => {
                         let _ = ack.send(MaintenanceSendPhase::Finished(Err(
                             DriverError::ChannelClosed,
                         )));
@@ -3931,7 +4157,8 @@ mod tests {
                         let _ = ack.send(());
                     },
                     MaintenanceLaneCommand::Send { ack, .. }
-                    | MaintenanceLaneCommand::LocalSend { ack, .. } => {
+                    | MaintenanceLaneCommand::LocalSend { ack, .. }
+                    | MaintenanceLaneCommand::StateTransitionLocalSend { ack, .. } => {
                         let _ = ack.send(MaintenanceSendPhase::Finished(Err(
                             DriverError::ChannelClosed,
                         )));
@@ -6068,26 +6295,39 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_manual_fault_after_resume_reopens_normal_control_and_restores_maintenance() {
+    fn test_complete_manual_fault_recovery_after_resume_reopens_normal_control_and_restores_maintenance()
+     {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let piper = Piper::new_dual_thread_parts_unvalidated(
-            MockRxAdapter,
-            RecordingTxAdapter {
-                sent_frames: sent_frames.clone(),
-            },
-            Some(maintenance_ready_config()),
-        )
-        .unwrap();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                Some(maintenance_ready_config()),
+            )
+            .unwrap(),
+        );
         let reliable_frame = PiperFrame::new_standard(0x472, &[0x0C]);
 
         mark_maintenance_standby_confirmed(&piper);
         piper.latch_fault();
 
-        let maintenance_state = piper
-            .clear_manual_fault_after_resume()
-            .expect("manual fault recovery should reopen the runtime");
+        let piper_for_feedback = Arc::clone(&piper);
+        let feedback_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            publish_confirmed_driver_mask(&piper_for_feedback, 0);
+        });
 
-        assert_eq!(maintenance_state, MaintenanceGateState::AllowedStandby);
+        let recovery = piper
+            .complete_manual_fault_recovery_after_resume(
+                Duration::from_millis(200),
+                Duration::from_millis(1),
+            )
+            .expect("manual fault recovery should reopen the runtime");
+        feedback_thread.join().expect("feedback thread should join");
+
+        assert_eq!(recovery, ManualFaultRecoveryResult::Standby);
         assert!(piper.health().fault.is_none());
         assert_eq!(piper.runtime_phase(), RuntimePhase::Running);
         assert_eq!(piper.normal_send_gate.state(), NormalSendGateState::Open);
@@ -6103,6 +6343,37 @@ mod tests {
             Duration::from_millis(200),
             || sent_frames.lock().expect("sent frames lock").contains(&reliable_frame),
             "recovered runtime should send normal reliable frames again",
+        );
+    }
+
+    #[test]
+    fn test_manual_fault_recovery_times_out_without_fresh_post_resume_feedback() {
+        let piper = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            MockTxAdapter,
+            Some(maintenance_ready_config()),
+        )
+        .unwrap();
+
+        mark_maintenance_standby_confirmed(&piper);
+        piper.latch_fault();
+
+        let error = piper
+            .complete_manual_fault_recovery_after_resume(
+                Duration::from_millis(20),
+                Duration::from_millis(1),
+            )
+            .expect_err("manual fault recovery must fail closed without fresh feedback");
+        assert!(matches!(error, DriverError::Timeout));
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::ManualFault));
+        assert_eq!(piper.runtime_phase(), RuntimePhase::FaultLatched);
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_lease_snapshot().state(),
+            MaintenanceGateState::DeniedFaulted
         );
     }
 
@@ -6403,7 +6674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_transition_abort_preempts_pending_normal_control_before_local_disable() {
+    fn test_state_transition_local_send_preempts_pending_normal_control_before_disable() {
         use crate::command::DeliveryPhase;
         use piper_protocol::control::MotorEnableCommand;
 
@@ -6429,6 +6700,7 @@ mod tests {
         let stale_reliable = PiperFrame::new_standard(0x151, &[0x03]);
         let disable_frame = MotorEnableCommand::disable_all().to_frame();
         let deadline = Instant::now() + Duration::from_secs(1);
+        let (state_reached_rx, state_release_tx) = install_state_transition_barrier(piper.as_ref());
 
         let (realtime_ack_tx, realtime_ack_rx) = crossbeam_channel::bounded(2);
         {
@@ -6460,20 +6732,25 @@ mod tests {
             ))
             .expect("stale reliable command should queue");
 
-        let deadline = Instant::now() + Duration::from_millis(200);
-        let (abort_command, abort_ack_rx) =
-            MaintenanceLaneCommand::blocking_abort_pending_normal_control();
-        piper
-            .maintenance_lane_tx
-            .send(abort_command)
-            .expect("abort command should enter maintenance lane");
-        release_tx.send(()).expect("tx loop barrier should release cleanly");
+        let piper_for_disable = Arc::clone(&piper);
+        let disable_handle = std::thread::spawn(move || {
+            piper_for_disable.send_local_state_transition_frame_confirmed(
+                disable_frame,
+                Duration::from_millis(200),
+            )
+        });
 
-        MaintenanceGate::wait_control_ack_until(abort_ack_rx, deadline)
-            .expect("abort helper should clear pending normal control");
-        piper
-            .send_local_maintenance_frame_confirmed(disable_frame, Duration::from_millis(200))
-            .expect("local maintenance disable should be sent after abort");
+        release_tx.send(()).expect("tx loop barrier should release cleanly");
+        state_reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("state-transition dispatch should abort pending normal control before send");
+        state_release_tx
+            .send(())
+            .expect("state-transition barrier should release cleanly");
+        disable_handle
+            .join()
+            .expect("state-transition sender thread should finish cleanly")
+            .expect("state-transition disable should preempt pending normal control");
 
         wait_until(
             Duration::from_millis(200),
@@ -6523,6 +6800,63 @@ mod tests {
     }
 
     #[test]
+    fn test_state_transition_closes_front_door_before_disable_dispatch() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+        let reliable_frame = PiperFrame::new_standard(0x151, &[0x05]);
+        let realtime_frame = PiperFrame::new_standard(0x155, &[0x06]);
+        let (reached_rx, release_tx) = install_state_transition_barrier(piper.as_ref());
+
+        let piper_for_disable = Arc::clone(&piper);
+        let disable_handle = std::thread::spawn(move || {
+            piper_for_disable.send_local_state_transition_frame_confirmed(
+                disable_frame,
+                Duration::from_millis(200),
+            )
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("state-transition send should close the front door before dispatch");
+
+        let reliable_error = piper
+            .send_reliable_package_confirmed([reliable_frame], Duration::from_millis(200))
+            .expect_err("new reliable submissions must be rejected during state transition");
+        assert!(matches!(reliable_error, DriverError::ControlPathClosed));
+
+        let realtime_error = piper
+            .send_realtime_package_confirmed([realtime_frame], Duration::from_millis(200))
+            .expect_err("new realtime submissions must be rejected during state transition");
+        assert!(matches!(realtime_error, DriverError::ControlPathClosed));
+
+        release_tx.send(()).expect("state-transition barrier should release cleanly");
+        disable_handle
+            .join()
+            .expect("state-transition sender thread should finish")
+            .expect("state-transition disable should complete");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.as_slice(),
+            &[disable_frame],
+            "state-transition barrier must not allow new commands to slip ahead of disable",
+        );
+    }
+
+    #[test]
     fn test_drop_running_disable_preempts_pending_normal_control_before_disable() {
         use crate::command::DeliveryPhase;
         use piper_protocol::control::MotorEnableCommand;
@@ -6549,6 +6883,7 @@ mod tests {
         let stale_reliable = PiperFrame::new_standard(0x151, &[0x03]);
         let disable_frame = MotorEnableCommand::disable_all().to_frame();
         let deadline = Instant::now() + Duration::from_secs(1);
+        let (state_reached_rx, state_release_tx) = install_state_transition_barrier(piper.as_ref());
 
         let (realtime_ack_tx, realtime_ack_rx) = crossbeam_channel::bounded(2);
         {
@@ -6580,13 +6915,24 @@ mod tests {
             ))
             .expect("stale reliable command should queue");
 
-        let release_handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            release_tx.send(()).expect("tx loop barrier should release cleanly");
+        let piper_for_drop = Arc::clone(&piper);
+        let drop_handle = thread::spawn(move || {
+            piper_for_drop.best_effort_disable_or_shutdown_on_drop(Duration::from_millis(200));
         });
 
-        piper.best_effort_disable_or_shutdown_on_drop(Duration::from_millis(200));
-        release_handle.join().expect("release thread should join");
+        wait_until(
+            Duration::from_millis(200),
+            || piper.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed,
+            "drop-time disable should close the normal-control gate before TX resumes",
+        );
+        release_tx.send(()).expect("tx loop barrier should release cleanly");
+        state_reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("drop-time disable should abort pending normal control before send");
+        state_release_tx
+            .send(())
+            .expect("state-transition barrier should release cleanly");
+        drop_handle.join().expect("drop-time disable thread should join cleanly");
 
         wait_until(
             Duration::from_millis(200),
