@@ -422,6 +422,7 @@ fn test_500hz_realtime_benchmark() {
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let normal_send_gate = Arc::new(NormalSendGate::new());
 
     // 创建 500Hz RX 适配器
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration);
@@ -430,6 +431,7 @@ fn test_500hz_realtime_benchmark() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
+    let normal_send_gate_rx = normal_send_gate.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -441,6 +443,7 @@ fn test_500hz_realtime_benchmark() {
             config,
             is_running_rx,
             runtime_phase_rx,
+            normal_send_gate_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,
@@ -524,6 +527,7 @@ fn test_1khz_realtime_benchmark() {
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let normal_send_gate = Arc::new(NormalSendGate::new());
 
     // 创建 1kHz RX 适配器
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration);
@@ -532,6 +536,7 @@ fn test_1khz_realtime_benchmark() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
+    let normal_send_gate_rx = normal_send_gate.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -543,6 +548,7 @@ fn test_1khz_realtime_benchmark() {
             config,
             is_running_rx,
             runtime_phase_rx,
+            normal_send_gate_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,
@@ -875,6 +881,7 @@ fn test_usb_fault_simulation() {
     let metrics = Arc::new(PiperMetrics::new());
     let last_fault = Arc::new(AtomicU8::new(0));
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let normal_send_gate = Arc::new(NormalSendGate::new());
 
     // 创建 RX 适配器（模拟 5% 延迟，10ms 延迟）
     let rx_adapter = ConfigurableRxAdapter::new(frequency_hz, test_duration)
@@ -885,6 +892,7 @@ fn test_usb_fault_simulation() {
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
+    let normal_send_gate_rx = normal_send_gate.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -896,6 +904,7 @@ fn test_usb_fault_simulation() {
             config,
             is_running_rx,
             runtime_phase_rx,
+            normal_send_gate_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,

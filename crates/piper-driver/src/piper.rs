@@ -1569,6 +1569,7 @@ impl Piper {
         let config_clone = config.clone().unwrap_or_default();
         let backend_capability_rx = backend_capability;
         let maintenance_gate_rx = maintenance_gate.clone();
+        let normal_send_gate_rx = normal_send_gate.clone();
 
         let rx_thread = spawn(move || {
             crate::pipeline::rx_loop(
@@ -1578,6 +1579,7 @@ impl Piper {
                 config_clone,
                 workers_running_clone,
                 runtime_phase_rx,
+                normal_send_gate_rx,
                 metrics_clone,
                 runtime_fault_rx,
                 maintenance_gate_rx,
@@ -2372,14 +2374,17 @@ impl Piper {
     /// println!("Current mode: {:?}", mode);
     /// # }
     /// ```
+    ///
+    /// 此值会观察到已经成功发布的模式切换结果。
     pub fn mode(&self) -> crate::mode::DriverMode {
-        self.driver_mode.get(std::sync::atomic::Ordering::Relaxed)
+        self.driver_mode.get(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 尝试在有界时间内设置 Driver 模式。
     ///
     /// 此操作在 driver 内部串行化。成功返回后，`driver_mode` 与
-    /// `normal_send_gate` 一定处于一致的模式语义。
+    /// `normal_send_gate` 一定处于一致的模式语义；其他线程的前门模式判决
+    /// 也必须与返回值一致。
     pub fn try_set_mode(
         &self,
         mode: crate::mode::DriverMode,
@@ -2481,6 +2486,7 @@ impl Piper {
     /// 这是一个串行化且有界等待的兼容包装：
     /// - `Replay` 切换成功返回后，普通控制路径一定已被隔离
     /// - `Normal` 切换不会与正在进行的 `Replay` 切换交错出混合状态
+    /// - 成功返回后，其他线程观察到的前门模式判决必须与返回值一致
     pub fn set_mode(&self, mode: crate::mode::DriverMode) {
         match self.try_set_mode(mode, DEFAULT_MODE_SWITCH_TIMEOUT) {
             Ok(()) => tracing::info!("Driver mode set to: {:?}", mode),
@@ -3330,6 +3336,21 @@ mod tests {
         }
     }
 
+    struct TriggeredFatalRxAdapter {
+        trigger: Arc<std::sync::atomic::AtomicBool>,
+        tripped: bool,
+    }
+
+    impl piper_can::RxAdapter for TriggeredFatalRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            if !self.tripped && self.trigger.load(std::sync::atomic::Ordering::Acquire) {
+                self.tripped = true;
+                return Err(CanError::BufferOverflow);
+            }
+            Err(CanError::Timeout)
+        }
+    }
+
     struct MockTxAdapter;
 
     impl piper_can::RealtimeTxAdapter for MockTxAdapter {
@@ -3883,6 +3904,50 @@ mod tests {
     }
 
     #[test]
+    fn test_mode_and_replay_front_door_observe_replay_after_cross_thread_switch() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let replay_frame = PiperFrame::new_standard(0x159, &[0xE1]);
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        let piper_switch = Arc::clone(&piper);
+        let switch_handle = std::thread::spawn(move || {
+            piper_switch
+                .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+                .expect("Replay switch should succeed");
+            ready_tx.send(()).expect("mode switch signal should be delivered");
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("cross-thread replay switch should signal completion");
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Replay);
+        piper
+            .send_replay_frame_confirmed(replay_frame, Duration::from_millis(200))
+            .expect("replay front door should observe Replay mode immediately");
+
+        switch_handle.join().expect("Replay mode switch thread should finish cleanly");
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "replay frame should be sent after the cross-thread mode switch",
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &[replay_frame]);
+    }
+
+    #[test]
     fn test_realtime_uses_current_mode_after_try_set_mode_normal_returns() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts_unvalidated(
@@ -3958,6 +4023,60 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[reliable_frame]);
+    }
+
+    #[test]
+    fn test_mode_and_normal_front_door_observe_normal_after_cross_thread_restore() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let reliable_frame = PiperFrame::new_standard(0x15A, &[0xE2]);
+        let realtime_frame = PiperFrame::new_standard(0x15B, &[0xE3]);
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        piper
+            .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+            .expect("entering Replay should succeed");
+
+        let piper_restore = Arc::clone(&piper);
+        let restore_handle = std::thread::spawn(move || {
+            piper_restore
+                .try_set_mode(crate::mode::DriverMode::Normal, Duration::from_millis(100))
+                .expect("returning to Normal should succeed");
+            ready_tx.send(()).expect("mode restore signal should be delivered");
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("cross-thread Normal restore should signal completion");
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
+        piper
+            .send_frame(reliable_frame)
+            .expect("standard reliable front door should observe Normal mode immediately");
+        piper
+            .send_realtime(realtime_frame)
+            .expect("realtime front door should observe Normal mode immediately");
+
+        restore_handle.join().expect("Normal restore thread should finish cleanly");
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 2,
+            "normal sends should be accepted immediately after the cross-thread restore",
+        );
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.len(), 2);
+        assert!(sent.contains(&reliable_frame));
+        assert!(sent.contains(&realtime_frame));
     }
 
     #[test]
@@ -4059,6 +4178,11 @@ mod tests {
         let piper_mode = Arc::clone(&piper);
         let mode_handle =
             std::thread::spawn(move || piper_mode.set_mode(crate::mode::DriverMode::Replay));
+        wait_until(
+            Duration::from_millis(200),
+            || piper.replay_barrier_active(),
+            "Replay switch should pause the normal gate before the in-flight frame is released",
+        );
         let _ = release_tx.send(());
         mode_handle
             .join()
@@ -4914,6 +5038,14 @@ mod tests {
         assert_eq!(metrics.tx_soft_consecutive_deadline_miss_total, 2);
         assert_eq!(metrics.tx_frames_sent_total, 3);
         assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
         assert!(matches!(
             piper.send_soft_realtime_package_confirmed(frames, Duration::from_millis(50)),
             Err(DriverError::ControlPathClosed)
@@ -5100,8 +5232,12 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &frames);
-        let metrics = piper.get_metrics();
-        assert_eq!(metrics.tx_packages_completed_total, 1);
+        wait_until(
+            Duration::from_millis(200),
+            || piper.get_metrics().tx_packages_completed_total == 1,
+            "confirmed reliable package should publish its completed-package metric",
+        );
+        assert_eq!(piper.get_metrics().tx_packages_completed_total, 1);
     }
 
     #[test]
@@ -5381,6 +5517,14 @@ mod tests {
         assert!(!health.rx_alive);
         assert!(health.tx_alive);
         assert_eq!(health.fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
         assert!(matches!(
             piper.send_reliable(PiperFrame::new_standard(0x472, &[0x02])),
             Err(DriverError::ControlPathClosed)
@@ -5480,6 +5624,74 @@ mod tests {
         assert_eq!(metrics.tx_packages_fault_aborted_total, 1);
         assert_eq!(metrics.tx_packages_completed_total, 0);
         assert_eq!(metrics.tx_packages_partial_total, 0);
+    }
+
+    #[test]
+    fn test_rx_fatal_aborts_realtime_package_after_inflight_frame_and_closes_gate() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let fatal_trigger = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                TriggeredFatalRxAdapter {
+                    trigger: fatal_trigger.clone(),
+                    tripped: false,
+                },
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let frames = [
+            PiperFrame::new_standard(0x165, &[0x01]),
+            PiperFrame::new_standard(0x166, &[0x02]),
+            PiperFrame::new_standard(0x167, &[0x03]),
+        ];
+        let piper_clone = Arc::clone(&piper);
+        let result_handle = std::thread::spawn(move || {
+            piper_clone.send_realtime_package_confirmed(frames, Duration::from_millis(500))
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first realtime frame should begin sending");
+        fatal_trigger.store(true, std::sync::atomic::Ordering::Release);
+
+        wait_until(
+            Duration::from_millis(200),
+            || {
+                piper.health().fault == Some(RuntimeFaultKind::TransportError)
+                    && piper.normal_send_gate.state() == NormalSendGateState::FaultClosed
+            },
+            "RX fatal path should latch a transport fault and close the normal send gate",
+        );
+        let _ = release_tx.send(());
+
+        let error = result_handle
+            .join()
+            .expect("confirmed send thread should finish")
+            .expect_err("RX fatal should abort the remaining realtime package frames");
+        assert!(matches!(
+            error,
+            DriverError::RealtimeDeliveryAbortedByFault { sent: 1, total: 3 }
+        ));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.as_slice(),
+            &[frames[0]],
+            "only the in-flight frame may complete after the RX fatal closes the gate",
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
     }
 
     #[test]

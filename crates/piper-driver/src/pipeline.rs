@@ -91,6 +91,36 @@ fn store_runtime_phase(slot: &AtomicU8, phase: RuntimePhase) {
     slot.store(phase as u8, Ordering::Release);
 }
 
+fn latch_transport_fault(
+    runtime_phase: &Arc<AtomicU8>,
+    normal_send_gate: &Arc<NormalSendGate>,
+    last_fault: &Arc<AtomicU8>,
+) {
+    record_fault(last_fault, RuntimeFaultKind::TransportError);
+    store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
+    normal_send_gate.close_for_fault();
+}
+
+fn latch_transport_fault_with_maintenance(
+    runtime_phase: &Arc<AtomicU8>,
+    normal_send_gate: &Arc<NormalSendGate>,
+    last_fault: &Arc<AtomicU8>,
+    maintenance_gate: &Arc<MaintenanceGate>,
+    maintenance_tx_state: Option<&mut MaintenanceTxState>,
+) {
+    latch_transport_fault(runtime_phase, normal_send_gate, last_fault);
+
+    if let Some(maintenance_tx_state) = maintenance_tx_state {
+        refresh_local_maintenance_tx_state(
+            maintenance_gate,
+            maintenance_tx_state,
+            MaintenanceGateState::DeniedFaulted,
+        );
+    } else {
+        let _ = maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
+    }
+}
+
 fn count_fault_abort(metrics: &Arc<PiperMetrics>) {
     metrics.tx_fault_aborts_total.fetch_add(1, Ordering::Relaxed);
 }
@@ -115,8 +145,10 @@ fn record_soft_deadline_miss(
     metrics: &Arc<PiperMetrics>,
     soft_deadline_miss_streak: &mut u32,
     runtime_phase: &Arc<AtomicU8>,
+    normal_send_gate: &Arc<NormalSendGate>,
     last_fault: &Arc<AtomicU8>,
     maintenance_gate: &Arc<MaintenanceGate>,
+    maintenance_tx_state: &mut MaintenanceTxState,
 ) {
     metrics.tx_soft_deadline_miss_total.fetch_add(1, Ordering::Relaxed);
     if *soft_deadline_miss_streak > 0 {
@@ -124,9 +156,13 @@ fn record_soft_deadline_miss(
     }
     *soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
     if *soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
-        record_fault(last_fault, RuntimeFaultKind::TransportError);
-        store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
-        maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+        latch_transport_fault_with_maintenance(
+            runtime_phase,
+            normal_send_gate,
+            last_fault,
+            maintenance_gate,
+            Some(maintenance_tx_state),
+        );
     }
 }
 
@@ -235,7 +271,15 @@ fn derive_maintenance_gate_state(
     ctx: &Arc<PiperContext>,
     last_fault: &Arc<AtomicU8>,
 ) -> MaintenanceGateState {
-    if load_runtime_phase(runtime_phase) != RuntimePhase::Running {
+    let phase = load_runtime_phase(runtime_phase);
+    if phase == RuntimePhase::FaultLatched {
+        return if last_fault.load(Ordering::Acquire) != 0 {
+            MaintenanceGateState::DeniedFaulted
+        } else {
+            MaintenanceGateState::DeniedTransportDown
+        };
+    }
+    if phase != RuntimePhase::Running {
         return MaintenanceGateState::DeniedTransportDown;
     }
     if last_fault.load(Ordering::Acquire) != 0 {
@@ -1043,6 +1087,7 @@ pub fn rx_loop(
     config: PipelineConfig,
     workers_running: Arc<AtomicBool>,
     runtime_phase: Arc<AtomicU8>,
+    normal_send_gate: Arc<NormalSendGate>,
     metrics: Arc<PiperMetrics>,
     last_fault: Arc<AtomicU8>,
     maintenance_gate: Arc<MaintenanceGate>,
@@ -1104,7 +1149,8 @@ pub fn rx_loop(
                     &metrics,
                 );
 
-                if maintenance_gate.current_state() != MaintenanceGateState::DeniedTransportDown
+                if load_runtime_phase(&runtime_phase) == RuntimePhase::Running
+                    && maintenance_gate.current_state() != MaintenanceGateState::DeniedTransportDown
                     && !ctx.connection_monitor.check_connection()
                 {
                     let _ = maintenance_gate
@@ -1130,9 +1176,13 @@ pub fn rx_loop(
 
                 if is_fatal {
                     error!("RX thread: Fatal error detected, latching runtime fault");
-                    record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                    store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                    let _ = maintenance_gate.set_state_synced(MaintenanceGateState::DeniedFaulted);
+                    latch_transport_fault_with_maintenance(
+                        &runtime_phase,
+                        &normal_send_gate,
+                        &last_fault,
+                        &maintenance_gate,
+                        None,
+                    );
                     break;
                 }
 
@@ -1255,6 +1305,7 @@ pub fn tx_loop_mailbox(
                 &ctx,
                 &last_fault,
                 &maintenance_gate,
+                &mut maintenance_tx_state,
                 "TX thread: Failed to send shutdown frame",
             );
             if should_break {
@@ -1318,12 +1369,12 @@ pub fn tx_loop_mailbox(
                         }
                         soft_deadline_miss_streak = soft_deadline_miss_streak.saturating_add(1);
                         if soft_deadline_miss_streak >= SOFT_DEADLINE_MISS_FAULT_THRESHOLD {
-                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                            refresh_local_maintenance_tx_state(
+                            latch_transport_fault_with_maintenance(
+                                &runtime_phase,
+                                &normal_send_gate,
+                                &last_fault,
                                 &maintenance_gate,
-                                &mut maintenance_tx_state,
-                                MaintenanceGateState::DeniedFaulted,
+                                Some(&mut maintenance_tx_state),
                             );
                         }
                         Err(crate::DriverError::Timeout)
@@ -1335,12 +1386,12 @@ pub fn tx_loop_mailbox(
                         } else {
                             metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                         }
-                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        refresh_local_maintenance_tx_state(
+                        latch_transport_fault_with_maintenance(
+                            &runtime_phase,
+                            &normal_send_gate,
+                            &last_fault,
                             &maintenance_gate,
-                            &mut maintenance_tx_state,
-                            MaintenanceGateState::DeniedFaulted,
+                            Some(&mut maintenance_tx_state),
                         );
                         Err(crate::DriverError::ReliableDeliveryFailed { source: e })
                     },
@@ -1444,6 +1495,7 @@ pub fn tx_loop_mailbox(
                                 &ctx,
                                 &last_fault,
                                 &maintenance_gate,
+                                &mut maintenance_tx_state,
                                 "TX thread: Failed to send shutdown frame while preempting realtime package",
                             );
                             count_fault_abort(&metrics);
@@ -1462,12 +1514,12 @@ pub fn tx_loop_mailbox(
                         } else {
                             metrics.device_errors.fetch_add(1, Ordering::Relaxed);
                         }
-                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        refresh_local_maintenance_tx_state(
+                        latch_transport_fault_with_maintenance(
+                            &runtime_phase,
+                            &normal_send_gate,
+                            &last_fault,
                             &maintenance_gate,
-                            &mut maintenance_tx_state,
-                            MaintenanceGateState::DeniedFaulted,
+                            Some(&mut maintenance_tx_state),
                         );
                         delivery_error = Some(crate::DriverError::RealtimeDeliveryFailed {
                             sent: sent_count,
@@ -1571,12 +1623,12 @@ pub fn tx_loop_mailbox(
                             sent_count, e
                         );
                         metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        refresh_local_maintenance_tx_state(
+                        latch_transport_fault_with_maintenance(
+                            &runtime_phase,
+                            &normal_send_gate,
+                            &last_fault,
                             &maintenance_gate,
-                            &mut maintenance_tx_state,
-                            MaintenanceGateState::DeniedFaulted,
+                            Some(&mut maintenance_tx_state),
                         );
                         send_result = Err(crate::DriverError::ReliableDeliveryFailed { source: e });
                         should_break = true;
@@ -1591,16 +1643,11 @@ pub fn tx_loop_mailbox(
                     &metrics,
                     &mut soft_deadline_miss_streak,
                     &runtime_phase,
+                    &normal_send_gate,
                     &last_fault,
                     &maintenance_gate,
+                    &mut maintenance_tx_state,
                 );
-                if load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched {
-                    refresh_local_maintenance_tx_state(
-                        &maintenance_gate,
-                        &mut maintenance_tx_state,
-                        MaintenanceGateState::DeniedFaulted,
-                    );
-                }
             } else if sent_count == total_frames {
                 reset_soft_deadline_miss_streak(&mut soft_deadline_miss_streak);
             }
@@ -1707,12 +1754,12 @@ pub fn tx_loop_mailbox(
                                 total: total_frames,
                             });
                             if backend_capability.is_strict_realtime() {
-                                record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                                store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                                refresh_local_maintenance_tx_state(
+                                latch_transport_fault_with_maintenance(
+                                    &runtime_phase,
+                                    &normal_send_gate,
+                                    &last_fault,
                                     &maintenance_gate,
-                                    &mut maintenance_tx_state,
-                                    MaintenanceGateState::DeniedFaulted,
+                                    Some(&mut maintenance_tx_state),
                                 );
                                 should_break = true;
                             }
@@ -1720,12 +1767,12 @@ pub fn tx_loop_mailbox(
                             deadline_missed = true;
                             send_result = Err(crate::DriverError::Timeout);
                         } else {
-                            record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                            store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                            refresh_local_maintenance_tx_state(
+                            latch_transport_fault_with_maintenance(
+                                &runtime_phase,
+                                &normal_send_gate,
+                                &last_fault,
                                 &maintenance_gate,
-                                &mut maintenance_tx_state,
-                                MaintenanceGateState::DeniedFaulted,
+                                Some(&mut maintenance_tx_state),
                             );
                             send_result = Err(crate::DriverError::ReliableDeliveryFailed {
                                 source: CanError::Timeout,
@@ -1740,12 +1787,12 @@ pub fn tx_loop_mailbox(
                             sent_count, e
                         );
                         metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                        record_fault(&last_fault, RuntimeFaultKind::TransportError);
-                        store_runtime_phase(&runtime_phase, RuntimePhase::FaultLatched);
-                        refresh_local_maintenance_tx_state(
+                        latch_transport_fault_with_maintenance(
+                            &runtime_phase,
+                            &normal_send_gate,
+                            &last_fault,
                             &maintenance_gate,
-                            &mut maintenance_tx_state,
-                            MaintenanceGateState::DeniedFaulted,
+                            Some(&mut maintenance_tx_state),
                         );
                         send_result = if package_command {
                             Err(crate::DriverError::ReliablePackageDeliveryFailed {
@@ -1794,16 +1841,11 @@ pub fn tx_loop_mailbox(
                         &metrics,
                         &mut soft_deadline_miss_streak,
                         &runtime_phase,
+                        &normal_send_gate,
                         &last_fault,
                         &maintenance_gate,
+                        &mut maintenance_tx_state,
                     );
-                    if load_runtime_phase(&runtime_phase) == RuntimePhase::FaultLatched {
-                        refresh_local_maintenance_tx_state(
-                            &maintenance_gate,
-                            &mut maintenance_tx_state,
-                            MaintenanceGateState::DeniedFaulted,
-                        );
-                    }
                 }
             }
 
@@ -1929,6 +1971,7 @@ fn send_shutdown_dispatch(
     ctx: &Arc<PiperContext>,
     last_fault: &Arc<AtomicU8>,
     maintenance_gate: &Arc<MaintenanceGate>,
+    maintenance_tx_state: &mut MaintenanceTxState,
     error_prefix: &str,
 ) -> bool {
     let frame = dispatch.frame;
@@ -1945,17 +1988,23 @@ fn send_shutdown_dispatch(
             error!("{}: {}", error_prefix, e);
             if matches!(e, CanError::Timeout) {
                 metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                record_fault(last_fault, RuntimeFaultKind::TransportError);
-                store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
-                normal_send_gate.close_for_fault();
-                maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+                latch_transport_fault_with_maintenance(
+                    runtime_phase,
+                    normal_send_gate,
+                    last_fault,
+                    maintenance_gate,
+                    Some(maintenance_tx_state),
+                );
                 Err(crate::DriverError::Timeout)
             } else {
                 metrics.device_errors.fetch_add(1, Ordering::Relaxed);
-                record_fault(last_fault, RuntimeFaultKind::TransportError);
-                store_runtime_phase(runtime_phase, RuntimePhase::FaultLatched);
-                normal_send_gate.close_for_fault();
-                maintenance_gate.set_state(MaintenanceGateState::DeniedFaulted);
+                latch_transport_fault_with_maintenance(
+                    runtime_phase,
+                    normal_send_gate,
+                    last_fault,
+                    maintenance_gate,
+                    Some(maintenance_tx_state),
+                );
                 Err(crate::DriverError::ReliableDeliveryFailed { source: e })
             }
         },

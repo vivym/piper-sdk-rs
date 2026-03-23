@@ -380,6 +380,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
+    let normal_send_gate = Arc::new(NormalSendGate::new());
     let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_tx = Arc::clone(&realtime_slot);
@@ -388,6 +389,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let ctx_rx = ctx.clone();
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
+    let normal_send_gate_rx = normal_send_gate.clone();
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -399,6 +401,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             config,
             is_running_rx,
             runtime_phase_rx,
+            normal_send_gate_rx,
             metrics_rx,
             last_fault_rx,
             maintenance_state_signal_rx,
@@ -412,11 +415,11 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
+    let normal_send_gate_tx = normal_send_gate.clone();
     let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
     maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
     let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
     let tx_handle = thread::spawn(move || {
-        let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
             tx_adapter,
             BackendCapability::StrictRealtime,
@@ -426,7 +429,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             reliable_rx,
             is_running_tx,
             runtime_phase_tx,
-            normal_send_gate,
+            normal_send_gate_tx,
             metrics_tx,
             ctx_tx,
             last_fault_tx,

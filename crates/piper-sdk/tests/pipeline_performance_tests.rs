@@ -149,6 +149,7 @@ fn start_rx_loop(
     fault: Arc<AtomicU8>,
 ) -> thread::JoinHandle<()> {
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
+    let normal_send_gate = Arc::new(NormalSendGate::new());
     thread::spawn(move || {
         rx_loop(
             rx_adapter,
@@ -157,6 +158,7 @@ fn start_rx_loop(
             PipelineConfig::default(),
             is_running,
             runtime_phase,
+            normal_send_gate,
             metrics,
             fault,
             maintenance_state_signal,
