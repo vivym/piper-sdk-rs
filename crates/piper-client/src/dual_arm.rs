@@ -1583,11 +1583,9 @@ mod tests {
             Self { inner, harness }
         }
 
-        fn maybe_arm_disabled_cycle(&self, frame: PiperFrame) {
+        fn is_disable_all_frame(&self, frame: PiperFrame) -> bool {
             let disable_all = MotorEnableCommand::disable_all().to_frame();
-            if frame.id == disable_all.id && frame.data == disable_all.data {
-                self.harness.arm_disabled_cycle();
-            }
+            frame.id == disable_all.id && frame.data == disable_all.data
         }
     }
 
@@ -1600,8 +1598,12 @@ mod tests {
             frame: PiperFrame,
             budget: Duration,
         ) -> std::result::Result<(), CanError> {
-            self.maybe_arm_disabled_cycle(frame);
-            self.inner.send_control(frame, budget)
+            let should_arm = self.is_disable_all_frame(frame);
+            let result = self.inner.send_control(frame, budget);
+            if should_arm && result.is_ok() {
+                self.harness.arm_disabled_cycle();
+            }
+            result
         }
 
         fn send_shutdown_until(
@@ -1609,8 +1611,12 @@ mod tests {
             frame: PiperFrame,
             deadline: Instant,
         ) -> std::result::Result<(), CanError> {
-            self.maybe_arm_disabled_cycle(frame);
-            self.inner.send_shutdown_until(frame, deadline)
+            let should_arm = self.is_disable_all_frame(frame);
+            let result = self.inner.send_shutdown_until(frame, deadline);
+            if should_arm && result.is_ok() {
+                self.harness.arm_disabled_cycle();
+            }
+            result
         }
     }
 
@@ -2255,6 +2261,114 @@ mod tests {
                 master_interaction_torque: JointArray::splat(NewtonMeter::ZERO),
             })
         }
+    }
+
+    #[test]
+    fn test_disable_aware_tx_send_control_arms_synthetic_feedback_only_on_success() {
+        let harness = Arc::new(DisableFeedbackHarness::default());
+        let mut tx = DisableAwareTxAdapter::new(
+            RecordingTxAdapter::new(Arc::new(Mutex::new(Vec::new()))),
+            harness.clone(),
+        );
+        let mut rx = DisableAwareRxAdapter::new(ScriptedRxAdapter::new(Vec::new()), harness);
+        let disable_all = MotorEnableCommand::disable_all().to_frame();
+
+        tx.send_control(disable_all, Duration::from_millis(1))
+            .expect("disable_all should be forwarded");
+
+        for joint_index in 1_u32..=6 {
+            let frame = rx.receive().expect("synthetic disabled feedback should be emitted");
+            assert_eq!(frame.id, ID_JOINT_DRIVER_LOW_SPEED_BASE + (joint_index - 1));
+            assert_eq!(frame.data[5], 0x00);
+        }
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn test_disable_aware_tx_send_control_timeout_does_not_emit_synthetic_feedback() {
+        let harness = Arc::new(DisableFeedbackHarness::default());
+        let mut tx = DisableAwareTxAdapter::new(
+            RecordingTxAdapter::new(Arc::new(Mutex::new(Vec::new()))),
+            harness.clone(),
+        );
+        let mut rx = DisableAwareRxAdapter::new(ScriptedRxAdapter::new(Vec::new()), harness);
+        let disable_all = MotorEnableCommand::disable_all().to_frame();
+
+        let result = tx.send_control(disable_all, Duration::ZERO);
+        assert!(matches!(result, Err(CanError::Timeout)));
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn test_disable_aware_tx_send_control_fatal_does_not_emit_synthetic_feedback() {
+        let harness = Arc::new(DisableFeedbackHarness::default());
+        let mut tx = DisableAwareTxAdapter::new(
+            FailOnNthFatalTxAdapter {
+                fail_on: 1,
+                sends: 0,
+            },
+            harness.clone(),
+        );
+        let mut rx = DisableAwareRxAdapter::new(ScriptedRxAdapter::new(Vec::new()), harness);
+        let disable_all = MotorEnableCommand::disable_all().to_frame();
+
+        let result = tx.send_control(disable_all, Duration::from_millis(1));
+        assert!(matches!(result, Err(CanError::BufferOverflow)));
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn test_disable_aware_tx_non_disable_frame_does_not_emit_synthetic_feedback() {
+        let harness = Arc::new(DisableFeedbackHarness::default());
+        let mut tx = DisableAwareTxAdapter::new(
+            RecordingTxAdapter::new(Arc::new(Mutex::new(Vec::new()))),
+            harness.clone(),
+        );
+        let mut rx = DisableAwareRxAdapter::new(ScriptedRxAdapter::new(Vec::new()), harness);
+        let frame = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.0)
+            .expect("command should build")
+            .to_frame();
+
+        tx.send_control(frame, Duration::from_millis(1))
+            .expect("non-disable command should be forwarded");
+
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn test_disable_aware_tx_send_shutdown_until_arms_synthetic_feedback_only_on_success() {
+        let harness = Arc::new(DisableFeedbackHarness::default());
+        let mut tx = DisableAwareTxAdapter::new(
+            RecordingTxAdapter::new(Arc::new(Mutex::new(Vec::new()))),
+            harness.clone(),
+        );
+        let mut rx = DisableAwareRxAdapter::new(ScriptedRxAdapter::new(Vec::new()), harness);
+        let disable_all = MotorEnableCommand::disable_all().to_frame();
+
+        tx.send_shutdown_until(disable_all, Instant::now() + Duration::from_millis(10))
+            .expect("disable_all shutdown should be forwarded");
+
+        for joint_index in 1_u32..=6 {
+            let frame = rx.receive().expect("synthetic disabled feedback should be emitted");
+            assert_eq!(frame.id, ID_JOINT_DRIVER_LOW_SPEED_BASE + (joint_index - 1));
+            assert_eq!(frame.data[5], 0x00);
+        }
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn test_disable_aware_tx_send_shutdown_until_timeout_does_not_emit_synthetic_feedback() {
+        let harness = Arc::new(DisableFeedbackHarness::default());
+        let mut tx = DisableAwareTxAdapter::new(
+            RecordingTxAdapter::new(Arc::new(Mutex::new(Vec::new()))),
+            harness.clone(),
+        );
+        let mut rx = DisableAwareRxAdapter::new(ScriptedRxAdapter::new(Vec::new()), harness);
+        let disable_all = MotorEnableCommand::disable_all().to_frame();
+
+        let result = tx.send_shutdown_until(disable_all, Instant::now());
+        assert!(matches!(result, Err(CanError::Timeout)));
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
     }
 
     #[test]
