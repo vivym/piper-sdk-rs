@@ -112,7 +112,6 @@ pub(crate) enum RuntimePhase {
 
 pub(crate) const NORMAL_FRAME_SEND_BUDGET: Duration = Duration::from_micros(500);
 pub(crate) const SOFT_CONTROL_SEND_BUDGET: Duration = Duration::from_millis(5);
-pub(crate) const SOFT_CONTROL_SEND_MIN_DEADLINE: Duration = Duration::from_millis(1);
 pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
 pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_MODE_SWITCH_TIMEOUT: Duration = Duration::from_millis(100);
@@ -1805,11 +1804,11 @@ impl Piper {
         let (soft_realtime_tx, soft_realtime_rx) =
             crossbeam_channel::bounded::<SoftRealtimeCommand>(4);
         let shutdown_lane = Arc::new(ShutdownLane::new());
-        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = Arc::new(PiperContext::with_metrics(metrics.clone()));
         let workers_running = Arc::new(AtomicBool::new(true));
         let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
         let normal_send_gate = Arc::new(NormalSendGate::new());
-        let metrics = Arc::new(PiperMetrics::new());
         let runtime_fault = Arc::new(AtomicU8::new(0));
         let maintenance_gate = Arc::new(MaintenanceGate::default());
         let driver_mode = Arc::new(crate::mode::AtomicDriverMode::new(
@@ -3218,7 +3217,6 @@ impl Piper {
             )));
         }
 
-        let timeout = timeout.max(SOFT_CONTROL_SEND_MIN_DEADLINE);
         let deadline = Instant::now() + timeout;
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         let command = SoftRealtimeCommand::confirmed(buffer, deadline, ack_tx);
@@ -4119,9 +4117,45 @@ mod tests {
 
     struct AlwaysTimeoutTxAdapter;
 
+    struct DelayedSubMillisecondBudgetTxAdapter {
+        sends: usize,
+    }
+
     impl piper_can::RealtimeTxAdapter for AlwaysTimeoutTxAdapter {
         fn send_control(&mut self, _frame: PiperFrame, _budget: Duration) -> Result<(), CanError> {
             Err(CanError::Timeout)
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+    }
+
+    impl piper_can::RealtimeTxAdapter for DelayedSubMillisecondBudgetTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            self.sends += 1;
+            if self.sends == 1 {
+                let remaining_tail = Duration::from_micros(700);
+                let delay = budget.saturating_sub(remaining_tail);
+                let delay_until = Instant::now() + delay;
+                while Instant::now() < delay_until {
+                    std::hint::spin_loop();
+                }
+                return Ok(());
+            }
+
+            if budget < Duration::from_millis(1) {
+                return Err(CanError::Timeout);
+            }
+
+            Err(CanError::BufferOverflow)
         }
 
         fn send_shutdown_until(
@@ -5926,6 +5960,60 @@ mod tests {
     }
 
     #[test]
+    fn test_soft_realtime_zero_budget_never_late_sends_expired_command() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts(
+            SoftRxAdapter,
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let frames = [PiperFrame::new_standard(0x155, &[0x01])];
+
+        let error = piper
+            .send_soft_realtime_package_confirmed(frames, Duration::ZERO)
+            .expect_err("zero-budget soft realtime command must time out before commit");
+        assert!(matches!(error, DriverError::Timeout));
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert!(
+            sent.is_empty(),
+            "expired soft realtime command must not commit to the bus later",
+        );
+        assert_eq!(piper.get_metrics().tx_frames_sent_total, 0);
+    }
+
+    #[test]
+    fn test_soft_realtime_sub_millisecond_remaining_budget_is_not_rounded_up() {
+        let piper = Piper::new_dual_thread_parts(
+            SoftRxAdapter,
+            DelayedSubMillisecondBudgetTxAdapter { sends: 0 },
+            None,
+        )
+        .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, &[0x01]),
+            PiperFrame::new_standard(0x156, &[0x02]),
+        ];
+
+        let error = piper
+            .send_soft_realtime_package_confirmed(frames, Duration::from_millis(20))
+            .expect_err("sub-millisecond remaining budget must not be rounded up");
+        assert!(matches!(
+            error,
+            DriverError::RealtimeDeliveryFailed {
+                sent: 1,
+                total: 2,
+                source: CanError::Timeout,
+            }
+        ));
+    }
+
+    #[test]
     fn test_health_reports_runtime_only_faults() {
         let piper =
             Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None).unwrap();
@@ -6146,7 +6234,7 @@ mod tests {
     }
 
     #[test]
-    fn test_soft_reliable_package_timeout_counts_per_command() {
+    fn test_soft_reliable_partial_timeout_fails_closed_immediately() {
         let piper =
             Piper::new_dual_thread_parts(SoftRxAdapter, PartialTimeoutTxAdapter { sends: 0 }, None)
                 .unwrap();
@@ -6155,23 +6243,37 @@ mod tests {
             PiperFrame::new_standard(0x156, &[0x02]),
         ];
 
-        for _ in 0..3 {
-            let error = piper
-                .send_reliable_package_confirmed(frames, Duration::from_millis(200))
-                .expect_err("each partial reliable package should time out");
-            assert!(matches!(
-                error,
-                DriverError::ReliablePackageTimeout { sent: 1, total: 2 }
-            ));
-        }
+        let error = piper
+            .send_reliable_package_confirmed(frames, Duration::from_millis(200))
+            .expect_err("partial reliable package must fail closed");
+        assert!(matches!(
+            error,
+            DriverError::ReliablePackageDeliveryFailed {
+                sent: 1,
+                total: 2,
+                source: CanError::Timeout,
+            }
+        ));
 
         std::thread::sleep(Duration::from_millis(20));
         let metrics = piper.get_metrics();
-        assert_eq!(metrics.tx_soft_deadline_miss_total, 3);
-        assert_eq!(metrics.tx_soft_consecutive_deadline_miss_total, 2);
-        assert_eq!(metrics.tx_frames_sent_total, 3);
-        assert_eq!(metrics.tx_packages_partial_total, 3);
+        assert_eq!(metrics.tx_soft_deadline_miss_total, 0);
+        assert_eq!(metrics.tx_soft_consecutive_deadline_miss_total, 0);
+        assert_eq!(metrics.tx_frames_sent_total, 1);
+        assert_eq!(metrics.tx_packages_partial_total, 1);
         assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
+        assert!(matches!(
+            piper.send_reliable_package_confirmed(frames, Duration::from_millis(50)),
+            Err(DriverError::ControlPathClosed)
+        ));
     }
 
     #[test]

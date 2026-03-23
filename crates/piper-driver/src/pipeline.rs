@@ -8,8 +8,7 @@ use crate::piper::{
     MaintenanceControlOp, MaintenanceGate, MaintenanceGateState, MaintenanceLaneCommand,
     MaintenanceLeaseSnapshot, MaintenanceSendPhase, NORMAL_FRAME_SEND_BUDGET, NormalSendGate,
     NormalSendGateDenyReason, RuntimeFaultKind, RuntimePhase, SOFT_CONTROL_SEND_BUDGET,
-    SOFT_CONTROL_SEND_MIN_DEADLINE, SOFT_DEADLINE_MISS_FAULT_THRESHOLD, ShutdownDispatch,
-    ShutdownLane,
+    SOFT_DEADLINE_MISS_FAULT_THRESHOLD, ShutdownDispatch, ShutdownLane,
 };
 use crate::state::*;
 use crossbeam_channel::Receiver;
@@ -1937,7 +1936,7 @@ pub fn tx_loop_mailbox(
                     break;
                 };
 
-                match tx.send_control(frame, remaining.max(SOFT_CONTROL_SEND_MIN_DEADLINE)) {
+                match tx.send_control(frame, remaining) {
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
@@ -2103,12 +2102,13 @@ pub fn tx_loop_mailbox(
                     Err(CanError::Timeout) => {
                         metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
                         if package_command {
-                            deadline_missed = true;
-                            send_result = Err(crate::DriverError::ReliablePackageTimeout {
-                                sent: sent_count,
-                                total: total_frames,
-                            });
-                            if backend_capability.is_strict_realtime() {
+                            if sent_count == 0 {
+                                deadline_missed = true;
+                                send_result = Err(crate::DriverError::ReliablePackageTimeout {
+                                    sent: sent_count,
+                                    total: total_frames,
+                                });
+                            } else {
                                 latch_runtime_fault_with_maintenance(
                                     &runtime_phase,
                                     &normal_send_gate,
@@ -2117,6 +2117,25 @@ pub fn tx_loop_mailbox(
                                     &maintenance_gate,
                                     Some(&mut maintenance_tx_state),
                                 );
+                                deadline_missed = true;
+                                send_result =
+                                    Err(crate::DriverError::ReliablePackageDeliveryFailed {
+                                        sent: sent_count,
+                                        total: total_frames,
+                                        source: CanError::Timeout,
+                                    });
+                            }
+                            if backend_capability.is_strict_realtime() {
+                                if sent_count == 0 {
+                                    latch_runtime_fault_with_maintenance(
+                                        &runtime_phase,
+                                        &normal_send_gate,
+                                        &last_fault,
+                                        RuntimeFaultKind::TransportError,
+                                        &maintenance_gate,
+                                        Some(&mut maintenance_tx_state),
+                                    );
+                                }
                                 should_break = true;
                             }
                         } else if backend_capability.is_soft_realtime() {

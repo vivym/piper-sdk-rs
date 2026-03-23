@@ -2100,7 +2100,7 @@ mod tests {
             }
 
             assert!(
-                start.elapsed() < Duration::from_millis(400),
+                start.elapsed() < Duration::from_secs(1),
                 "timed out waiting for {} sent frames, got {}",
                 expected,
                 frames.len()

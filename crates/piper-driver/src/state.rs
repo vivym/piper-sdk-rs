@@ -1,6 +1,7 @@
 //! Driver 模块状态结构定义
 
 use crate::fps_stats::FpsStatistics;
+use crate::metrics::PiperMetrics;
 use arc_swap::ArcSwap;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -16,7 +17,7 @@ use std::sync::{Arc, RwLock};
 /// # Safety
 ///
 /// 内部 `unsafe` 依赖以下不变量：
-/// - 只有单个写线程调用 `store()`
+/// - 只有单个写线程调用 `try_store()` / `store()`
 /// - 写者只会写入 `reader_count == 0` 的非已发布槽位
 /// - 读者在持有 reader count 期间，写者不会复用该槽位
 struct RealtimeSnapshotCell<T: Copy + Default, const N: usize = 3> {
@@ -55,31 +56,34 @@ impl<T: Copy + Default, const N: usize> RealtimeSnapshotCell<T, N> {
         }
     }
 
-    fn store(&self, value: T) {
-        loop {
-            let published = self.published_slot.load(Ordering::Acquire);
+    fn try_store(&self, value: T) -> bool {
+        let published = self.published_slot.load(Ordering::Acquire);
 
-            for slot in 0..N {
-                if slot == published {
-                    continue;
-                }
-                if self.reader_counts[slot].load(Ordering::Acquire) != 0 {
-                    continue;
-                }
-
-                // SAFETY:
-                // - 单写者模型下不存在并发写
-                // - 该槽位不是当前 published，新的读者无法进入
-                // - reader_count == 0，没有旧读者仍持有该槽位
-                unsafe {
-                    *self.slots[slot].get() = value;
-                }
-                self.published_slot.store(slot, Ordering::Release);
-                return;
+        for slot in 0..N {
+            if slot == published {
+                continue;
+            }
+            if self.reader_counts[slot].load(Ordering::Acquire) != 0 {
+                continue;
             }
 
-            std::hint::spin_loop();
+            // SAFETY:
+            // - 单写者模型下不存在并发写
+            // - 该槽位不是当前 published，新的读者无法进入
+            // - reader_count == 0，没有旧读者仍持有该槽位
+            unsafe {
+                *self.slots[slot].get() = value;
+            }
+            self.published_slot.store(slot, Ordering::Release);
+            return true;
         }
+
+        false
+    }
+
+    #[cfg(test)]
+    fn store(&self, value: T) {
+        let _ = self.try_store(value);
     }
 
     #[cfg(test)]
@@ -1366,6 +1370,7 @@ pub struct PiperContext {
     pub connection_monitor: crate::heartbeat::ConnectionMonitor,
     /// 第一次带可信设备时间戳的反馈到达主机的单调时间（微秒）。
     pub first_timestamped_feedback_host_rx_mono_us: AtomicU64,
+    hot_snapshot_metrics: Option<Arc<PiperMetrics>>,
 
     /// Test-only barrier that pauses one Piper instance at the top of its TX dispatch loop.
     #[cfg(test)]
@@ -1429,6 +1434,14 @@ impl PiperContext {
     /// assert!(joint_pos.latest_complete().is_none());
     /// ```
     pub fn new() -> Self {
+        Self::new_with_optional_metrics(None)
+    }
+
+    pub(crate) fn with_metrics(metrics: Arc<PiperMetrics>) -> Self {
+        Self::new_with_optional_metrics(Some(metrics))
+    }
+
+    fn new_with_optional_metrics(hot_snapshot_metrics: Option<Arc<PiperMetrics>>) -> Self {
         Self {
             // 热数据：固定槽位快照，无锁读取
             joint_position_monitor: Arc::new(RealtimeSnapshotCell::new(
@@ -1485,6 +1498,7 @@ impl PiperContext {
                 std::time::Duration::from_secs(1),
             ),
             first_timestamped_feedback_host_rx_mono_us: AtomicU64::new(0),
+            hot_snapshot_metrics,
             #[cfg(test)]
             tx_loop_dispatch_barrier: Mutex::new(None),
 
@@ -1533,6 +1547,18 @@ impl PiperContext {
 
     pub fn first_timestamped_feedback_host_rx_mono_us(&self) -> u64 {
         self.first_timestamped_feedback_host_rx_mono_us.load(Ordering::Acquire)
+    }
+
+    fn record_hot_snapshot_publish_skips(&self, skipped: u64) {
+        if skipped == 0 {
+            return;
+        }
+
+        if let Some(metrics) = &self.hot_snapshot_metrics {
+            metrics
+                .rx_hot_snapshot_publish_skipped_total
+                .fetch_add(skipped, Ordering::Relaxed);
+        }
     }
 
     /// 捕获运动状态快照（逻辑原子性）
@@ -1589,83 +1615,118 @@ impl PiperContext {
     /// 发布新的关节位置完整监控快照，并与当前末端位姿组合成逻辑原子快照。
     pub fn publish_joint_position(&self, joint_position: JointPositionState) {
         let end_pose = self.end_pose_monitor.load();
-        self.joint_position_monitor
-            .store(JointPositionMonitorSnapshot::from_complete(joint_position));
-        self.motion_snapshot.store(MotionSnapshot {
+        let mut skipped = 0;
+        if !self
+            .joint_position_monitor
+            .try_store(JointPositionMonitorSnapshot::from_complete(joint_position))
+        {
+            skipped += 1;
+        }
+        if !self.motion_snapshot.try_store(MotionSnapshot {
             joint_position,
             end_pose: end_pose.latest_complete_cloned().unwrap_or_default(),
-        });
-        self.raw_motion_snapshot.store(MotionSnapshot {
+        }) {
+            skipped += 1;
+        }
+        if !self.raw_motion_snapshot.try_store(MotionSnapshot {
             joint_position,
             end_pose: *end_pose.latest_raw(),
-        });
+        }) {
+            skipped += 1;
+        }
+        self.record_hot_snapshot_publish_skips(skipped);
     }
 
     /// 发布新的原始关节位置，并与当前原始末端位姿组合成逻辑原子快照。
     pub fn publish_raw_joint_position(&self, joint_position: JointPositionState) {
         let current = self.joint_position_monitor.load();
         let end_pose = self.end_pose_monitor.load();
-        self.joint_position_monitor.store(JointPositionMonitorSnapshot::with_raw(
+        let mut skipped = 0;
+        if !self.joint_position_monitor.try_store(JointPositionMonitorSnapshot::with_raw(
             current.latest_complete,
             joint_position,
-        ));
-        self.raw_motion_snapshot.store(MotionSnapshot {
+        )) {
+            skipped += 1;
+        }
+        if !self.raw_motion_snapshot.try_store(MotionSnapshot {
             joint_position,
             end_pose: *end_pose.latest_raw(),
-        });
+        }) {
+            skipped += 1;
+        }
+        self.record_hot_snapshot_publish_skips(skipped);
     }
 
     /// 发布新的末端位姿完整监控快照，并与当前关节位置组合成逻辑原子快照。
     pub fn publish_end_pose(&self, end_pose: EndPoseState) {
         let joint_position = self.joint_position_monitor.load();
-        self.end_pose_monitor.store(EndPoseMonitorSnapshot::from_complete(end_pose));
-        self.motion_snapshot.store(MotionSnapshot {
+        let mut skipped = 0;
+        if !self.end_pose_monitor.try_store(EndPoseMonitorSnapshot::from_complete(end_pose)) {
+            skipped += 1;
+        }
+        if !self.motion_snapshot.try_store(MotionSnapshot {
             joint_position: joint_position.latest_complete_cloned().unwrap_or_default(),
             end_pose,
-        });
-        self.raw_motion_snapshot.store(MotionSnapshot {
+        }) {
+            skipped += 1;
+        }
+        if !self.raw_motion_snapshot.try_store(MotionSnapshot {
             joint_position: *joint_position.latest_raw(),
             end_pose,
-        });
+        }) {
+            skipped += 1;
+        }
+        self.record_hot_snapshot_publish_skips(skipped);
     }
 
     /// 发布新的控制级关节位置。
     pub fn publish_control_joint_position(&self, joint_position: JointPositionState) {
-        self.control_joint_position.store(joint_position);
+        let stored = self.control_joint_position.try_store(joint_position);
+        self.record_hot_snapshot_publish_skips(u64::from(!stored));
     }
 
     /// 发布新的原始末端位姿，并与当前原始关节位置组合成逻辑原子快照。
     pub fn publish_raw_end_pose(&self, end_pose: EndPoseState) {
         let current = self.end_pose_monitor.load();
         let joint_position = self.joint_position_monitor.load();
-        self.end_pose_monitor.store(EndPoseMonitorSnapshot::with_raw(
+        let mut skipped = 0;
+        if !self.end_pose_monitor.try_store(EndPoseMonitorSnapshot::with_raw(
             current.latest_complete,
             end_pose,
-        ));
-        self.raw_motion_snapshot.store(MotionSnapshot {
+        )) {
+            skipped += 1;
+        }
+        if !self.raw_motion_snapshot.try_store(MotionSnapshot {
             joint_position: *joint_position.latest_raw(),
             end_pose,
-        });
+        }) {
+            skipped += 1;
+        }
+        self.record_hot_snapshot_publish_skips(skipped);
     }
 
     /// 发布新的完整关节动态监控快照。
     pub fn publish_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
-        self.joint_dynamic_monitor
-            .store(JointDynamicMonitorSnapshot::from_complete(joint_dynamic));
+        let stored = self
+            .joint_dynamic_monitor
+            .try_store(JointDynamicMonitorSnapshot::from_complete(joint_dynamic));
+        self.record_hot_snapshot_publish_skips(u64::from(!stored));
     }
 
     /// 发布新的控制级关节动态状态。
     pub fn publish_control_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
-        self.control_joint_dynamic.store(joint_dynamic);
+        let stored = self.control_joint_dynamic.try_store(joint_dynamic);
+        self.record_hot_snapshot_publish_skips(u64::from(!stored));
     }
 
     /// 发布新的原始关节动态状态。
     pub fn publish_raw_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
         let current = self.joint_dynamic_monitor.load();
-        self.joint_dynamic_monitor.store(JointDynamicMonitorSnapshot::with_raw(
+        let stored = self.joint_dynamic_monitor.try_store(JointDynamicMonitorSnapshot::with_raw(
             current.latest_complete,
             joint_dynamic,
         ));
+        self.record_hot_snapshot_publish_skips(u64::from(!stored));
     }
 }
 
@@ -2616,7 +2677,9 @@ mod tests {
             writer_start.wait();
             for seq in 1..=WRITES {
                 writer_max.store(seq, Ordering::Release);
-                writer_cell.store(SequenceSnapshot::new(seq));
+                while !writer_cell.try_store(SequenceSnapshot::new(seq)) {
+                    std::hint::spin_loop();
+                }
             }
             writer_stop.store(true, Ordering::Release);
         });
@@ -2667,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn test_realtime_snapshot_cell_waits_for_free_slot_before_reuse() {
+    fn test_realtime_snapshot_cell_skips_publish_when_all_spare_slots_are_reader_pinned() {
         let cell = Arc::new(RealtimeSnapshotCell::<SequenceSnapshot>::default());
 
         let held_oldest = cell.pin_slot_for_test(cell.published_slot_for_test());
@@ -2688,17 +2751,45 @@ mod tests {
         });
 
         thread::sleep(Duration::from_millis(10));
-        assert!(
-            !finished.load(Ordering::Acquire),
-            "writer should wait until one spare slot is released"
-        );
-        assert_eq!(cell.published_slot_for_test(), blocked_published_slot);
+        let finished_before_release = finished.load(Ordering::Acquire);
+        let published_before_release = cell.published_slot_for_test();
 
         drop(held_middle);
         writer.join().unwrap();
 
-        assert!(finished.load(Ordering::Acquire));
-        assert_eq!(cell.load().seq, 3);
+        assert!(
+            finished_before_release,
+            "writer should skip the publish instead of waiting for a spare slot",
+        );
+        assert_eq!(published_before_release, blocked_published_slot);
+        assert_eq!(cell.load().seq, 2);
+    }
+
+    #[test]
+    fn test_hot_snapshot_publish_skip_updates_metrics_when_context_has_metrics() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
+
+        let held_oldest = ctx
+            .control_joint_position
+            .pin_slot_for_test(ctx.control_joint_position.published_slot_for_test());
+        ctx.publish_control_joint_position(sample_joint_position_state(1, 0b111));
+        let held_middle = ctx
+            .control_joint_position
+            .pin_slot_for_test(ctx.control_joint_position.published_slot_for_test());
+        ctx.publish_control_joint_position(sample_joint_position_state(2, 0b111));
+
+        let published_before = ctx.capture_control_joint_position();
+        ctx.publish_control_joint_position(sample_joint_position_state(3, 0b111));
+
+        assert_eq!(
+            ctx.capture_control_joint_position().hardware_timestamp_us,
+            published_before.hardware_timestamp_us,
+        );
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 1);
+
+        drop(held_middle);
+        drop(held_oldest);
     }
 
     #[test]

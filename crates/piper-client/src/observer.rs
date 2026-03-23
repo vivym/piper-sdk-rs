@@ -801,7 +801,7 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     struct ScriptedRxAdapter {
         bootstrap: Option<PiperFrame>,
@@ -1152,7 +1152,19 @@ mod tests {
             .wait_for_feedback(Duration::from_millis(200))
             .expect("gripper feedback should arrive");
 
-        let gripper = observer.gripper_state();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let gripper = loop {
+            let gripper = observer.gripper_state();
+            if gripper.enabled && gripper.position == 0.5 && gripper.effort == 1.0 {
+                break gripper;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for gripper state to reflect received feedback",
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert_eq!(gripper.position, 0.5);
         assert_eq!(gripper.effort, 1.0);
         assert!(gripper.enabled);
