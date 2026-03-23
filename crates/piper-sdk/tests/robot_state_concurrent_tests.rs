@@ -192,6 +192,8 @@ fn test_robot_control_state_concurrent_read() {
                 trajectory_point_index: ((i + 5) % 256) as u8,
                 fault_angle_limit_mask: if i % 2 == 0 { 0b0000_0001 } else { 0 },
                 fault_comm_error_mask: 0,
+                driver_enabled_mask: if i % 2 == 0 { 0b11_1111 } else { 0 },
+                any_drive_enabled: i % 2 == 0,
                 is_enabled: i % 2 == 0,
                 feedback_counter: (i % 256) as u8,
             };
@@ -419,6 +421,8 @@ fn test_multiple_states_concurrent_read() {
                 trajectory_point_index: ((i + 5) % 256) as u8,
                 fault_angle_limit_mask: 0,
                 fault_comm_error_mask: 0,
+                driver_enabled_mask: if i % 2 == 0 { 0b11_1111 } else { 0 },
+                any_drive_enabled: i % 2 == 0,
                 is_enabled: i % 2 == 0,
                 feedback_counter: (i % 256) as u8,
             };

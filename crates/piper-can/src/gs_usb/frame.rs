@@ -4,7 +4,7 @@
 
 use crate::gs_usb::error::GsUsbError;
 use crate::gs_usb::protocol::*;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 
 /// GS-USB CAN 2.0 帧（不支持 CAN FD）
 ///
@@ -86,16 +86,12 @@ impl GsUsbFrame {
         buf.put_slice(packed);
     }
 
-    /// Unpack from Bytes
+    /// Unpack from a raw GS-USB frame slice
     ///
     /// # Arguments
     /// * `data` - Bytes to unpack from
     /// * `hw_timestamp` - If true, expect hardware timestamp field (frame size = 24 bytes, otherwise 20 bytes)
-    pub fn unpack_from_bytes(
-        &mut self,
-        mut data: Bytes,
-        hw_timestamp: bool,
-    ) -> Result<(), GsUsbError> {
+    pub fn unpack_from_bytes(&mut self, data: &[u8], hw_timestamp: bool) -> Result<(), GsUsbError> {
         let min_size = if hw_timestamp {
             GS_USB_FRAME_SIZE_HW_TIMESTAMP
         } else {
@@ -110,20 +106,18 @@ impl GsUsbFrame {
             )));
         }
 
-        self.echo_id = data.get_u32_le();
-        self.can_id = data.get_u32_le();
-        self.can_dlc = data.get_u8();
-        self.channel = data.get_u8();
-        self.flags = data.get_u8();
-        self.reserved = data.get_u8();
-
-        data.copy_to_slice(&mut self.data);
+        self.echo_id = u32::from_le_bytes(data[0..4].try_into().expect("slice length checked"));
+        self.can_id = u32::from_le_bytes(data[4..8].try_into().expect("slice length checked"));
+        self.can_dlc = data[8];
+        self.channel = data[9];
+        self.flags = data[10];
+        self.reserved = data[11];
+        self.data.copy_from_slice(&data[12..20]);
 
         // Optional hardware timestamp
         if hw_timestamp {
-            // 前面已经检查过 data.len() >= GS_USB_FRAME_SIZE_HW_TIMESTAMP (24)
-            // 所以这里 data.len() 一定 >= 4
-            self.timestamp_us = data.get_u32_le();
+            self.timestamp_us =
+                u32::from_le_bytes(data[20..24].try_into().expect("slice length checked"));
         } else {
             self.timestamp_us = 0;
         }
@@ -253,8 +247,6 @@ mod tests {
 
     #[test]
     fn test_frame_unpack_from_bytes() {
-        use bytes::Bytes;
-
         // 构造测试数据
         let mut data = vec![0u8; GS_USB_FRAME_SIZE];
 
@@ -269,7 +261,7 @@ mod tests {
         data[12..16].copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
 
         let mut frame = GsUsbFrame::default();
-        frame.unpack_from_bytes(Bytes::from(data), false).unwrap();
+        frame.unpack_from_bytes(&data, false).unwrap();
 
         assert_eq!(frame.echo_id, GS_USB_RX_ECHO_ID);
         assert_eq!(frame.can_id, 0x123);
@@ -280,12 +272,10 @@ mod tests {
 
     #[test]
     fn test_frame_unpack_too_short() {
-        use bytes::Bytes;
-
         let mut frame = GsUsbFrame::default();
-        let data = Bytes::from(vec![0u8; 10]); // 太短
+        let data = vec![0u8; 10]; // 太短
 
-        let result = frame.unpack_from_bytes(data, false);
+        let result = frame.unpack_from_bytes(&data, false);
         assert!(result.is_err());
     }
 
@@ -327,7 +317,7 @@ mod tests {
         original.pack_to(&mut buf, false);
 
         let mut unpacked = GsUsbFrame::default();
-        unpacked.unpack_from_bytes(buf.freeze(), false).unwrap();
+        unpacked.unpack_from_bytes(buf.as_ref(), false).unwrap();
 
         assert_eq!(original.echo_id, unpacked.echo_id);
         assert_eq!(original.can_id, unpacked.can_id);
@@ -360,8 +350,6 @@ mod tests {
 
     #[test]
     fn test_frame_unpack_with_hw_timestamp() {
-        use bytes::Bytes;
-
         let mut data = vec![0u8; GS_USB_FRAME_SIZE_HW_TIMESTAMP];
 
         // echo_id = 0xFFFF_FFFF (RX 帧)
@@ -377,7 +365,7 @@ mod tests {
         data[20..24].copy_from_slice(&12345678u32.to_le_bytes());
 
         let mut frame = GsUsbFrame::default();
-        frame.unpack_from_bytes(Bytes::from(data), true).unwrap();
+        frame.unpack_from_bytes(&data, true).unwrap();
 
         assert_eq!(frame.echo_id, GS_USB_RX_ECHO_ID);
         assert_eq!(frame.can_id, 0x123);
@@ -388,13 +376,11 @@ mod tests {
 
     #[test]
     fn test_frame_unpack_hw_timestamp_too_short() {
-        use bytes::Bytes;
-
         let mut frame = GsUsbFrame::default();
         // 只有 20 字节（无时间戳），但要求 24 字节（有时间戳）
-        let data = Bytes::from(vec![0u8; GS_USB_FRAME_SIZE]);
+        let data = vec![0u8; GS_USB_FRAME_SIZE];
 
-        let result = frame.unpack_from_bytes(data, true);
+        let result = frame.unpack_from_bytes(&data, true);
         assert!(result.is_err());
     }
 
@@ -418,7 +404,7 @@ mod tests {
 
         // 解包（带时间戳）
         let mut unpacked = GsUsbFrame::default();
-        unpacked.unpack_from_bytes(buf.freeze(), true).unwrap();
+        unpacked.unpack_from_bytes(buf.as_ref(), true).unwrap();
 
         assert_eq!(original.echo_id, unpacked.echo_id);
         assert_eq!(original.can_id, unpacked.can_id);
@@ -445,8 +431,6 @@ mod tests {
 
     #[test]
     fn test_frame_unpack_without_timestamp_clears_timestamp() {
-        use bytes::Bytes;
-
         let data = vec![0u8; GS_USB_FRAME_SIZE];
         // 只包含 20 字节的标准帧
 
@@ -455,7 +439,7 @@ mod tests {
             ..Default::default()
         };
 
-        frame.unpack_from_bytes(Bytes::from(data), false).unwrap();
+        frame.unpack_from_bytes(&data, false).unwrap();
         assert_eq!(frame.timestamp_us, 0); // 应该被清除
     }
 

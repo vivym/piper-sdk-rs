@@ -3377,6 +3377,25 @@ mod tests {
         sends: usize,
     }
 
+    struct AlwaysTimeoutTxAdapter;
+
+    impl piper_can::RealtimeTxAdapter for AlwaysTimeoutTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, _budget: Duration) -> Result<(), CanError> {
+            Err(CanError::Timeout)
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+    }
+
     impl piper_can::RealtimeTxAdapter for PartialTimeoutTxAdapter {
         fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
             if budget.is_zero() {
@@ -5017,8 +5036,7 @@ mod tests {
     #[test]
     fn test_soft_realtime_deadline_miss_streak_counts_per_command_package() {
         let piper =
-            Piper::new_dual_thread_parts(SoftRxAdapter, PartialTimeoutTxAdapter { sends: 0 }, None)
-                .unwrap();
+            Piper::new_dual_thread_parts(SoftRxAdapter, AlwaysTimeoutTxAdapter, None).unwrap();
         let frames = [
             PiperFrame::new_standard(0x155, &[0x01]),
             PiperFrame::new_standard(0x156, &[0x02]),
@@ -5027,7 +5045,7 @@ mod tests {
         for _ in 0..3 {
             let error = piper
                 .send_soft_realtime_package_confirmed(frames, Duration::from_millis(200))
-                .expect_err("each partial package should time out");
+                .expect_err("0-frame soft realtime misses should time out");
             assert!(matches!(error, DriverError::Timeout));
         }
 
@@ -5036,7 +5054,50 @@ mod tests {
         let metrics = piper.get_metrics();
         assert_eq!(metrics.tx_soft_deadline_miss_total, 3);
         assert_eq!(metrics.tx_soft_consecutive_deadline_miss_total, 2);
-        assert_eq!(metrics.tx_frames_sent_total, 3);
+        assert_eq!(metrics.tx_frames_sent_total, 0);
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+        assert_eq!(
+            piper.maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedFaulted
+        );
+        assert!(matches!(
+            piper.send_soft_realtime_package_confirmed(frames, Duration::from_millis(50)),
+            Err(DriverError::ControlPathClosed)
+        ));
+    }
+
+    #[test]
+    fn test_soft_realtime_partial_timeout_latches_fault_immediately() {
+        let piper =
+            Piper::new_dual_thread_parts(SoftRxAdapter, PartialTimeoutTxAdapter { sends: 0 }, None)
+                .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, &[0x01]),
+            PiperFrame::new_standard(0x156, &[0x02]),
+        ];
+
+        let error = piper
+            .send_soft_realtime_package_confirmed(frames, Duration::from_millis(200))
+            .expect_err("partial soft realtime package must fail closed");
+        assert!(matches!(
+            error,
+            DriverError::RealtimeDeliveryFailed {
+                sent: 1,
+                total: 2,
+                source: CanError::Timeout,
+            }
+        ));
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        let metrics = piper.get_metrics();
+        assert_eq!(metrics.tx_soft_deadline_miss_total, 0);
+        assert_eq!(metrics.tx_soft_consecutive_deadline_miss_total, 0);
+        assert_eq!(metrics.tx_frames_sent_total, 1);
         assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
         assert_eq!(
             piper.normal_send_gate.state(),

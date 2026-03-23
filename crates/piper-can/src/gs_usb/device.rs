@@ -11,6 +11,16 @@ use crate::gs_usb::error::GsUsbError;
 use crate::gs_usb::frame::GsUsbFrame;
 use crate::gs_usb::protocol::*;
 
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub(crate) const GS_USB_READ_BUFFER_SIZE: usize = 4096;
+pub(crate) const GS_USB_BATCH_FRAME_CAPACITY: usize = GS_USB_READ_BUFFER_SIZE / GS_USB_FRAME_SIZE;
+
 /// 轻量的设备枚举信息（不持有 USB 句柄）
 #[derive(Debug, Clone)]
 pub struct GsUsbDeviceInfo {
@@ -62,12 +72,185 @@ pub struct StartResult {
     pub hw_timestamp: bool,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TestUsbHandleHarness {
+    stop_requests: Arc<AtomicUsize>,
+    interface_releases: Arc<AtomicUsize>,
+    read_packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
+}
+
+#[cfg(test)]
+impl TestUsbHandleHarness {
+    pub(crate) fn stop_requests(&self) -> usize {
+        self.stop_requests.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn interface_releases(&self) -> usize {
+        self.interface_releases.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn enqueue_read_packet(&self, packet: Vec<u8>) {
+        self.read_packets.lock().expect("poisoned test queue").push_back(packet);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct TestUsbHandle {
+    harness: TestUsbHandleHarness,
+}
+
+#[cfg(test)]
+impl TestUsbHandle {
+    fn new(harness: TestUsbHandleHarness) -> Self {
+        Self { harness }
+    }
+}
+
+enum UsbHandle {
+    Real(DeviceHandle<GlobalContext>),
+    #[cfg(test)]
+    Test(TestUsbHandle),
+}
+
+#[allow(clippy::too_many_arguments)]
+impl UsbHandle {
+    fn kernel_driver_active(&self, interface_number: u8) -> Result<bool, rusb::Error> {
+        match self {
+            Self::Real(handle) => handle.kernel_driver_active(interface_number),
+            #[cfg(test)]
+            Self::Test(_) => Ok(false),
+        }
+    }
+
+    fn detach_kernel_driver(&self, interface_number: u8) -> Result<(), rusb::Error> {
+        match self {
+            Self::Real(handle) => handle.detach_kernel_driver(interface_number),
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
+        }
+    }
+
+    fn claim_interface(&self, interface_number: u8) -> Result<(), rusb::Error> {
+        match self {
+            Self::Real(handle) => handle.claim_interface(interface_number),
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
+        }
+    }
+
+    fn release_interface(&self, interface_number: u8) -> Result<(), rusb::Error> {
+        match self {
+            Self::Real(handle) => handle.release_interface(interface_number),
+            #[cfg(test)]
+            Self::Test(handle) => {
+                let _ = interface_number;
+                handle.harness.interface_releases.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        }
+    }
+
+    fn reset(&self) -> Result<(), rusb::Error> {
+        match self {
+            Self::Real(handle) => handle.reset(),
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
+        }
+    }
+
+    fn write_bulk(
+        &self,
+        endpoint: u8,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<usize, rusb::Error> {
+        match self {
+            Self::Real(handle) => handle.write_bulk(endpoint, data, timeout),
+            #[cfg(test)]
+            Self::Test(_) => {
+                let _ = (endpoint, timeout);
+                Ok(data.len())
+            },
+        }
+    }
+
+    fn read_bulk(
+        &self,
+        endpoint: u8,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize, rusb::Error> {
+        match self {
+            Self::Real(handle) => handle.read_bulk(endpoint, buf, timeout),
+            #[cfg(test)]
+            Self::Test(handle) => {
+                let _ = (endpoint, timeout);
+                let mut packets = handle.harness.read_packets.lock().expect("poisoned test queue");
+                let Some(packet) = packets.pop_front() else {
+                    return Err(rusb::Error::Timeout);
+                };
+                let len = packet.len().min(buf.len());
+                buf[..len].copy_from_slice(&packet[..len]);
+                Ok(len)
+            },
+        }
+    }
+
+    fn write_control(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<usize, rusb::Error> {
+        match self {
+            Self::Real(handle) => {
+                handle.write_control(request_type, request, value, index, data, timeout)
+            },
+            #[cfg(test)]
+            Self::Test(handle) => {
+                let _ = (request_type, value, index, timeout);
+                let reset_mode = DeviceMode::new(GS_CAN_MODE_RESET, 0).pack();
+                if request == GS_USB_BREQ_MODE && data == reset_mode.as_slice() {
+                    handle.harness.stop_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(data.len())
+            },
+        }
+    }
+
+    fn read_control(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize, rusb::Error> {
+        match self {
+            Self::Real(handle) => {
+                handle.read_control(request_type, request, value, index, buf, timeout)
+            },
+            #[cfg(test)]
+            Self::Test(_) => {
+                let _ = (request_type, request, value, index, buf, timeout);
+                Err(rusb::Error::NotSupported)
+            },
+        }
+    }
+}
+
 /// GS-USB 设备句柄
 ///
-/// 使用 `Arc<DeviceHandle>` 支持多线程共享
-/// 根据 `rusb` 源码，`DeviceHandle` 实现了 `Sync`，可以在不同线程间安全共享
+/// `GsUsbDevice` 本身会在 split 后被 `Arc` 共享；底层 USB handle 通过内部封装统一访问，
+/// 既保留生产路径的真实 `rusb::DeviceHandle`，也允许在单测里注入轻量测试替身。
 pub struct GsUsbDevice {
-    handle: Arc<DeviceHandle<GlobalContext>>,
+    handle: UsbHandle,
     vendor_id: u16,
     product_id: u16,
     bus_number: u8,
@@ -78,6 +261,8 @@ pub struct GsUsbDevice {
     capability: Option<DeviceCapability>,
     /// 记录是否已经 claim 了接口（用于正确的资源清理）
     interface_claimed: bool,
+    /// 设备是否已经进入 START 状态
+    started: bool,
     /// 是否启用硬件时间戳模式
     hw_timestamp: bool,
     /// 设备序列号（用于设备识别）
@@ -91,6 +276,32 @@ pub struct GsUsbDevice {
 impl GsUsbDevice {
     pub fn hw_timestamp_enabled(&self) -> bool {
         self.hw_timestamp
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test_device(
+        started: bool,
+        interface_claimed: bool,
+    ) -> (GsUsbDevice, TestUsbHandleHarness) {
+        let harness = TestUsbHandleHarness::default();
+        let device = GsUsbDevice {
+            handle: UsbHandle::Test(TestUsbHandle::new(harness.clone())),
+            vendor_id: 0x1D50,
+            product_id: 0x606F,
+            bus_number: 1,
+            address: 1,
+            interface_number: 0,
+            endpoint_in: 0x81,
+            endpoint_out: 0x01,
+            capability: None,
+            interface_claimed,
+            started,
+            hw_timestamp: false,
+            serial_number: Some("test-gs-usb".to_string()),
+            write_timeout: Duration::from_millis(1),
+            stall_count_callback: None,
+        };
+        (device, harness)
     }
 
     fn usb_timeout_from_deadline(deadline: Instant, now: Instant) -> Result<Duration, GsUsbError> {
@@ -200,7 +411,7 @@ impl GsUsbDevice {
             };
 
             return Ok(GsUsbDevice {
-                handle: Arc::new(handle), // 使用 Arc 包裹，支持多线程共享
+                handle: UsbHandle::Real(handle),
                 vendor_id,
                 product_id,
                 bus_number,
@@ -210,6 +421,7 @@ impl GsUsbDevice {
                 endpoint_out,
                 capability: None,
                 interface_claimed: false,
+                started: false,
                 hw_timestamp: false,
                 serial_number,
                 write_timeout: Duration::from_millis(1000), // 默认 1000ms（向后兼容）
@@ -477,6 +689,7 @@ impl GsUsbDevice {
             "GS-USB device started with flags: 0x{:08x}, hw_timestamp={}",
             flags, self.hw_timestamp
         );
+        self.started = true;
         Ok(StartResult {
             capability,
             effective_flags: flags,
@@ -486,9 +699,13 @@ impl GsUsbDevice {
 
     /// 停止设备
     pub fn stop(&mut self) -> Result<(), GsUsbError> {
+        if !self.started {
+            return Ok(());
+        }
         let mode = DeviceMode::new(GS_CAN_MODE_RESET, 0);
         // 忽略错误（设备可能已经停止）
         let _ = self.control_out(GS_USB_BREQ_MODE, 0, &mode.pack());
+        self.started = false;
         trace!("GS-USB device stopped");
         Ok(())
     }
@@ -622,59 +839,45 @@ impl GsUsbDevice {
         }
     }
 
-    /// 批量接收：读取一个 USB Bulk 包，并解析其中所有帧
-    ///
-    /// **关键修复**：USB 硬件会将多个 CAN 帧打包在一个 USB Bulk 包中发送（例如 64 或 512 字节）。
-    /// 此方法一次性读取整个 USB 包，并解析出其中所有的 GS-USB 帧。
-    ///
-    /// **返回**：包含所有解析出的帧的 Vec。如果 USB 包为空或只包含部分帧，返回相应数量的帧。
-    pub fn receive_batch(&self, timeout: Duration) -> Result<Vec<GsUsbFrame>, GsUsbError> {
-        // 准备一个足够大的 Buffer（USB Bulk 包通常是 64 或 512 字节）
-        // 假设每个 GS-USB 帧是 20-24 字节，4096 字节可以容纳 200+ 帧（足够安全）
-        let mut buf = vec![0u8; 4096];
+    /// 批量接收：读取一个 USB Bulk 包，并将解析结果写入调用方复用的缓冲区和帧容器。
+    pub fn receive_batch_into(
+        &self,
+        timeout: Duration,
+        buf: &mut [u8],
+        frames: &mut Vec<GsUsbFrame>,
+    ) -> Result<(), GsUsbError> {
+        frames.clear();
 
-        // 读取 USB Bulk IN
-        let len = match self.handle.read_bulk(self.endpoint_in, &mut buf, timeout) {
+        let len = match self.handle.read_bulk(self.endpoint_in, buf, timeout) {
             Ok(len) => len,
             Err(rusb::Error::Timeout) => return Err(GsUsbError::ReadTimeout),
             Err(e) => return Err(GsUsbError::Usb(e)),
         };
 
-        // 如果没有数据，返回空 Vec
         if len == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        // 根据是否启用硬件时间戳确定帧大小
         let frame_size = if self.hw_timestamp {
             GS_USB_FRAME_SIZE_HW_TIMESTAMP
         } else {
             GS_USB_FRAME_SIZE
         };
 
-        // 如果数据长度不是帧大小的整数倍，可能是最后一个不完整的帧
-        // 我们只解析完整的帧
-        let mut frames = Vec::new();
+        let complete_frames = len / frame_size;
+        if frames.capacity() < complete_frames {
+            frames.reserve(complete_frames - frames.capacity());
+        }
+
         let mut offset = 0;
-
-        // GS-USB 协议：帧是连续紧凑排列的，每个帧固定大小（20 或 24 字节）
         while offset + frame_size <= len {
-            // 从缓冲区中提取一个帧的字节
             let frame_bytes = &buf[offset..offset + frame_size];
-
-            // 解析帧
             let mut frame = GsUsbFrame::default();
-            frame.unpack_from_bytes(
-                bytes::Bytes::copy_from_slice(frame_bytes),
-                self.hw_timestamp,
-            )?;
-
+            frame.unpack_from_bytes(frame_bytes, self.hw_timestamp)?;
             frames.push(frame);
             offset += frame_size;
         }
 
-        // 如果还有剩余数据（不完整的帧），记录警告但不报错
-        // 这可能表明设备固件或 USB 传输有问题
         if offset < len {
             use tracing::warn;
             warn!(
@@ -683,7 +886,7 @@ impl GsUsbDevice {
             );
         }
 
-        Ok(frames)
+        Ok(())
     }
 
     /// 执行控制 OUT 传输
@@ -727,9 +930,30 @@ impl GsUsbDevice {
     }
 }
 
+impl Drop for GsUsbDevice {
+    fn drop(&mut self) {
+        let _ = self.stop();
+        self.release_interface();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack_packet(frames: &[GsUsbFrame], hw_timestamp: bool) -> Vec<u8> {
+        let frame_size = if hw_timestamp {
+            GS_USB_FRAME_SIZE_HW_TIMESTAMP
+        } else {
+            GS_USB_FRAME_SIZE
+        };
+        let mut packet = Vec::with_capacity(frames.len() * frame_size);
+        for frame in frames {
+            let mut raw = [0u8; GS_USB_FRAME_SIZE_HW_TIMESTAMP];
+            packet.extend_from_slice(frame.pack_into_array(&mut raw, hw_timestamp));
+        }
+        packet
+    }
 
     #[test]
     fn test_is_gs_usb_device() {
@@ -796,6 +1020,122 @@ mod tests {
                 expected: 20
             }
         ));
+    }
+
+    #[test]
+    fn test_drop_cleanup_runs_once_for_direct_device_owner() {
+        let (device, harness) = GsUsbDevice::new_test_device(true, true);
+
+        drop(device);
+
+        assert_eq!(harness.stop_requests(), 1);
+        assert_eq!(harness.interface_releases(), 1);
+    }
+
+    #[test]
+    fn test_drop_cleanup_skips_stop_and_release_when_already_inactive() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+
+        drop(device);
+
+        assert_eq!(harness.stop_requests(), 0);
+        assert_eq!(harness.interface_releases(), 0);
+    }
+
+    #[test]
+    fn test_receive_batch_into_parses_standard_frames_without_heap_backing_per_frame() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        let frames_in = [
+            GsUsbFrame {
+                echo_id: GS_USB_RX_ECHO_ID,
+                can_id: 0x251,
+                can_dlc: 8,
+                channel: 0,
+                flags: 0,
+                reserved: 0,
+                data: [1, 2, 3, 4, 5, 6, 7, 8],
+                timestamp_us: 0,
+            },
+            GsUsbFrame {
+                echo_id: GS_USB_RX_ECHO_ID,
+                can_id: 0x252,
+                can_dlc: 4,
+                channel: 0,
+                flags: 0,
+                reserved: 0,
+                data: [9, 10, 11, 12, 0, 0, 0, 0],
+                timestamp_us: 0,
+            },
+        ];
+        harness.enqueue_read_packet(pack_packet(&frames_in, false));
+
+        let mut buf = [0u8; GS_USB_READ_BUFFER_SIZE];
+        let mut frames_out = Vec::with_capacity(1);
+        device
+            .receive_batch_into(Duration::from_millis(1), &mut buf, &mut frames_out)
+            .unwrap();
+
+        assert_eq!(frames_out.len(), 2);
+        assert_eq!(frames_out[0].can_id, 0x251);
+        assert_eq!(frames_out[0].data, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(frames_out[1].can_id, 0x252);
+        assert_eq!(frames_out[1].can_dlc, 4);
+        assert_eq!(frames_out[1].data[..4], [9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn test_receive_batch_into_parses_hw_timestamp_frames() {
+        let (mut device, harness) = GsUsbDevice::new_test_device(false, false);
+        device.hw_timestamp = true;
+        let frames_in = [GsUsbFrame {
+            echo_id: GS_USB_RX_ECHO_ID,
+            can_id: 0x2A1,
+            can_dlc: 8,
+            channel: 0,
+            flags: 0,
+            reserved: 0,
+            data: [0xAA, 0xBB, 0xCC, 0xDD, 1, 2, 3, 4],
+            timestamp_us: 0x1122_3344,
+        }];
+        harness.enqueue_read_packet(pack_packet(&frames_in, true));
+
+        let mut buf = [0u8; GS_USB_READ_BUFFER_SIZE];
+        let mut frames_out = Vec::new();
+        device
+            .receive_batch_into(Duration::from_millis(1), &mut buf, &mut frames_out)
+            .unwrap();
+
+        assert_eq!(frames_out.len(), 1);
+        assert_eq!(frames_out[0].can_id, 0x2A1);
+        assert_eq!(frames_out[0].timestamp_us, 0x1122_3344);
+    }
+
+    #[test]
+    fn test_receive_batch_into_ignores_trailing_incomplete_frame_bytes() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        let frame = GsUsbFrame {
+            echo_id: GS_USB_RX_ECHO_ID,
+            can_id: 0x2A5,
+            can_dlc: 8,
+            channel: 0,
+            flags: 0,
+            reserved: 0,
+            data: [8, 7, 6, 5, 4, 3, 2, 1],
+            timestamp_us: 0,
+        };
+        let mut packet = pack_packet(&[frame], false);
+        packet.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        harness.enqueue_read_packet(packet);
+
+        let mut buf = [0u8; GS_USB_READ_BUFFER_SIZE];
+        let mut frames_out = Vec::new();
+        device
+            .receive_batch_into(Duration::from_millis(1), &mut buf, &mut frames_out)
+            .unwrap();
+
+        assert_eq!(frames_out.len(), 1);
+        assert_eq!(frames_out[0].can_id, 0x2A5);
+        assert_eq!(frames_out[0].data, [8, 7, 6, 5, 4, 3, 2, 1]);
     }
 
     // 注意：scan() 和实际 USB 操作的测试需要硬件，放在集成测试中

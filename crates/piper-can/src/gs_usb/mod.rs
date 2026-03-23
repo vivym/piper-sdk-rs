@@ -8,7 +8,9 @@ pub mod frame;
 pub mod protocol;
 pub mod split;
 
-use crate::gs_usb::device::{GsUsbDevice, GsUsbDeviceSelector};
+use crate::gs_usb::device::{
+    GS_USB_BATCH_FRAME_CAPACITY, GS_USB_READ_BUFFER_SIZE, GsUsbDevice, GsUsbDeviceSelector,
+};
 use crate::gs_usb::frame::GsUsbFrame;
 use crate::gs_usb::protocol::*;
 use crate::gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
@@ -17,7 +19,6 @@ use crate::{
     SplittableAdapter,
 };
 use std::collections::VecDeque;
-use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, trace, warn};
@@ -36,6 +37,10 @@ pub struct GsUsbCanAdapter {
     /// USB 硬件会将多个 CAN 帧打包在一个 USB Bulk 包中发送
     /// 我们需要缓存这些帧，以便逐帧返回给上层应用
     rx_queue: VecDeque<PiperFrame>,
+    /// 复用 USB 读缓冲，避免热路径每包分配
+    rx_usb_buf: [u8; GS_USB_READ_BUFFER_SIZE],
+    /// 复用 GS-USB 帧容器，避免 steady-state 堆分配
+    rx_batch_frames: Vec<GsUsbFrame>,
     /// 实时模式标志
     /// - `true`：写超时设为 5ms（快速失败）
     /// - `false`：写超时保持 1000ms（默认，更可靠）
@@ -142,7 +147,9 @@ impl GsUsbCanAdapter {
             // 对于非实时场景，用户可通过 set_receive_timeout() 显式设置更大的值
             rx_timeout: Duration::from_millis(2),
             rx_queue: VecDeque::with_capacity(64), // 初始化队列，预分配容量
-            realtime_mode: false,                  // 默认非实时模式
+            rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
+            rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
+            realtime_mode: false, // 默认非实时模式
             consecutive_write_timeouts: 0,
         })
     }
@@ -220,25 +227,12 @@ impl GsUsbCanAdapter {
             return Err(CanError::NotStarted);
         }
 
-        // ⚠️ CRITICAL: GsUsbCanAdapter implements Drop (for USB cleanup).
-        // We MUST use ManuallyDrop to prevent Drop from running when we
-        // extract fields. We cannot use simple field extraction because
-        // Rust prevents moving out of Drop types.
-        let adapter = ManuallyDrop::new(self);
-
-        // SAFETY:
-        // 1. `adapter.device` is a `GsUsbDevice` struct with no self-references
-        // 2. `GsUsbDevice` has no Drop impl that relies on field values
-        // 3. `adapter` is wrapped in ManuallyDrop, so it will never be dropped
-        // 4. We are moving `device` out, which is equivalent to a move operation
-        // 5. This is the standard pattern for extracting fields from Drop types
-        let device = unsafe { std::ptr::read(&adapter.device) };
-
-        // rx_timeout and mode are Copy types, safe to read
-        let rx_timeout = adapter.rx_timeout;
-        let mode = adapter.mode;
-
-        // 将 device 包裹为 Arc，支持多线程共享
+        let GsUsbCanAdapter {
+            device,
+            rx_timeout,
+            mode,
+            ..
+        } = self;
         let device_arc = Arc::new(device);
 
         Ok((
@@ -270,8 +264,12 @@ impl GsUsbCanAdapter {
             return Ok(out);
         }
 
-        let gs_frames = match self.device.receive_batch(self.rx_timeout) {
-            Ok(frames) => frames,
+        match self.device.receive_batch_into(
+            self.rx_timeout,
+            &mut self.rx_usb_buf,
+            &mut self.rx_batch_frames,
+        ) {
+            Ok(()) => {},
             Err(crate::gs_usb::error::GsUsbError::ReadTimeout) => {
                 return Err(CanError::Timeout);
             },
@@ -299,16 +297,17 @@ impl GsUsbCanAdapter {
                     format!("USB receive failed: {}", e),
                 )));
             },
-        };
+        }
 
-        if gs_frames.is_empty() {
+        if self.rx_batch_frames.is_empty() {
             return Ok(Vec::new());
         }
 
         let is_loopback = (self.mode & GS_CAN_MODE_LOOP_BACK) != 0;
-        let mut out = Vec::with_capacity(gs_frames.len());
+        let mut out = Vec::with_capacity(self.rx_batch_frames.len());
 
-        for gs_frame in gs_frames {
+        for idx in 0..self.rx_batch_frames.len() {
+            let gs_frame = self.rx_batch_frames[idx];
             if !is_loopback && gs_frame.is_tx_echo() {
                 continue;
             }
@@ -333,6 +332,7 @@ impl GsUsbCanAdapter {
                 timestamp_us: gs_frame.timestamp_us as u64,
             });
         }
+        self.rx_batch_frames.clear();
 
         // Note: We don't return a special error for overflow_detected because:
         // 1. The overflow was for PAST frames (before this batch)
@@ -492,33 +492,6 @@ impl SplittableAdapter for GsUsbCanAdapter {
     }
 }
 
-impl Drop for GsUsbCanAdapter {
-    /// 自动清理：当适配器离开作用域时，自动停止设备并释放资源
-    ///
-    /// 这是 Rust 管理硬件资源的黄金法则：
-    /// - 无论测试成功还是失败（panic），设备都会被正确复位
-    /// - 释放 USB 接口，交还给操作系统
-    /// - 防止设备状态残留，导致下次测试失败
-    /// - 类似 C++ 的 RAII (Resource Acquisition Is Initialization) 模式
-    fn drop(&mut self) {
-        // 当 Adapter 离开作用域时（测试结束、函数返回、或 Panic 时）自动调用
-
-        // 1. 停止设备固件逻辑（发送 RESET 命令）
-        if self.started {
-            // 忽略错误：析构路径中设备可能已断开
-            let _ = self.device.stop();
-            trace!("[Auto-Drop] Device stop/reset command sent");
-        }
-
-        // 2. 释放 USB 接口（交还给操作系统）
-        // **关键**：这解决了"状态残留"问题，特别是 macOS 的独占访问控制。
-        // 如果不释放接口，操作系统可能认为接口仍被占用，导致下次启动时
-        // 无法 claim 接口（Access denied）或保持错误的 Data Toggle 状态。
-        self.device.release_interface();
-        trace!("[Auto-Drop] USB Interface released");
-    }
-}
-
 impl CanAdapter for GsUsbCanAdapter {
     /// 发送帧（Fire-and-Forget）
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
@@ -623,9 +596,12 @@ impl CanAdapter for GsUsbCanAdapter {
         // USB 硬件可能将一个或多个 CAN 帧打包在一个 USB Bulk 包中
         // 我们需要一次性解析所有帧，并将它们放入队列
         loop {
-            // 从 USB 读取一批帧
-            let gs_frames = match self.device.receive_batch(self.rx_timeout) {
-                Ok(frames) => frames,
+            match self.device.receive_batch_into(
+                self.rx_timeout,
+                &mut self.rx_usb_buf,
+                &mut self.rx_batch_frames,
+            ) {
+                Ok(()) => {},
                 Err(crate::gs_usb::error::GsUsbError::ReadTimeout) => {
                     return Err(CanError::Timeout);
                 },
@@ -653,12 +629,12 @@ impl CanAdapter for GsUsbCanAdapter {
                         format!("USB receive failed: {}", e),
                     )));
                 },
-            };
+            }
 
             // 如果读取成功但没有帧（可能是空包），继续读下一个包
             // 注意：空包是正常情况，USB 硬件可能发送空的批量传输包
             // 超时时间短（2ms），影响不大，继续读取即可
-            if gs_frames.is_empty() {
+            if self.rx_batch_frames.is_empty() {
                 continue;
             }
 
@@ -666,8 +642,8 @@ impl CanAdapter for GsUsbCanAdapter {
             let is_loopback = (self.mode & GS_CAN_MODE_LOOP_BACK) != 0;
 
             // 优化：如果只有一个帧，且是有效帧，直接返回（避免队列操作）
-            if gs_frames.len() == 1 {
-                let gs_frame = &gs_frames[0];
+            if self.rx_batch_frames.len() == 1 {
+                let gs_frame = self.rx_batch_frames[0];
 
                 // 检查是否为有效帧
                 let is_valid = if !is_loopback && gs_frame.is_tx_echo() {
@@ -676,12 +652,14 @@ impl CanAdapter for GsUsbCanAdapter {
                 } else if gs_frame.has_overflow() {
                     // 缓冲区溢出，立即返回错误
                     error!("CAN Buffer Overflow!");
+                    self.rx_batch_frames.clear();
                     return Err(CanError::BufferOverflow);
                 } else {
                     // 有效帧
                     true
                 };
 
+                self.rx_batch_frames.clear();
                 if is_valid {
                     // 直接返回，不需要队列操作
                     let frame = PiperFrame {
@@ -699,7 +677,8 @@ impl CanAdapter for GsUsbCanAdapter {
             }
 
             // 多个帧：批量处理并放入队列
-            for gs_frame in gs_frames {
+            for idx in 0..self.rx_batch_frames.len() {
+                let gs_frame = self.rx_batch_frames[idx];
                 // 3.1 过滤 TX Echo（静默丢弃）
                 // 注意：在 Loopback 模式下，Echo 是测试的一部分，不应该被过滤
                 if !is_loopback && gs_frame.is_tx_echo() {
@@ -728,6 +707,7 @@ impl CanAdapter for GsUsbCanAdapter {
 
                 self.push_to_rx_queue(frame);
             }
+            self.rx_batch_frames.clear();
 
             // 4. 如果队列里有东西了，返回第一个；否则继续循环读 USB
             // 注意：如果这批数据都被过滤掉了（例如全是 Echo 且非 Loopback），循环继续
@@ -788,5 +768,58 @@ impl CanAdapter for GsUsbCanAdapter {
         self.device.set_write_timeout(old_timeout);
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn test_unsplit_adapter_drop_cleans_up_once() {
+        let (device, harness) = GsUsbDevice::new_test_device(true, true);
+        let adapter = GsUsbCanAdapter {
+            device,
+            started: true,
+            mode: 0,
+            rx_timeout: Duration::from_millis(2),
+            rx_queue: VecDeque::with_capacity(64),
+            rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
+            rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
+            realtime_mode: false,
+            consecutive_write_timeouts: 0,
+        };
+
+        drop(adapter);
+
+        assert_eq!(harness.stop_requests(), 1);
+        assert_eq!(harness.interface_releases(), 1);
+    }
+
+    #[test]
+    fn test_split_adapters_cleanup_runs_once_after_last_owner_drops() {
+        let (device, harness) = GsUsbDevice::new_test_device(true, true);
+        let adapter = GsUsbCanAdapter {
+            device,
+            started: true,
+            mode: 0,
+            rx_timeout: Duration::from_millis(2),
+            rx_queue: VecDeque::with_capacity(64),
+            rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
+            rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
+            realtime_mode: false,
+            consecutive_write_timeouts: 0,
+        };
+
+        let (rx, tx) = adapter.split().expect("test device should split");
+
+        drop(rx);
+        assert_eq!(harness.stop_requests(), 0);
+        assert_eq!(harness.interface_releases(), 0);
+
+        drop(tx);
+        assert_eq!(harness.stop_requests(), 1);
+        assert_eq!(harness.interface_releases(), 1);
     }
 }

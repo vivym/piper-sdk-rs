@@ -3,7 +3,7 @@
 //! 提供独立的 RX 和 TX 适配器，支持双线程并发访问。
 //! 基于 `Arc<GsUsbDevice>` 实现，利用 `rusb::DeviceHandle` 的 `Sync` 特性。
 
-use crate::gs_usb::device::GsUsbDevice;
+use crate::gs_usb::device::{GS_USB_BATCH_FRAME_CAPACITY, GS_USB_READ_BUFFER_SIZE, GsUsbDevice};
 use crate::gs_usb::frame::GsUsbFrame;
 use crate::gs_usb::protocol::{
     CAN_EFF_FLAG, CAN_EFF_MASK, CAN_ERR_CRTL_RX_BUS_OFF, CAN_ERR_CRTL_RX_PASSIVE,
@@ -38,6 +38,10 @@ pub struct GsUsbRxAdapter {
     /// USB Bulk 包通常包含 1-8 个 CAN 帧（512 字节包 / 20 字节每帧），
     /// 因此预分配 64 个槽位足够应对突发流量，且避免频繁分配/释放。
     rx_queue: VecDeque<PiperFrame>,
+    /// 复用 USB 读缓冲，避免热路径每包分配
+    rx_usb_buf: [u8; GS_USB_READ_BUFFER_SIZE],
+    /// 复用 GS-USB 帧容器，避免 steady-state 堆分配
+    rx_batch_frames: Vec<GsUsbFrame>,
     /// Bus Off 状态更新回调（可选）
     bus_off_callback: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     /// Error Passive 状态更新回调（可选）
@@ -66,6 +70,8 @@ impl GsUsbRxAdapter {
             // 关键：预分配容量，避免运行时扩容
             // 64 是经验值：足够应对突发，但不会浪费过多内存
             rx_queue: VecDeque::with_capacity(64),
+            rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
+            rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
             bus_off_callback: None,
             error_passive_callback: None,
         }
@@ -187,8 +193,12 @@ impl GsUsbRxAdapter {
 
         // 2. 从 USB Endpoint IN 批量读取
         loop {
-            let gs_frames = match self.device.receive_batch(self.rx_timeout) {
-                Ok(frames) => frames,
+            match self.device.receive_batch_into(
+                self.rx_timeout,
+                &mut self.rx_usb_buf,
+                &mut self.rx_batch_frames,
+            ) {
+                Ok(()) => {},
                 Err(crate::gs_usb::error::GsUsbError::ReadTimeout) => {
                     return Err(CanError::Timeout);
                 },
@@ -216,17 +226,18 @@ impl GsUsbRxAdapter {
                         format!("USB receive failed: {}", e),
                     )));
                 },
-            };
+            }
 
             // 如果读取成功但没有帧（可能是空包），继续读下一个包
-            if gs_frames.is_empty() {
+            if self.rx_batch_frames.is_empty() {
                 continue;
             }
 
             // 3. 过滤 Echo 帧（关键：双线程模式下会收到 TX 回显）
             let is_loopback = (self.mode & GS_CAN_MODE_LOOP_BACK) != 0;
 
-            for gs_frame in gs_frames {
+            for idx in 0..self.rx_batch_frames.len() {
+                let gs_frame = self.rx_batch_frames[idx];
                 if gs_frame.flags != 0 {
                     trace!(
                         "Non-zero flags detected: 0x{:02x}, CAN ID: 0x{:08x}, Channel: {}, Echo ID: 0x{:08x}, DLC: {}",
@@ -261,6 +272,7 @@ impl GsUsbRxAdapter {
                 let piper_frame = self.convert_to_piper_frame(&gs_frame)?;
                 self.push_to_rx_queue(piper_frame);
             }
+            self.rx_batch_frames.clear();
 
             // 4. 返回第一帧（如果有）
             if let Some(frame) = self.rx_queue.pop_front() {

@@ -323,6 +323,8 @@ fn test_bitmask_access_performance() {
         trajectory_point_index: 0,
         fault_angle_limit_mask: 0b0011_0001, // J1, J5, J6
         fault_comm_error_mask: 0b0000_0010,  // J2
+        driver_enabled_mask: 0b11_1111,
+        any_drive_enabled: true,
         is_enabled: true,
         feedback_counter: 0,
     };

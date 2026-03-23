@@ -17,7 +17,7 @@ use crate::{
 };
 use piper_driver::BackendCapability;
 use piper_protocol::control::{InstallPosition, MitControlCommand, MitMode as ProtocolMitMode};
-use piper_protocol::feedback::{ControlMode, MoveMode};
+use piper_protocol::feedback::{ControlMode, MoveMode, RobotStatus};
 use tracing::{debug, info, trace};
 
 const COLLISION_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -943,6 +943,7 @@ where
                 > baseline.robot_control.hardware_timestamp_us
                 || current.host_rx_mono_us > baseline.robot_control.host_rx_mono_us;
             let is_robot_state_match = current.is_enabled
+                && current.robot_status == RobotStatus::Normal as u8
                 && current.control_mode == expected.control_mode
                 && current.move_mode == expected.move_mode;
             let is_mode_echo_fresh = mode_echo.is_valid
@@ -2108,6 +2109,9 @@ where
 
 impl Piper<Active<MitPassthroughMode>, SoftRealtime> {
     /// 发送原始 MIT 批命令，并等待 SoftRealtime TX 线程确认发送结果。
+    ///
+    /// 如果批命令只部分落到硬件，driver 会立即锁存传输故障并返回
+    /// `DriverError::RealtimeDeliveryFailed`；上层不应将这类错误视为普通超时重试。
     pub fn command_mit_raw_confirmed(
         &self,
         commands: [MitControlCommand; 6],
@@ -3298,8 +3302,9 @@ mod tests {
         frame
     }
 
-    fn robot_status_frame(
+    fn robot_status_frame_with_status(
         control_mode: ControlMode,
+        robot_status: RobotStatus,
         move_mode: MoveMode,
         timestamp_us: u64,
     ) -> PiperFrame {
@@ -3307,7 +3312,7 @@ mod tests {
             piper_protocol::ids::ID_ROBOT_STATUS as u16,
             &[
                 control_mode as u8,
-                piper_protocol::feedback::RobotStatus::Normal as u8,
+                robot_status as u8,
                 move_mode as u8,
                 piper_protocol::feedback::TeachStatus::Closed as u8,
                 piper_protocol::feedback::MotionStatus::Arrived as u8,
@@ -3318,6 +3323,14 @@ mod tests {
         );
         frame.timestamp_us = timestamp_us;
         frame
+    }
+
+    fn robot_status_frame(
+        control_mode: ControlMode,
+        move_mode: MoveMode,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        robot_status_frame_with_status(control_mode, RobotStatus::Normal, move_mode, timestamp_us)
     }
 
     fn control_mode_echo_frame(
@@ -3506,6 +3519,45 @@ mod tests {
             .expect("fresh matching 0x2A1 + 0x151 should allow Active<MitMode>");
 
         assert!(active.observer().is_all_enabled());
+    }
+
+    #[test]
+    fn enable_mit_mode_rejects_non_normal_robot_status_even_if_drives_are_enabled() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames();
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame_with_status(
+                ControlMode::CanControl,
+                RobotStatus::EmergencyStop,
+                MoveMode::MoveM,
+                100,
+            ),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(5),
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveM,
+                80,
+                piper_protocol::control::MitMode::Mit,
+                InstallPosition::Invalid,
+                101,
+            ),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames);
+        let error = match standby.enable_mit_mode(MitModeConfig {
+            timeout: Duration::from_millis(80),
+            debounce_threshold: 1,
+            poll_interval: Duration::from_millis(1),
+            speed_percent: 80,
+        }) {
+            Ok(_) => panic!("non-Normal 0x2A1 must prevent Active<MitMode>"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
     }
 
     #[test]

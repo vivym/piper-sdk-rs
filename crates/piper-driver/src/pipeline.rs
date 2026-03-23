@@ -30,6 +30,7 @@ use spin_sleep;
 
 const STRICT_GROUP_MAX_SPAN_US: u64 = 2_000;
 const MOTION_GROUP_RESET_MAX_SPAN_US: u64 = 2_200;
+const ALL_DRIVES_ENABLED_MASK: u8 = 0b11_1111;
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -288,7 +289,7 @@ fn derive_maintenance_gate_state(
     if !ctx.connection_monitor.check_connection() {
         return MaintenanceGateState::DeniedTransportDown;
     }
-    if ctx.robot_control.load().is_enabled {
+    if ctx.robot_control.load().any_drive_enabled {
         return MaintenanceGateState::DeniedActiveControl;
     }
     MaintenanceGateState::AllowedStandby
@@ -1598,8 +1599,23 @@ pub fn tx_loop_mailbox(
                 }
 
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    deadline_missed = true;
-                    send_result = Err(crate::DriverError::Timeout);
+                    if sent_count == 0 {
+                        deadline_missed = true;
+                        send_result = Err(crate::DriverError::Timeout);
+                    } else {
+                        latch_transport_fault_with_maintenance(
+                            &runtime_phase,
+                            &normal_send_gate,
+                            &last_fault,
+                            &maintenance_gate,
+                            Some(&mut maintenance_tx_state),
+                        );
+                        send_result = Err(crate::DriverError::RealtimeDeliveryFailed {
+                            sent: sent_count,
+                            total: total_frames,
+                            source: CanError::Timeout,
+                        });
+                    }
                     break;
                 };
 
@@ -1613,8 +1629,23 @@ pub fn tx_loop_mailbox(
                     },
                     Err(CanError::Timeout) => {
                         metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
-                        deadline_missed = true;
-                        send_result = Err(crate::DriverError::Timeout);
+                        if sent_count == 0 {
+                            deadline_missed = true;
+                            send_result = Err(crate::DriverError::Timeout);
+                        } else {
+                            latch_transport_fault_with_maintenance(
+                                &runtime_phase,
+                                &normal_send_gate,
+                                &last_fault,
+                                &maintenance_gate,
+                                Some(&mut maintenance_tx_state),
+                            );
+                            send_result = Err(crate::DriverError::RealtimeDeliveryFailed {
+                                sent: sent_count,
+                                total: total_frames,
+                                source: CanError::Timeout,
+                            });
+                        }
                         break;
                     },
                     Err(e) => {
@@ -1630,7 +1661,11 @@ pub fn tx_loop_mailbox(
                             &maintenance_gate,
                             Some(&mut maintenance_tx_state),
                         );
-                        send_result = Err(crate::DriverError::ReliableDeliveryFailed { source: e });
+                        send_result = Err(crate::DriverError::RealtimeDeliveryFailed {
+                            sent: sent_count,
+                            total: total_frames,
+                            source: e,
+                        });
                         should_break = true;
                         break;
                     },
@@ -1655,9 +1690,6 @@ pub fn tx_loop_mailbox(
                 break;
             }
 
-            if sent_count == total_frames {
-                continue;
-            }
             continue;
         }
 
@@ -2328,6 +2360,8 @@ fn parse_and_update_state(
                     | (feedback.fault_code_comm_error.joint5_comm_error() as u8) << 4
                     | (feedback.fault_code_comm_error.joint6_comm_error() as u8) << 5;
 
+                let driver_enabled_mask = ctx.joint_driver_low_speed.load().driver_enabled_mask;
+                let any_drive_enabled = driver_enabled_mask != 0;
                 let new_robot_control_state = RobotControlState {
                     hardware_timestamp_us: frame.timestamp_us,
                     host_rx_mono_us,
@@ -2339,14 +2373,16 @@ fn parse_and_update_state(
                     trajectory_point_index: feedback.trajectory_point_index,
                     fault_angle_limit_mask,
                     fault_comm_error_mask,
-                    is_enabled: matches!(feedback.robot_status, RobotStatus::Normal),
+                    driver_enabled_mask,
+                    any_drive_enabled,
+                    is_enabled: driver_enabled_mask == ALL_DRIVES_ENABLED_MASK,
                     feedback_counter: 0,
                 };
 
                 let previous = ctx.robot_control.load();
-                let previous_enabled = previous.is_enabled;
+                let previous_any_drive_enabled = previous.any_drive_enabled;
                 ctx.robot_control.store(Arc::new(new_robot_control_state.clone()));
-                if previous_enabled != new_robot_control_state.is_enabled
+                if previous_any_drive_enabled != new_robot_control_state.any_drive_enabled
                     && let Some(gate) = maintenance_gate
                 {
                     refresh_maintenance_gate_state(gate, runtime_phase, ctx, last_fault);
@@ -2450,6 +2486,27 @@ fn parse_and_update_state(
                         }
                         Arc::new(new)
                     });
+
+                    let driver_enabled_mask = ctx.joint_driver_low_speed.load().driver_enabled_mask;
+                    let any_drive_enabled = driver_enabled_mask != 0;
+                    let is_enabled = driver_enabled_mask == ALL_DRIVES_ENABLED_MASK;
+                    let previous = ctx.robot_control.load();
+                    let previous_any_drive_enabled = previous.any_drive_enabled;
+                    if previous.driver_enabled_mask != driver_enabled_mask
+                        || previous.any_drive_enabled != any_drive_enabled
+                        || previous.is_enabled != is_enabled
+                    {
+                        let mut next = previous.as_ref().clone();
+                        next.driver_enabled_mask = driver_enabled_mask;
+                        next.any_drive_enabled = any_drive_enabled;
+                        next.is_enabled = is_enabled;
+                        ctx.robot_control.store(Arc::new(next));
+                    }
+                    if previous_any_drive_enabled != any_drive_enabled
+                        && let Some(gate) = maintenance_gate
+                    {
+                        refresh_maintenance_gate_state(gate, runtime_phase, ctx, last_fault);
+                    }
 
                     ctx.fps_stats
                         .load()
@@ -2785,6 +2842,23 @@ mod tests {
         frame
     }
 
+    fn joint_driver_low_speed_frame(
+        joint_index: u8,
+        enabled: bool,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let id = ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index.saturating_sub(1));
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&240u16.to_be_bytes());
+        data[2..4].copy_from_slice(&45i16.to_be_bytes());
+        data[4] = 50;
+        data[5] = if enabled { 0x40 } else { 0x00 };
+        data[6..8].copy_from_slice(&5000u16.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(id as u16, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
     fn parse_frame_for_test(
         ctx: &Arc<PiperContext>,
         state: &mut ParserState,
@@ -2804,6 +2878,30 @@ mod tests {
             None,
             &runtime_phase,
             &last_fault,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parse_frame_for_test_with_maintenance(
+        ctx: &Arc<PiperContext>,
+        state: &mut ParserState,
+        metrics: &Arc<PiperMetrics>,
+        config: &PipelineConfig,
+        frame: PiperFrame,
+        maintenance_gate: &Arc<MaintenanceGate>,
+        runtime_phase: &Arc<AtomicU8>,
+        last_fault: &Arc<AtomicU8>,
+    ) {
+        parse_and_update_state(
+            &frame,
+            BackendCapability::StrictRealtime,
+            ctx,
+            config,
+            state,
+            metrics,
+            Some(maintenance_gate),
+            runtime_phase,
+            last_fault,
         );
     }
 
@@ -3033,6 +3131,59 @@ mod tests {
         assert_eq!(complete.frame_valid_mask, 0b111);
         assert!((complete.joint_pos[0] - 10.0_f64.to_radians()).abs() < 1e-9);
         assert!((complete.joint_pos[5] - 60.0_f64.to_radians()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_maintenance_gate_denies_when_any_drive_is_enabled() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+
+        ctx.connection_monitor.register_feedback();
+
+        parse_frame_for_test_with_maintenance(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_driver_low_speed_frame(1, true, 1_000),
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+        );
+
+        let robot_control = ctx.robot_control.load();
+        assert_eq!(robot_control.driver_enabled_mask, 0b000001);
+        assert!(robot_control.any_drive_enabled);
+        assert!(!robot_control.is_enabled);
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::DeniedActiveControl
+        );
+
+        parse_frame_for_test_with_maintenance(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            joint_driver_low_speed_frame(1, false, 1_100),
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+        );
+
+        let robot_control = ctx.robot_control.load();
+        assert_eq!(robot_control.driver_enabled_mask, 0);
+        assert!(!robot_control.any_drive_enabled);
+        assert!(!robot_control.is_enabled);
+        assert_eq!(
+            maintenance_gate.current_state(),
+            MaintenanceGateState::AllowedStandby
+        );
     }
 
     #[test]

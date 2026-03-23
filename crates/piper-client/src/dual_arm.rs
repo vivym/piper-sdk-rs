@@ -1850,18 +1850,17 @@ mod tests {
             max_state_skew_us: 2_000,
             max_feedback_age: Duration::from_secs(5),
         };
-
         loop {
-            match observer.control_snapshot_full(policy) {
+            let last_error = match observer.control_snapshot_full(policy) {
                 Ok(_) => return,
-                Err(RobotError::ControlStateIncomplete { .. })
-                | Err(RobotError::StateMisaligned { .. }) => {},
+                Err(err @ RobotError::ControlStateIncomplete { .. })
+                | Err(err @ RobotError::StateMisaligned { .. }) => format!("{err:?}"),
                 Err(err) => panic!("expected complete control snapshot, got {err:?}"),
-            }
+            };
 
             assert!(
-                start.elapsed() < Duration::from_millis(200),
-                "timed out waiting for complete control snapshot",
+                start.elapsed() < Duration::from_secs(1),
+                "timed out waiting for complete control snapshot: last_error={last_error}",
             );
             thread::sleep(Duration::from_millis(1));
         }

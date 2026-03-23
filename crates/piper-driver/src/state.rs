@@ -351,7 +351,13 @@ pub struct RobotControlState {
     /// 故障码：通信异常（位掩码，Bit 0-5 对应 J1-J6）
     pub fault_comm_error_mask: u8,
 
-    /// 使能状态（从 robot_status 推导）
+    /// 驱动器使能位掩码（Bit 0-5 对应 J1-J6）
+    pub driver_enabled_mask: u8,
+
+    /// 是否至少有一个驱动器保持使能
+    pub any_drive_enabled: bool,
+
+    /// 使能状态（6 轴驱动器全部使能）
     pub is_enabled: bool,
 
     /// 反馈指令计数器（如果协议支持，用于检测链路卡死）
@@ -2175,6 +2181,8 @@ mod tests {
         assert_eq!(state.robot_status, 0);
         assert_eq!(state.fault_angle_limit_mask, 0);
         assert_eq!(state.fault_comm_error_mask, 0);
+        assert_eq!(state.driver_enabled_mask, 0);
+        assert!(!state.any_drive_enabled);
         assert_eq!(state.feedback_counter, 0);
         assert!(!state.is_enabled);
     }
@@ -2247,6 +2255,8 @@ mod tests {
             trajectory_point_index: 10,
             fault_angle_limit_mask: 0b0011_0001,
             fault_comm_error_mask: 0b0000_0100,
+            driver_enabled_mask: 0b11_1111,
+            any_drive_enabled: true,
             is_enabled: true,
             feedback_counter: 5,
         };
@@ -2255,6 +2265,8 @@ mod tests {
         assert_eq!(state.control_mode, cloned.control_mode);
         assert_eq!(state.fault_angle_limit_mask, cloned.fault_angle_limit_mask);
         assert_eq!(state.fault_comm_error_mask, cloned.fault_comm_error_mask);
+        assert_eq!(state.driver_enabled_mask, cloned.driver_enabled_mask);
+        assert_eq!(state.any_drive_enabled, cloned.any_drive_enabled);
         assert_eq!(state.is_enabled, cloned.is_enabled);
         assert_eq!(state.is_angle_limit(0), cloned.is_angle_limit(0));
         assert_eq!(state.is_comm_error(2), cloned.is_comm_error(2));
