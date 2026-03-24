@@ -401,6 +401,7 @@ pub(crate) struct ControlReadView {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ControlReadMeta {
+    published_pair: ControlPairSnapshot,
     position_candidate_mask: u8,
     dynamic_candidate_mask: u8,
 }
@@ -569,37 +570,85 @@ enum ControlPairPublishAttempt {
     SkippedNoSpareSlot,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ControlPairPublishOutcome {
+    skipped_no_spare_slot: bool,
+    invalidated_generations: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ControlPositionSample {
+    state: JointPositionState,
+    sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ControlDynamicSample {
+    state: JointDynamicState,
+    sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ActiveControlGeneration {
+    position: Option<ControlPositionSample>,
+    dynamic: Option<ControlDynamicSample>,
+}
+
+impl ActiveControlGeneration {
+    fn invalidate(&mut self) -> bool {
+        let had_generation = self.position.is_some() || self.dynamic.is_some();
+        self.position = None;
+        self.dynamic = None;
+        had_generation
+    }
+
+    fn ready_pair(&self) -> Option<ControlPairSnapshot> {
+        let position = self.position?;
+        let dynamic = self.dynamic?;
+        Some(ControlPairSnapshot {
+            joint_position: position.state,
+            joint_dynamic: dynamic.state,
+            position_sequence: position.sequence,
+            dynamic_sequence: dynamic.sequence,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ControlSideUpdate {
+    Position(ControlPositionSample),
+    Dynamic(ControlDynamicSample),
+}
+
 struct ControlPairPublisher {
     snapshot: RealtimeSnapshotCell<ControlPairSnapshot>,
-    pending_position: UnsafeCell<JointPositionState>,
-    pending_dynamic: UnsafeCell<JointDynamicState>,
+    latest_position: UnsafeCell<ControlPositionSample>,
+    latest_dynamic: UnsafeCell<ControlDynamicSample>,
+    active_generation: UnsafeCell<ActiveControlGeneration>,
     pending_candidate: UnsafeCell<Option<ControlPairSnapshot>>,
     read_meta_epoch: AtomicU64,
     read_meta: UnsafeCell<ControlReadMeta>,
     position_sequence: AtomicU64,
     dynamic_sequence: AtomicU64,
-    published_position_sequence: AtomicU64,
-    published_dynamic_sequence: AtomicU64,
 }
 
 impl ControlPairPublisher {
     fn new() -> Self {
         Self {
             snapshot: RealtimeSnapshotCell::new(ControlPairSnapshot::default()),
-            pending_position: UnsafeCell::new(JointPositionState::default()),
-            pending_dynamic: UnsafeCell::new(JointDynamicState::default()),
+            latest_position: UnsafeCell::new(ControlPositionSample::default()),
+            latest_dynamic: UnsafeCell::new(ControlDynamicSample::default()),
+            active_generation: UnsafeCell::new(ActiveControlGeneration::default()),
             pending_candidate: UnsafeCell::new(None),
             read_meta_epoch: AtomicU64::new(0),
             read_meta: UnsafeCell::new(ControlReadMeta::default()),
             position_sequence: AtomicU64::new(0),
             dynamic_sequence: AtomicU64::new(0),
-            published_position_sequence: AtomicU64::new(0),
-            published_dynamic_sequence: AtomicU64::new(0),
         }
     }
 
     fn load(&self) -> ControlPairSnapshot {
-        self.snapshot.load()
+        self.load_read_view().pair
     }
 
     fn load_read_view(&self) -> ControlReadView {
@@ -610,7 +659,6 @@ impl ControlPairPublisher {
                 continue;
             }
 
-            let pair = self.snapshot.load();
             // SAFETY:
             // - 控制级写路径是单写者
             // - 读者只在 read_meta_epoch 稳定时复制元数据
@@ -618,7 +666,7 @@ impl ControlPairPublisher {
             let epoch_after = self.read_meta_epoch.load(Ordering::Acquire);
             if epoch_before == epoch_after {
                 return ControlReadView {
-                    pair,
+                    pair: meta.published_pair,
                     position_candidate_mask: meta.position_candidate_mask,
                     dynamic_candidate_mask: meta.dynamic_candidate_mask,
                 };
@@ -628,66 +676,95 @@ impl ControlPairPublisher {
         }
     }
 
-    fn publish_position(&self, joint_position: JointPositionState) -> ControlPairPublishAttempt {
+    fn publish_position(&self, joint_position: JointPositionState) -> ControlPairPublishOutcome {
+        let sample = ControlPositionSample {
+            state: joint_position,
+            sequence: self.position_sequence.fetch_add(1, Ordering::AcqRel) + 1,
+        };
         // SAFETY:
         // - 控制级 publish 路径是单写者（RX 线程）
-        // - 读者只通过 published pair snapshot 读取，不访问 pending 缓冲
+        // - latest_position 只在当前线程中更新，不暴露给读者
         unsafe {
-            *self.pending_position.get() = joint_position;
+            *self.latest_position.get() = sample;
         }
-        self.position_sequence.fetch_add(1, Ordering::AcqRel);
         self.with_read_meta_write(|meta| {
             meta.position_candidate_mask = joint_position.frame_valid_mask;
-            self.try_publish_pair()
+            self.publish_side_update(ControlSideUpdate::Position(sample), meta)
         })
     }
 
-    fn publish_dynamic(&self, joint_dynamic: JointDynamicState) -> ControlPairPublishAttempt {
+    fn publish_dynamic(&self, joint_dynamic: JointDynamicState) -> ControlPairPublishOutcome {
+        let sample = ControlDynamicSample {
+            state: joint_dynamic,
+            sequence: self.dynamic_sequence.fetch_add(1, Ordering::AcqRel) + 1,
+        };
         // SAFETY:
         // - 控制级 publish 路径是单写者（RX 线程）
-        // - 读者只通过 published pair snapshot 读取，不访问 pending 缓冲
+        // - latest_dynamic 只在当前线程中更新，不暴露给读者
         unsafe {
-            *self.pending_dynamic.get() = joint_dynamic;
+            *self.latest_dynamic.get() = sample;
         }
-        self.dynamic_sequence.fetch_add(1, Ordering::AcqRel);
         self.with_read_meta_write(|meta| {
             meta.dynamic_candidate_mask = joint_dynamic.valid_mask;
-            self.try_publish_pair()
+            self.publish_side_update(ControlSideUpdate::Dynamic(sample), meta)
         })
     }
 
-    fn try_publish_pair(&self) -> ControlPairPublishAttempt {
-        let position_sequence = self.position_sequence.load(Ordering::Acquire);
-        let dynamic_sequence = self.dynamic_sequence.load(Ordering::Acquire);
-        let published_position_sequence = self.published_position_sequence.load(Ordering::Acquire);
-        let published_dynamic_sequence = self.published_dynamic_sequence.load(Ordering::Acquire);
+    fn publish_side_update(
+        &self,
+        update: ControlSideUpdate,
+        meta: &mut ControlReadMeta,
+    ) -> ControlPairPublishOutcome {
+        let mut outcome = ControlPairPublishOutcome::default();
+        self.flush_publishable_pairs(meta, &mut outcome);
+        self.record_generation_update(update, &mut outcome);
+        if !outcome.skipped_no_spare_slot {
+            self.flush_publishable_pairs(meta, &mut outcome);
+        }
+        outcome
+    }
+
+    fn flush_publishable_pairs(
+        &self,
+        meta: &mut ControlReadMeta,
+        outcome: &mut ControlPairPublishOutcome,
+    ) {
+        loop {
+            if self.has_pending_candidate() {
+                match self.try_publish_pending(meta) {
+                    ControlPairPublishAttempt::Published => continue,
+                    ControlPairPublishAttempt::SkippedNoSpareSlot => {
+                        outcome.skipped_no_spare_slot = true;
+                    },
+                    ControlPairPublishAttempt::AwaitingPeer => {},
+                }
+                break;
+            }
+
+            if !self.promote_ready_generation_to_pending() {
+                break;
+            }
+        }
+    }
+
+    fn has_pending_candidate(&self) -> bool {
+        // SAFETY:
+        // - 控制级 publish 路径是单写者（RX 线程）
+        // - pending_candidate 只在当前线程访问
+        unsafe { (*self.pending_candidate.get()).is_some() }
+    }
+
+    fn try_publish_pending(&self, meta: &mut ControlReadMeta) -> ControlPairPublishAttempt {
         // SAFETY:
         // - 控制级 publish 路径是单写者（RX 线程）
         // - pending_candidate 只在当前线程更新
         let pending_candidate = unsafe { &mut *self.pending_candidate.get() };
+        let Some(candidate) = *pending_candidate else {
+            return ControlPairPublishAttempt::AwaitingPeer;
+        };
 
-        if let Some(candidate) = pending_candidate.as_mut() {
-            if position_sequence > candidate.position_sequence
-                && dynamic_sequence > candidate.dynamic_sequence
-            {
-                *candidate = self.build_candidate(position_sequence, dynamic_sequence);
-            }
-        } else {
-            if position_sequence <= published_position_sequence
-                || dynamic_sequence <= published_dynamic_sequence
-            {
-                return ControlPairPublishAttempt::AwaitingPeer;
-            }
-
-            *pending_candidate = Some(self.build_candidate(position_sequence, dynamic_sequence));
-        }
-
-        let candidate = pending_candidate.expect("pending candidate must exist before publish");
         if self.snapshot.try_store(candidate) {
-            self.published_position_sequence
-                .store(candidate.position_sequence, Ordering::Release);
-            self.published_dynamic_sequence
-                .store(candidate.dynamic_sequence, Ordering::Release);
+            meta.published_pair = candidate;
             *pending_candidate = None;
             ControlPairPublishAttempt::Published
         } else {
@@ -695,21 +772,59 @@ impl ControlPairPublisher {
         }
     }
 
-    fn build_candidate(
-        &self,
-        position_sequence: u64,
-        dynamic_sequence: u64,
-    ) -> ControlPairSnapshot {
+    fn promote_ready_generation_to_pending(&self) -> bool {
         // SAFETY:
-        // - 单写者模型下，pending_position/pending_dynamic 只有当前线程写入
-        // - candidate 只从最新单边缓冲复制，不暴露内部引用
+        // - 控制级 publish 路径是单写者（RX 线程）
+        // - active_generation 和 pending_candidate 都只在当前线程更新
         unsafe {
-            ControlPairSnapshot {
-                joint_position: *self.pending_position.get(),
-                joint_dynamic: *self.pending_dynamic.get(),
-                position_sequence,
-                dynamic_sequence,
-            }
+            let active_generation = &mut *self.active_generation.get();
+            let Some(candidate) = active_generation.ready_pair() else {
+                return false;
+            };
+
+            *self.pending_candidate.get() = Some(candidate);
+            active_generation.invalidate();
+            true
+        }
+    }
+
+    fn record_generation_update(
+        &self,
+        update: ControlSideUpdate,
+        outcome: &mut ControlPairPublishOutcome,
+    ) {
+        // SAFETY:
+        // - 控制级 publish 路径是单写者（RX 线程）
+        // - active_generation 只在当前线程维护
+        let active_generation = unsafe { &mut *self.active_generation.get() };
+
+        match update {
+            ControlSideUpdate::Position(sample) => {
+                if active_generation.position.is_some() {
+                    if active_generation.invalidate() {
+                        outcome.invalidated_generations += 1;
+                    }
+                    return;
+                }
+                debug_assert_eq!(
+                    unsafe { (*self.latest_position.get()).sequence },
+                    sample.sequence
+                );
+                active_generation.position = Some(unsafe { *self.latest_position.get() });
+            },
+            ControlSideUpdate::Dynamic(sample) => {
+                if active_generation.dynamic.is_some() {
+                    if active_generation.invalidate() {
+                        outcome.invalidated_generations += 1;
+                    }
+                    return;
+                }
+                debug_assert_eq!(
+                    unsafe { (*self.latest_dynamic.get()).sequence },
+                    sample.sequence
+                );
+                active_generation.dynamic = Some(unsafe { *self.latest_dynamic.get() });
+            },
         }
     }
 
@@ -738,7 +853,7 @@ impl ControlPairPublisher {
 }
 
 // SAFETY:
-// - pending_position/pending_dynamic 只允许单个 RX 写线程写入
+// - latest_position/latest_dynamic/active_generation 只允许单个 RX 写线程写入
 // - 读者只通过 RealtimeSnapshotCell 读取已发布 pair 副本
 unsafe impl Send for ControlPairPublisher {}
 // SAFETY:
@@ -1840,6 +1955,18 @@ impl PiperContext {
         }
     }
 
+    fn record_control_pair_generation_invalidations(&self, invalidated: u64) {
+        if invalidated == 0 {
+            return;
+        }
+
+        if let Some(metrics) = &self.hot_snapshot_metrics {
+            metrics
+                .rx_control_pair_generation_invalidated_total
+                .fetch_add(invalidated, Ordering::Relaxed);
+        }
+    }
+
     /// 捕获运动状态快照（逻辑原子性）
     ///
     /// 虽然不能保证物理上的完全同步（因为CAN帧本身就不是同时到的），
@@ -1891,8 +2018,13 @@ impl PiperContext {
         self.control_pair.load_read_view()
     }
 
-    pub(crate) fn capture_control_joint_dynamic(&self) -> JointDynamicState {
-        self.capture_control_pair().joint_dynamic
+    pub(crate) fn capture_control_joint_dynamic(&self) -> Option<JointDynamicState> {
+        let pair = self.capture_control_pair();
+        if pair.position_sequence == 0 || pair.dynamic_sequence == 0 {
+            None
+        } else {
+            Some(pair.joint_dynamic)
+        }
     }
 
     /// 发布新的关节位置完整监控快照，并与当前末端位姿组合成逻辑原子快照。
@@ -1953,11 +2085,9 @@ impl PiperContext {
 
     /// 发布新的控制级关节位置。
     pub fn publish_control_joint_position(&self, joint_position: JointPositionState) {
-        let skipped = matches!(
-            self.control_pair.publish_position(joint_position),
-            ControlPairPublishAttempt::SkippedNoSpareSlot
-        );
-        self.record_hot_snapshot_publish_skips(u64::from(skipped));
+        let outcome = self.control_pair.publish_position(joint_position);
+        self.record_hot_snapshot_publish_skips(u64::from(outcome.skipped_no_spare_slot));
+        self.record_control_pair_generation_invalidations(outcome.invalidated_generations);
     }
 
     /// 发布新的原始末端位姿，并与当前原始关节位置组合成逻辑原子快照。
@@ -1986,11 +2116,9 @@ impl PiperContext {
 
     /// 发布新的控制级关节动态状态。
     pub fn publish_control_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
-        let skipped = matches!(
-            self.control_pair.publish_dynamic(joint_dynamic),
-            ControlPairPublishAttempt::SkippedNoSpareSlot
-        );
-        self.record_hot_snapshot_publish_skips(u64::from(skipped));
+        let outcome = self.control_pair.publish_dynamic(joint_dynamic);
+        self.record_hot_snapshot_publish_skips(u64::from(outcome.skipped_no_spare_slot));
+        self.record_control_pair_generation_invalidations(outcome.invalidated_generations);
     }
 
     /// 发布新的原始关节动态状态。
@@ -2939,8 +3067,18 @@ mod tests {
 
         assert_eq!(pair.joint_position.hardware_timestamp_us, 42);
         assert_eq!(pair.joint_position.frame_valid_mask, 0b111);
-        assert_eq!(ctx.capture_control_joint_dynamic().group_timestamp_us, 84);
-        assert_eq!(ctx.capture_control_joint_dynamic().valid_mask, 0b11_1111);
+        assert_eq!(
+            ctx.capture_control_joint_dynamic()
+                .expect("coherent pair must expose control dynamic state")
+                .group_timestamp_us,
+            84
+        );
+        assert_eq!(
+            ctx.capture_control_joint_dynamic()
+                .expect("coherent pair must expose control dynamic state")
+                .valid_mask,
+            0b11_1111
+        );
     }
 
     #[test]
@@ -3191,6 +3329,82 @@ mod tests {
             1
         );
         assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 0);
+    }
+
+    #[test]
+    fn test_control_pair_generation_invalidates_when_position_advances_twice_before_dynamic() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
+
+        ctx.publish_control_joint_position(sample_joint_position_state(1, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(1, 0b11_1111));
+        let baseline = ctx.capture_control_pair();
+
+        ctx.publish_control_joint_position(sample_joint_position_state(2, 0b111));
+        ctx.publish_control_joint_position(sample_joint_position_state(3, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(2, 0b11_1111));
+
+        let after_invalid_generation = ctx.capture_control_pair();
+        assert_eq!(after_invalid_generation.position_sequence, 1);
+        assert_eq!(after_invalid_generation.dynamic_sequence, 1);
+        assert_eq!(
+            after_invalid_generation.joint_position.hardware_timestamp_us,
+            baseline.joint_position.hardware_timestamp_us,
+        );
+        assert_eq!(
+            after_invalid_generation.joint_dynamic.group_timestamp_us,
+            baseline.joint_dynamic.group_timestamp_us,
+        );
+        assert_eq!(
+            metrics.snapshot().rx_control_pair_generation_invalidated_total,
+            1
+        );
+
+        ctx.publish_control_joint_position(sample_joint_position_state(4, 0b111));
+
+        let after_fresh_peer = ctx.capture_control_pair();
+        assert_eq!(after_fresh_peer.position_sequence, 4);
+        assert_eq!(after_fresh_peer.dynamic_sequence, 2);
+        assert_eq!(after_fresh_peer.joint_position.hardware_timestamp_us, 4);
+        assert_eq!(after_fresh_peer.joint_dynamic.group_timestamp_us, 2);
+    }
+
+    #[test]
+    fn test_control_pair_generation_invalidates_when_dynamic_advances_twice_before_position() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
+
+        ctx.publish_control_joint_position(sample_joint_position_state(10, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(10, 0b11_1111));
+        let baseline = ctx.capture_control_pair();
+
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(20, 0b11_1111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(30, 0b11_1111));
+        ctx.publish_control_joint_position(sample_joint_position_state(20, 0b111));
+
+        let after_invalid_generation = ctx.capture_control_pair();
+        assert_eq!(after_invalid_generation.position_sequence, 1);
+        assert_eq!(after_invalid_generation.dynamic_sequence, 1);
+        assert_eq!(
+            after_invalid_generation.joint_position.hardware_timestamp_us,
+            baseline.joint_position.hardware_timestamp_us,
+        );
+        assert_eq!(
+            after_invalid_generation.joint_dynamic.group_timestamp_us,
+            baseline.joint_dynamic.group_timestamp_us,
+        );
+        assert_eq!(
+            metrics.snapshot().rx_control_pair_generation_invalidated_total,
+            1
+        );
+
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(40, 0b11_1111));
+
+        let after_fresh_peer = ctx.capture_control_pair();
+        assert_eq!(after_fresh_peer.position_sequence, 2);
+        assert_eq!(after_fresh_peer.dynamic_sequence, 4);
+        assert_eq!(after_fresh_peer.joint_position.hardware_timestamp_us, 20);
+        assert_eq!(after_fresh_peer.joint_dynamic.group_timestamp_us, 40);
     }
 
     #[test]

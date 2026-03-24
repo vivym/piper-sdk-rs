@@ -1,0 +1,5 @@
+mod command_priority_tests;
+mod performance_regression_tests;
+mod pipeline_performance_tests;
+mod realtime_benchmark_tests;
+mod thread_isolation_tests;

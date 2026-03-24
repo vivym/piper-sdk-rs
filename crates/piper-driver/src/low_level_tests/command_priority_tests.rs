@@ -5,12 +5,13 @@
 //! 2. 配置帧不被丢弃（可靠命令队列）
 //! 3. 实时命令支持覆盖（Overwrite 策略）
 
-use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::command::{CommandPriority, PiperCommand, ReliableCommand};
-use piper_sdk::driver::{
-    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
-    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, test_support::spawn_tx_loop,
+use crate::command::{CommandPriority, PiperCommand, RealtimeCommand, ReliableCommand};
+use crate::test_support::spawn_tx_loop;
+use crate::{
+    AtomicDriverMode, BackendCapability, DriverMode, MaintenanceLeaseGate, MaintenanceStateSignal,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop,
 };
+use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -125,12 +126,10 @@ fn test_priority_scheduling() {
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
+    let driver_mode = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_clone = realtime_slot.clone();
 
@@ -180,9 +179,7 @@ fn test_priority_scheduling() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 同时发送实时命令和可靠命令（测试优先级）
@@ -196,9 +193,7 @@ fn test_priority_scheduling() {
     reliable_tx.send(ReliableCommand::single(reliable_frame2)).unwrap();
 
     // 立即发送实时命令（写入 mailbox slot）
-    *realtime_slot_clone.lock().unwrap() = Some(
-        piper_sdk::driver::command::RealtimeCommand::single(realtime_frame),
-    );
+    *realtime_slot_clone.lock().unwrap() = Some(RealtimeCommand::single(realtime_frame));
 
     // 等待处理完成
     thread::sleep(Duration::from_millis(150));
@@ -309,7 +304,7 @@ fn test_reliable_command_not_dropped() {
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
     // 启动 TX 线程
@@ -333,9 +328,7 @@ fn test_reliable_command_not_dropped() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 发送多个可靠命令（填满队列）
@@ -464,7 +457,7 @@ fn test_realtime_overwrite_strategy() {
     let normal_send_gate = Arc::new(NormalSendGate::new());
     let _maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_clone = realtime_slot.clone();
 
@@ -489,9 +482,7 @@ fn test_realtime_overwrite_strategy() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 快速发送多个实时命令（触发覆盖）
@@ -501,8 +492,7 @@ fn test_realtime_overwrite_strategy() {
 
     for frame in realtime_commands.iter() {
         // 写入 realtime slot（会覆盖之前的值）
-        *realtime_slot_clone.lock().unwrap() =
-            Some(piper_sdk::driver::command::RealtimeCommand::single(*frame));
+        *realtime_slot_clone.lock().unwrap() = Some(RealtimeCommand::single(*frame));
         thread::sleep(Duration::from_micros(50));
     }
 

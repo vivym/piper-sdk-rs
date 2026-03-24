@@ -113,6 +113,8 @@ pub struct PiperMetrics {
     pub rx_joint_dynamic_control_grade_rejected_total: AtomicU64,
     /// 热路径逻辑快照发布因参与 cell 无空闲槽位而被整体跳过的次数
     pub rx_hot_snapshot_publish_skipped_total: AtomicU64,
+    /// 控制级 clean generation 因单边连跳或 pending pair 阶段新输入而被整体丢弃的次数
+    pub rx_control_pair_generation_invalidated_total: AtomicU64,
     /// SoftRealtime admission 阶段因总预算已过期而被前门拒绝的次数
     pub tx_soft_admission_timeout_total: AtomicU64,
     /// SoftRealtime 控制发送 deadline miss 总次数
@@ -194,6 +196,9 @@ impl PiperMetrics {
             rx_hot_snapshot_publish_skipped_total: self
                 .rx_hot_snapshot_publish_skipped_total
                 .load(Ordering::Relaxed),
+            rx_control_pair_generation_invalidated_total: self
+                .rx_control_pair_generation_invalidated_total
+                .load(Ordering::Relaxed),
             tx_soft_admission_timeout_total: self
                 .tx_soft_admission_timeout_total
                 .load(Ordering::Relaxed),
@@ -242,6 +247,7 @@ impl PiperMetrics {
         self.rx_joint_dynamic_groups_dropped_total.store(0, Ordering::Relaxed);
         self.rx_joint_dynamic_control_grade_rejected_total.store(0, Ordering::Relaxed);
         self.rx_hot_snapshot_publish_skipped_total.store(0, Ordering::Relaxed);
+        self.rx_control_pair_generation_invalidated_total.store(0, Ordering::Relaxed);
         self.tx_soft_admission_timeout_total.store(0, Ordering::Relaxed);
         self.tx_soft_deadline_miss_total.store(0, Ordering::Relaxed);
         self.tx_soft_consecutive_deadline_miss_total.store(0, Ordering::Relaxed);
@@ -319,6 +325,8 @@ pub struct MetricsSnapshot {
     pub rx_joint_dynamic_control_grade_rejected_total: u64,
     /// 热路径逻辑快照发布因参与 cell 无空闲槽位而被整体跳过的次数
     pub rx_hot_snapshot_publish_skipped_total: u64,
+    /// 控制级 clean generation 因单边连跳或 pending pair 阶段新输入而被整体丢弃的次数
+    pub rx_control_pair_generation_invalidated_total: u64,
     /// SoftRealtime admission 阶段因总预算已过期而被前门拒绝的次数
     pub tx_soft_admission_timeout_total: u64,
     /// SoftRealtime 控制发送 deadline miss 总次数
@@ -412,6 +420,7 @@ mod tests {
         assert_eq!(snapshot.tx_frames_sent_total, 0);
         assert_eq!(snapshot.tx_realtime_enqueued_total, 0);
         assert_eq!(snapshot.rx_hot_snapshot_publish_skipped_total, 0);
+        assert_eq!(snapshot.rx_control_pair_generation_invalidated_total, 0);
         assert_eq!(snapshot.tx_soft_admission_timeout_total, 0);
     }
 
@@ -436,12 +445,19 @@ mod tests {
         metrics.rx_frames_total.fetch_add(100, Ordering::Relaxed);
         metrics.tx_frames_sent_total.fetch_add(50, Ordering::Relaxed);
         metrics.rx_hot_snapshot_publish_skipped_total.fetch_add(7, Ordering::Relaxed);
+        metrics
+            .rx_control_pair_generation_invalidated_total
+            .fetch_add(5, Ordering::Relaxed);
         metrics.tx_soft_admission_timeout_total.fetch_add(3, Ordering::Relaxed);
 
         let snapshot_before = metrics.snapshot();
         assert_eq!(snapshot_before.rx_frames_total, 100);
         assert_eq!(snapshot_before.tx_frames_sent_total, 50);
         assert_eq!(snapshot_before.rx_hot_snapshot_publish_skipped_total, 7);
+        assert_eq!(
+            snapshot_before.rx_control_pair_generation_invalidated_total,
+            5
+        );
         assert_eq!(snapshot_before.tx_soft_admission_timeout_total, 3);
 
         metrics.reset();
@@ -450,6 +466,10 @@ mod tests {
         assert_eq!(snapshot_after.rx_frames_total, 0);
         assert_eq!(snapshot_after.tx_frames_sent_total, 0);
         assert_eq!(snapshot_after.rx_hot_snapshot_publish_skipped_total, 0);
+        assert_eq!(
+            snapshot_after.rx_control_pair_generation_invalidated_total,
+            0
+        );
         assert_eq!(snapshot_after.tx_soft_admission_timeout_total, 0);
     }
 

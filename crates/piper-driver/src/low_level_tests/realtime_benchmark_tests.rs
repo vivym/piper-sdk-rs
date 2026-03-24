@@ -7,14 +7,13 @@
 //! 4. 支持多种测试场景（500Hz/1kHz、USB故障、CAN高负载）
 //! 5. 生成测试报告（Markdown）
 
-use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::{
-    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
-    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane,
-    command::{RealtimeCommand, ReliableCommand},
-    rx_loop,
-    test_support::spawn_tx_loop,
+use crate::command::{RealtimeCommand, ReliableCommand};
+use crate::test_support::spawn_tx_loop;
+use crate::{
+    AtomicDriverMode, BackendCapability, DriverMode, MaintenanceLeaseGate, MaintenanceStateSignal,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop,
 };
+use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -124,6 +123,7 @@ impl RealtimeMetrics {
         self.samples.len()
     }
 
+    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -158,6 +158,7 @@ impl RealtimeMetrics {
 }
 
 /// 实时性基准测试工具
+#[allow(dead_code)]
 pub struct RealtimeBenchmark {
     rx_interval_metrics: RealtimeMetrics,
     tx_latency_metrics: RealtimeMetrics,
@@ -190,6 +191,7 @@ impl RealtimeBenchmark {
     }
 
     /// 生成完整的测试报告（Markdown）
+    #[allow(dead_code)]
     pub fn generate_report(&self) -> String {
         format!(
             r#"# Realtime Benchmark Report
@@ -433,9 +435,7 @@ fn test_500hz_realtime_benchmark() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
-    let driver_mode_rx = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
+    let driver_mode_rx = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -542,9 +542,7 @@ fn test_1khz_realtime_benchmark() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
-    let driver_mode_rx = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
+    let driver_mode_rx = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -649,7 +647,7 @@ fn test_tx_latency_benchmark() {
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
     // 启动 TX 线程
@@ -674,9 +672,7 @@ fn test_tx_latency_benchmark() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 发送命令并测量延迟
@@ -772,7 +768,7 @@ fn test_send_duration_benchmark() {
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
     // 启动 TX 线程
@@ -797,9 +793,7 @@ fn test_send_duration_benchmark() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 发送命令
@@ -888,9 +882,7 @@ fn test_usb_fault_simulation() {
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
-    let driver_mode_rx = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
+    let driver_mode_rx = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();

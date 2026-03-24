@@ -3,12 +3,13 @@
 //! 这些测试保留在默认 `cargo test` 中，但只验证进度、队列语义和 metrics 准确性，
 //! 不再依赖 wall-clock P95/P99 阈值。
 
-use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::command::ReliableCommand;
-use piper_sdk::driver::{
-    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
-    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, test_support::spawn_tx_loop,
+use crate::command::{RealtimeCommand, ReliableCommand};
+use crate::test_support::spawn_tx_loop;
+use crate::{
+    AtomicDriverMode, BackendCapability, DriverMode, MaintenanceLeaseGate, MaintenanceStateSignal,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop,
 };
+use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -150,9 +151,7 @@ fn start_rx_loop(
 ) -> thread::JoinHandle<()> {
     let maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
+    let driver_mode = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
     thread::spawn(move || {
         rx_loop(
             rx_adapter,
@@ -178,7 +177,7 @@ fn start_tx_loop(
     is_running: Arc<AtomicBool>,
     runtime_phase: Arc<AtomicU8>,
     fault: Arc<AtomicU8>,
-    realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>>,
+    realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>>,
     shutdown_lane: Arc<ShutdownLane>,
     reliable_rx: crossbeam_channel::Receiver<ReliableCommand>,
 ) -> thread::JoinHandle<()> {
@@ -199,9 +198,7 @@ fn start_tx_loop(
         ctx,
         fault,
         maintenance_lease_gate,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     )
 }
 
@@ -321,8 +318,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
     let realtime_writer = thread::spawn(move || {
         for i in 0..30 {
             let frame = PiperFrame::new_standard((0x400 + i) as u16, &[i as u8; 8]);
-            *realtime_slot_writer.lock().unwrap() =
-                Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
+            *realtime_slot_writer.lock().unwrap() = Some(RealtimeCommand::single(frame));
             thread::sleep(Duration::from_micros(50));
         }
     });
@@ -438,8 +434,7 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
     );
 
     let first = PiperFrame::new_standard(0x610, &[1; 8]);
-    *realtime_slot_writer.lock().unwrap() =
-        Some(piper_sdk::driver::command::RealtimeCommand::single(first));
+    *realtime_slot_writer.lock().unwrap() = Some(RealtimeCommand::single(first));
 
     let blocked_frame = first_frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(blocked_frame.id, first.id);
@@ -451,8 +446,7 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
         PiperFrame::new_standard(0x613, &[4; 8]),
         latest,
     ] {
-        *realtime_slot_writer.lock().unwrap() =
-            Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
+        *realtime_slot_writer.lock().unwrap() = Some(RealtimeCommand::single(frame));
     }
 
     release_first_tx.send(()).unwrap();

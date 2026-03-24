@@ -6,12 +6,13 @@
 //! 3. 确保新功能（命令优先级、超时 API）不引入性能开销
 //! 4. 可集成到 CI，作为性能门禁
 
-use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
-use piper_sdk::driver::command::{PiperCommand, ReliableCommand};
-use piper_sdk::driver::{
-    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
-    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, test_support::spawn_tx_loop,
+use crate::command::{PiperCommand, RealtimeCommand, ReliableCommand};
+use crate::test_support::spawn_tx_loop;
+use crate::{
+    AtomicDriverMode, BackendCapability, DriverMode, MaintenanceLeaseGate, MaintenanceStateSignal,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop,
 };
+use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -381,7 +382,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_tx = Arc::clone(&realtime_slot);
 
@@ -390,9 +391,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
     let is_running_rx = is_running.clone();
     let runtime_phase_rx = runtime_phase.clone();
     let normal_send_gate_rx = normal_send_gate.clone();
-    let driver_mode_rx = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
+    let driver_mode_rx = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
     let metrics_rx = metrics.clone();
     let last_fault_rx = last_fault.clone();
     let maintenance_state_signal_rx = maintenance_state_signal.clone();
@@ -434,9 +433,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 监控 RX 状态更新周期
@@ -467,8 +464,7 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
             &[command_count as u8; 8],
         );
 
-        *realtime_slot_tx.lock().unwrap() =
-            Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
+        *realtime_slot_tx.lock().unwrap() = Some(RealtimeCommand::single(frame));
 
         let mut retries = 0;
         while retries < 100 {
@@ -604,7 +600,7 @@ fn test_command_priority_performance() {
     // 创建命令通道
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot_tx = Arc::clone(&realtime_slot);
 
@@ -629,9 +625,7 @@ fn test_command_priority_performance() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 测试直接发送（无优先级）
@@ -642,8 +636,7 @@ fn test_command_priority_performance() {
             0x200 + (direct_send_count % 10) as u16,
             &[direct_send_count as u8; 8],
         );
-        *realtime_slot_tx.lock().unwrap() =
-            Some(piper_sdk::driver::command::RealtimeCommand::single(frame));
+        *realtime_slot_tx.lock().unwrap() = Some(RealtimeCommand::single(frame));
         direct_send_count += 1;
         thread::sleep(Duration::from_millis(2));
     }
@@ -668,7 +661,7 @@ fn test_command_priority_performance() {
     let tx_adapter2 = SimpleTxAdapter::new(Duration::from_micros(100));
     let (_reliable_tx2, reliable_rx2) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane2 = Arc::new(ShutdownLane::new());
-    let realtime_slot2: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let realtime_slot2: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
     let realtime_slot2_tx = Arc::clone(&realtime_slot2);
 
@@ -692,9 +685,7 @@ fn test_command_priority_performance() {
         ctx_tx2,
         last_fault_tx2,
         maintenance_lease_gate_tx2,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     let start2 = Instant::now();
@@ -705,9 +696,7 @@ fn test_command_priority_performance() {
             &[command_send_count as u8; 8],
         );
         let cmd = PiperCommand::realtime(frame);
-        *realtime_slot2_tx.lock().unwrap() = Some(
-            piper_sdk::driver::command::RealtimeCommand::single(cmd.frame()),
-        );
+        *realtime_slot2_tx.lock().unwrap() = Some(RealtimeCommand::single(cmd.frame()));
         command_send_count += 1;
         thread::sleep(Duration::from_millis(2));
     }

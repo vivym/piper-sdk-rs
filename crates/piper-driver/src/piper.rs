@@ -2534,8 +2534,8 @@ impl Piper {
     /// 获取控制级关节动态状态。
     ///
     /// 返回最近一份 coherent control pair 中的 dynamic 状态，
-    /// 不会暴露仅单边推进的控制候选值。
-    pub fn get_control_joint_dynamic(&self) -> JointDynamicState {
+    /// 不会暴露仅单边推进的控制候选值；如果 coherent pair 尚未建立则返回 `None`。
+    pub fn get_control_joint_dynamic(&self) -> Option<JointDynamicState> {
         self.ctx.capture_control_joint_dynamic()
     }
 
@@ -6809,12 +6809,16 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
+        assert!(piper.get_control_joint_dynamic().is_none());
+
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
             host_rx_mono_us: 2_000,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         });
+
+        assert!(piper.get_control_joint_dynamic().is_none());
 
         let result = piper.get_aligned_motion(5_000);
         match result {
@@ -6877,7 +6881,13 @@ mod tests {
         };
         assert_eq!(after_dynamic_only.position_timestamp_us, 1_000);
         assert_eq!(after_dynamic_only.dynamic_timestamp_us, 1_000);
-        assert_eq!(piper.get_control_joint_dynamic().group_timestamp_us, 1_000);
+        assert_eq!(
+            piper
+                .get_control_joint_dynamic()
+                .expect("published coherent pair must expose dynamic state")
+                .group_timestamp_us,
+            1_000
+        );
 
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 3_000,
@@ -6894,7 +6904,13 @@ mod tests {
         };
         assert_eq!(after_both_advanced.position_timestamp_us, 3_000);
         assert_eq!(after_both_advanced.dynamic_timestamp_us, 3_000);
-        assert_eq!(piper.get_control_joint_dynamic().group_timestamp_us, 3_000);
+        assert_eq!(
+            piper
+                .get_control_joint_dynamic()
+                .expect("coherent pair should become readable after both sides advance")
+                .group_timestamp_us,
+            3_000
+        );
     }
 
     #[test]

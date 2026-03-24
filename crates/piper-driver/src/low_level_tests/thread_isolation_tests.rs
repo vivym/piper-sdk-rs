@@ -5,14 +5,15 @@
 //! 2. TX 线程能感知 RX 故障并 fault-latch
 //! 3. 外部 shutdown 请求仍能有序回收线程
 
-use piper_sdk::can::{
-    CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
+use crate::command::{RealtimeCommand, ReliableCommand};
+use crate::test_support::spawn_tx_loop;
+use crate::{
+    AtomicDriverMode, BackendCapability, DriverMode, MaintenanceLeaseGate, MaintenanceStateSignal,
+    NormalSendGate, PipelineConfig, PiperContext, PiperMetrics, RuntimeFaultKind, ShutdownLane,
+    rx_loop,
 };
-use piper_sdk::driver::command::ReliableCommand;
-use piper_sdk::driver::{
-    BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
-    PipelineConfig, PiperContext, PiperMetrics, RuntimeFaultKind, ShutdownLane, rx_loop,
-    test_support::spawn_tx_loop,
+use piper_can::{
+    CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -192,10 +193,8 @@ fn test_rx_unaffected_by_tx_timeout() {
     let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let driver_mode = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
     // 启动 RX 线程
@@ -245,9 +244,7 @@ fn test_rx_unaffected_by_tx_timeout() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 等待 50ms，让系统稳定运行
@@ -330,10 +327,8 @@ fn test_tx_detects_rx_failure() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let driver_mode = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
     // 启动 RX 线程
@@ -383,9 +378,7 @@ fn test_tx_detects_rx_failure() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 等待 20ms，让系统稳定运行
@@ -459,10 +452,8 @@ fn test_thread_lifecycle_linkage() {
     let (_reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
     let shutdown_lane = Arc::new(ShutdownLane::new());
     let normal_send_gate = Arc::new(NormalSendGate::new());
-    let driver_mode = Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-        piper_sdk::driver::DriverMode::Normal,
-    ));
-    let realtime_slot: Arc<std::sync::Mutex<Option<piper_sdk::driver::command::RealtimeCommand>>> =
+    let driver_mode = Arc::new(AtomicDriverMode::new(DriverMode::Normal));
+    let realtime_slot: Arc<std::sync::Mutex<Option<RealtimeCommand>>> =
         Arc::new(std::sync::Mutex::new(None));
 
     // 启动 RX 线程
@@ -512,9 +503,7 @@ fn test_thread_lifecycle_linkage() {
         ctx_tx,
         last_fault_tx,
         maintenance_lease_gate_tx,
-        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-            piper_sdk::driver::DriverMode::Normal,
-        )),
+        Arc::new(AtomicDriverMode::new(DriverMode::Normal)),
     );
 
     // 等待 20ms，让系统稳定运行

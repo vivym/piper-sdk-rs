@@ -14,8 +14,6 @@ default = []
 realtime = ["dep:thread-priority"]
 # Mock mode for testing without hardware
 mock = ["piper-can/mock"]
-# Workspace-internal helpers for integration/perf tests; not part of the stable API surface
-internal-test-support = []
 
 [dependencies]
 piper-protocol = { workspace = true }
@@ -28,3 +26,6 @@ tracing-subscriber = { workspace = true }
 smallvec = { workspace = true }
 thread-priority = { workspace = true, optional = true }
 spin_sleep = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

@@ -18,14 +18,16 @@ mod error;
 mod fps_stats;
 pub mod heartbeat;
 pub mod hooks;
+#[cfg(test)]
+mod low_level_tests;
 pub mod metrics;
 pub mod mode;
 pub mod pipeline;
 mod piper; // 原 robot_impl.rs
 pub mod recording;
 pub mod state;
-#[cfg(feature = "internal-test-support")]
-pub mod test_support;
+#[cfg(test)]
+mod test_support;
 
 pub use builder::{ConnectionTarget, PiperBuilder};
 pub use command::{CommandPriority, PiperCommand};
