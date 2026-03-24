@@ -14,6 +14,8 @@ default = []
 realtime = ["dep:thread-priority"]
 # Mock mode for testing without hardware
 mock = ["piper-can/mock"]
+# Workspace-internal helpers for integration/perf tests; not part of the stable API surface
+internal-test-support = []
 
 [dependencies]
 piper-protocol = { workspace = true }

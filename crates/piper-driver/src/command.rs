@@ -275,9 +275,8 @@ impl SoftRealtimeMailboxState {
     }
 }
 
-#[doc(hidden)]
 #[derive(Debug)]
-pub struct SoftRealtimeMailbox {
+pub(crate) struct SoftRealtimeMailbox {
     closed: AtomicBool,
     state: Mutex<SoftRealtimeMailboxState>,
 }

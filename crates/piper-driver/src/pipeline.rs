@@ -1425,7 +1425,7 @@ pub fn rx_loop(
 /// - `metrics`: 性能指标
 /// - `ctx`: 共享状态上下文（用于触发 TX 回调，v1.2.1）
 #[allow(clippy::too_many_arguments)]
-pub fn tx_loop_mailbox(
+pub(crate) fn tx_loop_mailbox(
     mut tx: impl RealtimeTxAdapter,
     backend_capability: BackendCapability,
     config: PipelineConfig,

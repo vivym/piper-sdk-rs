@@ -24,6 +24,8 @@ pub mod pipeline;
 mod piper; // 原 robot_impl.rs
 pub mod recording;
 pub mod state;
+#[cfg(feature = "internal-test-support")]
+pub mod test_support;
 
 pub use builder::{ConnectionTarget, PiperBuilder};
 pub use command::{CommandPriority, PiperCommand};
@@ -33,7 +35,7 @@ pub use heartbeat::ConnectionMonitor;
 pub use hooks::{FrameCallback, HookHandle, HookManager};
 pub use metrics::{MetricsSnapshot, PiperMetrics};
 pub use mode::{AtomicDriverMode, DriverMode};
-pub use pipeline::{PipelineConfig, rx_loop, tx_loop_mailbox};
+pub use pipeline::{PipelineConfig, rx_loop};
 pub use piper::{
     HealthStatus, MaintenanceGate, MaintenanceGateState, MaintenanceLeaseAcquireResult,
     MaintenanceLeaseGate, MaintenanceLeaseSnapshot, MaintenanceRevocationEvent,

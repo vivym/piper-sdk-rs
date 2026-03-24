@@ -7,7 +7,7 @@ use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::command::ReliableCommand;
 use piper_sdk::driver::{
     BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
-    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
+    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, test_support::spawn_tx_loop,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -185,31 +185,24 @@ fn start_tx_loop(
     let normal_send_gate = Arc::new(NormalSendGate::new());
     let _maintenance_state_signal = Arc::new(MaintenanceStateSignal::default());
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
-    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
-    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
-    thread::spawn(move || {
-        tx_loop_mailbox(
-            tx_adapter,
-            BackendCapability::StrictRealtime,
-            PipelineConfig::default(),
-            realtime_slot,
-            soft_realtime_rx,
-            shutdown_lane,
-            reliable_rx,
-            is_running,
-            runtime_phase,
-            normal_send_gate,
-            metrics,
-            ctx,
-            fault,
-            maintenance_ctrl_rx,
-            maintenance_lease_gate,
-            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-                piper_sdk::driver::DriverMode::Normal,
-            )),
-        );
-    })
+    spawn_tx_loop(
+        tx_adapter,
+        BackendCapability::StrictRealtime,
+        PipelineConfig::default(),
+        realtime_slot,
+        shutdown_lane,
+        reliable_rx,
+        is_running,
+        runtime_phase,
+        normal_send_gate,
+        metrics,
+        ctx,
+        fault,
+        maintenance_lease_gate,
+        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+            piper_sdk::driver::DriverMode::Normal,
+        )),
+    )
 }
 
 #[test]

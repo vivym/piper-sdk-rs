@@ -12,7 +12,8 @@ use piper_sdk::driver::{
     BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
     PipelineConfig, PiperContext, PiperMetrics, ShutdownLane,
     command::{RealtimeCommand, ReliableCommand},
-    rx_loop, tx_loop_mailbox,
+    rx_loop,
+    test_support::spawn_tx_loop,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -659,32 +660,24 @@ fn test_tx_latency_benchmark() {
     let last_fault_tx = last_fault.clone();
     let realtime_slot_tx = realtime_slot.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
-    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
-    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
-    let tx_handle = thread::spawn(move || {
-        let normal_send_gate = Arc::new(NormalSendGate::new());
-        tx_loop_mailbox(
-            tx_adapter,
-            BackendCapability::StrictRealtime,
-            PipelineConfig::default(),
-            realtime_slot_tx,
-            soft_realtime_rx,
-            shutdown_lane,
-            reliable_rx,
-            is_running_tx,
-            runtime_phase_tx,
-            normal_send_gate,
-            metrics_tx,
-            ctx_tx,
-            last_fault_tx,
-            maintenance_ctrl_rx,
-            maintenance_lease_gate_tx,
-            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-                piper_sdk::driver::DriverMode::Normal,
-            )),
-        );
-    });
+    let tx_handle = spawn_tx_loop(
+        tx_adapter,
+        BackendCapability::StrictRealtime,
+        PipelineConfig::default(),
+        realtime_slot_tx,
+        shutdown_lane,
+        reliable_rx,
+        is_running_tx,
+        runtime_phase_tx,
+        Arc::new(NormalSendGate::new()),
+        metrics_tx,
+        ctx_tx,
+        last_fault_tx,
+        maintenance_lease_gate_tx,
+        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+            piper_sdk::driver::DriverMode::Normal,
+        )),
+    );
 
     // 发送命令并测量延迟
     let start = Instant::now();
@@ -790,32 +783,24 @@ fn test_send_duration_benchmark() {
     let last_fault_tx = last_fault.clone();
     let realtime_slot_tx = realtime_slot.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
-    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
-    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
-    let tx_handle = thread::spawn(move || {
-        let normal_send_gate = Arc::new(NormalSendGate::new());
-        tx_loop_mailbox(
-            tx_adapter,
-            BackendCapability::StrictRealtime,
-            PipelineConfig::default(),
-            realtime_slot_tx,
-            soft_realtime_rx,
-            shutdown_lane,
-            reliable_rx,
-            is_running_tx,
-            runtime_phase_tx,
-            normal_send_gate,
-            metrics_tx,
-            ctx_tx,
-            last_fault_tx,
-            maintenance_ctrl_rx,
-            maintenance_lease_gate_tx,
-            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-                piper_sdk::driver::DriverMode::Normal,
-            )),
-        );
-    });
+    let tx_handle = spawn_tx_loop(
+        tx_adapter,
+        BackendCapability::StrictRealtime,
+        PipelineConfig::default(),
+        realtime_slot_tx,
+        shutdown_lane,
+        reliable_rx,
+        is_running_tx,
+        runtime_phase_tx,
+        Arc::new(NormalSendGate::new()),
+        metrics_tx,
+        ctx_tx,
+        last_fault_tx,
+        maintenance_lease_gate_tx,
+        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+            piper_sdk::driver::DriverMode::Normal,
+        )),
+    );
 
     // 发送命令
     let start = Instant::now();

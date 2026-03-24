@@ -9,7 +9,7 @@ use piper_sdk::can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
 use piper_sdk::driver::command::{CommandPriority, PiperCommand, ReliableCommand};
 use piper_sdk::driver::{
     BackendCapability, MaintenanceLeaseGate, MaintenanceStateSignal, NormalSendGate,
-    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, tx_loop_mailbox,
+    PipelineConfig, PiperContext, PiperMetrics, ShutdownLane, rx_loop, test_support::spawn_tx_loop,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -166,31 +166,24 @@ fn test_priority_scheduling() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
-    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
-    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
-    let tx_handle = thread::spawn(move || {
-        tx_loop_mailbox(
-            tx_adapter,
-            BackendCapability::StrictRealtime,
-            PipelineConfig::default(),
-            realtime_slot,
-            soft_realtime_rx,
-            shutdown_lane,
-            reliable_rx,
-            is_running_tx,
-            runtime_phase_tx,
-            normal_send_gate,
-            metrics_tx,
-            ctx_tx,
-            last_fault_tx,
-            maintenance_ctrl_rx,
-            maintenance_lease_gate_tx,
-            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-                piper_sdk::driver::DriverMode::Normal,
-            )),
-        );
-    });
+    let tx_handle = spawn_tx_loop(
+        tx_adapter,
+        BackendCapability::StrictRealtime,
+        PipelineConfig::default(),
+        realtime_slot,
+        shutdown_lane,
+        reliable_rx,
+        is_running_tx,
+        runtime_phase_tx,
+        normal_send_gate,
+        metrics_tx,
+        ctx_tx,
+        last_fault_tx,
+        maintenance_lease_gate_tx,
+        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+            piper_sdk::driver::DriverMode::Normal,
+        )),
+    );
 
     // 同时发送实时命令和可靠命令（测试优先级）
     // 为了确保两者都在队列中，我们快速连续发送
@@ -326,31 +319,24 @@ fn test_reliable_command_not_dropped() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
-    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
-    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
-    let tx_handle = thread::spawn(move || {
-        tx_loop_mailbox(
-            tx_adapter,
-            BackendCapability::StrictRealtime,
-            PipelineConfig::default(),
-            realtime_slot,
-            soft_realtime_rx,
-            shutdown_lane,
-            reliable_rx,
-            is_running_tx,
-            runtime_phase_tx,
-            normal_send_gate,
-            metrics_tx,
-            ctx_tx,
-            last_fault_tx,
-            maintenance_ctrl_rx,
-            maintenance_lease_gate_tx,
-            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-                piper_sdk::driver::DriverMode::Normal,
-            )),
-        );
-    });
+    let tx_handle = spawn_tx_loop(
+        tx_adapter,
+        BackendCapability::StrictRealtime,
+        PipelineConfig::default(),
+        realtime_slot,
+        shutdown_lane,
+        reliable_rx,
+        is_running_tx,
+        runtime_phase_tx,
+        normal_send_gate,
+        metrics_tx,
+        ctx_tx,
+        last_fault_tx,
+        maintenance_lease_gate_tx,
+        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+            piper_sdk::driver::DriverMode::Normal,
+        )),
+    );
 
     // 发送多个可靠命令（填满队列）
     let reliable_commands: Vec<PiperFrame> = (0..15)
@@ -489,31 +475,24 @@ fn test_realtime_overwrite_strategy() {
     let metrics_tx = metrics.clone();
     let last_fault_tx = last_fault.clone();
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
-    let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
-    maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
-    let tx_handle = thread::spawn(move || {
-        tx_loop_mailbox(
-            tx_adapter,
-            BackendCapability::StrictRealtime,
-            PipelineConfig::default(),
-            realtime_slot,
-            soft_realtime_rx,
-            shutdown_lane,
-            reliable_rx,
-            is_running_tx,
-            runtime_phase_tx,
-            normal_send_gate,
-            metrics_tx,
-            ctx_tx,
-            last_fault_tx,
-            maintenance_ctrl_rx,
-            maintenance_lease_gate_tx,
-            Arc::new(piper_sdk::driver::AtomicDriverMode::new(
-                piper_sdk::driver::DriverMode::Normal,
-            )),
-        );
-    });
+    let tx_handle = spawn_tx_loop(
+        tx_adapter,
+        BackendCapability::StrictRealtime,
+        PipelineConfig::default(),
+        realtime_slot,
+        shutdown_lane,
+        reliable_rx,
+        is_running_tx,
+        runtime_phase_tx,
+        normal_send_gate,
+        metrics_tx,
+        ctx_tx,
+        last_fault_tx,
+        maintenance_lease_gate_tx,
+        Arc::new(piper_sdk::driver::AtomicDriverMode::new(
+            piper_sdk::driver::DriverMode::Normal,
+        )),
+    );
 
     // 快速发送多个实时命令（触发覆盖）
     let realtime_commands: Vec<PiperFrame> = (0..5)
