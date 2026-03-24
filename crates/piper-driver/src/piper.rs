@@ -466,9 +466,35 @@ impl NormalSendGate {
         self.set_state(NormalSendGateState::StoppingClosed);
     }
 
-    pub(crate) fn close_for_state_transition(&self) {
-        if self.state() == NormalSendGateState::Open {
-            self.set_state(NormalSendGateState::StateTransitionClosed);
+    pub(crate) fn close_for_state_transition(&self) -> Result<(), NormalSendGateDenyReason> {
+        loop {
+            let current = self.state();
+            match current {
+                NormalSendGateState::Open | NormalSendGateState::ReplayPaused => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            current as u8,
+                            NormalSendGateState::StateTransitionClosed as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.epoch.fetch_add(1, Ordering::AcqRel);
+                        return Ok(());
+                    }
+                },
+                NormalSendGateState::FaultClosed => {
+                    return Err(NormalSendGateDenyReason::FaultClosed);
+                },
+                NormalSendGateState::StoppingClosed => {
+                    return Err(NormalSendGateDenyReason::StoppingClosed);
+                },
+                NormalSendGateState::StateTransitionClosed => {
+                    return Err(NormalSendGateDenyReason::StateTransitionClosed);
+                },
+            }
         }
     }
 
@@ -3508,25 +3534,54 @@ impl Piper {
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
+        if self.replay_mode_active() {
+            return Err(DriverError::ReplayModeActive);
+        }
+        if self.runtime_phase() != RuntimePhase::Running
+            || self.runtime_fault_kind().is_some()
+            || !self.rx_thread_alive()
+        {
+            return Err(DriverError::ControlPathClosed);
+        }
 
         let deadline = Instant::now() + timeout;
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+        self.normal_send_gate
+            .close_for_state_transition()
+            .map_err(|_| DriverError::ControlPathClosed)?;
 
         {
             let _mode_switch_guard =
                 self.mode_switch_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
             if !self.tx_thread_alive() {
+                self.normal_send_gate.restore_after_state_transition(
+                    self.runtime_phase(),
+                    self.runtime_fault_kind(),
+                    self.mode(),
+                );
                 return Err(DriverError::ChannelClosed);
             }
-            if self.replay_mode_active() || self.replay_barrier_active() {
+            if self.replay_mode_active() {
+                self.normal_send_gate.restore_after_state_transition(
+                    self.runtime_phase(),
+                    self.runtime_fault_kind(),
+                    self.mode(),
+                );
                 return Err(DriverError::ReplayModeActive);
             }
-            if !self.normal_control_open() {
+            if self.runtime_phase() != RuntimePhase::Running
+                || self.runtime_fault_kind().is_some()
+                || !self.rx_thread_alive()
+                || self.normal_send_gate.state() != NormalSendGateState::StateTransitionClosed
+            {
+                self.normal_send_gate.restore_after_state_transition(
+                    self.runtime_phase(),
+                    self.runtime_fault_kind(),
+                    self.mode(),
+                );
                 return Err(DriverError::ControlPathClosed);
             }
-
-            self.normal_send_gate.close_for_state_transition();
 
             if self
                 .maintenance_lane_tx
@@ -7381,6 +7436,102 @@ mod tests {
             sent.as_slice(),
             &[disable_frame],
             "Replay rejection must not cancel the pending disable frame",
+        );
+    }
+
+    #[test]
+    fn test_state_transition_disable_preempts_inflight_replay_switch_before_lock_release() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .expect("driver should start"),
+        );
+
+        let inflight_frame = PiperFrame::new_standard(0x303, &[0x01]);
+        piper
+            .send_frame(inflight_frame)
+            .expect("reliable frame should enter the blocked in-flight send");
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("reliable frame should begin sending");
+
+        let piper_replay = Arc::clone(&piper);
+        let replay_handle = std::thread::spawn(move || {
+            piper_replay.try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(200))
+        });
+
+        wait_until(
+            Duration::from_millis(100),
+            || piper.normal_send_gate.state() == NormalSendGateState::ReplayPaused,
+            "replay switch should pause the front door while it waits for inflight sends",
+        );
+
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+        let piper_disable = Arc::clone(&piper);
+        let disable_handle = std::thread::spawn(move || {
+            let started_at = Instant::now();
+            let result = piper_disable.send_local_state_transition_frame_confirmed(
+                disable_frame,
+                Duration::from_millis(20),
+            );
+            (started_at.elapsed(), result)
+        });
+
+        wait_until(
+            Duration::from_millis(100),
+            || piper.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed,
+            "safety disable should close the front door before the replay switch releases the lock",
+        );
+
+        wait_until(
+            Duration::from_millis(100),
+            || replay_handle.is_finished(),
+            "replay switch should fail quickly once safety disable wins the front door",
+        );
+
+        let replay_error = replay_handle
+            .join()
+            .expect("replay switch thread should finish")
+            .expect_err("replay switch must not block a pending safety disable");
+        assert!(matches!(replay_error, DriverError::ControlPathClosed));
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
+
+        let (disable_elapsed, disable_result) =
+            disable_handle.join().expect("state-transition sender thread should finish");
+        let disable_error =
+            disable_result.expect_err("blocked state-transition disable must still time out");
+
+        assert!(matches!(disable_error, DriverError::Timeout));
+        assert!(
+            disable_elapsed < Duration::from_millis(120),
+            "disable timeout should not be dragged by the replay timeout, got {disable_elapsed:?}"
+        );
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+
+        release_tx.send(()).expect("blocked adapter should release cleanly");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.as_slice(),
+            &[inflight_frame],
+            "replay-preempted state-transition disable must not commit after timing out",
         );
     }
 

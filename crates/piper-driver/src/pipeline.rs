@@ -3906,7 +3906,9 @@ mod tests {
         let driver_mode = Arc::new(crate::mode::AtomicDriverMode::new(
             crate::mode::DriverMode::Normal,
         ));
-        normal_send_gate.close_for_state_transition();
+        normal_send_gate
+            .close_for_state_transition()
+            .expect("disable-confirmation test should start from an open gate");
         normal_send_gate.arm_disable_confirmation_pending();
 
         for joint_index in 1..=5 {
@@ -3983,7 +3985,9 @@ mod tests {
             ),
         };
 
-        normal_send_gate.close_for_state_transition();
+        normal_send_gate
+            .close_for_state_transition()
+            .expect("disable-confirmation test should start from an open gate");
         feed_joint_driver_low_speed_cycle(
             &ctx,
             &mut state,
@@ -4049,7 +4053,9 @@ mod tests {
         let last_fault = Arc::new(AtomicU8::new(0));
         let normal_send_gate = Arc::new(NormalSendGate::new());
 
-        normal_send_gate.close_for_state_transition();
+        normal_send_gate
+            .close_for_state_transition()
+            .expect("disable-confirmation test should start from an open gate");
         normal_send_gate.arm_disable_confirmation_pending();
 
         feed_joint_driver_low_speed_cycle(
