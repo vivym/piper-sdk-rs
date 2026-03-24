@@ -12,7 +12,7 @@
 //! - **状态流转**：`park()` 返还 `Piper<Standby>`，支持继续使用
 //! - **循环锚点**：使用绝对时间锚点，消除累积漂移
 //! - **容错性**：允许最多连续 5 个失败控制周期（25ms @ 200Hz）
-//! - **诊断摘要**：热路径只输出限速故障告警，恢复信息改在冷路径聚合输出
+//! - **诊断摘要**：热路径只输出限速故障告警，恢复信息由异步后台诊断线程输出
 //!
 //! # 使用示例
 //!
@@ -64,9 +64,12 @@
 //! ```
 
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use super::hot_path_diagnostics::{FaultLogDecision, HotPathDiagnostics, RecoverySummary};
+use super::mit_diagnostic_dispatcher::{
+    MitDiagnosticDispatcher, MitDiagnosticEvent, global_dispatcher,
+};
 use crate::observer::{ControlReadPolicy, Observer};
 use crate::raw_commander::RawCommander;
 use crate::state::StrictRealtime;
@@ -209,6 +212,12 @@ pub struct MitController {
 
     /// 控制循环 overrun 诊断限速状态
     overrun_diagnostics: HotPathDiagnostics,
+
+    /// 异步诊断派发器，确保 recovery summary 不在实时线程直接记录日志
+    diagnostic_dispatcher: MitDiagnosticDispatcher,
+
+    /// 因异步派发队列满/不可用而暂存的丢失恢复事件计数
+    dropped_recovery_events: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +236,7 @@ enum CommandCycleDisposition {
 
 const DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const SAFE_STATE_DEADLINE: Duration = Duration::from_millis(50);
+const FORCED_DIAGNOSTIC_SEND_TIMEOUT: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone)]
 struct SafeStateLatch {
@@ -316,6 +326,34 @@ impl MitController {
 
         Self::validate_config(&config)?;
 
+        let diagnostic_dispatcher = match global_dispatcher() {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                if error.should_warn() {
+                    warn!(
+                        "Failed to initialize MIT async diagnostic logger; recovery summaries will be dropped until restart: {}",
+                        error.message(),
+                    );
+                }
+                MitDiagnosticDispatcher::disabled()
+            },
+        };
+        Self::new_with_dispatcher(piper, config, diagnostic_dispatcher)
+    }
+
+    fn new_with_dispatcher(
+        piper: Piper<Active<MitMode>, StrictRealtime>,
+        config: MitControllerConfig,
+        diagnostic_dispatcher: MitDiagnosticDispatcher,
+    ) -> Result<Self> {
+        if piper.driver.backend_capability() != BackendCapability::StrictRealtime {
+            return Err(RobotError::realtime_unsupported(
+                "MIT controller requires a StrictRealtime backend with trusted alignment timestamps",
+            ));
+        }
+
+        Self::validate_config(&config)?;
+
         // 提取 observer（Clone 是轻量的，Arc 指针）
         let observer = piper.observer().clone();
 
@@ -328,6 +366,8 @@ impl MitController {
             safe_state: None,
             send_failure_diagnostics: HotPathDiagnostics::default(),
             overrun_diagnostics: HotPathDiagnostics::default(),
+            diagnostic_dispatcher,
+            dropped_recovery_events: 0,
         })
     }
 
@@ -448,36 +488,80 @@ impl MitController {
         }
     }
 
-    fn force_flush_pending_diagnostics_at(&mut self, now: Instant) -> PendingDiagnosticFlush {
+    fn collect_forced_pending_diagnostics_at(&mut self, now: Instant) -> PendingDiagnosticFlush {
         PendingDiagnosticFlush {
             send_failure: self.send_failure_diagnostics.force_flush_recovery_summary(now),
             overrun: self.overrun_diagnostics.force_flush_recovery_summary(now),
         }
     }
 
-    fn emit_diagnostic_summaries(&self, pending: PendingDiagnosticFlush) {
-        if let Some(summary) = pending.send_failure {
-            info!(
-                "MIT control send path recovered {} time(s). Warning limiter suppressed {} repeated transient-failure warning(s) since the last summary.",
-                summary.recovery_count, summary.suppressed_fault_warnings,
-            );
-        }
-        if let Some(summary) = pending.overrun {
-            info!(
-                "MIT control loop returned within budget {} time(s). Warning limiter suppressed {} repeated overrun warning(s) since the last summary.",
-                summary.recovery_count, summary.suppressed_fault_warnings,
-            );
+    fn submit_diagnostic_event(
+        &self,
+        event: MitDiagnosticEvent,
+        forced: bool,
+    ) -> core::result::Result<(), ()> {
+        if forced {
+            self.diagnostic_dispatcher
+                .submit_cold_path_event(event, FORCED_DIAGNOSTIC_SEND_TIMEOUT)
+                .map_err(|_| ())
+        } else {
+            self.diagnostic_dispatcher.submit_runtime_event(event).map_err(|_| ())
         }
     }
 
-    fn poll_windowed_diagnostics(&mut self) {
-        let pending = self.poll_windowed_diagnostics_at(Instant::now());
-        self.emit_diagnostic_summaries(pending);
+    fn submit_pending_diagnostics(&mut self, pending: PendingDiagnosticFlush, forced: bool) -> u32 {
+        let mut newly_dropped: u32 = 0;
+
+        if self.dropped_recovery_events > 0
+            && self
+                .submit_diagnostic_event(
+                    MitDiagnosticEvent::DroppedRecoveryEvents {
+                        count: self.dropped_recovery_events,
+                    },
+                    forced,
+                )
+                .is_ok()
+        {
+            self.dropped_recovery_events = 0;
+        }
+
+        if let Some(summary) = pending.send_failure
+            && self
+                .submit_diagnostic_event(MitDiagnosticEvent::SendFailureRecovery(summary), forced)
+                .is_err()
+        {
+            self.dropped_recovery_events = self.dropped_recovery_events.saturating_add(1);
+            newly_dropped = newly_dropped.saturating_add(1);
+        }
+
+        if let Some(summary) = pending.overrun
+            && self
+                .submit_diagnostic_event(MitDiagnosticEvent::OverrunRecovery(summary), forced)
+                .is_err()
+        {
+            self.dropped_recovery_events = self.dropped_recovery_events.saturating_add(1);
+            newly_dropped = newly_dropped.saturating_add(1);
+        }
+
+        newly_dropped
+    }
+
+    fn submit_windowed_diagnostics_at(&mut self, now: Instant) -> u32 {
+        let pending = self.poll_windowed_diagnostics_at(now);
+        self.submit_pending_diagnostics(pending, false)
+    }
+
+    fn submit_windowed_diagnostics(&mut self) {
+        let _ = self.submit_windowed_diagnostics_at(Instant::now());
     }
 
     fn force_flush_pending_diagnostics(&mut self) {
-        let pending = self.force_flush_pending_diagnostics_at(Instant::now());
-        self.emit_diagnostic_summaries(pending);
+        let _ = self.force_flush_pending_diagnostics_at(Instant::now());
+    }
+
+    fn force_flush_pending_diagnostics_at(&mut self, now: Instant) -> u32 {
+        let pending = self.collect_forced_pending_diagnostics_at(now);
+        self.submit_pending_diagnostics(pending, true)
     }
 
     fn finish_safe_state_transition(&mut self, error: ControlError) -> ControlError {
@@ -593,7 +677,7 @@ impl MitController {
             }
 
             self.run_cycle_epilogue(&mut next_tick, period);
-            self.poll_windowed_diagnostics();
+            self.submit_windowed_diagnostics();
         };
 
         self.force_flush_pending_diagnostics();
@@ -839,9 +923,11 @@ impl Drop for MitController {
 
 #[cfg(test)]
 mod tests {
+    use super::super::mit_diagnostic_dispatcher::{MitDiagnosticDispatcher, MitDiagnosticEvent};
     use super::*;
     use crate::observer::Observer;
     use crate::state::machine::{DriverModeDropPolicy, DropPolicy};
+    use crossbeam_channel::bounded;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_driver::Piper as RobotPiper;
     use piper_protocol::control::{EmergencyStopCommand, MitControlCommand, MotorEnableCommand};
@@ -1310,54 +1396,58 @@ mod tests {
     fn collect_pending_diagnostics_summarizes_send_failure_recovery_once() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
-        let mut controller = MitController::new(active, MitControllerConfig::default())
-            .expect("controller should build");
+        let (event_tx, event_rx) = bounded(4);
+        let mut controller = MitController::new_with_dispatcher(
+            active,
+            MitControllerConfig::default(),
+            MitDiagnosticDispatcher::for_test(event_tx),
+        )
+        .expect("controller should build");
         let start = Instant::now();
 
         let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
         let recovered_at = start + Duration::from_millis(5);
         controller.send_failure_diagnostics.record_recovery(recovered_at);
 
+        assert_eq!(controller.submit_windowed_diagnostics_at(start), 0);
         assert_eq!(
-            controller.poll_windowed_diagnostics_at(start),
-            PendingDiagnosticFlush::default()
+            controller.submit_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
+            0
         );
         assert_eq!(
-            controller.poll_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
-            PendingDiagnosticFlush {
-                send_failure: Some(RecoverySummary {
-                    recovery_count: 1,
-                    suppressed_fault_warnings: 0,
-                }),
-                overrun: None,
-            }
+            event_rx.recv().expect("summary should be submitted asynchronously"),
+            MitDiagnosticEvent::SendFailureRecovery(RecoverySummary {
+                recovery_count: 1,
+                suppressed_fault_warnings: 0,
+            })
         );
-        assert_eq!(
-            controller.poll_windowed_diagnostics_at(start),
-            PendingDiagnosticFlush::default()
-        );
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
     fn enter_safe_state_force_flushes_pending_diagnostics_inside_summary_window() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
-        let mut controller = MitController::new(active, MitControllerConfig::default())
-            .expect("controller should build");
+        let (event_tx, event_rx) = bounded(8);
+        let mut controller = MitController::new_with_dispatcher(
+            active,
+            MitControllerConfig::default(),
+            MitDiagnosticDispatcher::for_test(event_tx),
+        )
+        .expect("controller should build");
         let start = Instant::now();
 
         let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
         let recovered_at = start + Duration::from_millis(5);
         controller.send_failure_diagnostics.record_recovery(recovered_at);
+        assert_eq!(controller.submit_windowed_diagnostics_at(start), 0);
         assert_eq!(
-            controller.poll_windowed_diagnostics_at(start).send_failure,
-            None
+            controller.submit_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
+            0
         );
         assert_eq!(
-            controller
-                .poll_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL)
-                .send_failure,
-            Some(RecoverySummary {
+            event_rx.recv().expect("matured summary should reach async sink"),
+            MitDiagnosticEvent::SendFailureRecovery(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 0,
             })
@@ -1369,8 +1459,8 @@ mod tests {
         let recovered_at = start + Duration::from_millis(10);
         controller.send_failure_diagnostics.record_recovery(recovered_at);
         assert_eq!(
-            controller.poll_windowed_diagnostics_at(start + Duration::from_millis(20)),
-            PendingDiagnosticFlush::default(),
+            controller.submit_windowed_diagnostics_at(start + Duration::from_millis(20)),
+            0,
             "normal flush must stay silent inside the summary window",
         );
 
@@ -1381,8 +1471,17 @@ mod tests {
         assert!(matches!(error, ControlError::SafedOut { .. }));
         assert_eq!(
             controller.force_flush_pending_diagnostics_at(Instant::now()),
-            PendingDiagnosticFlush::default(),
+            0,
             "safe-state transition must force-flush pending recovery summaries",
+        );
+        assert_eq!(
+            event_rx
+                .recv()
+                .expect("forced flush should submit pending summary to async sink"),
+            MitDiagnosticEvent::SendFailureRecovery(RecoverySummary {
+                recovery_count: 1,
+                suppressed_fault_warnings: 1,
+            })
         );
     }
 
@@ -1390,8 +1489,11 @@ mod tests {
     fn poll_windowed_diagnostics_emits_recovery_before_controller_exit() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
-        let mut controller = MitController::new(active, MitControllerConfig::default())
-            .expect("controller should build");
+        let (event_tx, event_rx) = bounded(4);
+        let dispatcher = MitDiagnosticDispatcher::for_test(event_tx);
+        let mut controller =
+            MitController::new_with_dispatcher(active, MitControllerConfig::default(), dispatcher)
+                .expect("controller should build");
         let start = Instant::now();
 
         let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
@@ -1402,25 +1504,109 @@ mod tests {
         controller.send_failure_diagnostics.record_recovery(recovered_at);
 
         assert_eq!(
-            controller.poll_windowed_diagnostics_at(start + Duration::from_millis(10)),
-            PendingDiagnosticFlush::default(),
+            controller.submit_windowed_diagnostics_at(start + Duration::from_millis(10)),
+            0,
             "the first runtime recovery summary must stay silent until the diagnostics window matures",
         );
         assert_eq!(
-            controller.poll_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
-            PendingDiagnosticFlush {
-                send_failure: Some(RecoverySummary {
-                    recovery_count: 1,
-                    suppressed_fault_warnings: 1,
-                }),
-                overrun: None,
-            },
+            controller.submit_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
+            0,
+            "mature window submission should enqueue without dropping diagnostics",
+        );
+        assert_eq!(
+            event_rx.recv().expect("runtime polling should submit a recovery event"),
+            MitDiagnosticEvent::SendFailureRecovery(RecoverySummary {
+                recovery_count: 1,
+                suppressed_fault_warnings: 1,
+            }),
             "long-running motion must surface recovery summaries before the controller exits",
         );
         assert_eq!(
             controller.force_flush_pending_diagnostics_at(start + Duration::from_millis(20)),
-            PendingDiagnosticFlush::default(),
+            0,
             "once runtime polling emitted the summary, forced flush should have nothing left to drain",
+        );
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn queued_dropped_runtime_summaries_are_reported_before_next_successful_submission() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let (event_tx, event_rx) = bounded(1);
+        let dispatcher = MitDiagnosticDispatcher::for_test(event_tx);
+        let mut controller =
+            MitController::new_with_dispatcher(active, MitControllerConfig::default(), dispatcher)
+                .expect("controller should build");
+        let start = Instant::now();
+
+        let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
+        controller
+            .send_failure_diagnostics
+            .record_recovery(start + Duration::from_millis(5));
+
+        let _ = controller.submit_windowed_diagnostics_at(start + DIAGNOSTIC_LOG_INTERVAL);
+
+        let _ = controller
+            .overrun_diagnostics
+            .record_fault(start + Duration::from_millis(10), DIAGNOSTIC_LOG_INTERVAL);
+        controller
+            .overrun_diagnostics
+            .record_recovery(start + Duration::from_millis(15));
+        let _ = controller.submit_windowed_diagnostics_at(
+            start + Duration::from_millis(15) + DIAGNOSTIC_LOG_INTERVAL,
+        );
+        assert_eq!(controller.dropped_recovery_events, 1);
+
+        drop(event_rx);
+        let (event_tx, event_rx) = bounded(4);
+        controller.diagnostic_dispatcher = MitDiagnosticDispatcher::for_test(event_tx);
+        let _ = controller
+            .send_failure_diagnostics
+            .record_fault(start + Duration::from_millis(20), DIAGNOSTIC_LOG_INTERVAL);
+        controller
+            .send_failure_diagnostics
+            .record_recovery(start + Duration::from_millis(25));
+
+        let _ = controller.submit_windowed_diagnostics_at(
+            start + Duration::from_millis(25) + DIAGNOSTIC_LOG_INTERVAL,
+        );
+        assert_eq!(
+            event_rx.recv().expect("dropped count must be replayed first"),
+            MitDiagnosticEvent::DroppedRecoveryEvents { count: 1 }
+        );
+        assert_eq!(
+            event_rx.recv().expect("current recovery must follow the dropped count"),
+            MitDiagnosticEvent::SendFailureRecovery(RecoverySummary {
+                recovery_count: 1,
+                suppressed_fault_warnings: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn disabled_dispatcher_does_not_restore_sync_hot_path_logging() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let mut controller = MitController::new_with_dispatcher(
+            active,
+            MitControllerConfig::default(),
+            MitDiagnosticDispatcher::disabled_for_test(),
+        )
+        .expect("controller should build");
+        let start = Instant::now();
+
+        let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
+        controller
+            .send_failure_diagnostics
+            .record_recovery(start + Duration::from_millis(5));
+        let recovered_at = start + Duration::from_millis(5);
+
+        assert_eq!(controller.submit_windowed_diagnostics_at(recovered_at), 0);
+        assert_eq!(
+            controller.submit_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
+            1,
+            "runtime maturity must degrade to dropped accounting instead of synchronous logging",
         );
     }
 

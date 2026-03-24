@@ -12,6 +12,7 @@ pub mod controller;
 pub(crate) mod hot_path_diagnostics;
 pub mod loop_runner;
 pub mod mit_controller;
+pub(crate) mod mit_diagnostic_dispatcher;
 pub mod pid;
 pub(crate) mod scheduler;
 pub mod trajectory;
