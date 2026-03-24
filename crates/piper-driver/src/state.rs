@@ -1869,13 +1869,11 @@ impl PiperContext {
 
     /// 发布新的控制级关节位置。
     pub fn publish_control_joint_position(&self, joint_position: JointPositionState) {
-        let mut skipped = !self.control_joint_position_candidate.try_store(joint_position);
-        if matches!(
+        let _ = self.control_joint_position_candidate.try_store(joint_position);
+        let skipped = matches!(
             self.control_pair.publish_position(joint_position),
             ControlPairPublishAttempt::SkippedNoSpareSlot
-        ) {
-            skipped = true;
-        }
+        );
         self.record_hot_snapshot_publish_skips(u64::from(skipped));
     }
 
@@ -1905,13 +1903,11 @@ impl PiperContext {
 
     /// 发布新的控制级关节动态状态。
     pub fn publish_control_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
-        let mut skipped = !self.control_joint_dynamic_candidate.try_store(joint_dynamic);
-        if matches!(
+        let _ = self.control_joint_dynamic_candidate.try_store(joint_dynamic);
+        let skipped = matches!(
             self.control_pair.publish_dynamic(joint_dynamic),
             ControlPairPublishAttempt::SkippedNoSpareSlot
-        ) {
-            skipped = true;
-        }
+        );
         self.record_hot_snapshot_publish_skips(u64::from(skipped));
     }
 
@@ -3080,6 +3076,40 @@ mod tests {
             published_before.hardware_timestamp_us,
         );
         assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 1);
+
+        drop(held_middle);
+        drop(held_oldest);
+    }
+
+    #[test]
+    fn test_control_candidate_store_failures_do_not_count_as_logical_publish_skips() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
+
+        ctx.publish_control_joint_position(sample_joint_position_state(1, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(1, 0b11_1111));
+
+        let held_oldest = ctx
+            .control_joint_position_candidate
+            .pin_slot_for_test(ctx.control_joint_position_candidate.published_slot_for_test());
+        ctx.control_joint_position_candidate
+            .store(sample_joint_position_state(1, 0b111));
+        let held_middle = ctx
+            .control_joint_position_candidate
+            .pin_slot_for_test(ctx.control_joint_position_candidate.published_slot_for_test());
+        ctx.control_joint_position_candidate
+            .store(sample_joint_position_state(1, 0b111));
+
+        ctx.publish_control_joint_position(sample_joint_position_state(2, 0b111));
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 0);
+
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(2, 0b11_1111));
+
+        assert_eq!(
+            ctx.capture_control_pair().joint_position.hardware_timestamp_us,
+            2
+        );
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 0);
 
         drop(held_middle);
         drop(held_oldest);

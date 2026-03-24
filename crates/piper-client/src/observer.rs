@@ -237,7 +237,11 @@ where
         match self.driver.get_aligned_motion(policy.max_state_skew_us) {
             AlignmentResult::Ok(state) => {
                 if !state.is_complete() {
-                    return Err(Self::incomplete_control_state_error(&state));
+                    let diagnostics = self.driver.get_control_read_diagnostics();
+                    return Err(Self::incomplete_control_state_error(
+                        diagnostics.position_candidate_mask,
+                        diagnostics.dynamic_candidate_mask,
+                    ));
                 }
 
                 let age = control_feedback_age(
@@ -269,7 +273,11 @@ where
             },
             AlignmentResult::Misaligned { state, .. } => {
                 if !state.is_complete() {
-                    return Err(Self::incomplete_control_state_error(&state));
+                    let diagnostics = self.driver.get_control_read_diagnostics();
+                    return Err(Self::incomplete_control_state_error(
+                        diagnostics.position_candidate_mask,
+                        diagnostics.dynamic_candidate_mask,
+                    ));
                 }
 
                 let age = control_feedback_age(
@@ -649,11 +657,11 @@ where
         }
     }
 
-    fn incomplete_control_state_error(state: &piper_driver::AlignedMotionState) -> RobotError {
-        RobotError::control_state_incomplete(
-            state.position_frame_valid_mask,
-            state.dynamic_valid_mask,
-        )
+    fn incomplete_control_state_error(
+        position_frame_valid_mask: u8,
+        dynamic_valid_mask: u8,
+    ) -> RobotError {
+        RobotError::control_state_incomplete(position_frame_valid_mask, dynamic_valid_mask)
     }
 
     fn complete_joint_position_state(

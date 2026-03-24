@@ -101,6 +101,16 @@ pub struct HealthStatus {
     pub fault: Option<RuntimeFaultKind>,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlReadDiagnostics {
+    pub pair_has_been_published: bool,
+    pub position_candidate_mask: u8,
+    pub dynamic_candidate_mask: u8,
+    pub position_candidate_timestamp_us: u64,
+    pub dynamic_candidate_timestamp_us: u64,
+}
+
 /// Driver 运行时阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -133,6 +143,13 @@ struct FaultLatchBarrier {
 #[cfg(test)]
 #[derive(Debug)]
 struct StateTransitionBarrier {
+    reached_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SoftRealtimeAdmissionBarrier {
     reached_tx: std::sync::mpsc::Sender<()>,
     release_rx: std::sync::mpsc::Receiver<()>,
 }
@@ -1544,6 +1561,9 @@ pub struct Piper {
     /// Test-only barrier that lets one Piper instance pause Replay mode publication.
     #[cfg(test)]
     mode_switch_replay_barrier: Mutex<Option<ModeSwitchBarrier>>,
+    /// Test-only barrier that pauses SoftRealtime admission before enqueue.
+    #[cfg(test)]
+    soft_realtime_admission_barrier: Mutex<Option<SoftRealtimeAdmissionBarrier>>,
     /// Capability of the active backend.
     backend_capability: BackendCapability,
 }
@@ -1670,6 +1690,38 @@ impl Piper {
 
     #[cfg(not(test))]
     fn maybe_wait_test_mode_switch_replay_barrier(&self) {}
+
+    #[cfg(test)]
+    fn install_soft_realtime_admission_barrier(
+        &self,
+        reached_tx: std::sync::mpsc::Sender<()>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut guard = self
+            .soft_realtime_admission_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(SoftRealtimeAdmissionBarrier {
+            reached_tx,
+            release_rx,
+        });
+    }
+
+    #[cfg(test)]
+    fn maybe_wait_test_soft_realtime_admission_barrier(&self) {
+        let barrier = self
+            .soft_realtime_admission_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.reached_tx.send(());
+            let _ = barrier.release_rx.recv();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_wait_test_soft_realtime_admission_barrier(&self) {}
 
     fn ensure_mode_allows_reliable_kind(
         &self,
@@ -1929,6 +1981,8 @@ impl Piper {
             mode_switch_lock: Mutex::new(()),
             #[cfg(test)]
             mode_switch_replay_barrier: Mutex::new(None),
+            #[cfg(test)]
+            soft_realtime_admission_barrier: Mutex::new(None),
             backend_capability,
         })
     }
@@ -2283,6 +2337,21 @@ impl Piper {
         self.ctx.capture_control_joint_dynamic()
     }
 
+    #[doc(hidden)]
+    pub fn get_control_read_diagnostics(&self) -> ControlReadDiagnostics {
+        let pair = self.ctx.capture_control_pair();
+        let position_candidate = self.ctx.capture_control_joint_position_candidate();
+        let dynamic_candidate = self.ctx.capture_control_joint_dynamic_candidate();
+
+        ControlReadDiagnostics {
+            pair_has_been_published: pair.position_sequence != 0 && pair.dynamic_sequence != 0,
+            position_candidate_mask: position_candidate.frame_valid_mask,
+            dynamic_candidate_mask: dynamic_candidate.valid_mask,
+            position_candidate_timestamp_us: position_candidate.hardware_timestamp_us,
+            dynamic_candidate_timestamp_us: dynamic_candidate.group_timestamp_us,
+        }
+    }
+
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
     pub fn get_raw_joint_dynamic(&self) -> JointDynamicState {
         *self.get_joint_dynamic_monitor_snapshot().latest_raw()
@@ -2588,17 +2657,8 @@ impl Piper {
     /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回状态数据
     pub fn get_aligned_motion(&self, max_time_diff_us: u64) -> AlignmentResult {
         let pair = self.ctx.capture_control_pair();
-        let pair_is_published = pair.position_sequence != 0 && pair.dynamic_sequence != 0;
-        let joint_position = if pair_is_published {
-            pair.joint_position
-        } else {
-            self.ctx.capture_control_joint_position_candidate()
-        };
-        let joint_dynamic = if pair_is_published {
-            pair.joint_dynamic
-        } else {
-            self.ctx.capture_control_joint_dynamic_candidate()
-        };
+        let joint_position = pair.joint_position;
+        let joint_dynamic = pair.joint_dynamic;
 
         let time_diff =
             joint_position.hardware_timestamp_us.abs_diff(joint_dynamic.group_timestamp_us);
@@ -3264,6 +3324,11 @@ impl Piper {
 
         let deadline = Instant::now() + timeout;
         if deadline <= Instant::now() {
+            return Err(DriverError::Timeout);
+        }
+
+        self.maybe_wait_test_soft_realtime_admission_barrier();
+        if Instant::now() >= deadline {
             return Err(DriverError::Timeout);
         }
 
@@ -3974,6 +4039,15 @@ mod tests {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         piper.install_mode_switch_replay_barrier(reached_tx, release_rx);
+        (reached_rx, release_tx)
+    }
+
+    fn install_soft_realtime_admission_barrier(
+        piper: &Piper,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        piper.install_soft_realtime_admission_barrier(reached_tx, release_rx);
         (reached_rx, release_tx)
     }
 
@@ -6115,6 +6189,74 @@ mod tests {
     }
 
     #[test]
+    fn test_soft_realtime_rechecks_deadline_before_enqueue_and_preserves_queue_capacity() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts(
+                SoftRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let (tx_reached_rx, tx_release_tx) = install_tx_loop_barrier(piper.as_ref());
+        tx_reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("TX loop should hit dispatch barrier");
+
+        let mut expired_handles = Vec::new();
+        for index in 0..4u8 {
+            let (admission_reached_rx, admission_release_tx) =
+                install_soft_realtime_admission_barrier(piper.as_ref());
+            let piper_for_send = Arc::clone(&piper);
+            expired_handles.push(thread::spawn(move || {
+                piper_for_send.send_soft_realtime_package_confirmed(
+                    [PiperFrame::new_standard(0x155 + u16::from(index), &[index])],
+                    Duration::from_millis(20),
+                )
+            }));
+            admission_reached_rx
+                .recv_timeout(Duration::from_millis(200))
+                .expect("soft realtime sender should block at admission barrier");
+            thread::sleep(Duration::from_millis(30));
+            admission_release_tx.send(()).expect("admission barrier should release cleanly");
+        }
+
+        let piper_for_valid_send = Arc::clone(&piper);
+        let valid_handle = thread::spawn(move || {
+            piper_for_valid_send.send_soft_realtime_package_confirmed(
+                [PiperFrame::new_standard(0x159, &[0xFF])],
+                Duration::from_millis(200),
+            )
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        tx_release_tx.send(()).expect("TX loop barrier should release cleanly");
+
+        for handle in expired_handles {
+            let result = handle.join().expect("expired sender thread should join");
+            assert!(
+                matches!(result, Err(DriverError::Timeout)),
+                "admission-expired command must fail before enqueue: {result:?}",
+            );
+        }
+
+        let valid_result = valid_handle.join().expect("valid sender thread should join");
+        assert!(
+            valid_result.is_ok(),
+            "admission-expired commands must not consume soft queue capacity: {valid_result:?}",
+        );
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "only the valid soft realtime command should reach the bus",
+        );
+    }
+
+    #[test]
     fn test_soft_realtime_sub_millisecond_remaining_budget_is_not_rounded_up() {
         let piper = Piper::new_dual_thread_parts(
             SoftRxAdapter,
@@ -6270,6 +6412,35 @@ mod tests {
 
         assert_eq!(state.position_frame_valid_mask, 0b101);
         assert_eq!(state.dynamic_valid_mask, 0b001111);
+        assert!(!state.is_complete());
+    }
+
+    #[test]
+    fn test_get_aligned_motion_without_coherent_pair_does_not_expose_candidate_values() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 1_000,
+            host_rx_mono_us: 2_000,
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        });
+
+        let result = piper.get_aligned_motion(5_000);
+        let state = match result {
+            AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
+        };
+
+        assert_eq!(state.position_timestamp_us, 0);
+        assert_eq!(state.dynamic_timestamp_us, 0);
+        assert_eq!(state.position_host_rx_mono_us, 0);
+        assert_eq!(state.dynamic_host_rx_mono_us, 0);
+        assert_eq!(state.position_frame_valid_mask, 0);
+        assert_eq!(state.dynamic_valid_mask, 0);
+        assert_eq!(state.joint_pos, [0.0; 6]);
+        assert_eq!(state.joint_vel, [0.0; 6]);
+        assert_eq!(state.joint_current, [0.0; 6]);
         assert!(!state.is_complete());
     }
 
