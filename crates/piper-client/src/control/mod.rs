@@ -19,7 +19,7 @@ pub mod zeroing_token;
 // 重新导出常用类型
 pub use controller::Controller;
 pub use loop_runner::{LoopConfig, run_controller};
-pub use mit_controller::{ControlError, MitController, MitControllerConfig};
+pub use mit_controller::{ControlError, MitController, MitControllerConfig, SafeAction};
 pub use pid::PidController;
 pub use trajectory::TrajectoryPlanner;
 pub use zeroing_token::{ZeroingConfirmToken, ZeroingTokenError};

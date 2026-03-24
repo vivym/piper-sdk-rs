@@ -28,7 +28,7 @@ use crate::{
 };
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
-use piper_protocol::ids::is_robot_feedback_id;
+use piper_protocol::ids::{driver_rx_robot_feedback_ids, is_robot_feedback_id};
 use socketcan::{
     BlockingCan, CanError as SocketCanError, CanErrorFrame, CanFilter, CanFrame, CanSocket,
     EmbeddedFrame, ExtendedId, Frame, Socket, SocketOptions, StandardId,
@@ -125,6 +125,14 @@ fn classify_startup_probe_frame(
     }
 }
 
+fn hardware_filter_ids() -> &'static [u32] {
+    driver_rx_robot_feedback_ids()
+}
+
+fn should_buffer_bootstrap_frame(frame: &PiperFrame) -> bool {
+    !frame.is_extended && is_robot_feedback_id(frame.id)
+}
+
 /// 只读适配器（用于 RX 线程）
 ///
 /// 独立的 RX 适配器，持有 `CanSocket` 的克隆，
@@ -170,10 +178,9 @@ impl SocketCanRxAdapter {
             )))
         })?;
 
-        // 注意：硬件过滤器默认关闭，因为 feedback_ids 列表可能不完整
-        // 如果需要启用硬件过滤器以降低 CPU 占用，可以取消下面的注释
-        // 但需要确保 feedback_ids 列表包含所有需要的 CAN ID
-        // Self::configure_hardware_filters(&rx_socket)?;
+        // 在 split RX 路径上默认启用 robot-only kernel filter，避免共享总线噪声
+        // 进入实时反馈/启动探测路径。
+        Self::configure_hardware_filters(&rx_socket)?;
 
         // ✅ 检查时间戳是否已启用（从原始 socket 继承）
         // SocketCanAdapter 在初始化时已启用 SO_TIMESTAMPING
@@ -213,36 +220,9 @@ impl SocketCanRxAdapter {
     /// # 错误
     /// - `CanError::Io`: 设置过滤器失败
     ///
-    /// # 注意
-    /// 此函数当前未使用（硬件过滤器默认关闭），但保留以备将来需要时使用。
-    #[allow(dead_code)]
     fn configure_hardware_filters(socket: &CanSocket) -> Result<(), CanError> {
-        // 定义需要接收的 CAN ID 列表
-        // 包括所有机械臂反馈帧：
-        // - 关节位置反馈: 0x2A5, 0x2A6, 0x2A7
-        // - 关节动态状态: 0x251-0x256
-        // - 末端位姿反馈: 0x2A2, 0x2A3, 0x2A4
-        // - 机器人状态: 0x2A1
-        // - 夹爪反馈: 0x2A8
-        let mut feedback_ids = Vec::new();
-
-        // 关节位置反馈 (0x2A5-0x2A7)
-        feedback_ids.extend_from_slice(&[0x2A5, 0x2A6, 0x2A7]);
-
-        // 关节动态状态 (0x251-0x256)
-        feedback_ids.extend((0x251..=0x256).collect::<Vec<u32>>());
-
-        // 末端位姿反馈 (0x2A2-0x2A4)
-        feedback_ids.extend_from_slice(&[0x2A2, 0x2A3, 0x2A4]);
-
-        // 机器人状态 (0x2A1)
-        feedback_ids.push(0x2A1);
-
-        // 夹爪反馈 (0x2A8)
-        feedback_ids.push(0x2A8);
-
         // 创建过滤器（精确匹配）
-        let filters: Vec<CanFilter> = feedback_ids
+        let filters: Vec<CanFilter> = hardware_filter_ids()
             .iter()
             .map(|&id| {
                 // 使用 0x7FF 作为掩码，实现精确匹配（标准帧）
@@ -260,7 +240,7 @@ impl SocketCanRxAdapter {
         })?;
 
         trace!(
-            "SocketCAN hardware filters configured: {} IDs (0x2A1, 0x2A2-0x2A4, 0x2A5-0x2A7, 0x2A8, 0x251-0x256)",
+            "SocketCAN hardware filters configured for {} robot feedback IDs",
             filters.len()
         );
 
@@ -438,7 +418,9 @@ impl RxAdapter for SocketCanRxAdapter {
             match self.receive_live(timeout) {
                 Ok(received) => {
                     let frame = received.frame;
-                    self.bootstrap_frames.push_back(frame);
+                    if should_buffer_bootstrap_frame(&frame) {
+                        self.bootstrap_frames.push_back(frame);
+                    }
                     let Some(capability) =
                         classify_startup_probe_frame(&frame, received.timestamp_source)
                     else {
@@ -464,7 +446,9 @@ impl RxAdapter for SocketCanRxAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piper_protocol::ids::{ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34};
+    use piper_protocol::ids::{
+        ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, driver_rx_robot_feedback_ids,
+    };
 
     #[test]
     fn test_classify_startup_probe_frame_accepts_hardware_timestamped_robot_feedback() {
@@ -497,6 +481,20 @@ mod tests {
             classify_startup_probe_frame(&noise_frame, TimestampSource::Hardware),
             None
         );
+    }
+
+    #[test]
+    fn test_hardware_filter_ids_match_protocol_driver_feedback_surface() {
+        assert_eq!(hardware_filter_ids(), driver_rx_robot_feedback_ids());
+    }
+
+    #[test]
+    fn test_startup_probe_buffers_only_robot_feedback_frames() {
+        let robot_frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
+        let noise_frame = PiperFrame::new_standard(0x7FF, &[0; 8]);
+
+        assert!(should_buffer_bootstrap_frame(&robot_frame));
+        assert!(!should_buffer_bootstrap_frame(&noise_frame));
     }
 }
 

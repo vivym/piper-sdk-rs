@@ -32,8 +32,10 @@
 //! #
 //! // 创建控制器配置
 //! let config = MitControllerConfig {
-//!     kp_gains: [5.0; 6],  // Nm/rad
-//!     kd_gains: [0.8; 6],  // Nm/(rad/s)
+//!     kp_gains: [5.0; 6],        // Nm/rad
+//!     kd_gains: [0.8; 6],        // Nm/(rad/s)
+//!     safe_hold_kp_gains: [5.0; 6],
+//!     safe_hold_kd_gains: [0.8; 6],
 //!     rest_position: None,
 //!     control_rate: 200.0,
 //!     read_policy: ControlReadPolicy::default(), // 默认严格控制级新鲜度（15ms）
@@ -61,9 +63,10 @@
 //! ```
 
 use std::time::{Duration, Instant};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::observer::{ControlReadPolicy, Observer};
+use crate::raw_commander::RawCommander;
 use crate::state::StrictRealtime;
 use crate::state::machine::{Active, DisableConfig, MitMode, Piper, Standby};
 use crate::types::*;
@@ -83,6 +86,16 @@ pub struct MitControllerConfig {
     /// 单位：Nm/(rad/s)
     /// 典型值：0.3 - 1.5
     pub kd_gains: [f64; 6],
+
+    /// 故障收口时使用的位置保持 Kp 增益（每个关节独立）
+    ///
+    /// 仅用于 fail-closed safe-hold，不会覆盖正常控制回路的用户增益。
+    pub safe_hold_kp_gains: [f64; 6],
+
+    /// 故障收口时使用的位置保持 Kd 增益（每个关节独立）
+    ///
+    /// 仅用于 fail-closed safe-hold，不会覆盖正常控制回路的用户增益。
+    pub safe_hold_kd_gains: [f64; 6],
 
     /// 显式回位使用的休息位置目标
     ///
@@ -107,11 +120,22 @@ impl Default for MitControllerConfig {
         Self {
             kp_gains: [5.0; 6],
             kd_gains: [0.8; 6],
+            safe_hold_kp_gains: [5.0; 6],
+            safe_hold_kd_gains: [0.8; 6],
             rest_position: None,
             control_rate: 200.0,
             read_policy: ControlReadPolicy::default(),
         }
     }
+}
+
+/// Safe-state action taken before the controller latched into terminal fail-closed mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeAction {
+    /// Sent a zero-velocity MIT hold command at the latest valid joint anchor.
+    HoldPosition,
+    /// Enqueued a bounded shutdown-lane emergency stop.
+    EmergencyStop,
 }
 
 /// 控制错误
@@ -126,6 +150,14 @@ pub enum ControlError {
         "Rest position is not configured; call move_to_position() explicitly or set MitControllerConfig::rest_position"
     )]
     RestPositionNotConfigured,
+
+    /// 控制器已进入 fail-closed 终态，只允许 `park()` 或 drop 安全退出
+    #[error("Controller entered fail-closed safe state via {action:?}: {source}")]
+    SafedOut {
+        action: SafeAction,
+        #[source]
+        source: Box<RobotError>,
+    },
 
     /// 连续错误超过阈值
     #[error("Consecutive CAN failures: {count}, last error: {last_error}")]
@@ -160,6 +192,21 @@ pub struct MitController {
 
     /// 控制器配置
     config: MitControllerConfig,
+
+    /// 最近一次成功闭环快照锚点，用于故障收口 safe-hold
+    last_hold_anchor: Option<JointArray<Rad>>,
+
+    /// 是否已进入终态 safe-out
+    safed_out: bool,
+
+    /// safe-out 终态的行为与原因
+    safe_state: Option<SafeStateLatch>,
+
+    /// 控制发送错误诊断限速状态
+    send_failure_warnings: RepeatedWarningState,
+
+    /// 控制循环 overrun 诊断限速状态
+    overrun_warnings: RepeatedWarningState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +221,64 @@ enum CommandCycleDisposition {
     CheckReached { next_error_count: u32 },
     MissedCycle { next_error_count: u32 },
     Abort { failure_count: u32 },
+}
+
+const DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const SAFE_STATE_DEADLINE: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone)]
+struct SafeStateLatch {
+    action: SafeAction,
+    reason: String,
+}
+
+#[derive(Debug, Default)]
+struct RepeatedWarningState {
+    active: bool,
+    last_emitted_at: Option<Instant>,
+    suppressed_repeats: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarningDecision {
+    Emit { suppressed_repeats: u32 },
+    Suppress,
+}
+
+impl RepeatedWarningState {
+    fn record_event(&mut self, now: Instant, interval: Duration) -> WarningDecision {
+        if !self.active {
+            self.active = true;
+            self.last_emitted_at = Some(now);
+            self.suppressed_repeats = 0;
+            return WarningDecision::Emit {
+                suppressed_repeats: 0,
+            };
+        }
+
+        if self
+            .last_emitted_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        {
+            let suppressed_repeats = self.suppressed_repeats;
+            self.last_emitted_at = Some(now);
+            self.suppressed_repeats = 0;
+            WarningDecision::Emit { suppressed_repeats }
+        } else {
+            self.suppressed_repeats = self.suppressed_repeats.saturating_add(1);
+            WarningDecision::Suppress
+        }
+    }
+
+    fn record_recovery(&mut self) -> Option<u32> {
+        if !self.active {
+            return None;
+        }
+
+        self.active = false;
+        self.last_emitted_at = None;
+        Some(std::mem::take(&mut self.suppressed_repeats))
+    }
 }
 
 fn finalize_tick_schedule(now: Instant, cycle_deadline: Instant, period: Duration) -> TickSchedule {
@@ -218,19 +323,6 @@ fn classify_command_cycle(
     }
 }
 
-fn run_cycle_epilogue(next_tick: &mut Instant, period: Duration) {
-    let schedule = finalize_tick_schedule(Instant::now(), *next_tick, period);
-    if let Some(sleep_duration) = schedule.sleep_duration {
-        spin_sleep::sleep(sleep_duration);
-    } else {
-        warn!(
-            "Control loop overrun: operation missed deadline by {:?} (period {:?}); skipping sleep and preserving anchored schedule.",
-            schedule.overrun_lateness, period,
-        );
-    }
-    *next_tick = schedule.next_cycle_deadline;
-}
-
 impl MitController {
     /// 创建新的 MIT 控制器
     ///
@@ -263,6 +355,8 @@ impl MitController {
             ));
         }
 
+        Self::validate_config(&config)?;
+
         // 提取 observer（Clone 是轻量的，Arc 指针）
         let observer = piper.observer().clone();
 
@@ -270,7 +364,139 @@ impl MitController {
             piper: Some(piper),
             observer,
             config,
+            last_hold_anchor: None,
+            safed_out: false,
+            safe_state: None,
+            send_failure_warnings: RepeatedWarningState::default(),
+            overrun_warnings: RepeatedWarningState::default(),
         })
+    }
+
+    fn validate_config(config: &MitControllerConfig) -> Result<()> {
+        if !config.control_rate.is_finite() || config.control_rate <= 0.0 {
+            return Err(RobotError::ConfigError(
+                "MitControllerConfig.control_rate must be finite and > 0.0".to_string(),
+            ));
+        }
+
+        Self::validate_gain_array("MitControllerConfig.kp_gains", &config.kp_gains)?;
+        Self::validate_gain_array("MitControllerConfig.kd_gains", &config.kd_gains)?;
+        Self::validate_gain_array(
+            "MitControllerConfig.safe_hold_kp_gains",
+            &config.safe_hold_kp_gains,
+        )?;
+        Self::validate_gain_array(
+            "MitControllerConfig.safe_hold_kd_gains",
+            &config.safe_hold_kd_gains,
+        )?;
+
+        Ok(())
+    }
+
+    fn validate_gain_array(name: &str, gains: &[f64; 6]) -> Result<()> {
+        for (index, gain) in gains.iter().copied().enumerate() {
+            if !gain.is_finite() || gain < 0.0 {
+                return Err(RobotError::ConfigError(format!(
+                    "{name}[{}] must be finite and non-negative",
+                    index + 1
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn active_piper(&self) -> crate::types::Result<&Piper<Active<MitMode>, StrictRealtime>> {
+        self.piper.as_ref().ok_or(RobotError::InvalidTransition {
+            from: "Active<MitMode>".to_string(),
+            to: "Standby".to_string(),
+        })
+    }
+
+    fn ensure_motion_allowed(&self) -> core::result::Result<(), ControlError> {
+        if self.safed_out {
+            return Err(self.safed_out_error());
+        }
+        if self.piper.is_none() {
+            return Err(ControlError::AlreadyParked);
+        }
+        Ok(())
+    }
+
+    fn safed_out_error(&self) -> ControlError {
+        let (action, reason) = match &self.safe_state {
+            Some(latch) => (latch.action, latch.reason.clone()),
+            None => (
+                SafeAction::EmergencyStop,
+                "controller is already latched in fail-closed mode".to_string(),
+            ),
+        };
+
+        ControlError::SafedOut {
+            action,
+            source: Box::new(RobotError::StatePoisoned { reason }),
+        }
+    }
+
+    fn latch_safe_state(&mut self, action: SafeAction, reason: impl Into<String>) {
+        self.safed_out = true;
+        self.safe_state = Some(SafeStateLatch {
+            action,
+            reason: reason.into(),
+        });
+    }
+
+    fn log_transient_send_failure(&mut self, error_count: u32, error: &RobotError) {
+        match self.send_failure_warnings.record_event(Instant::now(), DIAGNOSTIC_LOG_INTERVAL) {
+            WarningDecision::Emit { suppressed_repeats } => warn!(
+                "Transient CAN error ({}): {:?}. Preserving anchored schedule. Suppressed {} repeated warning(s) in the last window.",
+                error_count, error, suppressed_repeats,
+            ),
+            WarningDecision::Suppress => {},
+        }
+    }
+
+    fn log_send_failure_recovered(&mut self) {
+        if let Some(suppressed_repeats) = self.send_failure_warnings.record_recovery() {
+            info!(
+                "MIT control send path recovered after transient failures. Suppressed {} repeated warning(s).",
+                suppressed_repeats,
+            );
+        }
+    }
+
+    fn run_cycle_epilogue(&mut self, next_tick: &mut Instant, period: Duration) {
+        let schedule = finalize_tick_schedule(Instant::now(), *next_tick, period);
+        if let Some(sleep_duration) = schedule.sleep_duration {
+            if let Some(suppressed_repeats) = self.overrun_warnings.record_recovery() {
+                info!(
+                    "MIT control loop returned within budget. Suppressed {} repeated overrun warning(s).",
+                    suppressed_repeats,
+                );
+            }
+            spin_sleep::sleep(sleep_duration);
+        } else {
+            match self.overrun_warnings.record_event(Instant::now(), DIAGNOSTIC_LOG_INTERVAL) {
+                WarningDecision::Emit { suppressed_repeats } => warn!(
+                    "Control loop overrun: operation missed deadline by {:?} (period {:?}); skipping sleep and preserving anchored schedule. Suppressed {} repeated warning(s) in the last window.",
+                    schedule.overrun_lateness, period, suppressed_repeats,
+                ),
+                WarningDecision::Suppress => {},
+            }
+        }
+        *next_tick = schedule.next_cycle_deadline;
+    }
+
+    fn command_joints_with_gains(
+        &self,
+        target: JointArray<Rad>,
+        feedforward: Option<JointArray<NewtonMeter>>,
+        kp: JointArray<f64>,
+        kd: JointArray<f64>,
+    ) -> crate::types::Result<()> {
+        let velocities = JointArray::from([0.0; 6]);
+        let torques = feedforward.unwrap_or(JointArray::from([NewtonMeter(0.0); 6]));
+        self.active_piper()?.command_torques(&target, &velocities, &kp, &kd, &torques)
     }
 
     /// 阻塞式运动到目标位置
@@ -294,7 +520,7 @@ impl MitController {
     ///
     /// - `Ok(true)`: 到达目标
     /// - `Ok(false)`: 超时未到达
-    /// - `Err(ControlError::ConsecutiveFailures)`: 连续错误超过阈值
+    /// - `Err(ControlError::SafedOut)`: 控制器已执行 safe-hold 或 emergency-stop 并锁成终态
     ///
     /// # 示例
     ///
@@ -318,6 +544,8 @@ impl MitController {
         timeout: Duration,
     ) -> core::result::Result<bool, ControlError> {
         const MAX_TOLERANCE: u32 = 5; // 允许连续 5 个失败控制周期（25ms @ 200Hz）
+        self.ensure_motion_allowed()?;
+
         let mut error_count = 0;
 
         let start = Instant::now();
@@ -325,9 +553,6 @@ impl MitController {
         // 使用绝对时间锚点机制消除累积漂移，保证精确的 200Hz 控制频率
         let period = Duration::from_secs_f64(1.0 / self.config.control_rate); // 5ms @ 200Hz
         let mut next_tick = Instant::now() + period;
-
-        // 提取 piper 引用（避免每次都解 Option）
-        let _piper = self.piper.as_ref().ok_or(ControlError::AlreadyParked)?;
 
         while start.elapsed() < timeout {
             let command_result = self.command_joints(JointArray::from(target), None);
@@ -337,8 +562,13 @@ impl MitController {
             match (command_result, cycle_disposition) {
                 (Ok(()), CommandCycleDisposition::CheckReached { next_error_count }) => {
                     error_count = next_error_count;
+                    self.log_send_failure_recovered();
 
-                    let current = self.observer.control_snapshot(self.config.read_policy)?.position;
+                    let current = match self.observer.control_snapshot(self.config.read_policy) {
+                        Ok(snapshot) => snapshot.position,
+                        Err(error) => return Err(self.enter_safe_state(error)),
+                    };
+                    self.last_hold_anchor = Some(current);
                     let reached =
                         current.iter().zip(target.iter()).all(|(c, t)| (*c - *t).abs() < threshold);
 
@@ -348,25 +578,19 @@ impl MitController {
                 },
                 (Err(e), CommandCycleDisposition::MissedCycle { next_error_count }) => {
                     error_count = next_error_count;
-                    warn!(
-                        "Transient CAN error ({}): {:?}, marking this tick as a missed control cycle and preserving anchored schedule.",
-                        error_count, e
-                    );
+                    self.log_transient_send_failure(error_count, &e);
                 },
                 (Err(e), CommandCycleDisposition::Abort { failure_count }) => {
                     error!(
-                        "Consecutive CAN failures ({}): {:?}. Aborting motion.",
+                        "Consecutive CAN failures ({}): {:?}. Entering fail-closed safe state.",
                         failure_count, e
                     );
-                    return Err(ControlError::ConsecutiveFailures {
-                        count: failure_count,
-                        last_error: Box::new(e),
-                    });
+                    return Err(self.enter_safe_state(e));
                 },
                 _ => unreachable!("command result classification must stay consistent"),
             }
 
-            run_cycle_epilogue(&mut next_tick, period);
+            self.run_cycle_epilogue(&mut next_tick, period);
         }
 
         Ok(false)
@@ -381,6 +605,7 @@ impl MitController {
         threshold: Rad,
         timeout: Duration,
     ) -> core::result::Result<bool, ControlError> {
+        self.ensure_motion_allowed()?;
         let target = self.config.rest_position.ok_or(ControlError::RestPositionNotConfigured)?;
         self.move_to_position(target, threshold, timeout)
     }
@@ -399,31 +624,106 @@ impl MitController {
         target: JointArray<Rad>,
         feedforward: Option<JointArray<NewtonMeter>>,
     ) -> crate::types::Result<()> {
-        // 使用配置中的每个关节独立的 kp/kd 增益
-        let kp = JointArray::from(self.config.kp_gains);
-        let kd = JointArray::from(self.config.kd_gains);
+        self.command_joints_with_gains(
+            target,
+            feedforward,
+            JointArray::from(self.config.kp_gains),
+            JointArray::from(self.config.kd_gains),
+        )
+    }
 
-        // 速度参考（目标速度，通常为 0）
+    fn send_safe_hold(&self, anchor: JointArray<Rad>) -> crate::types::Result<()> {
         let velocities = JointArray::from([0.0; 6]);
+        let torques = JointArray::from([NewtonMeter(0.0); 6]);
+        self.active_piper()?.command_torques_confirmed(
+            &anchor,
+            &velocities,
+            &JointArray::from(self.config.safe_hold_kp_gains),
+            &JointArray::from(self.config.safe_hold_kd_gains),
+            &torques,
+            SAFE_STATE_DEADLINE,
+        )
+    }
 
-        // 前馈力矩（可选）
-        let torques = match feedforward {
-            Some(ff) => ff,
-            None => JointArray::from([NewtonMeter(0.0); 6]),
-        };
+    fn enqueue_emergency_stop(&self) -> crate::types::Result<()> {
+        let receipt = RawCommander::new(&self.active_piper()?.driver)
+            .emergency_stop_enqueue(Instant::now() + SAFE_STATE_DEADLINE)?;
+        receipt.wait()?;
+        Ok(())
+    }
 
-        // 直接传递 kp/kd 增益到底层，让固件进行 PD 计算
-        let piper =
-            self.piper.as_ref().ok_or(ControlError::AlreadyParked).map_err(|e| match e {
-                ControlError::AlreadyParked => crate::RobotError::InvalidTransition {
-                    from: "Active<MitMode>".to_string(),
-                    to: "Standby".to_string(),
+    fn enter_safe_state(&mut self, cause: RobotError) -> ControlError {
+        let cause_text = cause.to_string();
+
+        if let Some(anchor) = self.last_hold_anchor {
+            match self.send_safe_hold(anchor) {
+                Ok(()) => {
+                    self.latch_safe_state(
+                        SafeAction::HoldPosition,
+                        format!("safe-hold latched after {cause_text}"),
+                    );
+                    return ControlError::SafedOut {
+                        action: SafeAction::HoldPosition,
+                        source: Box::new(cause),
+                    };
                 },
-                _ => crate::RobotError::StatePoisoned {
-                    reason: format!("Controller error: {:?}", e),
+                Err(hold_error) => {
+                    error!(
+                        "MIT controller safe-hold send failed after {}: {:?}. Falling back to emergency stop.",
+                        cause_text, hold_error,
+                    );
+                    match self.enqueue_emergency_stop() {
+                        Ok(()) => {
+                            self.latch_safe_state(
+                                SafeAction::EmergencyStop,
+                                format!(
+                                    "emergency stop latched after {cause_text} and safe-hold failure {hold_error}"
+                                ),
+                            );
+                            return ControlError::SafedOut {
+                                action: SafeAction::EmergencyStop,
+                                source: Box::new(cause),
+                            };
+                        },
+                        Err(stop_error) => {
+                            self.latch_safe_state(
+                                SafeAction::EmergencyStop,
+                                format!(
+                                    "emergency stop failed after {cause_text}; safe-hold failure: {hold_error}; stop failure: {stop_error}"
+                                ),
+                            );
+                            return ControlError::SafedOut {
+                                action: SafeAction::EmergencyStop,
+                                source: Box::new(stop_error),
+                            };
+                        },
+                    }
                 },
-            })?;
-        piper.command_torques(&target, &velocities, &kp, &kd, &torques)
+            }
+        }
+
+        match self.enqueue_emergency_stop() {
+            Ok(()) => {
+                self.latch_safe_state(
+                    SafeAction::EmergencyStop,
+                    format!("emergency stop latched after {cause_text}"),
+                );
+                ControlError::SafedOut {
+                    action: SafeAction::EmergencyStop,
+                    source: Box::new(cause),
+                }
+            },
+            Err(stop_error) => {
+                self.latch_safe_state(
+                    SafeAction::EmergencyStop,
+                    format!("emergency stop failed after {cause_text}: {stop_error}"),
+                );
+                ControlError::SafedOut {
+                    action: SafeAction::EmergencyStop,
+                    source: Box::new(stop_error),
+                }
+            },
+        }
     }
 
     /// 放松关节（发送零力矩命令）
@@ -431,37 +731,27 @@ impl MitController {
     /// **注意**：此方法只发送一次零力矩命令，不会阻塞。
     /// 如果需要让关节自然下垂，应该多次调用或在循环中调用。
     ///
-    /// # 软降级
-    ///
-    /// 如果发送失败，只记录警告，不返回错误（软降级策略）。
+    /// 如果控制器已经进入 `SafedOut` 终态，则会拒绝继续发命令。
     ///
     /// # 示例
     ///
     /// ```rust,no_run
     /// # use piper_client::control::MitController;
     /// # let mut controller: MitController = unsafe { std::mem::zeroed() };
-    /// controller.relax_joints();
+    /// # // controller.relax_joints()?;
     /// ```
-    pub fn relax_joints(&mut self) {
+    pub fn relax_joints(&mut self) -> core::result::Result<(), ControlError> {
+        self.ensure_motion_allowed()?;
+
         let zero_pos = JointArray::from([Rad(0.0); 6]);
         let zero_vel = JointArray::from([0.0; 6]);
         let zero_kp = JointArray::from([0.0; 6]);
         let zero_kd = JointArray::from([0.0; 6]);
         let zero_torques = JointArray::from([NewtonMeter(0.0); 6]);
 
-        let piper = match self.piper.as_ref() {
-            Some(p) => p,
-            None => {
-                warn!("Cannot relax joints: Piper already consumed");
-                return;
-            },
-        };
-
-        if let Err(e) =
-            piper.command_torques(&zero_pos, &zero_vel, &zero_kp, &zero_kd, &zero_torques)
-        {
-            warn!("Failed to relax joints: {:?}. Continuing anyway.", e);
-        }
+        self.active_piper()?
+            .command_torques(&zero_pos, &zero_vel, &zero_kp, &zero_kd, &zero_torques)
+            .map_err(ControlError::from)
     }
 
     /// 停车（只失能并返还 `Piper<Standby>`）
@@ -506,15 +796,19 @@ impl MitController {
         config: DisableConfig,
     ) -> crate::types::Result<Piper<Standby, StrictRealtime>> {
         // 安全提取 piper（Option 变为 None）
-        let piper = self.piper.take().ok_or(ControlError::AlreadyParked).map_err(|e| match e {
-            ControlError::AlreadyParked => crate::RobotError::InvalidTransition {
-                from: "Active<MitMode>".to_string(),
-                to: "Standby".to_string(),
-            },
-            _ => crate::RobotError::StatePoisoned {
-                reason: format!("Controller error: {:?}", e),
-            },
-        })?;
+        let piper =
+            self.piper
+                .take()
+                .ok_or(ControlError::AlreadyParked)
+                .map_err(|error| match error {
+                    ControlError::AlreadyParked => crate::RobotError::InvalidTransition {
+                        from: "Active<MitMode>".to_string(),
+                        to: "Standby".to_string(),
+                    },
+                    _ => crate::RobotError::StatePoisoned {
+                        reason: format!("Controller error: {:?}", error),
+                    },
+                })?;
 
         // 失能并返回到 Standby 状态
         piper.disable(config)
@@ -524,17 +818,357 @@ impl MitController {
     pub fn observer(&self) -> &Observer<StrictRealtime> {
         &self.observer
     }
+
+    /// Returns whether this controller has already latched into fail-closed terminal state.
+    pub fn is_safed_out(&self) -> bool {
+        self.safed_out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observer::Observer;
+    use crate::state::machine::{DriverModeDropPolicy, DropPolicy};
+    use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
+    use piper_driver::Piper as RobotPiper;
+    use piper_protocol::control::{EmergencyStopCommand, MitControlCommand, MotorEnableCommand};
+    use piper_protocol::ids::{
+        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE, ID_JOINT_FEEDBACK_12,
+        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
+    };
+    use semver::Version;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[derive(Default)]
+    struct DisableFeedbackHarness {
+        pending_disabled_frames: AtomicUsize,
+        next_timestamp_us: AtomicU64,
+    }
+
+    impl DisableFeedbackHarness {
+        fn arm_disabled_cycle(&self) {
+            self.pending_disabled_frames.store(6, Ordering::Release);
+        }
+
+        fn next_disabled_joint(&self) -> Option<u8> {
+            loop {
+                let pending = self.pending_disabled_frames.load(Ordering::Acquire);
+                if pending == 0 {
+                    return None;
+                }
+                let next = pending - 1;
+                if self
+                    .pending_disabled_frames
+                    .compare_exchange(pending, next, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Some((6 - next) as u8);
+                }
+            }
+        }
+
+        fn next_timestamp_us(&self) -> u64 {
+            self.next_timestamp_us.fetch_add(1, Ordering::Relaxed) + 10_000
+        }
+    }
+
+    struct DisableAwareRxAdapter<R> {
+        inner: R,
+        harness: Arc<DisableFeedbackHarness>,
+    }
+
+    impl<R> DisableAwareRxAdapter<R> {
+        fn new(inner: R, harness: Arc<DisableFeedbackHarness>) -> Self {
+            Self { inner, harness }
+        }
+    }
+
+    impl<R> RxAdapter for DisableAwareRxAdapter<R>
+    where
+        R: RxAdapter,
+    {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            match self.inner.receive() {
+                Ok(frame) => Ok(frame),
+                Err(CanError::Timeout) => {
+                    let Some(joint_index) = self.harness.next_disabled_joint() else {
+                        return Err(CanError::Timeout);
+                    };
+                    Ok(joint_driver_low_speed_frame(
+                        joint_index,
+                        false,
+                        self.harness.next_timestamp_us(),
+                    ))
+                },
+                Err(error) => Err(error),
+            }
+        }
+
+        fn backend_capability(&self) -> piper_can::BackendCapability {
+            self.inner.backend_capability()
+        }
+
+        fn startup_probe_until(
+            &mut self,
+            deadline: Instant,
+        ) -> std::result::Result<Option<piper_can::BackendCapability>, CanError> {
+            self.inner.startup_probe_until(deadline)
+        }
+    }
+
+    struct DisableAwareTxAdapter<T> {
+        inner: T,
+        harness: Arc<DisableFeedbackHarness>,
+    }
+
+    impl<T> DisableAwareTxAdapter<T> {
+        fn new(inner: T, harness: Arc<DisableFeedbackHarness>) -> Self {
+            Self { inner, harness }
+        }
+
+        fn is_disable_all_frame(&self, frame: PiperFrame) -> bool {
+            let disable_all = MotorEnableCommand::disable_all().to_frame();
+            frame.id == disable_all.id && frame.data == disable_all.data
+        }
+    }
+
+    impl<T> RealtimeTxAdapter for DisableAwareTxAdapter<T>
+    where
+        T: RealtimeTxAdapter,
+    {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            let should_arm = self.is_disable_all_frame(frame);
+            let result = self.inner.send_control(frame, budget);
+            if should_arm && result.is_ok() {
+                self.harness.arm_disabled_cycle();
+            }
+            result
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            let should_arm = self.is_disable_all_frame(frame);
+            let result = self.inner.send_shutdown_until(frame, deadline);
+            if should_arm && result.is_ok() {
+                self.harness.arm_disabled_cycle();
+            }
+            result
+        }
+    }
+
+    struct ScriptedRxAdapter {
+        frames: VecDeque<PiperFrame>,
+    }
+
+    impl ScriptedRxAdapter {
+        fn new(frames: Vec<PiperFrame>) -> Self {
+            Self {
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl RxAdapter for ScriptedRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            self.frames.pop_front().ok_or(CanError::Timeout)
+        }
+    }
+
+    struct RecordingTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    }
+
+    impl RecordingTxAdapter {
+        fn new(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> Self {
+            Self { sent_frames }
+        }
+    }
+
+    impl RealtimeTxAdapter for RecordingTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
+    fn joint_feedback_frame(
+        can_id: u16,
+        first_deg_milli: i32,
+        second_deg_milli: i32,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
+        data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(can_id, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn joint_dynamic_frame(
+        joint_index: u8,
+        speed_millirad_per_sec: i16,
+        current_milliamp: i16,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&speed_millirad_per_sec.to_be_bytes());
+        data[2..4].copy_from_slice(&current_milliamp.to_be_bytes());
+        data[4..8].copy_from_slice(&0i32.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(
+            (ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1)) as u16,
+            &data,
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn joint_driver_low_speed_frame(
+        joint_index: u8,
+        enabled: bool,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&240u16.to_be_bytes());
+        data[2..4].copy_from_slice(&45i16.to_be_bytes());
+        data[4] = 50;
+        data[5] = if enabled { 0x40 } else { 0x00 };
+        data[6..8].copy_from_slice(&5000u16.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(
+            (ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index - 1)) as u16,
+            &data,
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn scripted_frames(timestamp_us: u64) -> Vec<PiperFrame> {
+        vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 0, timestamp_us),
+            joint_dynamic_frame(2, 0, 0, timestamp_us),
+            joint_dynamic_frame(3, 0, 0, timestamp_us),
+            joint_dynamic_frame(4, 0, 0, timestamp_us),
+            joint_dynamic_frame(5, 0, 0, timestamp_us),
+            joint_dynamic_frame(6, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(1, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(2, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(3, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(4, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(5, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(6, 0, 0, timestamp_us + 1),
+        ]
+    }
+
+    fn build_active_mit_piper_with_adapters<R, T>(
+        rx_adapter: R,
+        tx_adapter: T,
+        post_feedback_delay: Duration,
+    ) -> Piper<Active<MitMode>, StrictRealtime>
+    where
+        R: RxAdapter + Send + 'static,
+        T: RealtimeTxAdapter + Send + 'static,
+    {
+        let disable_feedback = Arc::new(DisableFeedbackHarness::default());
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                DisableAwareRxAdapter::new(rx_adapter, disable_feedback.clone()),
+                DisableAwareTxAdapter::new(tx_adapter, disable_feedback),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let observer = Observer::<StrictRealtime>::new(driver.clone());
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        if !post_feedback_delay.is_zero() {
+            thread::sleep(post_feedback_delay);
+        }
+
+        Piper {
+            driver,
+            observer,
+            quirks: DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            drop_policy: DropPolicy::Noop,
+            driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
+            _state: unsafe { std::mem::zeroed() },
+        }
+    }
+
+    fn build_active_mit_piper(
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+        post_feedback_delay: Duration,
+    ) -> Piper<Active<MitMode>, StrictRealtime> {
+        build_active_mit_piper_with_adapters(
+            ScriptedRxAdapter::new(scripted_frames(1_000)),
+            RecordingTxAdapter::new(sent_frames),
+            post_feedback_delay,
+        )
+    }
+
+    fn wait_for_sent_frames(
+        sent_frames: &Arc<Mutex<Vec<PiperFrame>>>,
+        at_least: usize,
+    ) -> Vec<PiperFrame> {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let frames = sent_frames.lock().expect("sent frames lock").clone();
+            if frames.len() >= at_least {
+                return frames;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "expected at least {at_least} sent frame(s), got {}",
+                    frames.len()
+                );
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn test_config_default() {
         let config = MitControllerConfig::default();
         assert_eq!(config.kp_gains[0], 5.0);
         assert_eq!(config.kd_gains[0], 0.8);
+        assert_eq!(config.safe_hold_kp_gains, [5.0; 6]);
+        assert_eq!(config.safe_hold_kd_gains, [0.8; 6]);
         assert!(config.rest_position.is_none());
         assert_eq!(config.control_rate, 200.0);
         assert_eq!(config.read_policy, ControlReadPolicy::default());
@@ -606,6 +1240,246 @@ mod tests {
         assert_eq!(
             classify_command_cycle(false, 5, 5),
             CommandCycleDisposition::Abort { failure_count: 6 }
+        );
+    }
+
+    #[test]
+    fn mit_controller_new_rejects_non_positive_or_non_finite_control_rate() {
+        for control_rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let active =
+                build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::from_millis(20));
+            let error = MitController::new(
+                active,
+                MitControllerConfig {
+                    control_rate,
+                    ..MitControllerConfig::default()
+                },
+            )
+            .err()
+            .expect("invalid control_rate must be rejected during construction");
+            assert!(matches!(error, RobotError::ConfigError(_)));
+        }
+    }
+
+    #[test]
+    fn mit_controller_new_rejects_invalid_motion_gains() {
+        for invalid_config in [
+            MitControllerConfig {
+                kp_gains: [-0.1, 5.0, 5.0, 5.0, 5.0, 5.0],
+                ..MitControllerConfig::default()
+            },
+            MitControllerConfig {
+                kd_gains: [0.8, 0.8, f64::NAN, 0.8, 0.8, 0.8],
+                ..MitControllerConfig::default()
+            },
+        ] {
+            let active =
+                build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::from_millis(20));
+            let error = MitController::new(active, invalid_config)
+                .err()
+                .expect("invalid motion gains must be rejected during construction");
+            assert!(matches!(error, RobotError::ConfigError(_)));
+        }
+    }
+
+    #[test]
+    fn mit_controller_new_rejects_invalid_safe_hold_gains() {
+        for invalid_config in [
+            MitControllerConfig {
+                safe_hold_kp_gains: [5.0, 5.0, 5.0, f64::INFINITY, 5.0, 5.0],
+                ..MitControllerConfig::default()
+            },
+            MitControllerConfig {
+                safe_hold_kd_gains: [0.8, 0.8, 0.8, 0.8, -0.1, 0.8],
+                ..MitControllerConfig::default()
+            },
+        ] {
+            let active =
+                build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::from_millis(20));
+            let error = MitController::new(active, invalid_config)
+                .err()
+                .expect("invalid safe-hold gains must be rejected during construction");
+            assert!(matches!(error, RobotError::ConfigError(_)));
+        }
+    }
+
+    #[test]
+    fn move_to_position_read_failure_with_anchor_enters_safe_hold_and_latches_safed_out() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames.clone(), Duration::from_millis(25));
+        let mut controller = MitController::new(
+            active,
+            MitControllerConfig {
+                kp_gains: [1.2; 6],
+                kd_gains: [0.3; 6],
+                safe_hold_kp_gains: [6.0; 6],
+                safe_hold_kd_gains: [0.9; 6],
+                rest_position: Some([Rad(0.0); 6]),
+                read_policy: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_millis(1),
+                },
+                ..MitControllerConfig::default()
+            },
+        )
+        .expect("strict realtime driver should support MitController");
+        controller.last_hold_anchor = Some(JointArray::from([Rad(0.0); 6]));
+
+        let error = controller
+            .move_to_position([Rad(0.0); 6], Rad(0.01), Duration::from_millis(50))
+            .expect_err("stale control snapshot must safe-out the controller");
+
+        match &error {
+            ControlError::SafedOut { action, source } => {
+                assert_eq!(*action, SafeAction::HoldPosition);
+                assert!(matches!(source.as_ref(), RobotError::FeedbackStale { .. }));
+            },
+            other => panic!("expected SafedOut, got {other:?}"),
+        }
+        assert!(controller.is_safed_out());
+
+        let frames = wait_for_sent_frames(&sent_frames, 6);
+        let safe_hold = MitControlCommand::try_new(1, 0.0, 0.0, 6.0, 0.9, 0.0)
+            .expect("safe-hold command should build")
+            .to_frame();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.id == safe_hold.id && frame.data == safe_hold.data),
+            "safe-hold package must reach the TX path before returning SafedOut"
+        );
+        assert!(
+            !frames.contains(&EmergencyStopCommand::emergency_stop().to_frame()),
+            "successful safe-hold must not fall back to emergency stop",
+        );
+
+        assert!(matches!(
+            controller
+                .move_to_position([Rad(0.0); 6], Rad(0.01), Duration::from_millis(10))
+                .expect_err("safed-out controller must reject future motion"),
+            ControlError::SafedOut {
+                action: SafeAction::HoldPosition,
+                ..
+            }
+        ));
+        assert!(matches!(
+            controller
+                .move_to_rest(Rad(0.01), Duration::from_millis(10))
+                .expect_err("safed-out controller must reject move_to_rest"),
+            ControlError::SafedOut {
+                action: SafeAction::HoldPosition,
+                ..
+            }
+        ));
+        assert!(matches!(
+            controller
+                .relax_joints()
+                .expect_err("safed-out controller must reject relax_joints"),
+            ControlError::SafedOut {
+                action: SafeAction::HoldPosition,
+                ..
+            }
+        ));
+
+        let standby = controller
+            .park(DisableConfig::default())
+            .expect("park should remain available after safe-out");
+        let frames = wait_for_sent_frames(&sent_frames, 7);
+        assert!(frames.contains(&MotorEnableCommand::disable_all().to_frame()));
+        drop(standby);
+    }
+
+    #[test]
+    fn move_to_position_read_failure_without_anchor_falls_back_to_emergency_stop() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames.clone(), Duration::from_millis(25));
+        let mut controller = MitController::new(
+            active,
+            MitControllerConfig {
+                read_policy: ControlReadPolicy {
+                    max_state_skew_us: 2_000,
+                    max_feedback_age: Duration::from_millis(1),
+                },
+                ..MitControllerConfig::default()
+            },
+        )
+        .expect("strict realtime driver should support MitController");
+
+        let error = controller
+            .move_to_position([Rad(0.0); 6], Rad(0.01), Duration::from_millis(50))
+            .expect_err("missing anchor must fall back to emergency stop");
+
+        assert!(matches!(
+            error,
+            ControlError::SafedOut {
+                action: SafeAction::EmergencyStop,
+                ..
+            }
+        ));
+        assert!(controller.is_safed_out());
+
+        let frames = wait_for_sent_frames(&sent_frames, 7);
+        assert!(frames.contains(&EmergencyStopCommand::emergency_stop().to_frame()));
+    }
+
+    #[test]
+    fn move_to_position_safe_hold_send_failure_falls_back_to_emergency_stop() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames.clone(), Duration::from_millis(5));
+        let mut controller = MitController::new(active, MitControllerConfig::default())
+            .expect("strict realtime driver should support MitController");
+        controller.last_hold_anchor = Some(JointArray::from([Rad(100.0); 6]));
+
+        let error = controller.enter_safe_state(RobotError::feedback_stale(
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        ));
+
+        assert!(matches!(
+            error,
+            ControlError::SafedOut {
+                action: SafeAction::EmergencyStop,
+                ..
+            }
+        ));
+
+        let frames = wait_for_sent_frames(&sent_frames, 1);
+        assert!(frames.contains(&EmergencyStopCommand::emergency_stop().to_frame()));
+    }
+
+    #[test]
+    fn move_to_position_sixth_consecutive_send_failure_safes_out_instead_of_returning_consecutive_failures()
+     {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames.clone(), Duration::from_millis(5));
+        let mut controller = MitController::new(active, MitControllerConfig::default())
+            .expect("strict realtime driver should support MitController");
+        controller.last_hold_anchor = Some(JointArray::from([Rad(0.0); 6]));
+        controller
+            .piper
+            .as_ref()
+            .expect("controller should still hold active piper")
+            .driver
+            .latch_fault();
+
+        let start = Instant::now();
+
+        let error = controller
+            .move_to_position([Rad(0.1); 6], Rad(0.001), Duration::from_millis(80))
+            .expect_err("sixth consecutive send failure must safe-out the controller");
+
+        assert!(!matches!(error, ControlError::ConsecutiveFailures { .. }));
+        assert!(matches!(error, ControlError::SafedOut { .. }));
+        assert!(controller.is_safed_out());
+        assert!(
+            start.elapsed() >= Duration::from_millis(20),
+            "controller should tolerate the first five failed cycles instead of bailing out immediately"
+        );
+
+        let frames = wait_for_sent_frames(&sent_frames, 1);
+        assert!(
+            frames.contains(&EmergencyStopCommand::emergency_stop().to_frame()),
+            "safe-out after repeated control failures must end on shutdown-lane emergency stop once the control path is faulted",
         );
     }
 }
