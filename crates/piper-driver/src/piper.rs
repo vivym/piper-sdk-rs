@@ -4,7 +4,8 @@
 
 use crate::command::{
     CommandPriority, DeliveryPhase, MaintenanceCommandMeta, PiperCommand, RealtimeCommand,
-    ReliableCommand, ReliableCommandKind, SoftRealtimeCommand,
+    ReliableCommand, ReliableCommandKind, SoftRealtimeCommand, SoftRealtimeMailbox,
+    SoftRealtimeTryReserveError, SoftRealtimeTrySendError,
 };
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
@@ -99,16 +100,6 @@ pub struct HealthStatus {
     pub rx_alive: bool,
     pub tx_alive: bool,
     pub fault: Option<RuntimeFaultKind>,
-}
-
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ControlReadDiagnostics {
-    pub pair_has_been_published: bool,
-    pub position_candidate_mask: u8,
-    pub dynamic_candidate_mask: u8,
-    pub position_candidate_timestamp_us: u64,
-    pub dynamic_candidate_timestamp_us: u64,
 }
 
 /// Driver 运行时阶段。
@@ -473,6 +464,47 @@ impl NormalSendGate {
         }
     }
 
+    fn replay_restore_state(
+        runtime_phase: RuntimePhase,
+        runtime_fault: Option<RuntimeFaultKind>,
+        driver_mode: crate::mode::DriverMode,
+    ) -> NormalSendGateState {
+        match runtime_phase {
+            RuntimePhase::Stopping => NormalSendGateState::StoppingClosed,
+            RuntimePhase::FaultLatched => NormalSendGateState::FaultClosed,
+            RuntimePhase::Running => {
+                if runtime_fault.is_some() {
+                    NormalSendGateState::FaultClosed
+                } else if driver_mode.is_replay() {
+                    NormalSendGateState::ReplayPaused
+                } else {
+                    NormalSendGateState::Open
+                }
+            },
+        }
+    }
+
+    pub(crate) fn abort_replay_switch(
+        &self,
+        runtime_phase: RuntimePhase,
+        runtime_fault: Option<RuntimeFaultKind>,
+        driver_mode: crate::mode::DriverMode,
+    ) {
+        match self.state() {
+            NormalSendGateState::ReplaySwitchPending | NormalSendGateState::ReplayPaused => {
+                self.set_state(Self::replay_restore_state(
+                    runtime_phase,
+                    runtime_fault,
+                    driver_mode,
+                ));
+            },
+            NormalSendGateState::StateTransitionClosed => {},
+            NormalSendGateState::Open
+            | NormalSendGateState::FaultClosed
+            | NormalSendGateState::StoppingClosed => {},
+        }
+    }
+
     pub(crate) fn close_for_fault(&self) {
         self.disable_confirmation_pending.store(false, Ordering::Release);
         if self.state() != NormalSendGateState::StoppingClosed {
@@ -618,20 +650,11 @@ impl NormalSendGate {
             return;
         }
 
-        let next_state = match runtime_phase {
-            RuntimePhase::Stopping => NormalSendGateState::StoppingClosed,
-            RuntimePhase::FaultLatched => NormalSendGateState::FaultClosed,
-            RuntimePhase::Running => {
-                if runtime_fault.is_some() {
-                    NormalSendGateState::FaultClosed
-                } else if driver_mode.is_replay() {
-                    NormalSendGateState::ReplayPaused
-                } else {
-                    NormalSendGateState::Open
-                }
-            },
-        };
-        self.set_state(next_state);
+        self.set_state(Self::replay_restore_state(
+            runtime_phase,
+            runtime_fault,
+            driver_mode,
+        ));
     }
 
     pub fn inflight_normal_sends(&self) -> usize {
@@ -669,6 +692,73 @@ impl NormalSendPermit<'_> {
                 Err(NormalSendGateDenyReason::StateTransitionClosed)
             },
         }
+    }
+}
+
+struct ReplaySwitchTxn<'a> {
+    normal_send_gate: &'a NormalSendGate,
+    driver_mode: &'a crate::mode::AtomicDriverMode,
+    runtime_phase: &'a AtomicU8,
+    runtime_fault: &'a AtomicU8,
+    published_replay: bool,
+}
+
+impl<'a> ReplaySwitchTxn<'a> {
+    fn begin(piper: &'a Piper) -> Result<Self, DriverError> {
+        match piper.normal_send_gate.begin_replay_switch() {
+            Ok(()) => Ok(Self {
+                normal_send_gate: piper.normal_send_gate.as_ref(),
+                driver_mode: piper.driver_mode.as_ref(),
+                runtime_phase: piper.runtime_phase.as_ref(),
+                runtime_fault: piper.runtime_fault.as_ref(),
+                published_replay: false,
+            }),
+            Err(NormalSendGateDenyReason::StoppingClosed) => Err(DriverError::ChannelClosed),
+            Err(
+                NormalSendGateDenyReason::ReplayPaused
+                | NormalSendGateDenyReason::FaultClosed
+                | NormalSendGateDenyReason::StateTransitionClosed,
+            ) => Err(DriverError::ControlPathClosed),
+        }
+    }
+
+    fn commit_paused(&self) -> Result<(), DriverError> {
+        match self.normal_send_gate.commit_replay_switch() {
+            Ok(()) => Ok(()),
+            Err(NormalSendGateDenyReason::StoppingClosed) => Err(DriverError::ChannelClosed),
+            Err(
+                NormalSendGateDenyReason::ReplayPaused
+                | NormalSendGateDenyReason::FaultClosed
+                | NormalSendGateDenyReason::StateTransitionClosed,
+            ) => Err(DriverError::ControlPathClosed),
+        }
+    }
+
+    fn publish_replay(mut self) {
+        self.driver_mode.set(crate::mode::DriverMode::Replay, Ordering::Release);
+        self.published_replay = true;
+    }
+
+    fn runtime_phase(&self) -> RuntimePhase {
+        RuntimePhase::from_raw(self.runtime_phase.load(Ordering::Acquire))
+    }
+
+    fn runtime_fault(&self) -> Option<RuntimeFaultKind> {
+        RuntimeFaultKind::from_raw(self.runtime_fault.load(Ordering::Acquire))
+    }
+}
+
+impl Drop for ReplaySwitchTxn<'_> {
+    fn drop(&mut self) {
+        if self.published_replay {
+            return;
+        }
+
+        self.normal_send_gate.abort_replay_switch(
+            self.runtime_phase(),
+            self.runtime_fault(),
+            self.driver_mode.get(Ordering::Acquire),
+        );
     }
 }
 
@@ -1601,8 +1691,8 @@ pub struct Piper {
     reliable_tx: ManuallyDrop<Sender<ReliableCommand>>,
     /// 维护写入/授权线性化通道。
     maintenance_lane_tx: ManuallyDrop<Sender<MaintenanceLaneCommand>>,
-    /// SoftRealtime 原始批命令发送通道。
-    soft_realtime_tx: ManuallyDrop<Sender<SoftRealtimeCommand>>,
+    /// SoftRealtime 原始批命令邮箱。
+    soft_realtime_tx: Arc<SoftRealtimeMailbox>,
     /// 单飞急停通道。
     shutdown_lane: Arc<ShutdownLane>,
     /// 实时命令插槽（邮箱模式，Overwrite）
@@ -1639,6 +1729,9 @@ pub struct Piper {
     /// Test-only barrier that pauses SoftRealtime admission before enqueue.
     #[cfg(test)]
     soft_realtime_admission_barrier: Mutex<Option<SoftRealtimeAdmissionBarrier>>,
+    /// Test-only barrier that pauses SoftRealtime admission after the final deadline check.
+    #[cfg(test)]
+    soft_realtime_post_check_barrier: Mutex<Option<SoftRealtimeAdmissionBarrier>>,
     /// Capability of the active backend.
     backend_capability: BackendCapability,
 }
@@ -1798,6 +1891,38 @@ impl Piper {
     #[cfg(not(test))]
     fn maybe_wait_test_soft_realtime_admission_barrier(&self) {}
 
+    #[cfg(test)]
+    fn install_soft_realtime_post_check_barrier(
+        &self,
+        reached_tx: std::sync::mpsc::Sender<()>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut guard = self
+            .soft_realtime_post_check_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(SoftRealtimeAdmissionBarrier {
+            reached_tx,
+            release_rx,
+        });
+    }
+
+    #[cfg(test)]
+    fn maybe_wait_test_soft_realtime_post_check_barrier(&self) {
+        let barrier = self
+            .soft_realtime_post_check_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.reached_tx.send(());
+            let _ = barrier.release_rx.recv();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_wait_test_soft_realtime_post_check_barrier(&self) {}
+
     fn ensure_mode_allows_reliable_kind(
         &self,
         kind: ReliableCommandKind,
@@ -1954,8 +2079,8 @@ impl Piper {
         let pipeline_config = config.unwrap_or_default();
         let realtime_slot = Arc::new(std::sync::Mutex::new(None::<RealtimeCommand>));
         let (reliable_tx, reliable_rx) = crossbeam_channel::bounded::<ReliableCommand>(10);
-        let (soft_realtime_tx, soft_realtime_rx) =
-            crossbeam_channel::bounded::<SoftRealtimeCommand>(4);
+        let soft_realtime_tx = Arc::new(SoftRealtimeMailbox::new());
+        let soft_realtime_rx = soft_realtime_tx.clone();
         let shutdown_lane = Arc::new(ShutdownLane::new());
         let metrics = Arc::new(PiperMetrics::new());
         let ctx = Arc::new(PiperContext::with_metrics(metrics.clone()));
@@ -2035,7 +2160,7 @@ impl Piper {
         Ok(Self {
             reliable_tx: ManuallyDrop::new(reliable_tx),
             maintenance_lane_tx: ManuallyDrop::new(maintenance_lane_tx),
-            soft_realtime_tx: ManuallyDrop::new(soft_realtime_tx),
+            soft_realtime_tx,
             shutdown_lane,
             realtime_slot,
             ctx,
@@ -2058,6 +2183,8 @@ impl Piper {
             mode_switch_replay_barrier: Mutex::new(None),
             #[cfg(test)]
             soft_realtime_admission_barrier: Mutex::new(None),
+            #[cfg(test)]
+            soft_realtime_post_check_barrier: Mutex::new(None),
             backend_capability,
         })
     }
@@ -2412,21 +2539,6 @@ impl Piper {
         self.ctx.capture_control_joint_dynamic()
     }
 
-    #[doc(hidden)]
-    pub fn get_control_read_diagnostics(&self) -> ControlReadDiagnostics {
-        let pair = self.ctx.capture_control_pair();
-        let position_candidate = self.ctx.capture_control_joint_position_candidate();
-        let dynamic_candidate = self.ctx.capture_control_joint_dynamic_candidate();
-
-        ControlReadDiagnostics {
-            pair_has_been_published: pair.position_sequence != 0 && pair.dynamic_sequence != 0,
-            position_candidate_mask: position_candidate.frame_valid_mask,
-            dynamic_candidate_mask: dynamic_candidate.valid_mask,
-            position_candidate_timestamp_us: position_candidate.hardware_timestamp_us,
-            dynamic_candidate_timestamp_us: dynamic_candidate.group_timestamp_us,
-        }
-    }
-
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
     pub fn get_raw_joint_dynamic(&self) -> JointDynamicState {
         *self.get_joint_dynamic_monitor_snapshot().latest_raw()
@@ -2728,15 +2840,14 @@ impl Piper {
     /// - `max_time_diff_us`: 允许的最大时间戳差异（微秒），推荐值：5000（5ms）
     ///
     /// # 返回值
-    /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内
-    /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回状态数据
+    /// - `AlignmentResult::Incomplete { .. }`: coherent control pair 尚未准备好
+    /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内，且状态完整
+    /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回完整状态数据
     pub fn get_aligned_motion(&self, max_time_diff_us: u64) -> AlignmentResult {
-        let pair = self.ctx.capture_control_pair();
+        let view = self.ctx.capture_control_read_view();
+        let pair = view.pair;
         let joint_position = pair.joint_position;
         let joint_dynamic = pair.joint_dynamic;
-
-        let time_diff =
-            joint_position.hardware_timestamp_us.abs_diff(joint_dynamic.group_timestamp_us);
 
         let state = AlignedMotionState {
             joint_pos: joint_position.joint_pos,
@@ -2752,6 +2863,16 @@ impl Piper {
             skew_us: (joint_dynamic.group_timestamp_us as i64)
                 - (joint_position.hardware_timestamp_us as i64),
         };
+
+        if pair.position_sequence == 0 || pair.dynamic_sequence == 0 || !state.is_complete() {
+            return AlignmentResult::Incomplete {
+                position_candidate_mask: view.position_candidate_mask,
+                dynamic_candidate_mask: view.dynamic_candidate_mask,
+            };
+        }
+
+        let time_diff =
+            joint_position.hardware_timestamp_us.abs_diff(joint_dynamic.group_timestamp_us);
 
         if time_diff > max_time_diff_us {
             AlignmentResult::Misaligned {
@@ -3088,18 +3209,8 @@ impl Piper {
                     return Err(DriverError::ControlPathClosed);
                 }
 
-                match self.normal_send_gate.begin_replay_switch() {
-                    Ok(()) => {},
-                    Err(NormalSendGateDenyReason::StoppingClosed) => {
-                        return Err(DriverError::ChannelClosed);
-                    },
-                    Err(
-                        NormalSendGateDenyReason::ReplayPaused
-                        | NormalSendGateDenyReason::FaultClosed
-                        | NormalSendGateDenyReason::StateTransitionClosed,
-                    ) => return Err(DriverError::ControlPathClosed),
-                }
                 let deadline = Instant::now() + timeout;
+                let replay_switch = ReplaySwitchTxn::begin(self)?;
 
                 while self.normal_send_gate.inflight_normal_sends() > 0 {
                     if self.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed {
@@ -3111,7 +3222,6 @@ impl Piper {
                         return Err(DriverError::ControlPathClosed);
                     }
                     if !self.tx_thread_alive() {
-                        self.normal_send_gate.resume_from_replay();
                         return Err(DriverError::ChannelClosed);
                     }
                     if Instant::now() >= deadline {
@@ -3122,27 +3232,37 @@ impl Piper {
                 }
 
                 if !self.tx_thread_alive() {
-                    self.normal_send_gate.resume_from_replay();
                     return Err(DriverError::ChannelClosed);
                 }
 
                 self.maybe_wait_test_mode_switch_replay_barrier();
-
-                match self.normal_send_gate.commit_replay_switch() {
-                    Ok(()) => {},
-                    Err(NormalSendGateDenyReason::StoppingClosed) => {
-                        return Err(DriverError::ChannelClosed);
+                if Instant::now() >= deadline {
+                    self.latch_fault_with_kind(RuntimeFaultKind::TransportError);
+                    return Err(DriverError::Timeout);
+                }
+                if !self.tx_thread_alive() {
+                    return Err(DriverError::ChannelClosed);
+                }
+                match (self.runtime_phase(), self.runtime_fault_kind()) {
+                    (RuntimePhase::Running, None) => {},
+                    (RuntimePhase::Stopping, _) => return Err(DriverError::ChannelClosed),
+                    (RuntimePhase::Running, Some(_)) | (RuntimePhase::FaultLatched, _) => {
+                        return Err(DriverError::ControlPathClosed);
                     },
-                    Err(
-                        NormalSendGateDenyReason::ReplayPaused
-                        | NormalSendGateDenyReason::FaultClosed
-                        | NormalSendGateDenyReason::StateTransitionClosed,
-                    ) => return Err(DriverError::ControlPathClosed),
+                }
+
+                replay_switch.commit_paused()?;
+                if Instant::now() >= deadline {
+                    self.latch_fault_with_kind(RuntimeFaultKind::TransportError);
+                    return Err(DriverError::Timeout);
+                }
+                if !self.tx_thread_alive() {
+                    return Err(DriverError::ChannelClosed);
                 }
 
                 match (self.runtime_phase(), self.runtime_fault_kind()) {
                     (RuntimePhase::Running, None) => {
-                        self.driver_mode.set(mode, std::sync::atomic::Ordering::Release);
+                        replay_switch.publish_replay();
                         Ok(())
                     },
                     (RuntimePhase::Stopping, _) => Err(DriverError::ChannelClosed),
@@ -3422,19 +3542,36 @@ impl Piper {
 
         self.maybe_wait_test_soft_realtime_admission_barrier();
         if Instant::now() >= deadline {
+            self.metrics.tx_soft_admission_timeout_total.fetch_add(1, Ordering::Relaxed);
+            return Err(DriverError::Timeout);
+        }
+
+        let reservation = match self.soft_realtime_tx.try_reserve() {
+            Ok(reservation) => reservation,
+            Err(SoftRealtimeTryReserveError::Full) => return Err(DriverError::ChannelFull),
+            Err(SoftRealtimeTryReserveError::Disconnected) => {
+                return Err(DriverError::ChannelClosed);
+            },
+        };
+
+        self.maybe_wait_test_soft_realtime_post_check_barrier();
+        if Instant::now() >= deadline {
+            self.metrics.tx_soft_admission_timeout_total.fetch_add(1, Ordering::Relaxed);
             return Err(DriverError::Timeout);
         }
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         let command = SoftRealtimeCommand::confirmed(buffer, deadline, ack_tx);
 
-        match self.soft_realtime_tx.try_send(command) {
+        match reservation.publish(command) {
             Ok(_) => {},
-            Err(crossbeam_channel::TrySendError::Full(command)) => {
+            Err(SoftRealtimeTrySendError::Full(command)) => {
+                let command = *command;
                 command.complete(Err(DriverError::ChannelFull));
                 return Err(DriverError::ChannelFull);
             },
-            Err(crossbeam_channel::TrySendError::Disconnected(command)) => {
+            Err(SoftRealtimeTrySendError::Disconnected(command)) => {
+                let command = *command;
                 command.complete(Err(DriverError::ChannelClosed));
                 return Err(DriverError::ChannelClosed);
             },
@@ -4032,11 +4169,11 @@ impl Drop for Piper {
         self.normal_send_gate.close_for_stop();
         self.workers_running.store(false, Ordering::Release);
         self.shutdown_lane.close_with(Err(DriverError::ChannelClosed));
+        self.soft_realtime_tx.close();
 
         unsafe {
             ManuallyDrop::drop(&mut self.reliable_tx);
             ManuallyDrop::drop(&mut self.maintenance_lane_tx);
-            ManuallyDrop::drop(&mut self.soft_realtime_tx);
         }
 
         self.clear_realtime_slot(DriverError::ChannelClosed, false);
@@ -4153,6 +4290,15 @@ mod tests {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         piper.install_soft_realtime_admission_barrier(reached_tx, release_rx);
+        (reached_rx, release_tx)
+    }
+
+    fn install_soft_realtime_post_check_barrier(
+        piper: &Piper,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        piper.install_soft_realtime_post_check_barrier(reached_tx, release_rx);
         (reached_rx, release_tx)
     }
 
@@ -5433,6 +5579,44 @@ mod tests {
     }
 
     #[test]
+    fn test_try_set_mode_replay_times_out_in_late_publish_window_and_latches_fault() {
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: Arc::new(Mutex::new(Vec::new())),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let (reached_rx, release_tx) = install_mode_switch_barrier(piper.as_ref());
+        let piper_for_mode = Arc::clone(&piper);
+        let mode_handle = std::thread::spawn(move || {
+            piper_for_mode.try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(20))
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("Replay switch should reach the late-publish barrier");
+        std::thread::sleep(Duration::from_millis(30));
+        release_tx.send(()).expect("mode-switch barrier should release cleanly");
+
+        let error = mode_handle
+            .join()
+            .expect("Replay switch thread should finish")
+            .expect_err("Replay switch must honor the caller deadline in the late-publish window");
+        assert!(matches!(error, DriverError::Timeout));
+        assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
+        assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
+        assert_eq!(
+            piper.normal_send_gate.state(),
+            NormalSendGateState::FaultClosed
+        );
+    }
+
+    #[test]
     fn test_set_mode_replay_wrapper_is_bounded_and_latches_fault_on_timeout() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let (started_tx, started_rx) = mpsc::channel();
@@ -5697,20 +5881,32 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        // 由于 MockCanAdapter 不发送帧，时间戳都为 0
-        // 测试默认状态下的对齐检查（时间戳都为 0，应该是对齐的）
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 1_000,
+            host_rx_mono_us: 2_000,
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        });
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 1_000,
+            group_host_rx_mono_us: 2_000,
+            joint_vel: [2.0; 6],
+            joint_current: [3.0; 6],
+            timestamps: [1_000; 6],
+            valid_mask: 0b11_1111,
+        });
+
         let result = piper.get_aligned_motion(5000);
         match result {
             AlignmentResult::Ok(state) => {
-                assert_eq!(state.position_timestamp_us, 0);
-                assert_eq!(state.dynamic_timestamp_us, 0);
-                assert_eq!(state.position_frame_valid_mask, 0);
-                assert_eq!(state.dynamic_valid_mask, 0);
+                assert_eq!(state.position_timestamp_us, 1_000);
+                assert_eq!(state.dynamic_timestamp_us, 1_000);
+                assert_eq!(state.position_frame_valid_mask, 0b111);
+                assert_eq!(state.dynamic_valid_mask, 0b11_1111);
                 assert_eq!(state.skew_us, 0);
             },
-            AlignmentResult::Misaligned { .. } => {
-                // 如果时间戳都为 0，不应该是不对齐的
-                // 但允许这种情况（因为时间戳都是 0）
+            AlignmentResult::Misaligned { .. } | AlignmentResult::Incomplete { .. } => {
+                panic!("complete coherent pair should be reported as aligned");
             },
         }
     }
@@ -5720,20 +5916,32 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        // 测试不同的时间差阈值
-        // 由于时间戳都是 0，应该是对齐的
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 1_000,
+            host_rx_mono_us: 2_000,
+            joint_pos: [0.0; 6],
+            frame_valid_mask: 0b111,
+        });
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 2_000,
+            group_host_rx_mono_us: 3_000,
+            joint_vel: [0.0; 6],
+            joint_current: [0.0; 6],
+            timestamps: [2_000; 6],
+            valid_mask: 0b11_1111,
+        });
+
         let result1 = piper.get_aligned_motion(0);
         let result2 = piper.get_aligned_motion(1000);
         let result3 = piper.get_aligned_motion(1000000);
 
-        // 所有结果都应该返回状态（即使是对齐的）
         match (result1, result2, result3) {
-            (AlignmentResult::Ok(_), AlignmentResult::Ok(_), AlignmentResult::Ok(_)) => {
-                // 正常情况
-            },
-            _ => {
-                // 允许其他情况
-            },
+            (
+                AlignmentResult::Misaligned { diff_us, .. },
+                AlignmentResult::Ok(_),
+                AlignmentResult::Ok(_),
+            ) => assert_eq!(diff_us, 1_000),
+            other => panic!("unexpected threshold behavior: {other:?}"),
         }
     }
 
@@ -6362,6 +6570,77 @@ mod tests {
     }
 
     #[test]
+    fn test_soft_realtime_expiry_after_final_admission_check_does_not_fill_queue() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts(
+                SoftRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let (tx_reached_rx, tx_release_tx) = install_tx_loop_barrier(piper.as_ref());
+        tx_reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("TX loop should hit dispatch barrier");
+
+        let mut expired_handles = Vec::new();
+        for index in 0..4u8 {
+            let (post_check_reached_rx, post_check_release_tx) =
+                install_soft_realtime_post_check_barrier(piper.as_ref());
+            let piper_for_send = Arc::clone(&piper);
+            expired_handles.push(thread::spawn(move || {
+                piper_for_send.send_soft_realtime_package_confirmed(
+                    [PiperFrame::new_standard(0x160 + u16::from(index), &[index])],
+                    Duration::from_millis(20),
+                )
+            }));
+            post_check_reached_rx
+                .recv_timeout(Duration::from_millis(200))
+                .expect("soft realtime sender should block after the final admission check");
+            thread::sleep(Duration::from_millis(30));
+            post_check_release_tx
+                .send(())
+                .expect("post-check barrier should release cleanly");
+        }
+
+        let piper_for_valid_send = Arc::clone(&piper);
+        let valid_handle = thread::spawn(move || {
+            piper_for_valid_send.send_soft_realtime_package_confirmed(
+                [PiperFrame::new_standard(0x169, &[0xFF])],
+                Duration::from_millis(200),
+            )
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        tx_release_tx.send(()).expect("TX loop barrier should release cleanly");
+
+        for handle in expired_handles {
+            let result = handle.join().expect("expired sender thread should join");
+            assert!(
+                matches!(result, Err(DriverError::Timeout)),
+                "admission-expired command must fail before becoming TX-visible: {result:?}",
+            );
+        }
+
+        let valid_result = valid_handle.join().expect("valid sender thread should join");
+        assert!(
+            valid_result.is_ok(),
+            "post-check-expired commands must not consume soft queue capacity: {valid_result:?}",
+        );
+        assert_eq!(piper.get_metrics().tx_soft_admission_timeout_total, 4);
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "only the valid soft realtime command should reach the bus",
+        );
+    }
+
+    #[test]
     fn test_soft_realtime_sub_millisecond_remaining_budget_is_not_rounded_up() {
         let piper = Piper::new_dual_thread_parts(
             SoftRxAdapter,
@@ -6475,23 +6754,23 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        // 测试对齐阈值边界情况
-        // 时间戳都为 0 时，skew_us 应该是 0
         let result = piper.get_aligned_motion(0);
         match result {
-            AlignmentResult::Ok(state) => {
-                assert_eq!(state.skew_us, 0);
+            AlignmentResult::Incomplete {
+                position_candidate_mask,
+                dynamic_candidate_mask,
+            } => {
+                assert_eq!(position_candidate_mask, 0);
+                assert_eq!(dynamic_candidate_mask, 0);
             },
-            AlignmentResult::Misaligned { state, diff_us } => {
-                // 如果时间戳都为 0，diff_us 应该也是 0
-                assert_eq!(diff_us, 0);
-                assert_eq!(state.skew_us, 0);
+            AlignmentResult::Ok(_) | AlignmentResult::Misaligned { .. } => {
+                panic!("empty control path must report incomplete");
             },
         }
     }
 
     #[test]
-    fn test_get_aligned_motion_carries_completeness_masks() {
+    fn test_get_aligned_motion_incomplete_pair_reports_incomplete_result() {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
@@ -6511,17 +6790,22 @@ mod tests {
         });
 
         let result = piper.get_aligned_motion(0);
-        let state = match result {
-            AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
-        };
-
-        assert_eq!(state.position_frame_valid_mask, 0b101);
-        assert_eq!(state.dynamic_valid_mask, 0b001111);
-        assert!(!state.is_complete());
+        match result {
+            AlignmentResult::Incomplete {
+                position_candidate_mask,
+                dynamic_candidate_mask,
+            } => {
+                assert_eq!(position_candidate_mask, 0b101);
+                assert_eq!(dynamic_candidate_mask, 0b001111);
+            },
+            AlignmentResult::Ok(_) | AlignmentResult::Misaligned { .. } => {
+                panic!("incomplete control pair must not be reported as Ok/Misaligned");
+            },
+        }
     }
 
     #[test]
-    fn test_get_aligned_motion_without_coherent_pair_does_not_expose_candidate_values() {
+    fn test_get_aligned_motion_without_coherent_pair_reports_incomplete_result() {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
@@ -6533,20 +6817,18 @@ mod tests {
         });
 
         let result = piper.get_aligned_motion(5_000);
-        let state = match result {
-            AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
-        };
-
-        assert_eq!(state.position_timestamp_us, 0);
-        assert_eq!(state.dynamic_timestamp_us, 0);
-        assert_eq!(state.position_host_rx_mono_us, 0);
-        assert_eq!(state.dynamic_host_rx_mono_us, 0);
-        assert_eq!(state.position_frame_valid_mask, 0);
-        assert_eq!(state.dynamic_valid_mask, 0);
-        assert_eq!(state.joint_pos, [0.0; 6]);
-        assert_eq!(state.joint_vel, [0.0; 6]);
-        assert_eq!(state.joint_current, [0.0; 6]);
-        assert!(!state.is_complete());
+        match result {
+            AlignmentResult::Incomplete {
+                position_candidate_mask,
+                dynamic_candidate_mask,
+            } => {
+                assert_eq!(position_candidate_mask, 0b111);
+                assert_eq!(dynamic_candidate_mask, 0);
+            },
+            AlignmentResult::Ok(_) | AlignmentResult::Misaligned { .. } => {
+                panic!("control read must not expose an uninitialized pair through Ok/Misaligned");
+            },
+        }
     }
 
     #[test]
@@ -6571,6 +6853,9 @@ mod tests {
 
         let initial = match piper.get_aligned_motion(5_000) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
+            AlignmentResult::Incomplete { .. } => {
+                panic!("published coherent pair must stay readable");
+            },
         };
         assert_eq!(initial.position_timestamp_us, 1_000);
         assert_eq!(initial.dynamic_timestamp_us, 1_000);
@@ -6586,6 +6871,9 @@ mod tests {
 
         let after_dynamic_only = match piper.get_aligned_motion(5_000) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
+            AlignmentResult::Incomplete { .. } => {
+                panic!("last coherent pair must remain readable while waiting for peer");
+            },
         };
         assert_eq!(after_dynamic_only.position_timestamp_us, 1_000);
         assert_eq!(after_dynamic_only.dynamic_timestamp_us, 1_000);
@@ -6600,6 +6888,9 @@ mod tests {
 
         let after_both_advanced = match piper.get_aligned_motion(5_000) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
+            AlignmentResult::Incomplete { .. } => {
+                panic!("coherent pair should become readable after both sides advance");
+            },
         };
         assert_eq!(after_both_advanced.position_timestamp_us, 3_000);
         assert_eq!(after_both_advanced.dynamic_timestamp_us, 3_000);

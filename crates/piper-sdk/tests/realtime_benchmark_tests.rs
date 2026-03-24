@@ -661,7 +661,7 @@ fn test_tx_latency_benchmark() {
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
     maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
+    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(
@@ -792,7 +792,7 @@ fn test_send_duration_benchmark() {
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
     maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
+    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
     let tx_handle = thread::spawn(move || {
         let normal_send_gate = Arc::new(NormalSendGate::new());
         tx_loop_mailbox(

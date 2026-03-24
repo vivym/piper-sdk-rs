@@ -235,14 +235,15 @@ where
         self.ensure_realtime_control_supported()?;
 
         match self.driver.get_aligned_motion(policy.max_state_skew_us) {
+            AlignmentResult::Incomplete {
+                position_candidate_mask,
+                dynamic_candidate_mask,
+            } => Err(Self::incomplete_control_state_error(
+                position_candidate_mask,
+                dynamic_candidate_mask,
+            )),
             AlignmentResult::Ok(state) => {
-                if !state.is_complete() {
-                    let diagnostics = self.driver.get_control_read_diagnostics();
-                    return Err(Self::incomplete_control_state_error(
-                        diagnostics.position_candidate_mask,
-                        diagnostics.dynamic_candidate_mask,
-                    ));
-                }
+                debug_assert!(state.is_complete());
 
                 let age = control_feedback_age(
                     state.position_host_rx_mono_us,
@@ -272,13 +273,7 @@ where
                 })
             },
             AlignmentResult::Misaligned { state, .. } => {
-                if !state.is_complete() {
-                    let diagnostics = self.driver.get_control_read_diagnostics();
-                    return Err(Self::incomplete_control_state_error(
-                        diagnostics.position_candidate_mask,
-                        diagnostics.dynamic_candidate_mask,
-                    ));
-                }
+                debug_assert!(state.is_complete());
 
                 let age = control_feedback_age(
                     state.position_host_rx_mono_us,

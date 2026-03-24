@@ -168,7 +168,7 @@ fn test_priority_scheduling() {
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
     maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
+    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
@@ -328,7 +328,7 @@ fn test_reliable_command_not_dropped() {
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
     maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
+    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,
@@ -491,7 +491,7 @@ fn test_realtime_overwrite_strategy() {
     let maintenance_lease_gate_tx = maintenance_lease_gate.clone();
     let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
     maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
+    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
     let tx_handle = thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,

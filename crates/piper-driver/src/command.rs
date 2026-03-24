@@ -6,6 +6,8 @@ use crate::DriverError;
 use crossbeam_channel::Sender;
 use piper_can::PiperFrame;
 use smallvec::SmallVec;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 // 编译期断言：确保 PiperFrame 永远实现 Copy，这对 SmallVec 性能至关重要
@@ -58,6 +60,8 @@ pub type RealtimeAck = Sender<DeliveryPhase>;
 pub type ReliableAck = Sender<DeliveryPhase>;
 pub type ShutdownAck = Sender<Result<(), DriverError>>;
 pub type SoftRealtimeAck = Sender<Result<(), DriverError>>;
+
+pub(crate) const SOFT_REALTIME_MAILBOX_CAPACITY: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReliableCommandKind {
@@ -218,6 +222,198 @@ pub struct SoftRealtimeCommand {
     frames: FrameBuffer,
     deadline: Instant,
     ack: SoftRealtimeAck,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum SoftRealtimeTrySendError {
+    Full(Box<SoftRealtimeCommand>),
+    Disconnected(Box<SoftRealtimeCommand>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SoftRealtimeTryReserveError {
+    Full,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SoftRealtimeTryRecvError {
+    Empty,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoftRealtimeSlotState {
+    Vacant,
+    Reserved,
+    Ready,
+}
+
+#[derive(Debug)]
+struct SoftRealtimeMailboxState {
+    slots: [Option<SoftRealtimeCommand>; SOFT_REALTIME_MAILBOX_CAPACITY],
+    slot_states: [SoftRealtimeSlotState; SOFT_REALTIME_MAILBOX_CAPACITY],
+    ready_queue: [usize; SOFT_REALTIME_MAILBOX_CAPACITY],
+    ready_head: usize,
+    ready_len: usize,
+}
+
+impl SoftRealtimeMailboxState {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+            slot_states: [SoftRealtimeSlotState::Vacant; SOFT_REALTIME_MAILBOX_CAPACITY],
+            ready_queue: [0; SOFT_REALTIME_MAILBOX_CAPACITY],
+            ready_head: 0,
+            ready_len: 0,
+        }
+    }
+
+    fn ready_tail(&self) -> usize {
+        (self.ready_head + self.ready_len) % SOFT_REALTIME_MAILBOX_CAPACITY
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct SoftRealtimeMailbox {
+    closed: AtomicBool,
+    state: Mutex<SoftRealtimeMailboxState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SoftRealtimeReservation<'a> {
+    mailbox: &'a SoftRealtimeMailbox,
+    slot: usize,
+    active: bool,
+}
+
+impl SoftRealtimeMailbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            state: Mutex::new(SoftRealtimeMailboxState::new()),
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn try_reserve(
+        &self,
+    ) -> Result<SoftRealtimeReservation<'_>, SoftRealtimeTryReserveError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SoftRealtimeTryReserveError::Disconnected);
+        }
+
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SoftRealtimeTryReserveError::Disconnected);
+        }
+
+        let Some(slot) = state
+            .slot_states
+            .iter()
+            .position(|slot_state| *slot_state == SoftRealtimeSlotState::Vacant)
+        else {
+            return Err(SoftRealtimeTryReserveError::Full);
+        };
+
+        state.slot_states[slot] = SoftRealtimeSlotState::Reserved;
+        Ok(SoftRealtimeReservation {
+            mailbox: self,
+            slot,
+            active: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_send(
+        &self,
+        command: SoftRealtimeCommand,
+    ) -> Result<(), SoftRealtimeTrySendError> {
+        match self.try_reserve() {
+            Ok(reservation) => reservation.publish(command),
+            Err(SoftRealtimeTryReserveError::Full) => {
+                Err(SoftRealtimeTrySendError::Full(Box::new(command)))
+            },
+            Err(SoftRealtimeTryReserveError::Disconnected) => {
+                Err(SoftRealtimeTrySendError::Disconnected(Box::new(command)))
+            },
+        }
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<SoftRealtimeCommand, SoftRealtimeTryRecvError> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.ready_len == 0 {
+            return if self.closed.load(Ordering::Acquire) {
+                Err(SoftRealtimeTryRecvError::Disconnected)
+            } else {
+                Err(SoftRealtimeTryRecvError::Empty)
+            };
+        }
+
+        let slot = state.ready_queue[state.ready_head];
+        state.ready_head = (state.ready_head + 1) % SOFT_REALTIME_MAILBOX_CAPACITY;
+        state.ready_len -= 1;
+        state.slot_states[slot] = SoftRealtimeSlotState::Vacant;
+        state.slots[slot].take().ok_or(SoftRealtimeTryRecvError::Disconnected)
+    }
+
+    fn publish_reserved(
+        &self,
+        slot: usize,
+        command: SoftRealtimeCommand,
+    ) -> Result<(), SoftRealtimeTrySendError> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            if state.slot_states[slot] == SoftRealtimeSlotState::Reserved {
+                state.slot_states[slot] = SoftRealtimeSlotState::Vacant;
+            }
+            return Err(SoftRealtimeTrySendError::Disconnected(Box::new(command)));
+        }
+
+        debug_assert_eq!(state.slot_states[slot], SoftRealtimeSlotState::Reserved);
+        state.slots[slot] = Some(command);
+        state.slot_states[slot] = SoftRealtimeSlotState::Ready;
+        let tail = state.ready_tail();
+        state.ready_queue[tail] = slot;
+        state.ready_len += 1;
+        Ok(())
+    }
+
+    fn release_reserved(&self, slot: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.slot_states[slot] == SoftRealtimeSlotState::Reserved {
+            state.slot_states[slot] = SoftRealtimeSlotState::Vacant;
+        }
+    }
+}
+
+impl Default for SoftRealtimeMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SoftRealtimeReservation<'_> {
+    pub(crate) fn publish(
+        mut self,
+        command: SoftRealtimeCommand,
+    ) -> Result<(), SoftRealtimeTrySendError> {
+        self.active = false;
+        self.mailbox.publish_reserved(self.slot, command)
+    }
+}
+
+impl Drop for SoftRealtimeReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.mailbox.release_reserved(self.slot);
+        }
+    }
 }
 
 impl SoftRealtimeCommand {

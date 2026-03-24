@@ -3924,6 +3924,10 @@ mod tests {
                         },
                         max_inter_arm_skew: Duration::from_secs(1),
                     },
+                    safety: DualArmSafetyConfig {
+                        safe_hold_max_duration: Duration::from_secs(1),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
             )

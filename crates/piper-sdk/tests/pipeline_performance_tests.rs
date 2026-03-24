@@ -187,7 +187,7 @@ fn start_tx_loop(
     let maintenance_lease_gate = Arc::new(MaintenanceLeaseGate::default());
     let (maintenance_ctrl_tx, maintenance_ctrl_rx) = crossbeam_channel::unbounded();
     maintenance_lease_gate.set_control_sink(maintenance_ctrl_tx);
-    let (_soft_realtime_tx, soft_realtime_rx) = crossbeam_channel::bounded(1);
+    let soft_realtime_rx = Arc::new(piper_sdk::driver::command::SoftRealtimeMailbox::default());
     thread::spawn(move || {
         tx_loop_mailbox(
             tx_adapter,

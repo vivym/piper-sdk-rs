@@ -2,6 +2,7 @@
 //!
 //! 负责后台 IO 线程的 CAN 帧接收、解析和状态更新逻辑。
 
+use crate::command::SoftRealtimeMailbox;
 use crate::heartbeat::monotonic_micros;
 use crate::metrics::PiperMetrics;
 use crate::piper::{
@@ -217,7 +218,7 @@ fn reliable_gate_abort_error(reason: NormalSendGateDenyReason) -> crate::DriverE
 }
 
 fn drain_soft_realtime_queue_with_reason<F>(
-    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    soft_realtime_rx: &Arc<SoftRealtimeMailbox>,
     metrics: &Arc<PiperMetrics>,
     reason: F,
     count_as_fault_abort: bool,
@@ -234,7 +235,7 @@ fn drain_soft_realtime_queue_with_reason<F>(
 
 fn reject_replay_mode_dispatches(
     realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
-    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    soft_realtime_rx: &Arc<SoftRealtimeMailbox>,
     metrics: &Arc<PiperMetrics>,
 ) {
     abort_realtime_slot_with(
@@ -410,7 +411,7 @@ fn drain_maintenance_lane(
     maintenance_tx_state: &mut MaintenanceTxState,
     normal_send_gate: &Arc<NormalSendGate>,
     realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
-    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    soft_realtime_rx: &Arc<SoftRealtimeMailbox>,
     reliable_rx: &Receiver<crate::command::ReliableCommand>,
     pending_reliable_commands: &mut VecDeque<crate::command::ReliableCommand>,
     metrics: &Arc<PiperMetrics>,
@@ -1429,7 +1430,7 @@ pub fn tx_loop_mailbox(
     backend_capability: BackendCapability,
     config: PipelineConfig,
     realtime_slot: Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
-    soft_realtime_rx: Receiver<crate::command::SoftRealtimeCommand>,
+    soft_realtime_rx: Arc<SoftRealtimeMailbox>,
     shutdown_lane: Arc<ShutdownLane>,
     reliable_rx: Receiver<crate::command::ReliableCommand>,
     workers_running: Arc<AtomicBool>,
@@ -2379,7 +2380,7 @@ fn drain_reliable_queue(
 }
 
 fn drain_soft_realtime_queue(
-    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    soft_realtime_rx: &Arc<SoftRealtimeMailbox>,
     metrics: &Arc<PiperMetrics>,
     fault_latched: bool,
     count_as_fault_abort: bool,
@@ -2407,7 +2408,7 @@ fn reliable_command_contains_normal_control(command: &crate::command::ReliableCo
 
 fn abort_pending_normal_control_for_state_transition(
     realtime_slot: &Arc<std::sync::Mutex<Option<crate::command::RealtimeCommand>>>,
-    soft_realtime_rx: &Receiver<crate::command::SoftRealtimeCommand>,
+    soft_realtime_rx: &Arc<SoftRealtimeMailbox>,
     reliable_rx: &Receiver<crate::command::ReliableCommand>,
     pending_reliable_commands: &mut VecDeque<crate::command::ReliableCommand>,
     metrics: &Arc<PiperMetrics>,
