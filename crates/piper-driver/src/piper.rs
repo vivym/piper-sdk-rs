@@ -288,19 +288,21 @@ pub struct NormalSendGate {
 #[repr(u8)]
 pub(crate) enum NormalSendGateState {
     Open = 0,
-    ReplayPaused = 1,
-    FaultClosed = 2,
-    StoppingClosed = 3,
-    StateTransitionClosed = 4,
+    ReplaySwitchPending = 1,
+    ReplayPaused = 2,
+    FaultClosed = 3,
+    StoppingClosed = 4,
+    StateTransitionClosed = 5,
 }
 
 impl NormalSendGateState {
     fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::Open,
-            1 => Self::ReplayPaused,
-            2 => Self::FaultClosed,
-            3 => Self::StoppingClosed,
+            1 => Self::ReplaySwitchPending,
+            2 => Self::ReplayPaused,
+            3 => Self::FaultClosed,
+            4 => Self::StoppingClosed,
             _ => Self::StateTransitionClosed,
         }
     }
@@ -308,7 +310,9 @@ impl NormalSendGateState {
     fn deny_reason(self) -> Option<NormalSendGateDenyReason> {
         match self {
             Self::Open => None,
-            Self::ReplayPaused => Some(NormalSendGateDenyReason::ReplayPaused),
+            Self::ReplaySwitchPending | Self::ReplayPaused => {
+                Some(NormalSendGateDenyReason::ReplayPaused)
+            },
             Self::FaultClosed => Some(NormalSendGateDenyReason::FaultClosed),
             Self::StoppingClosed => Some(NormalSendGateDenyReason::StoppingClosed),
             Self::StateTransitionClosed => Some(NormalSendGateDenyReason::StateTransitionClosed),
@@ -356,7 +360,10 @@ impl NormalSendGate {
     }
 
     pub(crate) fn is_replay_paused(&self) -> bool {
-        self.state() == NormalSendGateState::ReplayPaused
+        matches!(
+            self.state(),
+            NormalSendGateState::ReplaySwitchPending | NormalSendGateState::ReplayPaused
+        )
     }
 
     pub(crate) fn accepts_front_door_submissions(&self) -> bool {
@@ -387,18 +394,81 @@ impl NormalSendGate {
         }
     }
 
-    pub(crate) fn pause_for_replay(&self) {
-        match self.state() {
-            NormalSendGateState::Open => self.set_state(NormalSendGateState::ReplayPaused),
-            NormalSendGateState::ReplayPaused
-            | NormalSendGateState::FaultClosed
-            | NormalSendGateState::StoppingClosed
-            | NormalSendGateState::StateTransitionClosed => {},
+    pub(crate) fn begin_replay_switch(&self) -> Result<(), NormalSendGateDenyReason> {
+        loop {
+            let current = self.state();
+            match current {
+                NormalSendGateState::Open => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            current as u8,
+                            NormalSendGateState::ReplaySwitchPending as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.epoch.fetch_add(1, Ordering::AcqRel);
+                        return Ok(());
+                    }
+                },
+                NormalSendGateState::ReplaySwitchPending | NormalSendGateState::ReplayPaused => {
+                    return Err(NormalSendGateDenyReason::ReplayPaused);
+                },
+                NormalSendGateState::FaultClosed => {
+                    return Err(NormalSendGateDenyReason::FaultClosed);
+                },
+                NormalSendGateState::StoppingClosed => {
+                    return Err(NormalSendGateDenyReason::StoppingClosed);
+                },
+                NormalSendGateState::StateTransitionClosed => {
+                    return Err(NormalSendGateDenyReason::StateTransitionClosed);
+                },
+            }
+        }
+    }
+
+    pub(crate) fn commit_replay_switch(&self) -> Result<(), NormalSendGateDenyReason> {
+        loop {
+            let current = self.state();
+            match current {
+                NormalSendGateState::ReplaySwitchPending => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            current as u8,
+                            NormalSendGateState::ReplayPaused as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.epoch.fetch_add(1, Ordering::AcqRel);
+                        return Ok(());
+                    }
+                },
+                NormalSendGateState::ReplayPaused => {
+                    return Err(NormalSendGateDenyReason::ReplayPaused);
+                },
+                NormalSendGateState::FaultClosed => {
+                    return Err(NormalSendGateDenyReason::FaultClosed);
+                },
+                NormalSendGateState::StoppingClosed => {
+                    return Err(NormalSendGateDenyReason::StoppingClosed);
+                },
+                NormalSendGateState::StateTransitionClosed | NormalSendGateState::Open => {
+                    return Err(NormalSendGateDenyReason::StateTransitionClosed);
+                },
+            }
         }
     }
 
     pub(crate) fn resume_from_replay(&self) {
-        if self.state() == NormalSendGateState::ReplayPaused {
+        if matches!(
+            self.state(),
+            NormalSendGateState::ReplaySwitchPending | NormalSendGateState::ReplayPaused
+        ) {
             self.set_state(NormalSendGateState::Open);
         }
     }
@@ -487,7 +557,7 @@ impl NormalSendGate {
         loop {
             let current = self.state();
             match current {
-                NormalSendGateState::Open | NormalSendGateState::ReplayPaused => {
+                NormalSendGateState::Open | NormalSendGateState::ReplaySwitchPending => {
                     if self
                         .state
                         .compare_exchange(
@@ -501,6 +571,9 @@ impl NormalSendGate {
                         self.epoch.fetch_add(1, Ordering::AcqRel);
                         return Ok(());
                     }
+                },
+                NormalSendGateState::ReplayPaused => {
+                    return Err(NormalSendGateDenyReason::ReplayPaused);
                 },
                 NormalSendGateState::FaultClosed => {
                     return Err(NormalSendGateDenyReason::FaultClosed);
@@ -587,7 +660,9 @@ impl NormalSendPermit<'_> {
         }
 
         match current_state {
-            NormalSendGateState::Open | NormalSendGateState::ReplayPaused => Ok(()),
+            NormalSendGateState::Open
+            | NormalSendGateState::ReplaySwitchPending
+            | NormalSendGateState::ReplayPaused => Ok(()),
             NormalSendGateState::FaultClosed => Err(NormalSendGateDenyReason::FaultClosed),
             NormalSendGateState::StoppingClosed => Err(NormalSendGateDenyReason::StoppingClosed),
             NormalSendGateState::StateTransitionClosed => {
@@ -3013,7 +3088,17 @@ impl Piper {
                     return Err(DriverError::ControlPathClosed);
                 }
 
-                self.normal_send_gate.pause_for_replay();
+                match self.normal_send_gate.begin_replay_switch() {
+                    Ok(()) => {},
+                    Err(NormalSendGateDenyReason::StoppingClosed) => {
+                        return Err(DriverError::ChannelClosed);
+                    },
+                    Err(
+                        NormalSendGateDenyReason::ReplayPaused
+                        | NormalSendGateDenyReason::FaultClosed
+                        | NormalSendGateDenyReason::StateTransitionClosed,
+                    ) => return Err(DriverError::ControlPathClosed),
+                }
                 let deadline = Instant::now() + timeout;
 
                 while self.normal_send_gate.inflight_normal_sends() > 0 {
@@ -3043,8 +3128,16 @@ impl Piper {
 
                 self.maybe_wait_test_mode_switch_replay_barrier();
 
-                if self.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed {
-                    return Err(DriverError::ControlPathClosed);
+                match self.normal_send_gate.commit_replay_switch() {
+                    Ok(()) => {},
+                    Err(NormalSendGateDenyReason::StoppingClosed) => {
+                        return Err(DriverError::ChannelClosed);
+                    },
+                    Err(
+                        NormalSendGateDenyReason::ReplayPaused
+                        | NormalSendGateDenyReason::FaultClosed
+                        | NormalSendGateDenyReason::StateTransitionClosed,
+                    ) => return Err(DriverError::ControlPathClosed),
                 }
 
                 match (self.runtime_phase(), self.runtime_fault_kind()) {
@@ -3611,9 +3704,13 @@ impl Piper {
 
         let deadline = Instant::now() + timeout;
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
-        self.normal_send_gate
-            .close_for_state_transition()
-            .map_err(|_| DriverError::ControlPathClosed)?;
+        match self.normal_send_gate.close_for_state_transition() {
+            Ok(()) => {},
+            Err(NormalSendGateDenyReason::ReplayPaused) => {
+                return Err(DriverError::ReplayModeActive);
+            },
+            Err(_) => return Err(DriverError::ControlPathClosed),
+        }
 
         {
             let _mode_switch_guard =
@@ -3628,6 +3725,14 @@ impl Piper {
                 return Err(DriverError::ChannelClosed);
             }
             if self.replay_mode_active() {
+                self.normal_send_gate.restore_after_state_transition(
+                    self.runtime_phase(),
+                    self.runtime_fault_kind(),
+                    self.mode(),
+                );
+                return Err(DriverError::ReplayModeActive);
+            }
+            if self.normal_send_gate.state() == NormalSendGateState::ReplayPaused {
                 self.normal_send_gate.restore_after_state_transition(
                     self.runtime_phase(),
                     self.runtime_fault_kind(),
@@ -7646,7 +7751,7 @@ mod tests {
 
         wait_until(
             Duration::from_millis(100),
-            || piper.normal_send_gate.state() == NormalSendGateState::ReplayPaused,
+            || piper.replay_barrier_active(),
             "replay switch should pause the front door while it waits for inflight sends",
         );
 
@@ -7703,6 +7808,75 @@ mod tests {
             sent.as_slice(),
             &[inflight_frame],
             "replay-preempted state-transition disable must not commit after timing out",
+        );
+    }
+
+    #[test]
+    fn test_state_transition_disable_preempts_replay_in_late_publish_window() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .expect("driver should start"),
+        );
+
+        let (reached_rx, release_tx) = install_mode_switch_barrier(piper.as_ref());
+        let piper_replay = Arc::clone(&piper);
+        let replay_handle = std::thread::spawn(move || {
+            piper_replay.try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("Replay switch should reach the late-publish barrier");
+
+        let disable_frame = MotorEnableCommand::disable_all().to_frame();
+        let piper_disable = Arc::clone(&piper);
+        let disable_handle = std::thread::spawn(move || {
+            piper_disable.send_local_state_transition_frame_confirmed(
+                disable_frame,
+                Duration::from_millis(100),
+            )
+        });
+
+        wait_until(
+            Duration::from_millis(100),
+            || piper.normal_send_gate.state() == NormalSendGateState::StateTransitionClosed,
+            "safety disable should close the front door while replay is blocked at late publish",
+        );
+
+        release_tx.send(()).expect("mode-switch barrier should release cleanly");
+
+        let replay_result =
+            replay_handle.join().expect("replay switch thread should finish cleanly");
+        let disable_result = disable_handle
+            .join()
+            .expect("state-transition sender thread should finish cleanly");
+
+        assert!(
+            replay_result.is_err(),
+            "late-publish replay switch must not succeed once safety disable has closed the gate",
+        );
+        assert!(
+            !matches!(disable_result, Err(DriverError::ReplayModeActive)),
+            "safety disable must not lose the race to a replay publish that was still in flight",
+        );
+        assert_eq!(
+            piper.mode(),
+            crate::mode::DriverMode::Normal,
+            "late-publish race must not leave Replay mode published",
+        );
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert!(
+            sent.as_slice() == [disable_frame] || sent.is_empty(),
+            "late-publish race must not emit replay traffic",
         );
     }
 

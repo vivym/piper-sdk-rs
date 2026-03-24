@@ -1513,7 +1513,8 @@ pub fn tx_loop_mailbox(
             }
             let send_result = if dispatch.state_transition_completion.is_some() {
                 match normal_send_gate.state() {
-                    crate::piper::NormalSendGateState::ReplayPaused => {
+                    crate::piper::NormalSendGateState::ReplaySwitchPending
+                    | crate::piper::NormalSendGateState::ReplayPaused => {
                         Err(crate::DriverError::ReplayModeActive)
                     },
                     crate::piper::NormalSendGateState::FaultClosed => {
