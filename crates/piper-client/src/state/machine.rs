@@ -4747,7 +4747,7 @@ mod tests {
                     sent_frames: sent_frames.clone(),
                     shutdown_sends: 0,
                     delay_on: 2,
-                    delay: Duration::from_millis(15),
+                    delay: Duration::ZERO,
                 },
                 None,
             )

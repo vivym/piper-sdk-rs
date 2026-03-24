@@ -4273,7 +4273,7 @@ mod tests {
             "monitor-complete snapshot should still be published"
         );
         assert_eq!(
-            ctx.capture_control_joint_position().hardware_timestamp_us,
+            ctx.capture_control_pair().joint_position.hardware_timestamp_us,
             0
         );
         assert_eq!(

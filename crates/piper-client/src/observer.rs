@@ -1277,6 +1277,89 @@ mod tests {
     }
 
     #[test]
+    fn test_control_snapshot_holds_last_coherent_pair_until_position_side_catches_up() {
+        let frames = vec![
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(1, 1000, 1000, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(2, 1000, 1000, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(3, 1000, 1000, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(4, 1000, 1000, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(5, 1000, 1000, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(6, 1000, 1000, 1_000),
+            },
+            TimedFrame {
+                delay: Duration::from_millis(5),
+                frame: joint_dynamic_frame(1, 2000, 1000, 3_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(2, 2000, 1000, 3_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(3, 2000, 1000, 3_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(4, 2000, 1000, 3_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(5, 2000, 1000, 3_000),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(6, 2000, 1000, 3_000),
+            },
+        ];
+        let (driver, observer) = start_observer_with_timed_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(30));
+
+        let snapshot = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 5_000,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .expect("control snapshot should keep returning the last coherent pair");
+
+        assert_eq!(snapshot.position_timestamp_us, 1_000);
+        assert_eq!(snapshot.dynamic_timestamp_us, 1_000);
+        assert_eq!(snapshot.velocity[Joint::J1], RadPerSecond(1.0));
+    }
+
+    #[test]
     fn test_control_snapshot_full_exposes_metadata() {
         let position_timestamp_us = 1_000;
         let dynamic_timestamp_us = 1_000;

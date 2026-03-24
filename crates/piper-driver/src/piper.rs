@@ -2250,6 +2250,9 @@ impl Piper {
     }
 
     /// 获取控制级关节动态状态。
+    ///
+    /// 返回最近一份 coherent control pair 中的 dynamic 状态，
+    /// 不会暴露仅单边推进的控制候选值。
     pub fn get_control_joint_dynamic(&self) -> JointDynamicState {
         self.ctx.capture_control_joint_dynamic()
     }
@@ -2558,8 +2561,18 @@ impl Piper {
     /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内
     /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回状态数据
     pub fn get_aligned_motion(&self, max_time_diff_us: u64) -> AlignmentResult {
-        let joint_position = self.ctx.capture_control_joint_position();
-        let joint_dynamic = self.get_control_joint_dynamic();
+        let pair = self.ctx.capture_control_pair();
+        let pair_is_published = pair.position_sequence != 0 && pair.dynamic_sequence != 0;
+        let joint_position = if pair_is_published {
+            pair.joint_position
+        } else {
+            self.ctx.capture_control_joint_position_candidate()
+        };
+        let joint_dynamic = if pair_is_published {
+            pair.joint_dynamic
+        } else {
+            self.ctx.capture_control_joint_dynamic_candidate()
+        };
 
         let time_diff =
             joint_position.hardware_timestamp_us.abs_diff(joint_dynamic.group_timestamp_us);
@@ -3219,7 +3232,15 @@ impl Piper {
             )));
         }
 
+        if timeout.is_zero() {
+            return Err(DriverError::Timeout);
+        }
+
         let deadline = Instant::now() + timeout;
+        if deadline <= Instant::now() {
+            return Err(DriverError::Timeout);
+        }
+
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         let command = SoftRealtimeCommand::confirmed(buffer, deadline, ack_tx);
 
@@ -5990,6 +6011,55 @@ mod tests {
     }
 
     #[test]
+    fn test_soft_realtime_zero_budget_front_door_rejection_does_not_fill_queue() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts(
+                SoftRxAdapter,
+                RecordingTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let (reached_rx, release_tx) = install_tx_loop_barrier(piper.as_ref());
+        reached_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("TX loop should hit dispatch barrier");
+
+        let expired_frame = PiperFrame::new_standard(0x155, &[0x01]);
+        for _ in 0..4 {
+            let error = piper
+                .send_soft_realtime_package_confirmed([expired_frame], Duration::ZERO)
+                .expect_err("zero-budget soft realtime command must fail at the front door");
+            assert!(matches!(error, DriverError::Timeout));
+        }
+
+        let piper_for_send = Arc::clone(&piper);
+        let valid_frame = PiperFrame::new_standard(0x156, &[0x02]);
+        let send_handle = std::thread::spawn(move || {
+            piper_for_send
+                .send_soft_realtime_package_confirmed([valid_frame], Duration::from_millis(200))
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        let _ = release_tx.send(());
+
+        let result = send_handle.join().expect("soft realtime sender thread should join");
+        assert!(
+            result.is_ok(),
+            "front-door zero-budget rejections must not consume soft realtime queue capacity: {result:?}",
+        );
+
+        wait_until(
+            Duration::from_millis(200),
+            || sent_frames.lock().expect("sent frames lock").len() == 1,
+            "valid soft realtime command should still be delivered after zero-budget rejections",
+        );
+    }
+
+    #[test]
     fn test_soft_realtime_sub_millisecond_remaining_budget_is_not_rounded_up() {
         let piper = Piper::new_dual_thread_parts(
             SoftRxAdapter,
@@ -6146,6 +6216,63 @@ mod tests {
         assert_eq!(state.position_frame_valid_mask, 0b101);
         assert_eq!(state.dynamic_valid_mask, 0b001111);
         assert!(!state.is_complete());
+    }
+
+    #[test]
+    fn test_get_aligned_motion_holds_last_coherent_control_pair_until_both_sides_advance() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 1_000,
+            host_rx_mono_us: 2_000,
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        });
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 1_000,
+            group_host_rx_mono_us: 2_000,
+            joint_vel: [10.0; 6],
+            joint_current: [20.0; 6],
+            timestamps: [1_000; 6],
+            valid_mask: 0b11_1111,
+        });
+
+        let initial = match piper.get_aligned_motion(5_000) {
+            AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
+        };
+        assert_eq!(initial.position_timestamp_us, 1_000);
+        assert_eq!(initial.dynamic_timestamp_us, 1_000);
+
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 3_000,
+            group_host_rx_mono_us: 4_000,
+            joint_vel: [30.0; 6],
+            joint_current: [40.0; 6],
+            timestamps: [3_000; 6],
+            valid_mask: 0b11_1111,
+        });
+
+        let after_dynamic_only = match piper.get_aligned_motion(5_000) {
+            AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
+        };
+        assert_eq!(after_dynamic_only.position_timestamp_us, 1_000);
+        assert_eq!(after_dynamic_only.dynamic_timestamp_us, 1_000);
+        assert_eq!(piper.get_control_joint_dynamic().group_timestamp_us, 1_000);
+
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 3_000,
+            host_rx_mono_us: 4_000,
+            joint_pos: [3.0; 6],
+            frame_valid_mask: 0b111,
+        });
+
+        let after_both_advanced = match piper.get_aligned_motion(5_000) {
+            AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
+        };
+        assert_eq!(after_both_advanced.position_timestamp_us, 3_000);
+        assert_eq!(after_both_advanced.dynamic_timestamp_us, 3_000);
+        assert_eq!(piper.get_control_joint_dynamic().group_timestamp_us, 3_000);
     }
 
     #[test]

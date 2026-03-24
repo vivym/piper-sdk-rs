@@ -111,7 +111,7 @@ pub struct PiperMetrics {
     pub rx_joint_dynamic_groups_dropped_total: AtomicU64,
     /// 关节动态完整组因控制级时间跨度超限而被拒绝的次数
     pub rx_joint_dynamic_control_grade_rejected_total: AtomicU64,
-    /// 热路径快照发布因无空闲槽位而被跳过的次数
+    /// 热路径逻辑快照发布因参与 cell 无空闲槽位而被整体跳过的次数
     pub rx_hot_snapshot_publish_skipped_total: AtomicU64,
     /// SoftRealtime 控制发送 deadline miss 总次数
     pub tx_soft_deadline_miss_total: AtomicU64,
@@ -311,7 +311,7 @@ pub struct MetricsSnapshot {
     pub rx_joint_dynamic_groups_dropped_total: u64,
     /// 关节动态完整组因控制级时间跨度超限而被拒绝的次数
     pub rx_joint_dynamic_control_grade_rejected_total: u64,
-    /// 热路径快照发布因无空闲槽位而被跳过的次数
+    /// 热路径逻辑快照发布因参与 cell 无空闲槽位而被整体跳过的次数
     pub rx_hot_snapshot_publish_skipped_total: u64,
     /// SoftRealtime 控制发送 deadline miss 总次数
     pub tx_soft_deadline_miss_total: u64,

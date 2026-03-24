@@ -81,6 +81,23 @@ impl<T: Copy + Default, const N: usize> RealtimeSnapshotCell<T, N> {
         false
     }
 
+    fn reserve_slot(&self) -> Option<RealtimeSnapshotReservation<'_, T, N>> {
+        let published = self.published_slot.load(Ordering::Acquire);
+
+        for slot in 0..N {
+            if slot == published {
+                continue;
+            }
+            if self.reader_counts[slot].load(Ordering::Acquire) != 0 {
+                continue;
+            }
+
+            return Some(RealtimeSnapshotReservation { cell: self, slot });
+        }
+
+        None
+    }
+
     #[cfg(test)]
     fn store(&self, value: T) {
         let _ = self.try_store(value);
@@ -112,6 +129,71 @@ unsafe impl<T: Copy + Default + Send, const N: usize> Send for RealtimeSnapshotC
 // - 并发访问通过 published 索引和 per-slot reader count 协调
 // - 读者不会获得内部可变引用
 unsafe impl<T: Copy + Default + Send, const N: usize> Sync for RealtimeSnapshotCell<T, N> {}
+
+struct RealtimeSnapshotReservation<'a, T: Copy + Default, const N: usize = 3> {
+    cell: &'a RealtimeSnapshotCell<T, N>,
+    slot: usize,
+}
+
+impl<T: Copy + Default, const N: usize> RealtimeSnapshotReservation<'_, T, N> {
+    fn write(&mut self, value: T) {
+        // SAFETY:
+        // - 单写者模型下不存在并发写
+        // - 预留槽位不是当前 published，新的读者无法进入
+        // - reserve_slot() 已验证 reader_count == 0
+        unsafe {
+            *self.cell.slots[self.slot].get() = value;
+        }
+    }
+
+    fn publish(self) {
+        self.cell.published_slot.store(self.slot, Ordering::Release);
+    }
+}
+
+fn try_publish_pair<A: Copy + Default, B: Copy + Default>(
+    first: &RealtimeSnapshotCell<A>,
+    first_value: A,
+    second: &RealtimeSnapshotCell<B>,
+    second_value: B,
+) -> bool {
+    let (Some(mut first_reservation), Some(mut second_reservation)) =
+        (first.reserve_slot(), second.reserve_slot())
+    else {
+        return false;
+    };
+
+    first_reservation.write(first_value);
+    second_reservation.write(second_value);
+    first_reservation.publish();
+    second_reservation.publish();
+    true
+}
+
+fn try_publish_triplet<A: Copy + Default, B: Copy + Default, C: Copy + Default>(
+    first: &RealtimeSnapshotCell<A>,
+    first_value: A,
+    second: &RealtimeSnapshotCell<B>,
+    second_value: B,
+    third: &RealtimeSnapshotCell<C>,
+    third_value: C,
+) -> bool {
+    let (Some(mut first_reservation), Some(mut second_reservation), Some(mut third_reservation)) = (
+        first.reserve_slot(),
+        second.reserve_slot(),
+        third.reserve_slot(),
+    ) else {
+        return false;
+    };
+
+    first_reservation.write(first_value);
+    second_reservation.write(second_value);
+    third_reservation.write(third_value);
+    first_reservation.publish();
+    second_reservation.publish();
+    third_reservation.publish();
+    true
+}
 
 #[cfg(test)]
 struct RealtimeSnapshotSlotGuard<'a, T: Copy + Default, const N: usize = 3> {
@@ -302,6 +384,14 @@ pub struct MotionSnapshot {
     // pub joint_dynamic: JointDynamicState,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ControlPairSnapshot {
+    pub(crate) joint_position: JointPositionState,
+    pub(crate) joint_dynamic: JointDynamicState,
+    pub(crate) position_sequence: u64,
+    pub(crate) dynamic_sequence: u64,
+}
+
 /// 关节动态状态（独立帧，但通过缓冲提交保证一致性）
 ///
 /// 更新频率：500Hz
@@ -459,6 +549,104 @@ impl JointDynamicState {
         (0..6).filter(|&i| (self.valid_mask & (1 << i)) == 0).collect()
     }
 }
+
+enum ControlPairPublishAttempt {
+    Published,
+    AwaitingPeer,
+    SkippedNoSpareSlot,
+}
+
+struct ControlPairPublisher {
+    snapshot: RealtimeSnapshotCell<ControlPairSnapshot>,
+    pending_position: UnsafeCell<JointPositionState>,
+    pending_dynamic: UnsafeCell<JointDynamicState>,
+    position_sequence: AtomicU64,
+    dynamic_sequence: AtomicU64,
+    published_position_sequence: AtomicU64,
+    published_dynamic_sequence: AtomicU64,
+}
+
+impl ControlPairPublisher {
+    fn new() -> Self {
+        Self {
+            snapshot: RealtimeSnapshotCell::new(ControlPairSnapshot::default()),
+            pending_position: UnsafeCell::new(JointPositionState::default()),
+            pending_dynamic: UnsafeCell::new(JointDynamicState::default()),
+            position_sequence: AtomicU64::new(0),
+            dynamic_sequence: AtomicU64::new(0),
+            published_position_sequence: AtomicU64::new(0),
+            published_dynamic_sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn load(&self) -> ControlPairSnapshot {
+        self.snapshot.load()
+    }
+
+    fn publish_position(&self, joint_position: JointPositionState) -> ControlPairPublishAttempt {
+        // SAFETY:
+        // - 控制级 publish 路径是单写者（RX 线程）
+        // - 读者只通过 published pair snapshot 读取，不访问 pending 缓冲
+        unsafe {
+            *self.pending_position.get() = joint_position;
+        }
+        self.position_sequence.fetch_add(1, Ordering::AcqRel);
+        self.try_publish_pair()
+    }
+
+    fn publish_dynamic(&self, joint_dynamic: JointDynamicState) -> ControlPairPublishAttempt {
+        // SAFETY:
+        // - 控制级 publish 路径是单写者（RX 线程）
+        // - 读者只通过 published pair snapshot 读取，不访问 pending 缓冲
+        unsafe {
+            *self.pending_dynamic.get() = joint_dynamic;
+        }
+        self.dynamic_sequence.fetch_add(1, Ordering::AcqRel);
+        self.try_publish_pair()
+    }
+
+    fn try_publish_pair(&self) -> ControlPairPublishAttempt {
+        let position_sequence = self.position_sequence.load(Ordering::Acquire);
+        let dynamic_sequence = self.dynamic_sequence.load(Ordering::Acquire);
+        let published_position_sequence = self.published_position_sequence.load(Ordering::Acquire);
+        let published_dynamic_sequence = self.published_dynamic_sequence.load(Ordering::Acquire);
+
+        if position_sequence <= published_position_sequence
+            || dynamic_sequence <= published_dynamic_sequence
+        {
+            return ControlPairPublishAttempt::AwaitingPeer;
+        }
+
+        // SAFETY:
+        // - 单写者模型下，pending_position/pending_dynamic 只有当前线程写入
+        // - 只有在两侧都出现新版本后才会读取并尝试发布 pair
+        let snapshot = unsafe {
+            ControlPairSnapshot {
+                joint_position: *self.pending_position.get(),
+                joint_dynamic: *self.pending_dynamic.get(),
+                position_sequence,
+                dynamic_sequence,
+            }
+        };
+
+        if self.snapshot.try_store(snapshot) {
+            self.published_position_sequence.store(position_sequence, Ordering::Release);
+            self.published_dynamic_sequence.store(dynamic_sequence, Ordering::Release);
+            ControlPairPublishAttempt::Published
+        } else {
+            ControlPairPublishAttempt::SkippedNoSpareSlot
+        }
+    }
+}
+
+// SAFETY:
+// - pending_position/pending_dynamic 只允许单个 RX 写线程写入
+// - 读者只通过 RealtimeSnapshotCell 读取已发布 pair 副本
+unsafe impl Send for ControlPairPublisher {}
+// SAFETY:
+// - 并发读取通过 RealtimeSnapshotCell 协调
+// - pending 缓冲不暴露给读者
+unsafe impl Sync for ControlPairPublisher {}
 
 /// 机器人控制状态
 ///
@@ -1302,12 +1490,14 @@ pub struct PiperContext {
     end_pose_monitor: Arc<RealtimeSnapshotCell<EndPoseMonitorSnapshot>>,
     /// 完整监控运动状态快照（单次 load 保证逻辑原子）
     motion_snapshot: Arc<RealtimeSnapshotCell<MotionSnapshot>>,
-    /// 控制级关节位置状态（完整帧组 + 对齐跨度约束）
-    control_joint_position: Arc<RealtimeSnapshotCell<JointPositionState>>,
+    /// 控制级关节位置候选状态（用于不完整/被拒绝候选的诊断）
+    control_joint_position_candidate: Arc<RealtimeSnapshotCell<JointPositionState>>,
+    /// 控制级位置/动力学 pair（只向读路径暴露最后一份 coherent pair）
+    control_pair: Arc<ControlPairPublisher>,
     /// 关节动态监控快照（完整监控 + raw 诊断，共享一次原子发布）
     joint_dynamic_monitor: Arc<RealtimeSnapshotCell<JointDynamicMonitorSnapshot>>,
-    /// 控制级关节动态状态（完整 6 关节组 + 组内跨度约束）
-    control_joint_dynamic: Arc<RealtimeSnapshotCell<JointDynamicState>>,
+    /// 控制级关节动态候选状态（用于不完整/被拒绝候选的诊断）
+    control_joint_dynamic_candidate: Arc<RealtimeSnapshotCell<JointDynamicState>>,
     /// 原始运动状态快照（单次 load 保证逻辑原子）
     raw_motion_snapshot: Arc<RealtimeSnapshotCell<MotionSnapshot>>,
 
@@ -1451,15 +1641,16 @@ impl PiperContext {
                 RealtimeSnapshotCell::new(EndPoseMonitorSnapshot::default()),
             ),
             motion_snapshot: Arc::new(RealtimeSnapshotCell::new(MotionSnapshot::default())),
-            control_joint_position: Arc::new(RealtimeSnapshotCell::new(
+            control_joint_position_candidate: Arc::new(RealtimeSnapshotCell::new(
                 JointPositionState::default(),
             )),
+            control_pair: Arc::new(ControlPairPublisher::new()),
             joint_dynamic_monitor: Arc::new(RealtimeSnapshotCell::new(
                 JointDynamicMonitorSnapshot::default(),
             )),
-            control_joint_dynamic: Arc::new(
-                RealtimeSnapshotCell::new(JointDynamicState::default()),
-            ),
+            control_joint_dynamic_candidate: Arc::new(RealtimeSnapshotCell::new(
+                JointDynamicState::default(),
+            )),
             raw_motion_snapshot: Arc::new(RealtimeSnapshotCell::new(MotionSnapshot::default())),
 
             // 温数据：ArcSwap
@@ -1604,105 +1795,104 @@ impl PiperContext {
         self.raw_motion_snapshot.load()
     }
 
-    pub(crate) fn capture_control_joint_position(&self) -> JointPositionState {
-        self.control_joint_position.load()
+    pub(crate) fn capture_control_pair(&self) -> ControlPairSnapshot {
+        self.control_pair.load()
+    }
+
+    pub(crate) fn capture_control_joint_position_candidate(&self) -> JointPositionState {
+        self.control_joint_position_candidate.load()
     }
 
     pub(crate) fn capture_control_joint_dynamic(&self) -> JointDynamicState {
-        self.control_joint_dynamic.load()
+        self.capture_control_pair().joint_dynamic
+    }
+
+    pub(crate) fn capture_control_joint_dynamic_candidate(&self) -> JointDynamicState {
+        self.control_joint_dynamic_candidate.load()
     }
 
     /// 发布新的关节位置完整监控快照，并与当前末端位姿组合成逻辑原子快照。
     pub fn publish_joint_position(&self, joint_position: JointPositionState) {
         let end_pose = self.end_pose_monitor.load();
-        let mut skipped = 0;
-        if !self
-            .joint_position_monitor
-            .try_store(JointPositionMonitorSnapshot::from_complete(joint_position))
-        {
-            skipped += 1;
-        }
-        if !self.motion_snapshot.try_store(MotionSnapshot {
-            joint_position,
-            end_pose: end_pose.latest_complete_cloned().unwrap_or_default(),
-        }) {
-            skipped += 1;
-        }
-        if !self.raw_motion_snapshot.try_store(MotionSnapshot {
-            joint_position,
-            end_pose: *end_pose.latest_raw(),
-        }) {
-            skipped += 1;
-        }
-        self.record_hot_snapshot_publish_skips(skipped);
+        let published = try_publish_triplet(
+            &self.joint_position_monitor,
+            JointPositionMonitorSnapshot::from_complete(joint_position),
+            &self.motion_snapshot,
+            MotionSnapshot {
+                joint_position,
+                end_pose: end_pose.latest_complete_cloned().unwrap_or_default(),
+            },
+            &self.raw_motion_snapshot,
+            MotionSnapshot {
+                joint_position,
+                end_pose: *end_pose.latest_raw(),
+            },
+        );
+        self.record_hot_snapshot_publish_skips(u64::from(!published));
     }
 
     /// 发布新的原始关节位置，并与当前原始末端位姿组合成逻辑原子快照。
     pub fn publish_raw_joint_position(&self, joint_position: JointPositionState) {
         let current = self.joint_position_monitor.load();
         let end_pose = self.end_pose_monitor.load();
-        let mut skipped = 0;
-        if !self.joint_position_monitor.try_store(JointPositionMonitorSnapshot::with_raw(
-            current.latest_complete,
-            joint_position,
-        )) {
-            skipped += 1;
-        }
-        if !self.raw_motion_snapshot.try_store(MotionSnapshot {
-            joint_position,
-            end_pose: *end_pose.latest_raw(),
-        }) {
-            skipped += 1;
-        }
-        self.record_hot_snapshot_publish_skips(skipped);
+        let published = try_publish_pair(
+            &self.joint_position_monitor,
+            JointPositionMonitorSnapshot::with_raw(current.latest_complete, joint_position),
+            &self.raw_motion_snapshot,
+            MotionSnapshot {
+                joint_position,
+                end_pose: *end_pose.latest_raw(),
+            },
+        );
+        self.record_hot_snapshot_publish_skips(u64::from(!published));
     }
 
     /// 发布新的末端位姿完整监控快照，并与当前关节位置组合成逻辑原子快照。
     pub fn publish_end_pose(&self, end_pose: EndPoseState) {
         let joint_position = self.joint_position_monitor.load();
-        let mut skipped = 0;
-        if !self.end_pose_monitor.try_store(EndPoseMonitorSnapshot::from_complete(end_pose)) {
-            skipped += 1;
-        }
-        if !self.motion_snapshot.try_store(MotionSnapshot {
-            joint_position: joint_position.latest_complete_cloned().unwrap_or_default(),
-            end_pose,
-        }) {
-            skipped += 1;
-        }
-        if !self.raw_motion_snapshot.try_store(MotionSnapshot {
-            joint_position: *joint_position.latest_raw(),
-            end_pose,
-        }) {
-            skipped += 1;
-        }
-        self.record_hot_snapshot_publish_skips(skipped);
+        let published = try_publish_triplet(
+            &self.end_pose_monitor,
+            EndPoseMonitorSnapshot::from_complete(end_pose),
+            &self.motion_snapshot,
+            MotionSnapshot {
+                joint_position: joint_position.latest_complete_cloned().unwrap_or_default(),
+                end_pose,
+            },
+            &self.raw_motion_snapshot,
+            MotionSnapshot {
+                joint_position: *joint_position.latest_raw(),
+                end_pose,
+            },
+        );
+        self.record_hot_snapshot_publish_skips(u64::from(!published));
     }
 
     /// 发布新的控制级关节位置。
     pub fn publish_control_joint_position(&self, joint_position: JointPositionState) {
-        let stored = self.control_joint_position.try_store(joint_position);
-        self.record_hot_snapshot_publish_skips(u64::from(!stored));
+        let mut skipped = !self.control_joint_position_candidate.try_store(joint_position);
+        if matches!(
+            self.control_pair.publish_position(joint_position),
+            ControlPairPublishAttempt::SkippedNoSpareSlot
+        ) {
+            skipped = true;
+        }
+        self.record_hot_snapshot_publish_skips(u64::from(skipped));
     }
 
     /// 发布新的原始末端位姿，并与当前原始关节位置组合成逻辑原子快照。
     pub fn publish_raw_end_pose(&self, end_pose: EndPoseState) {
         let current = self.end_pose_monitor.load();
         let joint_position = self.joint_position_monitor.load();
-        let mut skipped = 0;
-        if !self.end_pose_monitor.try_store(EndPoseMonitorSnapshot::with_raw(
-            current.latest_complete,
-            end_pose,
-        )) {
-            skipped += 1;
-        }
-        if !self.raw_motion_snapshot.try_store(MotionSnapshot {
-            joint_position: *joint_position.latest_raw(),
-            end_pose,
-        }) {
-            skipped += 1;
-        }
-        self.record_hot_snapshot_publish_skips(skipped);
+        let published = try_publish_pair(
+            &self.end_pose_monitor,
+            EndPoseMonitorSnapshot::with_raw(current.latest_complete, end_pose),
+            &self.raw_motion_snapshot,
+            MotionSnapshot {
+                joint_position: *joint_position.latest_raw(),
+                end_pose,
+            },
+        );
+        self.record_hot_snapshot_publish_skips(u64::from(!published));
     }
 
     /// 发布新的完整关节动态监控快照。
@@ -1715,8 +1905,14 @@ impl PiperContext {
 
     /// 发布新的控制级关节动态状态。
     pub fn publish_control_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
-        let stored = self.control_joint_dynamic.try_store(joint_dynamic);
-        self.record_hot_snapshot_publish_skips(u64::from(!stored));
+        let mut skipped = !self.control_joint_dynamic_candidate.try_store(joint_dynamic);
+        if matches!(
+            self.control_pair.publish_dynamic(joint_dynamic),
+            ControlPairPublishAttempt::SkippedNoSpareSlot
+        ) {
+            skipped = true;
+        }
+        self.record_hot_snapshot_publish_skips(u64::from(skipped));
     }
 
     /// 发布新的原始关节动态状态。
@@ -2649,14 +2845,104 @@ mod tests {
 
         ctx.publish_control_joint_position(joint_position);
         ctx.publish_control_joint_dynamic(joint_dynamic);
+        let pair = ctx.capture_control_pair();
 
-        assert_eq!(
-            ctx.capture_control_joint_position().hardware_timestamp_us,
-            42
-        );
-        assert_eq!(ctx.capture_control_joint_position().frame_valid_mask, 0b111);
+        assert_eq!(pair.joint_position.hardware_timestamp_us, 42);
+        assert_eq!(pair.joint_position.frame_valid_mask, 0b111);
         assert_eq!(ctx.capture_control_joint_dynamic().group_timestamp_us, 84);
         assert_eq!(ctx.capture_control_joint_dynamic().valid_mask, 0b11_1111);
+    }
+
+    #[test]
+    fn test_publish_joint_position_skips_entire_group_when_any_target_cell_has_no_spare_slot() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
+
+        let baseline_end_pose = sample_end_pose_state(30, 0b111);
+        let baseline_joint_position = sample_joint_position_state(40, 0b111);
+        ctx.publish_end_pose(baseline_end_pose);
+        ctx.publish_joint_position(baseline_joint_position);
+
+        let baseline_motion = ctx.capture_motion_snapshot();
+        let baseline_raw_motion = ctx.capture_raw_motion_snapshot();
+
+        let held_oldest = ctx
+            .motion_snapshot
+            .pin_slot_for_test(ctx.motion_snapshot.published_slot_for_test());
+        ctx.motion_snapshot.store(baseline_motion);
+        let held_middle = ctx
+            .motion_snapshot
+            .pin_slot_for_test(ctx.motion_snapshot.published_slot_for_test());
+        ctx.motion_snapshot.store(baseline_motion);
+
+        let next_joint_position = sample_joint_position_state(41, 0b111);
+        ctx.publish_joint_position(next_joint_position);
+
+        let joint_monitor = ctx.capture_joint_position_monitor_snapshot();
+        let motion = ctx.capture_motion_snapshot();
+        let raw_motion = ctx.capture_raw_motion_snapshot();
+
+        assert_eq!(
+            joint_monitor
+                .latest_complete()
+                .expect("baseline complete joint position should remain visible")
+                .hardware_timestamp_us,
+            baseline_joint_position.hardware_timestamp_us
+        );
+        assert_eq!(
+            motion.joint_position.hardware_timestamp_us,
+            baseline_motion.joint_position.hardware_timestamp_us
+        );
+        assert_eq!(
+            raw_motion.joint_position.hardware_timestamp_us,
+            baseline_raw_motion.joint_position.hardware_timestamp_us
+        );
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 1);
+
+        drop(held_middle);
+        drop(held_oldest);
+    }
+
+    #[test]
+    fn test_publish_raw_end_pose_skips_entire_group_when_any_target_cell_has_no_spare_slot() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
+
+        let baseline_joint_position = sample_joint_position_state(60, 0b111);
+        let baseline_end_pose = sample_end_pose_state(70, 0b111);
+        ctx.publish_joint_position(baseline_joint_position);
+        ctx.publish_end_pose(baseline_end_pose);
+
+        let baseline_monitor = ctx.capture_end_pose_monitor_snapshot();
+        let baseline_raw_motion = ctx.capture_raw_motion_snapshot();
+
+        let held_oldest = ctx
+            .raw_motion_snapshot
+            .pin_slot_for_test(ctx.raw_motion_snapshot.published_slot_for_test());
+        ctx.raw_motion_snapshot.store(baseline_raw_motion);
+        let held_middle = ctx
+            .raw_motion_snapshot
+            .pin_slot_for_test(ctx.raw_motion_snapshot.published_slot_for_test());
+        ctx.raw_motion_snapshot.store(baseline_raw_motion);
+
+        let next_raw_end_pose = sample_end_pose_state(71, 0b001);
+        ctx.publish_raw_end_pose(next_raw_end_pose);
+
+        let end_pose_monitor = ctx.capture_end_pose_monitor_snapshot();
+        let raw_motion = ctx.capture_raw_motion_snapshot();
+
+        assert_eq!(
+            end_pose_monitor.latest_raw().hardware_timestamp_us,
+            baseline_monitor.latest_raw().hardware_timestamp_us
+        );
+        assert_eq!(
+            raw_motion.end_pose.hardware_timestamp_us,
+            baseline_raw_motion.end_pose.hardware_timestamp_us
+        );
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 1);
+
+        drop(held_middle);
+        drop(held_oldest);
     }
 
     #[test]
@@ -2770,20 +3056,27 @@ mod tests {
         let metrics = Arc::new(PiperMetrics::new());
         let ctx = PiperContext::with_metrics(metrics.clone());
 
-        let held_oldest = ctx
-            .control_joint_position
-            .pin_slot_for_test(ctx.control_joint_position.published_slot_for_test());
         ctx.publish_control_joint_position(sample_joint_position_state(1, 0b111));
-        let held_middle = ctx
-            .control_joint_position
-            .pin_slot_for_test(ctx.control_joint_position.published_slot_for_test());
-        ctx.publish_control_joint_position(sample_joint_position_state(2, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(1, 0b11_1111));
+        let published_before = ctx.capture_control_pair().joint_position;
+        let published_pair = ctx.capture_control_pair();
 
-        let published_before = ctx.capture_control_joint_position();
-        ctx.publish_control_joint_position(sample_joint_position_state(3, 0b111));
+        let held_oldest = ctx
+            .control_pair
+            .snapshot
+            .pin_slot_for_test(ctx.control_pair.snapshot.published_slot_for_test());
+        ctx.control_pair.snapshot.store(published_pair);
+        let held_middle = ctx
+            .control_pair
+            .snapshot
+            .pin_slot_for_test(ctx.control_pair.snapshot.published_slot_for_test());
+        ctx.control_pair.snapshot.store(published_pair);
+
+        ctx.publish_control_joint_position(sample_joint_position_state(2, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(2, 0b11_1111));
 
         assert_eq!(
-            ctx.capture_control_joint_position().hardware_timestamp_us,
+            ctx.capture_control_pair().joint_position.hardware_timestamp_us,
             published_before.hardware_timestamp_us,
         );
         assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 1);
