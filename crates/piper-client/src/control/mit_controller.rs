@@ -419,13 +419,13 @@ impl MitController {
     }
 
     fn note_send_failure_recovered(&mut self) {
-        self.send_failure_diagnostics.record_recovery();
+        self.send_failure_diagnostics.record_recovery(Instant::now());
     }
 
     fn run_cycle_epilogue(&mut self, next_tick: &mut Instant, period: Duration) {
         let schedule = finalize_tick_schedule(Instant::now(), *next_tick, period);
         if let Some(sleep_duration) = schedule.sleep_duration {
-            self.overrun_diagnostics.record_recovery();
+            self.overrun_diagnostics.record_recovery(Instant::now());
             spin_sleep::sleep(sleep_duration);
         } else {
             match self.overrun_diagnostics.record_fault(Instant::now(), DIAGNOSTIC_LOG_INTERVAL) {
@@ -1267,7 +1267,8 @@ mod tests {
                 suppressed_repeats: 0
             }
         );
-        warnings.record_recovery();
+        let recovered_at = start + Duration::from_millis(5);
+        warnings.record_recovery(recovered_at);
 
         assert_eq!(
             warnings.record_fault(start + Duration::from_millis(5), interval),
@@ -1288,9 +1289,15 @@ mod tests {
                 suppressed_repeats: 0
             }
         );
-        warnings.record_recovery();
+        let recovered_at = start + Duration::from_millis(5);
+        warnings.record_recovery(recovered_at);
         assert_eq!(
-            warnings.poll_recovery_summary(start + Duration::from_millis(5), interval),
+            warnings.poll_recovery_summary(recovered_at, interval),
+            None,
+            "recovery summaries must wait for the diagnostics window even for the first batch",
+        );
+        assert_eq!(
+            warnings.poll_recovery_summary(recovered_at + interval, interval),
             Some(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 0,
@@ -1308,10 +1315,15 @@ mod tests {
         let start = Instant::now();
 
         let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
-        controller.send_failure_diagnostics.record_recovery();
+        let recovered_at = start + Duration::from_millis(5);
+        controller.send_failure_diagnostics.record_recovery(recovered_at);
 
         assert_eq!(
             controller.poll_windowed_diagnostics_at(start),
+            PendingDiagnosticFlush::default()
+        );
+        assert_eq!(
+            controller.poll_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
             PendingDiagnosticFlush {
                 send_failure: Some(RecoverySummary {
                     recovery_count: 1,
@@ -1335,9 +1347,16 @@ mod tests {
         let start = Instant::now();
 
         let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
-        controller.send_failure_diagnostics.record_recovery();
+        let recovered_at = start + Duration::from_millis(5);
+        controller.send_failure_diagnostics.record_recovery(recovered_at);
         assert_eq!(
             controller.poll_windowed_diagnostics_at(start).send_failure,
+            None
+        );
+        assert_eq!(
+            controller
+                .poll_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL)
+                .send_failure,
             Some(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 0,
@@ -1347,7 +1366,8 @@ mod tests {
         let _ = controller
             .send_failure_diagnostics
             .record_fault(start + Duration::from_millis(10), DIAGNOSTIC_LOG_INTERVAL);
-        controller.send_failure_diagnostics.record_recovery();
+        let recovered_at = start + Duration::from_millis(10);
+        controller.send_failure_diagnostics.record_recovery(recovered_at);
         assert_eq!(
             controller.poll_windowed_diagnostics_at(start + Duration::from_millis(20)),
             PendingDiagnosticFlush::default(),
@@ -1378,10 +1398,16 @@ mod tests {
         let _ = controller
             .send_failure_diagnostics
             .record_fault(start + Duration::from_millis(5), DIAGNOSTIC_LOG_INTERVAL);
-        controller.send_failure_diagnostics.record_recovery();
+        let recovered_at = start + Duration::from_millis(5);
+        controller.send_failure_diagnostics.record_recovery(recovered_at);
 
         assert_eq!(
             controller.poll_windowed_diagnostics_at(start + Duration::from_millis(10)),
+            PendingDiagnosticFlush::default(),
+            "the first runtime recovery summary must stay silent until the diagnostics window matures",
+        );
+        assert_eq!(
+            controller.poll_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
             PendingDiagnosticFlush {
                 send_failure: Some(RecoverySummary {
                     recovery_count: 1,
