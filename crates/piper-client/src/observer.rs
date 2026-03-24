@@ -234,24 +234,34 @@ where
     {
         self.ensure_realtime_control_supported()?;
 
-        match self.driver.get_aligned_motion(policy.max_state_skew_us) {
+        match self
+            .driver
+            .get_aligned_motion(policy.max_state_skew_us, policy.max_feedback_age)
+        {
             AlignmentResult::Incomplete {
                 position_candidate_mask,
                 dynamic_candidate_mask,
-            } => Err(Self::incomplete_control_state_error(
-                position_candidate_mask,
-                dynamic_candidate_mask,
-            )),
+            } => {
+                let permissive = self
+                    .driver
+                    .get_aligned_motion(policy.max_state_skew_us, Duration::from_secs(u64::MAX));
+                if let AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } =
+                    permissive
+                {
+                    let age = state.feedback_age();
+                    if age > policy.max_feedback_age {
+                        return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
+                    }
+                }
+
+                Err(Self::incomplete_control_state_error(
+                    position_candidate_mask,
+                    dynamic_candidate_mask,
+                ))
+            },
             AlignmentResult::Ok(state) => {
                 debug_assert!(state.is_complete());
-
-                let age = control_feedback_age(
-                    state.position_host_rx_mono_us,
-                    state.dynamic_host_rx_mono_us,
-                );
-                if age > policy.max_feedback_age {
-                    return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
-                }
+                let age = state.feedback_age();
 
                 Ok(ControlSnapshotFull {
                     state: ControlSnapshot {
@@ -274,14 +284,6 @@ where
             },
             AlignmentResult::Misaligned { state, .. } => {
                 debug_assert!(state.is_complete());
-
-                let age = control_feedback_age(
-                    state.position_host_rx_mono_us,
-                    state.dynamic_host_rx_mono_us,
-                );
-                if age > policy.max_feedback_age {
-                    return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
-                }
 
                 Err(RobotError::state_misaligned(
                     state.skew_us,
@@ -744,12 +746,6 @@ where
 
         Ok(())
     }
-}
-
-fn control_feedback_age(position_host_rx_mono_us: u64, dynamic_host_rx_mono_us: u64) -> Duration {
-    let position_age = host_rx_mono_age(position_host_rx_mono_us);
-    let dynamic_age = host_rx_mono_age(dynamic_host_rx_mono_us);
-    position_age.max(dynamic_age)
 }
 
 fn host_rx_mono_age(timestamp_us: u64) -> Duration {
@@ -1400,6 +1396,37 @@ mod tests {
 
     #[test]
     fn test_control_snapshot_rejects_stale_feedback() {
+        let timestamp_us = 1_000;
+        let frames = vec![
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 1000, timestamp_us),
+            joint_dynamic_frame(2, 0, 1000, timestamp_us),
+            joint_dynamic_frame(3, 0, 1000, timestamp_us),
+            joint_dynamic_frame(4, 0, 1000, timestamp_us),
+            joint_dynamic_frame(5, 0, 1000, timestamp_us),
+            joint_dynamic_frame(6, 0, 1000, timestamp_us),
+        ];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        thread::sleep(Duration::from_millis(30));
+
+        let error = observer
+            .control_snapshot(ControlReadPolicy {
+                max_state_skew_us: 500,
+                max_feedback_age: Duration::from_millis(10),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, RobotError::FeedbackStale { .. }));
+    }
+
+    #[test]
+    fn test_control_snapshot_reports_feedback_stale_when_driver_marks_pair_incomplete_due_to_age() {
         let timestamp_us = 1_000;
         let frames = vec![
             joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),

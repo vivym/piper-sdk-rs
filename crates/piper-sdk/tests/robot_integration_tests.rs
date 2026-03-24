@@ -285,7 +285,7 @@ fn test_piper_end_to_end_full_state_read() {
     let _control = piper.get_robot_control();
     let _gripper = piper.get_gripper();
     let _motion = piper.get_motion_state();
-    let _aligned = piper.get_aligned_motion(5000);
+    let _aligned = piper.get_aligned_motion(5000, Duration::from_secs(3600));
     let _driver = piper.get_joint_driver_low_speed();
     let _limits = piper.get_joint_limit_config().unwrap();
     let _accel = piper.get_joint_accel_config().unwrap();

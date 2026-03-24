@@ -1963,17 +1963,11 @@ impl PiperContext {
             return None;
         }
 
-        let latest_host_rx_mono_us = pair
-            .joint_position
-            .host_rx_mono_us
-            .max(pair.joint_dynamic.group_host_rx_mono_us);
-        if latest_host_rx_mono_us == 0 {
-            return None;
-        }
-
         let max_feedback_age_us = max_feedback_age.as_micros().min(u128::from(u64::MAX)) as u64;
-        let feedback_age_us =
-            crate::heartbeat::monotonic_micros().saturating_sub(latest_host_rx_mono_us);
+        let feedback_age_us = control_feedback_age_us(
+            pair.joint_position.host_rx_mono_us,
+            pair.joint_dynamic.group_host_rx_mono_us,
+        )?;
         if feedback_age_us > max_feedback_age_us {
             None
         } else {
@@ -2130,6 +2124,34 @@ impl AlignedMotionState {
     pub fn is_complete(&self) -> bool {
         self.position_complete() && self.dynamic_complete()
     }
+
+    /// 控制级 pair 的反馈年龄（取位置/动态中较老的一侧）。
+    pub fn feedback_age(&self) -> std::time::Duration {
+        control_feedback_age(self.position_host_rx_mono_us, self.dynamic_host_rx_mono_us)
+    }
+}
+
+pub(crate) fn control_feedback_age(
+    position_host_rx_mono_us: u64,
+    dynamic_host_rx_mono_us: u64,
+) -> std::time::Duration {
+    control_feedback_age_us(position_host_rx_mono_us, dynamic_host_rx_mono_us)
+        .map(std::time::Duration::from_micros)
+        .unwrap_or_else(|| std::time::Duration::from_secs(u64::MAX))
+}
+
+fn control_feedback_age_us(
+    position_host_rx_mono_us: u64,
+    dynamic_host_rx_mono_us: u64,
+) -> Option<u64> {
+    if position_host_rx_mono_us == 0 || dynamic_host_rx_mono_us == 0 {
+        return None;
+    }
+
+    let now = crate::heartbeat::monotonic_micros();
+    let position_age_us = now.saturating_sub(position_host_rx_mono_us);
+    let dynamic_age_us = now.saturating_sub(dynamic_host_rx_mono_us);
+    Some(position_age_us.max(dynamic_age_us))
 }
 
 /// 时间对齐结果

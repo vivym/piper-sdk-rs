@@ -2834,19 +2834,24 @@ impl Piper {
         }
     }
 
-    /// 获取时间对齐的运动状态（推荐用于力控算法）
+    /// 获取时间对齐且仍然新鲜的运动状态（推荐用于力控算法）
     ///
     /// 以 `joint_position.hardware_timestamp_us` 为基准时间，检查时间戳差异。
-    /// 即使时间戳差异超过阈值，也返回状态数据（让用户有选择权）。
+    /// 仅当 coherent control pair 仍在 freshness 窗口内时才返回有效状态。
     ///
     /// # 参数
     /// - `max_time_diff_us`: 允许的最大时间戳差异（微秒），推荐值：5000（5ms）
+    /// - `max_feedback_age`: 允许的最大反馈年龄；位置和动态两侧都必须满足
     ///
     /// # 返回值
-    /// - `AlignmentResult::Incomplete { .. }`: coherent control pair 尚未准备好
-    /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内，且状态完整
-    /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但仍返回完整状态数据
-    pub fn get_aligned_motion(&self, max_time_diff_us: u64) -> AlignmentResult {
+    /// - `AlignmentResult::Incomplete { .. }`: coherent control pair 尚未准备好，或反馈已过期
+    /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内，且状态完整且新鲜
+    /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但状态仍完整且新鲜
+    pub fn get_aligned_motion(
+        &self,
+        max_time_diff_us: u64,
+        max_feedback_age: Duration,
+    ) -> AlignmentResult {
         let view = self.ctx.capture_control_read_view();
         let pair = view.pair;
         let joint_position = pair.joint_position;
@@ -2867,7 +2872,14 @@ impl Piper {
                 - (joint_position.hardware_timestamp_us as i64),
         };
 
-        if pair.position_sequence == 0 || pair.dynamic_sequence == 0 || !state.is_complete() {
+        let max_feedback_age_us = max_feedback_age.as_micros().min(u128::from(u64::MAX)) as u64;
+        let feedback_age_us = state.feedback_age().as_micros().min(u128::from(u64::MAX)) as u64;
+
+        if pair.position_sequence == 0
+            || pair.dynamic_sequence == 0
+            || !state.is_complete()
+            || feedback_age_us > max_feedback_age_us
+        {
             return AlignmentResult::Incomplete {
                 position_candidate_mask: view.position_candidate_mask,
                 dynamic_candidate_mask: view.dynamic_candidate_mask,
@@ -5899,7 +5911,7 @@ mod tests {
             valid_mask: 0b11_1111,
         });
 
-        let result = piper.get_aligned_motion(5000);
+        let result = piper.get_aligned_motion(5000, Duration::from_secs(3600));
         match result {
             AlignmentResult::Ok(state) => {
                 assert_eq!(state.position_timestamp_us, 1_000);
@@ -5934,9 +5946,9 @@ mod tests {
             valid_mask: 0b11_1111,
         });
 
-        let result1 = piper.get_aligned_motion(0);
-        let result2 = piper.get_aligned_motion(1000);
-        let result3 = piper.get_aligned_motion(1000000);
+        let result1 = piper.get_aligned_motion(0, Duration::from_secs(3600));
+        let result2 = piper.get_aligned_motion(1000, Duration::from_secs(3600));
+        let result3 = piper.get_aligned_motion(1000000, Duration::from_secs(3600));
 
         match (result1, result2, result3) {
             (
@@ -6757,7 +6769,7 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        let result = piper.get_aligned_motion(0);
+        let result = piper.get_aligned_motion(0, Duration::from_secs(3600));
         match result {
             AlignmentResult::Incomplete {
                 position_candidate_mask,
@@ -6792,7 +6804,7 @@ mod tests {
             valid_mask: 0b001111,
         });
 
-        let result = piper.get_aligned_motion(0);
+        let result = piper.get_aligned_motion(0, Duration::from_secs(3600));
         match result {
             AlignmentResult::Incomplete {
                 position_candidate_mask,
@@ -6823,7 +6835,7 @@ mod tests {
 
         assert!(piper.get_control_joint_dynamic(Duration::from_millis(1)).is_none());
 
-        let result = piper.get_aligned_motion(5_000);
+        let result = piper.get_aligned_motion(5_000, Duration::from_secs(3600));
         match result {
             AlignmentResult::Incomplete {
                 position_candidate_mask,
@@ -6858,7 +6870,7 @@ mod tests {
             valid_mask: 0b11_1111,
         });
 
-        let initial = match piper.get_aligned_motion(5_000) {
+        let initial = match piper.get_aligned_motion(5_000, Duration::from_secs(3600)) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
             AlignmentResult::Incomplete { .. } => {
                 panic!("published coherent pair must stay readable");
@@ -6876,7 +6888,7 @@ mod tests {
             valid_mask: 0b11_1111,
         });
 
-        let after_dynamic_only = match piper.get_aligned_motion(5_000) {
+        let after_dynamic_only = match piper.get_aligned_motion(5_000, Duration::from_secs(3600)) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
             AlignmentResult::Incomplete { .. } => {
                 panic!("last coherent pair must remain readable while waiting for peer");
@@ -6899,7 +6911,7 @@ mod tests {
             frame_valid_mask: 0b111,
         });
 
-        let after_both_advanced = match piper.get_aligned_motion(5_000) {
+        let after_both_advanced = match piper.get_aligned_motion(5_000, Duration::from_secs(3600)) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
             AlignmentResult::Incomplete { .. } => {
                 panic!("coherent pair should become readable after both sides advance");
@@ -6939,6 +6951,91 @@ mod tests {
 
         assert!(piper.get_control_joint_dynamic(Duration::from_millis(10)).is_some());
         assert!(piper.get_control_joint_dynamic(Duration::from_nanos(0)).is_none());
+    }
+
+    #[test]
+    fn test_get_control_joint_dynamic_returns_none_when_only_position_side_is_fresh() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        let now = crate::heartbeat::monotonic_micros();
+
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 2_000,
+            host_rx_mono_us: now,
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        });
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 2_000,
+            group_host_rx_mono_us: now.saturating_sub(20_000),
+            joint_vel: [10.0; 6],
+            joint_current: [20.0; 6],
+            timestamps: [2_000; 6],
+            valid_mask: 0b11_1111,
+        });
+
+        assert!(piper.get_control_joint_dynamic(Duration::from_millis(10)).is_none());
+    }
+
+    #[test]
+    fn test_get_control_joint_dynamic_returns_none_when_only_dynamic_side_is_fresh() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        let now = crate::heartbeat::monotonic_micros();
+
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 3_000,
+            host_rx_mono_us: now.saturating_sub(20_000),
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        });
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 3_000,
+            group_host_rx_mono_us: now,
+            joint_vel: [10.0; 6],
+            joint_current: [20.0; 6],
+            timestamps: [3_000; 6],
+            valid_mask: 0b11_1111,
+        });
+
+        assert!(piper.get_control_joint_dynamic(Duration::from_millis(10)).is_none());
+    }
+
+    #[test]
+    fn test_get_aligned_motion_returns_incomplete_when_published_pair_is_stale() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+        let now = crate::heartbeat::monotonic_micros().max(1);
+
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 4_000,
+            host_rx_mono_us: now,
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        });
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 4_000,
+            group_host_rx_mono_us: now,
+            joint_vel: [10.0; 6],
+            joint_current: [20.0; 6],
+            timestamps: [4_000; 6],
+            valid_mask: 0b11_1111,
+        });
+
+        match piper.get_aligned_motion(5_000, Duration::from_nanos(0)) {
+            AlignmentResult::Incomplete {
+                position_candidate_mask,
+                dynamic_candidate_mask,
+            } => {
+                assert_eq!(position_candidate_mask, 0b111);
+                assert_eq!(dynamic_candidate_mask, 0b11_1111);
+            },
+            AlignmentResult::Ok(_) | AlignmentResult::Misaligned { .. } => {
+                panic!("stale coherent pair must not be exposed through Ok/Misaligned");
+            },
+        }
     }
 
     #[test]
