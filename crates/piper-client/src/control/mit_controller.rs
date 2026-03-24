@@ -439,27 +439,23 @@ impl MitController {
         *next_tick = schedule.next_cycle_deadline;
     }
 
-    fn collect_pending_diagnostics_at(
-        &mut self,
-        now: Instant,
-        force: bool,
-    ) -> PendingDiagnosticFlush {
+    fn poll_windowed_diagnostics_at(&mut self, now: Instant) -> PendingDiagnosticFlush {
         PendingDiagnosticFlush {
-            send_failure: self.send_failure_diagnostics.flush_recovery_summary(
-                now,
-                DIAGNOSTIC_LOG_INTERVAL,
-                force,
-            ),
-            overrun: self.overrun_diagnostics.flush_recovery_summary(
-                now,
-                DIAGNOSTIC_LOG_INTERVAL,
-                force,
-            ),
+            send_failure: self
+                .send_failure_diagnostics
+                .poll_recovery_summary(now, DIAGNOSTIC_LOG_INTERVAL),
+            overrun: self.overrun_diagnostics.poll_recovery_summary(now, DIAGNOSTIC_LOG_INTERVAL),
         }
     }
 
-    fn flush_pending_diagnostics(&mut self, force: bool) {
-        let pending = self.collect_pending_diagnostics_at(Instant::now(), force);
+    fn force_flush_pending_diagnostics_at(&mut self, now: Instant) -> PendingDiagnosticFlush {
+        PendingDiagnosticFlush {
+            send_failure: self.send_failure_diagnostics.force_flush_recovery_summary(now),
+            overrun: self.overrun_diagnostics.force_flush_recovery_summary(now),
+        }
+    }
+
+    fn emit_diagnostic_summaries(&self, pending: PendingDiagnosticFlush) {
         if let Some(summary) = pending.send_failure {
             info!(
                 "MIT control send path recovered {} time(s). Warning limiter suppressed {} repeated transient-failure warning(s) since the last summary.",
@@ -474,8 +470,18 @@ impl MitController {
         }
     }
 
+    fn poll_windowed_diagnostics(&mut self) {
+        let pending = self.poll_windowed_diagnostics_at(Instant::now());
+        self.emit_diagnostic_summaries(pending);
+    }
+
+    fn force_flush_pending_diagnostics(&mut self) {
+        let pending = self.force_flush_pending_diagnostics_at(Instant::now());
+        self.emit_diagnostic_summaries(pending);
+    }
+
     fn finish_safe_state_transition(&mut self, error: ControlError) -> ControlError {
-        self.flush_pending_diagnostics(true);
+        self.force_flush_pending_diagnostics();
         error
     }
 
@@ -587,10 +593,10 @@ impl MitController {
             }
 
             self.run_cycle_epilogue(&mut next_tick, period);
+            self.poll_windowed_diagnostics();
         };
 
-        let force_flush = matches!(&result, Err(ControlError::SafedOut { .. }));
-        self.flush_pending_diagnostics(force_flush);
+        self.force_flush_pending_diagnostics();
         result
     }
 
@@ -793,7 +799,7 @@ impl MitController {
         mut self,
         config: DisableConfig,
     ) -> crate::types::Result<Piper<Standby, StrictRealtime>> {
-        self.flush_pending_diagnostics(true);
+        self.force_flush_pending_diagnostics();
 
         // 安全提取 piper（Option 变为 None）
         let piper =
@@ -827,7 +833,7 @@ impl MitController {
 
 impl Drop for MitController {
     fn drop(&mut self) {
-        self.flush_pending_diagnostics(true);
+        self.force_flush_pending_diagnostics();
     }
 }
 
@@ -1284,7 +1290,7 @@ mod tests {
         );
         warnings.record_recovery();
         assert_eq!(
-            warnings.flush_recovery_summary(start + Duration::from_millis(5), interval, false),
+            warnings.poll_recovery_summary(start + Duration::from_millis(5), interval),
             Some(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 0,
@@ -1305,7 +1311,7 @@ mod tests {
         controller.send_failure_diagnostics.record_recovery();
 
         assert_eq!(
-            controller.collect_pending_diagnostics_at(start, false),
+            controller.poll_windowed_diagnostics_at(start),
             PendingDiagnosticFlush {
                 send_failure: Some(RecoverySummary {
                     recovery_count: 1,
@@ -1315,7 +1321,7 @@ mod tests {
             }
         );
         assert_eq!(
-            controller.collect_pending_diagnostics_at(start, false),
+            controller.poll_windowed_diagnostics_at(start),
             PendingDiagnosticFlush::default()
         );
     }
@@ -1331,7 +1337,7 @@ mod tests {
         let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
         controller.send_failure_diagnostics.record_recovery();
         assert_eq!(
-            controller.collect_pending_diagnostics_at(start, false).send_failure,
+            controller.poll_windowed_diagnostics_at(start).send_failure,
             Some(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 0,
@@ -1343,7 +1349,7 @@ mod tests {
             .record_fault(start + Duration::from_millis(10), DIAGNOSTIC_LOG_INTERVAL);
         controller.send_failure_diagnostics.record_recovery();
         assert_eq!(
-            controller.collect_pending_diagnostics_at(start + Duration::from_millis(20), false),
+            controller.poll_windowed_diagnostics_at(start + Duration::from_millis(20)),
             PendingDiagnosticFlush::default(),
             "normal flush must stay silent inside the summary window",
         );
@@ -1354,9 +1360,41 @@ mod tests {
         ));
         assert!(matches!(error, ControlError::SafedOut { .. }));
         assert_eq!(
-            controller.collect_pending_diagnostics_at(Instant::now(), true),
+            controller.force_flush_pending_diagnostics_at(Instant::now()),
             PendingDiagnosticFlush::default(),
             "safe-state transition must force-flush pending recovery summaries",
+        );
+    }
+
+    #[test]
+    fn poll_windowed_diagnostics_emits_recovery_before_controller_exit() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let mut controller = MitController::new(active, MitControllerConfig::default())
+            .expect("controller should build");
+        let start = Instant::now();
+
+        let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
+        let _ = controller
+            .send_failure_diagnostics
+            .record_fault(start + Duration::from_millis(5), DIAGNOSTIC_LOG_INTERVAL);
+        controller.send_failure_diagnostics.record_recovery();
+
+        assert_eq!(
+            controller.poll_windowed_diagnostics_at(start + Duration::from_millis(10)),
+            PendingDiagnosticFlush {
+                send_failure: Some(RecoverySummary {
+                    recovery_count: 1,
+                    suppressed_fault_warnings: 1,
+                }),
+                overrun: None,
+            },
+            "long-running motion must surface recovery summaries before the controller exits",
+        );
+        assert_eq!(
+            controller.force_flush_pending_diagnostics_at(start + Duration::from_millis(20)),
+            PendingDiagnosticFlush::default(),
+            "once runtime polling emitted the summary, forced flush should have nothing left to drain",
         );
     }
 

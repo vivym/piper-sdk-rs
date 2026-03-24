@@ -16,9 +16,9 @@ pub(crate) struct RecoverySummary {
 pub(crate) struct HotPathDiagnostics {
     in_fault: bool,
     last_fault_emitted_at: Option<Instant>,
-    suppressed_faults_since_last_warning: u32,
+    fault_window_suppressed_repeats: u32,
     pending_recovery_count: u32,
-    pending_suppressed_fault_warnings: u32,
+    pending_summary_suppressed_warnings: u32,
     last_summary_emitted_at: Option<Instant>,
 }
 
@@ -30,14 +30,14 @@ impl HotPathDiagnostics {
             .last_fault_emitted_at
             .is_none_or(|last| now.saturating_duration_since(last) >= interval)
         {
-            let suppressed_repeats = std::mem::take(&mut self.suppressed_faults_since_last_warning);
+            let suppressed_repeats = std::mem::take(&mut self.fault_window_suppressed_repeats);
             self.last_fault_emitted_at = Some(now);
             FaultLogDecision::Emit { suppressed_repeats }
         } else {
-            self.suppressed_faults_since_last_warning =
-                self.suppressed_faults_since_last_warning.saturating_add(1);
-            self.pending_suppressed_fault_warnings =
-                self.pending_suppressed_fault_warnings.saturating_add(1);
+            self.fault_window_suppressed_repeats =
+                self.fault_window_suppressed_repeats.saturating_add(1);
+            self.pending_summary_suppressed_warnings =
+                self.pending_summary_suppressed_warnings.saturating_add(1);
             FaultLogDecision::Suppress
         }
     }
@@ -48,31 +48,44 @@ impl HotPathDiagnostics {
         }
 
         self.in_fault = false;
+        self.fault_window_suppressed_repeats = 0;
         self.pending_recovery_count = self.pending_recovery_count.saturating_add(1);
     }
 
-    pub(crate) fn flush_recovery_summary(
+    pub(crate) fn poll_recovery_summary(
         &mut self,
         now: Instant,
         interval: Duration,
-        force: bool,
     ) -> Option<RecoverySummary> {
         if self.pending_recovery_count == 0 {
             return None;
         }
 
-        if !force
-            && self
-                .last_summary_emitted_at
-                .is_some_and(|last| now.saturating_duration_since(last) < interval)
+        if self
+            .last_summary_emitted_at
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
         {
             return None;
         }
 
+        self.take_pending_summary(now)
+    }
+
+    pub(crate) fn force_flush_recovery_summary(&mut self, now: Instant) -> Option<RecoverySummary> {
+        if self.pending_recovery_count == 0 {
+            return None;
+        }
+
+        self.take_pending_summary(now)
+    }
+
+    fn take_pending_summary(&mut self, now: Instant) -> Option<RecoverySummary> {
         self.last_summary_emitted_at = Some(now);
         Some(RecoverySummary {
             recovery_count: std::mem::take(&mut self.pending_recovery_count),
-            suppressed_fault_warnings: std::mem::take(&mut self.pending_suppressed_fault_warnings),
+            suppressed_fault_warnings: std::mem::take(
+                &mut self.pending_summary_suppressed_warnings,
+            ),
         })
     }
 }
@@ -130,14 +143,14 @@ mod tests {
         diagnostics.record_recovery();
 
         assert_eq!(
-            diagnostics.flush_recovery_summary(start + Duration::from_millis(10), interval, false),
+            diagnostics.poll_recovery_summary(start + Duration::from_millis(10), interval),
             Some(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 1,
             })
         );
         assert_eq!(
-            diagnostics.flush_recovery_summary(start + Duration::from_millis(10), interval, false),
+            diagnostics.poll_recovery_summary(start + Duration::from_millis(10), interval),
             None
         );
     }
@@ -151,7 +164,7 @@ mod tests {
         let _ = diagnostics.record_fault(start, interval);
         diagnostics.record_recovery();
         assert_eq!(
-            diagnostics.flush_recovery_summary(start, interval, false),
+            diagnostics.poll_recovery_summary(start, interval),
             Some(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 0,
@@ -161,11 +174,11 @@ mod tests {
         let _ = diagnostics.record_fault(start + Duration::from_millis(10), interval);
         diagnostics.record_recovery();
         assert_eq!(
-            diagnostics.flush_recovery_summary(start + Duration::from_millis(20), interval, false),
+            diagnostics.poll_recovery_summary(start + Duration::from_millis(20), interval),
             None
         );
         assert_eq!(
-            diagnostics.flush_recovery_summary(start + Duration::from_millis(20), interval, true),
+            diagnostics.force_flush_recovery_summary(start + Duration::from_millis(20)),
             Some(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 1,
@@ -184,15 +197,64 @@ mod tests {
         send_failures.record_recovery();
 
         assert_eq!(
-            send_failures.flush_recovery_summary(start, interval, false),
+            send_failures.poll_recovery_summary(start, interval),
             Some(RecoverySummary {
                 recovery_count: 1,
                 suppressed_fault_warnings: 0,
             })
         );
+        assert_eq!(overruns.poll_recovery_summary(start, interval), None);
+    }
+
+    #[test]
+    fn long_gap_fault_warning_does_not_reuse_previous_incident_suppressed_count() {
+        let mut diagnostics = HotPathDiagnostics::default();
+        let interval = Duration::from_secs(1);
+        let start = Instant::now();
+
         assert_eq!(
-            overruns.flush_recovery_summary(start, interval, false),
-            None
+            diagnostics.record_fault(start, interval),
+            FaultLogDecision::Emit {
+                suppressed_repeats: 0
+            }
+        );
+        assert_eq!(
+            diagnostics.record_fault(start + Duration::from_millis(5), interval),
+            FaultLogDecision::Suppress
+        );
+        diagnostics.record_recovery();
+
+        assert_eq!(
+            diagnostics.record_fault(start + interval + Duration::from_millis(5), interval),
+            FaultLogDecision::Emit {
+                suppressed_repeats: 0
+            },
+            "a new fault burst must not inherit suppressed warnings from a recovered incident",
+        );
+    }
+
+    #[test]
+    fn pending_recoveries_are_emitted_from_window_poll_before_force_flush() {
+        let mut diagnostics = HotPathDiagnostics::default();
+        let interval = Duration::from_secs(1);
+        let start = Instant::now();
+
+        let _ = diagnostics.record_fault(start, interval);
+        let _ = diagnostics.record_fault(start + Duration::from_millis(5), interval);
+        diagnostics.record_recovery();
+
+        assert_eq!(
+            diagnostics.poll_recovery_summary(start + Duration::from_millis(10), interval),
+            Some(RecoverySummary {
+                recovery_count: 1,
+                suppressed_fault_warnings: 1,
+            }),
+            "recovery visibility must come from runtime window polling, not only exit-time flush",
+        );
+        assert_eq!(
+            diagnostics.force_flush_recovery_summary(start + Duration::from_millis(20)),
+            None,
+            "window poll must drain the pending recovery summary before forced flush",
         );
     }
 }
