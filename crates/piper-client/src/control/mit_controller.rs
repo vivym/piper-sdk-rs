@@ -68,7 +68,7 @@ use tracing::{error, warn};
 
 use super::hot_path_diagnostics::{FaultLogDecision, HotPathDiagnostics, RecoverySummary};
 use super::mit_diagnostic_dispatcher::{
-    MitDiagnosticDispatcher, MitDiagnosticEvent, global_dispatcher,
+    MitDiagnosticDispatchError, MitDiagnosticDispatcher, MitDiagnosticEvent, global_dispatcher,
 };
 use crate::observer::{ControlReadPolicy, Observer};
 use crate::raw_commander::RawCommander;
@@ -331,7 +331,7 @@ impl MitController {
             Err(error) => {
                 if error.should_warn() {
                     warn!(
-                        "Failed to initialize MIT async diagnostic logger; recovery summaries will be dropped until restart: {}",
+                        "Failed to initialize MIT async diagnostic logger; recovery summaries will be dropped until a later dispatcher rebuild succeeds: {}",
                         error.message(),
                     );
                 }
@@ -496,16 +496,34 @@ impl MitController {
     }
 
     fn submit_diagnostic_event(
-        &self,
+        &mut self,
         event: MitDiagnosticEvent,
         forced: bool,
     ) -> core::result::Result<(), ()> {
+        match self.try_submit_diagnostic_event(event, forced) {
+            Ok(()) => Ok(()),
+            Err(MitDiagnosticDispatchError::Disconnected) => {
+                if let Ok(dispatcher) = global_dispatcher() {
+                    self.diagnostic_dispatcher = dispatcher;
+                    self.try_submit_diagnostic_event(event, forced).map_err(|_| ())
+                } else {
+                    Err(())
+                }
+            },
+            Err(_) => Err(()),
+        }
+    }
+
+    fn try_submit_diagnostic_event(
+        &self,
+        event: MitDiagnosticEvent,
+        forced: bool,
+    ) -> core::result::Result<(), MitDiagnosticDispatchError> {
         if forced {
             self.diagnostic_dispatcher
                 .submit_cold_path_event(event, FORCED_DIAGNOSTIC_SEND_TIMEOUT)
-                .map_err(|_| ())
         } else {
-            self.diagnostic_dispatcher.submit_runtime_event(event).map_err(|_| ())
+            self.diagnostic_dispatcher.submit_runtime_event(event)
         }
     }
 
@@ -1607,6 +1625,62 @@ mod tests {
             controller.submit_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
             1,
             "runtime maturity must degrade to dropped accounting instead of synchronous logging",
+        );
+    }
+
+    #[test]
+    fn runtime_disconnect_refreshes_dispatcher_and_retries_once() {
+        let _guard = crate::control::mit_diagnostic_dispatcher::global_test_guard();
+        crate::control::mit_diagnostic_dispatcher::reset_global_dispatcher_for_test();
+
+        let (first_tx, first_rx) = bounded(1);
+        let (second_tx, second_rx) = bounded(4);
+        let attempts = Arc::new(Mutex::new(VecDeque::from([
+            Ok(MitDiagnosticDispatcher::for_test(first_tx)),
+            Ok(MitDiagnosticDispatcher::for_test(second_tx)),
+        ])));
+        crate::control::mit_diagnostic_dispatcher::set_global_builder_for_test({
+            let attempts = Arc::clone(&attempts);
+            move || {
+                attempts
+                    .lock()
+                    .expect("test builder attempts")
+                    .pop_front()
+                    .expect("expected another builder attempt")
+            }
+        });
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let dispatcher = crate::control::mit_diagnostic_dispatcher::global_dispatcher()
+            .expect("dispatcher should build");
+        let mut controller =
+            MitController::new_with_dispatcher(active, MitControllerConfig::default(), dispatcher)
+                .expect("controller should build");
+        let start = Instant::now();
+
+        let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
+        let recovered_at = start + Duration::from_millis(5);
+        controller.send_failure_diagnostics.record_recovery(recovered_at);
+
+        drop(first_rx);
+        assert_eq!(
+            controller.submit_windowed_diagnostics_at(recovered_at + DIAGNOSTIC_LOG_INTERVAL),
+            0,
+            "controller should refresh the dispatcher and replay the matured summary once",
+        );
+        assert_eq!(
+            second_rx
+                .recv_timeout(Duration::from_millis(50))
+                .expect("rebuilt dispatcher must receive the retried summary"),
+            MitDiagnosticEvent::SendFailureRecovery(RecoverySummary {
+                recovery_count: 1,
+                suppressed_fault_warnings: 0,
+            })
+        );
+        assert_eq!(
+            controller.dropped_recovery_events, 0,
+            "successful refresh-and-retry must not degrade into dropped diagnostics",
         );
     }
 
