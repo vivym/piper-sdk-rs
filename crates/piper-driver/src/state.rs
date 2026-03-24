@@ -397,6 +397,10 @@ pub(crate) struct ControlReadView {
     pub(crate) pair: ControlPairSnapshot,
     pub(crate) position_candidate_mask: u8,
     pub(crate) dynamic_candidate_mask: u8,
+    #[cfg(test)]
+    pub(crate) has_pending_candidate: bool,
+    #[cfg(test)]
+    pub(crate) generation_poisoned: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -404,6 +408,8 @@ struct ControlReadMeta {
     published_pair: ControlPairSnapshot,
     position_candidate_mask: u8,
     dynamic_candidate_mask: u8,
+    has_pending_candidate: bool,
+    generation_poisoned: bool,
 }
 
 /// 关节动态状态（独立帧，但通过缓冲提交保证一致性）
@@ -567,12 +573,11 @@ impl JointDynamicState {
 enum ControlPairPublishAttempt {
     Published,
     AwaitingPeer,
-    SkippedNoSpareSlot,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ControlPairPublishOutcome {
-    skipped_no_spare_slot: bool,
     invalidated_generations: u64,
 }
 
@@ -621,29 +626,33 @@ enum ControlSideUpdate {
 }
 
 struct ControlPairPublisher {
-    snapshot: RealtimeSnapshotCell<ControlPairSnapshot>,
     latest_position: UnsafeCell<ControlPositionSample>,
     latest_dynamic: UnsafeCell<ControlDynamicSample>,
     active_generation: UnsafeCell<ActiveControlGeneration>,
     pending_candidate: UnsafeCell<Option<ControlPairSnapshot>>,
+    generation_poisoned: UnsafeCell<bool>,
     read_meta_epoch: AtomicU64,
     read_meta: UnsafeCell<ControlReadMeta>,
     position_sequence: AtomicU64,
     dynamic_sequence: AtomicU64,
+    #[cfg(test)]
+    publish_blocked_for_test: AtomicU64,
 }
 
 impl ControlPairPublisher {
     fn new() -> Self {
         Self {
-            snapshot: RealtimeSnapshotCell::new(ControlPairSnapshot::default()),
             latest_position: UnsafeCell::new(ControlPositionSample::default()),
             latest_dynamic: UnsafeCell::new(ControlDynamicSample::default()),
             active_generation: UnsafeCell::new(ActiveControlGeneration::default()),
             pending_candidate: UnsafeCell::new(None),
+            generation_poisoned: UnsafeCell::new(false),
             read_meta_epoch: AtomicU64::new(0),
             read_meta: UnsafeCell::new(ControlReadMeta::default()),
             position_sequence: AtomicU64::new(0),
             dynamic_sequence: AtomicU64::new(0),
+            #[cfg(test)]
+            publish_blocked_for_test: AtomicU64::new(0),
         }
     }
 
@@ -669,6 +678,10 @@ impl ControlPairPublisher {
                     pair: meta.published_pair,
                     position_candidate_mask: meta.position_candidate_mask,
                     dynamic_candidate_mask: meta.dynamic_candidate_mask,
+                    #[cfg(test)]
+                    has_pending_candidate: meta.has_pending_candidate,
+                    #[cfg(test)]
+                    generation_poisoned: meta.generation_poisoned,
                 };
             }
 
@@ -717,31 +730,27 @@ impl ControlPairPublisher {
     ) -> ControlPairPublishOutcome {
         let mut outcome = ControlPairPublishOutcome::default();
         self.flush_publishable_pairs(meta, &mut outcome);
-        self.record_generation_update(update, &mut outcome);
-        if !outcome.skipped_no_spare_slot {
-            self.flush_publishable_pairs(meta, &mut outcome);
-        }
+        self.record_generation_update(update, meta, &mut outcome);
+        self.flush_publishable_pairs(meta, &mut outcome);
         outcome
     }
 
     fn flush_publishable_pairs(
         &self,
         meta: &mut ControlReadMeta,
-        outcome: &mut ControlPairPublishOutcome,
+        _outcome: &mut ControlPairPublishOutcome,
     ) {
         loop {
             if self.has_pending_candidate() {
                 match self.try_publish_pending(meta) {
                     ControlPairPublishAttempt::Published => continue,
-                    ControlPairPublishAttempt::SkippedNoSpareSlot => {
-                        outcome.skipped_no_spare_slot = true;
-                    },
+                    ControlPairPublishAttempt::Blocked => {},
                     ControlPairPublishAttempt::AwaitingPeer => {},
                 }
                 break;
             }
 
-            if !self.promote_ready_generation_to_pending() {
+            if !self.promote_ready_generation_to_pending(meta) {
                 break;
             }
         }
@@ -763,16 +772,21 @@ impl ControlPairPublisher {
             return ControlPairPublishAttempt::AwaitingPeer;
         };
 
-        if self.snapshot.try_store(candidate) {
-            meta.published_pair = candidate;
-            *pending_candidate = None;
-            ControlPairPublishAttempt::Published
-        } else {
-            ControlPairPublishAttempt::SkippedNoSpareSlot
+        if self.is_publish_blocked_for_test() {
+            return ControlPairPublishAttempt::Blocked;
         }
+
+        meta.published_pair = candidate;
+        *pending_candidate = None;
+        unsafe {
+            *self.generation_poisoned.get() = false;
+        }
+        meta.has_pending_candidate = false;
+        meta.generation_poisoned = false;
+        ControlPairPublishAttempt::Published
     }
 
-    fn promote_ready_generation_to_pending(&self) -> bool {
+    fn promote_ready_generation_to_pending(&self, meta: &mut ControlReadMeta) -> bool {
         // SAFETY:
         // - 控制级 publish 路径是单写者（RX 线程）
         // - active_generation 和 pending_candidate 都只在当前线程更新
@@ -784,6 +798,7 @@ impl ControlPairPublisher {
 
             *self.pending_candidate.get() = Some(candidate);
             active_generation.invalidate();
+            meta.has_pending_candidate = true;
             true
         }
     }
@@ -791,8 +806,19 @@ impl ControlPairPublisher {
     fn record_generation_update(
         &self,
         update: ControlSideUpdate,
+        meta: &mut ControlReadMeta,
         outcome: &mut ControlPairPublishOutcome,
     ) {
+        if self.has_pending_candidate() {
+            let generation_poisoned = unsafe { &mut *self.generation_poisoned.get() };
+            if !*generation_poisoned {
+                *generation_poisoned = true;
+                outcome.invalidated_generations += 1;
+            }
+            meta.generation_poisoned = true;
+            return;
+        }
+
         // SAFETY:
         // - 控制级 publish 路径是单写者（RX 线程）
         // - active_generation 只在当前线程维护
@@ -804,6 +830,7 @@ impl ControlPairPublisher {
                     if active_generation.invalidate() {
                         outcome.invalidated_generations += 1;
                     }
+                    meta.generation_poisoned = false;
                     return;
                 }
                 debug_assert_eq!(
@@ -817,6 +844,7 @@ impl ControlPairPublisher {
                     if active_generation.invalidate() {
                         outcome.invalidated_generations += 1;
                     }
+                    meta.generation_poisoned = false;
                     return;
                 }
                 debug_assert_eq!(
@@ -826,6 +854,8 @@ impl ControlPairPublisher {
                 active_generation.dynamic = Some(unsafe { *self.latest_dynamic.get() });
             },
         }
+        meta.has_pending_candidate = false;
+        meta.generation_poisoned = false;
     }
 
     fn with_read_meta_write<R>(&self, update: impl FnOnce(&mut ControlReadMeta) -> R) -> R {
@@ -850,16 +880,56 @@ impl ControlPairPublisher {
         );
         result
     }
+
+    #[cfg(test)]
+    fn block_publish_for_test(&self) -> ControlPairPublishBlockGuard<'_> {
+        self.publish_blocked_for_test.fetch_add(1, Ordering::AcqRel);
+        ControlPairPublishBlockGuard {
+            counter: &self.publish_blocked_for_test,
+        }
+    }
+
+    #[cfg(test)]
+    fn retry_publish_for_test(&self) {
+        self.with_read_meta_write(|meta| {
+            let mut outcome = ControlPairPublishOutcome::default();
+            self.flush_publishable_pairs(meta, &mut outcome);
+        });
+    }
+
+    fn is_publish_blocked_for_test(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.publish_blocked_for_test.load(Ordering::Acquire) > 0
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
 }
 
 // SAFETY:
-// - latest_position/latest_dynamic/active_generation 只允许单个 RX 写线程写入
-// - 读者只通过 RealtimeSnapshotCell 读取已发布 pair 副本
+// - latest_position/latest_dynamic/active_generation/pending_candidate/generation_poisoned
+//   只允许单个 RX 写线程写入
+// - 读者只通过 read_meta_epoch 协调后读取 read_meta 副本
 unsafe impl Send for ControlPairPublisher {}
 // SAFETY:
-// - 并发读取通过 RealtimeSnapshotCell 协调
+// - 并发读取通过 read_meta_epoch 协调
 // - pending 缓冲不暴露给读者
 unsafe impl Sync for ControlPairPublisher {}
+
+#[cfg(test)]
+struct ControlPairPublishBlockGuard<'a> {
+    counter: &'a AtomicU64,
+}
+
+#[cfg(test)]
+impl Drop for ControlPairPublishBlockGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// 机器人控制状态
 ///
@@ -2086,7 +2156,6 @@ impl PiperContext {
     /// 发布新的控制级关节位置。
     pub fn publish_control_joint_position(&self, joint_position: JointPositionState) {
         let outcome = self.control_pair.publish_position(joint_position);
-        self.record_hot_snapshot_publish_skips(u64::from(outcome.skipped_no_spare_slot));
         self.record_control_pair_generation_invalidations(outcome.invalidated_generations);
     }
 
@@ -2117,7 +2186,6 @@ impl PiperContext {
     /// 发布新的控制级关节动态状态。
     pub fn publish_control_joint_dynamic(&self, joint_dynamic: JointDynamicState) {
         let outcome = self.control_pair.publish_dynamic(joint_dynamic);
-        self.record_hot_snapshot_publish_skips(u64::from(outcome.skipped_no_spare_slot));
         self.record_control_pair_generation_invalidations(outcome.invalidated_generations);
     }
 
@@ -3280,37 +3348,19 @@ mod tests {
     }
 
     #[test]
-    fn test_hot_snapshot_publish_skip_updates_metrics_when_context_has_metrics() {
+    fn test_control_pair_publishes_do_not_touch_hot_snapshot_skip_metrics() {
         let metrics = Arc::new(PiperMetrics::new());
         let ctx = PiperContext::with_metrics(metrics.clone());
 
         ctx.publish_control_joint_position(sample_joint_position_state(1, 0b111));
         ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(1, 0b11_1111));
-        let published_before = ctx.capture_control_pair().joint_position;
-        let published_pair = ctx.capture_control_pair();
-
-        let held_oldest = ctx
-            .control_pair
-            .snapshot
-            .pin_slot_for_test(ctx.control_pair.snapshot.published_slot_for_test());
-        ctx.control_pair.snapshot.store(published_pair);
-        let held_middle = ctx
-            .control_pair
-            .snapshot
-            .pin_slot_for_test(ctx.control_pair.snapshot.published_slot_for_test());
-        ctx.control_pair.snapshot.store(published_pair);
-
         ctx.publish_control_joint_position(sample_joint_position_state(2, 0b111));
         ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(2, 0b11_1111));
-
         assert_eq!(
             ctx.capture_control_pair().joint_position.hardware_timestamp_us,
-            published_before.hardware_timestamp_us,
+            2
         );
-        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 1);
-
-        drop(held_middle);
-        drop(held_oldest);
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 0);
     }
 
     #[test]
@@ -3408,87 +3458,140 @@ mod tests {
     }
 
     #[test]
-    fn test_control_pair_skip_keeps_last_coherent_pair_when_only_position_advances_after_unblock() {
-        let ctx = PiperContext::new();
+    fn test_control_pair_pending_poison_drops_position_updates_arriving_while_pending_is_blocked() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
 
         ctx.publish_control_joint_position(sample_joint_position_state(1, 0b111));
         ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(1, 0b11_1111));
-        let baseline = ctx.capture_control_pair();
-
-        let held_oldest = ctx
-            .control_pair
-            .snapshot
-            .pin_slot_for_test(ctx.control_pair.snapshot.published_slot_for_test());
-        ctx.control_pair.snapshot.store(baseline);
-        let held_middle = ctx
-            .control_pair
-            .snapshot
-            .pin_slot_for_test(ctx.control_pair.snapshot.published_slot_for_test());
-        ctx.control_pair.snapshot.store(baseline);
+        let publish_guard = ctx.control_pair.block_publish_for_test();
 
         ctx.publish_control_joint_position(sample_joint_position_state(2, 0b111));
         ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(2, 0b11_1111));
         assert_eq!(ctx.capture_control_pair().position_sequence, 1);
         assert_eq!(ctx.capture_control_pair().dynamic_sequence, 1);
 
-        drop(held_middle);
-        drop(held_oldest);
-
         ctx.publish_control_joint_position(sample_joint_position_state(3, 0b111));
 
-        let after_single_side_advance = ctx.capture_control_pair();
-        assert_eq!(after_single_side_advance.position_sequence, 2);
-        assert_eq!(after_single_side_advance.dynamic_sequence, 2);
+        drop(publish_guard);
+
+        ctx.control_pair.retry_publish_for_test();
+
+        let after_release = ctx.capture_control_pair();
+        assert_eq!(after_release.position_sequence, 2);
+        assert_eq!(after_release.dynamic_sequence, 2);
+        assert_eq!(after_release.joint_position.hardware_timestamp_us, 2);
+        assert_eq!(after_release.joint_dynamic.group_timestamp_us, 2);
+
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(3, 0b11_1111));
+        let still_old = ctx.capture_control_pair();
+        assert_eq!(still_old.position_sequence, 2);
+        assert_eq!(still_old.dynamic_sequence, 2);
+
+        ctx.publish_control_joint_position(sample_joint_position_state(4, 0b111));
+        let after_fresh_generation = ctx.capture_control_pair();
+        assert_eq!(after_fresh_generation.position_sequence, 4);
+        assert_eq!(after_fresh_generation.dynamic_sequence, 3);
         assert_eq!(
-            after_single_side_advance.joint_position.hardware_timestamp_us,
-            2
+            after_fresh_generation.joint_position.hardware_timestamp_us,
+            4
         );
+        assert_eq!(after_fresh_generation.joint_dynamic.group_timestamp_us, 3);
         assert_eq!(
-            after_single_side_advance.joint_dynamic.group_timestamp_us,
-            2
+            metrics.snapshot().rx_control_pair_generation_invalidated_total,
+            1
         );
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 0);
+
+        let read_view = ctx.capture_control_read_view();
+        assert!(!read_view.has_pending_candidate);
+        assert!(!read_view.generation_poisoned);
+        assert_eq!(read_view.pair.position_sequence, 4);
+        assert_eq!(read_view.pair.dynamic_sequence, 3);
     }
 
     #[test]
-    fn test_control_pair_skip_keeps_last_coherent_pair_when_only_dynamic_advances_after_unblock() {
-        let ctx = PiperContext::new();
+    fn test_control_pair_pending_poison_drops_dynamic_updates_arriving_while_pending_is_blocked() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
 
         ctx.publish_control_joint_position(sample_joint_position_state(10, 0b111));
         ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(10, 0b11_1111));
-        let baseline = ctx.capture_control_pair();
 
-        let held_oldest = ctx
-            .control_pair
-            .snapshot
-            .pin_slot_for_test(ctx.control_pair.snapshot.published_slot_for_test());
-        ctx.control_pair.snapshot.store(baseline);
-        let held_middle = ctx
-            .control_pair
-            .snapshot
-            .pin_slot_for_test(ctx.control_pair.snapshot.published_slot_for_test());
-        ctx.control_pair.snapshot.store(baseline);
+        let publish_guard = ctx.control_pair.block_publish_for_test();
 
         ctx.publish_control_joint_position(sample_joint_position_state(20, 0b111));
         ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(20, 0b11_1111));
-        assert_eq!(ctx.capture_control_pair().position_sequence, 1);
-        assert_eq!(ctx.capture_control_pair().dynamic_sequence, 1);
-
-        drop(held_middle);
-        drop(held_oldest);
-
         ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(30, 0b11_1111));
 
-        let after_single_side_advance = ctx.capture_control_pair();
-        assert_eq!(after_single_side_advance.position_sequence, 2);
-        assert_eq!(after_single_side_advance.dynamic_sequence, 2);
+        drop(publish_guard);
+
+        ctx.control_pair.retry_publish_for_test();
+
+        let after_release = ctx.capture_control_pair();
+        assert_eq!(after_release.position_sequence, 2);
+        assert_eq!(after_release.dynamic_sequence, 2);
+        assert_eq!(after_release.joint_position.hardware_timestamp_us, 20);
+        assert_eq!(after_release.joint_dynamic.group_timestamp_us, 20);
+
+        ctx.publish_control_joint_position(sample_joint_position_state(30, 0b111));
+        let still_old = ctx.capture_control_pair();
+        assert_eq!(still_old.position_sequence, 2);
+        assert_eq!(still_old.dynamic_sequence, 2);
+
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(40, 0b11_1111));
+        let after_fresh_generation = ctx.capture_control_pair();
+        assert_eq!(after_fresh_generation.position_sequence, 3);
+        assert_eq!(after_fresh_generation.dynamic_sequence, 4);
         assert_eq!(
-            after_single_side_advance.joint_position.hardware_timestamp_us,
-            20
+            after_fresh_generation.joint_position.hardware_timestamp_us,
+            30
         );
+        assert_eq!(after_fresh_generation.joint_dynamic.group_timestamp_us, 40);
         assert_eq!(
-            after_single_side_advance.joint_dynamic.group_timestamp_us,
-            20
+            metrics.snapshot().rx_control_pair_generation_invalidated_total,
+            1
         );
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 0);
+    }
+
+    #[test]
+    fn test_control_pair_pending_poison_drops_both_sides_that_arrive_while_pending_is_blocked() {
+        let metrics = Arc::new(PiperMetrics::new());
+        let ctx = PiperContext::with_metrics(metrics.clone());
+
+        ctx.publish_control_joint_position(sample_joint_position_state(100, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(100, 0b11_1111));
+
+        let publish_guard = ctx.control_pair.block_publish_for_test();
+
+        ctx.publish_control_joint_position(sample_joint_position_state(200, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(200, 0b11_1111));
+        ctx.publish_control_joint_position(sample_joint_position_state(300, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(300, 0b11_1111));
+
+        drop(publish_guard);
+
+        ctx.control_pair.retry_publish_for_test();
+        let after_release = ctx.capture_control_pair();
+        assert_eq!(after_release.position_sequence, 2);
+        assert_eq!(after_release.dynamic_sequence, 2);
+
+        ctx.publish_control_joint_position(sample_joint_position_state(400, 0b111));
+        ctx.publish_control_joint_dynamic(sample_joint_dynamic_state(400, 0b11_1111));
+        let after_fresh_generation = ctx.capture_control_pair();
+        assert_eq!(after_fresh_generation.position_sequence, 4);
+        assert_eq!(after_fresh_generation.dynamic_sequence, 4);
+        assert_eq!(
+            after_fresh_generation.joint_position.hardware_timestamp_us,
+            400
+        );
+        assert_eq!(after_fresh_generation.joint_dynamic.group_timestamp_us, 400);
+        assert_eq!(
+            metrics.snapshot().rx_control_pair_generation_invalidated_total,
+            1
+        );
+        assert_eq!(metrics.snapshot().rx_hot_snapshot_publish_skipped_total, 0);
     }
 
     #[test]

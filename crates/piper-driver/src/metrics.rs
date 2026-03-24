@@ -112,6 +112,8 @@ pub struct PiperMetrics {
     /// 关节动态完整组因控制级时间跨度超限而被拒绝的次数
     pub rx_joint_dynamic_control_grade_rejected_total: AtomicU64,
     /// 热路径逻辑快照发布因参与 cell 无空闲槽位而被整体跳过的次数
+    ///
+    /// 仅统计 joint/end-pose/motion/raw 这些固定槽位快照发布，不包含 control pair。
     pub rx_hot_snapshot_publish_skipped_total: AtomicU64,
     /// 控制级 clean generation 因单边连跳或 pending pair 阶段新输入而被整体丢弃的次数
     pub rx_control_pair_generation_invalidated_total: AtomicU64,
@@ -324,6 +326,8 @@ pub struct MetricsSnapshot {
     /// 关节动态完整组因控制级时间跨度超限而被拒绝的次数
     pub rx_joint_dynamic_control_grade_rejected_total: u64,
     /// 热路径逻辑快照发布因参与 cell 无空闲槽位而被整体跳过的次数
+    ///
+    /// 仅统计 joint/end-pose/motion/raw 这些固定槽位快照发布，不包含 control pair。
     pub rx_hot_snapshot_publish_skipped_total: u64,
     /// 控制级 clean generation 因单边连跳或 pending pair 阶段新输入而被整体丢弃的次数
     pub rx_control_pair_generation_invalidated_total: u64,
