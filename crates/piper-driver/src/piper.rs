@@ -2534,9 +2534,12 @@ impl Piper {
     /// 获取控制级关节动态状态。
     ///
     /// 返回最近一份 coherent control pair 中的 dynamic 状态，
-    /// 不会暴露仅单边推进的控制候选值；如果 coherent pair 尚未建立则返回 `None`。
-    pub fn get_control_joint_dynamic(&self) -> Option<JointDynamicState> {
-        self.ctx.capture_control_joint_dynamic()
+    /// 不会暴露仅单边推进的控制候选值；如果 coherent pair 尚未建立或反馈已过期则返回 `None`。
+    pub fn get_control_joint_dynamic(
+        &self,
+        max_feedback_age: Duration,
+    ) -> Option<JointDynamicState> {
+        self.ctx.capture_control_joint_dynamic(max_feedback_age)
     }
 
     /// 获取原始关节动态状态（允许部分动态组，仅供诊断）
@@ -6809,7 +6812,7 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        assert!(piper.get_control_joint_dynamic().is_none());
+        assert!(piper.get_control_joint_dynamic(Duration::from_millis(1)).is_none());
 
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
@@ -6818,7 +6821,7 @@ mod tests {
             frame_valid_mask: 0b111,
         });
 
-        assert!(piper.get_control_joint_dynamic().is_none());
+        assert!(piper.get_control_joint_dynamic(Duration::from_millis(1)).is_none());
 
         let result = piper.get_aligned_motion(5_000);
         match result {
@@ -6883,7 +6886,7 @@ mod tests {
         assert_eq!(after_dynamic_only.dynamic_timestamp_us, 1_000);
         assert_eq!(
             piper
-                .get_control_joint_dynamic()
+                .get_control_joint_dynamic(Duration::from_secs(3600))
                 .expect("published coherent pair must expose dynamic state")
                 .group_timestamp_us,
             1_000
@@ -6906,11 +6909,36 @@ mod tests {
         assert_eq!(after_both_advanced.dynamic_timestamp_us, 3_000);
         assert_eq!(
             piper
-                .get_control_joint_dynamic()
+                .get_control_joint_dynamic(Duration::from_secs(3600))
                 .expect("coherent pair should become readable after both sides advance")
                 .group_timestamp_us,
             3_000
         );
+    }
+
+    #[test]
+    fn test_get_control_joint_dynamic_returns_none_when_published_pair_is_stale() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+        let now = crate::heartbeat::monotonic_micros().max(1);
+
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 1_000,
+            host_rx_mono_us: now,
+            joint_pos: [1.0; 6],
+            frame_valid_mask: 0b111,
+        });
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 1_000,
+            group_host_rx_mono_us: now,
+            joint_vel: [10.0; 6],
+            joint_current: [20.0; 6],
+            timestamps: [1_000; 6],
+            valid_mask: 0b11_1111,
+        });
+
+        assert!(piper.get_control_joint_dynamic(Duration::from_millis(10)).is_some());
+        assert!(piper.get_control_joint_dynamic(Duration::from_nanos(0)).is_none());
     }
 
     #[test]

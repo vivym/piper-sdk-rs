@@ -115,7 +115,7 @@ pub struct PiperMetrics {
     ///
     /// 仅统计 joint/end-pose/motion/raw 这些固定槽位快照发布，不包含 control pair。
     pub rx_hot_snapshot_publish_skipped_total: AtomicU64,
-    /// 控制级 clean generation 因单边连跳或 pending pair 阶段新输入而被整体丢弃的次数
+    /// 控制级 clean generation 因单边连跳而被整体丢弃的次数
     pub rx_control_pair_generation_invalidated_total: AtomicU64,
     /// SoftRealtime admission 阶段因总预算已过期而被前门拒绝的次数
     pub tx_soft_admission_timeout_total: AtomicU64,
@@ -329,7 +329,7 @@ pub struct MetricsSnapshot {
     ///
     /// 仅统计 joint/end-pose/motion/raw 这些固定槽位快照发布，不包含 control pair。
     pub rx_hot_snapshot_publish_skipped_total: u64,
-    /// 控制级 clean generation 因单边连跳或 pending pair 阶段新输入而被整体丢弃的次数
+    /// 控制级 clean generation 因单边连跳而被整体丢弃的次数
     pub rx_control_pair_generation_invalidated_total: u64,
     /// SoftRealtime admission 阶段因总预算已过期而被前门拒绝的次数
     pub tx_soft_admission_timeout_total: u64,
