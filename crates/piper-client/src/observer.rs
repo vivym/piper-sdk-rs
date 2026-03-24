@@ -241,23 +241,12 @@ where
             AlignmentResult::Incomplete {
                 position_candidate_mask,
                 dynamic_candidate_mask,
-            } => {
-                let permissive = self
-                    .driver
-                    .get_aligned_motion(policy.max_state_skew_us, Duration::from_secs(u64::MAX));
-                if let AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } =
-                    permissive
-                {
-                    let age = state.feedback_age();
-                    if age > policy.max_feedback_age {
-                        return Err(RobotError::feedback_stale(age, policy.max_feedback_age));
-                    }
-                }
-
-                Err(Self::incomplete_control_state_error(
-                    position_candidate_mask,
-                    dynamic_candidate_mask,
-                ))
+            } => Err(Self::incomplete_control_state_error(
+                position_candidate_mask,
+                dynamic_candidate_mask,
+            )),
+            AlignmentResult::Stale { age, .. } => {
+                Err(RobotError::feedback_stale(age, policy.max_feedback_age))
             },
             AlignmentResult::Ok(state) => {
                 debug_assert!(state.is_complete());
@@ -1426,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn test_control_snapshot_reports_feedback_stale_when_driver_marks_pair_incomplete_due_to_age() {
+    fn test_control_snapshot_reports_feedback_stale_when_driver_marks_pair_stale_due_to_age() {
         let timestamp_us = 1_000;
         let frames = vec![
             joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),

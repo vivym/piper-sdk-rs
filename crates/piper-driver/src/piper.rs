@@ -2844,7 +2844,8 @@ impl Piper {
     /// - `max_feedback_age`: 允许的最大反馈年龄；位置和动态两侧都必须满足
     ///
     /// # 返回值
-    /// - `AlignmentResult::Incomplete { .. }`: coherent control pair 尚未准备好，或反馈已过期
+    /// - `AlignmentResult::Incomplete { .. }`: coherent control pair 尚未准备好，或状态不完整
+    /// - `AlignmentResult::Stale { state, age }`: coherent control pair 完整但反馈已过期
     /// - `AlignmentResult::Ok(state)`: 时间戳差异在可接受范围内，且状态完整且新鲜
     /// - `AlignmentResult::Misaligned { state, diff_us }`: 时间戳差异过大，但状态仍完整且新鲜
     pub fn get_aligned_motion(
@@ -2875,14 +2876,18 @@ impl Piper {
         let max_feedback_age_us = max_feedback_age.as_micros().min(u128::from(u64::MAX)) as u64;
         let feedback_age_us = state.feedback_age().as_micros().min(u128::from(u64::MAX)) as u64;
 
-        if pair.position_sequence == 0
-            || pair.dynamic_sequence == 0
-            || !state.is_complete()
-            || feedback_age_us > max_feedback_age_us
-        {
+        if pair.position_sequence == 0 || pair.dynamic_sequence == 0 || !state.is_complete() {
             return AlignmentResult::Incomplete {
                 position_candidate_mask: view.position_candidate_mask,
                 dynamic_candidate_mask: view.dynamic_candidate_mask,
+            };
+        }
+
+        let feedback_age = state.feedback_age();
+        if feedback_age_us > max_feedback_age_us {
+            return AlignmentResult::Stale {
+                state,
+                age: feedback_age,
             };
         }
 
@@ -5920,7 +5925,9 @@ mod tests {
                 assert_eq!(state.dynamic_valid_mask, 0b11_1111);
                 assert_eq!(state.skew_us, 0);
             },
-            AlignmentResult::Misaligned { .. } | AlignmentResult::Incomplete { .. } => {
+            AlignmentResult::Misaligned { .. }
+            | AlignmentResult::Incomplete { .. }
+            | AlignmentResult::Stale { .. } => {
                 panic!("complete coherent pair should be reported as aligned");
             },
         }
@@ -6778,7 +6785,9 @@ mod tests {
                 assert_eq!(position_candidate_mask, 0);
                 assert_eq!(dynamic_candidate_mask, 0);
             },
-            AlignmentResult::Ok(_) | AlignmentResult::Misaligned { .. } => {
+            AlignmentResult::Ok(_)
+            | AlignmentResult::Misaligned { .. }
+            | AlignmentResult::Stale { .. } => {
                 panic!("empty control path must report incomplete");
             },
         }
@@ -6813,7 +6822,9 @@ mod tests {
                 assert_eq!(position_candidate_mask, 0b101);
                 assert_eq!(dynamic_candidate_mask, 0b001111);
             },
-            AlignmentResult::Ok(_) | AlignmentResult::Misaligned { .. } => {
+            AlignmentResult::Ok(_)
+            | AlignmentResult::Misaligned { .. }
+            | AlignmentResult::Stale { .. } => {
                 panic!("incomplete control pair must not be reported as Ok/Misaligned");
             },
         }
@@ -6844,7 +6855,9 @@ mod tests {
                 assert_eq!(position_candidate_mask, 0b111);
                 assert_eq!(dynamic_candidate_mask, 0);
             },
-            AlignmentResult::Ok(_) | AlignmentResult::Misaligned { .. } => {
+            AlignmentResult::Ok(_)
+            | AlignmentResult::Misaligned { .. }
+            | AlignmentResult::Stale { .. } => {
                 panic!("control read must not expose an uninitialized pair through Ok/Misaligned");
             },
         }
@@ -6872,7 +6885,7 @@ mod tests {
 
         let initial = match piper.get_aligned_motion(5_000, Duration::from_secs(3600)) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
-            AlignmentResult::Incomplete { .. } => {
+            AlignmentResult::Incomplete { .. } | AlignmentResult::Stale { .. } => {
                 panic!("published coherent pair must stay readable");
             },
         };
@@ -6890,7 +6903,7 @@ mod tests {
 
         let after_dynamic_only = match piper.get_aligned_motion(5_000, Duration::from_secs(3600)) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
-            AlignmentResult::Incomplete { .. } => {
+            AlignmentResult::Incomplete { .. } | AlignmentResult::Stale { .. } => {
                 panic!("last coherent pair must remain readable while waiting for peer");
             },
         };
@@ -6913,7 +6926,7 @@ mod tests {
 
         let after_both_advanced = match piper.get_aligned_motion(5_000, Duration::from_secs(3600)) {
             AlignmentResult::Ok(state) | AlignmentResult::Misaligned { state, .. } => state,
-            AlignmentResult::Incomplete { .. } => {
+            AlignmentResult::Incomplete { .. } | AlignmentResult::Stale { .. } => {
                 panic!("coherent pair should become readable after both sides advance");
             },
         };
@@ -7004,7 +7017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_aligned_motion_returns_incomplete_when_published_pair_is_stale() {
+    fn test_get_aligned_motion_returns_stale_when_published_pair_is_stale() {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
         let now = crate::heartbeat::monotonic_micros().max(1);
@@ -7025,15 +7038,15 @@ mod tests {
         });
 
         match piper.get_aligned_motion(5_000, Duration::from_nanos(0)) {
-            AlignmentResult::Incomplete {
-                position_candidate_mask,
-                dynamic_candidate_mask,
-            } => {
-                assert_eq!(position_candidate_mask, 0b111);
-                assert_eq!(dynamic_candidate_mask, 0b11_1111);
+            AlignmentResult::Stale { state, age } => {
+                assert_eq!(state.position_frame_valid_mask, 0b111);
+                assert_eq!(state.dynamic_valid_mask, 0b11_1111);
+                assert!(age > Duration::from_nanos(0));
             },
-            AlignmentResult::Ok(_) | AlignmentResult::Misaligned { .. } => {
-                panic!("stale coherent pair must not be exposed through Ok/Misaligned");
+            AlignmentResult::Ok(_)
+            | AlignmentResult::Misaligned { .. }
+            | AlignmentResult::Incomplete { .. } => {
+                panic!("stale coherent pair must be classified explicitly as stale");
             },
         }
     }

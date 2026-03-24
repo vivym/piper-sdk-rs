@@ -2156,13 +2156,18 @@ fn control_feedback_age_us(
 
 /// 时间对齐结果
 ///
-/// 即使时间戳不对齐，也返回状态数据，让用户有选择权（是急停还是继续运行）。
+/// fresh 状态允许继续区分对齐/失配；stale 与 incomplete 单独分类。
 #[derive(Debug)]
 pub enum AlignmentResult {
     /// 控制级 pair 尚未准备好；返回最新候选 mask 供诊断使用
     Incomplete {
         position_candidate_mask: u8,
         dynamic_candidate_mask: u8,
+    },
+    /// 控制级 pair 完整但反馈已过期
+    Stale {
+        state: AlignedMotionState,
+        age: std::time::Duration,
     },
     /// 时间戳对齐，数据可靠
     Ok(AlignedMotionState),
@@ -2523,6 +2528,25 @@ mod tests {
         };
         let debug_str0 = format!("{:?}", result_incomplete);
         assert!(debug_str0.contains("Incomplete") || debug_str0.contains("AlignmentResult"));
+
+        let result_stale = AlignmentResult::Stale {
+            state: AlignedMotionState {
+                joint_pos: [1.0; 6],
+                joint_vel: [2.0; 6],
+                joint_current: [3.0; 6],
+                position_timestamp_us: 1000,
+                dynamic_timestamp_us: 1500,
+                dynamic_group_span_us: 0,
+                position_host_rx_mono_us: 2000,
+                dynamic_host_rx_mono_us: 2500,
+                position_frame_valid_mask: 0b111,
+                dynamic_valid_mask: 0b111111,
+                skew_us: 500,
+            },
+            age: std::time::Duration::from_millis(20),
+        };
+        let debug_str_stale = format!("{:?}", result_stale);
+        assert!(debug_str_stale.contains("Stale") || debug_str_stale.contains("AlignmentResult"));
 
         let result_ok = AlignmentResult::Ok(state);
         let debug_str = format!("{:?}", result_ok);
