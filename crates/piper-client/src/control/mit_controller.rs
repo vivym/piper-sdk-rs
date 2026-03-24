@@ -12,6 +12,7 @@
 //! - **状态流转**：`park()` 返还 `Piper<Standby>`，支持继续使用
 //! - **循环锚点**：使用绝对时间锚点，消除累积漂移
 //! - **容错性**：允许最多连续 5 个失败控制周期（25ms @ 200Hz）
+//! - **诊断摘要**：热路径只输出限速故障告警，恢复信息改在冷路径聚合输出
 //!
 //! # 使用示例
 //!
@@ -65,6 +66,7 @@
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+use super::hot_path_diagnostics::{FaultLogDecision, HotPathDiagnostics, RecoverySummary};
 use crate::observer::{ControlReadPolicy, Observer};
 use crate::raw_commander::RawCommander;
 use crate::state::StrictRealtime;
@@ -203,10 +205,10 @@ pub struct MitController {
     safe_state: Option<SafeStateLatch>,
 
     /// 控制发送错误诊断限速状态
-    send_failure_warnings: RepeatedWarningState,
+    send_failure_diagnostics: HotPathDiagnostics,
 
     /// 控制循环 overrun 诊断限速状态
-    overrun_warnings: RepeatedWarningState,
+    overrun_diagnostics: HotPathDiagnostics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,53 +234,10 @@ struct SafeStateLatch {
     reason: String,
 }
 
-#[derive(Debug, Default)]
-struct RepeatedWarningState {
-    active: bool,
-    last_emitted_at: Option<Instant>,
-    suppressed_repeats: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WarningDecision {
-    Emit { suppressed_repeats: u32 },
-    Suppress,
-}
-
-impl RepeatedWarningState {
-    fn record_event(&mut self, now: Instant, interval: Duration) -> WarningDecision {
-        if !self.active {
-            self.active = true;
-            self.last_emitted_at = Some(now);
-            self.suppressed_repeats = 0;
-            return WarningDecision::Emit {
-                suppressed_repeats: 0,
-            };
-        }
-
-        if self
-            .last_emitted_at
-            .is_none_or(|last| now.saturating_duration_since(last) >= interval)
-        {
-            let suppressed_repeats = self.suppressed_repeats;
-            self.last_emitted_at = Some(now);
-            self.suppressed_repeats = 0;
-            WarningDecision::Emit { suppressed_repeats }
-        } else {
-            self.suppressed_repeats = self.suppressed_repeats.saturating_add(1);
-            WarningDecision::Suppress
-        }
-    }
-
-    fn record_recovery(&mut self) -> Option<u32> {
-        if !self.active {
-            return None;
-        }
-
-        self.active = false;
-        self.last_emitted_at = None;
-        Some(std::mem::take(&mut self.suppressed_repeats))
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PendingDiagnosticFlush {
+    send_failure: Option<RecoverySummary>,
+    overrun: Option<RecoverySummary>,
 }
 
 fn finalize_tick_schedule(now: Instant, cycle_deadline: Instant, period: Duration) -> TickSchedule {
@@ -367,8 +326,8 @@ impl MitController {
             last_hold_anchor: None,
             safed_out: false,
             safe_state: None,
-            send_failure_warnings: RepeatedWarningState::default(),
-            overrun_warnings: RepeatedWarningState::default(),
+            send_failure_diagnostics: HotPathDiagnostics::default(),
+            overrun_diagnostics: HotPathDiagnostics::default(),
         })
     }
 
@@ -447,44 +406,77 @@ impl MitController {
     }
 
     fn log_transient_send_failure(&mut self, error_count: u32, error: &RobotError) {
-        match self.send_failure_warnings.record_event(Instant::now(), DIAGNOSTIC_LOG_INTERVAL) {
-            WarningDecision::Emit { suppressed_repeats } => warn!(
+        match self
+            .send_failure_diagnostics
+            .record_fault(Instant::now(), DIAGNOSTIC_LOG_INTERVAL)
+        {
+            FaultLogDecision::Emit { suppressed_repeats } => warn!(
                 "Transient CAN error ({}): {:?}. Preserving anchored schedule. Suppressed {} repeated warning(s) in the last window.",
                 error_count, error, suppressed_repeats,
             ),
-            WarningDecision::Suppress => {},
+            FaultLogDecision::Suppress => {},
         }
     }
 
-    fn log_send_failure_recovered(&mut self) {
-        if let Some(suppressed_repeats) = self.send_failure_warnings.record_recovery() {
-            info!(
-                "MIT control send path recovered after transient failures. Suppressed {} repeated warning(s).",
-                suppressed_repeats,
-            );
-        }
+    fn note_send_failure_recovered(&mut self) {
+        self.send_failure_diagnostics.record_recovery();
     }
 
     fn run_cycle_epilogue(&mut self, next_tick: &mut Instant, period: Duration) {
         let schedule = finalize_tick_schedule(Instant::now(), *next_tick, period);
         if let Some(sleep_duration) = schedule.sleep_duration {
-            if let Some(suppressed_repeats) = self.overrun_warnings.record_recovery() {
-                info!(
-                    "MIT control loop returned within budget. Suppressed {} repeated overrun warning(s).",
-                    suppressed_repeats,
-                );
-            }
+            self.overrun_diagnostics.record_recovery();
             spin_sleep::sleep(sleep_duration);
         } else {
-            match self.overrun_warnings.record_event(Instant::now(), DIAGNOSTIC_LOG_INTERVAL) {
-                WarningDecision::Emit { suppressed_repeats } => warn!(
+            match self.overrun_diagnostics.record_fault(Instant::now(), DIAGNOSTIC_LOG_INTERVAL) {
+                FaultLogDecision::Emit { suppressed_repeats } => warn!(
                     "Control loop overrun: operation missed deadline by {:?} (period {:?}); skipping sleep and preserving anchored schedule. Suppressed {} repeated warning(s) in the last window.",
                     schedule.overrun_lateness, period, suppressed_repeats,
                 ),
-                WarningDecision::Suppress => {},
+                FaultLogDecision::Suppress => {},
             }
         }
         *next_tick = schedule.next_cycle_deadline;
+    }
+
+    fn collect_pending_diagnostics_at(
+        &mut self,
+        now: Instant,
+        force: bool,
+    ) -> PendingDiagnosticFlush {
+        PendingDiagnosticFlush {
+            send_failure: self.send_failure_diagnostics.flush_recovery_summary(
+                now,
+                DIAGNOSTIC_LOG_INTERVAL,
+                force,
+            ),
+            overrun: self.overrun_diagnostics.flush_recovery_summary(
+                now,
+                DIAGNOSTIC_LOG_INTERVAL,
+                force,
+            ),
+        }
+    }
+
+    fn flush_pending_diagnostics(&mut self, force: bool) {
+        let pending = self.collect_pending_diagnostics_at(Instant::now(), force);
+        if let Some(summary) = pending.send_failure {
+            info!(
+                "MIT control send path recovered {} time(s). Warning limiter suppressed {} repeated transient-failure warning(s) since the last summary.",
+                summary.recovery_count, summary.suppressed_fault_warnings,
+            );
+        }
+        if let Some(summary) = pending.overrun {
+            info!(
+                "MIT control loop returned within budget {} time(s). Warning limiter suppressed {} repeated overrun warning(s) since the last summary.",
+                summary.recovery_count, summary.suppressed_fault_warnings,
+            );
+        }
+    }
+
+    fn finish_safe_state_transition(&mut self, error: ControlError) -> ControlError {
+        self.flush_pending_diagnostics(true);
+        error
     }
 
     fn command_joints_with_gains(
@@ -554,7 +546,11 @@ impl MitController {
         let period = Duration::from_secs_f64(1.0 / self.config.control_rate); // 5ms @ 200Hz
         let mut next_tick = Instant::now() + period;
 
-        while start.elapsed() < timeout {
+        let result = loop {
+            if start.elapsed() >= timeout {
+                break Ok(false);
+            }
+
             let command_result = self.command_joints(JointArray::from(target), None);
             let cycle_disposition =
                 classify_command_cycle(command_result.is_ok(), error_count, MAX_TOLERANCE);
@@ -562,18 +558,18 @@ impl MitController {
             match (command_result, cycle_disposition) {
                 (Ok(()), CommandCycleDisposition::CheckReached { next_error_count }) => {
                     error_count = next_error_count;
-                    self.log_send_failure_recovered();
+                    self.note_send_failure_recovered();
 
                     let current = match self.observer.control_snapshot(self.config.read_policy) {
                         Ok(snapshot) => snapshot.position,
-                        Err(error) => return Err(self.enter_safe_state(error)),
+                        Err(error) => break Err(self.enter_safe_state(error)),
                     };
                     self.last_hold_anchor = Some(current);
                     let reached =
                         current.iter().zip(target.iter()).all(|(c, t)| (*c - *t).abs() < threshold);
 
                     if reached {
-                        return Ok(true);
+                        break Ok(true);
                     }
                 },
                 (Err(e), CommandCycleDisposition::MissedCycle { next_error_count }) => {
@@ -585,15 +581,17 @@ impl MitController {
                         "Consecutive CAN failures ({}): {:?}. Entering fail-closed safe state.",
                         failure_count, e
                     );
-                    return Err(self.enter_safe_state(e));
+                    break Err(self.enter_safe_state(e));
                 },
                 _ => unreachable!("command result classification must stay consistent"),
             }
 
             self.run_cycle_epilogue(&mut next_tick, period);
-        }
+        };
 
-        Ok(false)
+        let force_flush = matches!(&result, Err(ControlError::SafedOut { .. }));
+        self.flush_pending_diagnostics(force_flush);
+        result
     }
 
     /// 阻塞式运动到配置中的休息位置
@@ -662,10 +660,10 @@ impl MitController {
                         SafeAction::HoldPosition,
                         format!("safe-hold latched after {cause_text}"),
                     );
-                    return ControlError::SafedOut {
+                    return self.finish_safe_state_transition(ControlError::SafedOut {
                         action: SafeAction::HoldPosition,
                         source: Box::new(cause),
-                    };
+                    });
                 },
                 Err(hold_error) => {
                     error!(
@@ -675,15 +673,15 @@ impl MitController {
                     match self.enqueue_emergency_stop() {
                         Ok(()) => {
                             self.latch_safe_state(
-                                SafeAction::EmergencyStop,
-                                format!(
-                                    "emergency stop latched after {cause_text} and safe-hold failure {hold_error}"
-                                ),
-                            );
-                            return ControlError::SafedOut {
+                                    SafeAction::EmergencyStop,
+                                    format!(
+                                        "emergency stop latched after {cause_text} and safe-hold failure {hold_error}"
+                                    ),
+                                );
+                            return self.finish_safe_state_transition(ControlError::SafedOut {
                                 action: SafeAction::EmergencyStop,
                                 source: Box::new(cause),
-                            };
+                            });
                         },
                         Err(stop_error) => {
                             self.latch_safe_state(
@@ -692,10 +690,10 @@ impl MitController {
                                     "emergency stop failed after {cause_text}; safe-hold failure: {hold_error}; stop failure: {stop_error}"
                                 ),
                             );
-                            return ControlError::SafedOut {
+                            return self.finish_safe_state_transition(ControlError::SafedOut {
                                 action: SafeAction::EmergencyStop,
                                 source: Box::new(stop_error),
-                            };
+                            });
                         },
                     }
                 },
@@ -708,20 +706,20 @@ impl MitController {
                     SafeAction::EmergencyStop,
                     format!("emergency stop latched after {cause_text}"),
                 );
-                ControlError::SafedOut {
+                self.finish_safe_state_transition(ControlError::SafedOut {
                     action: SafeAction::EmergencyStop,
                     source: Box::new(cause),
-                }
+                })
             },
             Err(stop_error) => {
                 self.latch_safe_state(
                     SafeAction::EmergencyStop,
                     format!("emergency stop failed after {cause_text}: {stop_error}"),
                 );
-                ControlError::SafedOut {
+                self.finish_safe_state_transition(ControlError::SafedOut {
                     action: SafeAction::EmergencyStop,
                     source: Box::new(stop_error),
-                }
+                })
             },
         }
     }
@@ -795,6 +793,8 @@ impl MitController {
         mut self,
         config: DisableConfig,
     ) -> crate::types::Result<Piper<Standby, StrictRealtime>> {
+        self.flush_pending_diagnostics(true);
+
         // 安全提取 piper（Option 变为 None）
         let piper =
             self.piper
@@ -822,6 +822,12 @@ impl MitController {
     /// Returns whether this controller has already latched into fail-closed terminal state.
     pub fn is_safed_out(&self) -> bool {
         self.safed_out
+    }
+}
+
+impl Drop for MitController {
+    fn drop(&mut self) {
+        self.flush_pending_diagnostics(true);
     }
 }
 
@@ -1240,6 +1246,117 @@ mod tests {
         assert_eq!(
             classify_command_cycle(false, 5, 5),
             CommandCycleDisposition::Abort { failure_count: 6 }
+        );
+    }
+
+    #[test]
+    fn repeated_warning_state_keeps_faults_rate_limited_across_recovery_edges() {
+        let mut warnings = HotPathDiagnostics::default();
+        let interval = Duration::from_secs(1);
+        let start = Instant::now();
+
+        assert_eq!(
+            warnings.record_fault(start, interval),
+            FaultLogDecision::Emit {
+                suppressed_repeats: 0
+            }
+        );
+        warnings.record_recovery();
+
+        assert_eq!(
+            warnings.record_fault(start + Duration::from_millis(5), interval),
+            FaultLogDecision::Suppress,
+            "fault warnings must stay rate-limited even when the loop briefly recovers",
+        );
+    }
+
+    #[test]
+    fn repeated_warning_state_recovery_does_not_emit_hot_path_signal() {
+        let mut warnings = HotPathDiagnostics::default();
+        let interval = Duration::from_secs(1);
+        let start = Instant::now();
+
+        assert_eq!(
+            warnings.record_fault(start, interval),
+            FaultLogDecision::Emit {
+                suppressed_repeats: 0
+            }
+        );
+        warnings.record_recovery();
+        assert_eq!(
+            warnings.flush_recovery_summary(start + Duration::from_millis(5), interval, false),
+            Some(RecoverySummary {
+                recovery_count: 1,
+                suppressed_fault_warnings: 0,
+            }),
+            "recovery should only be summarized later from a cold path",
+        );
+    }
+
+    #[test]
+    fn collect_pending_diagnostics_summarizes_send_failure_recovery_once() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let mut controller = MitController::new(active, MitControllerConfig::default())
+            .expect("controller should build");
+        let start = Instant::now();
+
+        let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
+        controller.send_failure_diagnostics.record_recovery();
+
+        assert_eq!(
+            controller.collect_pending_diagnostics_at(start, false),
+            PendingDiagnosticFlush {
+                send_failure: Some(RecoverySummary {
+                    recovery_count: 1,
+                    suppressed_fault_warnings: 0,
+                }),
+                overrun: None,
+            }
+        );
+        assert_eq!(
+            controller.collect_pending_diagnostics_at(start, false),
+            PendingDiagnosticFlush::default()
+        );
+    }
+
+    #[test]
+    fn enter_safe_state_force_flushes_pending_diagnostics_inside_summary_window() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let mut controller = MitController::new(active, MitControllerConfig::default())
+            .expect("controller should build");
+        let start = Instant::now();
+
+        let _ = controller.send_failure_diagnostics.record_fault(start, DIAGNOSTIC_LOG_INTERVAL);
+        controller.send_failure_diagnostics.record_recovery();
+        assert_eq!(
+            controller.collect_pending_diagnostics_at(start, false).send_failure,
+            Some(RecoverySummary {
+                recovery_count: 1,
+                suppressed_fault_warnings: 0,
+            })
+        );
+
+        let _ = controller
+            .send_failure_diagnostics
+            .record_fault(start + Duration::from_millis(10), DIAGNOSTIC_LOG_INTERVAL);
+        controller.send_failure_diagnostics.record_recovery();
+        assert_eq!(
+            controller.collect_pending_diagnostics_at(start + Duration::from_millis(20), false),
+            PendingDiagnosticFlush::default(),
+            "normal flush must stay silent inside the summary window",
+        );
+
+        let error = controller.enter_safe_state(RobotError::feedback_stale(
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        ));
+        assert!(matches!(error, ControlError::SafedOut { .. }));
+        assert_eq!(
+            controller.collect_pending_diagnostics_at(Instant::now(), true),
+            PendingDiagnosticFlush::default(),
+            "safe-state transition must force-flush pending recovery summaries",
         );
     }
 

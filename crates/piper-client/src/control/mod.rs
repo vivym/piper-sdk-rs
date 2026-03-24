@@ -9,6 +9,7 @@
 //! - Loop Runner - 控制循环包装器
 
 pub mod controller;
+pub(crate) mod hot_path_diagnostics;
 pub mod loop_runner;
 pub mod mit_controller;
 pub mod pid;
