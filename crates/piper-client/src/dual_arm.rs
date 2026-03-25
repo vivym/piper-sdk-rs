@@ -1274,7 +1274,9 @@ fn classify_runtime_fault_exit_reason(health: DualArmRuntimeHealth) -> Option<Bi
         || matches!(health.right.fault, Some(RuntimeFaultKind::ManualFault))
     {
         Some(BilateralExitReason::RuntimeManualFault)
-    } else if !health.left.rx_alive
+    } else if !health.left.connected
+        || !health.right.connected
+        || !health.left.rx_alive
         || !health.left.tx_alive
         || !health.right.rx_alive
         || !health.right.tx_alive
@@ -3748,7 +3750,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_bilateral_ignores_connected_false_for_faulted_exit() {
+    fn test_run_bilateral_treats_connected_false_as_runtime_transport_fault() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
         let stale_but_acceptable_delay = Duration::from_millis(1_100);
@@ -3777,19 +3779,21 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect("connected=false alone should not trigger faulted exit");
+            .expect("connected=false should surface as a runtime fault exit");
 
         match exit {
-            DualArmLoopExit::Standby { report, .. } => {
-                assert_eq!(report.exit_reason, Some(BilateralExitReason::ReadFault));
-                assert!(report.read_faults >= 1);
-                assert_eq!(report.left_stop_attempt, StopAttemptResult::NotAttempted);
-                assert_eq!(report.right_stop_attempt, StopAttemptResult::NotAttempted);
+            DualArmLoopExit::Faulted { report, .. } => {
+                assert_eq!(
+                    report.exit_reason,
+                    Some(BilateralExitReason::RuntimeTransportFault)
+                );
                 assert_eq!(report.last_runtime_fault_left, None);
                 assert_eq!(report.last_runtime_fault_right, None);
+                assert_ne!(report.left_stop_attempt, StopAttemptResult::NotAttempted);
+                assert_ne!(report.right_stop_attempt, StopAttemptResult::NotAttempted);
             },
-            DualArmLoopExit::Faulted { .. } => {
-                panic!("connected=false should remain on the non-faulted path");
+            DualArmLoopExit::Standby { .. } => {
+                panic!("connected=false should not remain on the non-faulted path");
             },
         }
     }
