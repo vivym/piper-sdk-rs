@@ -11,7 +11,7 @@
 //! - **Option 模式**：使用 `Option<Piper<Active<MitMode>>>` 允许安全提取
 //! - **状态流转**：`park()` 返还 `Piper<Standby>`，支持继续使用
 //! - **循环锚点**：使用绝对时间锚点，消除累积漂移
-//! - **容错性**：允许最多连续 5 个失败控制周期（25ms @ 200Hz）
+//! - **发送容错性**：允许最多连续 5 个发送失败控制周期（25ms @ 200Hz）
 //! - **诊断摘要**：热路径只输出限速故障告警，恢复信息由异步后台诊断线程输出
 //!
 //! # 使用示例
@@ -608,7 +608,11 @@ impl MitController {
     ///
     /// # 容错性
     ///
-    /// 控制循环具有**容错性**：允许偶尔的 CAN 通信错误（最多连续 5 个失败控制周期）。
+    /// 控制循环仅对**发送路径**提供有限容错：
+    /// 允许偶尔的 CAN 发送错误（最多连续 5 个失败控制周期）。
+    ///
+    /// 控制快照读取一旦失败，会立即进入 fail-closed safe-out，
+    /// 不会像发送路径那样继续容忍多个周期。
     ///
     /// # 参数
     ///
@@ -643,7 +647,7 @@ impl MitController {
         threshold: Rad,
         timeout: Duration,
     ) -> core::result::Result<bool, ControlError> {
-        const MAX_TOLERANCE: u32 = 5; // 允许连续 5 个失败控制周期（25ms @ 200Hz）
+        const MAX_TOLERANCE: u32 = 5; // 允许连续 5 个发送失败控制周期（25ms @ 200Hz）
         self.ensure_motion_allowed()?;
 
         let mut error_count = 0;
