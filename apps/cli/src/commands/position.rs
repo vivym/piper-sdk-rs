@@ -6,7 +6,7 @@ use piper_sdk::client::ConnectedPiper;
 use serde_json::json;
 
 use crate::commands::config::CliConfig;
-use crate::connection::{TargetArgs, client_builder};
+use crate::connection::{TargetArgs, client_builder, wait_for_initial_monitor_snapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PositionOutputFormat {
@@ -41,20 +41,20 @@ impl PositionCommand {
             println!("🔌 连接到机器人...");
         }
         let robot = builder.build()?;
-        let (positions, end_pose) = match &robot {
-            ConnectedPiper::Strict(state) => (
+        let (positions, end_pose) = wait_for_initial_monitor_snapshot(|| match &robot {
+            ConnectedPiper::Strict(state) => Ok((
                 state.observer().joint_positions()?,
                 state.observer().end_pose()?,
-            ),
-            ConnectedPiper::Soft(state) => (
+            )),
+            ConnectedPiper::Soft(state) => Ok((
                 state.observer().joint_positions()?,
                 state.observer().end_pose()?,
-            ),
-            ConnectedPiper::Monitor(robot) => (
+            )),
+            ConnectedPiper::Monitor(robot) => Ok((
                 robot.observer().joint_positions()?,
                 robot.observer().end_pose()?,
-            ),
-        };
+            )),
+        })?;
 
         match self.format {
             PositionOutputFormat::Table => {

@@ -8,11 +8,14 @@ use clap::Parser;
 use piper_sdk::client::state::{
     Active, DisableConfig, MitMode, MitModeConfig, MotionCapability, Standby, StrictCapability,
 };
-use piper_sdk::client::types::{JointArray, NewtonMeter, Rad};
+use piper_sdk::client::types::{JointArray, NewtonMeter, Rad, RobotError};
 use piper_sdk::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const INITIAL_MONITOR_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(200);
+const INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// 命令行参数
 #[derive(Parser, Debug)]
@@ -149,7 +152,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             robot.observer().clone()
         };
 
-        let positions = observer.joint_positions()?;
+        let positions = wait_for_monitor_snapshot(
+            INITIAL_MONITOR_SNAPSHOT_TIMEOUT,
+            INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL,
+            || observer.joint_positions(),
+        )?;
         sample_count += 1;
 
         // 每秒输出一次状态
@@ -199,4 +206,113 @@ where
     Capability: MotionCapability + StrictCapability,
 {
     Ok(robot.disable(DisableConfig::default())?)
+}
+
+fn wait_for_monitor_snapshot<T, Read>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut read: Read,
+) -> std::result::Result<T, RobotError>
+where
+    Read: FnMut() -> std::result::Result<T, RobotError>,
+{
+    let start = Instant::now();
+
+    loop {
+        match read() {
+            Ok(value) => return Ok(value),
+            Err(
+                RobotError::MonitorStateIncomplete { .. } | RobotError::MonitorStateStale { .. },
+            ) => {},
+            Err(other) => return Err(other),
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let sleep_duration = poll_interval.min(remaining);
+        if sleep_duration.is_zero() {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        std::thread::sleep(sleep_duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use piper_sdk::client::types::MonitorStateSource;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn wait_for_monitor_snapshot_retries_warmup_errors_until_ready() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let read = {
+            let attempts = Arc::clone(&attempts);
+            move || {
+                let current = attempts.fetch_add(1, Ordering::SeqCst);
+                if current < 2 {
+                    Err(RobotError::monitor_state_incomplete(
+                        MonitorStateSource::JointPosition,
+                        0b001,
+                        0b111,
+                    ))
+                } else {
+                    Ok(7_u8)
+                }
+            }
+        };
+
+        let value =
+            wait_for_monitor_snapshot(Duration::from_millis(50), Duration::from_millis(1), read)
+                .expect("helper should retry monitor warmup errors");
+
+        assert_eq!(value, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn wait_for_monitor_snapshot_returns_non_warmup_error_without_retrying() {
+        let started_at = Instant::now();
+        let error =
+            wait_for_monitor_snapshot(Duration::from_millis(50), Duration::from_millis(10), || {
+                Err::<u8, _>(RobotError::ConfigError("boom".to_string()))
+            })
+            .expect_err("unexpected errors must not be retried");
+
+        assert!(started_at.elapsed() < Duration::from_millis(10));
+        assert!(matches!(error, RobotError::ConfigError(_)));
+    }
+
+    #[test]
+    fn wait_for_monitor_snapshot_does_not_oversleep_timeout_budget() {
+        let started_at = Instant::now();
+        let error = wait_for_monitor_snapshot(
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            || {
+                Err::<u8, _>(RobotError::monitor_state_stale(
+                    MonitorStateSource::JointPosition,
+                    Duration::from_millis(30),
+                    Duration::from_millis(15),
+                ))
+            },
+        )
+        .expect_err("persistent warmup errors should time out");
+
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "snapshot wait overslept too far past its 20ms budget: {elapsed:?}",
+        );
+        assert!(matches!(error, RobotError::Timeout { timeout_ms: 20 }));
+    }
 }

@@ -1,7 +1,7 @@
 //! REPL 模式（交互式 Shell）
 
 use crate::commands::config::CliConfig;
-use crate::connection::client_builder;
+use crate::connection::{client_builder, wait_for_initial_monitor_snapshot};
 use crate::parsing::{parse_collision_levels, parse_joint_indices_arg};
 use anyhow::{Result, bail};
 use piper_client::state::{
@@ -243,19 +243,23 @@ impl ReplSession {
     fn observer_positions(&self) -> Result<[f64; 6]> {
         match &self.state {
             ReplState::StandbyStrict(robot) => {
-                let positions = robot.observer().joint_positions()?;
+                let positions =
+                    wait_for_initial_monitor_snapshot(|| robot.observer().joint_positions())?;
                 Ok(std::array::from_fn(|index| positions[index].0))
             },
             ReplState::StandbySoft(robot) => {
-                let positions = robot.observer().joint_positions()?;
+                let positions =
+                    wait_for_initial_monitor_snapshot(|| robot.observer().joint_positions())?;
                 Ok(std::array::from_fn(|index| positions[index].0))
             },
             ReplState::ActivePositionStrict(robot) => {
-                let positions = robot.observer().joint_positions()?;
+                let positions =
+                    wait_for_initial_monitor_snapshot(|| robot.observer().joint_positions())?;
                 Ok(std::array::from_fn(|index| positions[index].0))
             },
             ReplState::ActivePositionSoft(robot) => {
-                let positions = robot.observer().joint_positions()?;
+                let positions =
+                    wait_for_initial_monitor_snapshot(|| robot.observer().joint_positions())?;
                 Ok(std::array::from_fn(|index| positions[index].0))
             },
             ReplState::Disconnected => {

@@ -1,7 +1,7 @@
 //! 移动命令
 
 use crate::commands::config::CliConfig;
-use crate::connection::{TargetArgs, client_builder};
+use crate::connection::{TargetArgs, client_builder, wait_for_initial_monitor_snapshot};
 use crate::safety::confirm_prepared_move;
 use anyhow::{Context, Result};
 use clap::Args;
@@ -97,10 +97,10 @@ impl MoveCommand {
 }
 
 fn current_positions(standby: &MotionConnectedPiper) -> Result<[f64; 6]> {
-    let positions = match standby {
-        MotionConnectedPiper::Strict(state) => state.observer().joint_positions()?,
-        MotionConnectedPiper::Soft(state) => state.observer().joint_positions()?,
-    };
+    let positions = wait_for_initial_monitor_snapshot(|| match standby {
+        MotionConnectedPiper::Strict(state) => state.observer().joint_positions(),
+        MotionConnectedPiper::Soft(state) => state.observer().joint_positions(),
+    })?;
     Ok(std::array::from_fn(|index| positions[index].0))
 }
 

@@ -11,7 +11,7 @@ use piper_sdk::driver::ConnectionTarget;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-use crate::connection::client_builder;
+use crate::connection::{client_builder, wait_for_initial_monitor_snapshot};
 use crate::parsing::normalize_joint_indices;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,7 +227,8 @@ impl ScriptExecutor {
             ScriptCommand::Move { joints, force } => {
                 println!("  移动: joints = {:?}", joints);
                 let positions =
-                    standby.observer().joint_positions().map_err(CommandFailure::lost_standby)?;
+                    wait_for_initial_monitor_snapshot(|| standby.observer().joint_positions())
+                        .map_err(CommandFailure::lost_standby)?;
                 let current = std::array::from_fn(|index| positions[index].0);
                 let prepared =
                     match prepare_move(current, joints, &self.config.profile.safety, *force) {
@@ -256,7 +257,8 @@ impl ScriptExecutor {
             ScriptCommand::Position => {
                 println!("  查询位置");
                 let positions =
-                    standby.observer().joint_positions().map_err(CommandFailure::lost_standby)?;
+                    wait_for_initial_monitor_snapshot(|| standby.observer().joint_positions())
+                        .map_err(CommandFailure::lost_standby)?;
                 for (index, position) in positions.iter().enumerate() {
                     println!(
                         "    J{}: {:.3} rad ({:.1}°)",

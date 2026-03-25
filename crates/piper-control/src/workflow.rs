@@ -196,6 +196,13 @@ fn joint_array_from_f64(values: [f64; 6]) -> JointArray<Rad> {
     JointArray::from(values.map(Rad))
 }
 
+fn is_monitor_warmup_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<RobotError>(),
+        Some(RobotError::MonitorStateIncomplete { .. } | RobotError::MonitorStateStale { .. })
+    )
+}
+
 fn blocking_motion_loop_with_cancel<ReadCurrent, Publish, ShouldCancel>(
     target: [f64; 6],
     wait: &MotionWaitConfig,
@@ -215,15 +222,41 @@ where
             .map(|(current, target)| (target - current).abs())
             .fold(0.0_f64, f64::max)
     };
+    let start = Instant::now();
 
     if should_cancel() {
         return Ok(MotionExecutionOutcome::Cancelled);
     }
-    if max_error(read_current()?) <= wait.threshold_rad {
-        return Ok(MotionExecutionOutcome::Reached);
+
+    let initial_error = loop {
+        match read_current() {
+            Ok(current) => {
+                if max_error(current) <= wait.threshold_rad {
+                    return Ok(MotionExecutionOutcome::Reached);
+                }
+                break None;
+            },
+            Err(error) if is_monitor_warmup_error(&error) => {
+                if start.elapsed() >= wait.timeout {
+                    break Some(error);
+                }
+
+                let remaining = wait.timeout.saturating_sub(start.elapsed());
+                let sleep_duration = wait.poll_interval.min(remaining);
+                if sleep_duration.is_zero() {
+                    break Some(error);
+                }
+                std::thread::sleep(sleep_duration);
+            },
+            Err(error) => break Some(error),
+        }
+    };
+
+    if let Some(error) = initial_error {
+        return Err(error);
     }
+
     publish()?;
-    let start = Instant::now();
     let mut last_publish = Instant::now();
 
     loop {
@@ -231,7 +264,23 @@ where
             return Ok(MotionExecutionOutcome::Cancelled);
         }
 
-        let max_error = max_error(read_current()?);
+        let max_error = match read_current() {
+            Ok(current) => max_error(current),
+            Err(error) if is_monitor_warmup_error(&error) => {
+                if start.elapsed() >= wait.timeout {
+                    return Err(error);
+                }
+
+                let remaining = wait.timeout.saturating_sub(start.elapsed());
+                let sleep_duration = wait.poll_interval.min(remaining);
+                if sleep_duration.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(sleep_duration);
+                continue;
+            },
+            Err(error) => return Err(error),
+        };
 
         if max_error <= wait.threshold_rad {
             return Ok(MotionExecutionOutcome::Reached);
@@ -318,6 +367,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_client::MonitorStateSource;
     use piper_tools::SafetyConfig;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -416,6 +466,57 @@ mod tests {
 
         assert_eq!(outcome, MotionExecutionOutcome::Reached);
         assert_eq!(*publishes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn blocking_motion_loop_retries_monitor_warmup_errors_before_deciding_target_is_reached() {
+        let publishes = Arc::new(Mutex::new(0usize));
+        let attempts = Arc::new(Mutex::new(0usize));
+        let wait = MotionWaitConfig {
+            threshold_rad: 0.01,
+            poll_interval: Duration::from_millis(1),
+            republish_interval: Duration::from_millis(1),
+            timeout: Duration::from_millis(50),
+        };
+
+        let outcome = blocking_motion_loop_with_cancel(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &wait,
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let mut attempts = attempts.lock().unwrap();
+                    *attempts += 1;
+                    if *attempts < 3 {
+                        Err(RobotError::monitor_state_incomplete(
+                            MonitorStateSource::JointPosition,
+                            0b001,
+                            0b111,
+                        )
+                        .into())
+                    } else {
+                        Ok([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    }
+                }
+            },
+            {
+                let publishes = Arc::clone(&publishes);
+                move || {
+                    *publishes.lock().unwrap() += 1;
+                    Ok(())
+                }
+            },
+            || false,
+        )
+        .expect("warmup errors should be retried until a valid snapshot arrives");
+
+        assert_eq!(outcome, MotionExecutionOutcome::Reached);
+        assert_eq!(*attempts.lock().unwrap(), 3);
+        assert_eq!(
+            *publishes.lock().unwrap(),
+            0,
+            "warmup retries should not publish when the validated snapshot already matches target",
+        );
     }
 
     #[test]
