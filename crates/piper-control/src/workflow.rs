@@ -254,7 +254,11 @@ where
             last_publish = now;
         }
 
-        std::thread::sleep(wait.poll_interval);
+        let remaining = wait.timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            continue;
+        }
+        std::thread::sleep(wait.poll_interval.min(remaining));
     }
 }
 
@@ -438,6 +442,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*query_attempts.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn blocking_motion_loop_does_not_oversleep_past_timeout_budget() {
+        let wait = MotionWaitConfig {
+            threshold_rad: 0.01,
+            poll_interval: Duration::from_millis(100),
+            republish_interval: Duration::from_millis(100),
+            timeout: Duration::from_millis(20),
+        };
+
+        let started_at = Instant::now();
+        let error = blocking_motion_loop_with_cancel(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &wait,
+            || Ok([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            || Ok(()),
+            || false,
+        )
+        .expect_err("unreached target should time out");
+
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "timeout loop overslept too far past its 20ms budget: {elapsed:?}",
+        );
+        assert!(
+            error.to_string().contains("motion did not reach target within 0.02s"),
+            "unexpected timeout error: {error}",
+        );
     }
 
     #[test]
