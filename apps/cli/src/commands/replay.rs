@@ -10,6 +10,7 @@ use piper_control::TargetSpec;
 use piper_sdk::client::state::{MotionCapability, Standby};
 use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState, Piper};
 use piper_sdk::driver::ConnectionTarget;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::spawn_blocking;
@@ -35,9 +36,24 @@ pub struct ReplayCommand {
     #[command(flatten)]
     pub target: TargetArgs,
 
-    /// 回放前确认
-    #[arg(long)]
-    pub confirm: bool,
+    /// 跳过确认提示并立即开始回放
+    #[arg(long = "yes", alias = "confirm")]
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayRunOutcome {
+    Completed,
+    Cancelled,
+}
+
+impl fmt::Display for ReplayRunOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed => write!(f, "completed"),
+            Self::Cancelled => write!(f, "cancelled"),
+        }
+    }
 }
 
 impl ReplayCommand {
@@ -91,7 +107,7 @@ impl ReplayCommand {
 
         // === 4. 安全确认 ===
 
-        if !self.confirm {
+        if !self.yes {
             let prompt = "即将开始回放，确定要继续吗？[y/N] ";
 
             print!("{}", prompt);
@@ -145,13 +161,12 @@ impl ReplayCommand {
 
         // 检查结果
         match result {
-            Ok(Ok(())) => {
+            Ok(Ok(ReplayRunOutcome::Completed)) => {
                 println!();
                 println!("✅ 回放完成");
             },
-            Ok(Err(e)) if e.to_string().contains("cancelled") => {
+            Ok(Ok(ReplayRunOutcome::Cancelled)) => {
                 println!("⚠️ 回放被用户中断");
-                // 安全停止已在 replay_sync 中处理
                 return Ok(());
             },
             Ok(Err(e)) => {
@@ -185,7 +200,7 @@ impl ReplayCommand {
         target: ConnectionTarget,
         target_spec: TargetSpec,
         running: Arc<AtomicBool>,
-    ) -> Result<()> {
+    ) -> Result<ReplayRunOutcome> {
         // === 连接到机器人 ===
 
         println!("⏳ 连接到机器人...");
@@ -219,7 +234,7 @@ impl ReplayCommand {
         input: &str,
         speed: f64,
         running: &Arc<AtomicBool>,
-    ) -> Result<()>
+    ) -> Result<ReplayRunOutcome>
     where
         Capability: MotionCapability,
     {
@@ -230,14 +245,16 @@ impl ReplayCommand {
         println!("🔄 开始回放...");
         println!();
 
-        match replay.replay_recording_with_cancel(input, speed, running) {
-            Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("cancelled") => {
-                println!("⚠️ 正在发送安全停止指令...");
-                println!("✅ 已进入 Standby");
-                Err(anyhow::anyhow!("Replay cancelled by user"))
-            },
-            Err(e) => Err(e.into()),
+        replay
+            .replay_recording_with_cancel(input, speed, running)
+            .map_err(anyhow::Error::from)?;
+
+        if running.load(Ordering::Acquire) {
+            Ok(ReplayRunOutcome::Completed)
+        } else {
+            println!("⚠️ 正在发送安全停止指令...");
+            println!("✅ 已进入 Standby");
+            Ok(ReplayRunOutcome::Cancelled)
         }
     }
 }
@@ -256,12 +273,12 @@ mod tests {
                     iface: "can0".to_string(),
                 }),
             },
-            confirm: true,
+            yes: true,
         };
 
         assert_eq!(cmd.input, "recording.bin");
         assert_eq!(cmd.speed, 2.0);
-        assert!(cmd.confirm);
+        assert!(cmd.yes);
     }
 
     #[test]
@@ -270,11 +287,11 @@ mod tests {
             input: "recording.bin".to_string(),
             speed: 1.0,
             target: TargetArgs::default(),
-            confirm: false,
+            yes: false,
         };
 
         assert_eq!(cmd.speed, 1.0);
-        assert!(!cmd.confirm);
+        assert!(!cmd.yes);
     }
 
     #[test]
@@ -287,7 +304,7 @@ mod tests {
                     serial: "ABC123".to_string(),
                 }),
             },
-            confirm: false,
+            yes: false,
         };
 
         assert_eq!(cmd.input, "test.bin");
@@ -308,7 +325,7 @@ mod tests {
                     iface: "vcan0".to_string(),
                 }),
             },
-            confirm: true,
+            yes: true,
         };
 
         assert!(matches!(
@@ -324,7 +341,7 @@ mod tests {
             input: "test.bin".to_string(),
             speed: max_speed,
             target: TargetArgs::default(),
-            confirm: true,
+            yes: true,
         };
 
         assert_eq!(cmd.speed, max_speed);
@@ -337,7 +354,7 @@ mod tests {
             input: "test.bin".to_string(),
             speed: min_speed,
             target: TargetArgs::default(),
-            confirm: false,
+            yes: false,
         };
 
         assert_eq!(cmd.speed, min_speed);
@@ -350,9 +367,15 @@ mod tests {
             input: "test.bin".to_string(),
             speed: recommended_speed,
             target: TargetArgs::default(),
-            confirm: false,
+            yes: false,
         };
 
         assert_eq!(cmd.speed, recommended_speed);
+    }
+
+    #[test]
+    fn test_replay_run_outcome_display() {
+        assert_eq!(ReplayRunOutcome::Completed.to_string(), "completed");
+        assert_eq!(ReplayRunOutcome::Cancelled.to_string(), "cancelled");
     }
 }

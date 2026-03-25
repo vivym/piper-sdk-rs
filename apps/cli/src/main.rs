@@ -139,14 +139,14 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     // 初始化日志（compact 格式，隐藏 target，易读）
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("piper_cli=info".parse()?)
+        .add_directive("piper_driver=warn".parse()?)
+        .add_directive("piper_can=warn".parse()?)
+        .add_directive("piper_protocol=warn".parse()?);
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("piper_cli=info".parse().unwrap())
-                .add_directive("piper_driver=warn".parse().unwrap())
-                .add_directive("piper_can=warn".parse().unwrap())
-                .add_directive("piper_protocol=warn".parse().unwrap()),
-        )
+        .with_env_filter(env_filter)
         .with_target(false)
         .compact()
         .init();

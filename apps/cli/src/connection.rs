@@ -7,7 +7,7 @@ use crate::commands::config::CliConfig;
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct TargetArgs {
-    /// 连接目标，示例: auto / socketcan:can0 / gs-usb-serial:ABC123 / gs-usb-bus-address:1:8
+    /// 连接目标，示例: auto-strict / socketcan:can0 / gs-usb-serial:ABC123 / gs-usb-bus-address:1:8
     #[arg(long, value_name = "SPEC")]
     pub target: Option<TargetSpec>,
 }

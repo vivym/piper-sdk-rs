@@ -1,6 +1,6 @@
 //! run 命令
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Args;
 
 use crate::commands::config::CliConfig;
@@ -22,6 +22,17 @@ pub struct RunCommand {
 }
 
 impl RunCommand {
+    fn status_from_result(result: &crate::script::ScriptResult) -> Result<()> {
+        if result.failed.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "script finished with {} failed command(s)",
+                result.failed.len()
+            ))
+        }
+    }
+
     pub async fn execute(&self) -> Result<()> {
         println!("📜 加载脚本: {}", self.script);
         let script = ScriptExecutor::load_script(&self.script)?;
@@ -57,7 +68,7 @@ impl RunCommand {
             }
         }
 
-        Ok(())
+        Self::status_from_result(&result)
     }
 }
 
@@ -65,6 +76,7 @@ impl RunCommand {
 mod tests {
     use super::*;
     use piper_control::TargetSpec;
+    use std::time::SystemTime;
 
     #[test]
     fn run_command_creation() {
@@ -80,5 +92,35 @@ mod tests {
 
         assert_eq!(cmd.script, "test.json");
         assert!(cmd.continue_on_error);
+    }
+
+    #[test]
+    fn run_command_reports_error_when_script_contains_failures() {
+        let result = crate::script::ScriptResult {
+            script_name: "test".to_string(),
+            total_commands: 2,
+            succeeded: vec![0],
+            failed: vec![(1, "boom".to_string())],
+            start_time: SystemTime::UNIX_EPOCH,
+            end_time: Some(SystemTime::UNIX_EPOCH),
+            duration_secs: 0.1,
+        };
+
+        assert!(RunCommand::status_from_result(&result).is_err());
+    }
+
+    #[test]
+    fn run_command_accepts_fully_successful_script_result() {
+        let result = crate::script::ScriptResult {
+            script_name: "test".to_string(),
+            total_commands: 2,
+            succeeded: vec![0, 1],
+            failed: vec![],
+            start_time: SystemTime::UNIX_EPOCH,
+            end_time: Some(SystemTime::UNIX_EPOCH),
+            duration_secs: 0.1,
+        };
+
+        assert!(RunCommand::status_from_result(&result).is_ok());
     }
 }

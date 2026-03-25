@@ -279,12 +279,10 @@ impl ConfigCommand {
 
     async fn set_rest_pose(pose: String) -> Result<()> {
         let mut config = CliConfig::load()?;
-        config.park.rest_pose_override = Some(parse_pose(&pose)?);
+        let rest_pose = parse_pose(&pose)?;
+        config.park.rest_pose_override = Some(rest_pose);
         config.save()?;
-        println!(
-            "✅ park rest pose 已设置为 {}",
-            format_pose(config.park.rest_pose_override.unwrap())
-        );
+        println!("✅ park rest pose 已设置为 {}", format_pose(rest_pose));
         Ok(())
     }
 

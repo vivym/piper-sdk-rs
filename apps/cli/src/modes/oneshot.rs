@@ -12,6 +12,33 @@ use tokio::signal;
 use crate::commands::config::CliConfig;
 use crate::connection::{driver_builder, resolved_target};
 
+const MONITOR_FEEDBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+trait MonitorStartupDriver {
+    fn wait_for_feedback(&self, timeout: std::time::Duration) -> Result<()>;
+    fn reset_fps_stats(&self);
+}
+
+impl MonitorStartupDriver for piper_sdk::driver::Piper {
+    fn wait_for_feedback(&self, timeout: std::time::Duration) -> Result<()> {
+        piper_sdk::driver::Piper::wait_for_feedback(self, timeout)?;
+        Ok(())
+    }
+
+    fn reset_fps_stats(&self) {
+        piper_sdk::driver::Piper::reset_fps_stats(self);
+    }
+}
+
+fn prepare_monitor_startup<Driver: MonitorStartupDriver>(
+    driver: &Driver,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    driver.wait_for_feedback(timeout)?;
+    driver.reset_fps_stats();
+    Ok(())
+}
+
 pub struct OneShotMode {
     config: CliConfig,
 }
@@ -34,6 +61,8 @@ impl OneShotMode {
         let piper = builder.build()?;
 
         println!("✅ 已连接");
+        println!("⏳ 等待首帧反馈...");
+        prepare_monitor_startup(&piper, MONITOR_FEEDBACK_TIMEOUT)?;
         println!("📊 监控中 ({} Hz)...", frequency);
         println!("按 Ctrl+C 停止\n");
 
@@ -59,8 +88,6 @@ impl OneShotMode {
             }
         });
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        piper.reset_fps_stats();
         let mut fps_window_start = std::time::Instant::now();
 
         while running.load(Ordering::SeqCst) {
@@ -150,5 +177,65 @@ impl OneShotMode {
 
         println!("✅ 已停止监控");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct MockMonitorDriver {
+        calls: Mutex<Vec<&'static str>>,
+        wait_result: Mutex<Option<anyhow::Error>>,
+    }
+
+    impl MockMonitorDriver {
+        fn with_wait_error(message: &'static str) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                wait_result: Mutex::new(Some(anyhow::anyhow!(message))),
+            }
+        }
+    }
+
+    impl MonitorStartupDriver for MockMonitorDriver {
+        fn wait_for_feedback(&self, _timeout: Duration) -> Result<()> {
+            self.calls.lock().unwrap().push("wait_for_feedback");
+            if let Some(error) = self.wait_result.lock().unwrap().take() {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn reset_fps_stats(&self) {
+            self.calls.lock().unwrap().push("reset_fps_stats");
+        }
+    }
+
+    #[test]
+    fn monitor_startup_waits_for_feedback_before_resetting_fps() {
+        let driver = MockMonitorDriver::default();
+
+        prepare_monitor_startup(&driver, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            driver.calls.lock().unwrap().as_slice(),
+            ["wait_for_feedback", "reset_fps_stats"]
+        );
+    }
+
+    #[test]
+    fn monitor_startup_does_not_reset_fps_if_feedback_wait_fails() {
+        let driver = MockMonitorDriver::with_wait_error("no feedback");
+
+        assert!(prepare_monitor_startup(&driver, Duration::from_secs(5)).is_err());
+        assert_eq!(
+            driver.calls.lock().unwrap().as_slice(),
+            ["wait_for_feedback"]
+        );
     }
 }

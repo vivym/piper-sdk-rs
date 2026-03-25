@@ -16,13 +16,14 @@ cargo install --path apps/cli
 
 CLI 和配置文件统一使用强类型 target spec：
 
-- `auto`
+- `auto-strict`
+- `auto-any`
 - `socketcan:can0`
 - `gs-usb-auto`
 - `gs-usb-serial:ABC123`
 - `gs-usb-bus-address:1:8`
 
-默认值是 `auto`。
+默认值是 `auto-strict`。
 
 ## 快速开始
 
@@ -41,6 +42,9 @@ piper-cli move --joints 0.1,0.2,0.3
 
 # 查询当前位置
 piper-cli position
+
+# JSON 输出
+piper-cli position --format json
 
 # 回到零关节位
 piper-cli home
@@ -90,7 +94,7 @@ REPL 现在使用“前台输入 + 后台命令 worker”模型：
 
 ```toml
 [target]
-kind = "auto"
+kind = "auto-strict"
 
 [park]
 orientation = "upright"
@@ -145,8 +149,8 @@ timeout_ms = 5000
 ### `collision-protection set`
 
 - 会发送写入命令
-- 然后按“post-write 新状态”做校验
-- 只要观察到写入后的新缓存与目标一致，就算成功
+- 然后发送主动 query，并等待这次 query 之后返回的确认结果
+- 不会仅凭旧缓存或写入前的历史反馈判定成功
 
 ## 急停语义
 
@@ -182,8 +186,14 @@ piper-cli monitor --frequency 20
 # 录制
 piper-cli record --output recording.bin --duration 10
 
+# 接收到指定 CAN ID 后停止（优先级高于 --duration）
+piper-cli record --output recording.bin --duration 30 --stop-on-id 0x2A4
+
 # 回放
 piper-cli replay --input recording.bin --speed 2.0
+
+# 跳过确认提示
+piper-cli replay --input recording.bin --speed 2.0 --yes
 
 # 执行脚本
 piper-cli run --script examples/move_sequence.json

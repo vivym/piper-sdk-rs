@@ -663,9 +663,6 @@ pub async fn run_repl() -> Result<()> {
                         },
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    announce_stop_request(executor.request_emergency_stop()?);
-                }
                 completion = executor.wait_for_completion() => {
                     executor.finish_completion(completion?);
                     if exit_after_completion {
@@ -693,9 +690,6 @@ pub async fn run_repl() -> Result<()> {
                         }
                     },
                 }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                announce_stop_request(executor.request_emergency_stop()?);
             }
         }
     }

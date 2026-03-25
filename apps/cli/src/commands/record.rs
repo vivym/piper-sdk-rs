@@ -44,6 +44,28 @@ pub struct RecordCommand {
 }
 
 impl RecordCommand {
+    fn effective_stop_condition(duration: u64, stop_on_id: Option<u32>) -> StopCondition {
+        if let Some(id) = stop_on_id {
+            StopCondition::OnCanId(id)
+        } else if duration > 0 {
+            StopCondition::Duration(duration)
+        } else {
+            StopCondition::Manual
+        }
+    }
+
+    fn effective_loop_timeout_secs(duration: u64, stop_on_id: Option<u32>) -> u64 {
+        if stop_on_id.is_some() { 0 } else { duration }
+    }
+
+    fn current_operator_name() -> String {
+        std::env::var("USER")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var("USERNAME").ok().filter(|value| !value.is_empty()))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     /// 执行录制
     pub async fn execute(&self) -> Result<()> {
         // === 1. 参数验证 ===
@@ -224,19 +246,23 @@ impl RecordCommand {
         // === 2. 映射停止条件 ===
 
         // ✅ 优先级：stop_on_id > duration > manual
-        let stop_condition = if let Some(id) = stop_on_id {
-            StopCondition::OnCanId(id)
-        } else if duration > 0 {
-            StopCondition::Duration(duration)
-        } else {
-            StopCondition::Manual
-        };
+        let stop_condition = Self::effective_stop_condition(duration, stop_on_id);
+        let loop_timeout_secs = Self::effective_loop_timeout_secs(duration, stop_on_id);
 
         // === 3. 启动录制 ===
 
         let metadata = RecordingMetadata {
-            notes: format!("CLI recording, duration={}", duration),
-            operator: std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()),
+            notes: match stop_condition {
+                StopCondition::OnCanId(id) => format!("CLI recording, stop_on_id=0x{id:X}"),
+                StopCondition::Duration(seconds) => {
+                    format!("CLI recording, duration={seconds}")
+                },
+                StopCondition::Manual => "CLI recording, manual stop".to_string(),
+                StopCondition::FrameCount(count) => {
+                    format!("CLI recording, frame_count={count}")
+                },
+            },
+            operator: Self::current_operator_name(),
         };
 
         let config = RecordingConfig {
@@ -247,17 +273,17 @@ impl RecordCommand {
 
         match standby {
             ConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
-                Self::record_with_standby(standby, config, duration, running)
+                Self::record_with_standby(standby, config, loop_timeout_secs, running)
             },
             ConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
-                Self::record_with_standby(standby, config, duration, running)
+                Self::record_with_standby(standby, config, loop_timeout_secs, running)
             },
             ConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
             | ConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => Err(anyhow::anyhow!(
                 "机械臂当前不在确认全失能的 Standby，请先执行 stop"
             )),
             ConnectedPiper::Monitor(standby) => {
-                Self::record_with_standby(standby, config, duration, running)
+                Self::record_with_standby(standby, config, loop_timeout_secs, running)
             },
         }
     }
@@ -422,5 +448,61 @@ mod tests {
             Some(TargetSpec::GsUsbSerial { .. })
         ));
         assert!(cmd.force);
+    }
+
+    #[test]
+    fn effective_stop_condition_prefers_stop_on_id_over_duration() {
+        match RecordCommand::effective_stop_condition(30, Some(0x2A5)) {
+            StopCondition::OnCanId(0x2A5) => {},
+            StopCondition::OnCanId(other) => panic!("unexpected CAN ID: 0x{other:X}"),
+            StopCondition::Duration(seconds) => {
+                panic!("expected OnCanId, got Duration({seconds})")
+            },
+            StopCondition::Manual => panic!("expected OnCanId, got Manual"),
+            StopCondition::FrameCount(count) => {
+                panic!("expected OnCanId, got FrameCount({count})")
+            },
+        }
+        assert_eq!(
+            RecordCommand::effective_loop_timeout_secs(30, Some(0x2A5)),
+            0
+        );
+    }
+
+    #[test]
+    fn effective_stop_condition_uses_duration_when_no_can_id_is_set() {
+        match RecordCommand::effective_stop_condition(30, None) {
+            StopCondition::Duration(30) => {},
+            StopCondition::Duration(other) => panic!("unexpected duration: {other}"),
+            StopCondition::OnCanId(id) => panic!("expected Duration, got OnCanId(0x{id:X})"),
+            StopCondition::Manual => panic!("expected Duration, got Manual"),
+            StopCondition::FrameCount(count) => {
+                panic!("expected Duration, got FrameCount({count})")
+            },
+        }
+        assert_eq!(RecordCommand::effective_loop_timeout_secs(30, None), 30);
+    }
+
+    #[test]
+    fn current_operator_name_falls_back_to_username() {
+        let user_backup = std::env::var("USER").ok();
+        let username_backup = std::env::var("USERNAME").ok();
+
+        unsafe {
+            std::env::remove_var("USER");
+            std::env::set_var("USERNAME", "windows-user");
+        }
+
+        assert_eq!(RecordCommand::current_operator_name(), "windows-user");
+
+        unsafe {
+            std::env::remove_var("USERNAME");
+            if let Some(user) = user_backup {
+                std::env::set_var("USER", user);
+            }
+            if let Some(username) = username_backup {
+                std::env::set_var("USERNAME", username);
+            }
+        }
     }
 }

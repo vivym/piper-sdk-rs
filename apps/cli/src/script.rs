@@ -152,6 +152,7 @@ impl ScriptExecutor {
         Capability: MotionCapability,
         Reconnect: Fn() -> Result<Piper<Standby, Capability>>,
     {
+        let started_at = std::time::Instant::now();
         let mut result = ScriptResult {
             script_name: script.name.clone(),
             total_commands: script.commands.len(),
@@ -203,12 +204,7 @@ impl ScriptExecutor {
         }
 
         result.end_time = Some(std::time::SystemTime::now());
-        result.duration_secs = result
-            .end_time
-            .unwrap()
-            .duration_since(result.start_time)
-            .unwrap_or_default()
-            .as_secs_f64();
+        result.duration_secs = started_at.elapsed().as_secs_f64();
 
         println!();
         println!("📊 脚本执行结果:");
@@ -361,6 +357,7 @@ pub struct ScriptResult {
     pub total_commands: usize,
     pub succeeded: Vec<usize>,
     pub failed: Vec<(usize, String)>,
+    #[allow(dead_code)]
     pub start_time: std::time::SystemTime,
     pub end_time: Option<std::time::SystemTime>,
     pub duration_secs: f64,
