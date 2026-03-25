@@ -4,7 +4,7 @@
 //! and inverse dynamics torques for the Piper robot.
 //!
 //! **NOTE**: This example requires the `mujoco` feature to be enabled:
-//! `cargo run --example gravity_compensation_mujoco --features mujoco`
+//! `cargo run --manifest-path addons/piper-physics-mujoco/Cargo.toml --example gravity_compensation_mujoco`
 //!
 //! # Prerequisites
 //!

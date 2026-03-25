@@ -159,7 +159,7 @@ run_socketcan_diagnostics() {
 run_gs_usb_diagnostics() {
     run_logged \
         "gs-usb-debug-scan" \
-        "cargo test --test gs_usb_debug_scan -- --ignored --nocapture --test-threads=1"
+        "cargo test -p piper-sdk --test gs_usb_debug_scan -- --ignored --nocapture --test-threads=1"
     run_optional_logged \
         "gs-usb-lsusb" \
         "if command -v lsusb >/dev/null 2>&1; then lsusb -v; else echo 'lsusb command not available'; fi"
@@ -174,7 +174,7 @@ run_socketcan_strict() {
 
     run_logged \
         "socketcan-timeout-config" \
-        "PIPER_TEST_SOCKETCAN_IFACE=\"${SOCKETCAN_IFACE}\" cargo test --test timeout_convergence_tests test_socketcan_timeout_config -- --ignored --nocapture"
+        "PIPER_TEST_SOCKETCAN_IFACE=\"${SOCKETCAN_IFACE}\" cargo test -p piper-sdk --test timeout_convergence_tests test_socketcan_timeout_config -- --ignored --nocapture"
     if [[ ${LAST_STATUS} -ne 0 && "${CONTINUE_ON_FAILURE}" != "1" ]]; then
         STOP_REQUESTED=1
     fi
@@ -185,7 +185,7 @@ run_socketcan_strict() {
 
     run_logged \
         "socketcan-rx-500hz-benchmark" \
-        "cargo test --test realtime_benchmark_tests test_500hz_realtime_benchmark -- --ignored --nocapture"
+        "cargo test -p piper-sdk --test realtime_benchmark_tests test_500hz_realtime_benchmark -- --ignored --nocapture"
     if [[ ${LAST_STATUS} -ne 0 && "${CONTINUE_ON_FAILURE}" != "1" ]]; then
         STOP_REQUESTED=1
     fi
@@ -196,7 +196,7 @@ run_socketcan_strict() {
 
     run_logged \
         "socketcan-tx-latency-benchmark" \
-        "cargo test --test realtime_benchmark_tests test_tx_latency_benchmark -- --ignored --nocapture"
+        "cargo test -p piper-sdk --test realtime_benchmark_tests test_tx_latency_benchmark -- --ignored --nocapture"
     if [[ ${LAST_STATUS} -ne 0 && "${CONTINUE_ON_FAILURE}" != "1" ]]; then
         STOP_REQUESTED=1
     fi
@@ -207,7 +207,7 @@ run_socketcan_strict() {
 
     run_logged \
         "socketcan-send-duration-benchmark" \
-        "cargo test --test realtime_benchmark_tests test_send_duration_benchmark -- --ignored --nocapture"
+        "cargo test -p piper-sdk --test realtime_benchmark_tests test_send_duration_benchmark -- --ignored --nocapture"
     if [[ ${LAST_STATUS} -ne 0 && "${CONTINUE_ON_FAILURE}" != "1" ]]; then
         STOP_REQUESTED=1
     fi
@@ -223,7 +223,7 @@ run_gs_usb_soft() {
 
     run_logged \
         "gs-usb-timeout-config" \
-        "cargo test --test timeout_convergence_tests test_gs_usb_timeout_config -- --ignored --nocapture --test-threads=1"
+        "cargo test -p piper-sdk --test timeout_convergence_tests test_gs_usb_timeout_config -- --ignored --nocapture --test-threads=1"
     if [[ ${LAST_STATUS} -ne 0 && "${CONTINUE_ON_FAILURE}" != "1" ]]; then
         STOP_REQUESTED=1
     fi
@@ -234,7 +234,7 @@ run_gs_usb_soft() {
 
     run_logged \
         "gs-usb-performance-suite" \
-        "cargo test --test gs_usb_performance_tests -- --ignored --nocapture --test-threads=1"
+        "cargo test -p piper-sdk --test gs_usb_performance_tests -- --ignored --nocapture --test-threads=1"
     if [[ ${LAST_STATUS} -ne 0 && "${CONTINUE_ON_FAILURE}" != "1" ]]; then
         STOP_REQUESTED=1
     fi

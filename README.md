@@ -26,7 +26,7 @@
   - **Windows/macOS**: GS-USB driver implementation using `rusb` (driver-free/universal)
 - 🎬 **Async CAN Frame Recording**:
   - **Non-blocking hooks**: <1μs overhead per frame using `try_send`
-  - **Bounded queues**: 10,000 frame capacity prevents OOM at 1kHz
+  - **Bounded queues**: 100,000 frame capacity prevents OOM while preserving ~1.6 min @ 1kHz / ~3.3 min @ 500Hz of burst tolerance
   - **Hardware timestamps**: Direct use of kernel/driver interrupt timestamps
   - **TX safety**: Only records frames after successful `send()`
   - **Drop monitoring**: Built-in `dropped_frames` counter for loss tracking
@@ -149,8 +149,9 @@ This demonstrates:
 - Recording CAN frames to JSON
 - Saving/loading frame data
 - Debugging CAN bus communication
+- Using neutral example IDs instead of live robot protocol traffic
 
-See [examples/frame_dump.rs](../crates/piper-sdk/examples/frame_dump.rs) for details.
+See [frame_dump.rs](crates/piper-sdk/examples/frame_dump.rs) for details.
 
 ### Platform-Specific Features
 
@@ -192,15 +193,28 @@ Most users should use the high-level client API for type-safe, easy-to-use contr
 
 ```rust
 use piper_sdk::prelude::*;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Connect using an explicit SocketCAN target on Linux.
     // On macOS/Windows, use `.gs_usb_auto()` or `.gs_usb_serial(...)`.
-    let robot = PiperBuilder::new()
+    let connected = PiperBuilder::new()
         .socketcan("can0")
         .baud_rate(1_000_000)
-        .build()?;
-    let robot = robot.enable_position_mode(PositionModeConfig::default())?;
+        .build()?
+        .require_motion()?;
+    let robot = match connected {
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => {
+            robot.enable_position_mode(PositionModeConfig::default())?
+        }
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => {
+            robot.enable_position_mode(PositionModeConfig::default())?
+        }
+        MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+            return Err("robot is not in confirmed Standby".into());
+        }
+    };
 
     // Get observer for reading state
     let observer = robot.observer();
@@ -222,11 +236,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 Record CAN frames asynchronously with non-blocking hooks:
 
 ```rust
-use piper_driver::recording::AsyncRecordingHook;
 use piper_driver::hooks::FrameCallback;
-use piper_sdk::prelude::*;
+use piper_driver::recording::AsyncRecordingHook;
+use piper_sdk::driver::PiperBuilder;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
@@ -238,24 +252,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register as callback
     let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
 
-    // Connect robot
+    // Connect robot through the driver API
     let robot = PiperBuilder::new()
         .socketcan("can0")
         .build()?;
 
     // Register hook in driver layer
-    // (Note: This is advanced usage - see driver API docs)
-    robot.context.hooks.write()?.add_callback(callback);
+    let hook_handle = robot.hooks().write()?.add_callback(callback);
 
     // Spawn recording thread
     let handle = thread::spawn(move || {
-        let mut file = std::fs::File::create("recording.bin")?;
         while let Ok(frame) = rx.recv() {
-            // Process frame: write to file, analyze, etc.
-            println!("Received frame: ID=0x{:03X}, timestamp={}us",
-                     frame.id, frame.timestamp_us);
+            println!(
+                "Received frame: ID=0x{:03X}, timestamp={}us",
+                frame.id, frame.timestamp_us
+            );
         }
-        Ok::<_, Box<dyn std::error::Error>>(())
     });
 
     // Run for 5 seconds
@@ -265,14 +277,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dropped = dropped_counter.load(Ordering::Relaxed);
     println!("Dropped frames: {}", dropped);
 
-    handle.join().ok();
+    // Remove hook so the receiver can exit cleanly
+    let _removed = robot.hooks().write()?.remove_callback(hook_handle);
+    let _ = handle.join();
     Ok(())
 }
 ```
 
 **Key Features**:
 - ✅ **Non-blocking**: `<1μs` overhead per frame
-- ✅ **OOM-safe**: Bounded queue (10,000 frames @ 1kHz = 10s buffer)
+- ✅ **OOM-safe**: Bounded queue (100,000 frames ≈ 1.6 min @ 1kHz / 3.3 min @ 500Hz)
 - ✅ **Hardware timestamps**: Microsecond precision from kernel/driver
 - ✅ **TX safe**: Only records successfully sent frames
 - ✅ **Loss tracking**: Built-in `dropped_frames` counter
@@ -292,16 +306,19 @@ Piper SDK provides three complementary APIs for CAN frame recording and replay:
 The simplest way to record CAN frames to a file:
 
 ```rust
-use piper_client::{PiperBuilder, recording::{RecordingConfig, RecordingMetadata, StopCondition}};
+use piper_sdk::{
+    ConnectedPiper,
+    PiperBuilder,
+    RecordingConfig,
+    RecordingMetadata,
+    StopCondition,
+    client::state::{CapabilityMarker, Piper, Standby},
+};
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Connect to robot
-    let robot = PiperBuilder::new()
-        .socketcan("can0")
-        .build()?;
-
+async fn run_recording<C: CapabilityMarker>(
+    robot: Piper<Standby, C>,
+) -> anyhow::Result<()> {
     // Start recording with metadata
     let (robot, handle) = robot.start_recording(RecordingConfig {
         output_path: "demo_recording.bin".into(),
@@ -316,12 +333,26 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Stop recording and get statistics
-    let (robot, stats) = robot.stop_recording(handle)?;
+    let (_robot, stats) = robot.stop_recording(handle)?;
 
     println!("Recorded {} frames in {:.2}s", stats.frame_count, stats.duration.as_secs_f64());
     println!("Dropped frames: {}", stats.dropped_frames);
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Connect to robot
+    let connected = PiperBuilder::new()
+        .socketcan("can0")
+        .build()?;
+
+    match connected {
+        ConnectedPiper::Strict(state) => run_recording(state.require_standby()?).await,
+        ConnectedPiper::Soft(state) => run_recording(state.require_standby()?).await,
+        ConnectedPiper::Monitor(standby) => run_recording(standby).await,
+    }
 }
 ```
 
@@ -331,24 +362,37 @@ async fn main() -> anyhow::Result<()> {
 - ✅ **Statistics**: Frame count, duration, dropped frames
 - ✅ **Type-safe**: Recording handle prevents misuse
 
-See [examples/standard_recording.rs](examples/standard_recording.rs) for full example.
+See [standard_recording.rs](crates/piper-sdk/examples/standard_recording.rs) for full example.
 
 ### 2. Custom Diagnostics API
 
 Advanced users can register custom frame callbacks for real-time analysis:
 
 ```rust
-use piper_client::PiperBuilder;
+use piper_sdk::PiperBuilder;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 use piper_driver::recording::AsyncRecordingHook;
 use std::sync::Arc;
 use std::thread;
 
 fn main() -> anyhow::Result<()> {
     // Connect and enable robot
-    let robot = PiperBuilder::new()
+    let connected = PiperBuilder::new()
         .socketcan("can0")
-        .build()?;
-    let active = robot.enable_position_mode(Default::default())?;
+        .build()?
+        .require_motion()?;
+    let active = match connected {
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => {
+            robot.enable_position_mode(Default::default())?
+        }
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => {
+            robot.enable_position_mode(Default::default())?
+        }
+        MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+            anyhow::bail!("robot is not in confirmed Standby");
+        }
+    };
 
     // Get diagnostics interface
     let diag = active.diagnostics();
@@ -359,7 +403,7 @@ fn main() -> anyhow::Result<()> {
 
     // Register hook
     let callback = Arc::new(hook) as Arc<dyn piper_driver::FrameCallback>;
-    diag.register_callback(callback)?;
+    let hook_handle = diag.register_callback(callback)?;
 
     // Process frames in background thread
     thread::spawn(move || {
@@ -380,8 +424,12 @@ fn main() -> anyhow::Result<()> {
     // Run operations...
     thread::sleep(std::time::Duration::from_secs(5));
 
+    // Remove hook before shutdown
+    let _removed = diag.unregister_callback(hook_handle)?;
+
     // Shutdown
     let _standby = active.shutdown()?;
+    let _summary = handle.join();
 
     Ok(())
 }
@@ -390,23 +438,33 @@ fn main() -> anyhow::Result<()> {
 **Features**:
 - ✅ **Real-time processing**: Analyze frames as they arrive
 - ✅ **Custom logic**: Implement any analysis algorithm
-- ✅ **Background threading**: Non-blocking main thread
+- ✅ **Background threading**: Analysis runs off the RX thread, and shutdown waits deterministically for the worker to exit
 - ✅ **Loss tracking**: Monitor dropped frames
 
-See [examples/custom_diagnostics.rs](examples/custom_diagnostics.rs) for full example.
+See [custom_diagnostics.rs](crates/piper-sdk/examples/custom_diagnostics.rs) for full example.
 
 ### 3. ReplayMode API
 
 Safely replay previously recorded sessions with driver-level protection:
 
 ```rust
-use piper_client::PiperBuilder;
+use piper_sdk::PiperBuilder;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 fn main() -> anyhow::Result<()> {
     // Connect to robot
-    let robot = PiperBuilder::new()
+    let connected = PiperBuilder::new()
         .socketcan("can0")
-        .build()?;
+        .build()?
+        .require_motion()?;
+    let robot = match connected {
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => robot,
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => robot,
+        MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+            anyhow::bail!("robot is not in confirmed Standby");
+        }
+    };
 
     // Enter ReplayMode (Driver TX thread pauses automatically)
     let replay = robot.enter_replay_mode()?;
@@ -433,7 +491,7 @@ fn main() -> anyhow::Result<()> {
 - **> 2.0x**: Use with caution - ensure safe environment
 - **Maximum**: 5.0x (hard limit for safety)
 
-See [examples/replay_mode.rs](examples/replay_mode.rs) for full example with speed validation.
+See [replay_mode.rs](crates/piper-sdk/examples/replay_mode.rs) for full example with speed validation.
 
 ### CLI Usage
 
@@ -450,20 +508,20 @@ piper-cli replay -i demo.bin
 piper-cli replay -i demo.bin --speed 2.0
 
 # Replay without confirmation prompt
-piper-cli replay -i demo.bin --confirm
+piper-cli replay -i demo.bin --yes
 ```
 
 ### Complete Workflow Example
 
 ```bash
 # Step 1: Record a session
-cargo run --example standard_recording
+cargo run -p piper-sdk --example standard_recording
 
 # Step 2: Analyze the recording
-cargo run --example custom_diagnostics
+cargo run -p piper-sdk --example custom_diagnostics
 
 # Step 3: Replay the recording safely
-cargo run --example replay_mode
+cargo run -p piper-sdk --example replay_mode
 ```
 
 ### Architecture Highlights
@@ -482,12 +540,12 @@ The ReplayMode API uses Rust's type system for compile-time safety:
 
 ```rust
 // ✅ Compile-time error: cannot enable in ReplayMode
-let replay = robot.enter_replay_mode()?;
+let replay = standby.enter_replay_mode()?;
 let active = replay.enable_position_mode(...);  // ERROR!
 
 // ✅ Must exit ReplayMode first
-let robot = replay.replay_recording(...)?;
-let active = robot.enable_position_mode(...);  // OK!
+let standby = replay.replay_recording(...)?;
+let active = standby.enable_position_mode(...)?;  // OK!
 ```
 
 #### Driver-Level Protection
@@ -498,7 +556,7 @@ ReplayMode switches the driver to `DriverMode::Replay`, which:
 - **Allows explicit frames**: Only replay frames are sent to CAN bus
 - **Prevents conflicts**: No dual control flow (Driver vs Replay)
 
-This design is documented in [architecture analysis](docs/architecture/piper-driver-client-mixing-analysis.md).
+This design is documented in [architecture analysis](docs/v0/architecture/piper-driver-client-mixing-analysis.md).
 
 ### Advanced Usage (Driver API)
 
@@ -617,18 +675,31 @@ Adopts **asynchronous IO concepts but implemented with synchronous threads** (en
 
 ## 📚 Examples
 
-Check the `examples/` directory for more examples:
+Check the `crates/piper-sdk/examples/` directory for more examples:
 
-> **Note**: Example code is under development. See [examples/](examples/) directory for more examples.
+> **Note**: Example code is under development. See [crates/piper-sdk/examples/](crates/piper-sdk/examples/) for more examples.
 
 Available examples:
 - `state_api_demo.rs` - Simple state reading and printing
-- `realtime_control_demo.rs` - Real-time control with dual-threaded architecture
+- `realtime_control_demo.rs` - Driver scheduling / metrics demo (`--allow-raw-tx` only on an isolated bus)
 - `robot_monitor.rs` - Robot state monitoring
 - `timestamp_verification.rs` - Timestamp synchronization verification
 - `standard_recording.rs` - 📼 Standard recording API usage (record CAN frames to file)
 - `custom_diagnostics.rs` - 🔧 Custom diagnostics interface (real-time frame analysis)
 - `replay_mode.rs` - 🔄 ReplayMode API (safe CAN frame replay)
+- `bridge_test.rs` - Bridge debug / replay utility (Unix defaults to `/tmp/piper_bridge.sock`; non-Unix requires explicit `--endpoint`)
+- `bridge_latency_bench.rs` - Bridge latency benchmark (Unix defaults to `/tmp/piper_bridge.sock`; non-Unix requires explicit `--endpoint`)
+- `embedded_bridge_host.rs` - Controller-embedded bridge host (non-Unix requires explicit `--tcp-tls` and TLS material)
+- `position_control_demo.rs` - End-to-end position-mode motion flow (teaching example; uses fixed waits rather than production-grade motion completion confirmation)
+- `multi_threaded_demo.rs` - Sharing `Piper` across threads with explicit disable on shutdown
+- `dual_arm_bilateral_control.rs` - Dual-arm master/slave control example
+- `high_level_simple_move.rs` - Offline trajectory planning quickstart
+- `high_level_trajectory_demo.rs` - Trajectory planner analysis / reset demo
+- `high_level_pid_control.rs` - Offline PID controller demo
+- `high_level_gripper_control.rs` - Gripper API usage walkthrough
+- `frame_dump.rs` - Frame serialization / dump example
+- `iface_check.rs` - SocketCAN interface inspection utility
+- `gs_usb_direct_test.rs` - GS-USB direct enumeration / transport demo
 
 Planned examples:
 - `torque_control.rs` - Force control demonstration
@@ -644,15 +715,17 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## 📖 Documentation
 
-For detailed design documentation, see:
+Current runnable entry points are this README, the source tree, and [piper-sdk examples](crates/piper-sdk/examples/README.md).
+
+Historical design notes and migration records are archived under [`docs/v0/`](docs/v0/README.md). For detailed background material, see:
 - [Architecture Design Document](docs/v0/TDD.md)
 - [Protocol Document](docs/v0/protocol.md)
 - [Real-time Configuration Guide](docs/v0/realtime_configuration.md)
 - [Real-time Optimization Guide](docs/v0/realtime_optimization.md)
 - [Migration Guide](docs/v0/MIGRATION_GUIDE.md) - Guide for migrating from v0.1.x to v0.2.0+
 - [Position Control & MOVE Mode User Guide](docs/v0/position_control_user_guide.md) - Complete guide for position control and motion types
-- **[Hooks System Code Review](docs/architecture/code-review-v1.2.1-hooks-system.md)** - Deep dive into the recording system design
-- **[Full Repository Code Review](docs/architecture/code-review-full-repo-v1.2.1.md)** - Comprehensive codebase analysis
+- **[Hooks System Code Review](docs/v0/architecture/code-review-v1.2.1-hooks-system.md)** - Deep dive into the recording system design
+- **[Full Repository Code Review](docs/v0/architecture/code-review-full-repo-v1.2.1.md)** - Comprehensive codebase analysis
 
 ## 🔗 Related Links
 

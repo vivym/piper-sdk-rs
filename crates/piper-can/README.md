@@ -437,7 +437,7 @@ sudo udevadm trigger
 
 - [架构概述](../../docs/v0/README.md)（CLAUDE.md）
 - [GS-USB 实现对比](../../docs/v0/gs_usb/gs_usb_implementation_comparison.md)
-- [硬件时间戳实现](../../docs/v0/gs_usb/hardware_timestamp_implementation_plan.md)
+- [GS-USB 启动与时间戳分析](../../docs/v0/gs_usb/detailed_gs_usb_startup_and_api_analysis.md)
 - [Position Control 用户指南](../../docs/v0/position_control_user_guide.md)
 
 ## License

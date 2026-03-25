@@ -443,61 +443,6 @@ impl RxAdapter for SocketCanRxAdapter {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use piper_protocol::ids::{
-        ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, driver_rx_robot_feedback_ids,
-    };
-
-    #[test]
-    fn test_classify_startup_probe_frame_accepts_hardware_timestamped_robot_feedback() {
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-        assert_eq!(
-            classify_startup_probe_frame(&frame, TimestampSource::Hardware),
-            Some(BackendCapability::StrictRealtime)
-        );
-    }
-
-    #[test]
-    fn test_classify_startup_probe_frame_accepts_software_timestamped_robot_feedback() {
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_34 as u16, &[0; 8]);
-        assert_eq!(
-            classify_startup_probe_frame(&frame, TimestampSource::Software),
-            Some(BackendCapability::SoftRealtime)
-        );
-    }
-
-    #[test]
-    fn test_classify_startup_probe_frame_rejects_noise_and_missing_timestamps() {
-        let robot_frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-        let noise_frame = PiperFrame::new_standard(0x7FF, &[0; 8]);
-
-        assert_eq!(
-            classify_startup_probe_frame(&robot_frame, TimestampSource::None),
-            None
-        );
-        assert_eq!(
-            classify_startup_probe_frame(&noise_frame, TimestampSource::Hardware),
-            None
-        );
-    }
-
-    #[test]
-    fn test_hardware_filter_ids_match_protocol_driver_feedback_surface() {
-        assert_eq!(hardware_filter_ids(), driver_rx_robot_feedback_ids());
-    }
-
-    #[test]
-    fn test_startup_probe_buffers_only_robot_feedback_frames() {
-        let robot_frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-        let noise_frame = PiperFrame::new_standard(0x7FF, &[0; 8]);
-
-        assert!(should_buffer_bootstrap_frame(&robot_frame));
-        assert!(!should_buffer_bootstrap_frame(&noise_frame));
-    }
-}
-
 impl SocketCanRxAdapter {
     /// 从 CMSG 中提取时间戳（与 SocketCanAdapter 一致）
     ///
@@ -826,5 +771,60 @@ impl Drop for SocketCanTxAdapter {
             self.socket.as_raw_fd()
         );
         // SocketCAN socket 会自动关闭，无需额外操作
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use piper_protocol::ids::{
+        ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, driver_rx_robot_feedback_ids,
+    };
+
+    #[test]
+    fn test_classify_startup_probe_frame_accepts_hardware_timestamped_robot_feedback() {
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
+        assert_eq!(
+            classify_startup_probe_frame(&frame, TimestampSource::Hardware),
+            Some(BackendCapability::StrictRealtime)
+        );
+    }
+
+    #[test]
+    fn test_classify_startup_probe_frame_accepts_software_timestamped_robot_feedback() {
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_34 as u16, &[0; 8]);
+        assert_eq!(
+            classify_startup_probe_frame(&frame, TimestampSource::Software),
+            Some(BackendCapability::SoftRealtime)
+        );
+    }
+
+    #[test]
+    fn test_classify_startup_probe_frame_rejects_noise_and_missing_timestamps() {
+        let robot_frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
+        let noise_frame = PiperFrame::new_standard(0x7FF, &[0; 8]);
+
+        assert_eq!(
+            classify_startup_probe_frame(&robot_frame, TimestampSource::None),
+            None
+        );
+        assert_eq!(
+            classify_startup_probe_frame(&noise_frame, TimestampSource::Hardware),
+            None
+        );
+    }
+
+    #[test]
+    fn test_hardware_filter_ids_match_protocol_driver_feedback_surface() {
+        assert_eq!(hardware_filter_ids(), driver_rx_robot_feedback_ids());
+    }
+
+    #[test]
+    fn test_startup_probe_buffers_only_robot_feedback_frames() {
+        let robot_frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
+        let noise_frame = PiperFrame::new_standard(0x7FF, &[0; 8]);
+
+        assert!(should_buffer_bootstrap_frame(&robot_frame));
+        assert!(!should_buffer_bootstrap_frame(&noise_frame));
     }
 }

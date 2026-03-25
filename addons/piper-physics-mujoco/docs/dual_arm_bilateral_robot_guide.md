@@ -331,7 +331,7 @@ just clippy-physics
 Non-physics dual-arm baseline:
 
 ```bash
-cargo run --example dual_arm_bilateral_control -- \
+cargo run -p piper-sdk --example dual_arm_bilateral_control -- \
   --left-interface can0 \
   --right-interface can1 \
   --mode master-follower

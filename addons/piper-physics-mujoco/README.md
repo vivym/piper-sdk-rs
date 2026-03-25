@@ -36,7 +36,7 @@ cargo add piper-physics
 cargo build
 
 # Run your application - no manual configuration needed!
-cargo run --example gravity_compensation_mujoco
+cargo run --manifest-path addons/piper-physics-mujoco/Cargo.toml --example gravity_compensation_mujoco
 ```
 
 That's it! **No manual environment variables or setup scripts needed** - the executable automatically finds MuJoCo through embedded RPATH (Linux/macOS) or DLL copying (Windows).
@@ -216,10 +216,10 @@ MuJoCo will be automatically downloaded and configured on the first build (see Q
 
 ```bash
 # Run gravity compensation example
-cargo run --example gravity_compensation_mujoco
+cargo run --manifest-path addons/piper-physics-mujoco/Cargo.toml --example gravity_compensation_mujoco
 
 # Run real robot control example
-cargo run --example gravity_compensation_robot -- can0
+cargo run --manifest-path addons/piper-physics-mujoco/Cargo.toml --example gravity_compensation_robot -- can0
 
 # Run dual-arm bilateral MuJoCo example
 cargo run --manifest-path addons/piper-physics-mujoco/Cargo.toml --example dual_arm_bilateral_mujoco -- \

@@ -22,25 +22,25 @@ cargo test --lib
 cargo test --doc
 
 # Hardware tests (GS-USB device required, MUST run serially)
-cargo test --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1
-cargo test --test gs_usb_integration_tests -- --ignored --test-threads=1
-cargo test --test gs_usb_performance_tests -- --ignored --test-threads=1
+cargo test -p piper-sdk --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1
+cargo test -p piper-sdk --test gs_usb_integration_tests -- --ignored --test-threads=1
+cargo test -p piper-sdk --test gs_usb_performance_tests -- --ignored --test-threads=1
 
 # Debug tools
-cargo test --test gs_usb_debug_scan -- --ignored --nocapture
+cargo test -p piper-sdk --test gs_usb_debug_scan -- --ignored --nocapture
 ./scripts/run_realtime_acceptance.sh gs-usb-soft
 ```
 
 ### Running Examples
 ```bash
-cargo run --example state_api_demo            # One-shot state API demo
-cargo run --example robot_monitor             # Real-time monitoring tool
-cargo run --example timestamp_verification    # Verify SocketCAN hardware timestamps
+cargo run -p piper-sdk --example state_api_demo            # One-shot state API demo
+cargo run -p piper-sdk --example robot_monitor             # Real-time monitoring tool
+cargo run -p piper-sdk --example timestamp_verification    # Verify SocketCAN hardware timestamps
 ```
 
 ### Running Bridge Host
 ```bash
-cargo run --example embedded_bridge_host      # Run the controller-embedded bridge host
+cargo run -p piper-sdk --example embedded_bridge_host      # Run the controller-embedded bridge host
 ```
 
 ## Architecture Overview

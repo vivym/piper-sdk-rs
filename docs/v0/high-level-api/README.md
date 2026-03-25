@@ -1,5 +1,7 @@
 # Piper Rust SDK 高层 API 文档索引
 
+> **归档说明**: 本目录属于 `docs/v0` 历史设计文档。文中的进度、状态和部分 API 片段不再代表 2026-03-24 的当前实现。当前入口请优先参考 [顶层 README](../../../README.md) 和 [piper-sdk examples](../../../crates/piper-sdk/examples/README.md)。
+
 **创建日期**: 2026-01-23
 **当前状态**: Phase 4 完成 ✅
 **总体进度**: 83% (5/6 phases)

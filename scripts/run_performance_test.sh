@@ -13,7 +13,7 @@ if [ ! -S "/tmp/piper_bridge.sock" ]; then
     echo "❌ Bridge host 未运行或 socket 文件不存在"
     echo ""
     echo "请先启动 embedded bridge host:"
-    echo "  cargo run --example embedded_bridge_host"
+    echo "  cargo run -p piper-sdk --example embedded_bridge_host"
     echo ""
     exit 1
 fi
@@ -25,7 +25,7 @@ echo ""
 echo "开始运行性能测试..."
 echo ""
 
-cargo run --example bridge_latency_bench
+cargo run -p piper-sdk --example bridge_latency_bench
 
 echo ""
 echo "=========================================="

@@ -1,5 +1,7 @@
 # Piper SDK Workspace 重构文档
 
+> **归档说明**: 这是 workspace 重构阶段的历史分析文档。当前 workspace 已经落地，本文中的“待迁移/待实施”描述主要用于追溯背景，不应视为当前状态说明。
+
 本目录包含将 piper-sdk-rs 重构为 Cargo workspace 的完整分析和规划文档。
 
 ## 📚 文档目录
@@ -439,7 +441,7 @@ socketcan = { workspace = true, optional = true }  # ✅ 添加 optional
 - [Bevy Workspace](https://github.com/bevyengine/bevy) (参考实现)
 
 ### 本项目文档
-- [Pipeline 设计](../pipeline_design.md)
+- [架构设计文档](../TDD.md)
 - [Position Control 用户指南](../position_control_user_guide.md)
 
 ---

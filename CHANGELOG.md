@@ -107,7 +107,8 @@ let (robot, stats) = robot.stop_recording(handle)?;
 
 // API 2: Custom Diagnostics (advanced)
 let diag = active.diagnostics();
-diag.register_callback(custom_hook)?;
+let hook_handle = diag.register_callback(custom_hook)?;
+let _ = hook_handle;
 
 // API 3: ReplayMode (safe replay)
 let replay = robot.enter_replay_mode()?;

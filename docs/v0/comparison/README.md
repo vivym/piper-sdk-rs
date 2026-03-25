@@ -1,5 +1,7 @@
 # Piper SDK 对比分析
 
+> **归档说明**: 本目录以对比研究和设计推演为主，部分结论基于早期 API/实现状态，不应直接视为当前 public API 行为说明。
+
 本目录包含与另一个团队 Piper SDK 的详细对比分析。
 
 ## 文档索引
@@ -144,6 +146,6 @@
 
 ## 相关文档
 
-- [架构设计文档](../architecture.md)
+- [架构设计文档](../TDD.md)
 - [位置控制用户指南](../position_control_user_guide.md)
 - [死代码分析报告](../dead_code_analysis_report.md)

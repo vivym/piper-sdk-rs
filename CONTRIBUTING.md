@@ -183,7 +183,7 @@ fn test_hardware_feature() {
 运行硬件测试：
 
 ```bash
-cargo test --test <test_name> -- --ignored --test-threads=1
+cargo test -p piper-sdk --test <test_name> -- --ignored --test-threads=1
 ```
 
 ### 测试覆盖率
@@ -369,16 +369,16 @@ fn process_single_frame(&self, frame: Frame) {
 
 ```bash
 # 默认级别
-cargo run --example your_example
+cargo run -p piper-sdk --example your_example
 
 # 启用调试日志
-RUST_LOG=debug cargo run --example your_example
+RUST_LOG=debug cargo run -p piper-sdk --example your_example
 
 # 启用特定模块的 trace 日志（谨慎使用！）
-RUST_LOG=piper_sdk=trace cargo run --example your_example
+RUST_LOG=piper_sdk=trace cargo run -p piper-sdk --example your_example
 
 # 多模块组合
-RUST_LOG=piper_sdk=debug,piper_driver=warn cargo run --example your_example
+RUST_LOG=piper_sdk=debug,piper_driver=warn cargo run -p piper-sdk --example your_example
 ```
 
 #### 兼容旧 `log` crate

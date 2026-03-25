@@ -104,7 +104,7 @@ kinematics = []  # Analytical RNE (no external deps)
 
 The `mujoco` feature is **currently broken** due to breaking API changes in `mujoco-rs` 2.3.
 - Use the `kinematics` feature for basic functionality
-- See [analysis report](docs/v0/piper-physics/MUJOCO_COMPILATION_ERRORS_ANALYSIS.md) for details
+- See [analysis report](./MUJOCO_COMPILATION_ERRORS_ANALYSIS.md) for details
 - Track progress in [Issue #XXX](https://github.com/xxx/issues/XXX)
 
 **Workaround**: The `kinematics` feature provides basic gravity compensation (returns zeros pending RNE implementation).
@@ -162,8 +162,8 @@ const XML: &str = include_str!("../assets/piper_no_gripper.xml");
 ## 📚 相关文档
 
 - [详细分析报告](./MUJOCO_COMPILATION_ERRORS_ANALYSIS.md) - 完整的技术分析
-- [GRAVITY_COMPARISON_ANALYSIS_REVISED.md](../GRAVITY_COMPARISON_ANALYSIS_REVISED.md) - 物理实现对比
-- [README.md](../README.md) - piper-physics 用户指南
+- [GRAVITY_COMPARISON_ANALYSIS_REVISED.md](./GRAVITY_COMPARISON_ANALYSIS_REVISED.md) - 物理实现对比
+- [Addon README](../../../addons/piper-physics-mujoco/README.md) - 当前 piper-physics 使用指南
 
 ---
 

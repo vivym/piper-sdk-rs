@@ -26,7 +26,7 @@
   - **Windows/macOS**: 基于 `rusb` 实现用户态 GS-USB 驱动（免驱动/通用）
 - 🎬 **异步 CAN 帧录制**：
   - **非阻塞钩子**：使用 `try_send` 实现 <1μs 帧开销
-  - **有界队列**：10,000 帧容量，防止 1kHz 时 OOM
+  - **有界队列**：100,000 帧容量，约支持 1kHz 下 1.6 分钟 / 500Hz 下 3.3 分钟突发缓冲
   - **硬件时间戳**：直接使用内核/驱动中断时间戳
   - **TX 安全**：仅在成功 `send()` 后录制帧
   - **丢帧监控**：内置 `dropped_frames` 计数器
@@ -149,8 +149,9 @@ cargo run -p piper-sdk --example frame_dump --features serde
 - 将 CAN 帧录制到 JSON
 - 保存/加载帧数据
 - 调试 CAN 总线通信
+- 使用中性的示例 ID，而不是机器人协议流量
 
-详见 [examples/frame_dump.rs](../crates/piper-sdk/examples/frame_dump.rs)。
+详见 [crates/piper-sdk/examples/frame_dump.rs](crates/piper-sdk/examples/frame_dump.rs)。
 
 ### 平台特定特性
 
@@ -192,15 +193,28 @@ piper-tools = "0.1"
 
 ```rust
 use piper_sdk::prelude::*;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 在 Linux 上显式使用 SocketCAN 连接。
     // macOS/Windows 请改用 `.gs_usb_auto()` 或 `.gs_usb_serial(...)`。
-    let robot = PiperBuilder::new()
+    let connected = PiperBuilder::new()
         .socketcan("can0")
         .baud_rate(1_000_000)
-        .build()?;
-    let robot = robot.enable_position_mode(PositionModeConfig::default())?;
+        .build()?
+        .require_motion()?;
+    let robot = match connected {
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => {
+            robot.enable_position_mode(PositionModeConfig::default())?
+        }
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => {
+            robot.enable_position_mode(PositionModeConfig::default())?
+        }
+        MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+            return Err("robot is not in confirmed Standby".into());
+        }
+    };
 
     // 获取观察器用于读取状态
     let observer = robot.observer();
@@ -226,7 +240,7 @@ use piper_driver::recording::AsyncRecordingHook;
 use piper_driver::hooks::FrameCallback;
 use piper_sdk::prelude::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
@@ -245,7 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 在驱动层注册钩子
     // （注意：这是高级用法 - 参见驱动 API 文档）
-    robot.context.hooks.write()?.add_callback(callback);
+    let hook_handle = robot.hooks().write()?.add_callback(callback);
 
     // 启动录制线程
     let handle = thread::spawn(move || {
@@ -265,6 +279,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dropped = dropped_counter.load(Ordering::Relaxed);
     println!("丢帧数: {}", dropped);
 
+    // 移除钩子，让接收线程能够正常退出
+    let _removed = robot.hooks().write()?.remove_callback(hook_handle);
     handle.join().ok();
     Ok(())
 }
@@ -272,7 +288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **核心特性**：
 - ✅ **非阻塞**：每帧开销 `<1μs`
-- ✅ **OOM 安全**：有界队列（1kHz 时 10,000 帧 = 10s 缓冲）
+- ✅ **OOM 安全**：有界队列（100,000 帧 ≈ 1kHz 下 1.6 分钟 / 500Hz 下 3.3 分钟）
 - ✅ **硬件时间戳**：来自内核/驱动的微秒级精度
 - ✅ **TX 安全**：仅录制成功发送的帧
 - ✅ **丢失跟踪**：内置 `dropped_frames` 计数器
@@ -292,36 +308,47 @@ Piper SDK 提供三个互补的 API 用于 CAN 帧录制和回放：
 将 CAN 帧录制到文件的最简单方式：
 
 ```rust
-use piper_client::{PiperBuilder, recording::{RecordingConfig, RecordingMetadata, StopCondition}};
+use piper_sdk::{
+    ConnectedPiper,
+    PiperBuilder,
+    RecordingConfig,
+    RecordingMetadata,
+    StopCondition,
+    client::state::{CapabilityMarker, Piper, Standby},
+};
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // 连接到机器人
-    let robot = PiperBuilder::new()
-        .socketcan("can0")
-        .build()?;
-
-    // 启动录制（带元数据）
+async fn run_recording<C: CapabilityMarker>(
+    robot: Piper<Standby, C>,
+) -> anyhow::Result<()> {
     let (robot, handle) = robot.start_recording(RecordingConfig {
         output_path: "demo_recording.bin".into(),
-        stop_condition: StopCondition::Duration(10), // 录制 10 秒
+        stop_condition: StopCondition::Duration(10),
         metadata: RecordingMetadata {
             notes: "标准录制示例".to_string(),
             operator: "DemoUser".to_string(),
         },
     })?;
 
-    // 执行操作（所有 CAN 帧都会被录制）
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // 停止录制并获取统计信息
-    let (robot, stats) = robot.stop_recording(handle)?;
-
+    let (_robot, stats) = robot.stop_recording(handle)?;
     println!("录制了 {} 帧，耗时 {:.2} 秒", stats.frame_count, stats.duration.as_secs_f64());
     println!("丢帧数: {}", stats.dropped_frames);
-
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let connected = PiperBuilder::new()
+        .socketcan("can0")
+        .build()?;
+
+    match connected {
+        ConnectedPiper::Strict(state) => run_recording(state.require_standby()?).await,
+        ConnectedPiper::Soft(state) => run_recording(state.require_standby()?).await,
+        ConnectedPiper::Monitor(standby) => run_recording(standby).await,
+    }
 }
 ```
 
@@ -331,43 +358,48 @@ async fn main() -> anyhow::Result<()> {
 - ✅ **统计信息**：帧数、时长、丢帧数
 - ✅ **类型安全**：录制句柄防止误用
 
-完整示例参见 [examples/standard_recording.rs](examples/standard_recording.rs)
+完整示例参见 [crates/piper-sdk/examples/standard_recording.rs](crates/piper-sdk/examples/standard_recording.rs)
 
 ### 2. 自定义诊断 API
 
 高级用户可以注册自定义帧回调进行实时分析：
 
 ```rust
-use piper_client::PiperBuilder;
+use piper_sdk::PiperBuilder;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 use piper_driver::recording::AsyncRecordingHook;
 use std::sync::Arc;
 use std::thread;
 
 fn main() -> anyhow::Result<()> {
-    // 连接并使能机器人
-    let robot = PiperBuilder::new()
+    let connected = PiperBuilder::new()
         .socketcan("can0")
-        .build()?;
-    let active = robot.enable_position_mode(Default::default())?;
+        .build()?
+        .require_motion()?;
+    let active = match connected {
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => {
+            robot.enable_position_mode(Default::default())?
+        }
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => {
+            robot.enable_position_mode(Default::default())?
+        }
+        MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+            anyhow::bail!("robot is not in confirmed Standby");
+        }
+    };
 
-    // 获取诊断接口
     let diag = active.diagnostics();
-
-    // 创建自定义录制钩子
     let (hook, rx) = AsyncRecordingHook::new();
     let dropped_counter = hook.dropped_frames().clone();
 
-    // 注册钩子
     let callback = Arc::new(hook) as Arc<dyn piper_driver::FrameCallback>;
-    diag.register_callback(callback)?;
+    let hook_handle = diag.register_callback(callback)?;
 
-    // 在后台线程处理帧
     thread::spawn(move || {
         let mut frame_count = 0;
         while let Ok(frame) = rx.recv() {
             frame_count += 1;
-
-            // 自定义分析：例如 CAN ID 分布、时序分析
             if frame_count % 1000 == 0 {
                 println!("收到帧: ID=0x{:03X}", frame.id);
             }
@@ -377,12 +409,10 @@ fn main() -> anyhow::Result<()> {
         println!("丢帧: {}", dropped_counter.load(std::sync::atomic::Ordering::Relaxed));
     });
 
-    // 执行操作...
     thread::sleep(std::time::Duration::from_secs(5));
-
-    // 关闭
+    let _removed = diag.unregister_callback(hook_handle)?;
     let _standby = active.shutdown()?;
-
+    let _summary = handle.join();
     Ok(())
 }
 ```
@@ -390,33 +420,36 @@ fn main() -> anyhow::Result<()> {
 **核心特性**：
 - ✅ **实时处理**：帧到达时即时分析
 - ✅ **自定义逻辑**：实现任何分析算法
-- ✅ **后台线程**：主线程不阻塞
+- ✅ **后台线程**：分析逻辑不阻塞 RX 线程，关闭时会确定性等待后台线程退出
 - ✅ **丢失跟踪**：监控丢帧数
 
-完整示例参见 [examples/custom_diagnostics.rs](examples/custom_diagnostics.rs)
+完整示例参见 [crates/piper-sdk/examples/custom_diagnostics.rs](crates/piper-sdk/examples/custom_diagnostics.rs)
 
 ### 3. 回放模式 API
 
 使用驱动层保护安全地回放预先录制的会话：
 
 ```rust
-use piper_client::PiperBuilder;
+use piper_sdk::PiperBuilder;
+use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
 
 fn main() -> anyhow::Result<()> {
-    // 连接到机器人
-    let robot = PiperBuilder::new()
+    let connected = PiperBuilder::new()
         .socketcan("can0")
-        .build()?;
+        .build()?
+        .require_motion()?;
+    let robot = match connected {
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => robot,
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => robot,
+        MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+            anyhow::bail!("robot is not in confirmed Standby");
+        }
+    };
 
-    // 进入回放模式（驱动 TX 线程自动暂停）
     let replay = robot.enter_replay_mode()?;
-
-    // 以 2.0x 速度回放录制
-    let robot = replay.replay_recording("demo_recording.bin", 2.0)?;
-
-    // 自动退出回放模式（TX 线程恢复）
+    let _standby = replay.replay_recording("demo_recording.bin", 2.0)?;
     println!("回放完成！");
-
     Ok(())
 }
 ```
@@ -433,7 +466,7 @@ fn main() -> anyhow::Result<()> {
 - **> 2.0x**：谨慎使用 - 确保安全环境
 - **最大值**：5.0x（安全硬限制）
 
-完整示例参见 [examples/replay_mode.rs](examples/replay_mode.rs)
+完整示例参见 [crates/piper-sdk/examples/replay_mode.rs](crates/piper-sdk/examples/replay_mode.rs)
 
 ### CLI 使用
 
@@ -450,20 +483,20 @@ piper-cli replay -i demo.bin
 piper-cli replay -i demo.bin --speed 2.0
 
 # 回放时跳过确认提示
-piper-cli replay -i demo.bin --confirm
+piper-cli replay -i demo.bin --yes
 ```
 
 ### 完整工作流示例
 
 ```bash
 # 步骤 1: 录制会话
-cargo run --example standard_recording
+cargo run -p piper-sdk --example standard_recording
 
 # 步骤 2: 分析录制
-cargo run --example custom_diagnostics
+cargo run -p piper-sdk --example custom_diagnostics
 
 # 步骤 3: 安全回放录制
-cargo run --example replay_mode
+cargo run -p piper-sdk --example replay_mode
 ```
 
 ### 架构亮点
@@ -482,12 +515,12 @@ ReplayMode API 使用 Rust 类型系统实现编译期安全：
 
 ```rust
 // ✅ 编译期错误：在回放模式下无法使能
-let replay = robot.enter_replay_mode()?;
+let replay = standby.enter_replay_mode()?;
 let active = replay.enable_position_mode(...);  // 错误！
 
 // ✅ 必须先退出回放模式
-let robot = replay.replay_recording(...)?;
-let active = robot.enable_position_mode(...);  // OK!
+let standby = replay.replay_recording(...)?;
+let active = standby.enable_position_mode(...)?;  // OK!
 ```
 
 #### 驱动层保护
@@ -498,7 +531,7 @@ ReplayMode 将驱动切换到 `DriverMode::Replay`，从而：
 - **允许显式帧**：只有回放帧被发送到 CAN 总线
 - **防止冲突**：无双控制流（驱动 vs 回放）
 
-此设计记录在[架构分析](docs/architecture/piper-driver-client-mixing-analysis.md)中。
+此设计记录在[架构分析](docs/v0/architecture/piper-driver-client-mixing-analysis.md)中。
 
 ### 高级使用（驱动层 API）
 
@@ -617,18 +650,31 @@ piper-sdk-rs/
 
 ## 📚 示例
 
-查看 `examples/` 目录了解更多示例：
+查看 `crates/piper-sdk/examples/` 目录了解更多示例：
 
-> **注意**：示例代码正在开发中。更多示例请查看 [examples/](examples/) 目录。
+> **注意**：示例代码正在开发中。更多示例请查看 [crates/piper-sdk/examples/](crates/piper-sdk/examples/) 目录。
 
 可用示例：
 - `state_api_demo.rs` - 简单的状态读取和打印
-- `realtime_control_demo.rs` - 实时控制演示（双线程架构）
+- `realtime_control_demo.rs` - 驱动调度 / 指标演示（`--allow-raw-tx` 仅限隔离总线）
 - `robot_monitor.rs` - 机器人状态监控
 - `timestamp_verification.rs` - 时间戳同步验证
 - `standard_recording.rs` - 📼 标准录制 API 使用（录制 CAN 帧到文件）
 - `custom_diagnostics.rs` - 🔧 自定义诊断接口（实时帧分析）
 - `replay_mode.rs` - 🔄 回放模式 API（安全 CAN 帧回放）
+- `bridge_test.rs` - bridge 调试 / 回放工具（Unix 默认 `/tmp/piper_bridge.sock`；非 Unix 需显式 `--endpoint`）
+- `bridge_latency_bench.rs` - bridge 链路延迟基准（Unix 默认 `/tmp/piper_bridge.sock`；非 Unix 需显式 `--endpoint`）
+- `embedded_bridge_host.rs` - 控制进程内嵌 bridge host（非 Unix 必须显式传 `--tcp-tls` 和 TLS 材料）
+- `position_control_demo.rs` - 位置模式完整运动流程（教学示例，使用固定等待而非生产级到位确认）
+- `multi_threaded_demo.rs` - 多线程共享 `Piper` 并显式失能
+- `dual_arm_bilateral_control.rs` - 双臂主从 / 镜像控制示例
+- `high_level_simple_move.rs` - 离线轨迹规划快速入门
+- `high_level_trajectory_demo.rs` - 轨迹规划器分析 / reset 演示
+- `high_level_pid_control.rs` - 离线 PID 控制器示例
+- `high_level_gripper_control.rs` - 夹爪 API 用法讲解
+- `frame_dump.rs` - 帧序列化 / 转储示例
+- `iface_check.rs` - SocketCAN 接口检查工具
+- `gs_usb_direct_test.rs` - GS-USB 直连枚举 / 收发调试示例
 
 计划中的示例：
 - `torque_control.rs` - 力控演示
@@ -644,15 +690,17 @@ piper-sdk-rs/
 
 ## 📖 文档
 
-详细的设计文档请参阅：
+当前可执行的入口请优先参考本 README、源码，以及 [piper-sdk examples](crates/piper-sdk/examples/README.md)。
+
+历史设计文档和迁移记录归档在 [`docs/v0/`](docs/v0/README.md) 下。详细背景资料请参阅：
 - [架构设计文档](docs/v0/TDD.md)
 - [协议文档](docs/v0/protocol.md)
 - [实时配置指南](docs/v0/realtime_configuration.md)
 - [实时优化指南](docs/v0/realtime_optimization.md)
 - [迁移指南](docs/v0/MIGRATION_GUIDE.md) - 从 v0.1.x 迁移到 v0.2.0+ 的指南
 - [位置控制与 MOVE 模式用户指南](docs/v0/position_control_user_guide.md) - 位置控制和运动类型完整指南
-- **[钩子系统代码审查](docs/architecture/code-review-v1.2.1-hooks-system.md)** - 录制系统设计深度剖析
-- **[全仓库代码审查](docs/architecture/code-review-full-repo-v1.2.1.md)** - 代码库综合分析
+- **[钩子系统代码审查](docs/v0/architecture/code-review-v1.2.1-hooks-system.md)** - 录制系统设计深度剖析
+- **[全仓库代码审查](docs/v0/architecture/code-review-full-repo-v1.2.1.md)** - 代码库综合分析
 
 ## 🔗 相关链接
 
