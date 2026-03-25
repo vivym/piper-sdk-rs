@@ -73,6 +73,14 @@ fn drain_recorded_frames(
     }
 }
 
+fn ensure_callback_removed(removed: bool) -> Result<()> {
+    if removed {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("diagnostics callback was already absent"))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -158,7 +166,8 @@ where
 
     println!("🧹 注销诊断回调...");
     let removed = diag.unregister_callback(hook_handle)?;
-    println!("✅ 回调已注销: {}", removed);
+    ensure_callback_removed(removed)?;
+    println!("✅ 回调已注销");
 
     println!("⏳ 优雅关闭...");
     let _standby = active.shutdown()?;
@@ -191,6 +200,19 @@ mod tests {
     use crossbeam_channel::bounded;
     use piper_sdk::driver::TimestampedFrame;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn ensure_callback_removed_accepts_true() {
+        ensure_callback_removed(true).expect("true should mean the callback was detached");
+    }
+
+    #[test]
+    fn ensure_callback_removed_rejects_false() {
+        let error = ensure_callback_removed(false)
+            .expect_err("false should not be reported as a successful unregister");
+
+        assert!(error.to_string().contains("diagnostics callback was already absent"));
+    }
 
     #[test]
     fn drain_recorded_frames_reports_summary_after_channel_closes() {

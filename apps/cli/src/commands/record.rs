@@ -43,6 +43,27 @@ pub struct RecordCommand {
     pub force: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordRunOutcome {
+    Completed,
+    StoppedByCondition,
+    InterruptedByUser,
+}
+
+fn classify_recording_outcome(
+    still_running: bool,
+    stop_requested: bool,
+    _duration_elapsed: bool,
+) -> RecordRunOutcome {
+    if !still_running {
+        RecordRunOutcome::InterruptedByUser
+    } else if stop_requested {
+        RecordRunOutcome::StoppedByCondition
+    } else {
+        RecordRunOutcome::Completed
+    }
+}
+
 impl RecordCommand {
     fn effective_stop_condition(duration: u64, stop_on_id: Option<u32>) -> StopCondition {
         if let Some(id) = stop_on_id {
@@ -179,7 +200,7 @@ impl RecordCommand {
         });
 
         let result: Result<
-            Result<piper_sdk::RecordingStats, anyhow::Error>,
+            Result<(piper_sdk::RecordingStats, RecordRunOutcome), anyhow::Error>,
             tokio::task::JoinError,
         > = task.await;
 
@@ -187,9 +208,17 @@ impl RecordCommand {
 
         match result {
             Ok(inner_result) => match inner_result {
-                Ok(stats) => {
+                Ok((stats, outcome)) => {
                     println!();
-                    println!("✅ 录制完成");
+                    match outcome {
+                        RecordRunOutcome::Completed => println!("✅ 录制完成"),
+                        RecordRunOutcome::StoppedByCondition => {
+                            println!("✅ 录制已按停止条件结束");
+                        },
+                        RecordRunOutcome::InterruptedByUser => {
+                            println!("⚠️  录制被用户中断");
+                        },
+                    }
                     println!("   📊 帧数: {}", stats.frame_count);
                     println!("   ⏱️  时长: {:.2}s", stats.duration.as_secs_f64());
                     println!("   ⚠️ 丢帧: {}", stats.dropped_frames);
@@ -223,7 +252,7 @@ impl RecordCommand {
         target_spec: TargetSpec,
         stop_on_id: Option<u32>,
         running: Arc<AtomicBool>,
-    ) -> Result<piper_sdk::RecordingStats> {
+    ) -> Result<(piper_sdk::RecordingStats, RecordRunOutcome)> {
         // === 1. 连接到机器人 ===
 
         println!("⏳ 连接到机器人...");
@@ -293,7 +322,7 @@ impl RecordCommand {
         config: RecordingConfig,
         duration: u64,
         running: Arc<AtomicBool>,
-    ) -> Result<piper_sdk::RecordingStats>
+    ) -> Result<(piper_sdk::RecordingStats, RecordRunOutcome)>
     where
         Capability: CapabilityMarker,
     {
@@ -314,9 +343,9 @@ impl RecordCommand {
 
         // === 6. 然后再处理循环的错误（如果有） ===
 
-        loop_result?;
+        let outcome = loop_result?;
 
-        Ok(stats)
+        Ok((stats, outcome))
     }
 
     /// 录制循环（独立函数，错误不会影响数据保存）🛡️
@@ -331,7 +360,7 @@ impl RecordCommand {
         handle: &piper_sdk::RecordingHandle,
         running: &Arc<AtomicBool>,
         duration: u64,
-    ) -> Result<()> {
+    ) -> Result<RecordRunOutcome> {
         let start = Instant::now();
         let timeout = if duration > 0 {
             Some(Duration::from_secs(duration))
@@ -346,14 +375,14 @@ impl RecordCommand {
             if matches!(timeout, Some(duration) if start.elapsed() >= duration) {
                 println!();
                 println!("⏳ 录制时长已到");
-                break;
+                return Ok(classify_recording_outcome(true, false, true));
             }
 
             // 2. ✅ 检查 OnCanId 停止条件（Driver 层检测到触发帧）
             if handle.is_stop_requested() {
                 println!();
                 println!("🛑 检测到停止触发帧");
-                break;
+                return Ok(classify_recording_outcome(true, true, false));
             }
 
             // 3. ⚡ 短暂休眠（提升 Ctrl-C 响应速度）
@@ -384,7 +413,7 @@ impl RecordCommand {
             }
         }
 
-        Ok(())
+        Ok(classify_recording_outcome(false, false, false))
     }
 }
 
@@ -504,5 +533,29 @@ mod tests {
                 std::env::set_var("USERNAME", username);
             }
         }
+    }
+
+    #[test]
+    fn classify_recording_outcome_marks_user_stop_as_interrupted() {
+        assert_eq!(
+            classify_recording_outcome(false, false, false),
+            RecordRunOutcome::InterruptedByUser
+        );
+    }
+
+    #[test]
+    fn classify_recording_outcome_marks_stop_condition_as_condition_triggered() {
+        assert_eq!(
+            classify_recording_outcome(true, true, false),
+            RecordRunOutcome::StoppedByCondition
+        );
+    }
+
+    #[test]
+    fn classify_recording_outcome_marks_timeout_completion_as_completed() {
+        assert_eq!(
+            classify_recording_outcome(true, false, true),
+            RecordRunOutcome::Completed
+        );
     }
 }

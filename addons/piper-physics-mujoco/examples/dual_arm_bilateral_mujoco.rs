@@ -264,10 +264,12 @@ fn main() -> AppResult<()> {
         DualArmLoopExit::Standby { report, .. } => {
             println!("\ndual-arm loop exited cleanly to Standby.");
             print_report(&report);
+            exit_status_from_report(false, &report)?;
         },
         DualArmLoopExit::Faulted { report, .. } => {
             eprintln!("\ndual-arm loop entered Faulted after a bounded shutdown attempt.");
             print_report(&report);
+            exit_status_from_report(true, &report)?;
         },
     }
 
@@ -492,6 +494,29 @@ fn wait_for_enter(prompt: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn exit_status_from_report(faulted: bool, report: &BilateralRunReport) -> AppResult<()> {
+    if faulted {
+        if let Some(last_error) = &report.last_error {
+            Err(format!("dual-arm loop exited faulted: {last_error}").into())
+        } else {
+            Err("dual-arm loop exited faulted".into())
+        }
+    } else {
+        match report.exit_reason {
+            None
+            | Some(BilateralExitReason::Cancelled)
+            | Some(BilateralExitReason::MaxIterations) => Ok(()),
+            Some(other) => {
+                if let Some(last_error) = &report.last_error {
+                    Err(format!("dual-arm loop exited with {other:?}: {last_error}").into())
+                } else {
+                    Err(format!("dual-arm loop exited with {other:?}").into())
+                }
+            },
+        }
+    }
+}
+
 fn print_report(report: &BilateralRunReport) {
     println!("iterations: {}", report.iterations);
     println!("exit_reason: {:?}", report.exit_reason);
@@ -546,4 +571,48 @@ fn parse_vec3(value: &str) -> std::result::Result<[f64; 3], String> {
         .parse()
         .map_err(|error| format!("invalid z component: {error}"))?;
     Ok([x, y, z])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_status_from_report_accepts_cancelled_standby_exit() {
+        let report = BilateralRunReport {
+            exit_reason: Some(BilateralExitReason::Cancelled),
+            ..Default::default()
+        };
+
+        assert!(exit_status_from_report(false, &report).is_ok());
+    }
+
+    #[test]
+    fn exit_status_from_report_rejects_fault_like_standby_exit() {
+        let report = BilateralRunReport {
+            exit_reason: Some(BilateralExitReason::ReadFault),
+            last_error: Some("stale snapshot".to_string()),
+            ..Default::default()
+        };
+
+        let error = exit_status_from_report(false, &report)
+            .expect_err("fault-like standby exits should not be reported as clean");
+
+        assert!(error.to_string().contains("ReadFault"));
+        assert!(error.to_string().contains("stale snapshot"));
+    }
+
+    #[test]
+    fn exit_status_from_report_rejects_faulted_exit() {
+        let report = BilateralRunReport {
+            last_error: Some("tx fault".to_string()),
+            ..Default::default()
+        };
+
+        let error =
+            exit_status_from_report(true, &report).expect_err("faulted exits must return error");
+
+        assert!(error.to_string().contains("faulted"));
+        assert!(error.to_string().contains("tx fault"));
+    }
 }
