@@ -25,6 +25,9 @@ use crate::state::machine::ErrorState;
 use crate::state::{Active, DisableConfig, MitMode, MitModeConfig, Piper, Standby, StrictRealtime};
 use crate::types::{Joint, JointArray, NewtonMeter, Rad, Result, RobotError};
 
+const CALIBRATION_SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_millis(200);
+const CALIBRATION_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 /// 双臂构建器
 pub struct DualArmBuilder {
     left: PiperBuilder,
@@ -74,12 +77,48 @@ impl DualArmStandby {
         policy: DualArmReadPolicy,
     ) -> Result<DualArmCalibration> {
         map.validate()?;
-        let snapshot = self.observer().snapshot(policy)?;
+        let snapshot = wait_for_dual_arm_snapshot_ready(
+            CALIBRATION_SNAPSHOT_READY_TIMEOUT,
+            CALIBRATION_SNAPSHOT_POLL_INTERVAL,
+            || self.observer().snapshot(policy),
+        )?;
         Ok(DualArmCalibration {
             master_zero: snapshot.left.state.position,
             slave_zero: snapshot.right.state.position,
             map,
         })
+    }
+}
+
+fn wait_for_dual_arm_snapshot_ready<Read>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut read: Read,
+) -> Result<DualArmSnapshot>
+where
+    Read: FnMut() -> Result<DualArmSnapshot>,
+{
+    let start = Instant::now();
+
+    loop {
+        match read() {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(err @ RobotError::ControlStateIncomplete { .. })
+            | Err(err @ RobotError::StateMisaligned { .. }) => {
+                if start.elapsed() >= timeout {
+                    return Err(err);
+                }
+
+                let remaining = timeout.saturating_sub(start.elapsed());
+                let sleep_duration = poll_interval.min(remaining);
+                if sleep_duration.is_zero() {
+                    return Err(err);
+                }
+
+                std::thread::sleep(sleep_duration);
+            },
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -2952,6 +2991,37 @@ mod tests {
             .expect_err("strict calibration policy should reject the same feedback age");
 
         assert!(matches!(error, RobotError::FeedbackStale { .. }));
+    }
+
+    #[test]
+    fn test_wait_for_dual_arm_snapshot_ready_retries_incomplete_and_misaligned_states() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let snapshot = snapshot_with_state(
+            JointArray::splat(Rad(0.0)),
+            JointArray::splat(RadPerSecond(0.0)),
+            JointArray::splat(NewtonMeter::ZERO),
+        );
+
+        let waited = wait_for_dual_arm_snapshot_ready(
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let mut attempts = attempts.lock().unwrap();
+                    *attempts += 1;
+                    match *attempts {
+                        1 => Err(RobotError::control_state_incomplete(0b001, 0b11_1111)),
+                        2 => Err(RobotError::state_misaligned(6_000, 2_000)),
+                        _ => Ok(snapshot),
+                    }
+                }
+            },
+        )
+        .expect("helper should wait until a complete aligned snapshot becomes ready");
+
+        assert_eq!(waited, snapshot);
+        assert_eq!(*attempts.lock().unwrap(), 3);
     }
 
     #[test]
