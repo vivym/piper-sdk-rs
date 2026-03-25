@@ -13,16 +13,16 @@
 //! 使用方式：
 //! ```bash
 //! # Linux 平台：默认使用 can0（SocketCAN）
-//! cargo run --example robot_monitor
+//! cargo run -p piper-sdk --example robot_monitor
 //!
 //! # 非 Linux 平台：自动扫描 GS-USB 设备
-//! cargo run --example robot_monitor
+//! cargo run -p piper-sdk --example robot_monitor
 //!
 //! # Linux: 指定 SocketCAN 接口
-//! cargo run --example robot_monitor -- --interface can0
+//! cargo run -p piper-sdk --example robot_monitor -- --interface can0
 //!
 //! # 非 Linux: 指定 GS-USB 设备序列号
-//! cargo run --example robot_monitor -- --interface ABC123456  # 使用 GS-USB 设备序列号
+//! cargo run -p piper-sdk --example robot_monitor -- --interface ABC123456  # 使用 GS-USB 设备序列号
 //! ```
 
 use clap::Parser;
@@ -260,7 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(target_os = "linux"))]
         {
             println!("自动扫描 GS-USB 设备...");
-            PiperBuilder::new()
+            PiperBuilder::new().gs_usb_auto()
         }
     };
 
@@ -270,11 +270,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("连接失败: {}", e))?;
 
     println!("✓ 已连接到机械臂");
+    println!("等待首帧反馈...");
+    piper
+        .wait_for_feedback(Duration::from_secs(5))
+        .map_err(|e| format!("等待首帧反馈失败: {}", e))?;
+    println!("✓ 已收到首帧反馈");
     println!("正在监听反馈信息...");
     println!("按 Ctrl+C 退出\n");
-
-    // 2. 等待初始反馈（给设备一点时间建立连接）
-    std::thread::sleep(Duration::from_millis(100));
 
     // FPS 统计：每 5 秒重置一次（丢弃历史窗口）
     piper.reset_fps_stats();

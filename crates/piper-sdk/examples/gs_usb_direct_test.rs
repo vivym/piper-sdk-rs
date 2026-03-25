@@ -3,7 +3,7 @@
 //! 用途：用于验证启动序列、位定时参数与帧解析链路是否正确（对照实现/设备行为）
 //!
 //! 运行方式：
-//!   sudo cargo run --example gs_usb_direct_test
+//!   sudo cargo run -p piper-sdk --example gs_usb_direct_test
 
 use piper_can::gs_usb::protocol::*;
 use rusb::{DeviceHandle, GlobalContext};
@@ -67,10 +67,16 @@ fn is_gs_usb_device(vendor_id: u16, product_id: u16) -> bool {
 }
 
 fn find_device() -> Option<DeviceHandle<GlobalContext>> {
-    for device in rusb::devices().ok()?.iter() {
-        let desc = device.device_descriptor().ok()?;
-        if is_gs_usb_device(desc.vendor_id(), desc.product_id()) {
-            return device.open().ok();
+    let devices = rusb::devices().ok()?;
+
+    for device in devices.iter() {
+        let Ok(desc) = device.device_descriptor() else {
+            continue;
+        };
+        if is_gs_usb_device(desc.vendor_id(), desc.product_id())
+            && let Ok(handle) = device.open()
+        {
+            return Some(handle);
         }
     }
     None
@@ -334,7 +340,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             },
             Err(e) => {
                 eprintln!("读取错误: {:?}", e);
-                break;
+                return Err(format!("读取 CAN 帧失败: {e:?}").into());
             },
         }
     }

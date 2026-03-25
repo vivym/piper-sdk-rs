@@ -9,15 +9,17 @@
 //! cansend vcan0 123#DEADBEEF
 //!
 //! # 运行验证程序
-//! cargo run --example timestamp_verification --target x86_64-unknown-linux-gnu
+//! cargo run -p piper-sdk --example timestamp_verification -- --interface vcan0
 //! ```
 
+#[cfg(target_os = "linux")]
+use clap::Parser;
 #[cfg(not(target_os = "linux"))]
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
     piper_sdk::init_logger!();
 
-    eprintln!("该示例仅支持 Linux（SocketCAN）。");
+    Err("该示例仅支持 Linux（SocketCAN）。".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -32,17 +34,29 @@ use std::mem;
 use std::os::unix::io::AsRawFd;
 
 #[cfg(target_os = "linux")]
+#[derive(Parser, Debug)]
+#[command(name = "timestamp_verification")]
+#[command(about = "Verify SocketCAN timestamping support on a given interface")]
+struct Args {
+    /// SocketCAN interface to inspect, e.g. vcan0 / can0.
+    #[arg(long, default_value = "vcan0")]
+    interface: String,
+}
+
+#[cfg(target_os = "linux")]
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
     piper_sdk::init_logger!();
+    let args = Args::parse();
 
     println!("SocketCAN 硬件时间戳验证程序");
-    println!("正在打开 vcan0 接口...");
+    println!("正在打开 {} 接口...", args.interface);
 
     // 1. 打开 CAN Socket
-    let socket = CanSocket::open("vcan0").map_err(|e| format!("Failed to open vcan0: {}", e))?;
+    let socket = CanSocket::open(&args.interface)
+        .map_err(|e| format!("Failed to open {}: {}", args.interface, e))?;
     let fd = socket.as_raw_fd();
-    println!("✓ vcan0 已打开 (fd: {})", fd);
+    println!("✓ {} 已打开 (fd: {})", args.interface, fd);
 
     // 2. 启用 SO_TIMESTAMPING
     let flags = libc::SOF_TIMESTAMPING_RX_HARDWARE
@@ -76,7 +90,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut cmsg_buf = [0u8; 1024]; // CMSG 缓冲区
 
     println!("\n等待接收 CAN 帧（按 Ctrl+C 退出）...");
-    println!("提示：在另一个终端运行: cansend vcan0 123#DEADBEEF\n");
+    println!(
+        "提示：在另一个终端运行: cansend {} 123#DEADBEEF\n",
+        args.interface
+    );
 
     // 4. 接收帧（阻塞）
     loop {

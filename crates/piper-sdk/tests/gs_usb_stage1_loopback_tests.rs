@@ -10,10 +10,10 @@
 //! ```bash
 //! # ⚠️ 重要：设备是独占的，必须串行运行测试（--test-threads=1）
 //! # 运行所有 Loopback 测试（串行）
-//! cargo test --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1
+//! cargo test -p piper-sdk --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1
 //!
 //! # 运行单个测试
-//! cargo test --test gs_usb_stage1_loopback_tests -- --ignored test_loopback_end_to_end
+//! cargo test -p piper-sdk --test gs_usb_stage1_loopback_tests -- --ignored test_loopback_end_to_end
 //! ```
 //!
 //! ## 测试覆盖

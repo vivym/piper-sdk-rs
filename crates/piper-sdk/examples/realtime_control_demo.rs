@@ -8,43 +8,111 @@
 //! - Real-time vs reliable command sending
 //! - Performance metrics monitoring
 //! - Thread health checking
+//! - Optional raw TX on an isolated lab bus
+//!
+//! ```bash
+//! # Linux (SocketCAN)
+//! cargo run -p piper-sdk --example realtime_control_demo -- --interface can0
+//!
+//! # macOS/Windows (GS-USB serial)
+//! cargo run -p piper-sdk --example realtime_control_demo -- --interface ABC123456
+//!
+//! # Actually enqueue demo raw frames (isolated bus only)
+//! cargo run -p piper-sdk --example realtime_control_demo -- --interface vcan0 --allow-raw-tx
+//! ```
 
+use clap::Parser;
 use piper_sdk::can::PiperFrame;
-use piper_sdk::driver::{PiperBuilder, PiperCommand};
+use piper_sdk::driver::{HealthStatus, PiperBuilder, PiperCommand};
 use std::time::{Duration, Instant};
+
+const DEMO_REALTIME_ID: u16 = 0x620;
+const DEMO_RELIABLE_ID: u16 = 0x621;
+
+fn ensure_threads_healthy(
+    stage: &str,
+    health: &HealthStatus,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if health.rx_alive && health.tx_alive {
+        println!("   ✓ All threads are running normally\n");
+        return Ok(());
+    }
+
+    if !health.rx_alive {
+        eprintln!("   ✗ RX thread has stopped during {stage} check");
+    }
+    if !health.tx_alive {
+        eprintln!("   ✗ TX thread has stopped during {stage} check");
+    }
+    if let Some(fault) = health.fault {
+        eprintln!("   ✗ Runtime fault during {stage} check: {:?}", fault);
+    }
+
+    Err(format!("thread health check failed during {stage} stage").into())
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "realtime_control_demo")]
+#[command(about = "High-frequency driver-layer control demo")]
+struct Args {
+    /// Linux: SocketCAN interface; macOS/Windows: GS-USB serial.
+    #[cfg_attr(target_os = "linux", arg(long, default_value = "can0"))]
+    #[cfg_attr(not(target_os = "linux"), arg(long))]
+    interface: String,
+
+    /// CAN bitrate in bps.
+    #[arg(long, default_value_t = 1_000_000)]
+    baud_rate: u32,
+
+    /// Control loop frequency in Hz.
+    #[arg(long, default_value_t = 500.0)]
+    frequency_hz: f64,
+
+    /// Demo duration in seconds.
+    #[arg(long, default_value_t = 5)]
+    duration_secs: u64,
+
+    /// Actually transmit demo raw frames. Only use this on an isolated lab bus
+    /// such as `vcan0` or a standalone adapter that is not attached to a robot.
+    #[arg(long)]
+    allow_raw_tx: bool,
+}
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
     piper_sdk::init_logger!();
+    let args = Args::parse();
+    if args.frequency_hz <= 0.0 {
+        return Err("frequency_hz must be > 0".into());
+    }
 
     println!("=== Real-time Control Demo ===\n");
 
     // Create Piper instance with dual-threaded mode
     println!("1. Creating Piper instance with dual-threaded mode...");
     // Note: Dual-threaded mode is automatically enabled when the adapter supports splitting
-    let robot = PiperBuilder::new()
-        .socketcan("can0")  // Linux: SocketCAN interface name
-        .baud_rate(1_000_000)  // CAN baud rate
-        .build()?;
+    let robot = {
+        #[cfg(target_os = "linux")]
+        {
+            PiperBuilder::new()
+                .socketcan(&args.interface)
+                .baud_rate(args.baud_rate)
+                .build()?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            PiperBuilder::new()
+                .gs_usb_serial(&args.interface)
+                .baud_rate(args.baud_rate)
+                .build()?
+        }
+    };
     println!("   ✓ Piper instance created (dual-threaded if supported)\n");
 
     // Check thread health
     println!("2. Checking thread health...");
     let health = robot.health();
-    if health.rx_alive && health.tx_alive {
-        println!("   ✓ All threads are running normally\n");
-    } else {
-        if !health.rx_alive {
-            eprintln!("   ✗ RX thread has stopped!");
-        }
-        if !health.tx_alive {
-            eprintln!("   ✗ TX thread has stopped!");
-        }
-        if let Some(fault) = health.fault {
-            eprintln!("   ✗ Runtime fault: {:?}", fault);
-        }
-        return Err("Thread health check failed".into());
-    }
+    ensure_threads_healthy("initial", &health)?;
 
     // Monitor performance metrics
     println!("3. Monitoring performance metrics...");
@@ -59,10 +127,26 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("     - TX timeouts: {}", start_metrics.tx_timeouts);
     println!();
 
+    if args.allow_raw_tx {
+        println!(
+            "   Raw TX enabled: demo frames will be sent on CAN IDs 0x{:03X} and 0x{:03X}",
+            DEMO_REALTIME_ID, DEMO_RELIABLE_ID
+        );
+        println!("   Only use this on an isolated lab bus.\n");
+    } else {
+        println!(
+            "   Raw TX disabled: running the scheduling/metrics demo without injecting frames."
+        );
+        println!("   Pass --allow-raw-tx only on an isolated lab bus such as vcan0.\n");
+    }
+
     // Simulate high-frequency control loop (500Hz)
-    println!("4. Running high-frequency control loop (500Hz) for 5 seconds...");
-    let control_duration = Duration::from_secs(5);
-    let control_interval = Duration::from_millis(2); // 500Hz = 2ms
+    println!(
+        "4. Running high-frequency control loop ({:.1}Hz) for {} seconds...",
+        args.frequency_hz, args.duration_secs
+    );
+    let control_duration = Duration::from_secs(args.duration_secs);
+    let control_interval = Duration::from_secs_f64(1.0 / args.frequency_hz);
     let start_time = Instant::now();
     let mut iteration_count = 0u32;
 
@@ -77,16 +161,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // In real application, you would compute control commands here
         let _control_output = compute_control(&joint_pos, &joint_dynamic);
 
-        // Send real-time control command (overwritable)
-        let frame = PiperFrame::new_standard(
-            0x1A1, // Example control frame ID
-            &[iteration_count as u8; 8],
-        );
-        match robot.send_realtime(frame) {
-            Ok(_) => {},
-            Err(e) => {
-                eprintln!("   Warning: Failed to send realtime command: {}", e);
-            },
+        if args.allow_raw_tx {
+            // Deliberately use demo-only IDs outside the Piper protocol ranges.
+            let frame = PiperFrame::new_standard(DEMO_REALTIME_ID, &[iteration_count as u8; 8]);
+            match robot.send_realtime(frame) {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("   Warning: Failed to send realtime command: {}", e);
+                },
+            }
         }
 
         iteration_count += 1;
@@ -143,30 +226,30 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Demonstrate command priority
     println!("6. Demonstrating command priority...");
 
-    // Send reliable command (configuration)
-    let config_frame = PiperFrame::new_standard(0x1A2, &[0x01, 0x02, 0x03, 0x04]);
-    match robot.send_reliable(config_frame) {
-        Ok(_) => println!("   ✓ Reliable command sent (FIFO queue)"),
-        Err(e) => eprintln!("   ✗ Failed to send reliable command: {}", e),
-    }
+    if args.allow_raw_tx {
+        // Use demo-only IDs so this example never emits robot protocol traffic.
+        let config_frame = PiperFrame::new_standard(DEMO_RELIABLE_ID, &[0x01, 0x02, 0x03, 0x04]);
+        match robot.send_reliable(config_frame) {
+            Ok(_) => println!("   ✓ Reliable command sent (FIFO queue)"),
+            Err(e) => eprintln!("   ✗ Failed to send reliable command: {}", e),
+        }
 
-    // Send real-time command using PiperCommand
-    let control_frame = PiperFrame::new_standard(0x1A1, &[0x05, 0x06, 0x07, 0x08]);
-    let cmd = PiperCommand::realtime(control_frame);
-    match robot.send_command(cmd) {
-        Ok(_) => println!("   ✓ Real-time command sent (overwritable queue)"),
-        Err(e) => eprintln!("   ✗ Failed to send real-time command: {}", e),
+        let control_frame = PiperFrame::new_standard(DEMO_REALTIME_ID, &[0x05, 0x06, 0x07, 0x08]);
+        let cmd = PiperCommand::realtime(control_frame);
+        match robot.send_command(cmd) {
+            Ok(_) => println!("   ✓ Real-time command sent (overwritable queue)"),
+            Err(e) => eprintln!("   ✗ Failed to send real-time command: {}", e),
+        }
+    } else {
+        println!("   Raw TX disabled; skipping demo sends.");
+        println!("   Re-run with --allow-raw-tx on an isolated bus to exercise the TX queues.");
     }
     println!();
 
     // Final health check
     println!("7. Final thread health check...");
     let health = robot.health();
-    if health.rx_alive && health.tx_alive {
-        println!("   ✓ All threads are still running normally");
-    } else {
-        eprintln!("   ✗ Thread health check failed!");
-    }
+    ensure_threads_healthy("final", &health)?;
 
     println!("\n=== Demo completed successfully ===");
     Ok(())
@@ -180,4 +263,36 @@ fn compute_control(
     // In real application, this would compute control commands
     // based on current state and desired trajectory
     [0.0; 6]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use piper_sdk::driver::{HealthStatus, RuntimeFaultKind};
+
+    #[test]
+    fn unhealthy_threads_should_fail_demo_health_check() {
+        let health = HealthStatus {
+            connected: true,
+            last_feedback_age: Duration::from_millis(10),
+            rx_alive: true,
+            tx_alive: false,
+            fault: Some(RuntimeFaultKind::TxExited),
+        };
+
+        assert!(ensure_threads_healthy("final", &health).is_err());
+    }
+
+    #[test]
+    fn healthy_threads_pass_demo_health_check() {
+        let health = HealthStatus {
+            connected: true,
+            last_feedback_age: Duration::from_millis(10),
+            rx_alive: true,
+            tx_alive: true,
+            fault: None,
+        };
+
+        assert!(ensure_threads_healthy("final", &health).is_ok());
+    }
 }

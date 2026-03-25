@@ -9,8 +9,15 @@
 ### 1. 启动 Embedded Bridge Host
 
 ```bash
-# 在终端 1 中启动 embedded bridge host
-cargo run --example embedded_bridge_host
+# Linux / Unix: 默认使用 UDS listener
+cargo run -p piper-sdk --example embedded_bridge_host
+
+# 非 Unix: 必须显式使用 TCP/TLS listener
+cargo run -p piper-sdk --example embedded_bridge_host -- \
+  --tcp-tls 127.0.0.1:18888 \
+  --tls-server-cert server.pem \
+  --tls-server-key server.key \
+  --tls-client-ca ca.pem
 ```
 
 确保 embedded bridge host 成功启动并连接到设备。
@@ -18,8 +25,16 @@ cargo run --example embedded_bridge_host
 ### 2. 运行性能测试
 
 ```bash
-# 在终端 2 中运行性能测试
-cargo run --example bridge_latency_bench
+# Unix UDS
+cargo run -p piper-sdk --example bridge_latency_bench
+
+# TCP/TLS
+cargo run -p piper-sdk --example bridge_latency_bench -- \
+  --endpoint 127.0.0.1:18888 \
+  --tls-ca ca.pem \
+  --tls-client-cert client.pem \
+  --tls-client-key client.key \
+  --tls-server-name bridge.local
 ```
 
 ## 测试场景
@@ -77,8 +92,9 @@ cargo run --example bridge_latency_bench
 
 **解决方案**:
 1. 确认 embedded bridge host 已启动: `ps aux | grep embedded_bridge_host`
-2. 检查 socket 文件: `ls -l /tmp/piper_bridge.sock`
-3. 确认 daemon 日志显示设备已连接
+2. Unix UDS 路径下检查 socket 文件: `ls -l /tmp/piper_bridge.sock`
+3. TCP/TLS 路径下确认 `--tcp-tls` 地址和证书参数匹配
+4. 确认 daemon 日志显示设备已连接
 
 ### 问题 2: 接收测试超时
 
@@ -117,14 +133,16 @@ cargo run --example bridge_latency_bench
 
 ```bash
 # 终端 2
-cargo run --example bridge_latency_bench
+cargo run -p piper-sdk --example bridge_latency_bench
 
 # 终端 3
-cargo run --example bridge_latency_bench
+cargo run -p piper-sdk --example bridge_latency_bench
 
 # 终端 4
-cargo run --example bridge_latency_bench
+cargo run -p piper-sdk --example bridge_latency_bench
 ```
+
+非 Unix 平台请为每个实例显式传 `--endpoint` 和完整 TLS 参数。
 
 观察 daemon 日志，验证：
 - 所有客户端正常工作

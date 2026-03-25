@@ -9,14 +9,19 @@
 //! 6. 移动回原位置
 //! 7. 失能机械臂
 //!
+//! 这是一个教学型示例：它用固定等待时间演示位置命令流程，
+//! 不把“sleep 结束”当作生产级的到位确认。
+//! 如果你需要按误差阈值、超时和重发策略确认运动完成，
+//! 请参考 `piper-control::workflow` 里的阻塞运动执行模式。
+//!
 //! # 运行
 //!
 //! ```bash
 //! # Linux (SocketCAN)
-//! cargo run --example position_control_demo -- --interface can0
+//! cargo run -p piper-sdk --example position_control_demo -- --interface can0
 //!
-//! # 所有平台 (GS-USB)
-//! cargo run --example position_control_demo -- --interface ABC123456
+//! # macOS/Windows (GS-USB)
+//! cargo run -p piper-sdk --example position_control_demo -- --interface ABC123456
 //! ```
 
 use clap::Parser;
@@ -33,9 +38,10 @@ use std::time::{Duration, Instant};
 struct Args {
     /// CAN 接口名称或设备序列号
     ///
-    /// - Linux: "can0"/"can1" 等 SocketCAN 接口名，或设备序列号（使用 GS-USB）
+    /// - Linux: "can0"/"can1" 等 SocketCAN 接口名
     /// - macOS/Windows: GS-USB 设备序列号
-    #[arg(long, default_value = "can0")]
+    #[cfg_attr(target_os = "linux", arg(long, default_value = "can0"))]
+    #[cfg_attr(not(target_os = "linux"), arg(long))]
     interface: String,
 
     /// CAN 波特率（默认: 1000000）
@@ -144,8 +150,8 @@ where
     robot.send_position_command(&target_positions)?;
     println!("   ✅ 位置命令已发送");
 
-    // 等待运动完成（简单方法：等待一段时间）
-    // 注意：实际应用中应该监控位置误差，直到到达目标位置
+    // 等待运动完成（教学示例：固定等待）
+    // 生产代码应按位置误差/超时做确认，而不是把 sleep 当作“已到位”信号。
     println!("   ⏳ 等待运动完成...");
     std::thread::sleep(Duration::from_secs(10));
 
@@ -215,6 +221,7 @@ where
     println!("🔙 步骤 6: 移动回原位置...");
     robot.send_position_command(&current_positions)?;
     println!("   ✅ 位置命令已发送");
+    // 同上：这里只是教学型固定等待，不是生产级完成确认。
     println!("   ⏳ 等待运动完成...");
     std::thread::sleep(Duration::from_secs(10));
     println!("   ✅ 运动完成\n");

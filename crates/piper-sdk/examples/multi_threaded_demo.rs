@@ -5,7 +5,9 @@
 //! 正确的做法是使用 Arc<Mutex<Piper>> 来共享机器人实例。
 
 use clap::Parser;
-use piper_sdk::client::state::MitModeConfig;
+use piper_sdk::client::state::{
+    Active, DisableConfig, MitMode, MitModeConfig, MotionCapability, Standby, StrictCapability,
+};
 use piper_sdk::client::types::{JointArray, NewtonMeter, Rad};
 use piper_sdk::prelude::*;
 use std::sync::{Arc, Mutex};
@@ -17,8 +19,9 @@ use std::time::{Duration, Instant};
 #[command(name = "multi_threaded_demo")]
 #[command(about = "多线程控制演示 - 展示如何在多线程环境下安全地共享 Piper 实例")]
 struct Args {
-    /// CAN 接口名称或设备序列号
-    #[arg(long, default_value = "can0")]
+    /// Linux: SocketCAN interface; macOS/Windows: GS-USB serial.
+    #[cfg_attr(target_os = "linux", arg(long, default_value = "can0"))]
+    #[cfg_attr(not(target_os = "linux"), arg(long))]
     interface: String,
 
     /// CAN 波特率（默认: 1000000）
@@ -39,6 +42,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     piper_sdk::init_logger!();
 
     let args = Args::parse();
+    if args.frequency_hz <= 0.0 {
+        return Err("frequency_hz must be > 0".into());
+    }
 
     println!("🤖 Piper SDK - 多线程控制演示");
     println!("=========================\n");
@@ -77,7 +83,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
 
     let robot_clone = Arc::clone(&robot);
-    let control_thread = thread::spawn(move || {
+    let control_thread = thread::spawn(move || -> std::result::Result<u64, String> {
         let period = Duration::from_secs_f64(1.0 / args.frequency_hz);
         let start_time = Instant::now();
         let mut iteration = 0;
@@ -110,19 +116,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let torques = JointArray::from([NewtonMeter(0.0); 6]);
 
                 if let Err(e) = robot.command_torques(&positions, &velocities, &kp, &kd, &torques) {
-                    eprintln!("   ❌ 发送命令失败: {:?}", e);
-                    break;
+                    return Err(format!("发送命令失败: {e:?}"));
                 }
             } else {
-                // 获取锁失败（不应该发生）
-                eprintln!("   ❌ 获取锁失败");
-                break;
+                return Err("获取机器人锁失败".to_string());
             }
 
             // 检查是否超时
             if elapsed >= args.duration_sec as f64 {
                 println!("   📝 控制线程结束，总迭代次数: {}", iteration);
-                break;
+                return Ok(iteration);
             }
 
             iteration += 1;
@@ -137,11 +140,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let monitor_start = Instant::now();
     let mut sample_count = 0;
+    let mut last_status_print = monitor_start - Duration::from_secs(1);
 
     while monitor_start.elapsed() < Duration::from_secs(args.duration_sec) {
         // 克隆 Observer 用于只读监控（不需要锁）
         let observer = {
-            let robot = robot.lock().unwrap();
+            let robot = robot.lock().map_err(|_| "failed to lock robot for observation")?;
             robot.observer().clone()
         };
 
@@ -149,35 +153,50 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         sample_count += 1;
 
         // 每秒输出一次状态
-        if sample_count % (args.frequency_hz as u32) == 0 {
+        if last_status_print.elapsed() >= Duration::from_secs(1) {
             println!(
                 "   📍 J1 = {:.4} rad ({:.2} deg) - 样本 #{:04}",
                 positions[Joint::J1].0,
                 positions[Joint::J1].to_deg().0,
                 sample_count
             );
+            last_status_print = Instant::now();
         }
 
         std::thread::sleep(Duration::from_millis(10));
     }
 
     // 等待控制线程完成
-    control_thread.join().unwrap();
-    println!("\n   ✅ 控制线程已结束\n");
+    let iterations = match control_thread.join() {
+        Ok(Ok(iterations)) => iterations,
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => return Err("control thread panicked".into()),
+    };
+    println!("\n   ✅ 控制线程已结束（{} iterations）\n", iterations);
 
     // ==================== 步骤 4: 失能机械臂 ====================
     println!("🛑 步骤 4: 失能机械臂...");
 
-    // 从 Arc 中获取所有权
-    let _robot = robot.lock().unwrap();
-    // 注意：不需要 disable，因为 MutexGuard 会释放
+    let robot = Arc::try_unwrap(robot)
+        .map_err(|_| "robot still has outstanding shared references after worker shutdown")?;
+    let robot = robot.into_inner().map_err(|_| "robot mutex poisoned during shutdown")?;
+    let _standby = disable_robot(robot)?;
 
     println!("   ✅ 演示完成！");
     println!("\n💡 关键要点：");
     println!("   1. 使用 Arc<Mutex<Piper>> 而非提取 MotionCommander");
     println!("   2. 每次发送命令时获取锁，发送后立即释放");
     println!("   3. Observer 可以 clone 用于只读监控（不需要锁）");
-    println!("   4. 这种模式保证了 Type State 安全性");
+    println!("   4. 在线程退出后回收所有权，并显式 disable 机器人");
 
     Ok(())
+}
+
+fn disable_robot<Capability>(
+    robot: Piper<Active<MitMode>, Capability>,
+) -> std::result::Result<Piper<Standby, Capability>, Box<dyn std::error::Error>>
+where
+    Capability: MotionCapability + StrictCapability,
+{
+    Ok(robot.disable(DisableConfig::default())?)
 }

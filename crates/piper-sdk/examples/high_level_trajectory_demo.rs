@@ -9,7 +9,7 @@
 //! # 运行
 //!
 //! ```bash
-//! cargo run --example high_level_trajectory_demo
+//! cargo run -p piper-sdk --example high_level_trajectory_demo
 //! ```
 
 use piper_sdk::client::control::TrajectoryPlanner;

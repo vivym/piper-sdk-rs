@@ -9,16 +9,16 @@
 //! 推荐使用方式：
 //! ```bash
 //! # Linux，默认 can0/can1，先用单向镜像联调
-//! cargo run --example dual_arm_bilateral_control -- --mode master-follower
+//! cargo run -p piper-sdk --example dual_arm_bilateral_control -- --mode master-follower
 //!
 //! # Linux，显式指定左右 SocketCAN 接口
-//! cargo run --example dual_arm_bilateral_control -- \
+//! cargo run -p piper-sdk --example dual_arm_bilateral_control -- \
 //!   --left-interface can0 \
 //!   --right-interface can1 \
 //!   --mode bilateral
 //!
 //! # macOS/Windows，显式指定两只 GS-USB 设备序列号
-//! cargo run --example dual_arm_bilateral_control -- \
+//! cargo run -p piper-sdk --example dual_arm_bilateral_control -- \
 //!   --left-serial LEFT123 \
 //!   --right-serial RIGHT456 \
 //!   --mode bilateral
@@ -189,10 +189,12 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         DualArmLoopExit::Standby { report, .. } => {
             println!("\n双臂循环已退出，机械臂回到 Standby。");
             print_report(&report);
+            exit_status_from_report(false, &report)?;
         },
         DualArmLoopExit::Faulted { report, .. } => {
             eprintln!("\n双臂循环进入 Faulted，已停止控制并执行有界停机尝试。");
             print_report(&report);
+            exit_status_from_report(true, &report)?;
         },
     }
 
@@ -261,6 +263,21 @@ fn install_ctrlc(cancel_signal: Arc<AtomicBool>) -> std::result::Result<(), Box<
     Ok(())
 }
 
+fn exit_status_from_report(
+    faulted: bool,
+    report: &BilateralRunReport,
+) -> std::result::Result<(), Box<dyn Error>> {
+    if faulted {
+        if let Some(last_error) = &report.last_error {
+            Err(format!("dual-arm loop exited faulted: {last_error}").into())
+        } else {
+            Err("dual-arm loop exited faulted".into())
+        }
+    } else {
+        Ok(())
+    }
+}
+
 fn wait_for_enter(prompt: &str) -> io::Result<()> {
     print!("{prompt}");
     io::stdout().flush()?;
@@ -314,5 +331,25 @@ fn print_report(report: &BilateralRunReport) {
     );
     if let Some(last_error) = &report.last_error {
         println!("last_error: {last_error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faulted_dual_arm_exit_should_return_error_status() {
+        let mut report = BilateralRunReport::default();
+        report.last_error = Some("faulted".to_string());
+
+        assert!(exit_status_from_report(true, &report).is_err());
+    }
+
+    #[test]
+    fn standby_dual_arm_exit_should_return_success_status() {
+        let report = BilateralRunReport::default();
+
+        assert!(exit_status_from_report(false, &report).is_ok());
     }
 }

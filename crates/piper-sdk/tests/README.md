@@ -14,13 +14,13 @@
 
 ```bash
 # Loopback 模式测试
-cargo test --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1
+cargo test -p piper-sdk --test gs_usb_stage1_loopback_tests -- --ignored --test-threads=1
 
 # 集成测试
-cargo test --test gs_usb_integration_tests -- --ignored --test-threads=1
+cargo test -p piper-sdk --test gs_usb_integration_tests -- --ignored --test-threads=1
 
 # 性能测试
-cargo test --test gs_usb_performance_tests -- --ignored --test-threads=1
+cargo test -p piper-sdk --test gs_usb_performance_tests -- --ignored --test-threads=1
 ```
 
 ### 一键运行实时验收
@@ -76,7 +76,7 @@ PIPER_ACCEPTANCE_CONTINUE_ON_FAILURE=1 ./scripts/run_realtime_acceptance.sh all
 
 ```bash
 # 运行单个测试（不会并发）
-cargo test --test gs_usb_stage1_loopback_tests -- --ignored test_loopback_end_to_end
+cargo test -p piper-sdk --test gs_usb_stage1_loopback_tests -- --ignored test_loopback_end_to_end
 ```
 
 ## 测试文件说明
@@ -104,13 +104,13 @@ cargo test --lib
 1. 确保使用 `--test-threads=1` 串行运行
 2. 检查是否有其他程序占用设备
 3. 尝试重新插拔 USB 设备
-4. 查看详细错误：`cargo test --test <test_name> -- --ignored --nocapture --test-threads=1`
+4. 查看详细错误：`cargo test -p piper-sdk --test <test_name> -- --ignored --nocapture --test-threads=1`
 
 ## 调试工具
 
 ### 设备扫描诊断
 ```bash
-cargo test --test gs_usb_debug_scan -- --ignored --nocapture
+cargo test -p piper-sdk --test gs_usb_debug_scan -- --ignored --nocapture
 ```
 
 ### 逐步初始化调试
@@ -118,7 +118,7 @@ cargo test --test gs_usb_debug_scan -- --ignored --nocapture
 如需现场诊断，优先使用：
 
 ```bash
-cargo test --test gs_usb_debug_scan -- --ignored --nocapture
+cargo test -p piper-sdk --test gs_usb_debug_scan -- --ignored --nocapture
 ```
 
 这些工具可以帮助诊断设备连接、权限和初始化问题。

@@ -26,12 +26,15 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 piper-driver = { workspace = true }
+piper-tools = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 proptest = { workspace = true }
 ctrlc = { workspace = true }
 rand = { workspace = true }
+tokio = { workspace = true }
+anyhow = "1"
 # For examples and tests (platform-specific)
 libc = { workspace = true }
 rusb = { workspace = true }

@@ -9,6 +9,11 @@
 //! - 帧回放功能
 //! - 网络传输帧数据
 
+#[cfg(feature = "serde")]
+fn frame_dump_output_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("piper_sdk_can_frames.json")
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
     piper_sdk::init_logger!();
@@ -25,8 +30,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         // 创建一些示例帧
         let frames = vec![
-            PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03, 0x04]),
-            PiperFrame::new_standard(0x2A1, &[0x05, 0x06, 0x07, 0x08]),
+            PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]),
+            PiperFrame::new_standard(0x456, &[0x05, 0x06, 0x07, 0x08]),
             PiperFrame::new_extended(0x12345678, &[0xFF, 0xFF, 0xFF, 0xFF]),
         ];
 
@@ -53,21 +58,29 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         assert_eq!(frames.len(), deserialized.len());
 
         // 3. 保存到文件
-        let output_path = "/tmp/can_frames.json";
-        let file = File::create(output_path)?;
+        let output_path = frame_dump_output_path();
+        let file = File::create(&output_path)?;
         let mut writer = BufWriter::new(file);
 
         for frame in frames.iter() {
             let json = serde_json::to_string(frame)?;
             writeln!(writer, "{}", json)?;
         }
-        println!("✅ Saved {} frames to {}", frames.len(), output_path);
+        println!(
+            "✅ Saved {} frames to {}",
+            frames.len(),
+            output_path.display()
+        );
 
         // 4. 从文件加载并验证
-        let file = File::open(output_path)?;
+        let file = File::open(&output_path)?;
         let reader = BufReader::new(file);
         let loaded_count = reader.lines().count();
-        println!("✅ Loaded {} frames from {}", loaded_count, output_path);
+        println!(
+            "✅ Loaded {} frames from {}",
+            loaded_count,
+            output_path.display()
+        );
     }
 
     #[cfg(not(feature = "serde"))]
@@ -83,4 +96,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_dump_uses_platform_temp_directory() {
+        let output = frame_dump_output_path();
+        assert_eq!(
+            output.file_name().and_then(|name| name.to_str()),
+            Some("piper_sdk_can_frames.json")
+        );
+        assert!(output.starts_with(std::env::temp_dir()));
+    }
 }

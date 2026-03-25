@@ -9,22 +9,65 @@
 //!
 //! **注意**：此示例一次性读取所有状态后退出，适合学习 API 用法。
 //! 如需实时监控，请使用 `robot_monitor` 示例。
+//!
+//! ```bash
+//! # Linux (SocketCAN)
+//! cargo run -p piper-sdk --example state_api_demo -- --interface can0
+//!
+//! # macOS/Windows (GS-USB serial)
+//! cargo run -p piper-sdk --example state_api_demo -- --interface ABC123456
+//! ```
 
+use clap::Parser;
 use piper_sdk::driver::PiperBuilder;
 use std::time::Duration;
 
+#[derive(Parser, Debug)]
+#[command(name = "state_api_demo")]
+#[command(about = "One-shot state API demo")]
+struct Args {
+    /// Linux: SocketCAN interface; macOS/Windows: GS-USB serial.
+    #[cfg_attr(target_os = "linux", arg(long, default_value = "can0"))]
+    #[cfg_attr(not(target_os = "linux"), arg(long))]
+    interface: String,
+
+    /// CAN bitrate in bps.
+    #[arg(long, default_value_t = 1_000_000)]
+    baud_rate: u32,
+
+    /// Wait timeout for the first feedback in seconds.
+    #[arg(long, default_value_t = 5)]
+    feedback_timeout_secs: u64,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    piper_sdk::init_logger!();
+
+    let args = Args::parse();
+
     // 创建 Piper 实例
     // 注意：此示例需要实际的 CAN 适配器
     // 对于测试，可以使用 MockCanAdapter
-    let robot = PiperBuilder::new()
-        .socketcan("can0")  // Linux: SocketCAN 接口名
-        .baud_rate(1_000_000)  // CAN 波特率
-        .build()?;
+    let robot = {
+        #[cfg(target_os = "linux")]
+        {
+            PiperBuilder::new()
+                .socketcan(&args.interface)
+                .baud_rate(args.baud_rate)
+                .build()?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            PiperBuilder::new()
+                .gs_usb_serial(&args.interface)
+                .baud_rate(args.baud_rate)
+                .build()?
+        }
+    };
 
     // 等待接收到第一个有效反馈
-    println!("Waiting for robot feedback...");
-    robot.wait_for_feedback(Duration::from_secs(5))?;
+    println!("Waiting for robot feedback on {}...", args.interface);
+    robot.wait_for_feedback(Duration::from_secs(args.feedback_timeout_secs))?;
     println!("Robot feedback received!");
 
     // 运行一段时间，收集数据

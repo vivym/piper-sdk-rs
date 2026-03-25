@@ -5,7 +5,7 @@
 //! # 运行
 //!
 //! ```bash
-//! cargo run --example high_level_simple_move
+//! cargo run -p piper-sdk --example high_level_simple_move
 //! ```
 
 use piper_sdk::client::control::TrajectoryPlanner;
@@ -77,7 +77,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
 
         // 在实际应用中，这里会发送命令到机器人：
-        // piper.motion_commander().command_positions(position)?;
+        // robot.send_position_command(&position)?;
 
         // 模拟控制周期延迟
         std::thread::sleep(Duration::from_millis(10));

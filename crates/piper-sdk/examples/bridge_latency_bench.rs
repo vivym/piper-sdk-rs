@@ -4,8 +4,13 @@
 //! - `get_status()` request/response 延迟
 //! - `SendFrame`（持有 writer lease）请求延迟
 //! - `ReceiveFrame/Gap` 事件等待延迟
+//!
+//! - Unix 平台默认连接 `/tmp/piper_bridge.sock`
+//! - 非 Unix 平台必须显式传 `--endpoint`
+//! - TCP/TLS endpoint 需要同时传 `--tls-ca` / `--tls-client-cert`
+//!   / `--tls-client-key` / `--tls-server-name`
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use piper_sdk::{
     BridgeClientOptions, BridgeEndpoint, BridgeEvent, BridgeRole, BridgeTlsClientConfig,
     PiperBridgeClient, PiperFrame, SessionToken,
@@ -21,12 +26,14 @@ use std::time::{Duration, Instant};
 #[command(about = "Benchmark the non-realtime controller-owned Piper bridge")]
 struct Args {
     /// Bridge endpoint.
+    ///
+    /// Non-Unix platforms must pass this explicitly.
     #[arg(long)]
     endpoint: Option<String>,
 
     /// Benchmark mode: send | status | receive | all
-    #[arg(long, default_value = "all")]
-    mode: String,
+    #[arg(long, value_enum, default_value_t = BridgeBenchMode::All)]
+    mode: BridgeBenchMode,
 
     /// Iteration count for send/status benchmarks.
     #[arg(long, default_value = "2000")]
@@ -55,6 +62,14 @@ struct Args {
     /// TLS server name used for certificate verification on TCP/TLS endpoints.
     #[arg(long)]
     tls_server_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BridgeBenchMode {
+    Send,
+    Status,
+    Receive,
+    All,
 }
 
 struct LatencyStats {
@@ -113,6 +128,20 @@ fn default_endpoint() -> String {
     }
 }
 
+fn resolved_endpoint_arg(
+    endpoint: Option<&str>,
+    unix_supported: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match endpoint {
+        Some(value) => Ok(value.to_string()),
+        None if unix_supported => Ok(default_endpoint()),
+        None => Err(
+            "non-Unix platforms require an explicit --endpoint for bridge_latency_bench; TCP/TLS endpoints also require --tls-ca, --tls-client-cert, --tls-client-key, and --tls-server-name"
+                .into(),
+        ),
+    }
+}
+
 fn parse_endpoint(raw: &str) -> Result<BridgeEndpoint, String> {
     if raw.starts_with('/') || raw.starts_with("unix:") {
         #[cfg(unix)]
@@ -162,6 +191,8 @@ fn maybe_tls_config(
 fn token_cache_dir() -> PathBuf {
     if let Some(xdg_cache_home) = std::env::var_os("XDG_CACHE_HOME") {
         PathBuf::from(xdg_cache_home).join("piper-sdk").join("bridge_tokens")
+    } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        PathBuf::from(local_app_data).join("piper-sdk").join("bridge_tokens")
     } else if let Some(home) = std::env::var_os("HOME") {
         PathBuf::from(home).join(".cache").join("piper-sdk").join("bridge_tokens")
     } else {
@@ -307,24 +338,35 @@ fn run_receive_bench(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let endpoint = args.endpoint.clone().unwrap_or_else(default_endpoint);
+    let endpoint = resolved_endpoint_arg(args.endpoint.as_deref(), cfg!(unix))?;
     let timeout = Duration::from_millis(args.timeout_ms);
 
     println!("Piper bridge latency benchmark");
     println!("endpoint: {}", endpoint);
     println!("non-realtime bridge/debug path only");
 
-    match args.mode.as_str() {
-        "status" => run_status_bench(&endpoint, &args, args.count, timeout)?,
-        "send" => run_send_bench(&endpoint, &args, args.count, timeout)?,
-        "receive" => run_receive_bench(&endpoint, &args, args.receive_count, timeout)?,
-        "all" => {
+    match args.mode {
+        BridgeBenchMode::Status => run_status_bench(&endpoint, &args, args.count, timeout)?,
+        BridgeBenchMode::Send => run_send_bench(&endpoint, &args, args.count, timeout)?,
+        BridgeBenchMode::Receive => {
+            run_receive_bench(&endpoint, &args, args.receive_count, timeout)?
+        },
+        BridgeBenchMode::All => {
             run_status_bench(&endpoint, &args, args.count, timeout)?;
             run_send_bench(&endpoint, &args, args.count, timeout)?;
             run_receive_bench(&endpoint, &args, args.receive_count, timeout)?;
         },
-        other => return Err(format!("unsupported mode: {}", other).into()),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_endpoint_arg_rejects_missing_non_unix_default() {
+        assert!(resolved_endpoint_arg(None, false).is_err());
+    }
 }

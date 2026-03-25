@@ -8,10 +8,10 @@
 //! 运行方式：
 //! ```bash
 //! # 运行所有测试
-//! cargo test --test timeout_convergence_tests -- --ignored
+//! cargo test -p piper-sdk --test timeout_convergence_tests -- --ignored
 //!
 //! # 运行特定测试
-//! cargo test --test timeout_convergence_tests test_command_latency_quiet_bus -- --ignored
+//! cargo test -p piper-sdk --test timeout_convergence_tests test_command_latency_quiet_bus -- --ignored
 //! ```
 
 use piper_sdk::driver::{PipelineConfig, PiperBuilder};

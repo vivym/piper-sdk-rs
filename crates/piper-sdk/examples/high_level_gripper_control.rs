@@ -9,7 +9,7 @@
 //! # 运行
 //!
 //! ```bash
-//! cargo run --example high_level_gripper_control
+//! cargo run -p piper-sdk --example high_level_gripper_control
 //! ```
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -35,15 +35,14 @@ fn demonstrate_gripper_api() {
     // 1. 基本控制方法
     println!("1️⃣  基本控制:");
     println!("   ```rust");
-    println!("   // 创建 MotionCommander（从已连接的 Piper 获取）");
-    println!("   // let piper: Piper<Active<MitMode>> = ...;");
-    println!("   // let commander = piper.motion_commander();");
+    println!("   // 从已连接的 Piper 直接控制夹爪");
+    println!("   // let robot: Piper<Active<MitMode>> = ...;");
     println!();
     println!("   // 打开夹爪（position = 1.0, effort = 0.3）");
-    println!("   commander.open_gripper()?;");
+    println!("   robot.open_gripper()?;");
     println!();
     println!("   // 关闭夹爪（position = 0.0, 指定力度）");
-    println!("   commander.close_gripper(0.5)?;  // 中等力度");
+    println!("   robot.close_gripper(0.5)?;  // 中等力度");
     println!("   ```\n");
 
     // 2. 精确位置控制
@@ -54,13 +53,13 @@ fn demonstrate_gripper_api() {
     println!("   // effort:   0.0 (最小力度) -> 1.0 (最大力度)");
     println!();
     println!("   // 半开状态，低力度");
-    println!("   commander.set_gripper(0.5, 0.3)?;");
+    println!("   robot.set_gripper(0.5, 0.3)?;");
     println!();
     println!("   // 夹取小物体，精确位置，中等力度");
-    println!("   commander.set_gripper(0.2, 0.5)?;");
+    println!("   robot.set_gripper(0.2, 0.5)?;");
     println!();
     println!("   // 夹取大物体，保持打开，高力度");
-    println!("   commander.set_gripper(0.8, 0.8)?;");
+    println!("   robot.set_gripper(0.8, 0.8)?;");
     println!("   ```\n");
 
     // 3. 读取夹爪状态
@@ -81,14 +80,14 @@ fn demonstrate_gripper_api() {
     println!("   📦 场景 1: 抓取物体");
     println!("   ```rust");
     println!("   // 1. 打开夹爪准备抓取");
-    println!("   commander.open_gripper()?;");
+    println!("   robot.open_gripper()?;");
     println!("   thread::sleep(Duration::from_millis(500));");
     println!();
     println!("   // 2. （移动机械臂到物体位置）");
     println!("   // piper.move_to_position(...)?;");
     println!();
     println!("   // 3. 闭合夹爪，中等力度");
-    println!("   commander.close_gripper(0.5)?;");
+    println!("   robot.close_gripper(0.5)?;");
     println!("   thread::sleep(Duration::from_millis(300));");
     println!();
     println!("   // 4. 检查是否抓取成功");
@@ -105,7 +104,7 @@ fn demonstrate_gripper_api() {
     println!("   // 对于精密操作，逐步闭合");
     println!("   for position in (0..10).rev() {{");
     println!("       let pos = position as f64 / 10.0;");
-    println!("       commander.set_gripper(pos, 0.4)?;");
+    println!("       robot.set_gripper(pos, 0.4)?;");
     println!("       thread::sleep(Duration::from_millis(50));");
     println!();
     println!("       // 检查是否接触到物体（位置不再变化）");
@@ -120,15 +119,15 @@ fn demonstrate_gripper_api() {
     println!("   🎯 场景 3: 力度感知");
     println!("   ```rust");
     println!("   // 软性物体使用低力度");
-    println!("   commander.set_gripper(0.3, 0.2)?;  // 轻柔夹持");
+    println!("   robot.set_gripper(0.3, 0.2)?;  // 轻柔夹持");
     println!();
     println!("   // 硬性物体使用高力度");
-    println!("   commander.set_gripper(0.2, 0.8)?;  // 牢固抓取");
+    println!("   robot.set_gripper(0.2, 0.8)?;  // 牢固抓取");
     println!();
     println!("   // 动态调整力度");
     println!("   let state = observer.gripper_state();");
     println!("   if state.position > 0.5 {{  // 物体较大");
-    println!("       commander.set_gripper(state.position, 0.6)?;");
+    println!("       robot.set_gripper(state.position, 0.6)?;");
     println!("   }}");
     println!("   ```\n");
 
@@ -163,20 +162,19 @@ fn demonstrate_gripper_api() {
     println!("}};");
     println!("use std::{{thread, time::Duration}};");
     println!();
-    println!("fn gripper_demo(piper: Piper<Active<MitMode>>) -> Result<()> {{");
-    println!("    let commander = piper.motion_commander();");
-    println!("    let observer = piper.observer();");
+    println!("fn gripper_demo(robot: Piper<Active<MitMode>>) -> Result<()> {{");
+    println!("    let observer = robot.observer();");
     println!();
     println!("    // 1. 打开夹爪");
     println!("    println!(\"打开夹爪...\");");
-    println!("    commander.open_gripper()?;");
+    println!("    robot.open_gripper()?;");
     println!("    thread::sleep(Duration::from_millis(500));");
     println!();
     println!("    // 2. 逐步闭合");
     println!("    println!(\"逐步闭合...\");");
     println!("    for i in (0..=10).rev() {{");
     println!("        let pos = i as f64 / 10.0;");
-    println!("        commander.set_gripper(pos, 0.5)?;");
+    println!("        robot.set_gripper(pos, 0.5)?;");
     println!();
     println!("        let state = observer.gripper_state();");
     println!("        println!(\"位置: {{:.2}}, 力度: {{:.2}}\", ");
@@ -187,12 +185,12 @@ fn demonstrate_gripper_api() {
     println!();
     println!("    // 3. 完全闭合");
     println!("    println!(\"完全闭合...\");");
-    println!("    commander.close_gripper(0.7)?;");
+    println!("    robot.close_gripper(0.7)?;");
     println!("    thread::sleep(Duration::from_millis(300));");
     println!();
     println!("    // 4. 再次打开");
     println!("    println!(\"重新打开...\");");
-    println!("    commander.open_gripper()?;");
+    println!("    robot.open_gripper()?;");
     println!();
     println!("    Ok(())");
     println!("}}");

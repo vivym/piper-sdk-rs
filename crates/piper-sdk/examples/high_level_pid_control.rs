@@ -5,7 +5,7 @@
 //! # 运行
 //!
 //! ```bash
-//! cargo run --example high_level_pid_control
+//! cargo run -p piper-sdk --example high_level_pid_control
 //! ```
 
 use piper_sdk::client::ControlSnapshot;

@@ -2,6 +2,12 @@
 //!
 //! This example keeps hardware ownership inside the controller process and
 //! attaches the non-realtime bridge host to that in-process controller surface.
+//!
+//! - Linux defaults to `socketcan:can0`
+//! - Other platforms default to `gs_usb_auto()`
+//! - Unix defaults to a UDS listener at `/tmp/piper_bridge.sock`
+//! - Non-Unix platforms must pass `--tcp-tls`, `--tls-server-cert`,
+//!   `--tls-server-key`, and `--tls-client-ca`
 
 use clap::Parser;
 use piper_sdk::{
@@ -15,11 +21,11 @@ use std::path::PathBuf;
 #[command(about = "Run the non-realtime bridge host inside the controller process")]
 struct Args {
     /// Linux SocketCAN interface, e.g. can0.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "gs_usb_serial")]
     socketcan: Option<String>,
 
     /// GS-USB serial number.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "socketcan")]
     gs_usb_serial: Option<String>,
 
     /// CAN bitrate in bps.
@@ -27,8 +33,9 @@ struct Args {
     bitrate: u32,
 
     /// Unix stream socket path.
-    #[arg(long, default_value = "/tmp/piper_bridge.sock")]
-    uds: String,
+    #[cfg_attr(unix, arg(long, default_value = "/tmp/piper_bridge.sock"))]
+    #[cfg_attr(not(unix), arg(long))]
+    uds: Option<String>,
 
     /// Granted bridge role for the UDS listener: observer | writer-candidate.
     #[arg(long, default_value = "observer")]
@@ -76,13 +83,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let uds_role = parse_bridge_role(&args.uds_role)?;
 
+    #[cfg(not(target_os = "linux"))]
+    if args.socketcan.is_some() {
+        return Err("--socketcan is only supported on Linux".into());
+    }
+    #[cfg(not(unix))]
+    if args.uds.is_some() {
+        return Err("--uds is only supported on Unix platforms".into());
+    }
+    #[cfg(not(unix))]
+    if args.tcp_tls.is_none() {
+        return Err(
+            "non-Unix platforms require --tcp-tls because UDS listeners are unavailable".into(),
+        );
+    }
+
     let mut builder = PiperBuilder::new().baud_rate(args.bitrate);
     if let Some(iface) = args.socketcan {
         builder = builder.socketcan(iface);
     } else if let Some(serial) = args.gs_usb_serial {
         builder = builder.gs_usb_serial(serial);
     } else {
-        builder = builder.gs_usb_auto();
+        #[cfg(target_os = "linux")]
+        {
+            builder = builder.socketcan("can0");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            builder = builder.gs_usb_auto();
+        }
     }
 
     let piper = builder.build()?;
@@ -112,8 +141,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let host_config = BridgeHostConfig {
-        uds: Some(BridgeUdsListenerConfig {
-            path: PathBuf::from(args.uds),
+        uds: args.uds.map(|path| BridgeUdsListenerConfig {
+            path: PathBuf::from(path),
             granted_role: uds_role,
         }),
         tcp_tls,

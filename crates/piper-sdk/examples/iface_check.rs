@@ -2,26 +2,26 @@
 //!
 //! 用法：
 //! - 默认检查 can0：
-//!   cargo run --example iface_check
+//!   cargo run -p piper-sdk --example iface_check
 //! - 指定接口名：
-//!   cargo run --example iface_check -- vcan0
+//!   cargo run -p piper-sdk --example iface_check -- vcan0
 //! - 指定轮询间隔（毫秒）：
-//!   cargo run --example iface_check -- vcan0 500
+//!   cargo run -p piper-sdk --example iface_check -- vcan0 500
 //!
 //! 你可以在另一个终端手动切换接口状态，然后观察此程序输出：
 //!   sudo ip link set up can0
 //!   sudo ip link set down can0
 
 #[cfg(not(target_os = "linux"))]
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
     piper_sdk::init_logger!();
 
-    eprintln!("该示例仅支持 Linux（SocketCAN）。");
+    Err("该示例仅支持 Linux（SocketCAN）。".into())
 }
 
 #[cfg(target_os = "linux")]
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
     piper_sdk::init_logger!();
 

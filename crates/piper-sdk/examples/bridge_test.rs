@@ -2,8 +2,13 @@
 //!
 //! 该示例通过 UDS/TCP-TLS stream 连接内嵌式 bridge host，用于 bridge/debug/replay。
 //! 它不是 MIT / 双臂 / fault-stop 的实时控制路径。
+//!
+//! - Unix 平台默认连接 `/tmp/piper_bridge.sock`
+//! - 非 Unix 平台必须显式传 `--endpoint`
+//! - TCP/TLS endpoint 需要同时传 `--tls-ca` / `--tls-client-cert`
+//!   / `--tls-client-key` / `--tls-server-name`
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use piper_sdk::{
     BridgeClientOptions, BridgeEndpoint, BridgeEvent, BridgeRole, BridgeTlsClientConfig,
     PiperBridgeClient, PiperFrame, SessionToken,
@@ -23,12 +28,13 @@ struct Args {
     ///
     /// Unix: /tmp/piper_bridge.sock
     /// TCP: 127.0.0.1:18888
+    /// Non-Unix platforms must pass this explicitly.
     #[arg(long)]
     endpoint: Option<String>,
 
     /// Mode: status | send | receive | interactive
-    #[arg(long, default_value = "status")]
-    mode: String,
+    #[arg(long, value_enum, default_value_t = BridgeTestMode::Status)]
+    mode: BridgeTestMode,
 
     /// Number of frames to send or receive.
     #[arg(long, default_value = "10")]
@@ -59,6 +65,14 @@ struct Args {
     tls_server_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BridgeTestMode {
+    Status,
+    Send,
+    Receive,
+    Interactive,
+}
+
 fn default_endpoint() -> String {
     #[cfg(unix)]
     {
@@ -67,6 +81,20 @@ fn default_endpoint() -> String {
     #[cfg(not(unix))]
     {
         "127.0.0.1:18888".to_string()
+    }
+}
+
+fn resolved_endpoint_arg(
+    endpoint: Option<&str>,
+    unix_supported: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match endpoint {
+        Some(value) => Ok(value.to_string()),
+        None if unix_supported => Ok(default_endpoint()),
+        None => Err(
+            "non-Unix platforms require an explicit --endpoint for bridge_test; TCP/TLS endpoints also require --tls-ca, --tls-client-cert, --tls-client-key, and --tls-server-name"
+                .into(),
+        ),
     }
 }
 
@@ -119,6 +147,8 @@ fn maybe_tls_config(
 fn token_cache_dir() -> PathBuf {
     if let Some(xdg_cache_home) = std::env::var_os("XDG_CACHE_HOME") {
         PathBuf::from(xdg_cache_home).join("piper-sdk").join("bridge_tokens")
+    } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        PathBuf::from(local_app_data).join("piper-sdk").join("bridge_tokens")
     } else if let Some(home) = std::env::var_os("HOME") {
         PathBuf::from(home).join(".cache").join("piper-sdk").join("bridge_tokens")
     } else {
@@ -235,12 +265,14 @@ fn run_receive(
     count: u32,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for index in 0..count {
+    let mut received = 0;
+    while received < count {
         match client.recv_event(timeout)? {
             BridgeEvent::ReceiveFrame(frame) => {
+                received += 1;
                 println!(
                     "recv #{:03}: id=0x{:03X} len={} data={:02X?} ts_us={}",
-                    index + 1,
+                    received,
                     frame.id,
                     frame.len,
                     &frame.data[..frame.len as usize],
@@ -260,6 +292,31 @@ fn run_receive(
         }
     }
     Ok(())
+}
+
+fn parse_interactive_send_frame(parts: &[&str]) -> Result<PiperFrame, Box<dyn std::error::Error>> {
+    let id = u32::from_str_radix(parts[1].trim_start_matches("0x"), 16)?;
+    if id > 0x7FF {
+        return Err(format!("standard CAN ID must be <= 0x7FF, got 0x{id:X}").into());
+    }
+
+    let data_tokens = &parts[2..];
+    if data_tokens.len() > 8 {
+        return Err("at most 8 data bytes are allowed".into());
+    }
+
+    let mut data = [0u8; 8];
+    for (index, token) in data_tokens.iter().enumerate() {
+        data[index] = u8::from_str_radix(token.trim_start_matches("0x"), 16)?;
+    }
+
+    Ok(PiperFrame {
+        id,
+        data,
+        len: data_tokens.len() as u8,
+        is_extended: false,
+        timestamp_us: 0,
+    })
 }
 
 fn run_interactive(
@@ -289,24 +346,11 @@ fn run_interactive(
                     println!("usage: send <id-hex> <b0> [b1..b7]");
                     continue;
                 }
-                let id = u32::from_str_radix(parts[1].trim_start_matches("0x"), 16)?;
-                let mut data = [0u8; 8];
-                let mut len = 0u8;
-                for (index, token) in parts.iter().skip(2).take(8).enumerate() {
-                    data[index] = u8::from_str_radix(token.trim_start_matches("0x"), 16)?;
-                    len += 1;
-                }
-                let frame = PiperFrame {
-                    id,
-                    data,
-                    len,
-                    is_extended: false,
-                    timestamp_us: 0,
-                };
+                let frame = parse_interactive_send_frame(&parts)?;
                 let mut lease = client.acquire_maintenance_lease(Duration::from_millis(500))?;
                 lease.send_frame(frame)?;
                 lease.release()?;
-                println!("sent frame id=0x{:03X}", id);
+                println!("sent frame id=0x{:03X}", frame.id);
             },
             "quit" | "exit" => break,
             other => println!("unknown command: {}", other),
@@ -315,35 +359,64 @@ fn run_interactive(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_interactive_send_frame_rejects_standard_id_overflow() {
+        let parts = vec!["send", "800", "01"];
+        assert!(parse_interactive_send_frame(&parts).is_err());
+    }
+
+    #[test]
+    fn parse_interactive_send_frame_rejects_more_than_eight_data_bytes() {
+        let parts = vec![
+            "send", "123", "00", "01", "02", "03", "04", "05", "06", "07", "08",
+        ];
+        assert!(parse_interactive_send_frame(&parts).is_err());
+    }
+
+    #[test]
+    fn resolved_endpoint_arg_rejects_missing_non_unix_default() {
+        assert!(resolved_endpoint_arg(None, false).is_err());
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let endpoint = args.endpoint.clone().unwrap_or_else(default_endpoint);
+    let endpoint = resolved_endpoint_arg(args.endpoint.as_deref(), cfg!(unix))?;
     let timeout = Duration::from_millis(args.timeout_ms);
 
     println!("Piper bridge test client");
     println!("endpoint: {}", endpoint);
     println!("non-realtime bridge/debug path only");
 
-    let role = if matches!(args.mode.as_str(), "send" | "interactive") {
+    let role = if matches!(
+        args.mode,
+        BridgeTestMode::Send | BridgeTestMode::Interactive
+    ) {
         BridgeRole::WriterCandidate
     } else {
         BridgeRole::Observer
     };
     let mut client = connect_client(&endpoint, &args, role, timeout)?;
-    if matches!(args.mode.as_str(), "receive" | "interactive") {
+    if matches!(
+        args.mode,
+        BridgeTestMode::Receive | BridgeTestMode::Interactive
+    ) {
         client.set_raw_frame_tap(true)?;
     }
 
-    match args.mode.as_str() {
-        "status" => print_status(&mut client)?,
-        "send" => run_send(
+    match args.mode {
+        BridgeTestMode::Status => print_status(&mut client)?,
+        BridgeTestMode::Send => run_send(
             &mut client,
             args.count,
             Duration::from_millis(args.interval_ms),
         )?,
-        "receive" => run_receive(&mut client, args.count, timeout)?,
-        "interactive" => run_interactive(&mut client, timeout)?,
-        other => return Err(format!("unsupported mode: {}", other).into()),
+        BridgeTestMode::Receive => run_receive(&mut client, args.count, timeout)?,
+        BridgeTestMode::Interactive => run_interactive(&mut client, timeout)?,
     }
 
     Ok(())

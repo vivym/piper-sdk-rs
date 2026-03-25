@@ -2,7 +2,7 @@
 //!
 //! 用于诊断设备扫描和初始化问题
 //!
-//! 运行方式：`cargo test --test gs_usb_debug_scan -- --ignored --nocapture`
+//! 运行方式：`cargo test -p piper-sdk --test gs_usb_debug_scan -- --ignored --nocapture`
 
 use rusb::{Context, UsbContext};
 

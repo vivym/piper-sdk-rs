@@ -7,7 +7,7 @@
 //! 运行方式：
 //! ```bash
 //! # 串行运行所有测试
-//! cargo test --test gs_usb_performance_tests -- --ignored --test-threads=1
+//! cargo test -p piper-sdk --test gs_usb_performance_tests -- --ignored --test-threads=1
 //! ```
 
 // GS-USB 模块在所有平台可用
