@@ -2,18 +2,18 @@
 //!
 //! 本模块提供基于 Channel 的异步录制钩子，用于高性能 CAN 帧录制。
 //!
-//! # 设计原则（v1.2.1）
+//! # 设计原则
 //!
-//! - **Bounded Queue**: 使用 `bounded(10000)` 防止 OOM
+//! - **Bounded Queue**: 使用 `bounded(100_000)` 防止 OOM
 //! - **非阻塞**: 使用 `try_send`，队列满时丢帧而非阻塞
 //! - **丢帧监控**: 提供 `dropped_frames` 计数器
 //! - **时间戳精度**: 直接使用 `frame.timestamp_us`（硬件时间戳）
 //!
 //! # 性能分析
 //!
-//! - 队列容量: 10,000 帧（约 10 秒 @ 1kHz）
+//! - 队列容量: 100,000 帧（约 1.6 分钟 @ 1kHz，约 3.3 分钟 @ 500Hz）
 //! - 回调开销: <1μs (0.1%)
-//! - 内存占用: 每帧约 32 bytes → 队列总约 320 KB
+//! - 内存占用: 每帧约 32 bytes → 队列总约 3.2 MB
 //!
 //! # 使用示例
 //!
@@ -46,6 +46,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use piper_protocol::PiperFrame;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// 带时间戳的帧
 ///
@@ -78,7 +79,7 @@ impl From<&PiperFrame> for TimestampedFrame {
 
 /// 异步录制钩子（Actor 模式 + Bounded Queue）
 ///
-/// # 内存安全（v1.2.1 关键修正）
+/// # 内存安全
 ///
 /// 使用 **有界通道**（Bounded Channel）防止 OOM：
 /// - 容量: 100,000 帧（约 3.3 分钟 @ 500Hz）
@@ -87,9 +88,9 @@ impl From<&PiperFrame> for TimestampedFrame {
 ///
 /// # 设计理由
 ///
-/// ❌ **v1.1 错误设计**: `unbounded()` 可能导致 OOM
-/// ✅ **v1.2.1 正确设计**: `bounded(10000)` 优雅降级
-/// ✅ **v1.3.0 最新设计**: `bounded(100000)` 更长录制时长（约 3.3 分钟）
+/// - `unbounded()` 在慢消费场景下可能导致 OOM
+/// - `bounded(100_000)` 为短时磁盘抖动和后台分析线程提供足够缓冲
+/// - 队列满时通过丢帧计数器显式暴露背压，而不是把压力转成无限内存增长
 ///
 /// # 示例
 ///
@@ -126,6 +127,12 @@ pub struct AsyncRecordingHook {
     /// 停止条件：当收到此 CAN ID 时停止录制（None 表示不启用）
     stop_on_id: Option<u32>,
 
+    /// 停止条件：达到指定录制时长后自动停止。
+    stop_deadline: Option<Instant>,
+
+    /// 停止条件：成功录制指定数量的帧后自动停止。
+    stop_after_frame_count: Option<u64>,
+
     /// 停止请求标志（原子操作，用于跨线程通信）
     stop_requested: Arc<AtomicBool>,
 }
@@ -158,6 +165,16 @@ impl AsyncRecordingHook {
     /// ```
     #[must_use]
     pub fn new() -> (Self, Receiver<TimestampedFrame>) {
+        Self::with_auto_stop(None, None, None)
+    }
+
+    /// 创建新的录制钩子（带自动停止条件）
+    #[must_use]
+    pub fn with_auto_stop(
+        stop_on_id: Option<u32>,
+        stop_duration: Option<Duration>,
+        stop_after_frame_count: Option<u64>,
+    ) -> (Self, Receiver<TimestampedFrame>) {
         // ⚠️ 缓冲区大小：100,000 帧（约 3-4 分钟 @ 500Hz）
         // 内存占用：约 2.4MB（100k × 24 bytes/frame）
         // 风险提示：超过此时长会导致丢帧
@@ -167,7 +184,9 @@ impl AsyncRecordingHook {
             tx,
             dropped_frames: Arc::new(AtomicU64::new(0)),
             frame_counter: Arc::new(AtomicU64::new(0)),
-            stop_on_id: None,
+            stop_on_id,
+            stop_deadline: stop_duration.map(|duration| Instant::now() + duration),
+            stop_after_frame_count,
             stop_requested: Arc::new(AtomicBool::new(false)),
         };
 
@@ -194,17 +213,7 @@ impl AsyncRecordingHook {
     /// ```
     #[must_use]
     pub fn with_stop_condition(stop_on_id: Option<u32>) -> (Self, Receiver<TimestampedFrame>) {
-        let (tx, rx) = bounded(100_000);
-
-        let hook = Self {
-            tx,
-            dropped_frames: Arc::new(AtomicU64::new(0)),
-            frame_counter: Arc::new(AtomicU64::new(0)),
-            stop_on_id,
-            stop_requested: Arc::new(AtomicBool::new(false)),
-        };
-
-        (hook, rx)
+        Self::with_auto_stop(stop_on_id, None, None)
     }
 
     /// 获取停止请求标志（新增：v1.4）
@@ -333,6 +342,16 @@ impl FrameCallback for AsyncRecordingHook {
     #[inline]
     #[allow(clippy::collapsible_if)] // 嵌套 if 结构更清晰：先检查 Option，再比较 ID
     fn on_frame_received(&self, frame: &PiperFrame) {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(deadline) = self.stop_deadline
+            && Instant::now() >= deadline
+        {
+            self.stop_requested.store(true, Ordering::Release);
+            return;
+        }
+
         // ⚠️ 关键：这里运行在 CAN 接收线程中，必须极快
         // ✅ 性能优化：先记录所有帧（包括触发帧），再检查停止条件（v1.4 修正）
 
@@ -342,7 +361,12 @@ impl FrameCallback for AsyncRecordingHook {
             // ⚠️ 缓冲区满时，丢弃"新"帧，保留"旧"帧
             self.dropped_frames.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.frame_counter.fetch_add(1, Ordering::Relaxed);
+            let new_count = self.frame_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(limit) = self.stop_after_frame_count
+                && new_count >= limit
+            {
+                self.stop_requested.store(true, Ordering::Release);
+            }
         }
 
         // 2. 再检查停止条件（原子操作，极快）
@@ -362,12 +386,29 @@ impl FrameCallback for AsyncRecordingHook {
     /// 仅在 `tx.send()` 成功后调用，确保录制的是实际发送的帧。
     #[inline]
     fn on_frame_sent(&self, frame: &PiperFrame) {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(deadline) = self.stop_deadline
+            && Instant::now() >= deadline
+        {
+            self.stop_requested.store(true, Ordering::Release);
+            return;
+        }
+
         // ⏱️ 直接透传硬件时间戳
         let ts_frame = TimestampedFrame::from(frame);
 
         // 🛡️ 非阻塞发送
         if self.tx.try_send(ts_frame).is_err() {
             self.dropped_frames.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let new_count = self.frame_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(limit) = self.stop_after_frame_count
+                && new_count >= limit
+            {
+                self.stop_requested.store(true, Ordering::Release);
+            }
         }
     }
 }
@@ -454,6 +495,53 @@ mod tests {
         let received = rx.recv_timeout(Duration::from_millis(100)).unwrap();
         assert_eq!(received.timestamp_us, 54321);
         assert_eq!(received.id, 0x1A1);
+    }
+
+    #[test]
+    fn test_async_recording_hook_frame_count_auto_stop_stops_after_limit() {
+        let (hook, rx) = AsyncRecordingHook::with_auto_stop(None, None, Some(1));
+        let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+
+        let frame = PiperFrame {
+            id: 0x2A5,
+            data: [0; 8],
+            len: 8,
+            is_extended: false,
+            timestamp_us: 100,
+        };
+
+        callback.on_frame_received(&frame);
+        callback.on_frame_received(&PiperFrame {
+            timestamp_us: 200,
+            ..frame
+        });
+
+        let first = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(first.timestamp_us, 100);
+        assert!(
+            rx.try_recv().is_err(),
+            "second frame must be ignored after auto-stop"
+        );
+    }
+
+    #[test]
+    fn test_async_recording_hook_duration_auto_stop_stops_new_frames_after_deadline() {
+        let (hook, rx) = AsyncRecordingHook::with_auto_stop(None, Some(Duration::ZERO), None);
+        let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+
+        let frame = PiperFrame {
+            id: 0x2A5,
+            data: [0; 8],
+            len: 8,
+            is_extended: false,
+            timestamp_us: 100,
+        };
+
+        callback.on_frame_received(&frame);
+        assert!(
+            rx.try_recv().is_err(),
+            "expired duration stop must reject new frames"
+        );
     }
 
     #[test]

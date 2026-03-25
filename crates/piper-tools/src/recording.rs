@@ -10,7 +10,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
-/// Piper 录制文件 v1.0
+/// Piper 录制文件
 ///
 /// 格式：使用 bincode 序列化
 ///
@@ -38,7 +38,7 @@ impl PiperRecording {
     /// 创建新的录制
     pub fn new(metadata: RecordingMetadata) -> Self {
         Self {
-            version: 1,
+            version: 2,
             metadata,
             frames: Vec::new(),
         }
@@ -147,18 +147,23 @@ impl PiperRecording {
         let mut version = [0u8; 1];
         reader.read_exact(&mut version).context("读取版本失败")?;
 
-        if version[0] != 1 {
-            anyhow::bail!("不支持的录制文件版本: {}", version[0]);
-        }
-
         // 读取剩余数据
         let mut data = Vec::new();
         reader.read_to_end(&mut data).context("读取录制数据失败")?;
 
-        // 反序列化
-        let recording: PiperRecording = bincode::deserialize(&data).context("反序列化录制失败")?;
-
-        Ok(recording)
+        match version[0] {
+            1 => {
+                let legacy: LegacyPiperRecording =
+                    bincode::deserialize(&data).context("反序列化 v1 录制失败")?;
+                Ok(legacy.into())
+            },
+            2 => {
+                let recording: PiperRecording =
+                    bincode::deserialize(&data).context("反序列化录制失败")?;
+                Ok(recording)
+            },
+            other => anyhow::bail!("不支持的录制文件版本: {}", other),
+        }
     }
 }
 
@@ -177,6 +182,9 @@ pub struct RecordingMetadata {
     /// 平台信息
     pub platform: String,
 
+    /// 操作员
+    pub operator: String,
+
     /// 备注
     pub notes: String,
 }
@@ -191,7 +199,47 @@ impl RecordingMetadata {
             interface,
             bus_speed,
             platform: std::env::consts::OS.to_string(),
+            operator: String::new(),
             notes: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyPiperRecording {
+    version: u8,
+    metadata: LegacyRecordingMetadata,
+    frames: Vec<TimestampedFrame>,
+}
+
+impl From<LegacyPiperRecording> for PiperRecording {
+    fn from(legacy: LegacyPiperRecording) -> Self {
+        Self {
+            version: 2,
+            metadata: legacy.metadata.into(),
+            frames: legacy.frames,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyRecordingMetadata {
+    start_time: u64,
+    interface: String,
+    bus_speed: u32,
+    platform: String,
+    notes: String,
+}
+
+impl From<LegacyRecordingMetadata> for RecordingMetadata {
+    fn from(legacy: LegacyRecordingMetadata) -> Self {
+        Self {
+            start_time: legacy.start_time,
+            interface: legacy.interface,
+            bus_speed: legacy.bus_speed,
+            platform: legacy.platform,
+            operator: String::new(),
+            notes: legacy.notes,
         }
     }
 }
@@ -246,6 +294,7 @@ mod tests {
         let metadata = RecordingMetadata::new("can0".to_string(), 1_000_000);
         assert_eq!(metadata.interface, "can0");
         assert_eq!(metadata.bus_speed, 1_000_000);
+        assert_eq!(metadata.operator, "");
     }
 
     #[test]
@@ -386,7 +435,7 @@ mod tests {
         let loaded = PiperRecording::load(temp_path).unwrap();
 
         // 验证数据
-        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.version, 2);
         assert_eq!(loaded.frame_count(), 2);
         assert_eq!(loaded.frames[0].timestamp_us, 1000);
         assert_eq!(loaded.frames[0].can_id, 0x100);
@@ -396,5 +445,40 @@ mod tests {
         assert_eq!(loaded.frames[1].data, vec![5, 6, 7, 8]);
 
         // ✅ temp_file 在 drop 时自动删除，无需手动清理
+    }
+
+    #[test]
+    fn test_load_v1_recording_upgrades_metadata() {
+        let legacy = LegacyPiperRecording {
+            version: 1,
+            metadata: LegacyRecordingMetadata {
+                start_time: 123,
+                interface: "can0".to_string(),
+                bus_speed: 1_000_000,
+                platform: "linux".to_string(),
+                notes: "legacy".to_string(),
+            },
+            frames: vec![TimestampedFrame::new(
+                1000,
+                0x123,
+                vec![1, 2, 3],
+                TimestampSource::Hardware,
+            )],
+        };
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path();
+        let mut writer = BufWriter::new(File::create(temp_path).unwrap());
+        writer.write_all(MAGIC).unwrap();
+        writer.write_all(&[1]).unwrap();
+        writer.write_all(&bincode::serialize(&legacy).unwrap()).unwrap();
+        writer.flush().unwrap();
+
+        let loaded = PiperRecording::load(temp_path).unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.metadata.interface, "can0");
+        assert_eq!(loaded.metadata.notes, "legacy");
+        assert_eq!(loaded.metadata.operator, "");
+        assert_eq!(loaded.frame_count(), 1);
     }
 }

@@ -1,7 +1,7 @@
 use crate::{ControlProfile, MotionWaitConfig};
 use anyhow::{Result, bail};
 use piper_client::Observer;
-use piper_client::observer::{CollisionProtectionSnapshot, MonitorReadPolicy};
+use piper_client::observer::MonitorReadPolicy;
 use piper_client::state::{Active, DisableConfig, MotionCapability, Piper, PositionMode, Standby};
 use piper_client::types::RobotError;
 use piper_client::types::{JointArray, Rad};
@@ -174,16 +174,9 @@ where
         }
     }
 
-    let baseline = standby.collision_protection_cached().ok();
-    let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
-    let baseline_sys = baseline.as_ref().map_or(0, |state| state.host_rx_mono_us);
-
     verify_collision_protection_after_write(
-        baseline_hw,
-        baseline_sys,
         levels,
         wait,
-        || standby.collision_protection_cached().map_err(Into::into),
         |timeout| standby.query_collision_protection(timeout).map_err(Into::into),
         || standby.set_collision_protection(levels).map_err(Into::into),
     )
@@ -215,8 +208,19 @@ where
     Publish: FnMut() -> Result<()>,
     ShouldCancel: Fn() -> bool,
 {
+    let max_error = |current: [f64; 6]| {
+        current
+            .iter()
+            .zip(target.iter())
+            .map(|(current, target)| (target - current).abs())
+            .fold(0.0_f64, f64::max)
+    };
+
     if should_cancel() {
         return Ok(MotionExecutionOutcome::Cancelled);
+    }
+    if max_error(read_current()?) <= wait.threshold_rad {
+        return Ok(MotionExecutionOutcome::Reached);
     }
     publish()?;
     let start = Instant::now();
@@ -227,12 +231,7 @@ where
             return Ok(MotionExecutionOutcome::Cancelled);
         }
 
-        let current = read_current()?;
-        let max_error = current
-            .iter()
-            .zip(target.iter())
-            .map(|(current, target)| (target - current).abs())
-            .fold(0.0_f64, f64::max);
+        let max_error = max_error(read_current()?);
 
         if max_error <= wait.threshold_rad {
             return Ok(MotionExecutionOutcome::Reached);
@@ -259,17 +258,13 @@ where
     }
 }
 
-fn verify_collision_protection_after_write<ReadCached, Query, Publish>(
-    baseline_hw: u64,
-    baseline_sys: u64,
+fn verify_collision_protection_after_write<Query, Publish>(
     expected: [u8; 6],
     wait: &MotionWaitConfig,
-    mut read_cached: ReadCached,
     mut request_query: Query,
     mut publish: Publish,
 ) -> Result<()>
 where
-    ReadCached: FnMut() -> Result<CollisionProtectionSnapshot>,
     Query: FnMut(std::time::Duration) -> Result<[u8; 6]>,
     Publish: FnMut() -> Result<()>,
 {
@@ -278,11 +273,6 @@ where
     let mut last_query_at: Option<Instant> = None;
 
     loop {
-        let cached = read_cached()?;
-        if cached.is_newer_than(baseline_hw, baseline_sys) && cached.levels == expected {
-            return Ok(());
-        }
-
         let now = Instant::now();
         if now.duration_since(start) >= wait.timeout {
             bail!(
@@ -304,6 +294,7 @@ where
                 );
             }
             match request_query(query_timeout) {
+                Ok(levels) if levels == expected => return Ok(()),
                 Ok(_) => {},
                 Err(error)
                     if matches!(
@@ -395,45 +386,52 @@ mod tests {
     }
 
     #[test]
-    fn verify_collision_protection_after_write_accepts_post_write_cached_match() {
+    fn blocking_motion_loop_skips_publish_when_target_is_already_reached() {
+        let publishes = Arc::new(Mutex::new(0usize));
+        let wait = MotionWaitConfig {
+            threshold_rad: 0.01,
+            poll_interval: Duration::from_millis(1),
+            republish_interval: Duration::from_millis(1),
+            timeout: Duration::from_millis(50),
+        };
+
+        let outcome = blocking_motion_loop_with_cancel(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &wait,
+            || Ok([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            {
+                let publishes = Arc::clone(&publishes);
+                move || {
+                    *publishes.lock().unwrap() += 1;
+                    Ok(())
+                }
+            },
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, MotionExecutionOutcome::Reached);
+        assert_eq!(*publishes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn verify_collision_protection_after_write_accepts_query_match() {
         let wait = MotionWaitConfig {
             threshold_rad: 0.02,
             poll_interval: Duration::from_millis(1),
             republish_interval: Duration::from_millis(1),
             timeout: Duration::from_millis(20),
         };
-        let current = Arc::new(Mutex::new(CollisionProtectionSnapshot {
-            hardware_timestamp_us: 10,
-            host_rx_mono_us: 10,
-            levels: [0; 6],
-        }));
         let query_attempts = Arc::new(Mutex::new(0usize));
 
         verify_collision_protection_after_write(
-            10,
-            10,
             [4_u8; 6],
             &wait,
             {
-                let current = Arc::clone(&current);
-                move || Ok(*current.lock().unwrap())
-            },
-            {
-                let current = Arc::clone(&current);
                 let query_attempts = Arc::clone(&query_attempts);
                 move |_| {
-                    let mut attempts = query_attempts.lock().unwrap();
-                    *attempts += 1;
-                    if *attempts == 1 {
-                        *current.lock().unwrap() = CollisionProtectionSnapshot {
-                            hardware_timestamp_us: 11,
-                            host_rx_mono_us: 11,
-                            levels: [4_u8; 6],
-                        };
-                        Err(RobotError::Timeout { timeout_ms: 1 }.into())
-                    } else {
-                        Ok([4_u8; 6])
-                    }
+                    *query_attempts.lock().unwrap() += 1;
+                    Ok([4_u8; 6])
                 }
             },
             || Ok(()),
@@ -443,45 +441,62 @@ mod tests {
     }
 
     #[test]
-    fn verify_collision_protection_after_write_rejects_stale_matching_cache() {
+    fn verify_collision_protection_after_write_retries_after_query_timeout() {
         let wait = MotionWaitConfig {
             threshold_rad: 0.02,
             poll_interval: Duration::from_millis(1),
             republish_interval: Duration::from_millis(1),
             timeout: Duration::from_millis(20),
         };
-        let reads = Arc::new(Mutex::new(0usize));
+        let query_attempts = Arc::new(Mutex::new(0usize));
 
         verify_collision_protection_after_write(
-            20,
-            20,
             [5_u8; 6],
             &wait,
             {
-                let reads = Arc::clone(&reads);
-                move || {
-                    let mut read_count = reads.lock().unwrap();
-                    *read_count += 1;
-                    if *read_count < 3 {
-                        Ok(CollisionProtectionSnapshot {
-                            hardware_timestamp_us: 20,
-                            host_rx_mono_us: 20,
-                            levels: [5_u8; 6],
-                        })
+                let query_attempts = Arc::clone(&query_attempts);
+                move |_| {
+                    let mut attempts = query_attempts.lock().unwrap();
+                    *attempts += 1;
+                    if *attempts < 3 {
+                        Err(RobotError::Timeout { timeout_ms: 1 }.into())
                     } else {
-                        Ok(CollisionProtectionSnapshot {
-                            hardware_timestamp_us: 21,
-                            host_rx_mono_us: 21,
-                            levels: [5_u8; 6],
-                        })
+                        Ok([5_u8; 6])
                     }
                 }
             },
-            |_| Err(RobotError::Timeout { timeout_ms: 1 }.into()),
             || Ok(()),
         )
         .unwrap();
 
-        assert!(*reads.lock().unwrap() >= 3);
+        assert_eq!(*query_attempts.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn verify_collision_protection_after_write_rejects_mismatched_query_result() {
+        let wait = MotionWaitConfig {
+            threshold_rad: 0.02,
+            poll_interval: Duration::from_millis(1),
+            republish_interval: Duration::from_millis(1),
+            timeout: Duration::from_millis(10),
+        };
+        let query_attempts = Arc::new(Mutex::new(0usize));
+
+        let error = verify_collision_protection_after_write(
+            [6_u8; 6],
+            &wait,
+            {
+                let query_attempts = Arc::clone(&query_attempts);
+                move |_| {
+                    *query_attempts.lock().unwrap() += 1;
+                    Ok([5_u8; 6])
+                }
+            },
+            || Ok(()),
+        )
+        .expect_err("mismatched query response must not verify the write");
+
+        assert!(error.to_string().contains("collision protection verification timed out"));
+        assert!(*query_attempts.lock().unwrap() >= 1);
     }
 }

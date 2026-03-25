@@ -5,7 +5,7 @@
 //! # 设计理念
 //!
 //! 这是一个**受限的逃生舱**（Escape Hatch），暴露了底层 driver 的部分功能：
-//! - ✅ 可以访问 context.hooks（注册自定义回调）
+//! - ✅ 可以通过 `register_callback()` / `unregister_callback()` / `driver().hooks()` 管理自定义回调
 //! - ✅ 可以访问 send_frame（发送原始 CAN 帧）
 //! - ❌ 不能直接调用 enable/disable（保持状态机安全）
 //!
@@ -63,7 +63,8 @@
 //! let (hook, rx) = AsyncRecordingHook::new();
 //!
 //! // 注册钩子
-//! diag.register_callback(Arc::new(hook))?;
+//! let hook_handle = diag.register_callback(Arc::new(hook))?;
+//! # let _ = hook_handle;
 //!
 //! // 在后台线程处理录制数据
 //! std::thread::spawn(move || {
@@ -71,6 +72,9 @@
 //!         println!("Received CAN frame: 0x{:03X}", frame.id);
 //!     }
 //! });
+//!
+//! // 清理时显式解绑
+//! let _removed = diag.unregister_callback(hook_handle)?;
 //! # Ok(())
 //! # }
 //!
@@ -139,7 +143,7 @@
 //! ```
 
 use piper_can::PiperFrame;
-use piper_driver::FrameCallback;
+use piper_driver::{FrameCallback, HookHandle};
 use std::sync::Arc;
 
 // 使用 Result 类型别名（使用 crate 的 RobotError）
@@ -201,7 +205,8 @@ impl PiperDiagnostics {
     /// let diag = active.diagnostics();
     ///
     /// let (hook, _rx) = AsyncRecordingHook::new();
-    /// diag.register_callback(Arc::new(hook))?;
+    /// let hook_handle = diag.register_callback(Arc::new(hook))?;
+    /// # let _ = hook_handle;
     /// # Ok(())
     /// # }
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -220,15 +225,31 @@ impl PiperDiagnostics {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn register_callback(&self, callback: Arc<dyn FrameCallback>) -> Result<()> {
-        self.driver
+    pub fn register_callback(&self, callback: Arc<dyn FrameCallback>) -> Result<HookHandle> {
+        let handle = self
+            .driver
             .hooks()
             .write()
             .map_err(|_e| {
                 crate::RobotError::Infrastructure(piper_driver::DriverError::PoisonedLock)
             })?
             .add_callback(callback);
-        Ok(())
+        Ok(handle)
+    }
+
+    /// 注销先前注册的 FrameCallback。
+    ///
+    /// 返回值为 `true` 表示确实移除了该句柄；`false` 表示该句柄已经不存在。
+    pub fn unregister_callback(&self, handle: HookHandle) -> Result<bool> {
+        let removed = self
+            .driver
+            .hooks()
+            .write()
+            .map_err(|_e| {
+                crate::RobotError::Infrastructure(piper_driver::DriverError::PoisonedLock)
+            })?
+            .remove_callback(handle);
+        Ok(removed)
     }
 
     /// 发送原始 CAN 帧

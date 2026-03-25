@@ -514,7 +514,9 @@ fn maintenance_send_denial(
 }
 
 fn maintenance_dispatch_committed(dispatch: &MaintenanceLaneDispatch) {
-    let _ = dispatch.ack.send(MaintenanceSendPhase::Committed);
+    let _ = dispatch.ack.send(MaintenanceSendPhase::Committed {
+        host_commit_mono_us: crate::heartbeat::monotonic_micros().max(1),
+    });
 }
 
 fn finish_maintenance_dispatch(
@@ -1801,7 +1803,9 @@ pub(crate) fn tx_loop_mailbox(
                         break;
                     }
                     if let Some(ack) = ack.as_ref() {
-                        let _ = ack.send(crate::command::DeliveryPhase::Committed);
+                        let _ = ack.send(crate::command::DeliveryPhase::Committed {
+                            host_commit_mono_us: crate::heartbeat::monotonic_micros().max(1),
+                        });
                     }
                     committed = true;
                 }
@@ -2100,7 +2104,9 @@ pub(crate) fn tx_loop_mailbox(
                         break;
                     }
                     if let Some(ack) = ack.as_ref() {
-                        let _ = ack.send(crate::command::DeliveryPhase::Committed);
+                        let _ = ack.send(crate::command::DeliveryPhase::Committed {
+                            host_commit_mono_us: crate::heartbeat::monotonic_micros().max(1),
+                        });
                     }
                     committed = true;
                 }

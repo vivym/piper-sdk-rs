@@ -31,6 +31,9 @@
 pub mod can {
     #[cfg(feature = "mock")]
     pub use piper_can::MockCanAdapter;
+    #[cfg(target_os = "linux")]
+    pub use piper_can::SocketCanAdapter;
+    pub use piper_can::gs_usb::GsUsbCanAdapter;
     pub use piper_can::{
         BridgeTxAdapter, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame,
         RealtimeTxAdapter, RxAdapter, SplittableAdapter,
@@ -167,12 +170,11 @@ pub type Driver = driver::Piper; // 高级用户可以使用这个别名
 ///     // 在 main 函数开头初始化日志
 ///     piper_sdk::init_logger!();
 ///
-///     // 连接机器人
-///     let driver = PiperBuilder::new().socketcan("can0").build()?;
+///     // 连接机器人（顶层 builder 返回 ConnectedPiper facade）
+///     let robot = PiperBuilder::new().socketcan("can0").build()?;
+///     tracing::info!("Connected via {:?}", robot.backend_capability());
 ///
 ///     // 现在可以使用 tracing::info!, tracing::warn! 等宏
-///     tracing::info!("Connected to robot");
-///
 ///     Ok(())
 /// }
 /// ```

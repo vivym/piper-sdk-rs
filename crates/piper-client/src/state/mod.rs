@@ -26,13 +26,22 @@
 //! # 使用示例
 //!
 //! ```rust,ignore
-//! # use piper_client::{PiperBuilder, state::MitModeConfig, types::*};
-//! # fn example() -> Result<()> {
-//! // 连接
-//! let robot = PiperBuilder::new().socketcan("can0").build()?; // Piper<Standby>
+//! # use piper_client::{
+//! #     MotionConnectedPiper, MotionConnectedState, PiperBuilder, state::MitModeConfig, types::*,
+//! # };
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let connected = PiperBuilder::new().socketcan("can0").build()?.require_motion()?;
+//! let standby = match connected {
+//!     MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => robot,
+//!     MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => robot,
+//!     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+//!     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+//!         return Err("robot is not in confirmed Standby".into());
+//!     }
+//! };
 //!
 //! // 使能 MIT 模式
-//! let robot = robot.enable_mit_mode(MitModeConfig::default())?; // Piper<Active<MitMode>>
+//! let robot = standby.enable_mit_mode(MitModeConfig::default())?;
 //!
 //! // 发送命令
 //! let positions = JointArray::splat(Rad(1.0));
@@ -43,9 +52,7 @@
 //! robot.command_torques(&positions, &velocities, &kp, &kd, &torques)?;
 //!
 //! // 失能
-//! let _robot = robot.disable()?; // Piper<Standby>
-//!
-//! // Drop 自动失能
+//! let _robot = robot.disable()?;
 //! # Ok(())
 //! # }
 //! ```

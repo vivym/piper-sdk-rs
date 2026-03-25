@@ -327,35 +327,41 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
-    /// 查询当前碰撞保护级别。
-    pub(crate) fn query_collision_protection(&self) -> Result<()> {
+    pub(crate) fn query_collision_protection_confirmed(&self, timeout: Duration) -> Result<u64> {
         use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
 
         let frame = ParameterQuerySetCommand::query(ParameterQueryType::CollisionProtectionLevel)
             .to_frame()
             .map_err(RobotError::from)?;
-        self.driver.send_reliable(frame)?;
-        Ok(())
+        Ok(self.driver.send_reliable_frame_confirmed_commit_marker(frame, timeout)?)
     }
 
-    /// 请求设置关节零位
+    /// 请求设置关节零位，并等待请求至少完成 confirmed reliable 发送。
     ///
     /// 请求将指定关节的当前位置设为零点。
     ///
     /// # 参数
     ///
     /// - `joints`: 要设置零位的关节索引数组（0-based，0-5 对应 J1-J6）
+    /// - `timeout`: 等待 confirmed reliable 提交的最长时间
     ///
     /// # 示例
     ///
     /// ```ignore
     /// // 设置 J1 的当前位置为零点
-    /// raw_commander.request_joint_zero_positions(&[0])?;
+    /// raw_commander.request_joint_zero_positions_confirmed(&[0], Duration::from_secs(2))?;
     ///
     /// // 设置所有关节的零位
-    /// raw_commander.request_joint_zero_positions(&[0, 1, 2, 3, 4, 5])?;
+    /// raw_commander.request_joint_zero_positions_confirmed(
+    ///     &[0, 1, 2, 3, 4, 5],
+    ///     Duration::from_secs(2),
+    /// )?;
     /// ```
-    pub(crate) fn request_joint_zero_positions(&self, joints: &[usize]) -> Result<()> {
+    pub(crate) fn request_joint_zero_positions_confirmed(
+        &self,
+        joints: &[usize],
+        timeout: Duration,
+    ) -> Result<()> {
         use piper_protocol::config::JointSettingCommand;
 
         if joints.is_empty() {
@@ -383,7 +389,7 @@ impl<'a> RawCommander<'a> {
             },
         };
 
-        self.driver.send_reliable(cmd.to_frame())?;
+        self.driver.send_reliable_package_confirmed([cmd.to_frame()], timeout)?;
         Ok(())
     }
 }
@@ -551,7 +557,7 @@ mod tests {
         let commander = RawCommander::new(&driver);
 
         commander
-            .query_collision_protection()
+            .query_collision_protection_confirmed(Duration::from_secs(2))
             .expect("collision protection query should succeed");
 
         let frames = wait_for_sent_frames(&sent_frames, 1);
@@ -571,7 +577,7 @@ mod tests {
         let commander = RawCommander::new(&driver);
 
         commander
-            .request_joint_zero_positions(&[0])
+            .request_joint_zero_positions_confirmed(&[0], Duration::from_secs(2))
             .expect("single-joint zeroing request should succeed");
 
         let frames = wait_for_sent_frames(&sent_frames, 1);
@@ -588,7 +594,7 @@ mod tests {
         let commander = RawCommander::new(&driver);
 
         commander
-            .request_joint_zero_positions(&[0, 1, 2, 3, 4, 5])
+            .request_joint_zero_positions_confirmed(&[0, 1, 2, 3, 4, 5], Duration::from_secs(2))
             .expect("all-joint zeroing request should succeed");
 
         let frames = wait_for_sent_frames(&sent_frames, 1);
@@ -605,7 +611,7 @@ mod tests {
         let commander = RawCommander::new(&driver);
 
         let error = commander
-            .request_joint_zero_positions(&[0, 1])
+            .request_joint_zero_positions_confirmed(&[0, 1], Duration::from_secs(2))
             .expect_err("2-5 joint subsets should be rejected without partial submission");
 
         assert!(matches!(error, RobotError::ConfigError(_)));

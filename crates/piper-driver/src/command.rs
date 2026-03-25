@@ -52,7 +52,7 @@ pub type FrameBuffer = SmallVec<[PiperFrame; 6]>;
 /// - 消除 CPU 分支预测压力
 #[derive(Debug)]
 pub enum DeliveryPhase {
-    Committed,
+    Committed { host_commit_mono_us: u64 },
     Finished(Result<(), DriverError>),
 }
 

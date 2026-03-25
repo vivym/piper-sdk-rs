@@ -45,7 +45,9 @@ pub struct Standby;
 /// 维护状态
 ///
 /// 已连接但不保证全关节失能，允许执行局部使能/失能等维护操作。
-pub struct Maintenance;
+pub struct Maintenance {
+    pending_disable_commit_host_mono_us: Option<u64>,
+}
 
 /// 活动状态（带控制模式）
 ///
@@ -108,21 +110,26 @@ pub struct ErrorState;
 /// # 示例
 ///
 /// ```rust,ignore
-/// # use piper_client::{PiperBuilder};
+/// # use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
 /// # fn main() -> anyhow::Result<()> {
-/// let robot = PiperBuilder::new()
+/// let connected = PiperBuilder::new()
 ///     .socketcan("can0")
-///     .build()?;
-///
-/// let standby = robot.connect()?;
+///     .build()?
+///     .require_motion()?;
+/// let standby = match connected {
+///     MotionConnectedPiper::Strict(MotionConnectedState::Standby(robot)) => robot,
+///     MotionConnectedPiper::Soft(MotionConnectedState::Standby(robot)) => robot,
+///     MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+///     | MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+///         anyhow::bail!("robot is not in confirmed Standby");
+///     }
+/// };
 ///
 /// // 进入回放模式
 /// let replay = standby.enter_replay_mode()?;
 ///
 /// // 回放录制（1.0x 速度，原始速度）
-/// let standby = replay.replay_recording("recording.bin", 1.0)?;
-///
-/// // 回放完成后自动返回 Standby 状态
+/// let _standby = replay.replay_recording("recording.bin", 1.0)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -136,12 +143,6 @@ struct ModeConfirmationExpectation {
     mit_mode: u8,
     install_position: u8,
     trajectory_stay_time: u8,
-}
-
-#[derive(Clone)]
-struct ModeConfirmationBaseline {
-    robot_control: piper_driver::RobotControlState,
-    mode_echo: piper_driver::MasterSlaveControlModeState,
 }
 
 #[derive(Clone, Copy)]
@@ -313,7 +314,7 @@ pub struct PositionModeConfig {
     /// 默认为 `Joint`（关节空间运动），保持向后兼容。
     ///
     /// **重要**：必须根据 `motion_type` 使用对应的控制方法：
-    /// - `Joint`: 使用 `command_joint_positions()` 或 `motion_commander().send_position_command()`
+    /// - `Joint`: 使用 `send_position_command()` 或 `command_position_from_snapshot()`
     /// - `Cartesian`/`Linear`: 使用 `command_cartesian_pose()`
     /// - `Circular`: 使用 `move_circular()` 方法
     /// - `ContinuousPositionVelocity`: 待实现
@@ -484,7 +485,7 @@ where
 fn wait_for_fresh_collision_protection_update<SendQuery, ReadCached>(
     timeout: Duration,
     poll_interval: Duration,
-    baseline: Option<CollisionProtectionSnapshot>,
+    min_host_rx_mono_us: u64,
     mut send_query: SendQuery,
     mut read_cached: ReadCached,
 ) -> Result<CollisionProtectionSnapshot>
@@ -492,15 +493,12 @@ where
     SendQuery: FnMut() -> Result<()>,
     ReadCached: FnMut() -> Result<CollisionProtectionSnapshot>,
 {
-    let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
-    let baseline_sys = baseline.as_ref().map_or(0, |state| state.host_rx_mono_us);
-
     send_query()?;
 
     let start = Instant::now();
     loop {
         let state = read_cached()?;
-        if state.is_newer_than(baseline_hw, baseline_sys) {
+        if state.host_rx_mono_us > min_host_rx_mono_us {
             return Ok(state);
         }
 
@@ -590,7 +588,9 @@ where
             quirks,
             drop_policy: DropPolicy::DisableAll,
             driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
-            _state: Maintenance,
+            _state: Maintenance {
+                pending_disable_commit_host_mono_us: None,
+            },
         }),
     }
 }
@@ -789,18 +789,19 @@ where
 
         // 1. 发送使能指令
         let enable_cmd = MotorEnableCommand::enable_all();
-        self.driver.send_reliable(enable_cmd.to_frame())?;
+        let enable_commit_host_mono_us = self
+            .driver
+            .send_reliable_frame_confirmed_commit_marker(enable_cmd.to_frame(), config.timeout)?;
         debug!("Motor enable command sent");
 
         // 2. 等待使能完成（带 Debounce）
         self.wait_for_enabled(
+            enable_commit_host_mono_us,
             config.timeout,
             config.debounce_threshold,
             config.poll_interval,
         )?;
         debug!("All motors enabled (debounced)");
-
-        let baseline = self.capture_mode_confirmation_baseline();
 
         // 3. 设置 MIT 模式
         let control_cmd = ControlModeCommandFrame::new(
@@ -811,9 +812,11 @@ where
             0,
             InstallPosition::Invalid,
         );
-        self.driver.send_reliable(control_cmd.to_frame())?;
+        let commit_host_mono_us = self
+            .driver
+            .send_reliable_frame_confirmed_commit_marker(control_cmd.to_frame(), config.timeout)?;
         self.wait_for_mode_confirmation(
-            baseline,
+            commit_host_mono_us,
             config.timeout,
             config.poll_interval,
             ModeConfirmationExpectation {
@@ -864,17 +867,19 @@ where
 
         // 1. 发送使能指令
         let enable_cmd = MotorEnableCommand::enable_all();
-        self.driver.send_reliable(enable_cmd.to_frame())?;
+        let enable_commit_host_mono_us = self
+            .driver
+            .send_reliable_frame_confirmed_commit_marker(enable_cmd.to_frame(), config.timeout)?;
         debug!("Motor enable command sent");
 
         // 2. 等待使能完成（带 Debounce）
         self.wait_for_enabled(
+            enable_commit_host_mono_us,
             config.timeout,
             config.debounce_threshold,
             config.poll_interval,
         )?;
         debug!("All motors enabled (debounced)");
-        let baseline = self.capture_mode_confirmation_baseline();
 
         // 3. 设置位置模式
         // ✅ 修改：使用配置的 motion_type
@@ -888,9 +893,11 @@ where
             0,
             config.install_position,
         );
-        self.driver.send_reliable(control_cmd.to_frame())?;
+        let commit_host_mono_us = self
+            .driver
+            .send_reliable_frame_confirmed_commit_marker(control_cmd.to_frame(), config.timeout)?;
         self.wait_for_mode_confirmation(
-            baseline,
+            commit_host_mono_us,
             config.timeout,
             config.poll_interval,
             ModeConfirmationExpectation {
@@ -933,7 +940,9 @@ where
     {
         transition_piper_state(
             self,
-            Maintenance,
+            Maintenance {
+                pending_disable_commit_host_mono_us: None,
+            },
             DropPolicy::DisableAll,
             DriverModeDropPolicy::Preserve,
         )
@@ -965,6 +974,7 @@ where
     /// 请不要在 `async` 上下文（如 Tokio）中直接调用此方法。
     fn wait_for_enabled(
         &self,
+        commit_host_mono_us: u64,
         timeout: Duration,
         debounce_threshold: usize,
         poll_interval: Duration,
@@ -983,7 +993,9 @@ where
             }
 
             // ✅ 直接从 Observer 读取状态（View 模式，零延迟）
-            if self.observer.is_all_enabled_confirmed() {
+            if self.driver.confirmed_driver_enabled_mask_after_host_mono(commit_host_mono_us)
+                == Some(0b11_1111)
+            {
                 // ✅ Debounce：连续 N 次读到 Enabled 才认为成功
                 stable_count += 1;
                 if stable_count >= debounce_threshold {
@@ -1000,7 +1012,7 @@ where
 
     fn wait_for_mode_confirmation(
         &self,
-        baseline: ModeConfirmationBaseline,
+        commit_host_mono_us: u64,
         timeout: Duration,
         poll_interval: Duration,
         expected: ModeConfirmationExpectation,
@@ -1018,16 +1030,13 @@ where
 
             let current = self.driver.get_robot_control();
             let mode_echo = self.driver.get_control_mode_echo();
-            let is_robot_state_fresh = current.hardware_timestamp_us
-                > baseline.robot_control.hardware_timestamp_us
-                || current.host_rx_mono_us > baseline.robot_control.host_rx_mono_us;
+            let is_robot_state_fresh = current.host_rx_mono_us > commit_host_mono_us;
             let is_robot_state_match = current.is_fully_enabled_confirmed()
                 && current.robot_status == RobotStatus::Normal as u8
                 && current.control_mode == expected.control_mode
                 && current.move_mode == expected.move_mode;
-            let is_mode_echo_fresh = mode_echo.is_valid
-                && (mode_echo.hardware_timestamp_us > baseline.mode_echo.hardware_timestamp_us
-                    || mode_echo.host_rx_mono_us > baseline.mode_echo.host_rx_mono_us);
+            let is_mode_echo_fresh =
+                mode_echo.is_valid && mode_echo.host_rx_mono_us > commit_host_mono_us;
             let is_mode_echo_match = mode_echo.control_mode == expected.control_mode
                 && mode_echo.move_mode == expected.move_mode
                 && mode_echo.speed_percent == expected.speed_percent
@@ -1063,7 +1072,8 @@ where
     /// # fn example() -> Result<()> {
     /// let standby = PiperBuilder::new()
     ///     .socketcan("can0")
-    ///     .build()?;
+    ///     .build()?
+    ///     .require_strict()?;
     ///
     /// // 启动录制
     /// let (standby, handle) = standby.start_recording(RecordingConfig {
@@ -1087,49 +1097,67 @@ where
         self,
         config: crate::recording::RecordingConfig,
     ) -> Result<(Self, crate::recording::RecordingHandle)> {
-        use crate::recording::{RecordingHandle, StopCondition};
+        use crate::recording::{
+            RecordingHandle, RecordingHandleParts, RecordingStopCondition, StopCondition,
+        };
 
-        // ✅ 提取 stop_on_id 从 StopCondition
         let stop_on_id = match &config.stop_condition {
             StopCondition::OnCanId(id) => Some(*id),
             _ => None,
         };
-
-        // ✅ 根据是否需要停止条件选择构造函数
-        let (hook, rx) = if let Some(id) = stop_on_id {
-            tracing::info!("Recording with stop condition: CAN ID 0x{:X}", id);
-            piper_driver::recording::AsyncRecordingHook::with_stop_condition(Some(id))
-        } else {
-            piper_driver::recording::AsyncRecordingHook::new()
+        let stop_duration = match &config.stop_condition {
+            StopCondition::Duration(seconds) => Some(Duration::from_secs(*seconds)),
+            _ => None,
         };
+        let stop_after_frame_count = match &config.stop_condition {
+            StopCondition::FrameCount(count) => Some(*count as u64),
+            _ => None,
+        };
+
+        let (hook, rx) = piper_driver::recording::AsyncRecordingHook::with_auto_stop(
+            stop_on_id,
+            stop_duration,
+            stop_after_frame_count,
+        );
 
         let dropped = hook.dropped_frames().clone();
         let counter = hook.frame_counter().clone();
-        let stop_requested = hook.stop_requested().clone(); // ✅ 获取停止标志引用
+        let stop_requested = hook.stop_requested().clone();
 
         // 注册钩子
         let callback = std::sync::Arc::new(hook) as std::sync::Arc<dyn piper_driver::FrameCallback>;
-        self.driver
-            .hooks()
+        let hook_manager = self.driver.hooks();
+        let hook_handle = hook_manager
             .write()
             .map_err(|_e| {
                 crate::RobotError::Infrastructure(piper_driver::DriverError::PoisonedLock)
             })?
             .add_callback(callback);
 
-        // ✅ 传递 stop_requested（OnCanId 时使用 Driver 层的标志，其他情况使用 None）
-        let handle = RecordingHandle::new(
-            rx,
-            dropped,
-            counter,
-            config.output_path.clone(),
-            std::time::Instant::now(),
-            if stop_on_id.is_some() {
-                Some(stop_requested)
-            } else {
-                None
+        let stop_condition = match &config.stop_condition {
+            StopCondition::Manual => RecordingStopCondition::Manual,
+            StopCondition::OnCanId(_) => RecordingStopCondition::OnCanId,
+            StopCondition::Duration(seconds) => {
+                RecordingStopCondition::Duration(std::time::Duration::from_secs(*seconds))
             },
-        );
+            StopCondition::FrameCount(count) => RecordingStopCondition::FrameCount(*count as u64),
+        };
+        let handle = RecordingHandle::new(RecordingHandleParts {
+            rx,
+            dropped_frames: dropped,
+            frame_counter: counter,
+            stop_requested,
+            output_path: config.output_path.clone(),
+            metadata: config.metadata.clone(),
+            start_time_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            start_time: std::time::Instant::now(),
+            hook_manager,
+            hook_handle,
+            stop_condition,
+        });
 
         tracing::info!("Recording started: {:?}", config.output_path);
 
@@ -1153,7 +1181,8 @@ where
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let standby = PiperBuilder::new()
     ///     .socketcan("can0")
-    ///     .build()?;
+    ///     .build()?
+    ///     .require_strict()?;
     ///
     /// let (standby, handle) = standby.start_recording(config)?;
     ///
@@ -1172,11 +1201,17 @@ where
     ) -> Result<(Self, crate::recording::RecordingStats)> {
         use piper_tools::{PiperRecording, TimestampSource, TimestampedFrame};
 
+        handle.stop();
+        handle.detach_hook();
+
         // 创建录制对象
         let mut recording = PiperRecording::new(piper_tools::RecordingMetadata::new(
             self.driver.interface(),
             self.driver.bus_speed(),
         ));
+        recording.metadata.start_time = handle.start_time_unix_secs();
+        recording.metadata.notes = handle.metadata().notes.clone();
+        recording.metadata.operator = handle.metadata().operator.clone();
 
         // 收集所有帧（转换为 piper_tools 格式）
         let mut frame_count = 0;
@@ -1244,7 +1279,8 @@ where
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let standby = PiperBuilder::new()
     ///     .socketcan("can0")
-    ///     .build()?;
+    ///     .build()?
+    ///     .require_strict()?;
     ///
     /// // 进入回放模式
     /// let replay = standby.enter_replay_mode()?;
@@ -1288,7 +1324,7 @@ where
     /// ```rust,ignore
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let standby = PiperBuilder::new().socketcan("can0").build()?;
+    /// let standby = PiperBuilder::new().socketcan("can0").build()?.require_strict()?;
     ///
     /// // 所有关节设置为等级 5（中等保护）
     /// standby.set_collision_protection([5, 5, 5, 5, 5, 5])?;
@@ -1336,7 +1372,7 @@ where
     /// ```rust,ignore
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let standby = PiperBuilder::new().socketcan("can0").build()?;
+    /// let standby = PiperBuilder::new().socketcan("can0").build()?.require_strict()?;
     ///
     /// // 设置 J1 的当前位置为零点
     /// // 注意：确保 J1 已移动到预期的零点位置
@@ -1355,14 +1391,16 @@ where
             return Ok(());
         }
 
-        let baseline = self.setting_response_cached_inner().ok();
+        // Invalidate any cached 0x476 before issuing the new request so the subsequent
+        // wait only observes a response that arrived after this call started.
+        self.driver.clear_setting_response()?;
         let raw = RawCommander::new(&self.driver);
-        raw.request_joint_zero_positions(joints)?;
+        raw.request_joint_zero_positions_confirmed(joints, ZERO_SETTING_CONFIRM_TIMEOUT)?;
 
         let response = wait_for_fresh_setting_response(
             ZERO_SETTING_CONFIRM_TIMEOUT,
             ZERO_SETTING_POLL_INTERVAL,
-            baseline,
+            None,
             0x75,
             || self.setting_response_cached_inner(),
             || self.ensure_runtime_health_healthy(),
@@ -1422,14 +1460,15 @@ where
     }
 
     /// 请求全关节失能，但仍保持在 Maintenance，直到确认完成。
-    pub fn request_disable_all(self) -> Result<Piper<Maintenance, Capability>> {
-        self.send_disable_request()?;
+    pub fn request_disable_all(mut self) -> Result<Piper<Maintenance, Capability>> {
+        self._state.pending_disable_commit_host_mono_us = Some(self.send_disable_request()?);
         Ok(self)
     }
 
     /// 等待确认全关节失能，并返回 Standby。
     pub fn wait_until_disabled(self, config: DisableConfig) -> Result<Piper<Standby, Capability>> {
         self.wait_for_disabled(
+            self._state.pending_disable_commit_host_mono_us,
             config.timeout,
             config.debounce_threshold,
             config.poll_interval,
@@ -1457,14 +1496,16 @@ impl Piper<Standby, SoftRealtime> {
         );
 
         let enable_cmd = MotorEnableCommand::enable_all();
-        self.driver.send_reliable(enable_cmd.to_frame())?;
+        let enable_commit_host_mono_us = self
+            .driver
+            .send_reliable_frame_confirmed_commit_marker(enable_cmd.to_frame(), config.timeout)?;
         self.wait_for_enabled(
+            enable_commit_host_mono_us,
             config.timeout,
             config.debounce_threshold,
             config.poll_interval,
         )?;
 
-        let baseline = self.capture_mode_confirmation_baseline();
         let control_cmd = ControlModeCommandFrame::new(
             ControlModeCommand::CanControl,
             MoveMode::MoveM,
@@ -1473,9 +1514,11 @@ impl Piper<Standby, SoftRealtime> {
             0,
             InstallPosition::Invalid,
         );
-        self.driver.send_reliable(control_cmd.to_frame())?;
+        let commit_host_mono_us = self
+            .driver
+            .send_reliable_frame_confirmed_commit_marker(control_cmd.to_frame(), config.timeout)?;
         self.wait_for_mode_confirmation(
-            baseline,
+            commit_host_mono_us,
             config.timeout,
             config.poll_interval,
             ModeConfirmationExpectation {
@@ -1503,13 +1546,6 @@ impl<State, Capability> Piper<State, Capability>
 where
     Capability: CapabilityMarker,
 {
-    fn capture_mode_confirmation_baseline(&self) -> ModeConfirmationBaseline {
-        ModeConfirmationBaseline {
-            robot_control: self.driver.get_robot_control(),
-            mode_echo: self.driver.get_control_mode_echo(),
-        }
-    }
-
     fn ensure_runtime_health_healthy(&self) -> Result<()> {
         let health = self.runtime_health();
         if health.fault.is_some() || !health.rx_alive || !health.tx_alive {
@@ -1540,14 +1576,15 @@ where
         Ok(())
     }
 
-    fn send_disable_request(&self) -> Result<()> {
+    fn send_disable_request(&self) -> Result<u64> {
         use piper_protocol::control::MotorEnableCommand;
 
-        self.driver.send_local_state_transition_frame_confirmed(
-            MotorEnableCommand::disable_all().to_frame(),
-            STATE_TRANSITION_SEND_TIMEOUT,
-        )?;
-        Ok(())
+        self.driver
+            .send_local_state_transition_frame_confirmed_commit_marker(
+                MotorEnableCommand::disable_all().to_frame(),
+                STATE_TRANSITION_SEND_TIMEOUT,
+            )
+            .map_err(Into::into)
     }
 
     fn into_state<NextState>(
@@ -1576,19 +1613,15 @@ where
         timeout: Duration,
         poll_interval: Duration,
     ) -> Result<CollisionProtectionSnapshot> {
-        let baseline = self.collision_protection_cached_inner().ok();
         let raw = RawCommander::new(&self.driver);
-        let baseline_hw = baseline.as_ref().map_or(0, |state| state.hardware_timestamp_us);
-        let baseline_sys = baseline.as_ref().map_or(0, |state| state.host_rx_mono_us);
-
-        raw.query_collision_protection()?;
+        let commit_host_mono_us = raw.query_collision_protection_confirmed(timeout)?;
 
         let start = Instant::now();
         loop {
             self.ensure_runtime_health_healthy()?;
 
             let state = self.collision_protection_cached_inner()?;
-            if state.is_newer_than(baseline_hw, baseline_sys) {
+            if state.host_rx_mono_us > commit_host_mono_us {
                 return Ok(state);
             }
 
@@ -1664,7 +1697,7 @@ where
     /// ```rust,ignore
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let robot = PiperBuilder::new().socketcan("can0").build()?;
+    /// let robot = PiperBuilder::new().socketcan("can0").build()?.require_strict()?;
     ///
     /// // 获取固件特性
     /// let quirks = robot.quirks();
@@ -1743,6 +1776,7 @@ where
     /// 请不要在 `async` 上下文（如 Tokio）中直接调用此方法。
     fn wait_for_disabled(
         &self,
+        commit_host_mono_us: Option<u64>,
         timeout: Duration,
         debounce_threshold: usize,
         poll_interval: Duration,
@@ -1759,7 +1793,13 @@ where
                 });
             }
 
-            if self.observer.is_all_disabled_confirmed() {
+            let confirmed_mask = match commit_host_mono_us {
+                Some(commit_host_mono_us) => {
+                    self.driver.confirmed_driver_enabled_mask_after_host_mono(commit_host_mono_us)
+                },
+                None => self.driver.get_robot_control().confirmed_driver_enabled_mask,
+            };
+            if confirmed_mask == Some(0) {
                 stable_count += 1;
                 if stable_count >= debounce_threshold {
                     return Ok(());
@@ -1785,9 +1825,11 @@ where
     /// 如果 state-transition disable 在进入 TX commit 前或发送点超时，
     /// 调用会返回错误，同时底层 driver 会 fail-closed 锁存 `TransportError`。
     pub fn request_disable_all(self) -> Result<Piper<Maintenance, Capability>> {
-        self.send_disable_request()?;
+        let disable_commit_host_mono_us = self.send_disable_request()?;
         Ok(self.into_state(
-            Maintenance,
+            Maintenance {
+                pending_disable_commit_host_mono_us: Some(disable_commit_host_mono_us),
+            },
             DropPolicy::DisableAll,
             DriverModeDropPolicy::Preserve,
         ))
@@ -1817,11 +1859,12 @@ where
         info!("Starting graceful robot shutdown");
 
         trace!("Disabling motors");
-        self.send_disable_request()?;
+        let disable_commit_host_mono_us = self.send_disable_request()?;
 
         // 2. 等待失能确认
         trace!("Waiting for disable confirmation");
         self.wait_for_disabled(
+            Some(disable_commit_host_mono_us),
             Duration::from_secs(1),
             1, // debounce_threshold
             Duration::from_millis(10),
@@ -1921,7 +1964,8 @@ where
     /// # fn example() -> Result<()> {
     /// let standby = PiperBuilder::new()
     ///     .socketcan("can0")
-    ///     .build()?;
+    ///     .build()?
+    ///     .require_strict()?;
     /// let active = standby.enable_mit_mode(Default::default())?;
     ///
     /// // 启动录制（Active 状态）
@@ -1946,49 +1990,67 @@ where
         self,
         config: crate::recording::RecordingConfig,
     ) -> Result<(Self, crate::recording::RecordingHandle)> {
-        use crate::recording::{RecordingHandle, StopCondition};
+        use crate::recording::{
+            RecordingHandle, RecordingHandleParts, RecordingStopCondition, StopCondition,
+        };
 
-        // ✅ 提取 stop_on_id 从 StopCondition
         let stop_on_id = match &config.stop_condition {
             StopCondition::OnCanId(id) => Some(*id),
             _ => None,
         };
-
-        // ✅ 根据是否需要停止条件选择构造函数
-        let (hook, rx) = if let Some(id) = stop_on_id {
-            tracing::info!("Recording with stop condition: CAN ID 0x{:X}", id);
-            piper_driver::recording::AsyncRecordingHook::with_stop_condition(Some(id))
-        } else {
-            piper_driver::recording::AsyncRecordingHook::new()
+        let stop_duration = match &config.stop_condition {
+            StopCondition::Duration(seconds) => Some(Duration::from_secs(*seconds)),
+            _ => None,
         };
+        let stop_after_frame_count = match &config.stop_condition {
+            StopCondition::FrameCount(count) => Some(*count as u64),
+            _ => None,
+        };
+
+        let (hook, rx) = piper_driver::recording::AsyncRecordingHook::with_auto_stop(
+            stop_on_id,
+            stop_duration,
+            stop_after_frame_count,
+        );
 
         let dropped = hook.dropped_frames().clone();
         let counter = hook.frame_counter().clone();
-        let stop_requested = hook.stop_requested().clone(); // ✅ 获取停止标志引用
+        let stop_requested = hook.stop_requested().clone();
 
         // 注册钩子
         let callback = std::sync::Arc::new(hook) as std::sync::Arc<dyn piper_driver::FrameCallback>;
-        self.driver
-            .hooks()
+        let hook_manager = self.driver.hooks();
+        let hook_handle = hook_manager
             .write()
             .map_err(|_e| {
                 crate::RobotError::Infrastructure(piper_driver::DriverError::PoisonedLock)
             })?
             .add_callback(callback);
 
-        // ✅ 传递 stop_requested（OnCanId 时使用 Driver 层的标志，其他情况使用 None）
-        let handle = RecordingHandle::new(
-            rx,
-            dropped,
-            counter,
-            config.output_path.clone(),
-            std::time::Instant::now(),
-            if stop_on_id.is_some() {
-                Some(stop_requested)
-            } else {
-                None
+        let stop_condition = match &config.stop_condition {
+            StopCondition::Manual => RecordingStopCondition::Manual,
+            StopCondition::OnCanId(_) => RecordingStopCondition::OnCanId,
+            StopCondition::Duration(seconds) => {
+                RecordingStopCondition::Duration(std::time::Duration::from_secs(*seconds))
             },
-        );
+            StopCondition::FrameCount(count) => RecordingStopCondition::FrameCount(*count as u64),
+        };
+        let handle = RecordingHandle::new(RecordingHandleParts {
+            rx,
+            dropped_frames: dropped,
+            frame_counter: counter,
+            stop_requested,
+            output_path: config.output_path.clone(),
+            metadata: config.metadata.clone(),
+            start_time_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            start_time: std::time::Instant::now(),
+            hook_manager,
+            hook_handle,
+            stop_condition,
+        });
 
         tracing::info!("Recording started (Active): {:?}", config.output_path);
 
@@ -2012,7 +2074,8 @@ where
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let standby = PiperBuilder::new()
     ///     .socketcan("can0")
-    ///     .build()?;
+    ///     .build()?
+    ///     .require_strict()?;
     /// let active = standby.enable_mit_mode(Default::default())?;
     ///
     /// let (active, handle) = active.start_recording(config)?;
@@ -2032,11 +2095,17 @@ where
     ) -> Result<(Self, crate::recording::RecordingStats)> {
         use piper_tools::{PiperRecording, TimestampSource, TimestampedFrame};
 
+        handle.stop();
+        handle.detach_hook();
+
         // 创建录制对象
         let mut recording = PiperRecording::new(piper_tools::RecordingMetadata::new(
             self.driver.interface(),
             self.driver.bus_speed(),
         ));
+        recording.metadata.start_time = handle.start_time_unix_secs();
+        recording.metadata.notes = handle.metadata().notes.clone();
+        recording.metadata.operator = handle.metadata().operator.clone();
 
         // 收集所有帧（转换为 piper_tools 格式）
         let mut frame_count = 0;
@@ -2089,7 +2158,7 @@ where
     /// ```rust,ignore
     /// # use piper_client::PiperBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let standby = PiperBuilder::new().socketcan("can0").build()?;
+    /// let standby = PiperBuilder::new().socketcan("can0").build()?.require_strict()?;
     /// let active = standby.enable_position_mode(Default::default())?;
     ///
     /// // 运行时提高碰撞保护级别（例如进入精密操作区域）
@@ -2263,11 +2332,12 @@ where
         // === PHASE 1: All operations that can panic ===
 
         // 1. 失能机械臂
-        self.send_disable_request()?;
+        let disable_commit_host_mono_us = self.send_disable_request()?;
         debug!("Motor disable command sent");
 
         // 2. 等待失能完成（带 Debounce）
         self.wait_for_disabled(
+            Some(disable_commit_host_mono_us),
             config.timeout,
             config.debounce_threshold,
             config.poll_interval,
@@ -2305,8 +2375,9 @@ impl Piper<Active<MitPassthroughMode>, SoftRealtime> {
     pub fn disable(self, config: DisableConfig) -> Result<Piper<Standby, SoftRealtime>> {
         debug!("Disabling robot");
 
-        self.send_disable_request()?;
+        let disable_commit_host_mono_us = self.send_disable_request()?;
         self.wait_for_disabled(
+            Some(disable_commit_host_mono_us),
             config.timeout,
             config.debounce_threshold,
             config.poll_interval,
@@ -2576,11 +2647,12 @@ where
         // === PHASE 1: All operations that can panic ===
 
         // 1. 失能机械臂
-        self.send_disable_request()?;
+        let disable_commit_host_mono_us = self.send_disable_request()?;
         debug!("Motor disable command sent");
 
         // 2. 等待失能完成（带 Debounce）
         self.wait_for_disabled(
+            Some(disable_commit_host_mono_us),
             config.timeout,
             config.debounce_threshold,
             config.poll_interval,
@@ -2623,7 +2695,9 @@ where
             data,
             len: frame.data.len() as u8,
             is_extended: frame.can_id > 0x7FF,
-            timestamp_us: frame.timestamp_us,
+            // Replay timing is enforced by the inter-frame delay schedule, not by carrying the
+            // historical capture timestamp into a new TX event.
+            timestamp_us: 0,
         })
     }
 
@@ -2706,7 +2780,8 @@ where
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let standby = PiperBuilder::new()
     ///     .socketcan("can0")
-    ///     .build()?;
+    ///     .build()?
+    ///     .require_strict()?;
     /// let replay = standby.enter_replay_mode()?;
     ///
     /// // 回放录制（1.0x 速度，原始速度）
@@ -3026,7 +3101,8 @@ where
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let standby = PiperBuilder::new()
     ///     .socketcan("can0")
-    ///     .build()?;
+    ///     .build()?
+    ///     .require_strict()?;
     /// let replay = standby.enter_replay_mode()?;
     ///
     /// // 提前退出回放模式
@@ -3131,7 +3207,9 @@ where
             )),
             ManualFaultRecoveryResult::Maintenance { .. } => {
                 MotionConnectedState::Maintenance(self.into_state(
-                    Maintenance,
+                    Maintenance {
+                        pending_disable_commit_host_mono_us: None,
+                    },
                     DropPolicy::DisableAll,
                     DriverModeDropPolicy::Preserve,
                 ))
@@ -3490,6 +3568,17 @@ mod tests {
         path
     }
 
+    fn temp_recording_path(prefix: &str) -> PathBuf {
+        static NEXT_RECORDING_ID: AtomicUsize = AtomicUsize::new(0);
+
+        let id = NEXT_RECORDING_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "piper-client-{prefix}-{}-{}.bin",
+            std::process::id(),
+            id
+        ))
+    }
+
     fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool, message: &str) {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
@@ -3764,16 +3853,12 @@ mod tests {
             .collect()
     }
 
-    fn disabled_joint_frames(delay: Duration, timestamp_base: u64) -> Vec<TimedFrame> {
-        (1..=6)
-            .map(|joint_index| TimedFrame {
-                delay,
-                frame: joint_driver_disabled_frame(
-                    joint_index,
-                    timestamp_base + joint_index as u64,
-                ),
-            })
-            .collect()
+    fn enabled_joint_frames_after(delay: Duration) -> Vec<TimedFrame> {
+        delayed_joint_state_frames(true, delay, Duration::ZERO, 1)
+    }
+
+    fn disabled_joint_frames_after(first_delay: Duration, timestamp_base: u64) -> Vec<TimedFrame> {
+        delayed_joint_state_frames(false, first_delay, Duration::ZERO, timestamp_base)
     }
 
     fn delayed_joint_state_frames(
@@ -3858,7 +3943,7 @@ mod tests {
     #[test]
     fn enable_mit_mode_times_out_without_fresh_control_mode_echo() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let mut frames = enabled_joint_frames();
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
         frames.push(TimedFrame {
             delay: Duration::from_millis(15),
             frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
@@ -3889,7 +3974,7 @@ mod tests {
     #[test]
     fn enable_position_mode_rejects_mismatched_control_mode_echo() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let mut frames = enabled_joint_frames();
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(5));
         frames.push(TimedFrame {
             delay: Duration::from_millis(15),
             frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveL, 100),
@@ -3926,9 +4011,9 @@ mod tests {
     #[test]
     fn enable_mit_mode_succeeds_with_fresh_matching_robot_and_echo() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let mut frames = enabled_joint_frames();
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
         frames.push(TimedFrame {
-            delay: Duration::from_millis(15),
+            delay: Duration::from_millis(20),
             frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
         });
         frames.push(TimedFrame {
@@ -3960,7 +4045,7 @@ mod tests {
     #[test]
     fn enable_mit_mode_rejects_stale_historical_enabled_feedback_before_confirmation() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let mut frames = enabled_joint_frames();
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(5));
         frames.push(TimedFrame {
             delay: Duration::from_millis(80),
             frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
@@ -4008,7 +4093,7 @@ mod tests {
     #[test]
     fn enable_mit_mode_rejects_stale_enabled_state_during_mode_confirmation() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let mut frames = enabled_joint_frames();
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(5));
         frames.push(TimedFrame {
             delay: Duration::from_millis(40),
             frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
@@ -4047,6 +4132,119 @@ mod tests {
         };
 
         assert!(matches!(error, RobotError::Timeout { .. }));
+    }
+
+    #[test]
+    fn enable_mit_mode_rejects_matching_mode_feedback_that_arrives_before_commit() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut frames = enabled_joint_frames();
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(5),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::ZERO,
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveM,
+                80,
+                piper_protocol::control::MitMode::Mit,
+                InstallPosition::Invalid,
+                101,
+            ),
+        });
+
+        let standby = build_standby_piper_with_tx(
+            PacedRxAdapter::new(frames),
+            BlockingFirstControlTxAdapter {
+                sent_frames: sent_frames.clone(),
+                started_tx,
+                release_rx,
+                sends: 0,
+            },
+        );
+        let driver = Arc::clone(&standby.driver);
+        driver
+            .send_reliable(PiperFrame::new_standard(0x221, &[0x01]))
+            .expect("blocking reliable frame should enqueue before mode switch");
+
+        let standby_handle = thread::spawn(move || {
+            standby.enable_mit_mode(MitModeConfig {
+                timeout: Duration::from_millis(120),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 80,
+            })
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("mode command should block at tx.send_control before commit");
+        thread::sleep(Duration::from_millis(20));
+        let _ = release_tx.send(());
+
+        let error = match standby_handle.join().expect("enable_mit_mode thread should finish") {
+            Ok(_) => panic!("pre-commit matching feedback must not satisfy mode confirmation"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RobotError::Timeout { .. }));
+    }
+
+    #[test]
+    fn enable_mit_mode_rejects_enabled_feedback_that_arrives_before_enable_commit() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let standby = build_standby_piper_with_tx(
+            PacedRxAdapter::new(enabled_joint_frames()),
+            BlockingFirstControlTxAdapter {
+                sent_frames: sent_frames.clone(),
+                started_tx,
+                release_rx,
+                sends: 0,
+            },
+        );
+        let driver = Arc::clone(&standby.driver);
+        driver
+            .send_reliable(PiperFrame::new_standard(0x221, &[0x02]))
+            .expect("blocking reliable frame should enqueue before enable_all");
+
+        let standby_handle = thread::spawn(move || {
+            standby.enable_mit_mode(MitModeConfig {
+                timeout: Duration::from_millis(120),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 80,
+            })
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("blocking reliable frame should reach the adapter first");
+        wait_until(
+            Duration::from_millis(200),
+            || driver.get_robot_control().confirmed_driver_enabled_mask == Some(0b11_1111),
+            "enabled low-speed feedback should land before enable_all reaches TX commit",
+        );
+
+        release_tx.send(()).expect("blocked reliable frame should release");
+        let error = match standby_handle.join().expect("enable_mit_mode thread should finish") {
+            Ok(_) => panic!("pre-commit enabled feedback must not satisfy wait_for_enabled"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RobotError::Timeout { .. }));
+        assert!(
+            !sent_frames
+                .lock()
+                .expect("sent frames lock")
+                .iter()
+                .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
+            "mode switch must not start when enable confirmation only existed before commit",
+        );
     }
 
     #[test]
@@ -4091,7 +4289,7 @@ mod tests {
     #[test]
     fn enable_mit_passthrough_succeeds_with_fresh_matching_robot_and_echo() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let mut frames = enabled_joint_frames();
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(5));
         frames.push(TimedFrame {
             delay: Duration::from_millis(15),
             frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
@@ -4144,12 +4342,7 @@ mod tests {
     #[test]
     fn disable_succeeds_with_fresh_confirmed_disabled_feedback() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let frames = (1..=6)
-            .map(|joint_index| TimedFrame {
-                delay: Duration::from_millis(2),
-                frame: joint_driver_disabled_frame(joint_index, joint_index as u64),
-            })
-            .collect();
+        let frames = disabled_joint_frames_after(Duration::from_millis(10), 1);
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 PacedRxAdapter::new(frames),
@@ -4175,12 +4368,7 @@ mod tests {
     #[test]
     fn active_request_disable_all_transitions_via_maintenance_to_standby() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let frames = (1..=6)
-            .map(|joint_index| TimedFrame {
-                delay: Duration::from_millis(2),
-                frame: joint_driver_disabled_frame(joint_index, joint_index as u64),
-            })
-            .collect();
+        let frames = disabled_joint_frames_after(Duration::from_millis(10), 1);
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 PacedRxAdapter::new(frames),
@@ -4215,12 +4403,7 @@ mod tests {
     #[test]
     fn active_request_disable_all_keeps_shared_driver_control_closed_until_disabled_feedback() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let frames = (1..=6)
-            .map(|joint_index| TimedFrame {
-                delay: Duration::from_millis(3),
-                frame: joint_driver_disabled_frame(joint_index, joint_index as u64),
-            })
-            .collect();
+        let frames = disabled_joint_frames_after(Duration::from_millis(10), 1);
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 PacedRxAdapter::new(frames),
@@ -4261,7 +4444,7 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let frames = disabled_joint_frames(Duration::from_millis(1), 100);
+        let frames = disabled_joint_frames_after(Duration::from_millis(20), 100);
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 PacedRxAdapter::new(frames),
@@ -4381,7 +4564,7 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                PacedRxAdapter::new(disabled_joint_frames(Duration::from_millis(2), 10)),
+                PacedRxAdapter::new(disabled_joint_frames_after(Duration::from_millis(10), 10)),
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
             )
@@ -4414,7 +4597,7 @@ mod tests {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
-                PacedRxAdapter::new(disabled_joint_frames(Duration::from_millis(2), 40)),
+                PacedRxAdapter::new(disabled_joint_frames_after(Duration::from_millis(10), 40)),
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
             )
@@ -5170,6 +5353,250 @@ mod tests {
     }
 
     #[test]
+    fn standby_stop_recording_removes_registered_hook() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let output_path = temp_recording_path("recording-hook-remove");
+
+        let hooks_len_before = standby.driver.hooks().read().expect("hooks read lock").len();
+        assert_eq!(hooks_len_before, 0);
+
+        let (standby, handle) = standby
+            .start_recording(crate::recording::RecordingConfig {
+                output_path: output_path.clone(),
+                stop_condition: crate::recording::StopCondition::Manual,
+                metadata: crate::recording::RecordingMetadata {
+                    notes: "test".to_string(),
+                    operator: "tester".to_string(),
+                },
+            })
+            .expect("recording should start");
+
+        let hooks_len_during = standby.driver.hooks().read().expect("hooks read lock").len();
+        assert_eq!(hooks_len_during, 1);
+
+        let driver = Arc::clone(&standby.driver);
+
+        let (_standby, _stats) =
+            standby.stop_recording(handle).expect("recording should stop cleanly");
+
+        let hooks_len_after = driver.hooks().read().expect("hooks read lock").len();
+        assert_eq!(hooks_len_after, 0);
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn dropping_recording_handle_removes_registered_hook() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let output_path = temp_recording_path("recording-handle-drop");
+
+        let hooks_len_before = standby.driver.hooks().read().expect("hooks read lock").len();
+        assert_eq!(hooks_len_before, 0);
+
+        let driver = Arc::clone(&standby.driver);
+        let (_standby, handle) = standby
+            .start_recording(crate::recording::RecordingConfig {
+                output_path: output_path.clone(),
+                stop_condition: crate::recording::StopCondition::Manual,
+                metadata: crate::recording::RecordingMetadata {
+                    notes: "test".to_string(),
+                    operator: "tester".to_string(),
+                },
+            })
+            .expect("recording should start");
+
+        assert_eq!(
+            driver.hooks().read().expect("hooks read lock").len(),
+            1,
+            "recording hook should be registered while handle is alive"
+        );
+
+        drop(handle);
+
+        assert_eq!(
+            driver.hooks().read().expect("hooks read lock").len(),
+            0,
+            "dropping the handle must automatically unregister the hook"
+        );
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn manual_recording_stop_prevents_later_frames_from_being_recorded() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let driver = Arc::clone(&standby.driver);
+        let output_path = temp_recording_path("recording-manual-stop");
+
+        let (standby, handle) = standby
+            .start_recording(crate::recording::RecordingConfig {
+                output_path: output_path.clone(),
+                stop_condition: crate::recording::StopCondition::Manual,
+                metadata: crate::recording::RecordingMetadata {
+                    notes: "test".to_string(),
+                    operator: "tester".to_string(),
+                },
+            })
+            .expect("recording should start");
+
+        handle.stop();
+        driver
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x44]))
+            .expect("driver should send a frame after manual stop");
+        thread::sleep(Duration::from_millis(20));
+
+        let (_standby, stats) = standby
+            .stop_recording(handle)
+            .expect("recording should stop cleanly after manual stop");
+        assert_eq!(
+            stats.frame_count, 0,
+            "frames sent after manual stop must not be recorded"
+        );
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn stop_recording_persists_user_metadata_to_recording_file() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let driver = Arc::clone(&standby.driver);
+        let output_path = temp_recording_path("recording-metadata");
+
+        let (standby, handle) = standby
+            .start_recording(crate::recording::RecordingConfig {
+                output_path: output_path.clone(),
+                stop_condition: crate::recording::StopCondition::Manual,
+                metadata: crate::recording::RecordingMetadata {
+                    notes: "metadata note".to_string(),
+                    operator: "metadata operator".to_string(),
+                },
+            })
+            .expect("recording should start");
+
+        driver
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x66]))
+            .expect("driver should emit a frame for recording metadata test");
+        wait_until(
+            Duration::from_millis(200),
+            || handle.frame_count() >= 1,
+            "recording should capture the test frame before saving",
+        );
+
+        let (_standby, stats) =
+            standby.stop_recording(handle).expect("recording should stop cleanly");
+        assert_eq!(stats.frame_count, 1);
+
+        let saved = PiperRecording::load(&output_path).expect("saved recording should load");
+        assert_eq!(saved.metadata.notes, "metadata note");
+        assert_eq!(saved.metadata.operator, "metadata operator");
+        assert_eq!(saved.frame_count(), 1);
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn stop_recording_persists_recording_start_time_not_save_time() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let output_path = temp_recording_path("recording-start-time");
+
+        let before_start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (standby, handle) = standby
+            .start_recording(crate::recording::RecordingConfig {
+                output_path: output_path.clone(),
+                stop_condition: crate::recording::StopCondition::Manual,
+                metadata: crate::recording::RecordingMetadata {
+                    notes: "start-time".to_string(),
+                    operator: "tester".to_string(),
+                },
+            })
+            .expect("recording should start");
+
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        let before_stop = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (_standby, _stats) =
+            standby.stop_recording(handle).expect("recording should stop cleanly");
+        let saved = PiperRecording::load(&output_path).expect("saved recording should load");
+
+        assert!(
+            saved.metadata.start_time >= before_start,
+            "recording start time must be captured when recording begins"
+        );
+        assert!(
+            saved.metadata.start_time < before_stop,
+            "recording start time must not collapse to the later save time"
+        );
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn duration_recording_stop_condition_sets_stop_requested_after_deadline() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let output_path = temp_recording_path("recording-duration-stop");
+
+        let (_standby, handle) = standby
+            .start_recording(crate::recording::RecordingConfig {
+                output_path: output_path.clone(),
+                stop_condition: crate::recording::StopCondition::Duration(0),
+                metadata: crate::recording::RecordingMetadata {
+                    notes: "test".to_string(),
+                    operator: "tester".to_string(),
+                },
+            })
+            .expect("recording should start");
+
+        assert!(
+            handle.is_stop_requested(),
+            "zero-duration recordings should request stop immediately once observed"
+        );
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn frame_count_recording_stop_condition_sets_stop_requested_after_threshold() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let driver = Arc::clone(&standby.driver);
+        let output_path = temp_recording_path("recording-framecount-stop");
+
+        let (_standby, handle) = standby
+            .start_recording(crate::recording::RecordingConfig {
+                output_path: output_path.clone(),
+                stop_condition: crate::recording::StopCondition::FrameCount(1),
+                metadata: crate::recording::RecordingMetadata {
+                    notes: "test".to_string(),
+                    operator: "tester".to_string(),
+                },
+            })
+            .expect("recording should start");
+
+        driver
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x55]))
+            .expect("driver should send a frame for frame-count stop");
+        wait_until(
+            Duration::from_millis(200),
+            || handle.is_stop_requested(),
+            "frame-count stop should request stop after the first recorded frame",
+        );
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
     fn command_position_with_policy_rejects_stale_feedback_without_sending() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = Arc::new(
@@ -5600,7 +6027,32 @@ mod tests {
         assert_eq!(sent[0].id, 0x155);
         assert_eq!(sent[0].len, 1);
         assert_eq!(sent[0].data[0], 0x01);
-        assert_eq!(sent[0].timestamp_us, 1_000);
+        assert_eq!(sent[0].timestamp_us, 0);
+
+        drop(standby);
+        let _ = std::fs::remove_file(recording_path);
+    }
+
+    #[test]
+    fn replay_recording_clears_source_timestamps_before_sending() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let recording_path = write_test_recording(&[(123_456, 0x155, &[0x01, 0x02])]);
+        let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+
+        let standby = replay
+            .replay_recording(&recording_path, 1.0)
+            .expect("replay should complete successfully");
+        assert!(matches!(standby._state, Standby));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, 0x155);
+        assert_eq!(sent[0].len, 2);
+        assert_eq!(sent[0].data[0], 0x01);
+        assert_eq!(sent[0].data[1], 0x02);
+        assert_eq!(sent[0].timestamp_us, 0);
 
         drop(standby);
         let _ = std::fs::remove_file(recording_path);
@@ -5864,7 +6316,7 @@ mod tests {
         let error = wait_for_fresh_collision_protection_update(
             Duration::from_millis(3),
             Duration::from_millis(1),
-            Some(baseline),
+            baseline.host_rx_mono_us,
             || Ok(()),
             || {
                 reads.fetch_add(1, Ordering::SeqCst);
@@ -5890,7 +6342,7 @@ mod tests {
         let snapshot = wait_for_fresh_collision_protection_update(
             Duration::from_millis(10),
             Duration::from_millis(1),
-            Some(baseline),
+            baseline.host_rx_mono_us,
             || {
                 sent.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -5920,11 +6372,7 @@ mod tests {
         let error = wait_for_fresh_collision_protection_update(
             Duration::from_millis(3),
             Duration::from_millis(1),
-            Some(CollisionProtectionSnapshot {
-                hardware_timestamp_us: 7,
-                host_rx_mono_us: 7,
-                levels: [2; 6],
-            }),
+            7,
             || Ok(()),
             || {
                 Ok(CollisionProtectionSnapshot {

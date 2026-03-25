@@ -1613,18 +1613,17 @@ impl MasterSlaveGripperControlState {
 /// use piper_driver::hooks::HookManager;
 /// use piper_driver::hooks::FrameCallback;
 /// use piper_driver::recording::AsyncRecordingHook;
-/// use piper_driver::state::PiperContext;
 /// use std::sync::Arc;
 ///
 /// // 添加录制钩子
-/// let context = PiperContext::new();
+/// let mut hooks = HookManager::new();
 /// let (hook, _rx) = AsyncRecordingHook::new();
 /// let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
-///
-/// if let Ok(mut hooks) = context.hooks.write() {
-///     hooks.add_callback(callback);
-/// }
+/// hooks.add_callback(callback);
 /// ```
+///
+/// 更高层的调用方如果已经持有 [`crate::piper::Piper`]，通常应优先使用
+/// `piper.hooks()` 获取同一份 `HookManager`，而不是直接依赖 `PiperContext` 的内部结构。
 use crate::hooks::HookManager;
 #[cfg(test)]
 use std::sync::{Mutex, mpsc};
@@ -1726,20 +1725,18 @@ pub struct PiperContext {
     /// # 示例
     ///
     /// ```rust
+    /// use piper_driver::hooks::{FrameCallback, HookManager};
     /// use piper_driver::recording::AsyncRecordingHook;
-    /// use piper_driver::hooks::FrameCallback;
-    /// use piper_driver::state::PiperContext;
     /// use std::sync::Arc;
     ///
-    /// // 创建上下文和录制钩子
-    /// let context = PiperContext::new();
+    /// // 创建钩子管理器和录制钩子
+    /// let mut hooks = HookManager::new();
     /// let (hook, _rx) = AsyncRecordingHook::new();
-    ///
-    /// // 注册为回调
-    /// if let Ok(mut hooks) = context.hooks.write() {
-    ///     hooks.add_callback(Arc::new(hook) as Arc<dyn FrameCallback>);
-    /// }
+    /// hooks.add_callback(Arc::new(hook) as Arc<dyn FrameCallback>);
     /// ```
+    ///
+    /// 如果调用方持有的是 [`crate::piper::Piper`]，更推荐通过 `piper.hooks()` 访问钩子管理器，
+    /// 这样不会把 `PiperContext` 当作更高层 API 的常规入口。
     pub hooks: Arc<RwLock<HookManager>>,
 }
 

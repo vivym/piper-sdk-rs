@@ -55,9 +55,11 @@
 //! ```
 
 use piper_driver::recording::TimestampedFrame;
+use piper_driver::{HookHandle, HookManager};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 /// 录制句柄（用于控制和监控）
@@ -65,8 +67,8 @@ use std::time::Instant;
 /// # Drop 语义
 ///
 /// 当 `RecordingHandle` 被丢弃时：
-/// - ✅ 自动 flush 缓冲区中的数据
-/// - ✅ 自动关闭接收端
+/// - ✅ 自动请求停止录制
+/// - ✅ 自动解绑 Driver 侧 recording hook
 /// - ❌ 不会自动保存文件（需要显式调用 `stop_recording()`）
 ///
 /// # Panics
@@ -89,8 +91,42 @@ pub struct RecordingHandle {
     /// 输出文件路径
     output_path: PathBuf,
 
+    /// 用户提供的录制元数据。
+    metadata: RecordingMetadata,
+
+    /// 录制开始时间（Unix 时间戳，秒）。
+    start_time_unix_secs: u64,
+
     /// 录制开始时间
     start_time: Instant,
+
+    /// Driver hook 注册信息，用于在 stop_recording/Drop 时解绑 callback。
+    hook_registration: Mutex<Option<(Arc<RwLock<HookManager>>, HookHandle)>>,
+
+    /// 自动停止条件。
+    stop_condition: RecordingStopCondition,
+}
+
+pub(super) struct RecordingHandleParts {
+    pub rx: crossbeam_channel::Receiver<TimestampedFrame>,
+    pub dropped_frames: Arc<AtomicU64>,
+    pub frame_counter: Arc<AtomicU64>,
+    pub stop_requested: Arc<AtomicBool>,
+    pub output_path: PathBuf,
+    pub metadata: RecordingMetadata,
+    pub start_time_unix_secs: u64,
+    pub start_time: Instant,
+    pub hook_manager: Arc<RwLock<HookManager>>,
+    pub hook_handle: HookHandle,
+    pub stop_condition: RecordingStopCondition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RecordingStopCondition {
+    Manual,
+    OnCanId,
+    Duration(std::time::Duration),
+    FrameCount(u64),
 }
 
 impl RecordingHandle {
@@ -101,21 +137,36 @@ impl RecordingHandle {
     /// - `stop_requested`: 可选的外部停止标志（用于 Driver 层的 `OnCanId` 停止条件）
     ///   - `None`: 创建新的内部停止标志（用于 `Manual` 停止条件）
     ///   - `Some(external)`: 使用 Driver 层提供的停止标志（用于 `OnCanId` 停止条件）
-    pub(super) fn new(
-        rx: crossbeam_channel::Receiver<TimestampedFrame>,
-        dropped_frames: Arc<AtomicU64>,
-        frame_counter: Arc<AtomicU64>,
-        output_path: PathBuf,
-        start_time: Instant,
-        stop_requested: Option<Arc<AtomicBool>>,
-    ) -> Self {
+    pub(super) fn new(parts: RecordingHandleParts) -> Self {
         Self {
-            rx,
-            dropped_frames,
-            frame_counter,
-            stop_requested: stop_requested.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            output_path,
-            start_time,
+            rx: parts.rx,
+            dropped_frames: parts.dropped_frames,
+            frame_counter: parts.frame_counter,
+            stop_requested: parts.stop_requested,
+            output_path: parts.output_path,
+            metadata: parts.metadata,
+            start_time_unix_secs: parts.start_time_unix_secs,
+            start_time: parts.start_time,
+            hook_registration: Mutex::new(Some((parts.hook_manager, parts.hook_handle))),
+            stop_condition: parts.stop_condition,
+        }
+    }
+
+    fn refresh_stop_condition(&self) {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+
+        let should_stop = match self.stop_condition {
+            RecordingStopCondition::Manual | RecordingStopCondition::OnCanId => false,
+            RecordingStopCondition::Duration(limit) => self.start_time.elapsed() >= limit,
+            RecordingStopCondition::FrameCount(limit) => {
+                self.frame_counter.load(Ordering::Relaxed) >= limit
+            },
+        };
+
+        if should_stop {
+            self.stop_requested.store(true, Ordering::Release);
         }
     }
 
@@ -125,16 +176,19 @@ impl RecordingHandle {
     ///
     /// 当前已成功录制的帧数
     pub fn frame_count(&self) -> u64 {
+        self.refresh_stop_condition();
         self.frame_counter.load(Ordering::Relaxed)
     }
 
     /// 获取当前丢帧数量
     pub fn dropped_count(&self) -> u64 {
+        self.refresh_stop_condition();
         self.dropped_frames.load(Ordering::Relaxed)
     }
 
     /// 检查是否已请求停止（用于循环条件判断）
     pub fn is_stop_requested(&self) -> bool {
+        self.refresh_stop_condition();
         self.stop_requested.load(Ordering::Relaxed)
     }
 
@@ -145,7 +199,9 @@ impl RecordingHandle {
 
     /// 获取录制时长
     pub fn elapsed(&self) -> std::time::Duration {
-        self.start_time.elapsed()
+        let elapsed = self.start_time.elapsed();
+        self.refresh_stop_condition();
+        elapsed
     }
 
     /// 获取输出文件路径
@@ -153,21 +209,43 @@ impl RecordingHandle {
         &self.output_path
     }
 
+    pub(super) fn metadata(&self) -> &RecordingMetadata {
+        &self.metadata
+    }
+
+    pub(super) fn start_time_unix_secs(&self) -> u64 {
+        self.start_time_unix_secs
+    }
+
     /// 获取接收端的引用（用于 stop_recording）
     pub(super) fn receiver(&self) -> &crossbeam_channel::Receiver<TimestampedFrame> {
         &self.rx
+    }
+
+    /// 解绑当前录制 hook。重复调用是幂等的。
+    pub(super) fn detach_hook(&self) {
+        let registration = match self.hook_registration.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+
+        if let Some((hook_manager, hook_handle)) = registration
+            && let Ok(mut hooks) = hook_manager.write()
+        {
+            hooks.remove_callback(hook_handle);
+        }
     }
 }
 
 impl Drop for RecordingHandle {
     /// ⚠️ Drop 语义：自动清理资源
     ///
-    /// 注意：这里只关闭接收端，不保存文件。
+    /// 注意：这里只请求停止录制并解绑 hook，不保存文件。
     /// 文件保存必须在 `stop_recording()` 中显式完成。
     fn drop(&mut self) {
-        // 接收端会在 Drop 时自动关闭
-        // 这里只是显式标记（用于调试）
-        tracing::debug!("RecordingHandle dropped, receiver closed");
+        self.stop_requested.store(true, Ordering::SeqCst);
+        self.detach_hook();
+        tracing::debug!("RecordingHandle dropped, callback removed");
     }
 }
 

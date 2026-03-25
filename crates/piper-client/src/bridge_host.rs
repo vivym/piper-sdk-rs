@@ -1527,6 +1527,10 @@ pub struct PiperBridgeHost {
     started: AtomicBool,
 }
 
+fn supported_bridge_endpoint_count(config: &BridgeHostConfig, uds_supported: bool) -> usize {
+    usize::from(uds_supported && config.uds.is_some()) + usize::from(config.tcp_tls.is_some())
+}
+
 impl PiperBridgeHost {
     fn attach_backend(backend: Arc<dyn BridgeControllerBackend>, config: BridgeHostConfig) -> Self {
         Self {
@@ -1548,9 +1552,10 @@ impl PiperBridgeHost {
         if self.started.swap(true, Ordering::AcqRel) {
             return Err(BridgeHostError::AlreadyRunning);
         }
-        if self.config.uds.is_none() && self.config.tcp_tls.is_none() {
+        if supported_bridge_endpoint_count(&self.config, cfg!(unix)) == 0 {
             return Err(BridgeHostError::InvalidConfig(
-                "at least one bridge endpoint must be enabled".to_string(),
+                "at least one supported bridge endpoint must be enabled on this platform"
+                    .to_string(),
             ));
         }
 
@@ -3071,10 +3076,7 @@ mod tests {
         driver.set_mode(piper_driver::DriverMode::Replay);
         let snapshot = driver.maintenance_lease_snapshot();
         assert_eq!(snapshot.state(), MaintenanceGateState::DeniedFaulted);
-        assert_eq!(
-            snapshot.holder_session_key(),
-            Some(authority.session_key().raw())
-        );
+        assert_eq!(snapshot.holder_session_key(), None);
 
         let err = broker
             .send(&authority, PiperFrame::new_standard(0x321, &[0x01]))
@@ -3250,5 +3252,20 @@ mod tests {
             .expect("reconcile without subscribers should succeed");
         assert_eq!(backend.installs.load(Ordering::Relaxed), 0);
         assert_eq!(backend.uninstalls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn supported_bridge_endpoint_count_ignores_uds_when_platform_does_not_support_it() {
+        let config = BridgeHostConfig {
+            uds: Some(BridgeUdsListenerConfig {
+                path: PathBuf::from("/tmp/piper_bridge.sock"),
+                granted_role: BridgeRole::Observer,
+            }),
+            tcp_tls: None,
+            allow_raw_frame_tap: false,
+        };
+
+        assert_eq!(supported_bridge_endpoint_count(&config, false), 0);
+        assert_eq!(supported_bridge_endpoint_count(&config, true), 1);
     }
 }

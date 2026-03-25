@@ -120,26 +120,17 @@ struct HookEntry {
 /// use piper_driver::hooks::{HookManager, FrameCallback};
 /// use piper_driver::recording::AsyncRecordingHook;
 /// use piper_protocol::PiperFrame;
-/// use std::sync::{Arc, RwLock};
+/// use std::sync::Arc;
 ///
-/// // 在 PiperContext 中
-/// pub struct PiperContext {
-///     pub hooks: RwLock<HookManager>,
-/// }
-///
-/// // 创建上下文并添加回调
-/// let context = PiperContext { hooks: RwLock::new(HookManager::new()) };
+/// // 创建 hook manager 并添加回调
+/// let mut hooks = HookManager::new();
 /// let (hook, _rx) = AsyncRecordingHook::new();
 /// let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
-/// if let Ok(mut hooks) = context.hooks.write() {
-///     hooks.add_callback(callback);
-/// }
+/// hooks.add_callback(callback);
 ///
-/// // 触发回调（在 rx_loop 中）
+/// // 触发回调
 /// let frame = PiperFrame::new_standard(0x251, &[1, 2, 3, 4]);
-/// if let Ok(hooks) = context.hooks.read() {
-///     hooks.trigger_all(&frame);
-/// }
+/// hooks.trigger_all(&frame);
 /// ```
 pub struct HookManager {
     next_handle: u64,

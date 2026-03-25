@@ -884,6 +884,7 @@ impl MitController {
     /// ```rust,no_run
     /// # use piper_client::control::MitController;
     /// # use piper_client::state::*;
+    /// # use piper_client::types::Rad;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut controller: MitController = unsafe { std::mem::zeroed() };
     ///

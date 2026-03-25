@@ -232,10 +232,38 @@ fn wait_for_maintenance_send_result(
 ) -> Result<(), DriverError> {
     match recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)? {
         DeliveryPhase::Finished(result) => result,
-        DeliveryPhase::Committed => loop {
+        DeliveryPhase::Committed { .. } => loop {
             match ack_rx.recv() {
                 Ok(DeliveryPhase::Finished(result)) => return result,
-                Ok(DeliveryPhase::Committed) => continue,
+                Ok(DeliveryPhase::Committed { .. }) => continue,
+                Err(_) => return Err(DriverError::ChannelClosed),
+            }
+        },
+    }
+}
+
+fn wait_for_delivery_result_with_commit<F>(
+    ack_rx: Receiver<DeliveryPhase>,
+    deadline: Instant,
+    timeout_error: F,
+) -> Result<Option<u64>, DriverError>
+where
+    F: Fn() -> DriverError,
+{
+    match recv_until_deadline(&ack_rx, deadline, timeout_error)? {
+        DeliveryPhase::Finished(result) => {
+            result?;
+            Ok(None)
+        },
+        DeliveryPhase::Committed {
+            host_commit_mono_us,
+        } => loop {
+            match ack_rx.recv() {
+                Ok(DeliveryPhase::Finished(result)) => {
+                    result?;
+                    return Ok(Some(host_commit_mono_us));
+                },
+                Ok(DeliveryPhase::Committed { .. }) => continue,
                 Err(_) => return Err(DriverError::ChannelClosed),
             }
         },
@@ -250,16 +278,7 @@ fn wait_for_delivery_result<F>(
 where
     F: Fn() -> DriverError,
 {
-    match recv_until_deadline(&ack_rx, deadline, timeout_error)? {
-        DeliveryPhase::Finished(result) => result,
-        DeliveryPhase::Committed => loop {
-            match ack_rx.recv() {
-                Ok(DeliveryPhase::Finished(result)) => return result,
-                Ok(DeliveryPhase::Committed) => continue,
-                Err(_) => return Err(DriverError::ChannelClosed),
-            }
-        },
-    }
+    wait_for_delivery_result_with_commit(ack_rx, deadline, timeout_error).map(|_| ())
 }
 
 #[doc(hidden)]
@@ -1045,12 +1064,32 @@ impl Default for MaintenanceGate {
 
 impl MaintenanceGate {
     fn sync_atomics(&self, inner: &MaintenanceGateInner) {
+        let published_holder_visible =
+            inner.holder_session_key.is_some() && inner.applied_lease_epoch == inner.lease_epoch;
+        let published_lease_epoch =
+            if inner.holder_session_key.is_some() && !published_holder_visible {
+                inner.applied_lease_epoch
+            } else {
+                inner.lease_epoch
+            };
         self.state.store(inner.state as u8, Ordering::Release);
-        self.holder_session_id
-            .store(inner.holder_session_id.unwrap_or(0), Ordering::Release);
-        self.holder_session_key
-            .store(inner.holder_session_key.unwrap_or(0), Ordering::Release);
-        self.lease_epoch.store(inner.lease_epoch, Ordering::Release);
+        self.holder_session_id.store(
+            if published_holder_visible {
+                inner.holder_session_id.unwrap_or(0)
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
+        self.holder_session_key.store(
+            if published_holder_visible {
+                inner.holder_session_key.unwrap_or(0)
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
+        self.lease_epoch.store(published_lease_epoch, Ordering::Release);
     }
 
     fn emit(&self, event: MaintenanceRevocationEvent) {
@@ -1141,6 +1180,7 @@ impl MaintenanceGate {
             && inner.applied_lease_epoch < lease_epoch
         {
             inner.applied_lease_epoch = lease_epoch;
+            self.sync_atomics(&inner);
             self.wait_cv.notify_all();
         }
     }
@@ -1366,6 +1406,44 @@ impl MaintenanceGate {
             if inner.holder_session_key != Some(session_key) {
                 return Ok(None);
             }
+            let event = self.build_revocation_event(&inner, reason);
+            inner.holder_session_id = None;
+            inner.holder_session_key = None;
+            inner.lease_epoch = inner.lease_epoch.wrapping_add(1);
+            let lease_epoch = inner.lease_epoch;
+            self.sync_atomics(&inner);
+            self.wait_cv.notify_all();
+            match self.send_control_command_locked(
+                MaintenanceControlOp::Revoke {
+                    session_key,
+                    lease_epoch,
+                    reason,
+                },
+                false,
+            ) {
+                Ok(None) => {},
+                Ok(Some(_)) => unreachable!("non-blocking revoke must not return ack"),
+                Err(err) => return Err(err),
+            }
+            event
+        };
+        if let Some(event) = event {
+            self.emit(event);
+            Ok(Some(event))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn revoke_current_holder(
+        &self,
+        reason: MaintenanceRevocationReason,
+    ) -> Result<Option<MaintenanceRevocationEvent>, DriverError> {
+        let event = {
+            let mut inner = self.inner.lock().unwrap();
+            let Some(session_key) = inner.holder_session_key else {
+                return Ok(None);
+            };
             let event = self.build_revocation_event(&inner, reason);
             inner.holder_session_id = None;
             inner.holder_session_key = None;
@@ -2363,6 +2441,7 @@ impl Piper {
         let (result, maintenance_state) =
             Self::manual_fault_recovery_result_from_confirmed_mask(confirmed_mask);
         self.maintenance_gate.set_state_synced(maintenance_state)?;
+        self.runtime_fault.store(0, Ordering::Release);
 
         match self.runtime_phase.compare_exchange(
             RuntimePhase::FaultLatched as u8,
@@ -2372,12 +2451,20 @@ impl Piper {
         ) {
             Ok(_) => {
                 self.normal_send_gate.reopen_after_fault();
-                self.runtime_fault.store(0, Ordering::Release);
+                // Publish the controller-visible maintenance state after reopening the
+                // runtime so observers do not depend on the next RX refresh tick.
+                self.maintenance_gate.local_set_state(maintenance_state);
                 Ok(result)
             },
             Err(observed) => match RuntimePhase::from_raw(observed) {
-                RuntimePhase::Stopping => Err(DriverError::ChannelClosed),
+                RuntimePhase::Stopping => {
+                    self.runtime_fault
+                        .store(RuntimeFaultKind::ManualFault as u8, Ordering::Release);
+                    Err(DriverError::ChannelClosed)
+                },
                 RuntimePhase::Running | RuntimePhase::FaultLatched => {
+                    self.runtime_fault
+                        .store(RuntimeFaultKind::ManualFault as u8, Ordering::Release);
                     Err(DriverError::ControlPathClosed)
                 },
             },
@@ -2674,6 +2761,19 @@ impl Piper {
         self.ctx.joint_driver_low_speed.load().as_ref().clone()
     }
 
+    #[doc(hidden)]
+    pub fn confirmed_driver_enabled_mask_after_host_mono(
+        &self,
+        min_host_rx_mono_us: u64,
+    ) -> Option<u8> {
+        let driver_state = self.ctx.joint_driver_low_speed.load();
+        driver_state.confirmed_driver_enabled_mask_after_host_mono(
+            min_host_rx_mono_us,
+            crate::heartbeat::monotonic_micros().max(1),
+            self.low_speed_drive_state_freshness_window_us(),
+        )
+    }
+
     /// 返回已缓存的固件版本。
     pub fn firmware_version_cached(&self) -> Option<String> {
         if let Ok(mut firmware_state) = self.ctx.firmware_version.write() {
@@ -2773,6 +2873,20 @@ impl Piper {
             .setting_response
             .read()
             .map(|guard| guard.clone())
+            .map_err(|_| DriverError::PoisonedLock)
+    }
+
+    /// 清空最近一次设置指令应答缓存。
+    ///
+    /// 用于请求-应答型配置操作在发送新命令前显式失效旧缓存，
+    /// 避免调用方把历史 0x476 应答误判为本次请求的确认。
+    pub fn clear_setting_response(&self) -> Result<(), DriverError> {
+        self.ctx
+            .setting_response
+            .write()
+            .map(|mut guard| {
+                *guard = SettingResponseState::default();
+            })
             .map_err(|_| DriverError::PoisonedLock)
     }
 
@@ -3156,7 +3270,7 @@ impl Piper {
     ///
     /// - [`HookManager`](crate::hooks::HookManager) - 钩子管理器
     /// - [`FrameCallback`](crate::hooks::FrameCallback) - 回调 trait
-    /// - [架构分析报告](../../../docs/architecture/piper-driver-client-mixing-analysis.md) - 方案 B 设计
+    /// - [架构分析报告](../../../docs/v0/architecture/piper-driver-client-mixing-analysis.md) - 方案 B 设计
     pub fn hooks(&self) -> Arc<std::sync::RwLock<crate::hooks::HookManager>> {
         Arc::clone(&self.ctx.hooks)
     }
@@ -3279,6 +3393,8 @@ impl Piper {
                 if !self.tx_thread_alive() {
                     return Err(DriverError::ChannelClosed);
                 }
+                self.maintenance_gate
+                    .revoke_current_holder(MaintenanceRevocationReason::ControllerStateChanged)?;
 
                 match (self.runtime_phase(), self.runtime_fault_kind()) {
                     (RuntimePhase::Running, None) => {
@@ -3467,6 +3583,10 @@ impl Piper {
     }
 
     /// 发送实时帧包并等待 TX 线程确认实际发送结果。
+    ///
+    /// `timeout` 只约束此包能否在 deadline 前进入 TX commit point。
+    /// 一旦 TX 线程在 deadline 前进入 `tx.send_control(...)`，调用方将继续等待真实发送结果，
+    /// 即使该结果返回时间晚于最初的 `timeout`。
     pub fn send_realtime_package_confirmed(
         &self,
         frames: impl IntoIterator<Item = PiperFrame>,
@@ -3729,6 +3849,10 @@ impl Piper {
     }
 
     /// 发送可靠帧包并等待 TX 线程确认整包实际发送结果。
+    ///
+    /// `timeout` 只约束此包能否在 deadline 前进入 TX commit point。
+    /// 一旦 TX 线程在 deadline 前进入 `tx.send_control(...)`，调用方将继续等待真实发送结果，
+    /// 即使该结果返回时间晚于最初的 `timeout`。
     pub fn send_reliable_package_confirmed(
         &self,
         frames: impl IntoIterator<Item = PiperFrame>,
@@ -3758,6 +3882,23 @@ impl Piper {
         )?;
 
         wait_for_delivery_result(ack_rx, deadline, || DriverError::Timeout)
+    }
+
+    #[doc(hidden)]
+    pub fn send_reliable_frame_confirmed_commit_marker(
+        &self,
+        frame: PiperFrame,
+        timeout: Duration,
+    ) -> Result<u64, DriverError> {
+        let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+        self.enqueue_reliable_timeout_until(
+            ReliableCommand::package_confirmed([frame], deadline, ack_tx),
+            deadline,
+        )?;
+
+        wait_for_delivery_result_with_commit(ack_rx, deadline, || DriverError::Timeout)?
+            .ok_or(DriverError::ChannelClosed)
     }
 
     /// 发送维护帧并等待 TX 线程在实际发送点完成最终运行时准入判定。
@@ -3846,6 +3987,16 @@ impl Piper {
         frame: PiperFrame,
         timeout: Duration,
     ) -> Result<(), DriverError> {
+        self.send_local_state_transition_frame_confirmed_commit_marker(frame, timeout)
+            .map(|_| ())
+    }
+
+    #[doc(hidden)]
+    pub fn send_local_state_transition_frame_confirmed_commit_marker(
+        &self,
+        frame: PiperFrame,
+        timeout: Duration,
+    ) -> Result<u64, DriverError> {
         if !self.tx_thread_alive() {
             return Err(DriverError::ChannelClosed);
         }
@@ -3930,7 +4081,9 @@ impl Piper {
         }
 
         self.metrics.tx_reliable_enqueued_total.fetch_add(1, Ordering::Relaxed);
-        let result = wait_for_maintenance_send_result(ack_rx, deadline);
+        let result =
+            wait_for_delivery_result_with_commit(ack_rx, deadline, || DriverError::Timeout)
+                .and_then(|commit| commit.ok_or(DriverError::ChannelClosed));
         if matches!(result, Err(DriverError::Timeout)) {
             self.latch_state_transition_timeout_fault_fast();
         }
@@ -5311,7 +5464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_maintenance_uses_current_mode_after_try_set_mode_normal_returns() {
+    fn test_replay_mode_revokes_maintenance_lease_before_returning_to_normal() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Arc::new(
             Piper::new_dual_thread_parts_unvalidated(
@@ -5338,6 +5491,9 @@ mod tests {
         piper
             .try_set_mode(crate::mode::DriverMode::Replay, Duration::from_millis(100))
             .expect("entering Replay should succeed");
+        let snapshot = piper.maintenance_lease_snapshot();
+        assert_eq!(snapshot.holder_session_id(), None);
+        assert_eq!(snapshot.holder_session_key(), None);
         let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
         reached_rx
             .recv_timeout(Duration::from_millis(200))
@@ -5358,16 +5514,38 @@ mod tests {
             )
         });
 
-        wait_until(
-            Duration::from_millis(200),
-            || piper.get_metrics().tx_reliable_enqueued_total >= 1,
-            "maintenance frame should enqueue while the TX loop is paused at the barrier",
-        );
         let _ = release_tx.send(());
-        send_handle
+        let error = send_handle
             .join()
             .expect("maintenance send thread should finish")
-            .expect("maintenance frame should not be rejected by stale Replay mode snapshot");
+            .expect_err("Replay must revoke the pre-existing maintenance lease");
+        assert!(matches!(error, DriverError::MaintenanceWriteDenied(_)));
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert!(sent.is_empty());
+        drop(sent);
+
+        let new_lease_epoch = match piper
+            .acquire_maintenance_lease_gate(9, session_key, Duration::from_millis(10))
+            .expect("maintenance reacquire should succeed after Replay returns to Normal")
+        {
+            MaintenanceLeaseAcquireResult::Granted { lease_epoch } => lease_epoch,
+            other => panic!("unexpected maintenance reacquire result: {other:?}"),
+        };
+        assert!(
+            new_lease_epoch > lease_epoch,
+            "Replay revocation should bump the maintenance lease epoch"
+        );
+
+        piper
+            .send_maintenance_frame_confirmed(
+                9,
+                session_key,
+                new_lease_epoch,
+                maintenance_frame,
+                Duration::from_millis(200),
+            )
+            .expect("maintenance writes should succeed after reacquiring a fresh lease");
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[maintenance_frame]);
@@ -7331,13 +7509,19 @@ mod tests {
     fn test_shutdown_receipt_returns_ready_ack_even_after_deadline_passes() {
         let piper =
             Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None).unwrap();
+        let timeout = Duration::from_millis(200);
         let receipt = piper
             .enqueue_shutdown(
                 PiperFrame::new_standard(0x471, &[0x01]),
-                Instant::now() + Duration::from_millis(10),
+                Instant::now() + timeout,
             )
             .expect("enqueue should succeed");
-        std::thread::sleep(Duration::from_millis(20));
+        wait_until(
+            timeout,
+            || piper.get_metrics().tx_shutdown_sent_total == 1,
+            "shutdown send should complete before receipt wait crosses the deadline",
+        );
+        std::thread::sleep(timeout + Duration::from_millis(20));
 
         receipt
             .wait()
@@ -8007,7 +8191,7 @@ mod tests {
             .expect("realtime waiter should receive an abort result")
         {
             DeliveryPhase::Finished(result) => result.expect_err("realtime command must abort"),
-            DeliveryPhase::Committed => panic!("stale realtime command must not commit"),
+            DeliveryPhase::Committed { .. } => panic!("stale realtime command must not commit"),
         };
         assert!(matches!(
             realtime_error,
@@ -8028,7 +8212,7 @@ mod tests {
             .expect("reliable waiter should receive an abort result")
         {
             DeliveryPhase::Finished(result) => result.expect_err("reliable command must abort"),
-            DeliveryPhase::Committed => panic!("stale reliable command must not commit"),
+            DeliveryPhase::Committed { .. } => panic!("stale reliable command must not commit"),
         };
         assert!(matches!(
             reliable_error,
@@ -8627,7 +8811,7 @@ mod tests {
             .expect("realtime waiter should receive an abort result")
         {
             DeliveryPhase::Finished(result) => result.expect_err("realtime command must abort"),
-            DeliveryPhase::Committed => panic!("stale realtime command must not commit"),
+            DeliveryPhase::Committed { .. } => panic!("stale realtime command must not commit"),
         };
         assert!(matches!(
             realtime_error,
@@ -8648,7 +8832,7 @@ mod tests {
             .expect("reliable waiter should receive an abort result")
         {
             DeliveryPhase::Finished(result) => result.expect_err("reliable command must abort"),
-            DeliveryPhase::Committed => panic!("stale reliable command must not commit"),
+            DeliveryPhase::Committed { .. } => panic!("stale reliable command must not commit"),
         };
         assert!(matches!(
             reliable_error,
@@ -9180,8 +9364,13 @@ mod tests {
         );
 
         let snapshot = gate.snapshot();
-        assert_eq!(snapshot.holder_session_id(), Some(4));
-        assert_eq!(snapshot.holder_session_key(), Some(44));
+        assert_eq!(snapshot.holder_session_id(), None);
+        assert_eq!(snapshot.holder_session_key(), None);
+        assert_eq!(
+            snapshot.lease_epoch(),
+            0,
+            "tentative grant must not publish a lease epoch before control-lane ack"
+        );
 
         {
             let ops = ops.lock().expect("maintenance ops lock");
@@ -9496,6 +9685,110 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &[first]);
+    }
+
+    #[test]
+    fn test_realtime_confirmed_waits_past_timeout_after_commit() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let frames = [PiperFrame::new_standard(0x155, &[0x01])];
+        let result = Arc::new(Mutex::new(None));
+        let result_clone = Arc::clone(&result);
+        let piper_clone = Arc::clone(&piper);
+
+        let handle = std::thread::spawn(move || {
+            let send_result =
+                piper_clone.send_realtime_package_confirmed(frames, Duration::from_millis(20));
+            *result_clone.lock().expect("result lock") = Some(send_result);
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("confirmed realtime send should reach tx.send_control");
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            result.lock().expect("result lock").is_none(),
+            "confirmed realtime send should keep waiting after commit even if timeout elapsed"
+        );
+
+        let _ = release_tx.send(());
+        handle.join().expect("confirmed realtime sender should finish");
+
+        let send_result = result
+            .lock()
+            .expect("result lock")
+            .take()
+            .expect("confirmed realtime result should be captured");
+        send_result.expect("confirmed realtime send should succeed after delayed completion");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &frames);
+    }
+
+    #[test]
+    fn test_reliable_confirmed_waits_past_timeout_after_commit() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let frames = [PiperFrame::new_standard(0x201, &[0x01])];
+        let result = Arc::new(Mutex::new(None));
+        let result_clone = Arc::clone(&result);
+        let piper_clone = Arc::clone(&piper);
+
+        let handle = std::thread::spawn(move || {
+            let send_result =
+                piper_clone.send_reliable_package_confirmed(frames, Duration::from_millis(20));
+            *result_clone.lock().expect("result lock") = Some(send_result);
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("confirmed reliable send should reach tx.send_control");
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            result.lock().expect("result lock").is_none(),
+            "confirmed reliable send should keep waiting after commit even if timeout elapsed"
+        );
+
+        let _ = release_tx.send(());
+        handle.join().expect("confirmed reliable sender should finish");
+
+        let send_result = result
+            .lock()
+            .expect("result lock")
+            .take()
+            .expect("confirmed reliable result should be captured");
+        send_result.expect("confirmed reliable send should succeed after delayed completion");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &frames);
     }
 
     #[test]

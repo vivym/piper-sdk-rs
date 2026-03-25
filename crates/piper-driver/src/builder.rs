@@ -9,7 +9,10 @@ use crate::piper::{Piper, StartupValidationDeadline};
 use piper_can::SocketCanAdapter;
 use piper_can::gs_usb::GsUsbCanAdapter;
 use piper_can::gs_usb::device::GsUsbDeviceSelector;
-use piper_can::{CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter};
+use piper_can::{
+    CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter,
+    SplittableAdapter,
+};
 use std::time::Duration;
 
 /// 类型化的连接目标。
@@ -207,7 +210,12 @@ impl PiperBuilder {
         self
     }
 
-    /// 设置 StrictRealtime 启动验收超时。
+    /// 设置整个启动验收流程的总超时预算。
+    ///
+    /// 该预算覆盖：
+    /// - backend 打开阶段
+    /// - startup probe / validation
+    /// - Auto 模式下的候选切换与 fallback
     pub fn startup_validation_timeout(mut self, timeout: Duration) -> Self {
         self.startup_validation_timeout = timeout;
         self
@@ -231,33 +239,27 @@ impl PiperBuilder {
             ConnectionTarget::SocketCan { iface } => {
                 self.build_socketcan_backend(factory, iface, receive_timeout, startup_deadline)
             },
-            ConnectionTarget::GsUsbAuto => {
-                let backend = factory.open_gs_usb(
-                    GsUsbSelectorSpec::Auto,
-                    self.baud_rate,
-                    receive_timeout,
-                )?;
-                self.build_backend(backend, self.startup_validation_timeout)
-            },
-            ConnectionTarget::GsUsbSerial { serial } => {
-                let backend = factory.open_gs_usb(
-                    GsUsbSelectorSpec::Serial(serial.clone()),
-                    self.baud_rate,
-                    receive_timeout,
-                )?;
-                self.build_backend(backend, self.startup_validation_timeout)
-            },
-            ConnectionTarget::GsUsbBusAddress { bus, address } => {
-                let backend = factory.open_gs_usb(
-                    GsUsbSelectorSpec::BusAddress {
-                        bus: *bus,
-                        address: *address,
-                    },
-                    self.baud_rate,
-                    receive_timeout,
-                )?;
-                self.build_backend(backend, self.startup_validation_timeout)
-            },
+            ConnectionTarget::GsUsbAuto => self.build_gs_usb_backend(
+                factory,
+                GsUsbSelectorSpec::Auto,
+                receive_timeout,
+                startup_deadline,
+            ),
+            ConnectionTarget::GsUsbSerial { serial } => self.build_gs_usb_backend(
+                factory,
+                GsUsbSelectorSpec::Serial(serial.clone()),
+                receive_timeout,
+                startup_deadline,
+            ),
+            ConnectionTarget::GsUsbBusAddress { bus, address } => self.build_gs_usb_backend(
+                factory,
+                GsUsbSelectorSpec::BusAddress {
+                    bus: *bus,
+                    address: *address,
+                },
+                receive_timeout,
+                startup_deadline,
+            ),
         }
     }
 
@@ -285,20 +287,19 @@ impl PiperBuilder {
         self.build_backend_until_deadline(backend, startup_deadline)
     }
 
-    fn build_backend(
+    fn build_gs_usb_backend(
         &self,
-        backend: BuiltBackend,
-        startup_timeout: Duration,
+        factory: &impl BackendFactory,
+        selector: GsUsbSelectorSpec,
+        receive_timeout: Duration,
+        startup_deadline: StartupValidationDeadline,
     ) -> Result<Piper, DriverError> {
-        let interface = backend.interface;
-        let bus_speed = backend.bus_speed;
-        Piper::new_dual_thread_parts_with_startup_timeout(
-            backend.rx,
-            backend.tx,
-            Some(self.pipeline_config.clone()),
-            startup_timeout,
-        )
-        .map(|piper| piper.with_metadata(interface, bus_speed))
+        if startup_deadline.is_expired_now() {
+            return Err(self.startup_deadline_expired_error("before opening GS-USB target"));
+        }
+
+        let backend = factory.open_gs_usb(selector, self.baud_rate, receive_timeout)?;
+        self.build_backend_until_deadline(backend, startup_deadline)
     }
 
     fn build_backend_until_deadline(
@@ -469,8 +470,13 @@ impl PiperBuilder {
             Err(errors) => errors,
         };
 
-        match factory.open_gs_usb(GsUsbSelectorSpec::Auto, self.baud_rate, receive_timeout) {
-            Ok(backend) => self.build_backend(backend, self.startup_validation_timeout),
+        match self.build_gs_usb_backend(
+            factory,
+            GsUsbSelectorSpec::Auto,
+            receive_timeout,
+            startup_deadline,
+        ) {
+            Ok(piper) => Ok(piper),
             Err(error) if strict_errors.is_empty() => Err(error),
             Err(error) => Err(Self::attach_auto_context(
                 error,
@@ -916,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_strict_retries_next_socketcan_candidate_after_validation_failure() {
+    fn test_auto_strict_stops_after_validation_failure_exhausts_shared_deadline() {
         let factory = FallbackFactory {
             openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
             calls: Mutex::new(Vec::new()),
@@ -929,10 +935,13 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            result.expect("vcan0 should be tried after can0 strict validation fails");
+            assert!(
+                result.is_err(),
+                "AutoStrict should fail once the first strict validation exhausts the shared deadline"
+            );
             assert_eq!(
                 factory.calls.lock().unwrap().as_slice(),
-                &["socketcan:can0".to_string(), "socketcan:vcan0".to_string()]
+                &["socketcan:can0".to_string()]
             );
         }
         #[cfg(not(target_os = "linux"))]
@@ -1004,9 +1013,9 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_any_falls_back_to_gs_usb_after_strict_validation_failure() {
-        let factory = FallbackFactory {
-            openable_socketcan: vec!["can0".to_string()],
+    fn test_auto_any_falls_back_to_gs_usb_after_fast_socketcan_failure() {
+        let factory = FakeFactory {
+            openable_socketcan: Vec::new(),
             calls: Mutex::new(Vec::new()),
         };
 
@@ -1027,7 +1036,7 @@ mod tests {
                 &[
                     "socketcan:can0".to_string(),
                     "socketcan:vcan0".to_string(),
-                    "gs-usb:auto".to_string()
+                    "gs-usb:auto".to_string(),
                 ]
             );
         }
@@ -1051,14 +1060,13 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            let piper = result.expect("AutoAny should still fall back to GS-USB");
-            assert_eq!(
-                piper.backend_capability(),
-                piper_can::BackendCapability::SoftRealtime
+            assert!(
+                result.is_err(),
+                "AutoAny should stop once the shared startup deadline is exhausted before fallback"
             );
             assert_eq!(
                 factory.calls.lock().unwrap().as_slice(),
-                &["socketcan:can0".to_string(), "gs-usb:auto".to_string()]
+                &["socketcan:can0".to_string()]
             );
         }
         #[cfg(not(target_os = "linux"))]
@@ -1111,7 +1119,10 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            let error = result.expect_err("slow open should exhaust explicit strict deadline");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("slow open should exhaust explicit strict deadline"),
+            };
             match error {
                 DriverError::Can(CanError::Device(device_error)) => {
                     assert_eq!(device_error.kind, CanDeviceErrorKind::UnsupportedConfig);
@@ -1134,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_any_stops_after_slow_open_exhausts_shared_deadline() {
+    fn test_auto_any_stops_after_slow_open_exhausts_total_startup_budget() {
         let factory = SlowOpenFactory {
             openable_socketcan: vec!["can0".to_string(), "vcan0".to_string()],
             calls: Mutex::new(Vec::new()),
@@ -1148,15 +1159,13 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            let piper =
-                result.expect("AutoAny should fall back after slow strict open exhausts budget");
-            assert_eq!(
-                piper.backend_capability(),
-                piper_can::BackendCapability::SoftRealtime
+            assert!(
+                result.is_err(),
+                "AutoAny should fail once the first slow probe exhausts the total startup budget"
             );
             assert_eq!(
                 factory.calls.lock().unwrap().as_slice(),
-                &["socketcan:can0".to_string(), "gs-usb:auto".to_string()]
+                &["socketcan:can0".to_string()]
             );
         }
         #[cfg(not(target_os = "linux"))]
@@ -1180,8 +1189,12 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            let error = result
-                .expect_err("AutoStrict should fail once slow open exhausts the shared deadline");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => {
+                    panic!("AutoStrict should fail once slow open exhausts the shared deadline")
+                },
+            };
             match error {
                 DriverError::Can(CanError::Device(device_error)) => {
                     assert_eq!(device_error.kind, CanDeviceErrorKind::UnsupportedConfig);
