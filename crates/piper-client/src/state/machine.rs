@@ -3770,6 +3770,25 @@ mod tests {
         joint_driver_state_frame(joint_index, false, timestamp_us)
     }
 
+    fn joint_dynamic_frame(
+        joint_index: u8,
+        speed_millirad_per_sec: i16,
+        current_milliamp: i16,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&speed_millirad_per_sec.to_be_bytes());
+        data[2..4].copy_from_slice(&current_milliamp.to_be_bytes());
+        data[4..8].copy_from_slice(&0i32.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(
+            (piper_protocol::ids::ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1))
+                as u16,
+            &data,
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
     fn robot_status_frame_with_status(
         control_mode: ControlMode,
         robot_status: RobotStatus,
@@ -3881,6 +3900,47 @@ mod tests {
                 },
             })
             .collect()
+    }
+
+    fn control_snapshot_frames(timestamp_us: u64) -> Vec<TimedFrame> {
+        vec![
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(1, 0, 0, timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(2, 0, 0, timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(3, 0, 0, timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(4, 0, 0, timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(5, 0, 0, timestamp_us),
+            },
+            TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_dynamic_frame(6, 0, 0, timestamp_us),
+            },
+        ]
     }
 
     #[test]
@@ -4709,9 +4769,17 @@ mod tests {
     #[test]
     fn mit_controller_move_to_rest_requires_explicit_rest_position() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(control_snapshot_frames(1_000)),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
             DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
-            sent_frames.clone(),
         );
         let mut controller = MitController::new(active, MitControllerConfig::default())
             .expect("strict realtime driver should support MitController");
@@ -4730,9 +4798,17 @@ mod tests {
     #[test]
     fn mit_controller_drop_with_rest_position_only_sends_disable_all() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                PacedRxAdapter::new(control_snapshot_frames(1_000)),
+                RecordingTxAdapter::new(sent_frames.clone()),
+                None,
+            )
+            .expect("driver should start"),
+        );
+        let active = build_active_mit_piper_with_driver(
+            driver,
             DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
-            sent_frames.clone(),
         );
         let controller = MitController::new(
             active,

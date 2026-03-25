@@ -15,6 +15,7 @@ pub mod mit_controller;
 pub(crate) mod mit_diagnostic_dispatcher;
 pub mod pid;
 pub(crate) mod scheduler;
+pub(crate) mod snapshot_ready;
 pub mod trajectory;
 pub mod zeroing_token;
 

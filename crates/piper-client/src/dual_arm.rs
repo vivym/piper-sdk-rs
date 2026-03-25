@@ -217,7 +217,57 @@ impl DualArmActiveMit {
         let mut read_failure_since: Option<Instant> = None;
         let mut compensation_failure_streak = 0u32;
         let mut gripper_counter = 0usize;
-        let mut hold_anchor: Option<DualArmHoldAnchor> = None;
+
+        if matches!(cfg.max_iterations, Some(0)) {
+            report.exit_reason = Some(BilateralExitReason::MaxIterations);
+            let arms =
+                active.disable_both(cfg.disable_config.clone()).map_err(DualArmError::from)?;
+            update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
+            return Ok(DualArmLoopExit::Standby { arms, report });
+        }
+
+        if let Some(cancel_signal) = &cfg.cancel_signal
+            && cancel_signal.load(Ordering::Acquire)
+        {
+            report.exit_reason = Some(BilateralExitReason::Cancelled);
+            report.last_error = Some("bilateral loop cancelled".to_string());
+            let arms =
+                active.disable_both(cfg.disable_config.clone()).map_err(DualArmError::from)?;
+            update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
+            return Ok(DualArmLoopExit::Standby { arms, report });
+        }
+
+        let initial_health = active.observer().runtime_health();
+        if let Some(exit_reason) = classify_runtime_fault_exit_reason(initial_health) {
+            report.exit_reason = Some(exit_reason);
+            report.last_runtime_fault_left = initial_health.left.fault;
+            report.last_runtime_fault_right = initial_health.right.fault;
+            report.last_error = Some(format_runtime_health_error(initial_health));
+            let (arms, shutdown) = active.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+            report.left_stop_attempt = shutdown.left_stop_attempt;
+            report.right_stop_attempt = shutdown.right_stop_attempt;
+            update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
+            return Ok(DualArmLoopExit::Faulted { arms, report });
+        }
+
+        let initial_snapshot = match wait_for_dual_arm_snapshot_ready(
+            CALIBRATION_SNAPSHOT_READY_TIMEOUT,
+            CALIBRATION_SNAPSHOT_POLL_INTERVAL,
+            || active.observer().snapshot(cfg.read_policy),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                report.read_faults += 1;
+                report.exit_reason = Some(BilateralExitReason::ReadFault);
+                report.last_error = Some(err.to_string());
+                let arms =
+                    active.disable_both(cfg.disable_config.clone()).map_err(DualArmError::from)?;
+                update_report_metrics(&mut report, &arms.left.driver, &arms.right.driver);
+                return Ok(DualArmLoopExit::Standby { arms, report });
+            },
+        };
+        report.max_inter_arm_skew = report.max_inter_arm_skew.max(initial_snapshot.inter_arm_skew);
+        let mut hold_anchor = Some(DualArmHoldAnchor::from_snapshot(&initial_snapshot));
 
         loop {
             if let Some(max_iterations) = cfg.max_iterations
@@ -1725,6 +1775,28 @@ mod tests {
         }
     }
 
+    struct DelayedScriptedRxAdapter {
+        frames: VecDeque<(Duration, PiperFrame)>,
+    }
+
+    impl DelayedScriptedRxAdapter {
+        fn new(frames: Vec<(Duration, PiperFrame)>) -> Self {
+            Self {
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl RxAdapter for DelayedScriptedRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            let (delay, frame) = self.frames.pop_front().ok_or(CanError::Timeout)?;
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            Ok(frame)
+        }
+    }
+
     struct FailAfterFramesRxAdapter {
         frames: VecDeque<PiperFrame>,
         tripped: bool,
@@ -1944,6 +2016,68 @@ mod tests {
         ]
     }
 
+    fn delayed_control_snapshot_frames(
+        timestamp_us: u64,
+        dynamic_delay: Duration,
+    ) -> Vec<(Duration, PiperFrame)> {
+        vec![
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            ),
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            ),
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            ),
+            (dynamic_delay, joint_dynamic_frame(1, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(2, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(3, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(4, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(5, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(6, 0, 0, timestamp_us)),
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us + 1),
+            ),
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us + 1),
+            ),
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us + 1),
+            ),
+            (
+                Duration::ZERO,
+                joint_dynamic_frame(1, 0, 0, timestamp_us + 1),
+            ),
+            (
+                Duration::ZERO,
+                joint_dynamic_frame(2, 0, 0, timestamp_us + 1),
+            ),
+            (
+                Duration::ZERO,
+                joint_dynamic_frame(3, 0, 0, timestamp_us + 1),
+            ),
+            (
+                Duration::ZERO,
+                joint_dynamic_frame(4, 0, 0, timestamp_us + 1),
+            ),
+            (
+                Duration::ZERO,
+                joint_dynamic_frame(5, 0, 0, timestamp_us + 1),
+            ),
+            (
+                Duration::ZERO,
+                joint_dynamic_frame(6, 0, 0, timestamp_us + 1),
+            ),
+        ]
+    }
+
     fn incomplete_scripted_frames(timestamp_us: u64) -> Vec<PiperFrame> {
         vec![
             joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
@@ -2072,6 +2206,17 @@ mod tests {
         );
         wait_for_complete_control_snapshot(&piper.observer().clone());
         piper
+    }
+
+    fn build_active_mit_piper_without_snapshot_warmup<R, T>(
+        rx_adapter: R,
+        tx_adapter: T,
+    ) -> Piper<Active<MitMode>, StrictRealtime>
+    where
+        R: RxAdapter + Send + 'static,
+        T: RealtimeTxAdapter + Send + 'static,
+    {
+        build_active_mit_piper_with_rx_and_tx_adapter(rx_adapter, tx_adapter, Duration::ZERO)
     }
 
     fn build_standby_piper(
@@ -3362,6 +3507,59 @@ mod tests {
             left_frames.iter().any(|frame| frame.id == hold.id && frame.data == hold.data),
             "expected anchor-based hold command after read fault",
         );
+    }
+
+    #[test]
+    fn test_run_bilateral_waits_for_initial_snapshot_before_faulting() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let arms = DualArmActiveMit {
+            left: build_active_mit_piper_without_snapshot_warmup(
+                DelayedScriptedRxAdapter::new(delayed_control_snapshot_frames(
+                    1_000,
+                    Duration::from_millis(25),
+                )),
+                RecordingTxAdapter::new(left_sent.clone()),
+            ),
+            right: build_active_mit_piper_without_snapshot_warmup(
+                DelayedScriptedRxAdapter::new(delayed_control_snapshot_frames(
+                    1_000,
+                    Duration::from_millis(25),
+                )),
+                RecordingTxAdapter::new(right_sent.clone()),
+            ),
+        };
+
+        let exit = arms
+            .run_bilateral(
+                ForwardingController::default(),
+                BilateralLoopConfig {
+                    frequency_hz: 100.0,
+                    warmup_cycles: 0,
+                    max_iterations: Some(1),
+                    gripper: GripperTeleopConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    read_policy: DualArmReadPolicy {
+                        per_arm: ControlReadPolicy {
+                            max_state_skew_us: 2_000,
+                            max_feedback_age: Duration::from_millis(50),
+                        },
+                        max_inter_arm_skew: Duration::from_secs(1),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("initial cold snapshot gap should not immediately downgrade to read fault");
+
+        match exit {
+            DualArmLoopExit::Standby { report, .. } => {
+                assert_eq!(report.exit_reason, Some(BilateralExitReason::MaxIterations));
+                assert_eq!(report.read_faults, 0);
+            },
+            DualArmLoopExit::Faulted { .. } => panic!("expected bounded standby exit"),
+        }
     }
 
     #[test]

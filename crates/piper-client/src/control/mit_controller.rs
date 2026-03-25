@@ -70,6 +70,9 @@ use super::hot_path_diagnostics::{FaultLogDecision, HotPathDiagnostics, Recovery
 use super::mit_diagnostic_dispatcher::{
     MitDiagnosticDispatchError, MitDiagnosticDispatcher, MitDiagnosticEvent, global_dispatcher,
 };
+use super::snapshot_ready::{
+    CONTROL_SNAPSHOT_POLL_INTERVAL, CONTROL_SNAPSHOT_READY_TIMEOUT, wait_for_control_snapshot_ready,
+};
 use crate::observer::{ControlReadPolicy, Observer};
 use crate::raw_commander::RawCommander;
 use crate::state::StrictRealtime;
@@ -300,6 +303,9 @@ impl MitController {
     /// - `piper`: 已使能 MIT 模式的 Piper
     /// - `config`: 控制器配置
     ///
+    /// 构造时会短暂等待第一份完整且对齐的控制快照，避免刚进入 MIT 模式时
+    /// 第一拍控制循环因冷数据而立即 fail-closed。
+    ///
     /// # 示例
     ///
     /// ```rust,no_run
@@ -356,6 +362,11 @@ impl MitController {
 
         // 提取 observer（Clone 是轻量的，Arc 指针）
         let observer = piper.observer().clone();
+        let _initial_snapshot = wait_for_control_snapshot_ready(
+            CONTROL_SNAPSHOT_READY_TIMEOUT,
+            CONTROL_SNAPSHOT_POLL_INTERVAL,
+            || observer.control_snapshot(config.read_policy),
+        )?;
 
         Ok(Self {
             piper: Some(piper),
@@ -1106,6 +1117,28 @@ mod tests {
         }
     }
 
+    struct DelayedScriptedRxAdapter {
+        frames: VecDeque<(Duration, PiperFrame)>,
+    }
+
+    impl DelayedScriptedRxAdapter {
+        fn new(frames: Vec<(Duration, PiperFrame)>) -> Self {
+            Self {
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl RxAdapter for DelayedScriptedRxAdapter {
+        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+            let (delay, frame) = self.frames.pop_front().ok_or(CanError::Timeout)?;
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            Ok(frame)
+        }
+    }
+
     struct RecordingTxAdapter {
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
     }
@@ -1213,6 +1246,32 @@ mod tests {
             joint_dynamic_frame(4, 0, 0, timestamp_us + 1),
             joint_dynamic_frame(5, 0, 0, timestamp_us + 1),
             joint_dynamic_frame(6, 0, 0, timestamp_us + 1),
+        ]
+    }
+
+    fn delayed_control_snapshot_frames(
+        timestamp_us: u64,
+        dynamic_delay: Duration,
+    ) -> Vec<(Duration, PiperFrame)> {
+        vec![
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+            ),
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+            ),
+            (
+                Duration::ZERO,
+                joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            ),
+            (dynamic_delay, joint_dynamic_frame(1, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(2, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(3, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(4, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(5, 0, 0, timestamp_us)),
+            (Duration::ZERO, joint_dynamic_frame(6, 0, 0, timestamp_us)),
         ]
     }
 
@@ -1418,7 +1477,7 @@ mod tests {
     #[test]
     fn collect_pending_diagnostics_summarizes_send_failure_recovery_once() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let active = build_active_mit_piper(sent_frames, Duration::ZERO);
         let (event_tx, event_rx) = bounded(4);
         let mut controller = MitController::new_with_dispatcher(
             active,
@@ -1450,7 +1509,7 @@ mod tests {
     #[test]
     fn enter_safe_state_force_flushes_pending_diagnostics_inside_summary_window() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let active = build_active_mit_piper(sent_frames, Duration::ZERO);
         let (event_tx, event_rx) = bounded(8);
         let mut controller = MitController::new_with_dispatcher(
             active,
@@ -1511,7 +1570,7 @@ mod tests {
     #[test]
     fn poll_windowed_diagnostics_emits_recovery_before_controller_exit() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let active = build_active_mit_piper(sent_frames, Duration::ZERO);
         let (event_tx, event_rx) = bounded(4);
         let dispatcher = MitDiagnosticDispatcher::for_test(event_tx);
         let mut controller =
@@ -1555,7 +1614,7 @@ mod tests {
     #[test]
     fn queued_dropped_runtime_summaries_are_reported_before_next_successful_submission() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let active = build_active_mit_piper(sent_frames, Duration::ZERO);
         let (event_tx, event_rx) = bounded(1);
         let dispatcher = MitDiagnosticDispatcher::for_test(event_tx);
         let mut controller =
@@ -1610,7 +1669,7 @@ mod tests {
     #[test]
     fn disabled_dispatcher_does_not_restore_sync_hot_path_logging() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let active = build_active_mit_piper(sent_frames, Duration::ZERO);
         let mut controller = MitController::new_with_dispatcher(
             active,
             MitControllerConfig::default(),
@@ -1656,7 +1715,7 @@ mod tests {
         });
 
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(sent_frames, Duration::from_millis(20));
+        let active = build_active_mit_piper(sent_frames, Duration::ZERO);
         let dispatcher = crate::control::mit_diagnostic_dispatcher::global_dispatcher()
             .expect("dispatcher should build");
         let mut controller =
@@ -1692,8 +1751,7 @@ mod tests {
     #[test]
     fn mit_controller_new_rejects_non_positive_or_non_finite_control_rate() {
         for control_rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let active =
-                build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::from_millis(20));
+            let active = build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::ZERO);
             let error = MitController::new(
                 active,
                 MitControllerConfig {
@@ -1719,8 +1777,7 @@ mod tests {
                 ..MitControllerConfig::default()
             },
         ] {
-            let active =
-                build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::from_millis(20));
+            let active = build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::ZERO);
             let error = MitController::new(active, invalid_config)
                 .err()
                 .expect("invalid motion gains must be rejected during construction");
@@ -1740,8 +1797,7 @@ mod tests {
                 ..MitControllerConfig::default()
             },
         ] {
-            let active =
-                build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::from_millis(20));
+            let active = build_active_mit_piper(Arc::new(Mutex::new(Vec::new())), Duration::ZERO);
             let error = MitController::new(active, invalid_config)
                 .err()
                 .expect("invalid safe-hold gains must be rejected during construction");
@@ -1752,7 +1808,7 @@ mod tests {
     #[test]
     fn move_to_position_read_failure_with_anchor_enters_safe_hold_and_latches_safed_out() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(sent_frames.clone(), Duration::from_millis(25));
+        let active = build_active_mit_piper(sent_frames.clone(), Duration::ZERO);
         let mut controller = MitController::new(
             active,
             MitControllerConfig {
@@ -1763,12 +1819,13 @@ mod tests {
                 rest_position: Some([Rad(0.0); 6]),
                 read_policy: ControlReadPolicy {
                     max_state_skew_us: 2_000,
-                    max_feedback_age: Duration::from_millis(1),
+                    max_feedback_age: Duration::from_millis(5),
                 },
                 ..MitControllerConfig::default()
             },
         )
         .expect("strict realtime driver should support MitController");
+        thread::sleep(Duration::from_millis(10));
         controller.last_hold_anchor = Some(JointArray::from([Rad(0.0); 6]));
 
         let error = controller
@@ -1836,20 +1893,51 @@ mod tests {
     }
 
     #[test]
+    fn mit_controller_new_waits_for_initial_control_snapshot_ready() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_mit_piper_with_adapters(
+            DelayedScriptedRxAdapter::new(delayed_control_snapshot_frames(
+                1_000,
+                Duration::from_millis(25),
+            )),
+            RecordingTxAdapter::new(sent_frames),
+            Duration::ZERO,
+        );
+
+        let mut controller = MitController::new(
+            active,
+            MitControllerConfig {
+                read_policy: ControlReadPolicy {
+                    max_feedback_age: Duration::from_millis(50),
+                    ..ControlReadPolicy::default()
+                },
+                ..MitControllerConfig::default()
+            },
+        )
+        .expect("controller construction should wait for the first aligned control snapshot");
+        let reached = controller
+            .move_to_position([Rad(0.0); 6], Rad(0.01), Duration::from_millis(50))
+            .expect("fresh controller should not safe-out on an initial cold snapshot gap");
+
+        assert!(reached);
+    }
+
+    #[test]
     fn move_to_position_read_failure_without_anchor_falls_back_to_emergency_stop() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
-        let active = build_active_mit_piper(sent_frames.clone(), Duration::from_millis(25));
+        let active = build_active_mit_piper(sent_frames.clone(), Duration::ZERO);
         let mut controller = MitController::new(
             active,
             MitControllerConfig {
                 read_policy: ControlReadPolicy {
                     max_state_skew_us: 2_000,
-                    max_feedback_age: Duration::from_millis(1),
+                    max_feedback_age: Duration::from_millis(5),
                 },
                 ..MitControllerConfig::default()
             },
         )
         .expect("strict realtime driver should support MitController");
+        thread::sleep(Duration::from_millis(10));
 
         let error = controller
             .move_to_position([Rad(0.0); 6], Rad(0.01), Duration::from_millis(50))
