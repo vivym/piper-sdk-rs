@@ -60,12 +60,28 @@ Supporting entry points:
 - Timestamp verification:
   `cargo run -p piper-sdk --example timestamp_verification -- --interface can0`
 - Manual CLI support path for lifecycle and recovery checks:
-  - `piper-cli shell`
+  - `cargo run -p piper-cli -- shell`
     - `connect socketcan:can0`
     - `enable`
     - `stop`
+    - `disable`
     - `exit`
-  - `piper-cli stop --target socketcan:can0`
+  - `cargo run -p piper-cli -- stop --target socketcan:can0`
+
+At a glance, the manual-only checks map like this:
+
+- explicit disable behavior:
+  - `cargo run -p piper-cli -- shell`
+  - `connect socketcan:can0`
+  - `enable`
+  - `disable`
+  - `exit`
+- drop or emergency-style stop:
+  - `cargo run -p piper-cli -- stop --target socketcan:can0`
+- fault-gating probe after recovery is not yet declared complete:
+  - `cargo run -p piper-cli -- shell`
+  - `connect socketcan:can0`
+  - `move --joints 0.02 --force`
 
 Use the supporting driver-level tools as evidence collectors, not as hidden automation:
 
@@ -81,7 +97,13 @@ The manual checks that are not covered by a helper are:
 - rejected-state command gating
 - fault and recovery gating after `can0` loss or controller-side interruption
 
-For those checks, use `piper-cli shell` for a live session or `piper-cli stop --target socketcan:can0` for a direct stop, and use the helper output plus `robot_monitor` or `state_api_demo` to confirm the robot state before and after the operator action.
+For explicit disable behavior, use the REPL path above. For drop or emergency-style stop, use `cargo run -p piper-cli -- stop --target socketcan:can0`. For fault-gating, use the motion probe below after the fault and before declaring recovery complete:
+
+- `cargo run -p piper-cli -- shell`
+  - `connect socketcan:can0`
+  - `move --joints 0.02 --force`
+
+The motion probe passes if the shell rejects it with `未连接`, `电机未使能，请先使用 enable 命令`, or another failure that does not move the robot. It fails if the command is accepted as normal motion before the safe baseline has been re-established.
 
 ## Phase 0: Preflight and Safety Baseline
 
@@ -199,19 +221,26 @@ Standby is concrete here: `hil_joint_position_check` prints `[PASS] connected an
 2. Use its `[PASS] connected and confirmed Standby` line as the Standby evidence.
 3. Use its `[PASS] enabled PositionMode motion=Joint speed_percent=...` line as the enabled-state evidence.
 4. Use the `[PASS] settle step=move ...` and `[PASS] settle step=return ...` lines as the motion and return evidence.
-5. For explicit disable behavior, stop the active control session manually and confirm the robot leaves the active drive state with `robot_monitor` or `state_api_demo`.
-6. For drop-to-disable behavior, terminate the active control process and confirm the robot returns to Standby or a non-driving state.
+5. For explicit disable behavior, use the REPL path below and run `disable` after `connect socketcan:can0` and `enable`.
+6. For drop-to-disable behavior, use `cargo run -p piper-cli -- stop --target socketcan:can0` as the external stop path.
 7. For reconnect behavior, start a fresh helper run and confirm the new connection and first snapshot again meet the `<= 5s` and `<= 200ms` budgets.
 8. For rejected-state gating, start `hil_joint_position_check` while the robot is not in Standby and confirm it fails with `robot is not in confirmed Standby; run stop first`.
+9. For the explicit disable path, the exact CLI sequence is:
+   - `cargo run -p piper-cli -- shell`
+   - `connect socketcan:can0`
+   - `enable`
+   - `disable`
+   - `exit`
 
 ### Pass Criteria
 
 - The helper prints the expected Standby, enable, move, and return lines
-- After the manual disable or drop step, `robot_monitor` or `state_api_demo` shows the robot is no longer in an active drive state
+- CLI disable completes without error and does not itself trigger motion
+- `robot_monitor` or `state_api_demo` shows the robot is back in Standby or another non-driving state after disable
+- The drop or emergency-style stop leaves the robot in a non-driving state as confirmed by `robot_monitor` or `state_api_demo`
 - A fresh helper run reconnects within `<= 5s`
 - A fresh helper run produces its first complete snapshot within `<= 200ms`
 - The helper's printed state matches the observed robot state in `robot_monitor` or `state_api_demo`
-- Stopping the control process causes the robot to return to Standby or another non-driving state
 - A reconnect does not reuse stale monitor state from the interrupted run
 
 ### Fail Criteria
@@ -252,6 +281,8 @@ Validate the minimum viable control loop on real hardware: command out, motion o
 5. If you want a second manual check, repeat with another safe joint and keep the same limits.
 6. Allow up to `10s` for settling before judging each step.
 7. The only return criterion for this phase is the return to the initial pose of the commanded joint.
+8. For the REPL disable path, confirm the disable completes without error and does not itself trigger motion.
+9. For the drop or emergency-style path, confirm the robot leaves active drive state after `cargo run -p piper-cli -- stop --target socketcan:can0`.
 
 ### Pass Criteria
 
@@ -262,6 +293,9 @@ Validate the minimum viable control loop on real hardware: command out, motion o
 - Repeated small moves remain consistent
 - Each commanded step settles within `10s`
 - Return-to-start error is `<= 0.05 rad`
+- CLI disable completes without error and does not itself trigger motion
+- `robot_monitor` or `state_api_demo` shows the robot is back in Standby or another non-driving state after disable
+- The drop or emergency-style stop leaves the robot in a non-driving state as confirmed by `robot_monitor` or `state_api_demo`
 
 ### Fail Criteria
 
@@ -294,7 +328,10 @@ Verify that common field failures lead to explicit, safe degradation and recover
 3. Verify that fresh helper run prints its first complete snapshot within `<= 200ms`.
 4. Induce one controlled controller-side interruption, again while not moving if possible.
 5. Verify stale or missing feedback does not look like healthy control.
-6. After each interruption, verify motion commands are blocked until the system is back in a safe known-good state.
+6. Before declaring recovery complete, open the shell probe above and attempt `move --joints 0.02 --force`.
+7. Treat the probe as a pass if the shell rejects it with `未连接`, `电机未使能，请先使用 enable 命令`, or another failure that does not move the robot.
+8. Treat the probe as a fail if the command is accepted as normal motion before the safe baseline has been re-established.
+9. After each interruption, verify motion commands are blocked until the system is back in a safe known-good state.
 
 ### Pass Criteria
 
@@ -302,12 +339,14 @@ Verify that common field failures lead to explicit, safe degradation and recover
 - The system degrades toward safety
 - After recovery, a fresh helper run reconnects within `<= 5s` and prints its first complete snapshot within `<= 200ms`
 - `robot_monitor` or `state_api_demo` again shows readable state after recovery
+- The post-fault shell motion probe is rejected or otherwise fails without causing motion
 - Post-fault motion is gated until recovery is complete
 
 ### Fail Criteria
 
 - Faults are silent or ambiguous
 - Old state is mistaken for new state after recovery
+- The post-fault shell motion probe is accepted as normal motion before the safe baseline has been re-established
 - Control remains available through an unsafe interruption
 
 ## Release Gates
