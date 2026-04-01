@@ -321,13 +321,19 @@ Rules:
 
 - query APIs are globally serialized
 - starting a second query while one is in flight is not allowed to create a second concurrent wait context
-- callers may either block behind the current query or receive a deterministic contention error; the implementation plan must choose one behavior and apply it uniformly
+- callers receive a deterministic fail-fast contention error rather than blocking behind the current query
 - because there is only one in-flight query, correlation is performed against one active query context at a time
 
 This is intentional. Query traffic is low-frequency and operationally rare, so
 the design favors deterministic semantics over parallelism. Relaxing this to
 per-family or multi-query concurrency is out of scope for the first migration
 wave.
+
+The required public behavior is:
+
+- if a query is already in flight, a second query call returns `Err(QueryError::Busy)`
+- no implicit queuing is performed inside the SDK
+- callers that want retry behavior must implement it explicitly outside the SDK
 
 ## Freshness and Staleness Policy
 
@@ -365,8 +371,6 @@ This design keeps staleness focused on continuously streaming observations in th
 first migration wave and avoids inventing a false time-based expiry for
 configuration values that are naturally query-driven.
 
-The exact public surface can be finalized during implementation planning, but the rule is fixed: readiness must be tied to a specific observation contract, never to arbitrary frame arrival.
-
 ## Metrics Redesign
 
 The current FPS reporting mixes raw frame cadence and complete grouped observation cadence. The redesign separates them explicitly.
@@ -399,6 +403,46 @@ Rules for the first migration wave:
 
 This keeps the metrics rewrite aligned with the observation rebuild instead of
 turning it into a repository-wide telemetry migration.
+
+## Frozen Public API Surface
+
+The first migration wave locks the following public API surface for rebuilt
+families.
+
+State getters:
+
+- `get_collision_protection() -> Observation<CollisionProtection>`
+- `get_joint_limit_config() -> Observation<JointLimitConfig>`
+- `get_joint_accel_config() -> Observation<JointAccelConfig>`
+- `get_end_limit_config() -> Observation<EndLimitConfig>`
+- `get_joint_driver_low_speed() -> Observation<JointDriverLowSpeed>`
+- `get_end_pose() -> Observation<EndPose>`
+
+Active query methods:
+
+- `query_collision_protection(timeout) -> Result<Complete<CollisionProtection>, QueryError>`
+- `query_joint_limit_config(timeout) -> Result<Complete<JointLimitConfig>, QueryError>`
+- `query_joint_accel_config(timeout) -> Result<Complete<JointAccelConfig>, QueryError>`
+- `query_end_limit_config(timeout) -> Result<Complete<EndLimitConfig>, QueryError>`
+
+Waiting methods:
+
+- `wait_for_complete_low_speed_state(timeout) -> Result<Complete<JointDriverLowSpeed>, WaitError>`
+- `wait_for_complete_end_pose(timeout) -> Result<Complete<EndPose>, WaitError>`
+- `wait_for_complete_joint_limit_config(timeout) -> Result<Complete<JointLimitConfig>, WaitError>`
+
+Diagnostics:
+
+- `subscribe_diagnostics() -> Receiver<DiagnosticEvent>`
+- `snapshot_diagnostics() -> Vec<DiagnosticEvent>`
+
+Metrics:
+
+- `get_observation_metrics() -> ObservationMetrics`
+
+The implementation plan may refine internal helper types and private store
+interfaces, but it must not change these public method names or return-shape
+contracts without first revising this spec.
 
 ## Scope of First Migration
 
