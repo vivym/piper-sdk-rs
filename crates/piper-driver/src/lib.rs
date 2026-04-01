@@ -14,6 +14,7 @@
 
 mod builder;
 pub mod command;
+pub mod diagnostics;
 mod error;
 mod fps_stats;
 pub mod heartbeat;
@@ -25,6 +26,7 @@ pub mod mode;
 pub mod observation;
 pub mod pipeline;
 mod piper; // 原 robot_impl.rs
+pub mod query_coordinator;
 pub mod recording;
 pub mod state;
 #[cfg(test)]
@@ -32,6 +34,7 @@ mod test_support;
 
 pub use builder::{ConnectionTarget, PiperBuilder};
 pub use command::{CommandPriority, PiperCommand};
+pub use diagnostics::{DiagnosticBuffer, DiagnosticEvent, ProtocolDiagnostic, QueryDiagnostic};
 pub use error::DriverError; // 原 DriverError
 pub use fps_stats::{FpsCounts, FpsResult};
 pub use heartbeat::ConnectionMonitor;
@@ -46,5 +49,6 @@ pub use piper::{
     Piper, RuntimeFaultKind, ShutdownLane, ShutdownReceipt,
 };
 pub use piper_can::BackendCapability;
+pub use query_coordinator::{ActiveQuery, QueryCoordinator, QueryError, QueryGuard, QueryKind};
 pub use recording::{AsyncRecordingHook, TimestampedFrame};
 pub use state::*;
