@@ -50,6 +50,7 @@ Pass if:
 - [ ] Confirm the commanded joint moves and returns to start
 - [ ] For explicit disable, use `cargo run -p piper-cli -- shell`, then `connect socketcan:can0`, `enable`, `disable`, `exit`
 - [ ] For drop or emergency-style stop, use `cargo run -p piper-cli -- stop --target socketcan:can0`
+- [ ] For rejected-state gating, run `cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10` while the robot is not in Standby and confirm it fails with `robot is not in confirmed Standby; run stop first`
 - [ ] For reconnect behavior, start a fresh helper run and re-check the `<= 5s` and `<= 200ms` budgets
 
 Pass if:
@@ -66,6 +67,7 @@ Pass if:
 - [ ] Keep the arm unloaded
 - [ ] Keep the selected joint away from limits
 - [ ] Keep motion within the low-risk envelope
+- [ ] Run `cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10`
 - [ ] Confirm `PositionMode + MotionType::Joint only`
 - [ ] Confirm `speed_percent <= 10`
 - [ ] Confirm `abs(delta) <= 0.035 rad`
@@ -77,6 +79,8 @@ Pass if:
 - [ ] Motion direction matches the command
 - [ ] Feedback trend matches the physical move
 - [ ] The commanded joint begins moving within `2s`
+- [ ] No obvious jump, oscillation, or overshoot occurs
+- [ ] Repeated small moves remain consistent
 - [ ] Each commanded step settles within `10s`
 - [ ] Return-to-start error is `<= 0.05 rad`
 
@@ -86,7 +90,11 @@ Pass if:
 - [ ] Restore the interface and confirm a fresh helper run reconnects within `<= 5s`
 - [ ] Confirm a fresh helper run prints its first complete snapshot within `<= 200ms`
 - [ ] Induce one controlled controller-side interruption while not moving if possible
-- [ ] Before declaring recovery complete, run the shell probe `move --joints 0.02 --force`
+- [ ] After the fault is cleared, capture readable-state recovery with `cargo run -p piper-sdk --example robot_monitor -- --interface can0` or `cargo run -p piper-sdk --example state_api_demo -- --interface can0`
+- [ ] Record the timeout or dropped-feedback case and confirm stale or missing feedback did not look like healthy control
+- [ ] Before declaring recovery complete, open `cargo run -p piper-cli -- shell`
+- [ ] Run `connect socketcan:can0`
+- [ ] Run the shell probe `move --joints 0.02 --force`
 - [ ] Confirm the shell rejects the probe or otherwise fails without causing motion
 - [ ] Confirm post-fault motion remains gated until the system is back in a safe known-good state
 
@@ -95,6 +103,8 @@ Pass if:
 - [ ] Faults are explicit in logs or return values
 - [ ] The system degrades toward safety
 - [ ] Recovery returns the robot to readable state
+- [ ] `robot_monitor` or `state_api_demo` shows readable state after the fault is cleared
+- [ ] Timeout or dropped-feedback behavior is recorded and did not look like healthy control
 - [ ] The post-fault shell motion probe is rejected or fails without causing motion
 
 ## Release Gates
@@ -103,4 +113,3 @@ Pass if:
 - [ ] `Gate 2: Core Control Credible` passed
 - [ ] `Gate 3: Recovery Credible` passed
 - [ ] Final verdict recorded as `PASS`, `CONDITIONAL PASS`, or `FAIL`
-

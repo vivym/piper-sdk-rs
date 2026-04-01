@@ -64,6 +64,8 @@ Disable evidence:
 
 Drop or emergency-stop evidence:
 
+Rejected-state gating evidence:
+
 Reconnect evidence:
 
 Observed:
@@ -88,6 +90,10 @@ Return evidence:
 
 Return-to-start error:
 
+Jump / oscillation / overshoot notes:
+
+Repeated small moves consistency:
+
 Observed:
 
 Notes:
@@ -102,7 +108,13 @@ Fault type:
 
 Fault evidence:
 
+Timeout or dropped-feedback evidence:
+
 Recovery evidence:
+
+Readable-state recovery evidence:
+
+Shell probe connection:
 
 Motion-gating probe:
 
@@ -123,6 +135,12 @@ Phase 2:
 Phase 3:
 
 Phase 4:
+
+Gate 1:
+
+Gate 2:
+
+Gate 3:
 
 Go/No-Go decision:
 
