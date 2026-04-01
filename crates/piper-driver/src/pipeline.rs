@@ -3,6 +3,7 @@
 //! 负责后台 IO 线程的 CAN 帧接收、解析和状态更新逻辑。
 
 use crate::command::SoftRealtimeMailbox;
+use crate::diagnostics::{DiagnosticEvent, QueryDiagnostic};
 use crate::heartbeat::monotonic_micros;
 use crate::metrics::PiperMetrics;
 use crate::piper::{
@@ -16,7 +17,9 @@ use crossbeam_channel::Receiver;
 #[cfg(test)]
 use piper_can::CanAdapter;
 use piper_can::{BackendCapability, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
+use piper_protocol::ProtocolDiagnostic;
 use piper_protocol::config::*;
+use piper_protocol::diagnostics::DecodeResult;
 use piper_protocol::feedback::*;
 use piper_protocol::ids::*;
 use std::collections::VecDeque;
@@ -2969,20 +2972,52 @@ fn parse_and_update_state(
             }
         },
         ID_COLLISION_PROTECTION_LEVEL_FEEDBACK => {
-            if let Ok(feedback) = CollisionProtectionLevelFeedback::try_from(*frame) {
-                outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+            match decode_collision_protection_feedback(*frame) {
+                DecodeResult::Data(typed) => {
+                    outcome.counts_as_robot_feedback = true;
+                    let host_rx_mono_us = host_rx_mono_us();
 
-                if let Ok(mut collision) = ctx.collision_protection.try_write() {
-                    collision.hardware_timestamp_us = frame.timestamp_us;
-                    collision.host_rx_mono_us = host_rx_mono_us;
-                    collision.protection_levels = feedback.levels;
-                }
+                    if let Ok(mut collision) = ctx.collision_protection.try_write() {
+                        collision.hardware_timestamp_us =
+                            typed.hardware_timestamp_us.unwrap_or_default();
+                        collision.host_rx_mono_us = host_rx_mono_us;
+                        collision.protection_levels = typed.payload.levels;
+                    }
 
-                ctx.fps_stats
-                    .load()
-                    .collision_protection_updates
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(active_query) = ctx.query_coordinator.active_query() {
+                        if active_query.kind
+                            == crate::query_coordinator::QueryKind::CollisionProtection
+                        {
+                            if let Ok(levels) =
+                                CollisionProtection::try_from_raw_levels(typed.payload.levels)
+                                && let Ok(mut store) = ctx.collision_protection_observation.write()
+                            {
+                                let _ = store.record_query_value(
+                                    active_query.token,
+                                    levels,
+                                    host_rx_mono_us,
+                                    typed.hardware_timestamp_us,
+                                );
+                            }
+                        } else {
+                            ctx.diagnostics.push(DiagnosticEvent::Query(
+                                QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                                    query: active_query.kind,
+                                    can_id: typed.can_id,
+                                },
+                            ));
+                        }
+                    }
+
+                    ctx.fps_stats
+                        .load()
+                        .collision_protection_updates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+                DecodeResult::Diagnostic(diagnostic) => {
+                    ctx.diagnostics.push(DiagnosticEvent::Protocol(diagnostic));
+                },
+                DecodeResult::Ignore => {},
             }
         },
         ID_SETTING_RESPONSE => {
@@ -2999,78 +3034,204 @@ fn parse_and_update_state(
                 }
             }
         },
-        ID_MOTOR_LIMIT_FEEDBACK => {
-            if let Ok(feedback) = MotorLimitFeedback::try_from(*frame) {
+        ID_MOTOR_LIMIT_FEEDBACK => match decode_motor_limit_feedback(*frame) {
+            DecodeResult::Data(typed) => {
+                let feedback = typed.payload;
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
-                if joint_idx < 6 {
-                    outcome.counts_as_robot_feedback = true;
-                    let host_rx_mono_us = host_rx_mono_us();
+                outcome.counts_as_robot_feedback = true;
+                let host_rx_mono_us = host_rx_mono_us();
 
-                    if let Ok(mut joint_limit) = ctx.joint_limit_config.write() {
-                        joint_limit.joint_limits_max[joint_idx] = feedback.max_angle().to_radians();
-                        joint_limit.joint_limits_min[joint_idx] = feedback.min_angle().to_radians();
-                        joint_limit.joint_max_velocity[joint_idx] = feedback.max_velocity();
-                        joint_limit.joint_update_hardware_timestamps[joint_idx] =
-                            frame.timestamp_us;
-                        joint_limit.joint_update_host_rx_mono_timestamps[joint_idx] =
-                            host_rx_mono_us;
-                        joint_limit.last_update_hardware_timestamp_us = frame.timestamp_us;
-                        joint_limit.last_update_host_rx_mono_us = host_rx_mono_us;
-                        joint_limit.valid_mask |= 1 << joint_idx;
-                    }
-
-                    ctx.fps_stats
-                        .load()
-                        .joint_limit_config_updates
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut joint_limit) = ctx.joint_limit_config.write() {
+                    joint_limit.joint_limits_max[joint_idx] = feedback.max_angle().to_radians();
+                    joint_limit.joint_limits_min[joint_idx] = feedback.min_angle().to_radians();
+                    joint_limit.joint_max_velocity[joint_idx] = feedback.max_velocity();
+                    joint_limit.joint_update_hardware_timestamps[joint_idx] =
+                        typed.hardware_timestamp_us.unwrap_or_default();
+                    joint_limit.joint_update_host_rx_mono_timestamps[joint_idx] = host_rx_mono_us;
+                    joint_limit.last_update_hardware_timestamp_us =
+                        typed.hardware_timestamp_us.unwrap_or_default();
+                    joint_limit.last_update_host_rx_mono_us = host_rx_mono_us;
+                    joint_limit.valid_mask |= 1 << joint_idx;
                 }
-            }
+
+                if let Some(active_query) = ctx.query_coordinator.active_query() {
+                    if active_query.kind == crate::query_coordinator::QueryKind::JointLimit {
+                        if let Ok(mut store) = ctx.joint_limit_observation.write() {
+                            let _ = store.record_query_slot(
+                                active_query.token,
+                                joint_idx,
+                                JointLimit {
+                                    min_angle_rad: feedback.min_angle().to_radians(),
+                                    max_angle_rad: feedback.max_angle().to_radians(),
+                                    max_velocity_rad_s: feedback.max_velocity(),
+                                },
+                                host_rx_mono_us,
+                                typed.hardware_timestamp_us,
+                                JointLimitConfig::from_slots,
+                            );
+                        }
+                    } else {
+                        ctx.diagnostics.push(DiagnosticEvent::Query(
+                            QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                                query: active_query.kind,
+                                can_id: typed.can_id,
+                            },
+                        ));
+                    }
+                }
+
+                ctx.fps_stats
+                    .load()
+                    .joint_limit_config_updates
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            DecodeResult::Diagnostic(diagnostic) => {
+                ctx.diagnostics.push(DiagnosticEvent::Protocol(diagnostic));
+            },
+            DecodeResult::Ignore => {},
         },
-        ID_MOTOR_MAX_ACCEL_FEEDBACK => {
-            if let Ok(feedback) = MotorMaxAccelFeedback::try_from(*frame) {
+        ID_MOTOR_MAX_ACCEL_FEEDBACK => match MotorMaxAccelFeedback::try_from(*frame) {
+            Ok(feedback) => {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
                     outcome.counts_as_robot_feedback = true;
                     let host_rx_mono_us = host_rx_mono_us();
+                    let hardware_timestamp_us =
+                        (frame.timestamp_us != 0).then_some(frame.timestamp_us);
 
                     if let Ok(mut joint_accel) = ctx.joint_accel_config.write() {
                         joint_accel.max_acc_limits[joint_idx] = feedback.max_accel();
                         joint_accel.joint_update_hardware_timestamps[joint_idx] =
-                            frame.timestamp_us;
+                            hardware_timestamp_us.unwrap_or_default();
                         joint_accel.joint_update_host_rx_mono_timestamps[joint_idx] =
                             host_rx_mono_us;
-                        joint_accel.last_update_hardware_timestamp_us = frame.timestamp_us;
+                        joint_accel.last_update_hardware_timestamp_us =
+                            hardware_timestamp_us.unwrap_or_default();
                         joint_accel.last_update_host_rx_mono_us = host_rx_mono_us;
                         joint_accel.valid_mask |= 1 << joint_idx;
+                    }
+
+                    if let Some(active_query) = ctx.query_coordinator.active_query() {
+                        if active_query.kind == crate::query_coordinator::QueryKind::JointAccel {
+                            if let Ok(mut store) = ctx.joint_accel_observation.write() {
+                                let _ = store.record_query_slot(
+                                    active_query.token,
+                                    joint_idx,
+                                    feedback.max_accel(),
+                                    host_rx_mono_us,
+                                    hardware_timestamp_us,
+                                    JointAccelConfig::from_slots,
+                                );
+                            }
+                        } else {
+                            ctx.diagnostics.push(DiagnosticEvent::Query(
+                                QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                                    query: active_query.kind,
+                                    can_id: frame.id,
+                                },
+                            ));
+                        }
                     }
 
                     ctx.fps_stats
                         .load()
                         .joint_accel_config_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    ctx.diagnostics.push(DiagnosticEvent::Protocol(
+                        ProtocolDiagnostic::OutOfRange {
+                            field: "joint_index",
+                            raw: feedback.joint_index as u32,
+                            min: 1,
+                            max: 6,
+                        },
+                    ));
                 }
-            }
+            },
+            Err(piper_protocol::ProtocolError::InvalidLength { expected, actual }) => {
+                ctx.diagnostics.push(DiagnosticEvent::Protocol(
+                    ProtocolDiagnostic::InvalidLength {
+                        can_id: frame.id,
+                        expected,
+                        actual,
+                    },
+                ));
+            },
+            Err(piper_protocol::ProtocolError::InvalidCanId { .. }) => {},
+            Err(_) => {
+                ctx.diagnostics.push(DiagnosticEvent::Protocol(
+                    ProtocolDiagnostic::UnsupportedValue {
+                        field: "motor_max_accel_feedback",
+                        raw: frame.id,
+                    },
+                ));
+            },
         },
-        ID_END_VELOCITY_ACCEL_FEEDBACK => {
-            if let Ok(feedback) = EndVelocityAccelFeedback::try_from(*frame) {
+        ID_END_VELOCITY_ACCEL_FEEDBACK => match EndVelocityAccelFeedback::try_from(*frame) {
+            Ok(feedback) => {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
+                let hardware_timestamp_us = (frame.timestamp_us != 0).then_some(frame.timestamp_us);
 
                 if let Ok(mut end_limit) = ctx.end_limit_config.write() {
                     end_limit.max_end_linear_velocity = feedback.max_linear_velocity();
                     end_limit.max_end_angular_velocity = feedback.max_angular_velocity();
                     end_limit.max_end_linear_accel = feedback.max_linear_accel();
                     end_limit.max_end_angular_accel = feedback.max_angular_accel();
-                    end_limit.last_update_hardware_timestamp_us = frame.timestamp_us;
+                    end_limit.last_update_hardware_timestamp_us =
+                        hardware_timestamp_us.unwrap_or_default();
                     end_limit.last_update_host_rx_mono_us = host_rx_mono_us;
                     end_limit.is_valid = true;
+                }
+
+                if let Some(active_query) = ctx.query_coordinator.active_query() {
+                    if active_query.kind == crate::query_coordinator::QueryKind::EndLimit {
+                        if let Ok(mut store) = ctx.end_limit_observation.write() {
+                            let _ = store.record_query_value(
+                                active_query.token,
+                                EndLimitConfig {
+                                    max_linear_velocity_m_s: feedback.max_linear_velocity(),
+                                    max_angular_velocity_rad_s: feedback.max_angular_velocity(),
+                                    max_linear_accel_m_s2: feedback.max_linear_accel(),
+                                    max_angular_accel_rad_s2: feedback.max_angular_accel(),
+                                },
+                                host_rx_mono_us,
+                                hardware_timestamp_us,
+                            );
+                        }
+                    } else {
+                        ctx.diagnostics.push(DiagnosticEvent::Query(
+                            QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                                query: active_query.kind,
+                                can_id: frame.id,
+                            },
+                        ));
+                    }
                 }
 
                 ctx.fps_stats
                     .load()
                     .end_limit_config_updates
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+            },
+            Err(piper_protocol::ProtocolError::InvalidLength { expected, actual }) => {
+                ctx.diagnostics.push(DiagnosticEvent::Protocol(
+                    ProtocolDiagnostic::InvalidLength {
+                        can_id: frame.id,
+                        expected,
+                        actual,
+                    },
+                ));
+            },
+            Err(piper_protocol::ProtocolError::InvalidCanId { .. }) => {},
+            Err(_) => {
+                ctx.diagnostics.push(DiagnosticEvent::Protocol(
+                    ProtocolDiagnostic::UnsupportedValue {
+                        field: "end_velocity_accel_feedback",
+                        raw: frame.id,
+                    },
+                ));
+            },
         },
         ID_FIRMWARE_READ => {
             if let Ok(feedback) = FirmwareReadFeedback::try_from(*frame) {

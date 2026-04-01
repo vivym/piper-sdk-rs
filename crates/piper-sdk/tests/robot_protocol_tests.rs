@@ -3,6 +3,7 @@
 //! 测试各种协议反馈帧的解析和状态更新。
 
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter};
+use piper_sdk::driver::observation::Observation;
 use piper_sdk::driver::*;
 use piper_sdk::protocol::ids::*;
 use std::collections::VecDeque;
@@ -315,10 +316,19 @@ fn test_motor_limit_feedback_accumulation() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // 验证配置状态已更新（不会崩溃）
-    let _limits = piper.get_joint_limit_config().unwrap();
-    let _accel = piper.get_joint_accel_config().unwrap();
-    let _end_limits = piper.get_end_limit_config().unwrap();
+    // rebuilt getters should not publish unqueried config families.
+    assert!(matches!(
+        piper.get_joint_limit_config(),
+        Observation::Unavailable
+    ));
+    assert!(matches!(
+        piper.get_joint_accel_config(),
+        Observation::Unavailable
+    ));
+    assert!(matches!(
+        piper.get_end_limit_config(),
+        Observation::Unavailable
+    ));
 }
 
 /// 测试 MotorMaxAccelFeedback (0x47C) 配置累积（6次查询）
@@ -346,10 +356,18 @@ fn test_motor_max_accel_feedback_accumulation() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // 验证配置状态已更新（不会崩溃）
-    let _limits = piper.get_joint_limit_config().unwrap();
-    let _accel = piper.get_joint_accel_config().unwrap();
-    let _end_limits = piper.get_end_limit_config().unwrap();
+    assert!(matches!(
+        piper.get_joint_limit_config(),
+        Observation::Unavailable
+    ));
+    assert!(matches!(
+        piper.get_joint_accel_config(),
+        Observation::Unavailable
+    ));
+    assert!(matches!(
+        piper.get_end_limit_config(),
+        Observation::Unavailable
+    ));
 }
 
 /// 测试 EndVelocityAccelFeedback (0x478) 更新 EndLimitConfigState
@@ -383,10 +401,18 @@ fn test_end_velocity_accel_feedback_update() {
     // 等待 IO 线程处理
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // 验证配置状态已更新（不会崩溃）
-    let _limits = piper.get_joint_limit_config().unwrap();
-    let _accel = piper.get_joint_accel_config().unwrap();
-    let _end_limits = piper.get_end_limit_config().unwrap();
+    assert!(matches!(
+        piper.get_joint_limit_config(),
+        Observation::Unavailable
+    ));
+    assert!(matches!(
+        piper.get_joint_accel_config(),
+        Observation::Unavailable
+    ));
+    assert!(matches!(
+        piper.get_end_limit_config(),
+        Observation::Unavailable
+    ));
 }
 
 /// 测试 CAN 接收错误处理（CanError::Timeout）

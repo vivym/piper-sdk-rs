@@ -7,10 +7,13 @@ use crate::command::{
     ReliableCommand, ReliableCommandKind, SoftRealtimeCommand, SoftRealtimeMailbox,
     SoftRealtimeTryReserveError, SoftRealtimeTrySendError,
 };
+use crate::diagnostics::{DiagnosticEvent, QueryDiagnostic};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
 use crate::metrics::{MetricsSnapshot, PiperMetrics};
+use crate::observation::{Available, Observation, ObservationPayload};
 use crate::pipeline::*;
+use crate::query_coordinator::{QueryError, QueryGuard, QueryKind};
 use crate::state::*;
 use crossbeam_channel::{Receiver, Sender};
 use piper_can::{
@@ -2849,44 +2852,13 @@ impl Piper {
         }
     }
 
-    fn clear_collision_protection_cache(&self) -> Result<(), DriverError> {
-        self.ctx
-            .collision_protection
-            .write()
-            .map(|mut guard| {
-                *guard = CollisionProtectionState::default();
-            })
-            .map_err(|_| DriverError::PoisonedLock)
-    }
-
-    fn clear_joint_limit_config_cache(&self) -> Result<(), DriverError> {
-        self.ctx
-            .joint_limit_config
-            .write()
-            .map(|mut guard| {
-                *guard = JointLimitConfigState::default();
-            })
-            .map_err(|_| DriverError::PoisonedLock)
-    }
-
-    fn clear_joint_accel_config_cache(&self) -> Result<(), DriverError> {
-        self.ctx
-            .joint_accel_config
-            .write()
-            .map(|mut guard| {
-                *guard = JointAccelConfigState::default();
-            })
-            .map_err(|_| DriverError::PoisonedLock)
-    }
-
-    fn clear_end_limit_config_cache(&self) -> Result<(), DriverError> {
-        self.ctx
-            .end_limit_config
-            .write()
-            .map(|mut guard| {
-                *guard = EndLimitConfigState::default();
-            })
-            .map_err(|_| DriverError::PoisonedLock)
+    fn try_begin_query(&self, kind: QueryKind) -> Result<QueryGuard<'_>, DriverError> {
+        self.ctx.query_coordinator.try_begin(kind).map_err(|err| {
+            if err == QueryError::Busy {
+                self.ctx.diagnostics.push(DiagnosticEvent::Query(QueryDiagnostic::Busy));
+            }
+            DriverError::InvalidInput("query coordinator busy".to_string())
+        })
     }
 
     /// 主动查询碰撞保护等级并等待新反馈。
@@ -2896,21 +2868,47 @@ impl Piper {
     ) -> Result<CollisionProtectionState, DriverError> {
         use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
 
-        self.clear_collision_protection_cache()?;
-        let deadline = Instant::now() + timeout;
-        let frame = ParameterQuerySetCommand::query(ParameterQueryType::CollisionProtectionLevel)
-            .to_frame()?;
-        let commit_host_mono_us =
+        let query = self.try_begin_query(QueryKind::CollisionProtection)?;
+        let token = query.token();
+        let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
+        self.ctx
+            .collision_protection_observation
+            .write()
+            .map(|mut store| store.begin_query(token, baseline_host_mono_us))
+            .map_err(|_| DriverError::PoisonedLock)?;
+
+        let result = (|| {
+            let deadline = Instant::now() + timeout;
+            let frame =
+                ParameterQuerySetCommand::query(ParameterQueryType::CollisionProtectionLevel)
+                    .to_frame()?;
             self.send_reliable_frame_confirmed_commit_marker(frame, timeout)?;
 
-        self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
-            let state = this.get_collision_protection()?;
-            if state.host_rx_mono_us > commit_host_mono_us {
-                Ok(Some(state))
-            } else {
-                Ok(None)
-            }
-        })
+            self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
+                let complete = this
+                    .ctx
+                    .collision_protection_observation
+                    .read()
+                    .map_err(|_| DriverError::PoisonedLock)?
+                    .current_complete_for_token(token);
+
+                Ok(complete.map(|complete| complete.value.into_state(complete.meta)))
+            })
+        })();
+
+        if let Ok(mut store) = self.ctx.collision_protection_observation.write() {
+            store.finish_query(token);
+        }
+
+        if matches!(result, Err(DriverError::Timeout)) {
+            self.ctx.diagnostics.push(DiagnosticEvent::Query(
+                QueryDiagnostic::DiagnosticsOnlyTimeout {
+                    query: QueryKind::CollisionProtection,
+                },
+            ));
+        }
+
+        result
     }
 
     /// 主动查询全部关节角度/速度限制并等待完整反馈。
@@ -2920,26 +2918,47 @@ impl Piper {
     ) -> Result<JointLimitConfigState, DriverError> {
         use piper_protocol::config::QueryMotorLimitCommand;
 
-        self.clear_joint_limit_config_cache()?;
-        let deadline = Instant::now() + timeout;
+        let query = self.try_begin_query(QueryKind::JointLimit)?;
+        let token = query.token();
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
-        let frames = (1..=6u8).map(|joint_index| {
-            QueryMotorLimitCommand::query_angle_and_max_velocity(joint_index).to_frame()
-        });
-        self.send_reliable_package_confirmed(frames, timeout)?;
+        self.ctx
+            .joint_limit_observation
+            .write()
+            .map(|mut store| store.begin_query(token, baseline_host_mono_us))
+            .map_err(|_| DriverError::PoisonedLock)?;
 
-        self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
-            let state = this.get_joint_limit_config()?;
-            let all_fresh = state
-                .joint_update_host_rx_mono_timestamps
-                .iter()
-                .all(|&timestamp| timestamp > baseline_host_mono_us);
-            if state.is_fully_valid() && all_fresh {
-                Ok(Some(state))
-            } else {
-                Ok(None)
-            }
-        })
+        let result = (|| {
+            let deadline = Instant::now() + timeout;
+            let frames = (1..=6u8).map(|joint_index| {
+                QueryMotorLimitCommand::query_angle_and_max_velocity(joint_index).to_frame()
+            });
+            self.send_reliable_package_confirmed(frames, timeout)?;
+
+            self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
+                let complete = this
+                    .ctx
+                    .joint_limit_observation
+                    .read()
+                    .map_err(|_| DriverError::PoisonedLock)?
+                    .current_complete_for_token(token);
+
+                Ok(complete.map(|complete| complete.value.into_state(complete.meta)))
+            })
+        })();
+
+        if let Ok(mut store) = self.ctx.joint_limit_observation.write() {
+            store.finish_query(token);
+        }
+
+        if matches!(result, Err(DriverError::Timeout)) {
+            self.ctx.diagnostics.push(DiagnosticEvent::Query(
+                QueryDiagnostic::DiagnosticsOnlyTimeout {
+                    query: QueryKind::JointLimit,
+                },
+            ));
+        }
+
+        result
     }
 
     /// 主动查询全部关节加速度限制并等待完整反馈。
@@ -2949,26 +2968,47 @@ impl Piper {
     ) -> Result<JointAccelConfigState, DriverError> {
         use piper_protocol::config::QueryMotorLimitCommand;
 
-        self.clear_joint_accel_config_cache()?;
-        let deadline = Instant::now() + timeout;
+        let query = self.try_begin_query(QueryKind::JointAccel)?;
+        let token = query.token();
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
-        let frames = (1..=6u8).map(|joint_index| {
-            QueryMotorLimitCommand::query_max_acceleration(joint_index).to_frame()
-        });
-        self.send_reliable_package_confirmed(frames, timeout)?;
+        self.ctx
+            .joint_accel_observation
+            .write()
+            .map(|mut store| store.begin_query(token, baseline_host_mono_us))
+            .map_err(|_| DriverError::PoisonedLock)?;
 
-        self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
-            let state = this.get_joint_accel_config()?;
-            let all_fresh = state
-                .joint_update_host_rx_mono_timestamps
-                .iter()
-                .all(|&timestamp| timestamp > baseline_host_mono_us);
-            if state.is_fully_valid() && all_fresh {
-                Ok(Some(state))
-            } else {
-                Ok(None)
-            }
-        })
+        let result = (|| {
+            let deadline = Instant::now() + timeout;
+            let frames = (1..=6u8).map(|joint_index| {
+                QueryMotorLimitCommand::query_max_acceleration(joint_index).to_frame()
+            });
+            self.send_reliable_package_confirmed(frames, timeout)?;
+
+            self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
+                let complete = this
+                    .ctx
+                    .joint_accel_observation
+                    .read()
+                    .map_err(|_| DriverError::PoisonedLock)?
+                    .current_complete_for_token(token);
+
+                Ok(complete.map(|complete| complete.value.into_state(complete.meta)))
+            })
+        })();
+
+        if let Ok(mut store) = self.ctx.joint_accel_observation.write() {
+            store.finish_query(token);
+        }
+
+        if matches!(result, Err(DriverError::Timeout)) {
+            self.ctx.diagnostics.push(DiagnosticEvent::Query(
+                QueryDiagnostic::DiagnosticsOnlyTimeout {
+                    query: QueryKind::JointAccel,
+                },
+            ));
+        }
+
+        result
     }
 
     /// 主动查询末端速度/加速度限制并等待新反馈。
@@ -2978,21 +3018,46 @@ impl Piper {
     ) -> Result<EndLimitConfigState, DriverError> {
         use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
 
-        self.clear_end_limit_config_cache()?;
-        let deadline = Instant::now() + timeout;
-        let frame =
-            ParameterQuerySetCommand::query(ParameterQueryType::EndVelocityAccel).to_frame()?;
-        let commit_host_mono_us =
+        let query = self.try_begin_query(QueryKind::EndLimit)?;
+        let token = query.token();
+        let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
+        self.ctx
+            .end_limit_observation
+            .write()
+            .map(|mut store| store.begin_query(token, baseline_host_mono_us))
+            .map_err(|_| DriverError::PoisonedLock)?;
+
+        let result = (|| {
+            let deadline = Instant::now() + timeout;
+            let frame =
+                ParameterQuerySetCommand::query(ParameterQueryType::EndVelocityAccel).to_frame()?;
             self.send_reliable_frame_confirmed_commit_marker(frame, timeout)?;
 
-        self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
-            let state = this.get_end_limit_config()?;
-            if state.is_valid && state.last_update_host_rx_mono_us > commit_host_mono_us {
-                Ok(Some(state))
-            } else {
-                Ok(None)
-            }
-        })
+            self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
+                let complete = this
+                    .ctx
+                    .end_limit_observation
+                    .read()
+                    .map_err(|_| DriverError::PoisonedLock)?
+                    .current_complete_for_token(token);
+
+                Ok(complete.map(|complete| complete.value.into_state(complete.meta)))
+            })
+        })();
+
+        if let Ok(mut store) = self.ctx.end_limit_observation.write() {
+            store.finish_query(token);
+        }
+
+        if matches!(result, Err(DriverError::Timeout)) {
+            self.ctx.diagnostics.push(DiagnosticEvent::Query(
+                QueryDiagnostic::DiagnosticsOnlyTimeout {
+                    query: QueryKind::EndLimit,
+                },
+            ));
+        }
+
+        result
     }
 
     /// 获取 0x151 控制模式回显状态（无锁）。
@@ -3036,12 +3101,27 @@ impl Piper {
     /// # 性能
     /// - 读锁（RwLock::read）
     /// - 返回快照副本
-    pub fn get_collision_protection(&self) -> Result<CollisionProtectionState, DriverError> {
-        self.ctx
-            .collision_protection
-            .read()
-            .map(|guard| guard.clone())
-            .map_err(|_| DriverError::PoisonedLock)
+    pub fn get_collision_protection(&self) -> Observation<CollisionProtectionState> {
+        let Ok(store) = self.ctx.collision_protection_observation.read() else {
+            return Observation::Unavailable;
+        };
+
+        match store.observe() {
+            Observation::Available(Available {
+                payload: ObservationPayload::Complete(value),
+                freshness,
+                meta,
+            }) => Observation::Available(Available {
+                payload: ObservationPayload::Complete(value.into_state(meta)),
+                freshness,
+                meta,
+            }),
+            Observation::Unavailable => Observation::Unavailable,
+            Observation::Available(Available {
+                payload: ObservationPayload::Partial { .. },
+                ..
+            }) => Observation::Unavailable,
+        }
     }
 
     /// 获取最近一次设置指令应答（读锁）
@@ -3076,12 +3156,34 @@ impl Piper {
     /// # 性能
     /// - 读锁（RwLock::read）
     /// - 返回快照副本
-    pub fn get_joint_limit_config(&self) -> Result<JointLimitConfigState, DriverError> {
-        self.ctx
-            .joint_limit_config
-            .read()
-            .map(|guard| guard.clone())
-            .map_err(|_| DriverError::PoisonedLock)
+    pub fn get_joint_limit_config(
+        &self,
+    ) -> Observation<JointLimitConfigState, PartialJointLimitConfig> {
+        let Ok(store) = self.ctx.joint_limit_observation.read() else {
+            return Observation::Unavailable;
+        };
+
+        match store.observe() {
+            Observation::Available(Available {
+                payload: ObservationPayload::Complete(value),
+                freshness,
+                meta,
+            }) => Observation::Available(Available {
+                payload: ObservationPayload::Complete(value.into_state(meta)),
+                freshness,
+                meta,
+            }),
+            Observation::Available(Available {
+                payload: ObservationPayload::Partial { partial, missing },
+                freshness,
+                meta,
+            }) => Observation::Available(Available {
+                payload: ObservationPayload::Partial { partial, missing },
+                freshness,
+                meta,
+            }),
+            Observation::Unavailable => Observation::Unavailable,
+        }
     }
 
     /// 获取关节加速度限制配置状态（读锁）
@@ -3091,12 +3193,34 @@ impl Piper {
     /// # 性能
     /// - 读锁（RwLock::read）
     /// - 返回快照副本
-    pub fn get_joint_accel_config(&self) -> Result<JointAccelConfigState, DriverError> {
-        self.ctx
-            .joint_accel_config
-            .read()
-            .map(|guard| guard.clone())
-            .map_err(|_| DriverError::PoisonedLock)
+    pub fn get_joint_accel_config(
+        &self,
+    ) -> Observation<JointAccelConfigState, PartialJointAccelConfig> {
+        let Ok(store) = self.ctx.joint_accel_observation.read() else {
+            return Observation::Unavailable;
+        };
+
+        match store.observe() {
+            Observation::Available(Available {
+                payload: ObservationPayload::Complete(value),
+                freshness,
+                meta,
+            }) => Observation::Available(Available {
+                payload: ObservationPayload::Complete(value.into_state(meta)),
+                freshness,
+                meta,
+            }),
+            Observation::Available(Available {
+                payload: ObservationPayload::Partial { partial, missing },
+                freshness,
+                meta,
+            }) => Observation::Available(Available {
+                payload: ObservationPayload::Partial { partial, missing },
+                freshness,
+                meta,
+            }),
+            Observation::Unavailable => Observation::Unavailable,
+        }
     }
 
     /// 获取末端限制配置状态（读锁）
@@ -3106,12 +3230,31 @@ impl Piper {
     /// # 性能
     /// - 读锁（RwLock::read）
     /// - 返回快照副本
-    pub fn get_end_limit_config(&self) -> Result<EndLimitConfigState, DriverError> {
-        self.ctx
-            .end_limit_config
-            .read()
-            .map(|guard| guard.clone())
-            .map_err(|_| DriverError::PoisonedLock)
+    pub fn get_end_limit_config(&self) -> Observation<EndLimitConfigState> {
+        let Ok(store) = self.ctx.end_limit_observation.read() else {
+            return Observation::Unavailable;
+        };
+
+        match store.observe() {
+            Observation::Available(Available {
+                payload: ObservationPayload::Complete(value),
+                freshness,
+                meta,
+            }) => Observation::Available(Available {
+                payload: ObservationPayload::Complete(value.into_state(meta)),
+                freshness,
+                meta,
+            }),
+            Observation::Unavailable => Observation::Unavailable,
+            Observation::Available(Available {
+                payload: ObservationPayload::Partial { .. },
+                ..
+            }) => Observation::Unavailable,
+        }
+    }
+
+    pub fn snapshot_diagnostics(&self) -> Vec<DiagnosticEvent> {
+        self.ctx.diagnostics.snapshot()
     }
 
     /// 获取组合运动状态（所有热数据）
@@ -4557,7 +4700,7 @@ mod tests {
     use super::*;
     use crate::DriverMode;
     use crate::observation::{Available, Freshness, Observation, ObservationPayload};
-    use crate::{DiagnosticEvent, ProtocolDiagnostic, QueryError};
+    use crate::{DiagnosticEvent, ProtocolDiagnostic};
     use piper_can::{CanAdapter, PiperFrame, SplittableAdapter};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
@@ -6394,8 +6537,10 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        let limits = piper.get_joint_limit_config().unwrap();
-        assert_eq!(limits.joint_limits_max, [0.0; 6]);
+        assert!(matches!(
+            piper.get_joint_limit_config(),
+            Observation::Unavailable
+        ));
     }
 
     #[test]
@@ -7339,7 +7484,7 @@ mod tests {
         let _ = piper.query_joint_limit_config(Duration::from_millis(400)).unwrap();
 
         let error = piper.query_joint_limit_config(Duration::from_millis(10)).unwrap_err();
-        assert!(matches!(error, QueryError::Timeout));
+        assert!(matches!(error, DriverError::Timeout));
 
         assert!(matches!(
             piper.get_joint_limit_config(),
@@ -10287,10 +10432,13 @@ mod tests {
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
         // 测试可以多次读取配置状态
-        let limits1 = piper.get_joint_limit_config().unwrap();
-        let limits2 = piper.get_joint_limit_config().unwrap();
-
-        assert_eq!(limits1.joint_limits_max, limits2.joint_limits_max);
-        assert_eq!(limits1.joint_limits_min, limits2.joint_limits_min);
+        assert!(matches!(
+            piper.get_joint_limit_config(),
+            Observation::Unavailable
+        ));
+        assert!(matches!(
+            piper.get_joint_limit_config(),
+            Observation::Unavailable
+        ));
     }
 }

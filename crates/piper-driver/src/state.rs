@@ -1,7 +1,13 @@
 //! Driver 模块状态结构定义
 
+use crate::diagnostics::DiagnosticBuffer;
 use crate::fps_stats::FpsStatistics;
 use crate::metrics::PiperMetrics;
+use crate::observation::{
+    Complete, Freshness, MissingSet, Observation, ObservationMeta, ObservationPayload,
+    ObservationSource, PartialPayload,
+};
+use crate::query_coordinator::QueryCoordinator;
 use arc_swap::ArcSwap;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1378,6 +1384,455 @@ pub struct EndLimitConfigState {
     pub is_valid: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CollisionProtectionLevel {
+    Disabled = 0,
+    Level1 = 1,
+    Level2 = 2,
+    Level3 = 3,
+    Level4 = 4,
+    Level5 = 5,
+    Level6 = 6,
+    Level7 = 7,
+    Level8 = 8,
+}
+
+impl CollisionProtectionLevel {
+    pub const fn raw(self) -> u8 {
+        self as u8
+    }
+}
+
+impl TryFrom<u8> for CollisionProtectionLevel {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Disabled),
+            1 => Ok(Self::Level1),
+            2 => Ok(Self::Level2),
+            3 => Ok(Self::Level3),
+            4 => Ok(Self::Level4),
+            5 => Ok(Self::Level5),
+            6 => Ok(Self::Level6),
+            7 => Ok(Self::Level7),
+            8 => Ok(Self::Level8),
+            other => Err(other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollisionProtection {
+    pub levels: [CollisionProtectionLevel; 6],
+}
+
+impl CollisionProtection {
+    pub fn try_from_raw_levels(levels: [u8; 6]) -> Result<Self, u8> {
+        let mut typed = [CollisionProtectionLevel::Disabled; 6];
+        for (index, raw) in levels.into_iter().enumerate() {
+            typed[index] = CollisionProtectionLevel::try_from(raw)?;
+        }
+        Ok(Self { levels: typed })
+    }
+
+    pub fn into_state(self, meta: ObservationMeta) -> CollisionProtectionState {
+        CollisionProtectionState {
+            hardware_timestamp_us: meta.hardware_timestamp_us.unwrap_or_default(),
+            host_rx_mono_us: meta.host_rx_mono_us.unwrap_or_default(),
+            protection_levels: self.levels.map(CollisionProtectionLevel::raw),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointLimit {
+    pub min_angle_rad: f64,
+    pub max_angle_rad: f64,
+    pub max_velocity_rad_s: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointLimitConfig {
+    pub joints: [JointLimit; 6],
+}
+
+impl JointLimitConfig {
+    pub fn from_slots(slots: &[Option<JointLimit>; 6]) -> Option<Self> {
+        Some(Self {
+            joints: [
+                slots[0]?, slots[1]?, slots[2]?, slots[3]?, slots[4]?, slots[5]?,
+            ],
+        })
+    }
+
+    pub fn into_state(self, meta: ObservationMeta) -> JointLimitConfigState {
+        let hardware_timestamp_us = meta.hardware_timestamp_us.unwrap_or_default();
+        let host_rx_mono_us = meta.host_rx_mono_us.unwrap_or_default();
+
+        JointLimitConfigState {
+            last_update_hardware_timestamp_us: hardware_timestamp_us,
+            last_update_host_rx_mono_us: host_rx_mono_us,
+            joint_limits_max: self.joints.map(|joint| joint.max_angle_rad),
+            joint_limits_min: self.joints.map(|joint| joint.min_angle_rad),
+            joint_max_velocity: self.joints.map(|joint| joint.max_velocity_rad_s),
+            joint_update_hardware_timestamps: [hardware_timestamp_us; 6],
+            joint_update_host_rx_mono_timestamps: [host_rx_mono_us; 6],
+            valid_mask: 0b11_1111,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartialJointLimitConfig {
+    pub joints: [Option<JointLimit>; 6],
+}
+
+impl PartialPayload<JointLimit, 6> for PartialJointLimitConfig {
+    fn from_present_slots(slots: &[Option<JointLimit>]) -> Self {
+        let mut joints = [None; 6];
+        for (index, slot) in slots.iter().take(6).enumerate() {
+            joints[index] = *slot;
+        }
+        Self { joints }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointAccelConfig {
+    pub max_accel_rad_s2: [f64; 6],
+}
+
+impl JointAccelConfig {
+    pub fn from_slots(slots: &[Option<f64>; 6]) -> Option<Self> {
+        Some(Self {
+            max_accel_rad_s2: [
+                slots[0]?, slots[1]?, slots[2]?, slots[3]?, slots[4]?, slots[5]?,
+            ],
+        })
+    }
+
+    pub fn into_state(self, meta: ObservationMeta) -> JointAccelConfigState {
+        let hardware_timestamp_us = meta.hardware_timestamp_us.unwrap_or_default();
+        let host_rx_mono_us = meta.host_rx_mono_us.unwrap_or_default();
+
+        JointAccelConfigState {
+            last_update_hardware_timestamp_us: hardware_timestamp_us,
+            last_update_host_rx_mono_us: host_rx_mono_us,
+            max_acc_limits: self.max_accel_rad_s2,
+            joint_update_hardware_timestamps: [hardware_timestamp_us; 6],
+            joint_update_host_rx_mono_timestamps: [host_rx_mono_us; 6],
+            valid_mask: 0b11_1111,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartialJointAccelConfig {
+    pub max_accel_rad_s2: [Option<f64>; 6],
+}
+
+impl PartialPayload<f64, 6> for PartialJointAccelConfig {
+    fn from_present_slots(slots: &[Option<f64>]) -> Self {
+        let mut max_accel_rad_s2 = [None; 6];
+        for (index, slot) in slots.iter().take(6).enumerate() {
+            max_accel_rad_s2[index] = *slot;
+        }
+        Self { max_accel_rad_s2 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EndLimitConfig {
+    pub max_linear_velocity_m_s: f64,
+    pub max_angular_velocity_rad_s: f64,
+    pub max_linear_accel_m_s2: f64,
+    pub max_angular_accel_rad_s2: f64,
+}
+
+impl EndLimitConfig {
+    pub fn into_state(self, meta: ObservationMeta) -> EndLimitConfigState {
+        EndLimitConfigState {
+            last_update_hardware_timestamp_us: meta.hardware_timestamp_us.unwrap_or_default(),
+            last_update_host_rx_mono_us: meta.host_rx_mono_us.unwrap_or_default(),
+            max_end_linear_velocity: self.max_linear_velocity_m_s,
+            max_end_angular_velocity: self.max_angular_velocity_rad_s,
+            max_end_linear_accel: self.max_linear_accel_m_s2,
+            max_end_angular_accel: self.max_angular_accel_rad_s2,
+            is_valid: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveQueryObservationWindow {
+    token: u64,
+    min_host_rx_mono_us: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoredQueryValue<T: Copy> {
+    value: T,
+    meta: ObservationMeta,
+}
+
+#[derive(Debug, Clone)]
+struct PublishedQueryValue<T: Copy> {
+    token: u64,
+    complete: Complete<T>,
+}
+
+pub struct QueryBackedSingleStore<T: Copy> {
+    published: Option<PublishedQueryValue<T>>,
+    active_query: Option<ActiveQueryObservationWindow>,
+}
+
+impl<T: Copy> QueryBackedSingleStore<T> {
+    pub fn new() -> Self {
+        Self {
+            published: None,
+            active_query: None,
+        }
+    }
+
+    pub fn begin_query(&mut self, token: u64, min_host_rx_mono_us: u64) {
+        self.active_query = Some(ActiveQueryObservationWindow {
+            token,
+            min_host_rx_mono_us,
+        });
+    }
+
+    pub fn finish_query(&mut self, token: u64) {
+        if self.active_query.map(|query| query.token) == Some(token) {
+            self.active_query = None;
+        }
+    }
+
+    pub fn record_query_value(
+        &mut self,
+        token: u64,
+        value: T,
+        host_rx_mono_us: u64,
+        hardware_timestamp_us: Option<u64>,
+    ) -> bool {
+        let Some(active_query) = self.active_query else {
+            return false;
+        };
+        if active_query.token != token || host_rx_mono_us <= active_query.min_host_rx_mono_us {
+            return false;
+        }
+
+        self.published = Some(PublishedQueryValue {
+            token,
+            complete: Complete {
+                value,
+                meta: ObservationMeta {
+                    hardware_timestamp_us,
+                    host_rx_mono_us: Some(host_rx_mono_us),
+                    source: ObservationSource::Query,
+                },
+            },
+        });
+        true
+    }
+
+    pub fn observe(&self) -> Observation<T> {
+        let Some(published) = self.published.as_ref() else {
+            return Observation::Unavailable;
+        };
+
+        Observation::Available(crate::observation::Available {
+            payload: ObservationPayload::Complete(published.complete.value),
+            freshness: Freshness::Fresh,
+            meta: published.complete.meta,
+        })
+    }
+
+    pub fn current_complete_for_token(&self, token: u64) -> Option<Complete<T>> {
+        let published = self.published.as_ref()?;
+        (published.token == token).then(|| published.complete.clone())
+    }
+}
+
+impl<T: Copy> Default for QueryBackedSingleStore<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct QueryBackedFrameGroupStore<TSlot: Copy, const N: usize, TComplete: Copy, TPartial>
+where
+    TPartial: PartialPayload<TSlot, N>,
+{
+    published: Option<PublishedQueryValue<TComplete>>,
+    active_query: Option<ActiveQueryObservationWindow>,
+    staging: [Option<StoredQueryValue<TSlot>>; N],
+    _partial: std::marker::PhantomData<TPartial>,
+}
+
+impl<TSlot: Copy, const N: usize, TComplete: Copy, TPartial>
+    QueryBackedFrameGroupStore<TSlot, N, TComplete, TPartial>
+where
+    TPartial: PartialPayload<TSlot, N>,
+{
+    pub fn new() -> Self {
+        Self {
+            published: None,
+            active_query: None,
+            staging: std::array::from_fn(|_| None),
+            _partial: std::marker::PhantomData,
+        }
+    }
+
+    pub fn begin_query(&mut self, token: u64, min_host_rx_mono_us: u64) {
+        self.active_query = Some(ActiveQueryObservationWindow {
+            token,
+            min_host_rx_mono_us,
+        });
+        self.clear_staging();
+    }
+
+    pub fn finish_query(&mut self, token: u64) {
+        if self.active_query.map(|query| query.token) == Some(token) {
+            self.active_query = None;
+            self.clear_staging();
+        }
+    }
+
+    pub fn record_query_slot<F>(
+        &mut self,
+        token: u64,
+        slot: usize,
+        value: TSlot,
+        host_rx_mono_us: u64,
+        hardware_timestamp_us: Option<u64>,
+        assemble: F,
+    ) -> bool
+    where
+        F: FnOnce(&[Option<TSlot>; N]) -> Option<TComplete>,
+    {
+        let Some(active_query) = self.active_query else {
+            return false;
+        };
+        if active_query.token != token || host_rx_mono_us <= active_query.min_host_rx_mono_us {
+            return false;
+        }
+        if slot >= N {
+            return false;
+        }
+
+        self.staging[slot] = Some(StoredQueryValue {
+            value,
+            meta: ObservationMeta {
+                hardware_timestamp_us,
+                host_rx_mono_us: Some(host_rx_mono_us),
+                source: ObservationSource::Query,
+            },
+        });
+
+        let present_slots = self.present_slots();
+        if let Some(value) = assemble(&present_slots) {
+            let meta = self
+                .staging_meta()
+                .expect("complete query-backed frame group should have metadata");
+            self.published = Some(PublishedQueryValue {
+                token,
+                complete: Complete { value, meta },
+            });
+        }
+
+        true
+    }
+
+    pub fn observe(&self) -> Observation<TComplete, TPartial> {
+        if let Some(published) = self.published.as_ref() {
+            return Observation::Available(crate::observation::Available {
+                payload: ObservationPayload::Complete(published.complete.value),
+                freshness: Freshness::Fresh,
+                meta: published.complete.meta,
+            });
+        }
+
+        if self.active_query.is_none() || !self.staging.iter().any(Option::is_some) {
+            return Observation::Unavailable;
+        }
+
+        let meta = self
+            .staging_meta()
+            .expect("partial query-backed frame group should have metadata");
+        let present_slots = self.present_slots();
+        Observation::Available(crate::observation::Available {
+            payload: ObservationPayload::Partial {
+                partial: TPartial::from_present_slots(&present_slots),
+                missing: MissingSet {
+                    missing_indices: self
+                        .staging
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, slot)| slot.is_none().then_some(index))
+                        .collect(),
+                },
+            },
+            freshness: Freshness::Fresh,
+            meta,
+        })
+    }
+
+    pub fn current_complete_for_token(&self, token: u64) -> Option<Complete<TComplete>> {
+        let published = self.published.as_ref()?;
+        (published.token == token).then(|| published.complete.clone())
+    }
+
+    fn clear_staging(&mut self) {
+        self.staging = std::array::from_fn(|_| None);
+    }
+
+    fn present_slots(&self) -> [Option<TSlot>; N] {
+        std::array::from_fn(|index| self.staging[index].as_ref().map(|slot| slot.value))
+    }
+
+    fn staging_meta(&self) -> Option<ObservationMeta> {
+        let mut iter = self.staging.iter().flatten();
+        let first = iter.next()?;
+        let mut hardware_timestamp_us = first.meta.hardware_timestamp_us;
+        let mut host_rx_mono_us = first.meta.host_rx_mono_us;
+
+        for slot in iter {
+            if slot.meta.hardware_timestamp_us != hardware_timestamp_us {
+                hardware_timestamp_us = None;
+            }
+            host_rx_mono_us = match (host_rx_mono_us, slot.meta.host_rx_mono_us) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                _ => None,
+            };
+        }
+
+        Some(ObservationMeta {
+            hardware_timestamp_us,
+            host_rx_mono_us,
+            source: ObservationSource::Query,
+        })
+    }
+}
+
+impl<TSlot: Copy, const N: usize, TComplete: Copy, TPartial> Default
+    for QueryBackedFrameGroupStore<TSlot, N, TComplete, TPartial>
+where
+    TPartial: PartialPayload<TSlot, N>,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub type CollisionProtectionObservationStore = QueryBackedSingleStore<CollisionProtection>;
+pub type JointLimitObservationStore =
+    QueryBackedFrameGroupStore<JointLimit, 6, JointLimitConfig, PartialJointLimitConfig>;
+pub type JointAccelObservationStore =
+    QueryBackedFrameGroupStore<f64, 6, JointAccelConfig, PartialJointAccelConfig>;
+pub type EndLimitObservationStore = QueryBackedSingleStore<EndLimitConfig>;
+
 // ============================================================================
 // 固件版本状态
 // ============================================================================
@@ -1675,6 +2130,19 @@ pub struct PiperContext {
     /// 末端限制配置状态（按需查询：0x478）
     pub end_limit_config: Arc<RwLock<EndLimitConfigState>>,
 
+    /// Task 4 rebuilt-family diagnostics buffer.
+    pub diagnostics: DiagnosticBuffer,
+    /// Single-flight query coordinator for rebuilt query-backed families.
+    pub query_coordinator: Arc<QueryCoordinator>,
+    /// Rebuilt collision protection observation store.
+    pub collision_protection_observation: Arc<RwLock<CollisionProtectionObservationStore>>,
+    /// Rebuilt joint limit observation store.
+    pub joint_limit_observation: Arc<RwLock<JointLimitObservationStore>>,
+    /// Rebuilt joint accel observation store.
+    pub joint_accel_observation: Arc<RwLock<JointAccelObservationStore>>,
+    /// Rebuilt end limit observation store.
+    pub end_limit_observation: Arc<RwLock<EndLimitObservationStore>>,
+
     // === 冷数据（固件版本）===
     /// 固件版本状态（按需查询：0x4AF）
     pub firmware_version: Arc<RwLock<FirmwareVersionState>>,
@@ -1802,6 +2270,14 @@ impl PiperContext {
             joint_limit_config: Arc::new(RwLock::new(JointLimitConfigState::default())),
             joint_accel_config: Arc::new(RwLock::new(JointAccelConfigState::default())),
             end_limit_config: Arc::new(RwLock::new(EndLimitConfigState::default())),
+            diagnostics: DiagnosticBuffer::new(256),
+            query_coordinator: Arc::new(QueryCoordinator::new()),
+            collision_protection_observation: Arc::new(RwLock::new(
+                CollisionProtectionObservationStore::new(),
+            )),
+            joint_limit_observation: Arc::new(RwLock::new(JointLimitObservationStore::new())),
+            joint_accel_observation: Arc::new(RwLock::new(JointAccelObservationStore::new())),
+            end_limit_observation: Arc::new(RwLock::new(EndLimitObservationStore::new())),
 
             // 冷数据：固件版本
             firmware_version: Arc::new(RwLock::new(FirmwareVersionState::default())),

@@ -4,6 +4,7 @@
 
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter};
 use piper_sdk::driver::DriverError;
+use piper_sdk::driver::observation::Observation;
 use piper_sdk::driver::*;
 use piper_sdk::protocol::ids::*;
 use std::collections::VecDeque;
@@ -287,9 +288,18 @@ fn test_piper_end_to_end_full_state_read() {
     let _motion = piper.get_motion_state();
     let _aligned = piper.get_aligned_motion(5000, Duration::from_secs(3600));
     let _driver = piper.get_joint_driver_low_speed();
-    let _limits = piper.get_joint_limit_config().unwrap();
-    let _accel = piper.get_joint_accel_config().unwrap();
-    let _end_limits = piper.get_end_limit_config().unwrap();
+    assert!(matches!(
+        piper.get_joint_limit_config(),
+        Observation::Unavailable
+    ));
+    assert!(matches!(
+        piper.get_joint_accel_config(),
+        Observation::Unavailable
+    ));
+    assert!(matches!(
+        piper.get_end_limit_config(),
+        Observation::Unavailable
+    ));
 }
 
 // 辅助函数：创建末端位姿反馈帧

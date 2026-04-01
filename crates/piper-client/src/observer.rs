@@ -626,7 +626,22 @@ where
     pub fn collision_protection_snapshot(
         &self,
     ) -> std::result::Result<CollisionProtectionSnapshot, DriverError> {
-        self.driver.get_collision_protection().map(CollisionProtectionSnapshot::from)
+        match self.driver.get_collision_protection() {
+            piper_driver::observation::Observation::Available(available) => match available.payload
+            {
+                piper_driver::observation::ObservationPayload::Complete(state) => {
+                    Ok(CollisionProtectionSnapshot::from(state))
+                },
+                piper_driver::observation::ObservationPayload::Partial { .. } => {
+                    Err(DriverError::InvalidInput(
+                        "collision protection observation unexpectedly partial".to_string(),
+                    ))
+                },
+            },
+            piper_driver::observation::Observation::Unavailable => Err(DriverError::InvalidInput(
+                "collision protection observation unavailable".to_string(),
+            )),
+        }
     }
 
     fn ensure_realtime_control_supported(&self) -> Result<()>

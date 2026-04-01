@@ -1636,10 +1636,22 @@ where
     }
 
     fn collision_protection_cached_inner(&self) -> Result<CollisionProtectionSnapshot> {
-        self.driver
-            .get_collision_protection()
-            .map(CollisionProtectionSnapshot::from)
-            .map_err(Into::into)
+        match self.driver.get_collision_protection() {
+            piper_driver::observation::Observation::Available(available) => match available.payload
+            {
+                piper_driver::observation::ObservationPayload::Complete(state) => {
+                    Ok(CollisionProtectionSnapshot::from(state))
+                },
+                piper_driver::observation::ObservationPayload::Partial { .. } => {
+                    Err(RobotError::ConfigError(
+                        "collision protection observation unexpectedly partial".to_string(),
+                    ))
+                },
+            },
+            piper_driver::observation::Observation::Unavailable => Err(RobotError::ConfigError(
+                "collision protection observation unavailable".to_string(),
+            )),
+        }
     }
 
     fn setting_response_cached_inner(&self) -> Result<SettingResponseSnapshot> {
