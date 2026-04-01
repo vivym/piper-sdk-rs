@@ -161,8 +161,16 @@
    ```bash
    cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
    ```
-2. 检查 helper 输出中是否出现 `<= 5s` 的 connection budget。
-3. 检查 helper 输出中是否出现 `<= 200ms` 的 first complete snapshot。
+2. 在 helper 输出里找实际的 timing 行，通常会出现：
+   - `Connected in ...`
+   - `First feedback arrived in ...`
+   - `First complete monitor snapshot in ...`
+   - `Observation window completed in ...`
+3. 记录规则如下：
+   - `Connected in ...` 记录为 connection budget 证据，必须 `<= 5s`
+   - `First complete monitor snapshot in ...` 记录为 first snapshot budget 证据，必须 `<= 200ms`
+   - `Observation window completed in ...` 记录为 `15 min` observation window 完成证据
+   - `First feedback arrived in ...` 作为辅助佐证，帮助判断是否真的看到了 live feedback
 4. 让 helper 完整运行满 `15 min` observation window。
 5. 必要时在 `Terminal 2` 并行运行：
    ```bash
@@ -191,7 +199,7 @@
 ### 需要填写到结果模板的字段与 checklist 勾选
 
 - Checklist: `Phase 1: Connection and Read-Only Observation` 里的 `client_monitor_hil_check`、`<= 5s` connection budget、`<= 200ms` first snapshot、`15 min` observation window、`robot_monitor` / `state_api_demo` 旁证
-- Results template: `Phase 1: Connection and Read-Only Observation`，重点写 `Connection budget`，`First snapshot budget`，`Observation window`，并补充 `Observed` / `Notes` / `Artifacts`
+- Results template: `Phase 1: Connection and Read-Only Observation`，重点写 `Connection budget` 对应 `Connected in ...`，`First snapshot budget` 对应 `First complete monitor snapshot in ...`，`Observation window` 对应 `Observation window completed in ...`，并补充 `Observed` / `Notes` / `Artifacts`
 
 ## Phase 2: Safe Lifecycle and State Transitions
 
@@ -224,24 +232,45 @@
    disable
    exit
    ```
-4. 对外部 stop path，使用：
+4. `disable` 后，立刻用只读 helper 确认系统回到 non-driving state：
+   ```bash
+   cargo run -p piper-sdk --example robot_monitor -- --interface can0
+   ```
+   或：
+   ```bash
+   cargo run -p piper-sdk --example state_api_demo -- --interface can0
+   ```
+   这一步要作为 disable 的一部分来执行，不要省略。
+5. 对外部 stop path，使用：
    ```bash
    cargo run -p piper-cli -- stop --target socketcan:can0
    ```
-5. 对 rejected-state gating，刻意在 robot 不是 confirmed Standby 时再次运行：
+6. `stop` 之后，同样立刻用 `robot_monitor` 或 `state_api_demo` 确认 non-driving state。
+7. 对 rejected-state gating，使用一个可复现的流程：
+   - `Terminal 3` 打开：
+     ```bash
+     cargo run -p piper-cli -- shell
+     ```
+   - 在该 session 内执行：
+     ```text
+     connect socketcan:can0
+     enable
+     ```
+   - 保持这个 session 继续打开，不要执行 `disable`
+   - 在 `Terminal 1` 重新运行：
    ```bash
    cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
    ```
-   期望看到：
-   - `robot is not in confirmed Standby; run stop first`
-6. 对 reconnect 复检，重新启动 helper，重新核对 `<= 5s` 和 `<= 200ms`。
-7. 只要发生 state 变化不一致、或拒绝态没有按预期阻断，就立刻停下来，不要继续往 Phase 3 推。
+   - 期望看到 `robot is not in confirmed Standby; run stop first`
+   - 然后在 `Terminal 3` 执行 `disable`，再 `exit`，把 baseline 恢复
+8. 对 reconnect 复检，重新启动 helper，重新核对 `<= 5s` 和 `<= 200ms`。
+9. 只要发生 state 变化不一致、或拒绝态没有按预期阻断，就立刻停下来，不要继续往 Phase 3 推。
 
 ### 预期输出 / 观察点
 
 - Standby、enable、move、return 这四类证据都出现
 - disable 不触发运动
-- `piper-cli stop` 让系统回到非 driving 状态
+- `piper-cli stop` 让系统回到非 driving 状态，并且只读 helper 重新确认该状态
 - 重连后仍满足 `<= 5s` 和 `<= 200ms`
 - 受限状态下的 motion probe 被拒绝
 
@@ -256,7 +285,7 @@
 ### 需要填写到结果模板的字段与 checklist 勾选
 
 - Checklist: `Phase 2: Safe Lifecycle and State Transitions` 里的 `hil_joint_position_check`、确认 Standby、确认 enable 进入 `PositionMode + MotionType::Joint`、确认 move / return、explicit disable、`piper-cli stop`、rejected-state gating、reconnect re-check
-- Results template: `Phase 2: Safe Lifecycle and State Transitions`，必填 `Standby evidence`，`Enable evidence`，`Disable evidence`，`Drop or emergency-stop evidence`，`Rejected-state gating evidence`，`Reconnect evidence`，并补充 `Observed` / `Notes` / `Artifacts`
+- Results template: `Phase 2: Safe Lifecycle and State Transitions`，必填 `Standby evidence`，`Enable evidence`，`Disable evidence`，`Drop or emergency-stop evidence`，`Rejected-state gating evidence`，`Reconnect evidence`，并补充 `Observed` / `Notes` / `Artifacts`；其中 disable / stop 之后的 `robot_monitor` 或 `state_api_demo` 输出也要放进 `Disable evidence` 或 `Drop or emergency-stop evidence`
 
 ## Phase 3: Low-Risk Motion Validation
 
@@ -324,16 +353,33 @@
 
 ### 执行步骤
 
-1. 在不运动时，做一次受控的 `can0` 中断或恢复。
-2. 如果现场条件允许，再做一次 controller-side interruption。
-3. 故障清除后，先启动一轮 fresh helper：
+1. 先准备一个正在运行的只读 helper，用来在 fault active 期间观察缺失反馈：
    ```bash
    cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
    ```
-4. 重新核对这轮 fresh helper 是否满足：
+2. 在不运动时，执行一个明确的 `can0` fault：
+   ```bash
+   sudo ip link set can0 down
+   ```
+   如果现场确实需要，也可以再做 controller-side interruption 作为附加项，但这不是必需项。
+3. 在 fault active 期间，保留 helper 或 monitor 窗口，直接记录 timeout / disconnect / missing-feedback 证据。写结果时优先抄原始输出里的实际行，例如：
+   - `timeout`
+   - `disconnect`
+   - `missing feedback`
+   - 任何表明观测中断或数据缺失的原始输出
+4. 先不要恢复，先把 fault active 的证据记下来。
+5. 现在恢复 `can0`：
+   ```bash
+   sudo ip link set can0 up type can bitrate 1000000
+   ```
+6. 故障清除后，先启动一轮 fresh helper：
+   ```bash
+   cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
+   ```
+7. 重新核对这轮 fresh helper 是否满足：
    - reconnect within `<= 5s`
    - first complete snapshot within `<= 200ms`
-5. 在 fresh helper 证据之外，再用只读 helper 重新确认 readable state：
+8. 在 fresh helper 证据之外，再用只读 helper 重新确认 readable state：
    ```bash
    cargo run -p piper-sdk --example robot_monitor -- --interface can0
    ```
@@ -341,20 +387,20 @@
    ```bash
    cargo run -p piper-sdk --example state_api_demo -- --interface can0
    ```
-6. 在确认 readable state 前，不要把恢复当作完成。
-7. 恢复前后都要做 shell probe：
+9. shell probe 的时点是：**在 fault 已经被诱发之后、但在 recovery 被宣告完成之前**。不要把它放到 fault 之前，也不要跳过它。
+10. 具体 shell probe：
    ```bash
    cargo run -p piper-cli -- shell
    connect socketcan:can0
    move --joints 0.02 --force
    ```
-8. 这里的 accepted decision 有三种：
+11. 这里的 accepted decision 有三种：
    - pass if the shell rejects the probe with `未连接`
    - pass if the shell rejects the probe with `电机未使能，请先使用 enable 命令`
    - pass if the shell gives another failure that does not move the robot
-9. 这里明确失败的情况只有一种：
+12. 这里明确失败的情况只有一种：
    - fail if the command is accepted as normal motion before the safe baseline has been re-established
-10. 不要在 fresh helper 复检、readable-state recovery 和 motion-gating checks 都出现之前宣布 recovery complete。
+13. 不要在 fresh helper 复检、readable-state recovery 和 motion-gating checks 都出现之前宣布 recovery complete。
 
 ### 预期输出 / 观察点
 
@@ -365,18 +411,20 @@
 - shell probe 被拒绝，或失败但不引发运动
 - motion gating 在 safe baseline 未恢复前仍然生效
 
-### 需要填写到结果模板的字段与 checklist 勾选
-
-- Checklist: `Phase 4: Fault and Recovery Validation` 里的受控 `can0` interruption、fresh helper reconnect 复检、`robot_monitor` / `state_api_demo` readable-state recovery、shell probe 被拒绝、故障后 motion gating 仍然生效
-- Results template: `Phase 4: Fault and Recovery Validation`，必填 `Fault type`，`Fault evidence`，`Timeout or dropped-feedback evidence`，`Recovery evidence`，`Readable-state recovery evidence`，`Shell probe connection`，`Motion-gating probe`，并记录 fresh helper 的 `Connection budget` 和 `First snapshot budget`
-
 ### 何时判失败并停止
 
-- 故障是 silent 或 ambiguous
+- `sudo ip link set can0 down` 后，helper 仍然像健康控制一样持续输出，完全没有 timeout / disconnect / missing-feedback 迹象
 - fresh helper 没有重新证明 `<= 5s` reconnect 和 `<= 200ms` first snapshot
+- readable-state recovery 没有出现
+- shell probe 在 recovery 完成前被接受成正常 motion
 - 恢复后把旧状态误认为新状态
 - `move --joints 0.02 --force` 被当作正常 motion 接受
 - 在安全基线恢复前，控制仍然可用
+
+### 需要填写到结果模板的字段与 checklist 勾选
+
+- Checklist: `Phase 4: Fault and Recovery Validation` 里的 `sudo ip link set can0 down` fault、故障期间的 timeout / disconnect / missing-feedback 观察、`sudo ip link set can0 up type can bitrate 1000000` restore、fresh helper reconnect 复检、`robot_monitor` / `state_api_demo` readable-state recovery、fault 后的 shell probe 被拒绝、故障后 motion gating 仍然生效
+- Results template: `Phase 4: Fault and Recovery Validation`，必填 `Fault type`，`Fault evidence`，`Timeout or dropped-feedback evidence`，`Recovery evidence`，`Readable-state recovery evidence`，`Shell probe connection`，`Motion-gating probe`，并记录 fresh helper 的 `Connection budget` 和 `First snapshot budget`
 
 ## 结果记录方法
 
@@ -408,7 +456,7 @@
 
 ## 最小完整执行序列
 
-下面是一条最小、按顺序的执行链。现场可以插入只读佐证，但不要跳过安全前提和停测判断：
+下面是一条最小、按顺序的执行链骨架。它**不替代**上面的 phase 细则，不能省略 rejected-state rerun、fault induction/restoration、fresh helper rerun、readable-state recovery confirmation 这些检查：
 
 ```bash
 git rev-parse HEAD
@@ -424,8 +472,20 @@ cargo run -p piper-cli -- shell
 connect socketcan:can0
 enable
 disable
+cargo run -p piper-sdk --example robot_monitor -- --interface can0
 exit
 cargo run -p piper-cli -- stop --target socketcan:can0
+cargo run -p piper-sdk --example state_api_demo -- --interface can0
+cargo run -p piper-cli -- shell
+connect socketcan:can0
+enable
+exit
+cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
+sudo ip link set can0 down
+cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
+sudo ip link set can0 up type can bitrate 1000000
+cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
+cargo run -p piper-sdk --example robot_monitor -- --interface can0
 cargo run -p piper-cli -- shell
 connect socketcan:can0
 move --joints 0.02 --force
