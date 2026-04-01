@@ -18,7 +18,6 @@
 pub mod config;
 pub mod constants;
 pub mod control;
-pub mod diagnostics;
 pub mod feedback;
 pub mod ids;
 
@@ -26,7 +25,6 @@ pub mod ids;
 pub use config::*;
 pub use constants::*;
 pub use control::*;
-pub use diagnostics::*;
 pub use feedback::*;
 pub use ids::*;
 

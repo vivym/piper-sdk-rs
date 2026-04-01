@@ -3,7 +3,6 @@
 //! 包含配置查询和设置指令的结构体，以及配置反馈帧。
 
 use crate::can::PiperFrame;
-use crate::diagnostics::{DecodeResult, ProtocolDiagnostic, TypedFrame};
 use crate::{ProtocolError, bytes_to_i16_be, i16_to_bytes_be, ids::*};
 
 // ============================================================================
@@ -145,28 +144,6 @@ impl MasterSlaveModeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::can::PiperFrame;
-    use crate::diagnostics::{DecodeResult, ProtocolDiagnostic};
-
-    #[test]
-    fn decode_collision_protection_out_of_range_returns_diagnostic() {
-        let frame = PiperFrame::new_standard(0x47B, &[255, 0, 0, 0, 0, 0, 0, 0]);
-        match decode_collision_protection_feedback(frame) {
-            DecodeResult::Diagnostic(ProtocolDiagnostic::OutOfRange { field, .. }) => {
-                assert_eq!(field, "collision_protection_level");
-            },
-            other => panic!("expected out-of-range diagnostic, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decode_motor_limit_valid_frame_returns_data() {
-        let frame = PiperFrame::new_standard(0x473, &[1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]);
-        assert!(matches!(
-            decode_motor_limit_feedback(frame),
-            DecodeResult::Data(_)
-        ));
-    }
 
     #[test]
     fn test_link_setting_from_u8() {
@@ -373,38 +350,6 @@ impl TryFrom<PiperFrame> for MotorLimitFeedback {
             min_angle_deg,
             max_velocity_rad_s,
         })
-    }
-}
-
-/// 解码电机限制反馈帧，返回结构化数据或协议诊断。
-pub fn decode_motor_limit_feedback(frame: PiperFrame) -> DecodeResult<MotorLimitFeedback> {
-    if frame.id != ID_MOTOR_LIMIT_FEEDBACK {
-        return DecodeResult::Ignore;
-    }
-
-    let can_id = frame.id;
-    let timestamp_us = frame.timestamp_us;
-    let actual = frame.len as usize;
-
-    if actual < 7 {
-        return DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
-            can_id,
-            expected: 7,
-            actual,
-        });
-    }
-
-    match MotorLimitFeedback::try_from(frame) {
-        Ok(payload) => DecodeResult::Data(TypedFrame {
-            can_id,
-            payload,
-            hardware_timestamp_us: (timestamp_us != 0).then_some(timestamp_us),
-        }),
-        Err(_) => DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
-            can_id,
-            expected: 7,
-            actual,
-        }),
     }
 }
 
@@ -1674,51 +1619,6 @@ impl TryFrom<PiperFrame> for CollisionProtectionLevelFeedback {
         levels.copy_from_slice(&frame.data[0..6]);
 
         Ok(Self { levels })
-    }
-}
-
-/// 解码碰撞防护等级反馈帧，返回结构化数据或协议诊断。
-pub fn decode_collision_protection_feedback(
-    frame: PiperFrame,
-) -> DecodeResult<CollisionProtectionLevelFeedback> {
-    if frame.id != ID_COLLISION_PROTECTION_LEVEL_FEEDBACK {
-        return DecodeResult::Ignore;
-    }
-
-    let can_id = frame.id;
-    let timestamp_us = frame.timestamp_us;
-    let actual = frame.len as usize;
-
-    if actual < 6 {
-        return DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
-            can_id,
-            expected: 6,
-            actual,
-        });
-    }
-
-    for &raw in &frame.data[0..6] {
-        if raw > 8 {
-            return DecodeResult::Diagnostic(ProtocolDiagnostic::OutOfRange {
-                field: "collision_protection_level",
-                raw: raw as u32,
-                min: 0,
-                max: 8,
-            });
-        }
-    }
-
-    match CollisionProtectionLevelFeedback::try_from(frame) {
-        Ok(payload) => DecodeResult::Data(TypedFrame {
-            can_id,
-            payload,
-            hardware_timestamp_us: (timestamp_us != 0).then_some(timestamp_us),
-        }),
-        Err(_) => DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
-            can_id,
-            expected: 6,
-            actual,
-        }),
     }
 }
 
