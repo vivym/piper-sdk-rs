@@ -141,7 +141,7 @@ pub struct Complete<T> {
 }
 
 pub struct Partial<T> {
-    pub value: T,
+    pub partial: PartialPayload<T>,
     pub meta: ObservationMeta,
     pub missing: MissingSet,
 }
@@ -159,6 +159,11 @@ pub struct ObservationMeta {
 }
 ```
 
+`PartialPayload<T>` is not a default-filled or previously preserved `T`.
+It is a family-specific partial view that contains only currently present members.
+Missing members must be structurally absent from the payload, not represented by
+default values and not backfilled from prior complete observations.
+
 Driver storage is split into two reusable primitives:
 
 - `SingleFrameStore<T>`
@@ -172,6 +177,9 @@ Responsibilities of `FrameGroupStore`:
 - report `Complete`, `Partial`, `Stale`, or `Unavailable`
 - expose missing-slot information
 - support query freshness boundaries so query APIs can demand post-query data
+
+For single-frame observations, `Partial` is not used. A single-frame state is
+either `Complete`, `Stale`, or `Unavailable`.
 
 ### Business State Types
 
@@ -254,10 +262,37 @@ Deprecate and remove ambiguous readiness helpers such as “wait for any robot f
 
 Replace them with observation-specific waiting APIs, for example:
 
-- `wait_for_complete_motion_state(timeout)`
 - `wait_for_complete_low_speed_state(timeout)`
 - `wait_for_complete_end_pose(timeout)`
+- `wait_for_complete_joint_limit_config(timeout)`
 - `wait_for_observation(predicate, timeout)`
+
+## Freshness and Staleness Policy
+
+Freshness is evaluated against `host_rx_mono_us`. Hardware timestamps are used
+for ordering and provenance, but not as the staleness clock because they may be
+absent on some transports.
+
+For the first migration wave:
+
+- `joint_driver_low_speed` becomes `Stale` when any required member is older than `3 * nominal_period`
+- `end_pose` becomes `Stale` when any required member is older than `3 * nominal_period`
+- `collision_protection`, `joint_limit_config`, `joint_accel_config`, and `end_limit_config` do not become stale by elapsed time alone
+
+Initial nominal periods:
+
+- `joint_driver_low_speed`: `25ms` nominal, stale after `75ms`
+- `end_pose`: `2ms` nominal, stale after `6ms`
+
+Query-backed configuration observations follow different rules:
+
+- before any successful query: `Unavailable`
+- after a successful query and before disconnect/reset/invalidation: `Complete`
+- during an in-flight query waiting for post-query data: the query API may fail with timeout, but previously cached complete data does not automatically become `Stale`
+
+This design keeps staleness focused on continuously streaming observations in the
+first migration wave and avoids inventing a false time-based expiry for
+configuration values that are naturally query-driven.
 
 The exact public surface can be finalized during implementation planning, but the rule is fixed: readiness must be tied to a specific observation contract, never to arbitrary frame arrival.
 
@@ -290,6 +325,23 @@ The first implementation wave covers the state families that exposed the current
 - end pose (`0x2A2`-`0x2A4`)
 
 Other state families may continue using the existing model temporarily, but the new observation module must be designed so additional state paths can migrate into it without another model change.
+
+The explicit legacy boundary for the first migration wave is:
+
+- `JointPositionState`
+- `JointDynamicState`
+- `RobotControlState`
+- `GripperState`
+- `SettingResponseState`
+- `FirmwareVersionState`
+- `MasterSlaveControlModeState`
+- `MasterSlaveJointControlState`
+- `MasterSlaveGripperControlState`
+- combined/aligned motion helper snapshots built on top of those families
+
+Those legacy families are out of scope for this spec and must not be pulled
+into the initial implementation plan except where the new observation module
+needs compatibility seams around them.
 
 ## Breaking Changes
 
