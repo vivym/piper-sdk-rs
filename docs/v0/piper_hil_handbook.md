@@ -59,6 +59,13 @@ Supporting entry points:
   `cargo run -p piper-sdk --example state_api_demo -- --interface can0`
 - Timestamp verification:
   `cargo run -p piper-sdk --example timestamp_verification -- --interface can0`
+- Manual CLI support path for lifecycle and recovery checks:
+  - `piper-cli shell`
+    - `connect socketcan:can0`
+    - `enable`
+    - `stop`
+    - `exit`
+  - `piper-cli stop --target socketcan:can0`
 
 Use the supporting driver-level tools as evidence collectors, not as hidden automation:
 
@@ -74,7 +81,7 @@ The manual checks that are not covered by a helper are:
 - rejected-state command gating
 - fault and recovery gating after `can0` loss or controller-side interruption
 
-For those checks, use the helper output as the primary baseline and the supporting tools above to confirm the robot state before and after the operator action.
+For those checks, use `piper-cli shell` for a live session or `piper-cli stop --target socketcan:can0` for a direct stop, and use the helper output plus `robot_monitor` or `state_api_demo` to confirm the robot state before and after the operator action.
 
 ## Phase 0: Preflight and Safety Baseline
 
@@ -108,7 +115,11 @@ Confirm the test environment is safe and the transport is configured before any 
    sudo ip link set can0 up type can bitrate 1000000
    ```
 4. Verify the robot is in a safe initial pose and the workspace is clear.
-5. Confirm that CAN feedback is present before any motion attempt.
+5. Confirm that CAN feedback is present before any motion attempt:
+   ```bash
+   cargo run -p piper-sdk --example robot_monitor -- --interface can0
+   ```
+   Treat the first live joint or gripper update as the preflight evidence that feedback is present on the bus.
 
 ### Pass Criteria
 
@@ -149,15 +160,16 @@ Verify the read path end to end: SocketCAN transport, protocol decode, driver sy
    - robot control state
    - end pose
    - any state that is harder to inspect from the read-only helper alone
-7. During the window, record missing state groups, repeated stale or incomplete reads, disconnects, and any mismatch between on-screen state and the real robot.
-8. Treat the helper's retry of `MonitorStateIncomplete` and `MonitorStateStale` as warmup behavior only if a complete snapshot arrives within `<= 200ms`.
+7. During the window, treat a helper timeout, a missed `<= 200ms` first snapshot, or an unexplained disconnect as the observable stale/incomplete failure mode.
+8. If you need corroboration, use `robot_monitor` or `state_api_demo` to show that live feedback is still present while the helper is timing out or restarting.
+9. Do not score hidden client-side retry counts; the observable criterion is whether the helper produces the required first snapshot and remains connected for `15 min`.
 
 ### Pass Criteria
 
 - Connection succeeds within `<= 5s`
 - The first complete client monitor snapshot arrives within `<= 200ms`
 - The full `15 min` observation window completes
-- No sustained stale or incomplete burst longer than `1s` appears after warmup
+- No helper timeout, missed first snapshot, or unexplained disconnect occurs during the observation window
 - No unexplained disconnect occurs
 
 ### Fail Criteria
