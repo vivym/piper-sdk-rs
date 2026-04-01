@@ -28,11 +28,11 @@ pub struct Complete<T> {
     pub meta: ObservationMeta,
 }
 
-pub trait PartialPayload<T>: Sized {
+pub trait PartialPayload<T, const N: usize>: Sized {
     fn from_present_slots(slots: &[Option<T>]) -> Self;
 }
 
-impl<T: Copy> PartialPayload<T> for Vec<Option<T>> {
+impl<T: Copy, const N: usize> PartialPayload<T, N> for Vec<Option<T>> {
     fn from_present_slots(slots: &[Option<T>]) -> Self {
         slots.to_vec()
     }
@@ -149,7 +149,7 @@ struct StoredSlot<T: Copy> {
 impl<TSlot: Copy, const N: usize, TAssembled, TPartial>
     FrameGroupStore<TSlot, N, TAssembled, TPartial>
 where
-    TPartial: PartialPayload<TSlot>,
+    TPartial: PartialPayload<TSlot, N>,
 {
     pub fn new() -> Self {
         Self {
@@ -200,7 +200,7 @@ where
         F: FnOnce(&[Option<TSlot>; N]) -> Option<TAssembled>,
     {
         let present_slots = self.present_slots();
-        let Some(meta) = self.latest_meta() else {
+        let Some(meta) = self.aggregated_meta() else {
             return Observation::Unavailable;
         };
 
@@ -247,12 +247,34 @@ where
             .collect()
     }
 
-    fn latest_meta(&self) -> Option<ObservationMeta> {
-        self.slots
-            .iter()
-            .flatten()
-            .max_by_key(|slot| slot.meta.host_rx_mono_us.unwrap_or(0))
-            .map(|slot| slot.meta)
+    fn aggregated_meta(&self) -> Option<ObservationMeta> {
+        let mut iter = self.slots.iter().flatten();
+        let first = iter.next()?;
+
+        let source = first.meta.source;
+        let mut hardware_timestamp_us = first.meta.hardware_timestamp_us;
+        let mut host_rx_mono_us = first.meta.host_rx_mono_us;
+
+        for slot in iter {
+            if slot.meta.source != source {
+                return None;
+            }
+
+            if slot.meta.hardware_timestamp_us != hardware_timestamp_us {
+                hardware_timestamp_us = None;
+            }
+
+            host_rx_mono_us = match (host_rx_mono_us, slot.meta.host_rx_mono_us) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                _ => None,
+            };
+        }
+
+        Some(ObservationMeta::new(
+            host_rx_mono_us,
+            hardware_timestamp_us,
+            source,
+        ))
     }
 
     fn oldest_present_host_rx_mono_us(&self) -> Option<u64> {
@@ -263,7 +285,7 @@ where
 impl<TSlot: Copy, const N: usize, TAssembled, TPartial> Default
     for FrameGroupStore<TSlot, N, TAssembled, TPartial>
 where
-    TPartial: PartialPayload<TSlot>,
+    TPartial: PartialPayload<TSlot, N>,
 {
     fn default() -> Self {
         Self::new()
@@ -299,7 +321,7 @@ struct PairPartial {
 }
 
 #[cfg(test)]
-impl PartialPayload<u8> for PairPartial {
+impl<const N: usize> PartialPayload<u8, N> for PairPartial {
     fn from_present_slots(slots: &[Option<u8>]) -> Self {
         Self {
             first: slots[0],
@@ -351,6 +373,34 @@ mod tests {
                 assert_eq!(available.meta.source, ObservationSource::Stream);
             },
             other => panic!("expected available custom partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_store_rejects_mixed_sources() {
+        let mut store = FrameGroupStore::<u8, 2, [u8; 2]>::new();
+        store.record_slot_with_source(0, 10, 1_000, Some(10), ObservationSource::Stream);
+        store.record_slot_with_source(1, 11, 1_001, Some(10), ObservationSource::Query);
+
+        assert!(matches!(
+            store.observe(1_020, 50, |_| None),
+            Observation::Unavailable
+        ));
+    }
+
+    #[test]
+    fn group_store_aggregates_conservative_meta() {
+        let mut store = FrameGroupStore::<u8, 3, [u8; 3]>::new();
+        store.record_slot_with_source(0, 10, 1_000, Some(10), ObservationSource::Query);
+        store.record_slot_with_source(1, 11, 1_050, Some(10), ObservationSource::Query);
+
+        match store.observe(1_060, 100, |_| None) {
+            Observation::Available(available) => {
+                assert_eq!(available.meta.host_rx_mono_us, Some(1_000));
+                assert_eq!(available.meta.hardware_timestamp_us, Some(10));
+                assert_eq!(available.meta.source, ObservationSource::Query);
+            },
+            other => panic!("expected available observation, got {other:?}"),
         }
     }
 
@@ -454,8 +504,8 @@ mod tests {
             Some([slots[0].unwrap(), slots[1].unwrap()])
         }) {
             Observation::Available(available) => {
-                assert_eq!(available.meta.host_rx_mono_us, Some(1_010));
-                assert_eq!(available.meta.hardware_timestamp_us, Some(11));
+                assert_eq!(available.meta.host_rx_mono_us, Some(1_000));
+                assert_eq!(available.meta.hardware_timestamp_us, None);
                 assert_eq!(available.meta.source, ObservationSource::Query);
             },
             other => panic!("expected available observation, got {other:?}"),
