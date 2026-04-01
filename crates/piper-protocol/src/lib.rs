@@ -26,6 +26,7 @@ pub mod ids;
 pub use config::*;
 pub use constants::*;
 pub use control::*;
+pub use diagnostics::*;
 pub use feedback::*;
 pub use ids::*;
 
