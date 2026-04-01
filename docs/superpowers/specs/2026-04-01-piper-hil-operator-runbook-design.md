@@ -52,10 +52,11 @@ The new runbook covers the same tested scope as the accepted handbook:
 It should cover:
 
 - setup and terminal layout
+- safety baseline and stop conditions before any command execution
 - Phase 0 through Phase 4 execution
 - explicit references to helper examples and CLI support paths
 - pass/fail interpretation in operator language
-- how to capture evidence into the results template
+- how to capture evidence into the checklist and results template
 
 It should not expand scope to:
 
@@ -75,6 +76,22 @@ The runbook should be written in Chinese, with:
 - explicit terminal labels such as `Terminal 1`, `Terminal 2`, and `Terminal 3`
 
 The writing style should prioritize field usability over completeness-by-default. Each phase should be easy to execute in order without having to cross-read multiple other docs.
+
+## Safety Baseline Requirements
+
+The runbook must restate the accepted safety baseline in operator language before Phase 0 begins.
+
+At minimum it must explicitly require:
+
+- one operator runs the test
+- a second person supervises whenever motion is enabled
+- the arm is unloaded
+- the workspace is clear and collision-free
+- the emergency stop is reachable before any motion step
+- motion stays within the existing low-risk envelope
+- the run stops immediately if the observed behavior exits that envelope
+
+This is required so the runbook does not collapse into a command script that loses the handbook's safety preconditions.
 
 ## Proposed Structure
 
@@ -137,6 +154,19 @@ The runbook should also preserve the already-accepted REPL commands and failure 
 - `未连接`
 - `电机未使能，请先使用 enable 命令`
 
+For Phase 2 and Phase 4, the runbook must also call out the accepted evidence lines and decisions that the operator should look for, instead of paraphrasing them loosely.
+
+At minimum this includes:
+
+- `[PASS] connected and confirmed Standby`
+- `[PASS] enabled PositionMode motion=Joint speed_percent=...`
+- `[PASS] settle step=move ...`
+- `[PASS] settle step=return ...`
+- the rejected-state failure `robot is not in confirmed Standby; run stop first`
+- the Phase 4 motion-gating decision:
+  - pass if the shell rejects the probe with `未连接`, `电机未使能，请先使用 enable 命令`, or another failure that does not move the robot
+  - fail if the command is accepted as normal motion before the safe baseline has been re-established
+
 ## Acceptance Thresholds
 
 The runbook must restate and consistently use the handbook thresholds:
@@ -165,6 +195,8 @@ It should reference these exact files:
 - `docs/v0/piper_hil_execution_checklist.md`
 - `docs/v0/piper_hil_results_template.md`
 
+The runbook should also map each phase to the relevant checklist items, so the operator knows what to tick while executing, not only what to record afterward.
+
 ## Failure Handling
 
 The runbook should provide practical failure handling without becoming a troubleshooting manual.
@@ -178,9 +210,14 @@ It should include:
 
 It should not attempt root-cause diagnosis beyond short operator-facing guidance.
 
-## Results Recording Guidance
+## Checklist And Results Recording Guidance
 
-The runbook should include a short mapping from each phase to the key fields in `docs/v0/piper_hil_results_template.md`, so the operator knows where to record:
+The runbook should include a short mapping from each phase to:
+
+- the relevant checks in `docs/v0/piper_hil_execution_checklist.md`
+- the key fields in `docs/v0/piper_hil_results_template.md`
+
+so the operator knows both what to tick during execution and where to record evidence afterward:
 
 - timings
 - observed helper outputs
@@ -188,7 +225,7 @@ The runbook should include a short mapping from each phase to the key fields in 
 - fault type and recovery evidence
 - final gate decisions
 
-This mapping is required because the results template is intentionally terse.
+This mapping is required because the checklist is terse during live execution and the results template is intentionally terse for evidence capture.
 
 ## Deliverable
 
