@@ -124,7 +124,7 @@
    ```
 6. 把第一次出现的 live joint 或 gripper update 当作“反馈已存在”的证据。
 
-### 预期输出或观察点
+### 预期输出 / 观察点
 
 - 主机和版本信息被记录
 - `can0` 的状态和统计信息可读
@@ -138,10 +138,11 @@
 - 看不到 live feedback
 - 现场无法确认机械臂处于安全初始姿态
 
-### 记录到哪里
+### 需要填写到结果模板的字段与 checklist 勾选
 
-- Checklist: `Run Setup`，`Phase 0: Preflight and Safety Baseline`
-- Results template: `Run Metadata`，`Phase 0: Preflight and Safety Baseline`
+- Checklist: `Run Setup` 里的 git SHA、date、operator、supervisor、host OS、kernel、`rustc`、`cargo`、robot model、firmware version、CAN interface、bitrate、workspace clear、arm unloaded、logging ready
+- Checklist: `Phase 0: Preflight and Safety Baseline` 里的 `can0` status/counters、bring `can0` up、safe initial pose、`robot_monitor` live feedback present
+- Results template: `Run Metadata`，`Phase 0: Preflight and Safety Baseline`，重点记录 host / interface 元数据、`can0` 配置、live feedback 证据、第一条 live joint 或 gripper update
 
 ## Phase 1: Connection and Read-Only Observation
 
@@ -173,7 +174,7 @@
    ```
 6. 如果需要补充佐证，用 `Terminal 2` 继续看只读状态，不要在这个 phase 里启用 motion。
 
-### 预期输出或观察点
+### 预期输出 / 观察点
 
 - connection 成功且在 `<= 5s`
 - first complete snapshot 在 `<= 200ms`
@@ -187,10 +188,10 @@
 - 意外 disconnect
 - 观察窗口没有完整跑完
 
-### 记录到哪里
+### 需要填写到结果模板的字段与 checklist 勾选
 
-- Checklist: `Phase 1: Connection and Read-Only Observation`
-- Results template: `Phase 1: Connection and Read-Only Observation`，重点写 `Connection budget`，`First snapshot budget`，`Observation window`
+- Checklist: `Phase 1: Connection and Read-Only Observation` 里的 `client_monitor_hil_check`、`<= 5s` connection budget、`<= 200ms` first snapshot、`15 min` observation window、`robot_monitor` / `state_api_demo` 旁证
+- Results template: `Phase 1: Connection and Read-Only Observation`，重点写 `Connection budget`，`First snapshot budget`，`Observation window`，并补充 `Observed` / `Notes` / `Artifacts`
 
 ## Phase 2: Safe Lifecycle and State Transitions
 
@@ -236,7 +237,7 @@
 6. 对 reconnect 复检，重新启动 helper，重新核对 `<= 5s` 和 `<= 200ms`。
 7. 只要发生 state 变化不一致、或拒绝态没有按预期阻断，就立刻停下来，不要继续往 Phase 3 推。
 
-### 预期输出或观察点
+### 预期输出 / 观察点
 
 - Standby、enable、move、return 这四类证据都出现
 - disable 不触发运动
@@ -252,11 +253,10 @@
 - disable 后仍表现为可疑 motion
 - reconnect 的 budget 超限
 
-### 记录到哪里
+### 需要填写到结果模板的字段与 checklist 勾选
 
-- Checklist: `Phase 2: Safe Lifecycle and State Transitions`
-- Results template: `Phase 2: Safe Lifecycle and State Transitions`
-- 必填字段：`Standby evidence`，`Enable evidence`，`Disable evidence`，`Drop or emergency-stop evidence`，`Rejected-state gating evidence`，`Reconnect evidence`
+- Checklist: `Phase 2: Safe Lifecycle and State Transitions` 里的 `hil_joint_position_check`、确认 Standby、确认 enable 进入 `PositionMode + MotionType::Joint`、确认 move / return、explicit disable、`piper-cli stop`、rejected-state gating、reconnect re-check
+- Results template: `Phase 2: Safe Lifecycle and State Transitions`，必填 `Standby evidence`，`Enable evidence`，`Disable evidence`，`Drop or emergency-stop evidence`，`Rejected-state gating evidence`，`Reconnect evidence`，并补充 `Observed` / `Notes` / `Artifacts`
 
 ## Phase 3: Low-Risk Motion Validation
 
@@ -288,7 +288,7 @@
    - `[PASS] settle step=return ...`
 8. 关心的不是“看起来差不多”，而是 return-to-start error 是否 `<= 0.05 rad`。
 
-### 预期输出或观察点
+### 预期输出 / 观察点
 
 - motion direction 与命令一致
 - feedback trend 与物理动作一致
@@ -305,11 +305,10 @@
 - feedback 和物理动作明显背离
 - 运动越出 low-risk envelope
 
-### 记录到哪里
+### 需要填写到结果模板的字段与 checklist 勾选
 
-- Checklist: `Phase 3: Low-Risk Motion Validation`
-- Results template: `Phase 3: Low-Risk Motion Validation`
-- 必填字段：`Joint`，`Delta rad`，`Speed percent`，`Move evidence`，`Return evidence`，`Return-to-start error`，`Jump / oscillation / overshoot notes`，`Repeated small moves consistency`
+- Checklist: `Phase 3: Low-Risk Motion Validation` 里的低风险约束确认、`hil_joint_position_check`、`PositionMode + MotionType::Joint only`、`speed_percent <= 10`、`abs(delta) <= 0.035 rad`、每步人工确认、无 MIT / Cartesian / Linear / Circular motion
+- Results template: `Phase 3: Low-Risk Motion Validation`，必填 `Joint`，`Delta rad`，`Speed percent`，`Move evidence`，`Return evidence`，`Return-to-start error`，`Jump / oscillation / overshoot notes`，`Repeated small moves consistency`，并补充 `Observed` / `Notes` / `Artifacts`
 
 ## Phase 4: Fault and Recovery Validation
 
@@ -327,7 +326,14 @@
 
 1. 在不运动时，做一次受控的 `can0` 中断或恢复。
 2. 如果现场条件允许，再做一次 controller-side interruption。
-3. 故障清除后，用只读 helper 重新确认 readable state：
+3. 故障清除后，先启动一轮 fresh helper：
+   ```bash
+   cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
+   ```
+4. 重新核对这轮 fresh helper 是否满足：
+   - reconnect within `<= 5s`
+   - first complete snapshot within `<= 200ms`
+5. 在 fresh helper 证据之外，再用只读 helper 重新确认 readable state：
    ```bash
    cargo run -p piper-sdk --example robot_monitor -- --interface can0
    ```
@@ -335,41 +341,42 @@
    ```bash
    cargo run -p piper-sdk --example state_api_demo -- --interface can0
    ```
-4. 在确认 readable state 前，不要把恢复当作完成。
-5. 恢复前后都要做 shell probe：
+6. 在确认 readable state 前，不要把恢复当作完成。
+7. 恢复前后都要做 shell probe：
    ```bash
    cargo run -p piper-cli -- shell
    connect socketcan:can0
    move --joints 0.02 --force
    ```
-6. 这里的 accepted decision 有三种：
+8. 这里的 accepted decision 有三种：
    - pass if the shell rejects the probe with `未连接`
    - pass if the shell rejects the probe with `电机未使能，请先使用 enable 命令`
    - pass if the shell gives another failure that does not move the robot
-7. 这里明确失败的情况只有一种：
+9. 这里明确失败的情况只有一种：
    - fail if the command is accepted as normal motion before the safe baseline has been re-established
-8. 不要在 readable-state recovery 和 motion-gating checks 都出现之前宣布 recovery complete。
+10. 不要在 fresh helper 复检、readable-state recovery 和 motion-gating checks 都出现之前宣布 recovery complete。
 
-### 预期输出或观察点
+### 预期输出 / 观察点
 
 - 故障在日志或返回值中是显式的
 - 系统向 safety 方向降级
+- fresh helper 在恢复后重新证明 `<= 5s` reconnect 和 `<= 200ms` first snapshot
 - 故障清除后 readable state 重新出现
 - shell probe 被拒绝，或失败但不引发运动
 - motion gating 在 safe baseline 未恢复前仍然生效
 
+### 需要填写到结果模板的字段与 checklist 勾选
+
+- Checklist: `Phase 4: Fault and Recovery Validation` 里的受控 `can0` interruption、fresh helper reconnect 复检、`robot_monitor` / `state_api_demo` readable-state recovery、shell probe 被拒绝、故障后 motion gating 仍然生效
+- Results template: `Phase 4: Fault and Recovery Validation`，必填 `Fault type`，`Fault evidence`，`Timeout or dropped-feedback evidence`，`Recovery evidence`，`Readable-state recovery evidence`，`Shell probe connection`，`Motion-gating probe`，并记录 fresh helper 的 `Connection budget` 和 `First snapshot budget`
+
 ### 何时判失败并停止
 
 - 故障是 silent 或 ambiguous
+- fresh helper 没有重新证明 `<= 5s` reconnect 和 `<= 200ms` first snapshot
 - 恢复后把旧状态误认为新状态
 - `move --joints 0.02 --force` 被当作正常 motion 接受
 - 在安全基线恢复前，控制仍然可用
-
-### 记录到哪里
-
-- Checklist: `Phase 4: Fault and Recovery Validation`
-- Results template: `Phase 4: Fault and Recovery Validation`
-- 必填字段：`Fault type`，`Fault evidence`，`Timeout or dropped-feedback evidence`，`Recovery evidence`，`Readable-state recovery evidence`，`Shell probe connection`，`Motion-gating probe`
 
 ## 结果记录方法
 
@@ -424,4 +431,3 @@ connect socketcan:can0
 move --joints 0.02 --force
 exit
 ```
-
