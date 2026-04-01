@@ -86,10 +86,24 @@
 
 - **`position_control_demo`** - 完整的位置模式控制流程
   - 从连接、使能、移动、回位到显式失能的全流程演示
-  - 教学示例使用固定等待来展示流程，不把 `sleep` 视为生产级到位确认
+  - 这是教学示例，使用固定等待来展示流程，不把 `sleep` 视为生产级到位确认
   - 生产代码请参考 `piper-control::workflow` 的按误差阈值阻塞确认模式
   - Linux 默认 `can0`；macOS/Windows 需要显式传 GS-USB serial
   - 运行：`cargo run -p piper-sdk --example position_control_demo -- --interface can0`
+
+### 实用硬件辅助
+
+HIL 手册请参考：[docs/v0/piper_hil_handbook.md](/home/viv/projs/piper-sdk-rs/docs/v0/piper_hil_handbook.md)
+
+- **`client_monitor_hil_check`** - 只读客户端监控 HIL 辅助工具
+  - 验证连接时间、首个完整 monitor snapshot 和只读观测窗口
+  - 主要用于手册中的 Phase 1
+  - 运行：`cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900`
+
+- **`hil_joint_position_check`** - 安全关节位置 HIL 辅助工具
+  - 验证 `PositionMode + MotionType::Joint` 的低风险位置控制路径
+  - 主要用于手册中的 Phase 2 / Phase 3
+  - 运行：`cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10`
 
 - **`multi_threaded_demo`** - 多线程共享 Piper 的示例
   - 展示 `Arc<Mutex<Piper>>`、监控线程和显式 disable 收尾
