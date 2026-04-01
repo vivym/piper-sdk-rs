@@ -111,7 +111,6 @@ pub enum DecodeResult<T> {
 - `InvalidEnum`
 - `OutOfRange`
 - `UnsupportedValue`
-- `UnexpectedFrameForQuery`
 - `MalformedGroupMember`
 
 Rules:
@@ -120,6 +119,11 @@ Rules:
 - Semantic invalidity becomes `Diagnostic`
 - Only business-valid values become `Data`
 - `Ignore` is reserved for frames that are irrelevant to the consumer or intentionally unsupported in that path
+
+Query-correlation failures are out of scope for protocol decode. A valid frame
+that does not satisfy the currently pending query is emitted later by the
+driver/query coordination layer as a query diagnostic, not as a
+`ProtocolDiagnostic`.
 
 ### Driver Observation Layer
 
@@ -211,8 +215,23 @@ Diagnostics are stored and exposed independently from normal state.
 
 Minimum API:
 
-- `subscribe_diagnostics() -> Receiver<ProtocolDiagnostic>`
-- `snapshot_diagnostics() -> Vec<ProtocolDiagnostic>`
+- `subscribe_diagnostics() -> Receiver<DiagnosticEvent>`
+- `snapshot_diagnostics() -> Vec<DiagnosticEvent>`
+
+Where:
+
+```rust
+pub enum DiagnosticEvent {
+    Protocol(ProtocolDiagnostic),
+    Query(QueryDiagnostic),
+}
+```
+
+`QueryDiagnostic` captures driver/query-layer anomalies such as:
+
+- valid frame observed but not applicable to the pending query
+- wrong joint/member set received for the current query
+- query window expired after diagnostics-only traffic
 
 Implementation detail:
 
@@ -290,6 +309,15 @@ Query-backed configuration observations follow different rules:
 - after a successful query and before disconnect/reset/invalidation: `Complete`
 - during an in-flight query waiting for post-query data: the query API may fail with timeout, but previously cached complete data does not automatically become `Stale`
 
+For this spec, invalidation is limited to:
+
+- explicit driver reset of the relevant observation store
+- transport disconnect / session teardown
+- receipt of a future protocol-defined invalidation signal for that state family
+
+Application-level elapsed time alone does not invalidate query-backed
+configuration in the first migration wave.
+
 This design keeps staleness focused on continuously streaming observations in the
 first migration wave and avoids inventing a false time-based expiry for
 configuration values that are naturally query-driven.
@@ -312,6 +340,22 @@ For grouped data such as low-speed driver feedback:
 - complete observation rate is expected around `40Hz`
 
 Examples and tools must label these distinctly and stop using a single ambiguous “FPS” term for both concepts.
+
+### Metrics Migration Boundary
+
+The first migration wave introduces a new public observation metrics API for the
+rebuilt families only. It does not require the implementation plan to migrate
+every existing counter in the SDK.
+
+Rules for the first migration wave:
+
+- remove the current public `get_fps()` contract from rebuilt examples/tools
+- add a new observation metrics surface that reports only rebuilt-family metrics
+- legacy counters for non-migrated families may remain as internal implementation detail during transition
+- the implementation plan must not expand scope to rewrite metrics for legacy state families in this wave
+
+This keeps the metrics rewrite aligned with the observation rebuild instead of
+turning it into a repository-wide telemetry migration.
 
 ## Scope of First Migration
 
