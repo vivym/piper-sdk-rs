@@ -288,13 +288,13 @@ impl QueryMotorLimitCommand {
 ///
 /// 单位：
 /// - 角度限制：0.1°（原始值）
-/// - 最大关节速度：0.01rad/s（原始值）
+/// - 最大关节速度：0.001rad/s（原始值）
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MotorLimitFeedback {
     pub joint_index: u8,    // Byte 0: 关节电机序号（1-6）
     pub max_angle_deg: i16, // Byte 1-2: 最大角度限制，单位 0.1°
     pub min_angle_deg: i16, // Byte 3-4: 最小角度限制，单位 0.1°
-    pub max_velocity_rad_s: u16, // Byte 5-6: 最大关节速度，单位 0.01rad/s
+    pub max_velocity_rad_s: u16, // Byte 5-6: 最大关节速度，单位 0.001rad/s
                             // Byte 7: 保留
 }
 
@@ -311,7 +311,7 @@ impl MotorLimitFeedback {
 
     /// 获取最大速度（rad/s）
     pub fn max_velocity(&self) -> f64 {
-        self.max_velocity_rad_s as f64 / 100.0
+        self.max_velocity_rad_s as f64 / 1000.0
     }
 }
 
@@ -394,7 +394,7 @@ mod motor_limit_tests {
         // 测试数据：
         // - 最大角度: 180.0° = 1800 (0.1° 单位)
         // - 最小角度: -180.0° = -1800 (0.1° 单位)
-        // - 最大速度: 5.0 rad/s = 500 (0.01rad/s 单位)
+        // - 最大速度: 0.5 rad/s = 500 (0.001rad/s 单位)
         let max_angle_val = 1800i16;
         let min_angle_val = -1800i16;
         let max_velocity_val = 500u16;
@@ -414,7 +414,7 @@ mod motor_limit_tests {
         assert_eq!(feedback.max_velocity_rad_s, 500);
         assert!((feedback.max_angle() - 180.0).abs() < 0.0001);
         assert!((feedback.min_angle() - (-180.0)).abs() < 0.0001);
-        assert!((feedback.max_velocity() - 5.0).abs() < 0.0001);
+        assert!((feedback.max_velocity() - 0.5).abs() < 0.0001);
     }
 
     #[test]
@@ -441,13 +441,13 @@ mod motor_limit_tests {
 /// 用于设置电机的角度限制和最大速度。
 /// 单位：
 /// - 角度限制：0.1°（原始值），无效值：0x7FFF
-/// - 最大关节速度：0.01rad/s（原始值），无效值：0x7FFF
+/// - 最大关节速度：0.001rad/s（原始值），无效值：0x7FFF
 #[derive(Debug, Clone, Copy)]
 pub struct SetMotorLimitCommand {
     pub joint_index: u8,                 // Byte 0: 关节电机序号（1-6）
     pub max_angle_deg: Option<i16>,      // Byte 1-2: 最大角度限制，单位 0.1°，None 表示无效值
     pub min_angle_deg: Option<i16>,      // Byte 3-4: 最小角度限制，单位 0.1°，None 表示无效值
-    pub max_velocity_rad_s: Option<u16>, // Byte 5-6: 最大关节速度，单位 0.01rad/s，None 表示无效值
+    pub max_velocity_rad_s: Option<u16>, // Byte 5-6: 最大关节速度，单位 0.001rad/s，None 表示无效值
 }
 
 impl SetMotorLimitCommand {
@@ -462,7 +462,7 @@ impl SetMotorLimitCommand {
             joint_index,
             max_angle_deg: max_angle.map(|a| (a * 10.0) as i16),
             min_angle_deg: min_angle.map(|a| (a * 10.0) as i16),
-            max_velocity_rad_s: max_velocity.map(|v| (v * 100.0) as u16),
+            max_velocity_rad_s: max_velocity.map(|v| (v * 1000.0) as u16),
         }
     }
 
@@ -507,7 +507,7 @@ mod set_motor_limit_tests {
             1,
             Some(180.0),  // 最大角度 180°
             Some(-180.0), // 最小角度 -180°
-            Some(5.0),    // 最大速度 5.0 rad/s
+            Some(0.5),    // 最大速度 0.5 rad/s
         );
         assert_eq!(cmd.joint_index, 1);
         assert_eq!(cmd.max_angle_deg, Some(1800));
@@ -517,7 +517,7 @@ mod set_motor_limit_tests {
 
     #[test]
     fn test_set_motor_limit_command_to_frame() {
-        let cmd = SetMotorLimitCommand::new(1, Some(180.0), Some(-180.0), Some(5.0));
+        let cmd = SetMotorLimitCommand::new(1, Some(180.0), Some(-180.0), Some(0.5));
         let frame = cmd.to_frame();
 
         assert_eq!(frame.id, ID_SET_MOTOR_LIMIT);
@@ -554,7 +554,7 @@ mod set_motor_limit_tests {
             2,
             Some(90.0), // 只设置最大角度
             None,       // 最小角度无效
-            Some(3.0),  // 设置最大速度
+            Some(0.3),  // 设置最大速度
         );
         let frame = cmd.to_frame();
 

@@ -72,13 +72,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 运行一段时间，收集数据
     println!("\n=== 状态 API 演示 ===\n");
+    let query_timeout = Duration::from_secs(args.feedback_timeout_secs);
+    let motion_wait_timeout = query_timeout.min(Duration::from_millis(100));
+    let low_speed_wait_timeout = query_timeout.min(Duration::from_millis(250));
+    let poll_interval = Duration::from_millis(2);
 
     // 1. 读取关节位置和末端位姿（500Hz，无锁）
     println!("--- 运动状态（500Hz）---");
 
     // 方案1：分别获取（适合需要独立时间戳的场景）
-    let joint_pos = robot.get_joint_position();
-    let end_pose = robot.get_end_pose();
+    let joint_pos = wait_for_ready_state(
+        motion_wait_timeout,
+        poll_interval,
+        || robot.get_joint_position(),
+        |state| state.is_fully_valid(),
+    )
+    .unwrap_or_else(|| robot.get_joint_position());
+    let end_pose = wait_for_ready_state(
+        motion_wait_timeout,
+        poll_interval,
+        || robot.get_end_pose(),
+        |state| state.is_fully_valid(),
+    )
+    .unwrap_or_else(|| robot.get_end_pose());
 
     println!("Joint positions: {:?}", joint_pos.joint_pos);
     println!("End pose: {:?}", end_pose.end_pose);
@@ -108,7 +124,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 方案2：使用快照（适合需要逻辑原子性的场景）
-    let snapshot = robot.capture_motion_snapshot();
+    let snapshot = wait_for_ready_state(
+        motion_wait_timeout,
+        poll_interval,
+        || robot.capture_motion_snapshot(),
+        |state| state.joint_position.is_fully_valid() && state.end_pose.is_fully_valid(),
+    )
+    .unwrap_or_else(|| robot.capture_motion_snapshot());
     println!("\nMotion snapshot:");
     println!("  Joint positions: {:?}", snapshot.joint_position.joint_pos);
     println!("  End pose: {:?}", snapshot.end_pose.end_pose);
@@ -152,132 +174,161 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. 读取关节驱动器诊断状态（40Hz，无锁，Wait-Free）
     println!("\n--- 关节驱动器诊断状态（40Hz）---");
-    let driver_state = robot.get_joint_driver_low_speed();
+    let driver_state = wait_for_ready_state(
+        low_speed_wait_timeout,
+        poll_interval,
+        || robot.get_joint_driver_low_speed(),
+        |state| state.is_fully_valid(),
+    )
+    .unwrap_or_else(|| robot.get_joint_driver_low_speed());
 
-    println!("Motor temperatures:");
-    for i in 0..6 {
-        println!("  Joint {}: {:.1}°C", i + 1, driver_state.motor_temps[i]);
-    }
-
-    println!("\nDriver temperatures:");
-    for i in 0..6 {
-        println!("  Joint {}: {:.1}°C", i + 1, driver_state.driver_temps[i]);
-    }
-
-    println!("\nVoltages:");
-    for i in 0..6 {
-        println!("  Joint {}: {:.2}V", i + 1, driver_state.joint_voltage[i]);
-    }
-
-    println!("\nCurrents:");
-    for i in 0..6 {
-        println!(
-            "  Joint {}: {:.2}A",
-            i + 1,
-            driver_state.joint_bus_current[i]
-        );
-    }
-
-    // 检查状态（位掩码）
-    println!("\nDriver status:");
-    for i in 0..6 {
-        if driver_state.is_voltage_low(i) {
-            println!("  Joint {}: ⚠ Voltage low", i + 1);
-        }
-        if driver_state.is_motor_over_temp(i) {
-            println!("  Joint {}: ⚠ Motor over temperature", i + 1);
-        }
-        if driver_state.is_over_current(i) {
-            println!("  Joint {}: ⚠ Over current", i + 1);
-        }
-        if driver_state.is_enabled(i) {
-            println!("  Joint {}: ✓ Driver enabled", i + 1);
-        }
-    }
-
-    // 检查完整性
-    if driver_state.is_fully_valid() {
-        println!("\n✓ All joint driver states received");
+    if driver_state.valid_mask == 0 {
+        println!("No joint driver low-speed feedback received yet.");
+        println!("Expected CAN IDs: 0x261-0x266.");
     } else {
-        println!("\n⚠ Missing joints: {:?}", driver_state.missing_joints());
+        println!("Motor temperatures:");
+        for i in 0..6 {
+            println!("  Joint {}: {:.1}°C", i + 1, driver_state.motor_temps[i]);
+        }
+
+        println!("\nDriver temperatures:");
+        for i in 0..6 {
+            println!("  Joint {}: {:.1}°C", i + 1, driver_state.driver_temps[i]);
+        }
+
+        println!("\nVoltages:");
+        for i in 0..6 {
+            println!("  Joint {}: {:.2}V", i + 1, driver_state.joint_voltage[i]);
+        }
+
+        println!("\nCurrents:");
+        for i in 0..6 {
+            println!(
+                "  Joint {}: {:.2}A",
+                i + 1,
+                driver_state.joint_bus_current[i]
+            );
+        }
+
+        println!("\nDriver status:");
+        for i in 0..6 {
+            if driver_state.is_voltage_low(i) {
+                println!("  Joint {}: ⚠ Voltage low", i + 1);
+            }
+            if driver_state.is_motor_over_temp(i) {
+                println!("  Joint {}: ⚠ Motor over temperature", i + 1);
+            }
+            if driver_state.is_over_current(i) {
+                println!("  Joint {}: ⚠ Over current", i + 1);
+            }
+            if driver_state.is_enabled(i) {
+                println!("  Joint {}: ✓ Driver enabled", i + 1);
+            }
+        }
+
+        if driver_state.is_fully_valid() {
+            println!("\n✓ All joint driver states received");
+        } else {
+            println!("\n⚠ Missing joints: {:?}", driver_state.missing_joints());
+        }
     }
 
     // 5. 读取配置状态（按需查询，读锁）
     println!("\n--- 配置状态（按需查询）---");
 
-    // 碰撞保护状态
-    if let Ok(protection) = robot.get_collision_protection() {
-        println!("Collision protection levels:");
-        for i in 0..6 {
-            println!(
-                "  Joint {}: Level {}",
-                i + 1,
-                protection.protection_levels[i]
-            );
-        }
+    match robot.query_collision_protection(query_timeout) {
+        Ok(protection) => {
+            println!("Collision protection levels:");
+            let mut has_invalid_level = false;
+            for i in 0..6 {
+                let level = protection.protection_levels[i];
+                if level > 8 {
+                    has_invalid_level = true;
+                }
+                println!("  Joint {}: {}", i + 1, format_collision_level(level));
+            }
+            if has_invalid_level {
+                println!("⚠ Collision protection feedback contains out-of-range values.");
+            }
+        },
+        Err(err) => {
+            println!("Collision protection query failed: {err}");
+        },
     }
 
-    // 关节限制配置
-    if let Ok(limits) = robot.get_joint_limit_config() {
-        println!("\nJoint limits:");
-        for i in 0..6 {
-            println!(
-                "  Joint {}: [{:.2}, {:.2}] rad, max vel: {:.2} rad/s",
-                i + 1,
-                limits.joint_limits_min[i],
-                limits.joint_limits_max[i],
-                limits.joint_max_velocity[i]
-            );
-        }
+    match robot.query_joint_limit_config(query_timeout) {
+        Ok(limits) => {
+            println!("\nJoint limits:");
+            for i in 0..6 {
+                println!(
+                    "  Joint {}: [{:.2}, {:.2}] rad, max vel: {:.2} rad/s",
+                    i + 1,
+                    limits.joint_limits_min[i],
+                    limits.joint_limits_max[i],
+                    limits.joint_max_velocity[i]
+                );
+            }
 
-        if limits.is_fully_valid() {
-            println!("✓ All joint limits received");
-        } else {
-            println!("⚠ Missing joints: {:?}", limits.missing_joints());
-        }
+            if limits.is_fully_valid() {
+                println!("✓ All joint limits received");
+            } else {
+                println!("⚠ Missing joints: {:?}", limits.missing_joints());
+            }
+        },
+        Err(err) => {
+            println!("\nJoint limit query failed: {err}");
+        },
     }
 
-    // 关节加速度限制配置
-    if let Ok(accel_limits) = robot.get_joint_accel_config() {
-        println!("\nJoint acceleration limits:");
-        for i in 0..6 {
-            println!(
-                "  Joint {}: {:.2} rad/s²",
-                i + 1,
-                accel_limits.max_acc_limits[i]
-            );
-        }
+    match robot.query_joint_accel_config(query_timeout) {
+        Ok(accel_limits) => {
+            println!("\nJoint acceleration limits:");
+            for i in 0..6 {
+                println!(
+                    "  Joint {}: {:.2} rad/s²",
+                    i + 1,
+                    accel_limits.max_acc_limits[i]
+                );
+            }
 
-        if accel_limits.is_fully_valid() {
-            println!("✓ All acceleration limits received");
-        } else {
-            println!("⚠ Missing joints: {:?}", accel_limits.missing_joints());
-        }
+            if accel_limits.is_fully_valid() {
+                println!("✓ All acceleration limits received");
+            } else {
+                println!("⚠ Missing joints: {:?}", accel_limits.missing_joints());
+            }
+        },
+        Err(err) => {
+            println!("\nJoint acceleration query failed: {err}");
+        },
     }
 
-    // 末端限制配置
-    if let Ok(end_limits) = robot.get_end_limit_config() {
-        println!("\nEnd-effector limits:");
-        println!(
-            "  Max linear velocity: {:.2} m/s",
-            end_limits.max_end_linear_velocity
-        );
-        println!(
-            "  Max angular velocity: {:.2} rad/s",
-            end_limits.max_end_angular_velocity
-        );
-        println!(
-            "  Max linear accel: {:.2} m/s²",
-            end_limits.max_end_linear_accel
-        );
-        println!(
-            "  Max angular accel: {:.2} rad/s²",
-            end_limits.max_end_angular_accel
-        );
+    match robot.query_end_limit_config(query_timeout) {
+        Ok(end_limits) => {
+            println!("\nEnd-effector limits:");
+            println!(
+                "  Max linear velocity: {:.2} m/s",
+                end_limits.max_end_linear_velocity
+            );
+            println!(
+                "  Max angular velocity: {:.2} rad/s",
+                end_limits.max_end_angular_velocity
+            );
+            println!(
+                "  Max linear accel: {:.2} m/s²",
+                end_limits.max_end_linear_accel
+            );
+            println!(
+                "  Max angular accel: {:.2} rad/s²",
+                end_limits.max_end_angular_accel
+            );
 
-        if end_limits.is_valid {
-            println!("✓ End limits are valid");
-        }
+            if end_limits.is_valid {
+                println!("✓ End limits are valid");
+            }
+        },
+        Err(err) => {
+            println!("\nEnd-effector limit query failed: {err}");
+        },
     }
 
     // 6. 读取 FPS 统计
@@ -294,4 +345,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== 示例完成 ===");
     Ok(())
+}
+
+fn wait_for_ready_state<T, Read, Ready>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut read: Read,
+    mut is_ready: Ready,
+) -> Option<T>
+where
+    Read: FnMut() -> T,
+    Ready: FnMut(&T) -> bool,
+{
+    let start = std::time::Instant::now();
+
+    loop {
+        let state = read();
+        if is_ready(&state) {
+            return Some(state);
+        }
+
+        if start.elapsed() >= timeout {
+            return None;
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let sleep_duration = poll_interval.min(remaining);
+        if sleep_duration.is_zero() {
+            return None;
+        }
+
+        std::thread::sleep(sleep_duration);
+    }
+}
+
+fn format_collision_level(level: u8) -> String {
+    if level <= 8 {
+        format!("Level {level}")
+    } else {
+        format!("invalid ({level})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn format_collision_level_marks_invalid_values() {
+        assert_eq!(format_collision_level(255), "invalid (255)");
+        assert_eq!(format_collision_level(250), "invalid (250)");
+    }
+
+    #[test]
+    fn format_collision_level_preserves_valid_range() {
+        assert_eq!(format_collision_level(0), "Level 0");
+        assert_eq!(format_collision_level(8), "Level 8");
+    }
+
+    #[test]
+    fn wait_for_ready_state_retries_until_state_is_ready() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let read = {
+            let attempts = Arc::clone(&attempts);
+            move || {
+                let current = attempts.fetch_add(1, Ordering::SeqCst);
+                current >= 2
+            }
+        };
+
+        let ready = wait_for_ready_state(
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            read,
+            |state| *state,
+        )
+        .expect("helper should retry until the state is ready");
+
+        assert!(ready);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn wait_for_ready_state_returns_none_after_timeout() {
+        let started_at = std::time::Instant::now();
+        let value = wait_for_ready_state(
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            || false,
+            |state| *state,
+        );
+
+        assert!(started_at.elapsed() >= Duration::from_millis(20));
+        assert!(value.is_none());
+    }
 }

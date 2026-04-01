@@ -116,6 +116,7 @@ pub(crate) const SOFT_CONTROL_SEND_BUDGET: Duration = Duration::from_millis(5);
 pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
 pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_MODE_SWITCH_TIMEOUT: Duration = Duration::from_millis(100);
+const CONFIG_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -2814,6 +2815,184 @@ impl Piper {
 
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn wait_for_cached_update<T, F>(
+        &self,
+        deadline: Instant,
+        poll_interval: Duration,
+        mut try_read: F,
+    ) -> Result<T, DriverError>
+    where
+        F: FnMut(&Self) -> Result<Option<T>, DriverError>,
+    {
+        loop {
+            if let Some(value) = try_read(self)? {
+                return Ok(value);
+            }
+
+            if Instant::now() >= deadline {
+                return Err(DriverError::Timeout);
+            }
+
+            if !self.rx_thread_alive() || !self.tx_thread_alive() {
+                return Err(DriverError::ChannelClosed);
+            }
+
+            let sleep_duration =
+                poll_interval.min(deadline.saturating_duration_since(Instant::now()));
+            if sleep_duration.is_zero() {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(sleep_duration);
+            }
+        }
+    }
+
+    fn clear_collision_protection_cache(&self) -> Result<(), DriverError> {
+        self.ctx
+            .collision_protection
+            .write()
+            .map(|mut guard| {
+                *guard = CollisionProtectionState::default();
+            })
+            .map_err(|_| DriverError::PoisonedLock)
+    }
+
+    fn clear_joint_limit_config_cache(&self) -> Result<(), DriverError> {
+        self.ctx
+            .joint_limit_config
+            .write()
+            .map(|mut guard| {
+                *guard = JointLimitConfigState::default();
+            })
+            .map_err(|_| DriverError::PoisonedLock)
+    }
+
+    fn clear_joint_accel_config_cache(&self) -> Result<(), DriverError> {
+        self.ctx
+            .joint_accel_config
+            .write()
+            .map(|mut guard| {
+                *guard = JointAccelConfigState::default();
+            })
+            .map_err(|_| DriverError::PoisonedLock)
+    }
+
+    fn clear_end_limit_config_cache(&self) -> Result<(), DriverError> {
+        self.ctx
+            .end_limit_config
+            .write()
+            .map(|mut guard| {
+                *guard = EndLimitConfigState::default();
+            })
+            .map_err(|_| DriverError::PoisonedLock)
+    }
+
+    /// 主动查询碰撞保护等级并等待新反馈。
+    pub fn query_collision_protection(
+        &self,
+        timeout: Duration,
+    ) -> Result<CollisionProtectionState, DriverError> {
+        use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
+
+        self.clear_collision_protection_cache()?;
+        let deadline = Instant::now() + timeout;
+        let frame = ParameterQuerySetCommand::query(ParameterQueryType::CollisionProtectionLevel)
+            .to_frame()?;
+        let commit_host_mono_us =
+            self.send_reliable_frame_confirmed_commit_marker(frame, timeout)?;
+
+        self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
+            let state = this.get_collision_protection()?;
+            if state.host_rx_mono_us > commit_host_mono_us {
+                Ok(Some(state))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// 主动查询全部关节角度/速度限制并等待完整反馈。
+    pub fn query_joint_limit_config(
+        &self,
+        timeout: Duration,
+    ) -> Result<JointLimitConfigState, DriverError> {
+        use piper_protocol::config::QueryMotorLimitCommand;
+
+        self.clear_joint_limit_config_cache()?;
+        let deadline = Instant::now() + timeout;
+        let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
+        let frames = (1..=6u8).map(|joint_index| {
+            QueryMotorLimitCommand::query_angle_and_max_velocity(joint_index).to_frame()
+        });
+        self.send_reliable_package_confirmed(frames, timeout)?;
+
+        self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
+            let state = this.get_joint_limit_config()?;
+            let all_fresh = state
+                .joint_update_host_rx_mono_timestamps
+                .iter()
+                .all(|&timestamp| timestamp > baseline_host_mono_us);
+            if state.is_fully_valid() && all_fresh {
+                Ok(Some(state))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// 主动查询全部关节加速度限制并等待完整反馈。
+    pub fn query_joint_accel_config(
+        &self,
+        timeout: Duration,
+    ) -> Result<JointAccelConfigState, DriverError> {
+        use piper_protocol::config::QueryMotorLimitCommand;
+
+        self.clear_joint_accel_config_cache()?;
+        let deadline = Instant::now() + timeout;
+        let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
+        let frames = (1..=6u8).map(|joint_index| {
+            QueryMotorLimitCommand::query_max_acceleration(joint_index).to_frame()
+        });
+        self.send_reliable_package_confirmed(frames, timeout)?;
+
+        self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
+            let state = this.get_joint_accel_config()?;
+            let all_fresh = state
+                .joint_update_host_rx_mono_timestamps
+                .iter()
+                .all(|&timestamp| timestamp > baseline_host_mono_us);
+            if state.is_fully_valid() && all_fresh {
+                Ok(Some(state))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// 主动查询末端速度/加速度限制并等待新反馈。
+    pub fn query_end_limit_config(
+        &self,
+        timeout: Duration,
+    ) -> Result<EndLimitConfigState, DriverError> {
+        use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
+
+        self.clear_end_limit_config_cache()?;
+        let deadline = Instant::now() + timeout;
+        let frame =
+            ParameterQuerySetCommand::query(ParameterQueryType::EndVelocityAccel).to_frame()?;
+        let commit_host_mono_us =
+            self.send_reliable_frame_confirmed_commit_marker(frame, timeout)?;
+
+        self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
+            let state = this.get_end_limit_config()?;
+            if state.is_valid && state.last_update_host_rx_mono_us > commit_host_mono_us {
+                Ok(Some(state))
+            } else {
+                Ok(None)
+            }
+        })
     }
 
     /// 获取 0x151 控制模式回显状态（无锁）。
@@ -6923,6 +7102,182 @@ mod tests {
             .expect("firmware version should wait for all 8 bytes");
         assert_eq!(version, "S-V1.6-3");
         assert_eq!(piper.firmware_version_cached().as_deref(), Some("S-V1.6-3"));
+    }
+
+    #[test]
+    fn test_query_collision_protection_returns_fresh_feedback_and_sends_query_frame() {
+        let mut data = [0u8; 8];
+        data[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let mut feedback = PiperFrame::new_standard(
+            piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
+            &data,
+        );
+        feedback.timestamp_us = 321;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![feedback], Duration::from_millis(20)),
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+
+        let state = piper
+            .query_collision_protection(Duration::from_millis(200))
+            .expect("collision protection query should succeed");
+
+        assert_eq!(state.protection_levels, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(state.hardware_timestamp_us, 321);
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, piper_protocol::ids::ID_PARAMETER_QUERY_SET);
+        assert_eq!(
+            sent[0].data[0],
+            piper_protocol::config::ParameterQueryType::CollisionProtectionLevel as u8
+        );
+        assert_eq!(sent[0].data[1], 0);
+    }
+
+    #[test]
+    fn test_query_end_limit_config_returns_fresh_feedback_and_sends_query_frame() {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&1000u16.to_be_bytes());
+        data[2..4].copy_from_slice(&2000u16.to_be_bytes());
+        data[4..6].copy_from_slice(&3000u16.to_be_bytes());
+        data[6..8].copy_from_slice(&4000u16.to_be_bytes());
+        let mut feedback = PiperFrame::new_standard(
+            piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK as u16,
+            &data,
+        );
+        feedback.timestamp_us = 654;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![feedback], Duration::from_millis(20)),
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+
+        let state = piper
+            .query_end_limit_config(Duration::from_millis(200))
+            .expect("end limit query should succeed");
+
+        assert!(state.is_valid);
+        assert!((state.max_end_linear_velocity - 1.0).abs() < 1e-6);
+        assert!((state.max_end_angular_velocity - 2.0).abs() < 1e-6);
+        assert!((state.max_end_linear_accel - 3.0).abs() < 1e-6);
+        assert!((state.max_end_angular_accel - 4.0).abs() < 1e-6);
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, piper_protocol::ids::ID_PARAMETER_QUERY_SET);
+        assert_eq!(
+            sent[0].data[0],
+            piper_protocol::config::ParameterQueryType::EndVelocityAccel as u8
+        );
+    }
+
+    #[test]
+    fn test_query_joint_limit_config_queries_all_joints_and_waits_for_full_state() {
+        let frames: Vec<PiperFrame> = (1..=6)
+            .map(|joint_index| {
+                let mut data = [0u8; 8];
+                data[0] = joint_index;
+                data[1..3].copy_from_slice(&(1800i16 + i16::from(joint_index)).to_be_bytes());
+                data[3..5].copy_from_slice(&(-1800i16 - i16::from(joint_index)).to_be_bytes());
+                data[5..7].copy_from_slice(&(500u16 + u16::from(joint_index)).to_be_bytes());
+                let mut frame = PiperFrame::new_standard(
+                    piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK as u16,
+                    &data,
+                );
+                frame.timestamp_us = 1000 + u64::from(joint_index);
+                frame
+            })
+            .collect();
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(frames, Duration::from_millis(20)),
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+
+        let state = piper
+            .query_joint_limit_config(Duration::from_millis(400))
+            .expect("joint limit query should succeed");
+
+        assert!(state.is_fully_valid());
+        assert_eq!(state.valid_mask, 0b11_1111);
+        assert!((state.joint_limits_max[0] - 180.1_f64.to_radians()).abs() < 1e-6);
+        assert!((state.joint_limits_min[5] - (-180.6_f64).to_radians()).abs() < 1e-6);
+        assert!((state.joint_max_velocity[4] - 0.505).abs() < 1e-6);
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.len(), 6);
+        for (idx, frame) in sent.iter().enumerate() {
+            assert_eq!(frame.id, piper_protocol::ids::ID_QUERY_MOTOR_LIMIT);
+            assert_eq!(frame.data[0], (idx + 1) as u8);
+            assert_eq!(
+                frame.data[1],
+                piper_protocol::config::QueryType::AngleAndMaxVelocity as u8
+            );
+        }
+    }
+
+    #[test]
+    fn test_query_joint_accel_config_queries_all_joints_and_waits_for_full_state() {
+        let frames: Vec<PiperFrame> = (1..=6)
+            .map(|joint_index| {
+                let mut data = [0u8; 8];
+                data[0] = joint_index;
+                data[1..3].copy_from_slice(&(1000u16 + 10 * u16::from(joint_index)).to_be_bytes());
+                let mut frame = PiperFrame::new_standard(
+                    piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK as u16,
+                    &data,
+                );
+                frame.timestamp_us = 2000 + u64::from(joint_index);
+                frame
+            })
+            .collect();
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(frames, Duration::from_millis(20)),
+            RecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+            },
+            None,
+        )
+        .unwrap();
+
+        let state = piper
+            .query_joint_accel_config(Duration::from_millis(400))
+            .expect("joint accel query should succeed");
+
+        assert!(state.is_fully_valid());
+        assert_eq!(state.valid_mask, 0b11_1111);
+        assert!((state.max_acc_limits[0] - 1.01).abs() < 1e-6);
+        assert!((state.max_acc_limits[5] - 1.06).abs() < 1e-6);
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.len(), 6);
+        for (idx, frame) in sent.iter().enumerate() {
+            assert_eq!(frame.id, piper_protocol::ids::ID_QUERY_MOTOR_LIMIT);
+            assert_eq!(frame.data[0], (idx + 1) as u8);
+            assert_eq!(
+                frame.data[1],
+                piper_protocol::config::QueryType::MaxAcceleration as u8
+            );
+        }
     }
 
     #[test]
