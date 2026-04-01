@@ -4556,6 +4556,8 @@ impl Drop for Piper {
 mod tests {
     use super::*;
     use crate::DriverMode;
+    use crate::observation::{Available, Freshness, Observation, ObservationPayload};
+    use crate::{DiagnosticEvent, ProtocolDiagnostic, QueryError};
     use piper_can::{CanAdapter, PiperFrame, SplittableAdapter};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
@@ -7278,6 +7280,75 @@ mod tests {
                 piper_protocol::config::QueryType::MaxAcceleration as u8
             );
         }
+    }
+
+    #[test]
+    fn collision_protection_invalid_frame_goes_to_diagnostics_not_state() {
+        let frame = PiperFrame::new_standard(
+            piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
+            &[255, 0, 0, 0, 0, 0, 0, 0],
+        );
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(80));
+
+        assert!(matches!(
+            piper.get_collision_protection(),
+            Observation::Unavailable
+        ));
+        assert!(piper.snapshot_diagnostics().iter().any(|event| matches!(
+            event,
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::OutOfRange { .. })
+        )));
+    }
+
+    #[test]
+    fn unqueried_joint_limit_config_is_unavailable() {
+        let piper = Piper::new_dual_thread(MockCanAdapter, None).unwrap();
+
+        assert!(matches!(
+            piper.get_joint_limit_config(),
+            Observation::Unavailable
+        ));
+    }
+
+    #[test]
+    fn query_timeout_does_not_invalidate_prior_complete_joint_limit_config() {
+        let frames: Vec<PiperFrame> = (1..=6)
+            .map(|joint_index| {
+                let mut data = [0u8; 8];
+                data[0] = joint_index;
+                data[1..3].copy_from_slice(&(1800i16 + i16::from(joint_index)).to_be_bytes());
+                data[3..5].copy_from_slice(&(-1800i16 - i16::from(joint_index)).to_be_bytes());
+                data[5..7].copy_from_slice(&(500u16 + u16::from(joint_index)).to_be_bytes());
+                PiperFrame::new_standard(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK as u16, &data)
+            })
+            .collect();
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(frames, Duration::from_millis(20)),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        let _ = piper.query_joint_limit_config(Duration::from_millis(400)).unwrap();
+
+        let error = piper.query_joint_limit_config(Duration::from_millis(10)).unwrap_err();
+        assert!(matches!(error, QueryError::Timeout));
+
+        assert!(matches!(
+            piper.get_joint_limit_config(),
+            Observation::Available(Available {
+                payload: ObservationPayload::Complete(_),
+                freshness: Freshness::Fresh,
+                ..
+            })
+        ));
     }
 
     #[test]
