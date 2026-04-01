@@ -1,23 +1,23 @@
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Observation<TComplete, TPartial = TComplete> {
-    Available(Available<TComplete, TPartial>),
+pub enum Observation<T> {
+    Available(Available<T>),
     Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Available<TComplete, TPartial = TComplete> {
-    pub payload: ObservationPayload<TComplete, TPartial>,
+pub struct Available<T> {
+    pub payload: ObservationPayload<T>,
     pub freshness: Freshness,
     pub meta: ObservationMeta,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObservationPayload<TComplete, TPartial = TComplete> {
-    Complete(TComplete),
+pub enum ObservationPayload<T> {
+    Complete(T),
     Partial {
-        partial: PartialObservation<TPartial>,
+        partial: Vec<Option<T>>,
         missing: MissingSet,
     },
 }
@@ -32,16 +32,9 @@ pub trait PartialPayload<T>: Sized {
     fn from_present_slots(slots: &[Option<T>]) -> Self;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartialObservation<T> {
-    pub slots: Vec<Option<T>>,
-}
-
-impl<T: Copy> PartialPayload<T> for PartialObservation<T> {
+impl<T: Copy> PartialPayload<T> for Vec<Option<T>> {
     fn from_present_slots(slots: &[Option<T>]) -> Self {
-        Self {
-            slots: slots.to_vec(),
-        }
+        slots.to_vec()
     }
 }
 
@@ -196,9 +189,10 @@ impl<TSlot: Copy, const N: usize, TAssembled> FrameGroupStore<TSlot, N, TAssembl
         now_host_mono_us: u64,
         freshness_window_us: u64,
         assemble: F,
-    ) -> Observation<TAssembled, TSlot>
+    ) -> Observation<TAssembled>
     where
         F: FnOnce(&[Option<TSlot>; N]) -> Option<TAssembled>,
+        TAssembled: Default,
     {
         let present_slots = self.present_slots();
         let Some(meta) = self.latest_meta() else {
@@ -224,7 +218,13 @@ impl<TSlot: Copy, const N: usize, TAssembled> FrameGroupStore<TSlot, N, TAssembl
             return Observation::Unavailable;
         }
 
-        let partial = PartialObservation::from_present_slots(&present_slots);
+        let mut partial =
+            std::iter::repeat_with(|| None).take(N).collect::<Vec<Option<TAssembled>>>();
+        for (index, slot) in present_slots.iter().enumerate() {
+            if slot.is_some() {
+                partial[index] = Some(TAssembled::default());
+            }
+        }
 
         Observation::Available(Available {
             payload: ObservationPayload::Partial {
@@ -315,7 +315,7 @@ mod tests {
             Observation::Available(available) => {
                 match available.payload {
                     ObservationPayload::Partial { partial, missing } => {
-                        assert_eq!(partial.slots, vec![Some(10), None, None]);
+                        assert_eq!(partial, vec![Some([0, 0, 0]), None, None]);
                         assert_eq!(missing.missing_indices, vec![1, 2]);
                     },
                     other => panic!("expected partial payload, got {other:?}"),
@@ -380,7 +380,7 @@ mod tests {
         match observation {
             Observation::Available(available) => match available.payload {
                 ObservationPayload::Partial { partial, missing } => {
-                    assert_eq!(partial.slots, vec![None, Some(20), None]);
+                    assert_eq!(partial, vec![None, Some([0, 0, 0]), None]);
                     assert_eq!(missing.missing_indices, vec![0, 2]);
                 },
                 other => panic!("expected partial payload, got {other:?}"),
