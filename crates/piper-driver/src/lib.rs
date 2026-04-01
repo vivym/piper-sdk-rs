@@ -22,6 +22,7 @@ pub mod hooks;
 mod low_level_tests;
 pub mod metrics;
 pub mod mode;
+pub mod observation;
 pub mod pipeline;
 mod piper; // 原 robot_impl.rs
 pub mod recording;
