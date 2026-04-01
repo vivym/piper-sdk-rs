@@ -94,6 +94,7 @@
 ### 实用硬件辅助
 
 HIL 手册请参考：[docs/v0/piper_hil_handbook.md](/home/viv/projs/piper-sdk-rs/docs/v0/piper_hil_handbook.md)
+这两个 HIL 工具是手册支持入口，不是完整替代人工验收流程。
 
 - **`client_monitor_hil_check`** - 只读客户端监控 HIL 辅助工具
   - 验证连接时间、首个完整 monitor snapshot 和只读观测窗口
@@ -104,6 +105,8 @@ HIL 手册请参考：[docs/v0/piper_hil_handbook.md](/home/viv/projs/piper-sdk-
   - 验证 `PositionMode + MotionType::Joint` 的低风险位置控制路径
   - 主要用于手册中的 Phase 2 / Phase 3
   - 运行：`cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10`
+
+### 其他实用示例
 
 - **`multi_threaded_demo`** - 多线程共享 Piper 的示例
   - 展示 `Arc<Mutex<Piper>>`、监控线程和显式 disable 收尾
