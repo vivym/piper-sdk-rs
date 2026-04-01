@@ -275,6 +275,9 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if !(1..=6).contains(&args.joint) {
         return Err("joint must be between 1 and 6".to_string());
     }
+    if !args.delta_rad.is_finite() {
+        return Err("delta_rad must be finite for manual HIL".to_string());
+    }
     if args.speed_percent > MAX_SPEED_PERCENT {
         return Err("speed_percent must be <= 10 for manual HIL".to_string());
     }
@@ -316,4 +319,50 @@ fn validate_args_rejects_excessive_delta() {
 
     let error = validate_args(&args).expect_err("delta > 0.035 rad must be rejected");
     assert!(error.contains("delta_rad"));
+}
+
+#[test]
+fn validate_args_rejects_non_finite_delta() {
+    let args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: f64::NAN,
+        speed_percent: 10,
+        settle_timeout_ms: 10_000,
+    };
+
+    let error = validate_args(&args).expect_err("non-finite delta must be rejected");
+    assert!(error.contains("delta_rad"));
+    assert!(error.contains("finite"));
+}
+
+#[test]
+fn validate_args_rejects_invalid_joint() {
+    let args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 0,
+        delta_rad: 0.02,
+        speed_percent: 10,
+        settle_timeout_ms: 10_000,
+    };
+
+    let error = validate_args(&args).expect_err("joint outside 1..=6 must be rejected");
+    assert!(error.contains("joint"));
+}
+
+#[test]
+fn validate_args_rejects_zero_settle_timeout() {
+    let args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 10,
+        settle_timeout_ms: 0,
+    };
+
+    let error = validate_args(&args).expect_err("zero settle timeout must be rejected");
+    assert!(error.contains("settle_timeout_ms"));
 }
