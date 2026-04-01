@@ -18,6 +18,7 @@
 pub mod config;
 pub mod constants;
 pub mod control;
+pub mod diagnostics;
 pub mod feedback;
 pub mod ids;
 
