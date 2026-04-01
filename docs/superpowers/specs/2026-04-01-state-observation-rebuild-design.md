@@ -133,27 +133,29 @@ Core types:
 
 ```rust
 pub enum Observation<T> {
-    Complete(Complete<T>),
-    Partial(Partial<T>),
-    Stale(Stale<T>),
+    Available(Available<T>),
     Unavailable,
 }
 
-pub struct Complete<T> {
-    pub value: T,
+pub struct Available<T> {
+    pub payload: ObservationPayload<T>,
+    pub freshness: Freshness,
     pub meta: ObservationMeta,
 }
 
-pub struct Partial<T> {
-    pub partial: PartialPayload<T>,
-    pub meta: ObservationMeta,
-    pub missing: MissingSet,
+pub enum ObservationPayload<T> {
+    Complete(T),
+    Partial {
+        partial: PartialPayload<T>,
+        missing: MissingSet,
+    },
 }
 
-pub struct Stale<T> {
-    pub value: T,
-    pub meta: ObservationMeta,
-    pub stale_for: Duration,
+pub enum Freshness {
+    Fresh,
+    Stale {
+        stale_for: Duration,
+    },
 }
 
 pub struct ObservationMeta {
@@ -163,10 +165,21 @@ pub struct ObservationMeta {
 }
 ```
 
-`PartialPayload<T>` is not a default-filled or previously preserved `T`.
-It is a family-specific partial view that contains only currently present members.
+`PartialPayload<T>` is not a default-filled or previously preserved `T`. It is a
+family-specific partial view that contains only currently present members.
 Missing members must be structurally absent from the payload, not represented by
 default values and not backfilled from prior complete observations.
+
+This makes completeness and freshness orthogonal:
+
+- `Observation::Unavailable` means no usable observation exists
+- `Observation::Available { payload: Complete(_), freshness: Fresh }` means fully ready
+- `Observation::Available { payload: Partial { .. }, freshness: Fresh }` means incomplete but current
+- `Observation::Available { payload: Complete(_), freshness: Stale { .. } }` means complete but aged out
+- `Observation::Available { payload: Partial { .. }, freshness: Stale { .. } }` means both incomplete and aged out
+
+No precedence rule is needed because “partial” and “stale” are no longer
+competing enum variants.
 
 Driver storage is split into two reusable primitives:
 
@@ -178,12 +191,13 @@ Responsibilities of `FrameGroupStore`:
 - store the latest typed slot value for each member
 - track per-slot timestamps
 - assemble a business value only from valid slot members
-- report `Complete`, `Partial`, `Stale`, or `Unavailable`
+- report `Available` or `Unavailable`, with completeness and freshness evaluated independently
 - expose missing-slot information
 - support query freshness boundaries so query APIs can demand post-query data
 
-For single-frame observations, `Partial` is not used. A single-frame state is
-either `Complete`, `Stale`, or `Unavailable`.
+For single-frame observations, `ObservationPayload::Partial` is not used. A
+single-frame state is either `Unavailable` or `Available` with
+`ObservationPayload::Complete(_)` and a freshness value.
 
 ### Business State Types
 
@@ -275,6 +289,18 @@ These APIs must:
 - wait only for post-query valid data
 - reject incomplete, stale, or diagnostic-only outcomes
 
+Where `Complete<T>` in query results is shorthand for a fresh complete
+observation payload:
+
+```rust
+pub struct Complete<T> {
+    pub value: T,
+    pub meta: ObservationMeta,
+}
+```
+
+Query APIs do not expose partial or stale success results.
+
 ### Waiting/Readiness APIs
 
 Deprecate and remove ambiguous readiness helpers such as “wait for any robot feedback”.
@@ -285,6 +311,23 @@ Replace them with observation-specific waiting APIs, for example:
 - `wait_for_complete_end_pose(timeout)`
 - `wait_for_complete_joint_limit_config(timeout)`
 - `wait_for_observation(predicate, timeout)`
+
+## Query Concurrency Policy
+
+The first migration wave uses a single query coordinator with at most one
+in-flight query across all rebuilt query families.
+
+Rules:
+
+- query APIs are globally serialized
+- starting a second query while one is in flight is not allowed to create a second concurrent wait context
+- callers may either block behind the current query or receive a deterministic contention error; the implementation plan must choose one behavior and apply it uniformly
+- because there is only one in-flight query, correlation is performed against one active query context at a time
+
+This is intentional. Query traffic is low-frequency and operationally rare, so
+the design favors deterministic semantics over parallelism. Relaxing this to
+per-family or multi-query concurrency is out of scope for the first migration
+wave.
 
 ## Freshness and Staleness Policy
 
@@ -409,6 +452,7 @@ No compatibility shim is required unless implementation planning later identifie
 - transport/send failure
 - canceled/interrupted query
 - only diagnostics received, no valid data
+- query contention / coordinator busy
 
 ### Diagnostic Retention
 
@@ -416,7 +460,16 @@ Diagnostics are not fatal by default. They are retained and surfaced, but they d
 
 ### Partial State
 
-Partial grouped data is a first-class observation, not an implicit failure and not a fake complete state. The caller chooses whether partial is acceptable.
+Partial grouped data is a first-class observation, not an implicit failure and
+not a fake complete state. The caller chooses whether partial is acceptable.
+
+For rebuilt grouped families, tests must cover all four meaningful availability
+shapes:
+
+- fresh + complete
+- fresh + partial
+- stale + complete
+- stale + partial
 
 ## Example and Tooling Changes
 
@@ -441,11 +494,13 @@ The example should demonstrate correct usage of the new API rather than embeddin
 ### Driver Tests
 
 - no data yields `Observation::Unavailable`
-- incomplete group yields `Observation::Partial`
-- complete fresh group yields `Observation::Complete`
-- stale data yields `Observation::Stale`
+- incomplete current group yields `Observation::Available` with `ObservationPayload::Partial`
+- complete fresh group yields `Observation::Available` with `ObservationPayload::Complete` and `Freshness::Fresh`
+- stale complete group yields `Observation::Available` with `ObservationPayload::Complete` and `Freshness::Stale`
+- stale partial group yields `Observation::Available` with `ObservationPayload::Partial` and `Freshness::Stale`
 - diagnostics do not mutate normal state
 - query APIs require post-query fresh complete data
+- query contention behavior is deterministic and tested
 
 ### Integration/Example Tests
 
@@ -468,12 +523,13 @@ The design is considered implemented correctly when all of the following are tru
 
 1. Reading unqueried configuration returns `Observation::Unavailable`
 2. A complete successful query returns `Result<Complete<T>, QueryError>`
-3. Partial grouped data is represented as `Observation::Partial`
-4. Stale data is represented distinctly from partial and unavailable
+3. Grouped observations model completeness and freshness independently
+4. Partial grouped data is represented without default-filled business values
 5. Invalid `0x47B` values never appear in normal collision-protection state
 6. Invalid protocol input is observable through diagnostics
 7. Examples and tools no longer print default-zero placeholders as real values
 8. Metrics explicitly distinguish raw frame and complete observation rates
+9. Query concurrency semantics are deterministic and documented
 
 ## Implementation Notes for Planning
 
