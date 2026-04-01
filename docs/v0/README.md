@@ -16,6 +16,20 @@
 - [crates/piper-sdk/examples/README.md](../../crates/piper-sdk/examples/README.md)
 - 当前源码和测试
 
+HIL 相关文档是本目录中的少数例外。下面这些文件目前仍然是当前手工硬件验收流程的有效入口：
+
+- [piper_hil_handbook.md](./piper_hil_handbook.md)
+- [piper_hil_execution_checklist.md](./piper_hil_execution_checklist.md)
+- [piper_hil_results_template.md](./piper_hil_results_template.md)
+- [piper_hil_operator_runbook.md](./piper_hil_operator_runbook.md)
+
+使用顺序建议是：
+
+1. 先看 [piper_hil_handbook.md](./piper_hil_handbook.md) 了解规范性判据
+2. 执行时配合 [piper_hil_execution_checklist.md](./piper_hil_execution_checklist.md) 勾选
+3. 把证据写入 [piper_hil_results_template.md](./piper_hil_results_template.md)
+4. 现场逐步执行时参考 [piper_hil_operator_runbook.md](./piper_hil_operator_runbook.md)
+
 阅读 `docs/v0/` 时，建议把它视为：
 
 1. 历史决策记录
