@@ -1,22 +1,25 @@
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Observation<T> {
-    Available(Available<T>),
+pub enum Observation<TComplete, TPartial = TComplete> {
+    Available(Available<TComplete, TPartial>),
     Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Available<T> {
-    pub payload: ObservationPayload<T>,
+pub struct Available<TComplete, TPartial = TComplete> {
+    pub payload: ObservationPayload<TComplete, TPartial>,
     pub freshness: Freshness,
     pub meta: ObservationMeta,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObservationPayload<T> {
-    Complete(T),
-    Partial { missing: MissingSet },
+pub enum ObservationPayload<TComplete, TPartial = TComplete> {
+    Complete(TComplete),
+    Partial {
+        partial: PartialObservation<TPartial>,
+        missing: MissingSet,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +30,19 @@ pub struct Complete<T> {
 
 pub trait PartialPayload<T>: Sized {
     fn from_present_slots(slots: &[Option<T>]) -> Self;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialObservation<T> {
+    pub slots: Vec<Option<T>>,
+}
+
+impl<T: Copy> PartialPayload<T> for PartialObservation<T> {
+    fn from_present_slots(slots: &[Option<T>]) -> Self {
+        Self {
+            slots: slots.to_vec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +196,7 @@ impl<TSlot: Copy, const N: usize, TAssembled> FrameGroupStore<TSlot, N, TAssembl
         now_host_mono_us: u64,
         freshness_window_us: u64,
         assemble: F,
-    ) -> Observation<TAssembled>
+    ) -> Observation<TAssembled, TSlot>
     where
         F: FnOnce(&[Option<TSlot>; N]) -> Option<TAssembled>,
     {
@@ -208,8 +224,11 @@ impl<TSlot: Copy, const N: usize, TAssembled> FrameGroupStore<TSlot, N, TAssembl
             return Observation::Unavailable;
         }
 
+        let partial = PartialObservation::from_present_slots(&present_slots);
+
         Observation::Available(Available {
             payload: ObservationPayload::Partial {
+                partial,
                 missing: MissingSet { missing_indices },
             },
             freshness,
@@ -294,11 +313,17 @@ mod tests {
 
         match observation {
             Observation::Available(available) => {
-                assert!(matches!(
-                    available.payload,
-                    ObservationPayload::Partial { .. }
-                ));
+                match available.payload {
+                    ObservationPayload::Partial { partial, missing } => {
+                        assert_eq!(partial.slots, vec![Some(10), None, None]);
+                        assert_eq!(missing.missing_indices, vec![1, 2]);
+                    },
+                    other => panic!("expected partial payload, got {other:?}"),
+                }
                 assert!(matches!(available.freshness, Freshness::Fresh));
+                assert_eq!(available.meta.host_rx_mono_us, Some(1_000));
+                assert_eq!(available.meta.hardware_timestamp_us, Some(10));
+                assert_eq!(available.meta.source, ObservationSource::Stream);
             },
             other => panic!("expected available partial fresh, got {other:?}"),
         }
@@ -354,7 +379,8 @@ mod tests {
 
         match observation {
             Observation::Available(available) => match available.payload {
-                ObservationPayload::Partial { missing } => {
+                ObservationPayload::Partial { partial, missing } => {
+                    assert_eq!(partial.slots, vec![None, Some(20), None]);
                     assert_eq!(missing.missing_indices, vec![0, 2]);
                 },
                 other => panic!("expected partial payload, got {other:?}"),
