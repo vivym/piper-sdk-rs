@@ -35,6 +35,17 @@ If a run intentionally uses different values, document the override before the p
 
 Use these manual helpers as the primary entry points for this handbook:
 
+- `client_monitor_hil_check` covers Phase 1 only.
+  - It connects to the robot, measures the `<= 5s` connection budget, waits for the first complete monitor snapshot within `<= 200ms`, and then runs the `15 min` read-only observation window.
+  - It is the primary evidence source for connection timing and client monitor warmup behavior.
+  - It does not enable motion, disable motion, reconnect after a fault, or validate rejected-state or fault-gating behavior.
+- `hil_joint_position_check` covers the helper-driven parts of Phases 2 and 3 only.
+  - It connects, confirms Standby, enables `PositionMode + MotionType::Joint`, sends one low-risk joint move, and returns the commanded joint to the start position.
+  - It is the primary evidence source for the low-risk position-control path.
+  - It does not validate explicit disable commands, reconnect after interruption, rejected-state gating, or fault recovery.
+
+Use these exact helper commands:
+
 - Read-only client monitor check:
   `cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900`
 - Safe joint position check:
@@ -48,6 +59,22 @@ Supporting entry points:
   `cargo run -p piper-sdk --example state_api_demo -- --interface can0`
 - Timestamp verification:
   `cargo run -p piper-sdk --example timestamp_verification -- --interface can0`
+
+Use the supporting driver-level tools as evidence collectors, not as hidden automation:
+
+- Use `robot_monitor` when you need continuous evidence for joint dynamic state or gripper state during Phase 1 or when checking recovery after a manual interruption.
+- Use `state_api_demo` when you need a one-shot corroboration of control-state or driver-state fields at the start or end of a phase.
+- Use `client_monitor_hil_check` when you need the timed Phase 1 proof: connect, first snapshot, and the full observation window.
+- Use `hil_joint_position_check` when you need the timed Phase 2 and Phase 3 proof: Standby, enable, one low-risk move, and return-to-start.
+
+The manual checks that are not covered by a helper are:
+
+- explicit disable behavior
+- reconnect after interruption
+- rejected-state command gating
+- fault and recovery gating after `can0` loss or controller-side interruption
+
+For those checks, use the helper output as the primary baseline and the supporting tools above to confirm the robot state before and after the operator action.
 
 ## Phase 0: Preflight and Safety Baseline
 
@@ -64,10 +91,23 @@ Confirm the test environment is safe and the transport is configured before any 
 
 ### Execution
 
-1. Record `git rev-parse HEAD`, `uname -a`, `rustc --version`, and `cargo --version`.
-2. Confirm `can0` is up and configured as expected.
-3. Record interface counters before starting the run.
-4. Verify the robot is in a safe initial pose.
+1. Record the test metadata:
+   ```bash
+   git rev-parse HEAD
+   uname -a
+   rustc --version
+   cargo --version
+   ```
+2. Record the `can0` configuration and counters:
+   ```bash
+   ip -details link show can0
+   ip -statistics link show can0
+   ```
+3. If `can0` is down, bring it up with the configured bitrate and record the command used:
+   ```bash
+   sudo ip link set can0 up type can bitrate 1000000
+   ```
+4. Verify the robot is in a safe initial pose and the workspace is clear.
 5. Confirm that CAN feedback is present before any motion attempt.
 
 ### Pass Criteria
@@ -98,17 +138,19 @@ Verify the read path end to end: SocketCAN transport, protocol decode, driver sy
 
 ### Execution
 
-1. Start the read-only helper with the live interface.
-2. Confirm the first connection succeeds within `<= 5s`.
-3. Confirm the first complete client monitor snapshot arrives within `<= 200ms`.
-4. Observe the robot continuously for `15 min`.
-5. During the window, record missing state groups, repeated stale or incomplete reads, disconnects, and any mismatch between on-screen state and the real robot.
-6. Verify the current state groups remain readable:
-   - joint position
-   - end pose
+1. Start `client_monitor_hil_check` and use its log lines as the connection and snapshot timing evidence.
+2. Confirm the helper prints a connection time within `<= 5s`.
+3. Confirm the helper prints the first complete client monitor snapshot within `<= 200ms`.
+4. Keep the helper running for the full `15 min` observation window.
+5. Run `robot_monitor` alongside the helper when you need continuous evidence for:
    - joint dynamic state
-   - robot control state
    - gripper state
+6. Use `state_api_demo` at the beginning and end of the window when you need a one-shot corroboration of:
+   - robot control state
+   - end pose
+   - any state that is harder to inspect from the read-only helper alone
+7. During the window, record missing state groups, repeated stale or incomplete reads, disconnects, and any mismatch between on-screen state and the real robot.
+8. Treat the helper's retry of `MonitorStateIncomplete` and `MonitorStateStale` as warmup behavior only if a complete snapshot arrives within `<= 200ms`.
 
 ### Pass Criteria
 
@@ -137,28 +179,35 @@ Verify that SDK lifecycle transitions match real hardware behavior.
 - The robot is confirmed in Standby before enabling motion
 - Only the position-control path is in scope
 
+Standby is concrete here: `hil_joint_position_check` prints `[PASS] connected and confirmed Standby`, and the supporting read-only tools show the robot is not in a motion-enabled state before the enable step begins.
+
 ### Execution
 
-1. Record time to stable Standby after connection.
-2. Enable position mode with `MotionType::Joint` and `speed_percent <= 10`.
-3. Confirm the robot enters the expected controllable state within `<= 5s`.
-4. Disable control and confirm the robot leaves the active drive state within `<= 5s`.
-5. Drop the active control object and verify auto-disable behavior.
-6. Disconnect and reconnect, then confirm the system rebuilds a clean baseline within the same `<= 5s` connection and `<= 200ms` snapshot budgets.
-7. Introduce one controlled interruption under safe conditions and verify the SDK does not continue as if nothing happened.
+1. Run `hil_joint_position_check` to cover the helper-driven portion of this phase.
+2. Use its `[PASS] connected and confirmed Standby` line as the Standby evidence.
+3. Use its `[PASS] enabled PositionMode motion=Joint speed_percent=...` line as the enabled-state evidence.
+4. Use the `[PASS] settle step=move ...` and `[PASS] settle step=return ...` lines as the motion and return evidence.
+5. For explicit disable behavior, stop the active control session manually and confirm the robot leaves the active drive state with `robot_monitor` or `state_api_demo`.
+6. For drop-to-disable behavior, terminate the active control process and confirm the robot returns to Standby or a non-driving state.
+7. For reconnect behavior, start a fresh helper run and confirm the new connection and first snapshot again meet the `<= 5s` and `<= 200ms` budgets.
+8. For rejected-state gating, start `hil_joint_position_check` while the robot is not in Standby and confirm it fails with `robot is not in confirmed Standby; run stop first`.
 
 ### Pass Criteria
 
-- Transition results match SDK expectations and robot state
-- No silent mismatch exists between return values and robot state
-- Auto-disable on drop is observable and reliable
-- Reconnect re-establishes a clean baseline
+- The helper prints the expected Standby, enable, move, and return lines
+- After the manual disable or drop step, `robot_monitor` or `state_api_demo` shows the robot is no longer in an active drive state
+- A fresh helper run reconnects within `<= 5s`
+- A fresh helper run produces its first complete snapshot within `<= 200ms`
+- The helper's printed state matches the observed robot state in `robot_monitor` or `state_api_demo`
+- Stopping the control process causes the robot to return to Standby or another non-driving state
+- A reconnect does not reuse stale monitor state from the interrupted run
 
 ### Fail Criteria
 
 - A transition reports success while the robot remains in the wrong state
 - A transition reports failure after the robot has already changed state
-- Auto-disable does not happen
+- The robot remains in an active drive state after the control process is stopped
+- A reconnect reuses stale monitor state from the interrupted run
 - Recovery requires restarting the full application stack
 
 ## Phase 3: Low-Risk Motion Validation
@@ -185,14 +234,12 @@ Validate the minimum viable control loop on real hardware: command out, motion o
 ### Execution
 
 1. Choose one low-risk joint away from limits.
-2. Command a small positive step and verify the commanded joint begins moving in the expected direction within `2s`.
-3. Command a small negative step and verify the return trend within `2s`.
-4. Repeat the same small move several times to expose intermittent misses or unstable reads.
-5. Test sequential single-joint motions across other safe joints.
+2. Run `hil_joint_position_check` for one small positive or negative delta that stays within `abs(delta) <= 0.035 rad`.
+3. Use the helper's `[PASS] command step=move ...` and `[PASS] settle step=move ...` lines as the evidence that the commanded joint began moving and settled.
+4. Use the helper's `[PASS] command step=return ...` and `[PASS] settle step=return ...` lines as the evidence that the robot returned to the start pose.
+5. If you want a second manual check, repeat with another safe joint and keep the same limits.
 6. Allow up to `10s` for settling before judging each step.
-7. Return the robot to the initial pose or another known safe pose.
-8. Verify the commanded joint returns to within `<= 0.05 rad` of its starting position.
-9. Attempt a motion command from a state where motion should be rejected and verify rejection.
+7. The only return criterion for this phase is the return to the initial pose of the commanded joint.
 
 ### Pass Criteria
 
@@ -203,14 +250,12 @@ Validate the minimum viable control loop on real hardware: command out, motion o
 - Repeated small moves remain consistent
 - Each commanded step settles within `10s`
 - Return-to-start error is `<= 0.05 rad`
-- Rejected-state commands do not move the robot
 
 ### Fail Criteria
 
 - Wrong-direction motion
 - Large unexpected transient motion
 - Feedback and observed motion diverge
-- Illegal-state commands still move the robot
 
 ## Phase 4: Fault and Recovery Validation
 
@@ -233,8 +278,8 @@ Verify that common field failures lead to explicit, safe degradation and recover
 ### Execution
 
 1. Induce one controlled interface interruption while not moving and verify the SDK surfaces a real failure.
-2. Restore the interface and verify reconnect completes within `<= 5s`.
-3. Verify the first trustworthy snapshot rebuilds within `<= 200ms`.
+2. Restore the interface and verify a fresh helper run reconnects within `<= 5s`.
+3. Verify that fresh helper run prints its first complete snapshot within `<= 200ms`.
 4. Induce one controlled controller-side interruption, again while not moving if possible.
 5. Verify stale or missing feedback does not look like healthy control.
 6. After each interruption, verify motion commands are blocked until the system is back in a safe known-good state.
@@ -243,7 +288,8 @@ Verify that common field failures lead to explicit, safe degradation and recover
 
 - Faults are explicit in logs or return values
 - The system degrades toward safety
-- Recovery restores a clean baseline
+- After recovery, a fresh helper run reconnects within `<= 5s` and prints its first complete snapshot within `<= 200ms`
+- `robot_monitor` or `state_api_demo` again shows readable state after recovery
 - Post-fault motion is gated until recovery is complete
 
 ### Fail Criteria
@@ -294,4 +340,3 @@ Observed budgets:
 Notes:
 Artifacts:
 ```
-
