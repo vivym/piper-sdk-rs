@@ -34,6 +34,12 @@ pub struct QueryGuard<'a> {
     token: u64,
 }
 
+impl<'a> QueryGuard<'a> {
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+}
+
 impl QueryCoordinator {
     pub fn new() -> Self {
         Self {
@@ -105,6 +111,7 @@ mod tests {
         let coordinator = QueryCoordinator::new();
         let guard = coordinator.try_begin(QueryKind::JointLimit).unwrap();
 
+        assert_eq!(guard.token(), 1);
         assert_eq!(
             coordinator.active_query(),
             Some(ActiveQuery {
@@ -140,5 +147,15 @@ mod tests {
                 kind: QueryKind::CollisionProtection,
             })
         );
+    }
+
+    #[test]
+    fn query_guard_token_matches_active_query_snapshot() {
+        let coordinator = QueryCoordinator::new();
+        let guard = coordinator.try_begin(QueryKind::EndLimit).unwrap();
+
+        let active = coordinator.active_query().unwrap();
+        assert_eq!(guard.token(), active.token);
+        assert_eq!(active.kind, QueryKind::EndLimit);
     }
 }

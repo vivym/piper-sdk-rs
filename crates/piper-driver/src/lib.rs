@@ -34,7 +34,7 @@ mod test_support;
 
 pub use builder::{ConnectionTarget, PiperBuilder};
 pub use command::{CommandPriority, PiperCommand};
-pub use diagnostics::{DiagnosticBuffer, DiagnosticEvent, ProtocolDiagnostic, QueryDiagnostic};
+pub use diagnostics::{DiagnosticBuffer, DiagnosticEvent, QueryDiagnostic};
 pub use error::DriverError; // 原 DriverError
 pub use fps_stats::{FpsCounts, FpsResult};
 pub use heartbeat::ConnectionMonitor;
@@ -49,6 +49,7 @@ pub use piper::{
     Piper, RuntimeFaultKind, ShutdownLane, ShutdownReceipt,
 };
 pub use piper_can::BackendCapability;
+pub use piper_protocol::ProtocolDiagnostic;
 pub use query_coordinator::{ActiveQuery, QueryCoordinator, QueryError, QueryGuard, QueryKind};
 pub use recording::{AsyncRecordingHook, TimestampedFrame};
 pub use state::*;

@@ -1,34 +1,8 @@
 use crate::query_coordinator::QueryKind;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use piper_protocol::ProtocolDiagnostic;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProtocolDiagnostic {
-    InvalidLength {
-        can_id: u32,
-        expected: usize,
-        actual: usize,
-    },
-    InvalidEnum {
-        field: &'static str,
-        raw: u8,
-    },
-    OutOfRange {
-        field: &'static str,
-        raw: u32,
-        min: u32,
-        max: u32,
-    },
-    UnsupportedValue {
-        field: &'static str,
-        raw: u32,
-    },
-    MalformedGroupMember {
-        can_id: u32,
-        member: &'static str,
-    },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryDiagnostic {
@@ -154,5 +128,26 @@ mod tests {
         assert_eq!(buffer.snapshot(), vec![retained, live.clone()]);
         assert_eq!(rx.recv_timeout(Duration::from_millis(10)).unwrap(), live);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn diagnostics_buffer_accepts_protocol_layer_diagnostic() {
+        let buffer = DiagnosticBuffer::new(1);
+        buffer.push(DiagnosticEvent::Protocol(
+            ProtocolDiagnostic::UnsupportedValue {
+                field: "collision_protection_level",
+                raw: 7,
+            },
+        ));
+
+        assert!(matches!(
+            buffer.snapshot().as_slice(),
+            [DiagnosticEvent::Protocol(
+                ProtocolDiagnostic::UnsupportedValue {
+                    field: "collision_protection_level",
+                    raw: 7,
+                }
+            )]
+        ));
     }
 }
