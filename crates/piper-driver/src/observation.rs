@@ -31,6 +31,15 @@ pub trait PartialPayload<T>: Sized {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupAssembly<TComplete, TPartial> {
+    Complete(TComplete),
+    Partial {
+        partial: TPartial,
+        missing: MissingSet,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingSet {
     pub missing_indices: Vec<usize>,
 }
@@ -55,11 +64,15 @@ pub struct ObservationMeta {
 }
 
 impl ObservationMeta {
-    fn stream(host_rx_mono_us: Option<u64>, hardware_timestamp_us: Option<u64>) -> Self {
+    fn new(
+        host_rx_mono_us: Option<u64>,
+        hardware_timestamp_us: Option<u64>,
+        source: ObservationSource,
+    ) -> Self {
         Self {
             hardware_timestamp_us,
             host_rx_mono_us,
-            source: ObservationSource::Stream,
+            source,
         }
     }
 }
@@ -93,9 +106,24 @@ impl<T: Copy> SingleFrameStore<T> {
     }
 
     pub fn record(&mut self, value: T, host_rx_mono_us: u64, hardware_timestamp_us: Option<u64>) {
+        self.record_with_source(
+            value,
+            host_rx_mono_us,
+            hardware_timestamp_us,
+            ObservationSource::Stream,
+        );
+    }
+
+    pub fn record_with_source(
+        &mut self,
+        value: T,
+        host_rx_mono_us: u64,
+        hardware_timestamp_us: Option<u64>,
+        source: ObservationSource,
+    ) {
         self.record = Some(StoredObservation {
             value,
-            meta: ObservationMeta::stream(Some(host_rx_mono_us), hardware_timestamp_us),
+            meta: ObservationMeta::new(Some(host_rx_mono_us), hardware_timestamp_us, source),
         });
     }
 
@@ -160,10 +188,27 @@ where
         host_rx_mono_us: u64,
         hardware_timestamp_us: Option<u64>,
     ) {
+        self.record_slot_with_source(
+            slot,
+            value,
+            host_rx_mono_us,
+            hardware_timestamp_us,
+            ObservationSource::Stream,
+        );
+    }
+
+    pub fn record_slot_with_source(
+        &mut self,
+        slot: usize,
+        value: TSlot,
+        host_rx_mono_us: u64,
+        hardware_timestamp_us: Option<u64>,
+        source: ObservationSource,
+    ) {
         assert!(slot < N, "slot index out of range");
         self.slots[slot] = Some(StoredSlot {
             value,
-            meta: ObservationMeta::stream(Some(host_rx_mono_us), hardware_timestamp_us),
+            meta: ObservationMeta::new(Some(host_rx_mono_us), hardware_timestamp_us, source),
         });
     }
 
@@ -174,7 +219,7 @@ where
         assemble: F,
     ) -> Observation<TAssembled, TPartial>
     where
-        F: FnOnce(&[Option<TSlot>; N]) -> Option<TAssembled>,
+        F: FnOnce(&[Option<TSlot>; N]) -> GroupAssembly<TAssembled, TPartial>,
     {
         let present_slots = self.present_slots();
         let Some(meta) = self.latest_meta() else {
@@ -187,36 +232,22 @@ where
             freshness_window_us,
         );
 
-        if let Some(value) = assemble(&present_slots) {
-            return Observation::Available(Available {
+        match assemble(&present_slots) {
+            GroupAssembly::Complete(value) => Observation::Available(Available {
                 payload: ObservationPayload::Complete(value),
                 freshness,
                 meta,
-            });
+            }),
+            GroupAssembly::Partial { partial, missing } => Observation::Available(Available {
+                payload: ObservationPayload::Partial { partial, missing },
+                freshness,
+                meta,
+            }),
         }
-
-        let partial = TPartial::from_present_slots(&present_slots);
-        let missing = MissingSet {
-            missing_indices: self.missing_indices(),
-        };
-
-        Observation::Available(Available {
-            payload: ObservationPayload::Partial { partial, missing },
-            freshness,
-            meta,
-        })
     }
 
     fn present_slots(&self) -> [Option<TSlot>; N] {
         std::array::from_fn(|index| self.slots[index].as_ref().map(|slot| slot.value))
-    }
-
-    fn missing_indices(&self) -> Vec<usize> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| slot.is_none().then_some(index))
-            .collect()
     }
 
     fn latest_meta(&self) -> Option<ObservationMeta> {
@@ -268,10 +299,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn group_store_can_return_stale_partial_observation() {
+    fn observation_unavailable_is_reported() {
+        let single = SingleFrameStore::<u8>::new();
+        assert!(matches!(single.observe(100, 50), Observation::Unavailable));
+
+        let store = FrameGroupStore::<u8, 3, [u8; 3]>::new();
+        assert!(matches!(
+            store.observe(100, 50, |_| GroupAssembly::Complete([0, 0, 0])),
+            Observation::Unavailable
+        ));
+    }
+
+    #[test]
+    fn group_store_can_return_fresh_partial_observation() {
         let mut store = FrameGroupStore::<u8, 3, [u8; 3]>::new();
         store.record_slot(0, 10, 1_000, Some(10));
-        let observation = store.observe(1_100, 50, |slots| Some([slots[0]?, slots[1]?, slots[2]?]));
+        let observation = store.observe(1_020, 50, |slots| GroupAssembly::Partial {
+            partial: <SlotPresence<u8, 3> as PartialPayload<u8>>::from_present_slots(slots),
+            missing: MissingSet {
+                missing_indices: vec![1, 2],
+            },
+        });
 
         match observation {
             Observation::Available(available) => {
@@ -279,9 +327,73 @@ mod tests {
                     available.payload,
                     ObservationPayload::Partial { .. }
                 ));
-                assert!(matches!(available.freshness, Freshness::Stale { .. }));
+                assert!(matches!(available.freshness, Freshness::Fresh));
             },
             other => panic!("expected available partial stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_store_can_return_complete_fresh_observation() {
+        let mut store = FrameGroupStore::<u8, 3, [u8; 3]>::new();
+        store.record_slot(0, 10, 1_000, Some(11));
+        store.record_slot(1, 11, 1_001, Some(12));
+        store.record_slot(2, 12, 1_002, Some(13));
+
+        let observation = store.observe(1_020, 50, |slots| {
+            GroupAssembly::Complete([slots[0].unwrap(), slots[1].unwrap(), slots[2].unwrap()])
+        });
+
+        assert!(matches!(
+            observation,
+            Observation::Available(Available {
+                payload: ObservationPayload::Complete([10, 11, 12]),
+                freshness: Freshness::Fresh,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn group_store_can_return_complete_stale_observation() {
+        let mut store = FrameGroupStore::<u8, 2, [u8; 2]>::new();
+        store.record_slot(0, 7, 900, Some(70));
+        store.record_slot(1, 8, 901, Some(80));
+
+        let observation = store.observe(1_100, 50, |slots| {
+            GroupAssembly::Complete([slots[0].unwrap(), slots[1].unwrap()])
+        });
+
+        assert!(matches!(
+            observation,
+            Observation::Available(Available {
+                payload: ObservationPayload::Complete([7, 8]),
+                freshness: Freshness::Stale { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn group_store_reports_explicit_missing_indices() {
+        let mut store = FrameGroupStore::<u8, 3, [u8; 3]>::new();
+        store.record_slot(1, 20, 1_000, Some(20));
+
+        let observation = store.observe(1_010, 50, |slots| GroupAssembly::Partial {
+            partial: <SlotPresence<u8, 3> as PartialPayload<u8>>::from_present_slots(slots),
+            missing: MissingSet {
+                missing_indices: vec![0, 2],
+            },
+        });
+
+        match observation {
+            Observation::Available(available) => match available.payload {
+                ObservationPayload::Partial { missing, .. } => {
+                    assert_eq!(missing.missing_indices, vec![0, 2]);
+                },
+                other => panic!("expected partial payload, got {other:?}"),
+            },
+            other => panic!("expected available observation, got {other:?}"),
         }
     }
 
@@ -298,5 +410,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn metadata_propagates_through_single_frame_store() {
+        let mut store = SingleFrameStore::new();
+        store.record_with_source(42u8, 123, Some(456), ObservationSource::Query);
+
+        match store.observe(130, 50) {
+            Observation::Available(available) => {
+                assert_eq!(available.meta.host_rx_mono_us, Some(123));
+                assert_eq!(available.meta.hardware_timestamp_us, Some(456));
+                assert_eq!(available.meta.source, ObservationSource::Query);
+            },
+            other => panic!("expected available observation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metadata_propagates_through_group_store() {
+        let mut store = FrameGroupStore::<u8, 2, [u8; 2]>::new();
+        store.record_slot_with_source(0, 1, 1_000, Some(10), ObservationSource::Query);
+        store.record_slot_with_source(1, 2, 1_010, Some(11), ObservationSource::Query);
+
+        match store.observe(1_020, 50, |slots| {
+            GroupAssembly::Complete([slots[0].unwrap(), slots[1].unwrap()])
+        }) {
+            Observation::Available(available) => {
+                assert_eq!(available.meta.host_rx_mono_us, Some(1_010));
+                assert_eq!(available.meta.hardware_timestamp_us, Some(11));
+                assert_eq!(available.meta.source, ObservationSource::Query);
+            },
+            other => panic!("expected available observation, got {other:?}"),
+        }
     }
 }
