@@ -169,6 +169,91 @@ mod tests {
     }
 
     #[test]
+    fn decode_motor_limit_malformed_joint_index_returns_diagnostic() {
+        let frame = PiperFrame::new_standard(0x473, &[7, 0, 0, 0, 0, 0, 0, 0]);
+        match decode_motor_limit_feedback(frame) {
+            DecodeResult::Diagnostic(ProtocolDiagnostic::OutOfRange {
+                field,
+                raw,
+                min,
+                max,
+            }) => {
+                assert_eq!(field, "joint_index");
+                assert_eq!(raw, 7);
+                assert_eq!(min, 1);
+                assert_eq!(max, 6);
+            },
+            other => panic!("expected joint-index diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_motor_limit_invalid_length_returns_diagnostic() {
+        let frame = PiperFrame::new_standard(0x473, &[1, 2, 3, 4]);
+        match decode_motor_limit_feedback(frame) {
+            DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
+                can_id,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(can_id, 0x473);
+                assert_eq!(expected, 7);
+                assert_eq!(actual, 4);
+            },
+            other => panic!("expected invalid-length diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_motor_limit_mismatched_can_id_returns_ignore() {
+        let frame = PiperFrame::new_standard(0x999, &[1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]);
+        assert!(matches!(
+            decode_motor_limit_feedback(frame),
+            DecodeResult::Ignore
+        ));
+    }
+
+    #[test]
+    fn decode_motor_limit_propagates_hardware_timestamp() {
+        let mut frame =
+            PiperFrame::new_standard(0x473, &[1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]);
+        frame.timestamp_us = 123_456;
+
+        match decode_motor_limit_feedback(frame) {
+            DecodeResult::Data(typed) => {
+                assert_eq!(typed.hardware_timestamp_us, Some(123_456));
+            },
+            other => panic!("expected typed data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_collision_protection_invalid_length_returns_diagnostic() {
+        let frame = PiperFrame::new_standard(0x47B, &[1, 2, 3, 4, 5]);
+        match decode_collision_protection_feedback(frame) {
+            DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
+                can_id,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(can_id, 0x47B);
+                assert_eq!(expected, 6);
+                assert_eq!(actual, 5);
+            },
+            other => panic!("expected invalid-length diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_collision_protection_mismatched_can_id_returns_ignore() {
+        let frame = PiperFrame::new_standard(0x999, &[1, 2, 3, 4, 5, 6, 0, 0]);
+        assert!(matches!(
+            decode_collision_protection_feedback(frame),
+            DecodeResult::Ignore
+        ));
+    }
+
+    #[test]
     fn test_link_setting_from_u8() {
         assert_eq!(LinkSetting::try_from(0x00).unwrap(), LinkSetting::Invalid);
         assert_eq!(
@@ -356,6 +441,9 @@ impl TryFrom<PiperFrame> for MotorLimitFeedback {
         }
 
         let joint_index = frame.data[0];
+        if !(1..=6).contains(&joint_index) {
+            return Err(ProtocolError::InvalidJointIndex { joint_index });
+        }
 
         // 大端字节序
         let max_angle_bytes = [frame.data[1], frame.data[2]];
@@ -400,10 +488,25 @@ pub fn decode_motor_limit_feedback(frame: PiperFrame) -> DecodeResult<MotorLimit
             payload,
             hardware_timestamp_us: (timestamp_us != 0).then_some(timestamp_us),
         }),
-        Err(_) => DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
-            can_id,
-            expected: 7,
-            actual,
+        Err(ProtocolError::InvalidJointIndex { joint_index }) => {
+            DecodeResult::Diagnostic(ProtocolDiagnostic::OutOfRange {
+                field: "joint_index",
+                raw: joint_index as u32,
+                min: 1,
+                max: 6,
+            })
+        },
+        Err(ProtocolError::InvalidLength { expected, actual }) => {
+            DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
+                can_id,
+                expected,
+                actual,
+            })
+        },
+        Err(ProtocolError::InvalidCanId { .. }) => DecodeResult::Ignore,
+        Err(_) => DecodeResult::Diagnostic(ProtocolDiagnostic::UnsupportedValue {
+            field: "motor_limit_feedback",
+            raw: can_id,
         }),
     }
 }
@@ -1714,10 +1817,23 @@ pub fn decode_collision_protection_feedback(
             payload,
             hardware_timestamp_us: (timestamp_us != 0).then_some(timestamp_us),
         }),
-        Err(_) => DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
-            can_id,
-            expected: 6,
-            actual,
+        Err(ProtocolError::InvalidLength { expected, actual }) => {
+            DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
+                can_id,
+                expected,
+                actual,
+            })
+        },
+        Err(ProtocolError::InvalidCanId { .. }) => DecodeResult::Ignore,
+        Err(ProtocolError::InvalidValue { value, .. }) => {
+            DecodeResult::Diagnostic(ProtocolDiagnostic::UnsupportedValue {
+                field: "collision_protection_level",
+                raw: value as u32,
+            })
+        },
+        Err(_) => DecodeResult::Diagnostic(ProtocolDiagnostic::UnsupportedValue {
+            field: "collision_protection_level",
+            raw: can_id,
         }),
     }
 }
