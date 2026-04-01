@@ -1,3 +1,4 @@
+use crate::DriverError;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,10 +17,16 @@ pub struct ActiveQuery {
     pub kind: QueryKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     #[error("query coordinator busy")]
     Busy,
+    #[error("query timed out without matching feedback")]
+    Timeout,
+    #[error("query timed out after receiving diagnostics but no publishable value")]
+    DiagnosticsOnlyTimeout,
+    #[error("query infrastructure error: {0}")]
+    Driver(#[from] DriverError),
 }
 
 #[derive(Debug)]
@@ -114,7 +121,7 @@ mod tests {
         let _guard = coordinator.try_begin(QueryKind::JointLimit).unwrap();
         let err = coordinator.try_begin(QueryKind::CollisionProtection).unwrap_err();
 
-        assert_eq!(err, QueryError::Busy);
+        assert!(matches!(err, QueryError::Busy));
     }
 
     #[test]

@@ -241,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Collision protection levels:");
             let mut has_invalid_level = false;
             for i in 0..6 {
-                let level = protection.protection_levels[i];
+                let level = protection.value.levels[i].raw();
                 if level > 8 {
                     has_invalid_level = true;
                 }
@@ -263,17 +263,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "  Joint {}: [{:.2}, {:.2}] rad, max vel: {:.2} rad/s",
                     i + 1,
-                    limits.joint_limits_min[i],
-                    limits.joint_limits_max[i],
-                    limits.joint_max_velocity[i]
+                    limits.value.joints[i].min_angle_rad,
+                    limits.value.joints[i].max_angle_rad,
+                    limits.value.joints[i].max_velocity_rad_s
                 );
             }
-
-            if limits.is_fully_valid() {
-                println!("✓ All joint limits received");
-            } else {
-                println!("⚠ Missing joints: {:?}", limits.missing_joints());
-            }
+            println!("✓ All joint limits received");
         },
         Err(err) => {
             println!("\nJoint limit query failed: {err}");
@@ -287,15 +282,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "  Joint {}: {:.2} rad/s²",
                     i + 1,
-                    accel_limits.max_acc_limits[i]
+                    accel_limits.value.max_accel_rad_s2[i]
                 );
             }
-
-            if accel_limits.is_fully_valid() {
-                println!("✓ All acceleration limits received");
-            } else {
-                println!("⚠ Missing joints: {:?}", accel_limits.missing_joints());
-            }
+            println!("✓ All acceleration limits received");
         },
         Err(err) => {
             println!("\nJoint acceleration query failed: {err}");
@@ -307,24 +297,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\nEnd-effector limits:");
             println!(
                 "  Max linear velocity: {:.2} m/s",
-                end_limits.max_end_linear_velocity
+                end_limits.value.max_linear_velocity_m_s
             );
             println!(
                 "  Max angular velocity: {:.2} rad/s",
-                end_limits.max_end_angular_velocity
+                end_limits.value.max_angular_velocity_rad_s
             );
             println!(
                 "  Max linear accel: {:.2} m/s²",
-                end_limits.max_end_linear_accel
+                end_limits.value.max_linear_accel_m_s2
             );
             println!(
                 "  Max angular accel: {:.2} rad/s²",
-                end_limits.max_end_angular_accel
+                end_limits.value.max_angular_accel_rad_s2
             );
-
-            if end_limits.is_valid {
-                println!("✓ End limits are valid");
-            }
+            println!("✓ End limits are valid");
         },
         Err(err) => {
             println!("\nEnd-effector limit query failed: {err}");

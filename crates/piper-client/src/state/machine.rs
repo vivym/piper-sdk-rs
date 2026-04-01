@@ -16,7 +16,7 @@ use crate::{
     raw_commander::RawCommander,
 };
 use piper_driver::{
-    BackendCapability, DriverError, ManualFaultRecoveryResult, RuntimeFaultKind,
+    BackendCapability, DriverError, ManualFaultRecoveryResult, QueryError, RuntimeFaultKind,
     SettingResponseState,
 };
 use piper_protocol::control::{InstallPosition, MitControlCommand, MitMode as ProtocolMitMode};
@@ -1611,27 +1611,26 @@ where
     fn query_collision_protection_with_poll(
         &self,
         timeout: Duration,
-        poll_interval: Duration,
+        _poll_interval: Duration,
     ) -> Result<CollisionProtectionSnapshot> {
-        let raw = RawCommander::new(&self.driver);
-        let commit_host_mono_us = raw.query_collision_protection_confirmed(timeout)?;
+        self.ensure_runtime_health_healthy()?;
 
-        let start = Instant::now();
-        loop {
-            self.ensure_runtime_health_healthy()?;
-
-            let state = self.collision_protection_cached_inner()?;
-            if state.host_rx_mono_us > commit_host_mono_us {
-                return Ok(state);
-            }
-
-            if start.elapsed() > timeout {
-                return Err(RobotError::Timeout {
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-
-            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
+        match self.driver.query_collision_protection(timeout) {
+            Ok(complete) => Ok(CollisionProtectionSnapshot::from_driver_observation(
+                complete.value,
+                complete.meta,
+            )),
+            Err(QueryError::Busy) => Err(RobotError::ConfigError(
+                "collision protection query already in flight".to_string(),
+            )),
+            Err(QueryError::Timeout) => Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            }),
+            Err(QueryError::DiagnosticsOnlyTimeout) => Err(RobotError::ConfigError(
+                "collision protection query produced diagnostics but no publishable value"
+                    .to_string(),
+            )),
+            Err(QueryError::Driver(error)) => Err(error.into()),
         }
     }
 
@@ -1639,9 +1638,9 @@ where
         match self.driver.get_collision_protection() {
             piper_driver::observation::Observation::Available(available) => match available.payload
             {
-                piper_driver::observation::ObservationPayload::Complete(state) => {
-                    Ok(CollisionProtectionSnapshot::from(state))
-                },
+                piper_driver::observation::ObservationPayload::Complete(value) => Ok(
+                    CollisionProtectionSnapshot::from_driver_observation(value, available.meta),
+                ),
                 piper_driver::observation::ObservationPayload::Partial { .. } => {
                     Err(RobotError::ConfigError(
                         "collision protection observation unexpectedly partial".to_string(),

@@ -11,7 +11,7 @@ use crate::diagnostics::{DiagnosticEvent, QueryDiagnostic};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
 use crate::metrics::{MetricsSnapshot, PiperMetrics};
-use crate::observation::{Available, Observation, ObservationPayload};
+use crate::observation::{Complete, Observation};
 use crate::pipeline::*;
 use crate::query_coordinator::{QueryError, QueryGuard, QueryKind};
 use crate::state::*;
@@ -2852,60 +2852,74 @@ impl Piper {
         }
     }
 
-    fn try_begin_query(&self, kind: QueryKind) -> Result<QueryGuard<'_>, DriverError> {
+    fn try_begin_query(&self, kind: QueryKind) -> Result<QueryGuard<'_>, QueryError> {
         self.ctx.query_coordinator.try_begin(kind).map_err(|err| {
-            if err == QueryError::Busy {
+            if matches!(err, QueryError::Busy) {
                 self.ctx.diagnostics.push(DiagnosticEvent::Query(QueryDiagnostic::Busy));
             }
-            DriverError::InvalidInput("query coordinator busy".to_string())
+            err
         })
+    }
+
+    fn classify_query_timeout(
+        &self,
+        kind: QueryKind,
+        diagnostics_rx: &Receiver<DiagnosticEvent>,
+    ) -> QueryError {
+        if diagnostics_rx.try_iter().next().is_some() {
+            self.ctx.diagnostics.push(DiagnosticEvent::Query(
+                QueryDiagnostic::DiagnosticsOnlyTimeout { query: kind },
+            ));
+            QueryError::DiagnosticsOnlyTimeout
+        } else {
+            QueryError::Timeout
+        }
     }
 
     /// 主动查询碰撞保护等级并等待新反馈。
     pub fn query_collision_protection(
         &self,
         timeout: Duration,
-    ) -> Result<CollisionProtectionState, DriverError> {
+    ) -> Result<Complete<CollisionProtection>, QueryError> {
         use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
 
         let query = self.try_begin_query(QueryKind::CollisionProtection)?;
         let token = query.token();
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
+        let diagnostics_rx = self.ctx.diagnostics.subscribe();
         self.ctx
             .collision_protection_observation
             .write()
             .map(|mut store| store.begin_query(token, baseline_host_mono_us))
-            .map_err(|_| DriverError::PoisonedLock)?;
+            .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
         let result = (|| {
             let deadline = Instant::now() + timeout;
             let frame =
                 ParameterQuerySetCommand::query(ParameterQueryType::CollisionProtectionLevel)
-                    .to_frame()?;
-            self.send_reliable_frame_confirmed_commit_marker(frame, timeout)?;
+                    .to_frame()
+                    .map_err(DriverError::from)
+                    .map_err(QueryError::from)?;
+            self.send_reliable_frame_confirmed_commit_marker(frame, timeout)
+                .map_err(QueryError::from)?;
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
-                let complete = this
-                    .ctx
+                this.ctx
                     .collision_protection_observation
                     .read()
-                    .map_err(|_| DriverError::PoisonedLock)?
-                    .current_complete_for_token(token);
-
-                Ok(complete.map(|complete| complete.value.into_state(complete.meta)))
+                    .map_err(|_| DriverError::PoisonedLock)
+                    .map(|store| store.current_complete_for_token(token))
+            })
+            .map_err(|error| match error {
+                DriverError::Timeout => {
+                    self.classify_query_timeout(QueryKind::CollisionProtection, &diagnostics_rx)
+                },
+                other => QueryError::from(other),
             })
         })();
 
         if let Ok(mut store) = self.ctx.collision_protection_observation.write() {
             store.finish_query(token);
-        }
-
-        if matches!(result, Err(DriverError::Timeout)) {
-            self.ctx.diagnostics.push(DiagnosticEvent::Query(
-                QueryDiagnostic::DiagnosticsOnlyTimeout {
-                    query: QueryKind::CollisionProtection,
-                },
-            ));
         }
 
         result
@@ -2915,47 +2929,44 @@ impl Piper {
     pub fn query_joint_limit_config(
         &self,
         timeout: Duration,
-    ) -> Result<JointLimitConfigState, DriverError> {
+    ) -> Result<Complete<JointLimitConfig>, QueryError> {
         use piper_protocol::config::QueryMotorLimitCommand;
 
         let query = self.try_begin_query(QueryKind::JointLimit)?;
         let token = query.token();
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
+        let diagnostics_rx = self.ctx.diagnostics.subscribe();
         self.ctx
             .joint_limit_observation
             .write()
             .map(|mut store| store.begin_query(token, baseline_host_mono_us))
-            .map_err(|_| DriverError::PoisonedLock)?;
+            .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
         let result = (|| {
             let deadline = Instant::now() + timeout;
             let frames = (1..=6u8).map(|joint_index| {
                 QueryMotorLimitCommand::query_angle_and_max_velocity(joint_index).to_frame()
             });
-            self.send_reliable_package_confirmed(frames, timeout)?;
+            self.send_reliable_package_confirmed(frames, timeout)
+                .map_err(QueryError::from)?;
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
-                let complete = this
-                    .ctx
+                this.ctx
                     .joint_limit_observation
                     .read()
-                    .map_err(|_| DriverError::PoisonedLock)?
-                    .current_complete_for_token(token);
-
-                Ok(complete.map(|complete| complete.value.into_state(complete.meta)))
+                    .map_err(|_| DriverError::PoisonedLock)
+                    .map(|store| store.current_complete_for_token(token))
+            })
+            .map_err(|error| match error {
+                DriverError::Timeout => {
+                    self.classify_query_timeout(QueryKind::JointLimit, &diagnostics_rx)
+                },
+                other => QueryError::from(other),
             })
         })();
 
         if let Ok(mut store) = self.ctx.joint_limit_observation.write() {
             store.finish_query(token);
-        }
-
-        if matches!(result, Err(DriverError::Timeout)) {
-            self.ctx.diagnostics.push(DiagnosticEvent::Query(
-                QueryDiagnostic::DiagnosticsOnlyTimeout {
-                    query: QueryKind::JointLimit,
-                },
-            ));
         }
 
         result
@@ -2965,47 +2976,44 @@ impl Piper {
     pub fn query_joint_accel_config(
         &self,
         timeout: Duration,
-    ) -> Result<JointAccelConfigState, DriverError> {
+    ) -> Result<Complete<JointAccelConfig>, QueryError> {
         use piper_protocol::config::QueryMotorLimitCommand;
 
         let query = self.try_begin_query(QueryKind::JointAccel)?;
         let token = query.token();
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
+        let diagnostics_rx = self.ctx.diagnostics.subscribe();
         self.ctx
             .joint_accel_observation
             .write()
             .map(|mut store| store.begin_query(token, baseline_host_mono_us))
-            .map_err(|_| DriverError::PoisonedLock)?;
+            .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
         let result = (|| {
             let deadline = Instant::now() + timeout;
             let frames = (1..=6u8).map(|joint_index| {
                 QueryMotorLimitCommand::query_max_acceleration(joint_index).to_frame()
             });
-            self.send_reliable_package_confirmed(frames, timeout)?;
+            self.send_reliable_package_confirmed(frames, timeout)
+                .map_err(QueryError::from)?;
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
-                let complete = this
-                    .ctx
+                this.ctx
                     .joint_accel_observation
                     .read()
-                    .map_err(|_| DriverError::PoisonedLock)?
-                    .current_complete_for_token(token);
-
-                Ok(complete.map(|complete| complete.value.into_state(complete.meta)))
+                    .map_err(|_| DriverError::PoisonedLock)
+                    .map(|store| store.current_complete_for_token(token))
+            })
+            .map_err(|error| match error {
+                DriverError::Timeout => {
+                    self.classify_query_timeout(QueryKind::JointAccel, &diagnostics_rx)
+                },
+                other => QueryError::from(other),
             })
         })();
 
         if let Ok(mut store) = self.ctx.joint_accel_observation.write() {
             store.finish_query(token);
-        }
-
-        if matches!(result, Err(DriverError::Timeout)) {
-            self.ctx.diagnostics.push(DiagnosticEvent::Query(
-                QueryDiagnostic::DiagnosticsOnlyTimeout {
-                    query: QueryKind::JointAccel,
-                },
-            ));
         }
 
         result
@@ -3015,46 +3023,45 @@ impl Piper {
     pub fn query_end_limit_config(
         &self,
         timeout: Duration,
-    ) -> Result<EndLimitConfigState, DriverError> {
+    ) -> Result<Complete<EndLimitConfig>, QueryError> {
         use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
 
         let query = self.try_begin_query(QueryKind::EndLimit)?;
         let token = query.token();
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
+        let diagnostics_rx = self.ctx.diagnostics.subscribe();
         self.ctx
             .end_limit_observation
             .write()
             .map(|mut store| store.begin_query(token, baseline_host_mono_us))
-            .map_err(|_| DriverError::PoisonedLock)?;
+            .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
         let result = (|| {
             let deadline = Instant::now() + timeout;
-            let frame =
-                ParameterQuerySetCommand::query(ParameterQueryType::EndVelocityAccel).to_frame()?;
-            self.send_reliable_frame_confirmed_commit_marker(frame, timeout)?;
+            let frame = ParameterQuerySetCommand::query(ParameterQueryType::EndVelocityAccel)
+                .to_frame()
+                .map_err(DriverError::from)
+                .map_err(QueryError::from)?;
+            self.send_reliable_frame_confirmed_commit_marker(frame, timeout)
+                .map_err(QueryError::from)?;
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
-                let complete = this
-                    .ctx
+                this.ctx
                     .end_limit_observation
                     .read()
-                    .map_err(|_| DriverError::PoisonedLock)?
-                    .current_complete_for_token(token);
-
-                Ok(complete.map(|complete| complete.value.into_state(complete.meta)))
+                    .map_err(|_| DriverError::PoisonedLock)
+                    .map(|store| store.current_complete_for_token(token))
+            })
+            .map_err(|error| match error {
+                DriverError::Timeout => {
+                    self.classify_query_timeout(QueryKind::EndLimit, &diagnostics_rx)
+                },
+                other => QueryError::from(other),
             })
         })();
 
         if let Ok(mut store) = self.ctx.end_limit_observation.write() {
             store.finish_query(token);
-        }
-
-        if matches!(result, Err(DriverError::Timeout)) {
-            self.ctx.diagnostics.push(DiagnosticEvent::Query(
-                QueryDiagnostic::DiagnosticsOnlyTimeout {
-                    query: QueryKind::EndLimit,
-                },
-            ));
         }
 
         result
@@ -3101,27 +3108,12 @@ impl Piper {
     /// # 性能
     /// - 读锁（RwLock::read）
     /// - 返回快照副本
-    pub fn get_collision_protection(&self) -> Observation<CollisionProtectionState> {
+    pub fn get_collision_protection(&self) -> Observation<CollisionProtection> {
         let Ok(store) = self.ctx.collision_protection_observation.read() else {
             return Observation::Unavailable;
         };
 
-        match store.observe() {
-            Observation::Available(Available {
-                payload: ObservationPayload::Complete(value),
-                freshness,
-                meta,
-            }) => Observation::Available(Available {
-                payload: ObservationPayload::Complete(value.into_state(meta)),
-                freshness,
-                meta,
-            }),
-            Observation::Unavailable => Observation::Unavailable,
-            Observation::Available(Available {
-                payload: ObservationPayload::Partial { .. },
-                ..
-            }) => Observation::Unavailable,
-        }
+        store.observe()
     }
 
     /// 获取最近一次设置指令应答（读锁）
@@ -3156,34 +3148,12 @@ impl Piper {
     /// # 性能
     /// - 读锁（RwLock::read）
     /// - 返回快照副本
-    pub fn get_joint_limit_config(
-        &self,
-    ) -> Observation<JointLimitConfigState, PartialJointLimitConfig> {
+    pub fn get_joint_limit_config(&self) -> Observation<JointLimitConfig, PartialJointLimitConfig> {
         let Ok(store) = self.ctx.joint_limit_observation.read() else {
             return Observation::Unavailable;
         };
 
-        match store.observe() {
-            Observation::Available(Available {
-                payload: ObservationPayload::Complete(value),
-                freshness,
-                meta,
-            }) => Observation::Available(Available {
-                payload: ObservationPayload::Complete(value.into_state(meta)),
-                freshness,
-                meta,
-            }),
-            Observation::Available(Available {
-                payload: ObservationPayload::Partial { partial, missing },
-                freshness,
-                meta,
-            }) => Observation::Available(Available {
-                payload: ObservationPayload::Partial { partial, missing },
-                freshness,
-                meta,
-            }),
-            Observation::Unavailable => Observation::Unavailable,
-        }
+        store.observe()
     }
 
     /// 获取关节加速度限制配置状态（读锁）
@@ -3193,34 +3163,12 @@ impl Piper {
     /// # 性能
     /// - 读锁（RwLock::read）
     /// - 返回快照副本
-    pub fn get_joint_accel_config(
-        &self,
-    ) -> Observation<JointAccelConfigState, PartialJointAccelConfig> {
+    pub fn get_joint_accel_config(&self) -> Observation<JointAccelConfig, PartialJointAccelConfig> {
         let Ok(store) = self.ctx.joint_accel_observation.read() else {
             return Observation::Unavailable;
         };
 
-        match store.observe() {
-            Observation::Available(Available {
-                payload: ObservationPayload::Complete(value),
-                freshness,
-                meta,
-            }) => Observation::Available(Available {
-                payload: ObservationPayload::Complete(value.into_state(meta)),
-                freshness,
-                meta,
-            }),
-            Observation::Available(Available {
-                payload: ObservationPayload::Partial { partial, missing },
-                freshness,
-                meta,
-            }) => Observation::Available(Available {
-                payload: ObservationPayload::Partial { partial, missing },
-                freshness,
-                meta,
-            }),
-            Observation::Unavailable => Observation::Unavailable,
-        }
+        store.observe()
     }
 
     /// 获取末端限制配置状态（读锁）
@@ -3230,27 +3178,12 @@ impl Piper {
     /// # 性能
     /// - 读锁（RwLock::read）
     /// - 返回快照副本
-    pub fn get_end_limit_config(&self) -> Observation<EndLimitConfigState> {
+    pub fn get_end_limit_config(&self) -> Observation<EndLimitConfig> {
         let Ok(store) = self.ctx.end_limit_observation.read() else {
             return Observation::Unavailable;
         };
 
-        match store.observe() {
-            Observation::Available(Available {
-                payload: ObservationPayload::Complete(value),
-                freshness,
-                meta,
-            }) => Observation::Available(Available {
-                payload: ObservationPayload::Complete(value.into_state(meta)),
-                freshness,
-                meta,
-            }),
-            Observation::Unavailable => Observation::Unavailable,
-            Observation::Available(Available {
-                payload: ObservationPayload::Partial { .. },
-                ..
-            }) => Observation::Unavailable,
-        }
+        store.observe()
     }
 
     pub fn snapshot_diagnostics(&self) -> Vec<DiagnosticEvent> {
@@ -4699,8 +4632,8 @@ impl Drop for Piper {
 mod tests {
     use super::*;
     use crate::DriverMode;
-    use crate::observation::{Available, Freshness, Observation, ObservationPayload};
-    use crate::{DiagnosticEvent, ProtocolDiagnostic};
+    use crate::observation::{Available, Complete, Freshness, Observation, ObservationPayload};
+    use crate::{DiagnosticEvent, ProtocolDiagnostic, QueryError};
     use piper_can::{CanAdapter, PiperFrame, SplittableAdapter};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
@@ -7275,8 +7208,17 @@ mod tests {
             .query_collision_protection(Duration::from_millis(200))
             .expect("collision protection query should succeed");
 
-        assert_eq!(state.protection_levels, [1, 2, 3, 4, 5, 6]);
-        assert_eq!(state.hardware_timestamp_us, 321);
+        assert_eq!(
+            state,
+            Complete {
+                value: CollisionProtection::try_from_raw_levels([1, 2, 3, 4, 5, 6]).unwrap(),
+                meta: crate::observation::ObservationMeta {
+                    hardware_timestamp_us: Some(321),
+                    host_rx_mono_us: Some(state.meta.host_rx_mono_us.unwrap()),
+                    source: crate::observation::ObservationSource::Query,
+                },
+            }
+        );
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 1);
@@ -7315,11 +7257,22 @@ mod tests {
             .query_end_limit_config(Duration::from_millis(200))
             .expect("end limit query should succeed");
 
-        assert!(state.is_valid);
-        assert!((state.max_end_linear_velocity - 1.0).abs() < 1e-6);
-        assert!((state.max_end_angular_velocity - 2.0).abs() < 1e-6);
-        assert!((state.max_end_linear_accel - 3.0).abs() < 1e-6);
-        assert!((state.max_end_angular_accel - 4.0).abs() < 1e-6);
+        assert_eq!(
+            state,
+            Complete {
+                value: EndLimitConfig {
+                    max_linear_velocity_m_s: 1.0,
+                    max_angular_velocity_rad_s: 2.0,
+                    max_linear_accel_m_s2: 3.0,
+                    max_angular_accel_rad_s2: 4.0,
+                },
+                meta: crate::observation::ObservationMeta {
+                    hardware_timestamp_us: Some(654),
+                    host_rx_mono_us: Some(state.meta.host_rx_mono_us.unwrap()),
+                    source: crate::observation::ObservationSource::Query,
+                },
+            }
+        );
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 1);
@@ -7362,11 +7315,13 @@ mod tests {
             .query_joint_limit_config(Duration::from_millis(400))
             .expect("joint limit query should succeed");
 
-        assert!(state.is_fully_valid());
-        assert_eq!(state.valid_mask, 0b11_1111);
-        assert!((state.joint_limits_max[0] - 180.1_f64.to_radians()).abs() < 1e-6);
-        assert!((state.joint_limits_min[5] - (-180.6_f64).to_radians()).abs() < 1e-6);
-        assert!((state.joint_max_velocity[4] - 0.505).abs() < 1e-6);
+        assert!((state.value.joints[0].max_angle_rad - 180.1_f64.to_radians()).abs() < 1e-6);
+        assert!((state.value.joints[5].min_angle_rad - (-180.6_f64).to_radians()).abs() < 1e-6);
+        assert!((state.value.joints[4].max_velocity_rad_s - 0.505).abs() < 1e-6);
+        assert_eq!(
+            state.meta.source,
+            crate::observation::ObservationSource::Query
+        );
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 6);
@@ -7410,10 +7365,12 @@ mod tests {
             .query_joint_accel_config(Duration::from_millis(400))
             .expect("joint accel query should succeed");
 
-        assert!(state.is_fully_valid());
-        assert_eq!(state.valid_mask, 0b11_1111);
-        assert!((state.max_acc_limits[0] - 1.01).abs() < 1e-6);
-        assert!((state.max_acc_limits[5] - 1.06).abs() < 1e-6);
+        assert!((state.value.max_accel_rad_s2[0] - 1.01).abs() < 1e-6);
+        assert!((state.value.max_accel_rad_s2[5] - 1.06).abs() < 1e-6);
+        assert_eq!(
+            state.meta.source,
+            crate::observation::ObservationSource::Query
+        );
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 6);
@@ -7484,7 +7441,7 @@ mod tests {
         let _ = piper.query_joint_limit_config(Duration::from_millis(400)).unwrap();
 
         let error = piper.query_joint_limit_config(Duration::from_millis(10)).unwrap_err();
-        assert!(matches!(error, DriverError::Timeout));
+        assert!(matches!(error, QueryError::Timeout));
 
         assert!(matches!(
             piper.get_joint_limit_config(),
@@ -7494,6 +7451,24 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn query_collision_protection_invalid_feedback_returns_diagnostics_only_timeout() {
+        let frame = PiperFrame::new_standard(
+            piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
+            &[255, 0, 0, 0, 0, 0, 0, 0],
+        );
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        let error = piper.query_collision_protection(Duration::from_millis(60)).unwrap_err();
+
+        assert!(matches!(error, QueryError::DiagnosticsOnlyTimeout));
     }
 
     #[test]

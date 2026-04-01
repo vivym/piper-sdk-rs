@@ -82,14 +82,15 @@ impl CollisionProtectionSnapshot {
     pub fn is_newer_than(self, hardware_timestamp_us: u64, host_rx_mono_us: u64) -> bool {
         self.hardware_timestamp_us > hardware_timestamp_us || self.host_rx_mono_us > host_rx_mono_us
     }
-}
 
-impl From<piper_driver::CollisionProtectionState> for CollisionProtectionSnapshot {
-    fn from(value: piper_driver::CollisionProtectionState) -> Self {
+    pub(crate) fn from_driver_observation(
+        value: piper_driver::CollisionProtection,
+        meta: piper_driver::observation::ObservationMeta,
+    ) -> Self {
         Self {
-            hardware_timestamp_us: value.hardware_timestamp_us,
-            host_rx_mono_us: value.host_rx_mono_us,
-            levels: value.protection_levels,
+            hardware_timestamp_us: meta.hardware_timestamp_us.unwrap_or_default(),
+            host_rx_mono_us: meta.host_rx_mono_us.unwrap_or_default(),
+            levels: value.levels.map(piper_driver::CollisionProtectionLevel::raw),
         }
     }
 }
@@ -629,9 +630,9 @@ where
         match self.driver.get_collision_protection() {
             piper_driver::observation::Observation::Available(available) => match available.payload
             {
-                piper_driver::observation::ObservationPayload::Complete(state) => {
-                    Ok(CollisionProtectionSnapshot::from(state))
-                },
+                piper_driver::observation::ObservationPayload::Complete(value) => Ok(
+                    CollisionProtectionSnapshot::from_driver_observation(value, available.meta),
+                ),
                 piper_driver::observation::ObservationPayload::Partial { .. } => {
                     Err(DriverError::InvalidInput(
                         "collision protection observation unexpectedly partial".to_string(),

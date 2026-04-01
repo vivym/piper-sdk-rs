@@ -327,6 +327,7 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn query_collision_protection_confirmed(&self, timeout: Duration) -> Result<u64> {
         use piper_protocol::config::{ParameterQuerySetCommand, ParameterQueryType};
 
