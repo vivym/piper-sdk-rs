@@ -1,23 +1,23 @@
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Observation<T> {
-    Available(Available<T>),
+pub enum Observation<TComplete, TPartial = TComplete> {
+    Available(Available<TComplete, TPartial>),
     Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Available<T> {
-    pub payload: ObservationPayload<T>,
+pub struct Available<TComplete, TPartial = TComplete> {
+    pub payload: ObservationPayload<TComplete, TPartial>,
     pub freshness: Freshness,
     pub meta: ObservationMeta,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObservationPayload<T> {
-    Complete(T),
+pub enum ObservationPayload<TComplete, TPartial = TComplete> {
+    Complete(TComplete),
     Partial {
-        partial: Vec<Option<T>>,
+        partial: TPartial,
         missing: MissingSet,
     },
 }
@@ -135,8 +135,9 @@ impl<T: Copy> Default for SingleFrameStore<T> {
     }
 }
 
-pub struct FrameGroupStore<TSlot: Copy, const N: usize, TAssembled> {
+pub struct FrameGroupStore<TSlot: Copy, const N: usize, TAssembled, TPartial = Vec<Option<TSlot>>> {
     slots: [Option<StoredSlot<TSlot>>; N],
+    _partial: std::marker::PhantomData<TPartial>,
     _assembled: std::marker::PhantomData<TAssembled>,
 }
 
@@ -145,10 +146,15 @@ struct StoredSlot<T: Copy> {
     meta: ObservationMeta,
 }
 
-impl<TSlot: Copy, const N: usize, TAssembled> FrameGroupStore<TSlot, N, TAssembled> {
+impl<TSlot: Copy, const N: usize, TAssembled, TPartial>
+    FrameGroupStore<TSlot, N, TAssembled, TPartial>
+where
+    TPartial: PartialPayload<TSlot>,
+{
     pub fn new() -> Self {
         Self {
             slots: std::array::from_fn(|_| None),
+            _partial: std::marker::PhantomData,
             _assembled: std::marker::PhantomData,
         }
     }
@@ -189,10 +195,9 @@ impl<TSlot: Copy, const N: usize, TAssembled> FrameGroupStore<TSlot, N, TAssembl
         now_host_mono_us: u64,
         freshness_window_us: u64,
         assemble: F,
-    ) -> Observation<TAssembled>
+    ) -> Observation<TAssembled, TPartial>
     where
         F: FnOnce(&[Option<TSlot>; N]) -> Option<TAssembled>,
-        TAssembled: Default,
     {
         let present_slots = self.present_slots();
         let Some(meta) = self.latest_meta() else {
@@ -218,13 +223,7 @@ impl<TSlot: Copy, const N: usize, TAssembled> FrameGroupStore<TSlot, N, TAssembl
             return Observation::Unavailable;
         }
 
-        let mut partial =
-            std::iter::repeat_with(|| None).take(N).collect::<Vec<Option<TAssembled>>>();
-        for (index, slot) in present_slots.iter().enumerate() {
-            if slot.is_some() {
-                partial[index] = Some(TAssembled::default());
-            }
-        }
+        let partial = TPartial::from_present_slots(&present_slots);
 
         Observation::Available(Available {
             payload: ObservationPayload::Partial {
@@ -261,7 +260,11 @@ impl<TSlot: Copy, const N: usize, TAssembled> FrameGroupStore<TSlot, N, TAssembl
     }
 }
 
-impl<TSlot: Copy, const N: usize, TAssembled> Default for FrameGroupStore<TSlot, N, TAssembled> {
+impl<TSlot: Copy, const N: usize, TAssembled, TPartial> Default
+    for FrameGroupStore<TSlot, N, TAssembled, TPartial>
+where
+    TPartial: PartialPayload<TSlot>,
+{
     fn default() -> Self {
         Self::new()
     }
@@ -289,6 +292,23 @@ fn freshness_from_timestamp(
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairPartial {
+    first: Option<u8>,
+    second: Option<u8>,
+}
+
+#[cfg(test)]
+impl PartialPayload<u8> for PairPartial {
+    fn from_present_slots(slots: &[Option<u8>]) -> Self {
+        Self {
+            first: slots[0],
+            second: slots[1],
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -305,18 +325,23 @@ mod tests {
     }
 
     #[test]
-    fn group_store_can_return_fresh_partial_observation() {
-        let mut store = FrameGroupStore::<u8, 3, [u8; 3]>::new();
+    fn group_store_can_return_custom_partial_observation() {
+        let mut store = FrameGroupStore::<u8, 2, [u8; 2], PairPartial>::new();
         store.record_slot(0, 10, 1_000, Some(10));
-
         let observation = store.observe(1_020, 50, |_| None);
 
         match observation {
             Observation::Available(available) => {
                 match available.payload {
                     ObservationPayload::Partial { partial, missing } => {
-                        assert_eq!(partial, vec![Some([0, 0, 0]), None, None]);
-                        assert_eq!(missing.missing_indices, vec![1, 2]);
+                        assert_eq!(
+                            partial,
+                            PairPartial {
+                                first: Some(10),
+                                second: None,
+                            }
+                        );
+                        assert_eq!(missing.missing_indices, vec![1]);
                     },
                     other => panic!("expected partial payload, got {other:?}"),
                 }
@@ -325,7 +350,7 @@ mod tests {
                 assert_eq!(available.meta.hardware_timestamp_us, Some(10));
                 assert_eq!(available.meta.source, ObservationSource::Stream);
             },
-            other => panic!("expected available partial fresh, got {other:?}"),
+            other => panic!("expected available custom partial, got {other:?}"),
         }
     }
 
@@ -371,17 +396,17 @@ mod tests {
     }
 
     #[test]
-    fn group_store_reports_explicit_missing_indices() {
+    fn group_store_default_partial_representation_is_vec_option() {
         let mut store = FrameGroupStore::<u8, 3, [u8; 3]>::new();
-        store.record_slot(1, 20, 1_000, Some(20));
+        store.record_slot(0, 10, 1_000, Some(10));
 
-        let observation = store.observe(1_010, 50, |_| None);
+        let observation = store.observe(1_020, 50, |_| None);
 
         match observation {
             Observation::Available(available) => match available.payload {
                 ObservationPayload::Partial { partial, missing } => {
-                    assert_eq!(partial, vec![None, Some([0, 0, 0]), None]);
-                    assert_eq!(missing.missing_indices, vec![0, 2]);
+                    assert_eq!(partial, vec![Some(10), None, None]);
+                    assert_eq!(missing.missing_indices, vec![1, 2]);
                 },
                 other => panic!("expected partial payload, got {other:?}"),
             },
@@ -432,6 +457,24 @@ mod tests {
                 assert_eq!(available.meta.host_rx_mono_us, Some(1_010));
                 assert_eq!(available.meta.hardware_timestamp_us, Some(11));
                 assert_eq!(available.meta.source, ObservationSource::Query);
+            },
+            other => panic!("expected available observation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_store_reports_explicit_missing_indices() {
+        let mut store = FrameGroupStore::<u8, 3, [u8; 3]>::new();
+        store.record_slot(1, 20, 1_000, Some(20));
+
+        let observation = store.observe(1_010, 50, |_| None);
+
+        match observation {
+            Observation::Available(available) => match available.payload {
+                ObservationPayload::Partial { missing, .. } => {
+                    assert_eq!(missing.missing_indices, vec![0, 2]);
+                },
+                other => panic!("expected partial payload, got {other:?}"),
             },
             other => panic!("expected available observation, got {other:?}"),
         }
