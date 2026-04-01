@@ -1,5 +1,5 @@
 use crate::query_coordinator::QueryKind;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use piper_protocol::ProtocolDiagnostic;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -52,7 +52,11 @@ impl DiagnosticBuffer {
             inner.retained.push_back(event.clone());
         }
 
-        inner.subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        inner.subscribers.retain(|subscriber| match subscriber.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 
     pub fn snapshot(&self) -> Vec<DiagnosticEvent> {
@@ -66,7 +70,9 @@ impl DiagnosticBuffer {
     }
 
     pub fn subscribe(&self) -> Receiver<DiagnosticEvent> {
-        let (tx, rx) = unbounded();
+        let capacity =
+            self.inner.lock().unwrap_or_else(|poison| poison.into_inner()).capacity.max(1);
+        let (tx, rx) = bounded(capacity);
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -149,5 +155,66 @@ mod tests {
                 }
             )]
         ));
+    }
+
+    #[test]
+    fn diagnostics_push_drops_events_for_full_slow_subscriber_without_blocking() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let buffer = DiagnosticBuffer::new(2);
+        let rx = buffer.subscribe();
+
+        let first = DiagnosticEvent::Query(QueryDiagnostic::Busy);
+        let second = DiagnosticEvent::Query(QueryDiagnostic::DiagnosticsOnlyTimeout {
+            query: QueryKind::JointLimit,
+        });
+        let third = DiagnosticEvent::Query(QueryDiagnostic::UnexpectedFrameForActiveQuery {
+            query: QueryKind::CollisionProtection,
+            can_id: 0x47B,
+        });
+
+        buffer.push(first.clone());
+        buffer.push(second.clone());
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let cloned = buffer.clone();
+        let third_for_thread = third.clone();
+        thread::spawn(move || {
+            cloned.push(third_for_thread);
+            done_tx.send(()).unwrap();
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("push should not block on a full subscriber queue");
+
+        assert_eq!(buffer.snapshot(), vec![second.clone(), third]);
+        assert_eq!(rx.recv_timeout(Duration::from_millis(10)).unwrap(), first);
+        assert_eq!(rx.recv_timeout(Duration::from_millis(10)).unwrap(), second);
+        assert!(rx.recv_timeout(Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn diagnostics_cleanup_discards_disconnected_subscribers() {
+        let buffer = DiagnosticBuffer::new(1);
+        let rx = buffer.subscribe();
+        drop(rx);
+
+        buffer.push(DiagnosticEvent::Query(QueryDiagnostic::Busy));
+        buffer.push(DiagnosticEvent::Query(
+            QueryDiagnostic::DiagnosticsOnlyTimeout {
+                query: QueryKind::EndLimit,
+            },
+        ));
+
+        assert_eq!(
+            buffer.snapshot(),
+            vec![DiagnosticEvent::Query(
+                QueryDiagnostic::DiagnosticsOnlyTimeout {
+                    query: QueryKind::EndLimit,
+                }
+            )]
+        );
     }
 }

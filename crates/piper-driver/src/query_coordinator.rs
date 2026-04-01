@@ -29,6 +29,7 @@ pub struct QueryCoordinator {
 }
 
 #[derive(Debug)]
+#[must_use = "keep the query guard alive until the query is finished"]
 pub struct QueryGuard<'a> {
     coordinator: &'a QueryCoordinator,
     token: u64,
@@ -48,6 +49,16 @@ impl QueryCoordinator {
         }
     }
 
+    /// Begin a single-flight query.
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use piper_driver::{QueryCoordinator, QueryKind};
+    ///
+    /// let coordinator = QueryCoordinator::new();
+    /// coordinator.try_begin(QueryKind::JointLimit);
+    /// ```
+    #[must_use = "dropping the returned guard ends the active query immediately"]
     pub fn try_begin(&self, kind: QueryKind) -> Result<QueryGuard<'_>, QueryError> {
         let mut active = self.active.lock().unwrap_or_else(|poison| poison.into_inner());
 
