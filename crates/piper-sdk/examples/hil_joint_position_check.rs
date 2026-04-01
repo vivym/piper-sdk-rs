@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 const MAX_SPEED_PERCENT: u8 = 10;
 const MAX_DELTA_RAD: f64 = 0.035;
 const DEFAULT_SETTLE_TIMEOUT_MS: u64 = 10_000;
-const POSITION_SETTLE_TOLERANCE_RAD: f64 = 0.05;
+const POSITION_SETTLE_TOLERANCE_RAD: f64 = 0.002;
+const MIN_PROGRESS_RAD: f64 = 0.0005;
 const INITIAL_MONITOR_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(200);
 const INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const POSITION_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -145,6 +146,7 @@ where
     let moved_positions = wait_for_joint_settle(
         observer,
         joint_index,
+        initial_joint,
         target_joint,
         Duration::from_millis(args.settle_timeout_ms),
         POSITION_SETTLE_POLL_INTERVAL,
@@ -167,6 +169,7 @@ where
     let returned_positions = wait_for_joint_settle(
         observer,
         joint_index,
+        target_joint,
         initial_joint,
         Duration::from_millis(args.settle_timeout_ms),
         POSITION_SETTLE_POLL_INTERVAL,
@@ -222,6 +225,7 @@ where
 fn wait_for_joint_settle<Capability>(
     observer: &piper_sdk::client::observer::Observer<Capability>,
     joint_index: usize,
+    start_joint: Rad,
     target_joint: Rad,
     timeout: Duration,
     poll_interval: Duration,
@@ -230,6 +234,10 @@ where
     Capability: MotionCapability,
 {
     let start = Instant::now();
+    let total_delta = (target_joint.0 - start_joint.0).abs();
+    let progress_threshold = (total_delta * 0.25).max(MIN_PROGRESS_RAD).min(total_delta);
+    let mut progress_seen = false;
+
     loop {
         if start.elapsed() >= timeout {
             return Err(RobotError::Timeout {
@@ -240,8 +248,15 @@ where
         let remaining = timeout.saturating_sub(start.elapsed());
         let positions =
             wait_for_monitor_snapshot(remaining, poll_interval, || observer.joint_positions())?;
+        let observed_joint = positions[joint_index];
+        let observed_delta = (observed_joint.0 - start_joint.0).abs();
+        let remaining_error = (observed_joint.0 - target_joint.0).abs();
 
-        if (positions[joint_index].0 - target_joint.0).abs() <= POSITION_SETTLE_TOLERANCE_RAD {
+        if !progress_seen && observed_delta >= progress_threshold {
+            progress_seen = true;
+        }
+
+        if progress_seen && remaining_error <= POSITION_SETTLE_TOLERANCE_RAD {
             return Ok(positions);
         }
 
@@ -273,37 +288,32 @@ fn validate_args(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn validate_args_rejects_excessive_speed() {
+    let args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 11,
+        settle_timeout_ms: 10_000,
+    };
 
-    #[test]
-    fn validate_args_rejects_excessive_speed() {
-        let args = Args {
-            interface: "can0".to_string(),
-            baud_rate: 1_000_000,
-            joint: 1,
-            delta_rad: 0.02,
-            speed_percent: 11,
-            settle_timeout_ms: 10_000,
-        };
+    let error = validate_args(&args).expect_err("speed > 10 must be rejected");
+    assert!(error.contains("speed_percent"));
+}
 
-        let error = validate_args(&args).expect_err("speed > 10 must be rejected");
-        assert!(error.contains("speed_percent"));
-    }
+#[test]
+fn validate_args_rejects_excessive_delta() {
+    let args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.04,
+        speed_percent: 10,
+        settle_timeout_ms: 10_000,
+    };
 
-    #[test]
-    fn validate_args_rejects_excessive_delta() {
-        let args = Args {
-            interface: "can0".to_string(),
-            baud_rate: 1_000_000,
-            joint: 1,
-            delta_rad: 0.04,
-            speed_percent: 10,
-            settle_timeout_ms: 10_000,
-        };
-
-        let error = validate_args(&args).expect_err("delta > 0.035 rad must be rejected");
-        assert!(error.contains("delta_rad"));
-    }
+    let error = validate_args(&args).expect_err("delta > 0.035 rad must be rejected");
+    assert!(error.contains("delta_rad"));
 }
