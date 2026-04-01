@@ -132,21 +132,21 @@ The driver introduces a reusable observation module rather than baking validity 
 Core types:
 
 ```rust
-pub enum Observation<T> {
-    Available(Available<T>),
+pub enum Observation<TComplete, TPartial = TComplete> {
+    Available(Available<TComplete, TPartial>),
     Unavailable,
 }
 
-pub struct Available<T> {
-    pub payload: ObservationPayload<T>,
+pub struct Available<TComplete, TPartial = TComplete> {
+    pub payload: ObservationPayload<TComplete, TPartial>,
     pub freshness: Freshness,
     pub meta: ObservationMeta,
 }
 
-pub enum ObservationPayload<T> {
-    Complete(T),
+pub enum ObservationPayload<TComplete, TPartial = TComplete> {
+    Complete(TComplete),
     Partial {
-        partial: PartialPayload<T>,
+        partial: TPartial,
         missing: MissingSet,
     },
 }
@@ -165,8 +165,9 @@ pub struct ObservationMeta {
 }
 ```
 
-`PartialPayload<T>` is not a default-filled or previously preserved `T`. It is a
-family-specific partial view that contains only currently present members.
+For grouped observations, `TPartial` is not a default-filled or previously
+preserved `TComplete`. It is a family-specific partial view that contains only
+currently present members.
 Missing members must be structurally absent from the payload, not represented by
 default values and not backfilled from prior complete observations.
 
@@ -184,7 +185,7 @@ competing enum variants.
 Driver storage is split into two reusable primitives:
 
 - `SingleFrameStore<T>`
-- `FrameGroupStore<TSlot, const N: usize, TAssembled>`
+- `FrameGroupStore<TSlot, const N: usize, TAssembled, TPartial = Vec<Option<TSlot>>>`
 
 Responsibilities of `FrameGroupStore`:
 
@@ -195,9 +196,16 @@ Responsibilities of `FrameGroupStore`:
 - expose missing-slot information
 - support query freshness boundaries so query APIs can demand post-query data
 
-For single-frame observations, `ObservationPayload::Partial` is not used. A
-single-frame state is either `Unavailable` or `Available` with
-`ObservationPayload::Complete(_)` and a freshness value.
+`FrameGroupStore` is allowed to expose a distinct `TPartial` because grouped
+state is assembled from slot members whose partial shape is not generally the
+same as the final complete business value. `Vec<Option<TSlot>>` is an internal
+store-level default partial representation only. It is not part of the frozen
+public getter surface for the first migration wave. Public getters for rebuilt
+families must expose named domain-specific partial types where this spec names
+them.
+
+For single-frame observations, `ObservationPayload::Partial` is not used and the
+default shorthand `Observation<TComplete>` remains sufficient.
 
 ### Business State Types
 
@@ -222,6 +230,17 @@ pub struct JointLimit {
 ```
 
 `CollisionProtectionLevel` is a typed domain enum/value type constrained to valid levels only. Out-of-range raw bytes never create this type.
+
+Grouped rebuilt families also define named partial-domain types, for example:
+
+- `PartialJointLimitConfig`
+- `PartialJointAccelConfig`
+- `PartialJointDriverLowSpeed`
+- `PartialEndPose`
+
+These types are allowed to differ structurally from their corresponding complete
+business types. A partial type should model “only the members currently
+present,” not “a complete value with defaults filled in.”
 
 ### Diagnostics Channel
 
@@ -265,11 +284,11 @@ This allows:
 Current “raw state struct” getters are replaced with observation-returning getters for the rebuilt families:
 
 - `get_collision_protection() -> Observation<CollisionProtection>`
-- `get_joint_limit_config() -> Observation<JointLimitConfig>`
-- `get_joint_accel_config() -> Observation<JointAccelConfig>`
+- `get_joint_limit_config() -> Observation<JointLimitConfig, PartialJointLimitConfig>`
+- `get_joint_accel_config() -> Observation<JointAccelConfig, PartialJointAccelConfig>`
 - `get_end_limit_config() -> Observation<EndLimitConfig>`
-- `get_joint_driver_low_speed() -> Observation<JointDriverLowSpeed>`
-- `get_end_pose() -> Observation<EndPose>`
+- `get_joint_driver_low_speed() -> Observation<JointDriverLowSpeed, PartialJointDriverLowSpeed>`
+- `get_end_pose() -> Observation<EndPose, PartialEndPose>`
 
 This removes the possibility of mistaking default-zero values for a real state snapshot.
 
@@ -354,9 +373,26 @@ Initial nominal periods:
 
 Query-backed configuration observations follow different rules:
 
-- before any successful query: `Unavailable`
+- before any successful query: `Unavailable`, unless an active query has already
+  produced a post-query partial observation for that family
 - after a successful query and before disconnect/reset/invalidation: `Complete`
-- during an in-flight query waiting for post-query data: the query API may fail with timeout, but previously cached complete data does not automatically become `Stale`
+- during an in-flight query waiting for post-query data: the query API may fail with timeout, but previously published complete data does not automatically become `Stale` or get replaced by an in-flight partial
+
+Query-backed configuration getters publish observations according to these
+visibility rules:
+
+- if no successful query has ever published a complete value, the getter stays
+  `Unavailable` until post-query data is present
+- if no successful query has ever published a complete value and the active
+  query has received only some required members, the getter may publish
+  `ObservationPayload::Partial` for that query-backed family
+- once a successful query has published `Complete`, later in-flight queries do
+  not replace that published value with `Partial`; the previously published
+  complete observation remains visible until a new query publishes a new
+  complete observation or the family is explicitly invalidated
+- if an in-flight query times out before publishing `Complete`, any previously
+  published complete observation remains visible; otherwise the getter returns
+  to `Unavailable`
 
 For this spec, invalidation is limited to:
 
@@ -412,11 +448,11 @@ families.
 State getters:
 
 - `get_collision_protection() -> Observation<CollisionProtection>`
-- `get_joint_limit_config() -> Observation<JointLimitConfig>`
-- `get_joint_accel_config() -> Observation<JointAccelConfig>`
+- `get_joint_limit_config() -> Observation<JointLimitConfig, PartialJointLimitConfig>`
+- `get_joint_accel_config() -> Observation<JointAccelConfig, PartialJointAccelConfig>`
 - `get_end_limit_config() -> Observation<EndLimitConfig>`
-- `get_joint_driver_low_speed() -> Observation<JointDriverLowSpeed>`
-- `get_end_pose() -> Observation<EndPose>`
+- `get_joint_driver_low_speed() -> Observation<JointDriverLowSpeed, PartialJointDriverLowSpeed>`
+- `get_end_pose() -> Observation<EndPose, PartialEndPose>`
 
 Active query methods:
 
@@ -480,7 +516,7 @@ The following are intentional breaking changes:
 
 - remove default-zero config reads as a supported behavior
 - remove `valid_mask` and `is_valid` from rebuilt public state types
-- replace rebuilt getters with `Observation<T>` return types
+- replace rebuilt getters with `Observation<TComplete, TPartial>` return types
 - remove or rename readiness APIs whose semantics are weaker than observation readiness
 - replace ambiguous FPS outputs with explicit metric categories
 

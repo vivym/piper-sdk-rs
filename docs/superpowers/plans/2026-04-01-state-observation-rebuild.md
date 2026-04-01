@@ -28,7 +28,7 @@ cd ../piper-sdk-rs-state-observation
 - `crates/piper-protocol/src/diagnostics.rs`
   - protocol-layer diagnostic enums and decode result wrapper for rebuilt feedback families
 - `crates/piper-driver/src/observation.rs`
-  - `Observation<T>`, `Available<T>`, `ObservationPayload<T>`, `Freshness`, `ObservationMeta`, reusable stores
+  - `Observation<TComplete, TPartial>`, `Available<TComplete, TPartial>`, `ObservationPayload<TComplete, TPartial>`, `Freshness`, `ObservationMeta`, reusable stores
 - `crates/piper-driver/src/diagnostics.rs`
   - `DiagnosticEvent`, `QueryDiagnostic`, bounded retention buffer, subscriber fan-out
 - `crates/piper-driver/src/query_coordinator.rs`
@@ -201,20 +201,20 @@ Expected: FAIL because the observation module and stores do not exist yet.
 - [ ] **Step 3: Implement observation core types and reusable stores**
 
 ```rust
-pub enum Observation<T> {
-    Available(Available<T>),
+pub enum Observation<TComplete, TPartial = TComplete> {
+    Available(Available<TComplete, TPartial>),
     Unavailable,
 }
 
-pub struct Available<T> {
-    pub payload: ObservationPayload<T>,
+pub struct Available<TComplete, TPartial = TComplete> {
+    pub payload: ObservationPayload<TComplete, TPartial>,
     pub freshness: Freshness,
     pub meta: ObservationMeta,
 }
 
-pub enum ObservationPayload<T> {
-    Complete(T),
-    Partial { partial: PartialPayload<T>, missing: MissingSet },
+pub enum ObservationPayload<TComplete, TPartial = TComplete> {
+    Complete(TComplete),
+    Partial { partial: TPartial, missing: MissingSet },
 }
 
 pub struct Complete<T> {
@@ -222,7 +222,7 @@ pub struct Complete<T> {
     pub meta: ObservationMeta,
 }
 
-pub trait PartialPayload<T>: Sized {
+trait PartialPayload<T>: Sized {
     fn from_present_slots(slots: &[Option<T>]) -> Self;
 }
 
@@ -236,6 +236,12 @@ pub enum ObservationSource {
     Stream,
     Query,
 }
+
+type SlotPartial<T> = Vec<Option<T>>;
+
+pub struct FrameGroupStore<TSlot, const N: usize, TAssembled, TPartial = SlotPartial<TSlot>>
+where
+    TPartial: PartialPayload<TSlot>;
 ```
 
 - [ ] **Step 4: Run the observation test set**
@@ -281,6 +287,16 @@ fn query_coordinator_is_fail_fast_when_busy() {
     let err = coordinator.try_begin(QueryKind::CollisionProtection).unwrap_err();
     assert_eq!(err, QueryError::Busy);
 }
+
+#[test]
+fn active_query_is_observable_while_guard_is_alive() {
+    let coordinator = QueryCoordinator::new();
+    let guard = coordinator.try_begin(QueryKind::JointLimit).unwrap();
+    let active = coordinator.active_query().unwrap();
+
+    assert_eq!(active.kind, QueryKind::JointLimit);
+    assert_eq!(active.token, guard.token());
+}
 ```
 
 - [ ] **Step 2: Run the focused tests to verify they fail**
@@ -299,21 +315,51 @@ pub enum QueryDiagnostic {
 }
 
 pub struct QueryCoordinator {
-    in_flight: Mutex<Option<QueryKind>>,
+    state: Mutex<Option<ActiveQuery>>,
+    next_token: AtomicU64,
+}
+
+pub struct ActiveQuery {
+    pub kind: QueryKind,
+    pub token: u64,
 }
 
 pub struct QueryGuard<'a> {
-    slot: MutexGuard<'a, Option<QueryKind>>,
+    coordinator: &'a QueryCoordinator,
+    token: u64,
 }
 
 impl QueryCoordinator {
     pub fn try_begin(&self, kind: QueryKind) -> Result<QueryGuard<'_>, QueryError> {
-        let mut slot = self.in_flight.lock().unwrap();
-        if slot.is_some() {
+        let mut state = self.state.lock().unwrap();
+        if state.is_some() {
             return Err(QueryError::Busy);
         }
-        *slot = Some(kind);
-        Ok(QueryGuard { slot })
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        *state = Some(ActiveQuery { kind, token });
+        Ok(QueryGuard {
+            coordinator: self,
+            token,
+        })
+    }
+
+    pub fn active_query(&self) -> Option<ActiveQuery> {
+        self.state.lock().unwrap().clone()
+    }
+}
+
+impl QueryGuard<'_> {
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+}
+
+impl Drop for QueryGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.coordinator.state.lock().unwrap();
+        if state.as_ref().is_some_and(|active| active.token == self.token) {
+            *state = None;
+        }
     }
 }
 
@@ -387,7 +433,7 @@ pub struct CollisionProtection {
     pub levels: [CollisionProtectionLevel; 6],
 }
 
-pub fn get_joint_limit_config(&self) -> Observation<JointLimitConfig> {
+pub fn get_joint_limit_config(&self) -> Observation<JointLimitConfig, PartialJointLimitConfig> {
     self.ctx.joint_limit_store.observe(now_host_mono_us())
 }
 
@@ -395,32 +441,37 @@ pub fn query_joint_limit_config(
     &self,
     timeout: Duration,
 ) -> Result<Complete<JointLimitConfig>, QueryError> {
-    let _guard = self.query_coordinator.try_begin(QueryKind::JointLimit)?;
-    self.clear_joint_limit_store();
+    let guard = self.query_coordinator.try_begin(QueryKind::JointLimit)?;
+    self.begin_joint_limit_query_attempt(guard.token());
     self.send_joint_limit_queries()?;
-    self.wait_for_complete_joint_limit_config(timeout)
+    self.wait_for_complete_joint_limit_config(timeout, guard.token())
 }
 
 pub fn query_joint_accel_config(
     &self,
     timeout: Duration,
 ) -> Result<Complete<JointAccelConfig>, QueryError> {
-    let _guard = self.query_coordinator.try_begin(QueryKind::JointAccel)?;
-    self.clear_joint_accel_store();
+    let guard = self.query_coordinator.try_begin(QueryKind::JointAccel)?;
+    self.begin_joint_accel_query_attempt(guard.token());
     self.send_joint_accel_queries()?;
-    self.wait_for_complete_joint_accel_config(timeout)
+    self.wait_for_complete_joint_accel_config(timeout, guard.token())
 }
 
 pub fn query_end_limit_config(
     &self,
     timeout: Duration,
 ) -> Result<Complete<EndLimitConfig>, QueryError> {
-    let _guard = self.query_coordinator.try_begin(QueryKind::EndLimit)?;
-    self.clear_end_limit_store();
+    let guard = self.query_coordinator.try_begin(QueryKind::EndLimit)?;
+    self.begin_end_limit_query_attempt(guard.token());
     self.send_end_limit_query()?;
-    self.wait_for_complete_end_limit_config(timeout)
+    self.wait_for_complete_end_limit_config(timeout, guard.token())
 }
 ```
+
+The `begin_*_query_attempt()` helpers reset only per-query staging state. They
+must not clear the last published complete observation. A query attempt publishes
+into the public getter state only after a post-query complete result is assembled
+for that query token.
 
 - [ ] **Step 4: Run the rebuilt-family test set**
 
