@@ -165,11 +165,11 @@
    - `Connected in ...`
    - `First feedback arrived in ...`
    - `First complete monitor snapshot in ...`
-   - `Observation window completed in ...`
+   - `Observation window finished after ...`
 3. 记录规则如下：
    - `Connected in ...` 记录为 connection budget 证据，必须 `<= 5s`
    - `First complete monitor snapshot in ...` 记录为 first snapshot budget 证据，必须 `<= 200ms`
-   - `Observation window completed in ...` 记录为 `15 min` observation window 完成证据
+   - `Observation window finished after ...` 记录为 `15 min` observation window 完成证据
    - `First feedback arrived in ...` 作为辅助佐证，帮助判断是否真的看到了 live feedback
 4. 让 helper 完整运行满 `15 min` observation window。
 5. 必要时在 `Terminal 2` 并行运行：
@@ -199,7 +199,7 @@
 ### 需要填写到结果模板的字段与 checklist 勾选
 
 - Checklist: `Phase 1: Connection and Read-Only Observation` 里的 `client_monitor_hil_check`、`<= 5s` connection budget、`<= 200ms` first snapshot、`15 min` observation window、`robot_monitor` / `state_api_demo` 旁证
-- Results template: `Phase 1: Connection and Read-Only Observation`，重点写 `Connection budget` 对应 `Connected in ...`，`First snapshot budget` 对应 `First complete monitor snapshot in ...`，`Observation window` 对应 `Observation window completed in ...`，并补充 `Observed` / `Notes` / `Artifacts`
+- Results template: `Phase 1: Connection and Read-Only Observation`，重点写 `Connection budget` 对应 `Connected in ...`，`First snapshot budget` 对应 `First complete monitor snapshot in ...`，`Observation window` 对应 `Observation window finished after ...`，并补充 `Observed` / `Notes` / `Artifacts`
 
 ## Phase 2: Safe Lifecycle and State Transitions
 
@@ -456,9 +456,10 @@
 
 ## 最小完整执行序列
 
-下面是一条最小、按顺序的执行链骨架。它**不替代**上面的 phase 细则，不能省略 rejected-state rerun、fault induction/restoration、fresh helper rerun、readable-state recovery confirmation 这些检查：
+下面是一条最小、按顺序的执行链骨架。它**不替代**上面的 phase 细则，也不能跳过 rejected-state rerun、fault induction/restoration、fresh helper rerun、readable-state recovery confirmation 这些步骤：
 
 ```bash
+# Phase 0: preflight
 git rev-parse HEAD
 uname -a
 rustc --version
@@ -466,26 +467,35 @@ cargo --version
 ip -details link show can0
 ip -statistics link show can0
 cargo run -p piper-sdk --example robot_monitor -- --interface can0
+
+# Phase 1: read-only observation
 cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
+
+# Phase 2: lifecycle and rejected-state gating
 cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
 cargo run -p piper-cli -- shell
 connect socketcan:can0
 enable
+# keep this shell session active; do not `disable` yet
+cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
 disable
 cargo run -p piper-sdk --example robot_monitor -- --interface can0
 exit
+
+# Phase 2: explicit stop path and read-only corroboration
 cargo run -p piper-cli -- stop --target socketcan:can0
 cargo run -p piper-sdk --example state_api_demo -- --interface can0
-cargo run -p piper-cli -- shell
-connect socketcan:can0
-enable
-exit
-cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
-sudo ip link set can0 down
+
+# Phase 4: fault active observation, then recovery
 cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
+sudo ip link set can0 down
+# while the fault is active, record timeout / disconnect / missing-feedback evidence from the running helper
 sudo ip link set can0 up type can bitrate 1000000
+# after recovery, rerun the fresh helper to prove reconnect and first snapshot timing
 cargo run -p piper-sdk --example client_monitor_hil_check -- --interface can0 --baud-rate 1000000 --observation-window-secs 900
 cargo run -p piper-sdk --example robot_monitor -- --interface can0
+
+# final motion probe only after recovery evidence exists
 cargo run -p piper-cli -- shell
 connect socketcan:can0
 move --joints 0.02 --force
