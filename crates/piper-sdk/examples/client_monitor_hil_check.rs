@@ -96,34 +96,56 @@ where
     let observation_started = Instant::now();
     let observer = robot.observer().clone();
 
+    println!("Waiting for the first feedback...");
+    let first_feedback_started = Instant::now();
+    wait_for_first_feedback(
+        CONNECT_TIMEOUT,
+        INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL,
+        || observer.is_connected(),
+    )?;
+    println!(
+        "First feedback arrived in {:.3?} (connection age {:.3?})",
+        first_feedback_started.elapsed(),
+        observer.connection_age()
+    );
+
     println!("Waiting for the first complete monitor snapshot...");
     let first_snapshot_started = Instant::now();
-    let joint_positions = wait_for_monitor_snapshot(
+    let initial_snapshot = wait_for_monitor_snapshot(
         INITIAL_MONITOR_SNAPSHOT_TIMEOUT,
         INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL,
-        || observer.joint_positions(),
+        || {
+            Ok(InitialMonitorSnapshot {
+                joint_positions: observer.joint_positions()?,
+                end_pose: observer.end_pose()?,
+                control_enabled: observer.is_all_enabled_confirmed(),
+            })
+        },
     )?;
     let first_snapshot_elapsed = first_snapshot_started.elapsed();
-    println!("First joint snapshot in {:.3?}", first_snapshot_elapsed);
-
-    let end_pose = observer.end_pose()?;
-    let control_enabled = observer.is_all_enabled_confirmed();
-    print_snapshot("initial", &joint_positions, &end_pose, control_enabled);
+    println!(
+        "First complete monitor snapshot in {:.3?}",
+        first_snapshot_elapsed
+    );
+    print_snapshot("initial", &initial_snapshot);
 
     let mut iteration = 0_u64;
     while observation_started.elapsed() < observation_window {
         iteration += 1;
         std::thread::sleep(Duration::from_secs(1));
 
-        let joint_positions = observer.joint_positions()?;
-        let end_pose = observer.end_pose()?;
-        let control_enabled = observer.is_all_enabled_confirmed();
-        print_snapshot(
-            &format!("sample {iteration}"),
-            &joint_positions,
-            &end_pose,
-            control_enabled,
-        );
+        let snapshot = wait_for_monitor_snapshot(
+            INITIAL_MONITOR_SNAPSHOT_TIMEOUT,
+            INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL,
+            || {
+                Ok(InitialMonitorSnapshot {
+                    joint_positions: observer.joint_positions()?,
+                    end_pose: observer.end_pose()?,
+                    control_enabled: observer.is_all_enabled_confirmed(),
+                })
+            },
+        )?;
+        print_snapshot(&format!("sample {iteration}"), &snapshot);
     }
 
     println!(
@@ -134,19 +156,14 @@ where
     Ok(())
 }
 
-fn print_snapshot(
-    label: &str,
-    joint_positions: &piper_sdk::client::types::JointArray<piper_sdk::client::types::Rad>,
-    end_pose: &piper_sdk::driver::state::EndPoseState,
-    control_enabled: bool,
-) {
+fn print_snapshot(label: &str, snapshot: &InitialMonitorSnapshot) {
     println!(
         "{label}: J1={:.4} rad, end_pose=({:.4}, {:.4}, {:.4}), enabled={}",
-        joint_positions[0].0,
-        end_pose.end_pose[0],
-        end_pose.end_pose[1],
-        end_pose.end_pose[2],
-        control_enabled
+        snapshot.joint_positions[0].0,
+        snapshot.end_pose.end_pose[0],
+        snapshot.end_pose.end_pose[1],
+        snapshot.end_pose.end_pose[2],
+        snapshot.control_enabled
     );
 }
 
@@ -174,51 +191,84 @@ where
             });
         }
 
-        std::thread::sleep(poll_interval.min(timeout.saturating_sub(start.elapsed())));
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let sleep_duration = poll_interval.min(remaining);
+        if sleep_duration.is_zero() {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        std::thread::sleep(sleep_duration);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use piper_sdk::client::types::MonitorStateSource;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+fn wait_for_first_feedback<Check>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut check: Check,
+) -> ClientResult<()>
+where
+    Check: FnMut() -> bool,
+{
+    let start = Instant::now();
+    loop {
+        if check() {
+            return Ok(());
+        }
 
-    #[test]
-    fn wait_for_monitor_snapshot_retries_warmup_errors_until_ready() {
-        wait_for_monitor_snapshot_retries_warmup_errors_until_ready_impl();
+        if start.elapsed() >= timeout {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let sleep_duration = poll_interval.min(remaining);
+        if sleep_duration.is_zero() {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        std::thread::sleep(sleep_duration);
     }
+}
 
-    pub(crate) fn wait_for_monitor_snapshot_retries_warmup_errors_until_ready_impl() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let read = {
-            let attempts = Arc::clone(&attempts);
-            move || {
-                let current = attempts.fetch_add(1, Ordering::SeqCst);
-                if current < 2 {
-                    Err(RobotError::monitor_state_incomplete(
-                        MonitorStateSource::JointPosition,
-                        0b001,
-                        0b111,
-                    ))
-                } else {
-                    Ok(42_u8)
-                }
-            }
-        };
-
-        let value =
-            wait_for_monitor_snapshot(Duration::from_millis(50), Duration::from_millis(1), read)
-                .expect("helper should retry until the snapshot is ready");
-        assert_eq!(value, 42);
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    }
+#[derive(Debug)]
+struct InitialMonitorSnapshot {
+    joint_positions: piper_sdk::client::types::JointArray<piper_sdk::client::types::Rad>,
+    end_pose: piper_sdk::driver::state::EndPoseState,
+    control_enabled: bool,
 }
 
 #[cfg(test)]
 #[test]
 fn wait_for_monitor_snapshot_retries_warmup_errors_until_ready() {
-    tests::wait_for_monitor_snapshot_retries_warmup_errors_until_ready_impl();
+    use piper_sdk::client::types::MonitorStateSource;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let read = {
+        let attempts = Arc::clone(&attempts);
+        move || {
+            let current = attempts.fetch_add(1, Ordering::SeqCst);
+            if current < 2 {
+                Err(RobotError::monitor_state_incomplete(
+                    MonitorStateSource::JointPosition,
+                    0b001,
+                    0b111,
+                ))
+            } else {
+                Ok(42_u8)
+            }
+        }
+    };
+
+    let value =
+        wait_for_monitor_snapshot(Duration::from_millis(50), Duration::from_millis(1), read)
+            .expect("helper should retry until the snapshot is ready");
+    assert_eq!(value, 42);
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
 }
