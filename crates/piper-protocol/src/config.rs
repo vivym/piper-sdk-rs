@@ -245,6 +245,19 @@ mod tests {
     }
 
     #[test]
+    fn decode_collision_protection_propagates_hardware_timestamp() {
+        let mut frame = PiperFrame::new_standard(0x47B, &[1, 2, 3, 4, 5, 6, 0, 0]);
+        frame.timestamp_us = 654_321;
+
+        match decode_collision_protection_feedback(frame) {
+            DecodeResult::Data(typed) => {
+                assert_eq!(typed.hardware_timestamp_us, Some(654_321));
+            },
+            other => panic!("expected typed data, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn decode_collision_protection_mismatched_can_id_returns_ignore() {
         let frame = PiperFrame::new_standard(0x999, &[1, 2, 3, 4, 5, 6, 0, 0]);
         assert!(matches!(
