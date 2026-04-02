@@ -12,10 +12,11 @@
 2. [快速开始](#快速开始)
 3. [控制模式说明](#控制模式说明)
 4. [运动类型配置](#运动类型配置)
-5. [使用示例](#使用示例)
-6. [版本要求](#版本要求)
-7. [常见问题](#常见问题)
-8. [迁移指南](#迁移指南)
+5. [验证与 HIL Helper](#验证与-hil-helper)
+6. [使用示例](#使用示例)
+7. [版本要求](#版本要求)
+8. [常见问题](#常见问题)
+9. [迁移指南](#迁移指南)
 
 ---
 
@@ -76,7 +77,7 @@ let positions = JointArray::from([
     Rad(0.0),   // J5
     Rad(0.0),   // J6
 ]);
-robot.Piper.send_position_command_batch(&positions)?;
+robot.send_position_command(&positions)?;
 ```
 
 ### 3. 末端位姿控制
@@ -161,12 +162,39 @@ let robot = robot.enable_position_mode(config)?;
 | 运动类型 | 应使用的控制方法 |
 |---------|----------------|
 | `Joint` | `command_position()` 或 `Piper.send_position_command_batch()` |
-| `Cartesian` | `command_cartesian_pose()` 或 `Piper.send_cartesian_pose()` |
+| `Joint` | `send_position_command()` / `command_position_from_snapshot()` |
+| `Cartesian` | `command_cartesian_pose()` |
 | `Linear` | `move_linear()` |
 | `Circular` | `move_circular()` |
 | `ContinuousPositionVelocity` | 待实现 |
 
 **重要**：必须根据配置的 `motion_type` 使用对应的控制方法，否则可能导致运动异常。
+
+## 验证与 HIL Helper
+
+建议每种模式都用对应的 HIL helper 单独验收，而不是只看“机器人动了没有”。
+
+| 模式 | 正确 API | 推荐验证 helper |
+|---------|----------------|----------------|
+| `MotionType::Joint` | `send_position_command()` | `hil_joint_position_check` |
+| `MotionType::Cartesian` | `command_cartesian_pose()` | `hil_cartesian_pose_check` |
+| `MotionType::Linear` | `move_linear()` | `hil_linear_motion_check` |
+| `MotionType::Circular` | `move_circular()` | `hil_circular_motion_check` |
+| `MitMode` | `command_torques()` | `hil_mit_hold_check` |
+| `ReplayMode` | `replay_recording()` | `hil_replay_mode_check` |
+| gripper | `open_gripper()` / `close_gripper()` / `set_gripper()` | `hil_gripper_check` |
+
+验证入口和 soak 命令见：
+
+- [motion_command_validation_matrix.md](testing/motion_command_validation_matrix.md)
+
+额外说明：
+
+- `send_position_command()` 只适用于 `MotionType::Joint`
+- `command_cartesian_pose()` 只适用于 `MotionType::Cartesian`
+- `move_linear()` 只适用于 `MotionType::Linear`
+- `move_circular()` 只适用于 `MotionType::Circular`
+- `MitMode` 和 `ReplayMode` 不属于 `PositionMode` 的 `motion_type` 变体，必须使用各自单独的 helper 和验收标准
 
 ---
 
@@ -278,15 +306,15 @@ let config = MitModeConfig {
 };
 let robot = robot.enable_mit_mode(config)?;
 
-// 发送 MIT 控制命令
-robot.command_torques(
-    Joint::J1,
-    Rad(1.0),           // 位置参考
-    0.5,                // 速度参考（rad/s）
-    10.0,               // 位置增益 (kp)
-    2.0,                // 速度增益 (kd)
-    NewtonMeter(5.0),   // 力矩参考
-)?;
+// 发送 MIT 控制命令（6 关节批量）
+let positions = JointArray::from([
+    Rad(1.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0),
+]);
+let velocities = JointArray::splat(0.0);
+let kp = JointArray::from([10.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+let kd = JointArray::from([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+let torques = JointArray::splat(NewtonMeter(0.0));
+robot.command_torques(&positions, &velocities, &kp, &kd, &torques)?;
 ```
 
 ### 示例 6：批量发送末端位姿（轨迹跟踪）
@@ -311,8 +339,10 @@ let trajectory = vec![
     (Position3D::new(0.3, 0.2, 0.2), EulerAngles::new(0.0, 180.0, 0.0)),
 ];
 
-// 批量发送
-robot.Piper.send_cartesian_pose_batch(&trajectory)?;
+// 逐点发送
+for (position, orientation) in trajectory {
+    robot.command_cartesian_pose(position, orientation)?;
+}
 ```
 
 ---
@@ -356,7 +386,7 @@ println!("Firmware version: {:?}", firmware_version);
 **A**: 请检查以下几点：
 
 1. **运动类型配置**：确保使用 `MotionType::Cartesian` 或 `MotionType::Linear`
-2. **使用方法匹配**：必须使用 `command_cartesian_pose()` 或 `move_linear()`，而不是 `command_position()`
+2. **使用方法匹配**：`Cartesian` 用 `command_cartesian_pose()`，`Linear` 用 `move_linear()`，`Circular` 用 `move_circular()`
 3. **单位正确**：位置单位是**米（m）**，角度单位是**度（degree）**
 
 ### Q3: 圆弧运动需要发送起点吗？
@@ -370,6 +400,20 @@ println!("Firmware version: {:?}", firmware_version);
 ### Q5: 如何确保指令顺序正确？
 
 **A**: SDK 内部使用 Frame Package 机制，利用 CAN 总线优先级保证指令顺序。对于圆弧运动，所有相关帧会打包发送，确保顺序正确。
+
+### Q6: 如何验证“模式和 API 匹配”真的没写错？
+
+**A**: 不要只看示教器或肉眼。请按模式运行对应的 HIL helper：
+
+- `Joint` -> `hil_joint_position_check`
+- `Cartesian` -> `hil_cartesian_pose_check`
+- `Linear` -> `hil_linear_motion_check`
+- `Circular` -> `hil_circular_motion_check`
+- `MitMode` -> `hil_mit_hold_check`
+- `ReplayMode` -> `hil_replay_mode_check`
+- gripper -> `hil_gripper_check`
+
+完整命令和 soak 方案见 [motion_command_validation_matrix.md](testing/motion_command_validation_matrix.md)。
 
 ---
 
@@ -418,10 +462,10 @@ robot.command_cartesian_pose(
 
 - [位置控制与 MOVE 模式架构调研报告](position_control_and_move_mode_analysis.md)
 - [位置控制与 MOVE 模式执行方案](position_control_move_mode_implementation_plan.md)
+- [Motion Command Validation Matrix](testing/motion_command_validation_matrix.md)
 - [协议文档](protocol.md)
 
 ---
 
 **文档版本**: v1.0
 **最后更新**: 2024
-
