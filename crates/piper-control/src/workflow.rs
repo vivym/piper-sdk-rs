@@ -116,6 +116,16 @@ where
     active.disable(DisableConfig::default()).map_err(Into::into)
 }
 
+pub fn active_park_blocking<Capability>(
+    robot: &Piper<Active<PositionMode>, Capability>,
+    profile: &ControlProfile,
+) -> Result<()>
+where
+    Capability: MotionCapability,
+{
+    active_move_to_joint_target_blocking(robot, profile.park_pose(), &profile.wait)
+}
+
 pub fn home_zero_blocking<Capability>(
     standby: Piper<Standby, Capability>,
     profile: &ControlProfile,
@@ -133,7 +143,9 @@ pub fn park_blocking<Capability>(
 where
     Capability: MotionCapability,
 {
-    move_to_joint_target_blocking(standby, profile, profile.park_pose())
+    let active = standby.enable_position_mode(profile.park_position_mode_config()?)?;
+    active_move_to_joint_target_blocking(&active, profile.park_pose(), &profile.wait)?;
+    active.disable(DisableConfig::default()).map_err(Into::into)
 }
 
 pub fn set_joint_zero_blocking<Capability>(
@@ -367,10 +379,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ParkOrientation;
     use piper_client::MonitorStateSource;
+    use piper_client::state::{Active, Piper, PositionMode, SoftRealtime};
+    use piper_driver::ConnectionTarget;
     use piper_tools::SafetyConfig;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    fn test_profile_with_park_speed(park_speed_percent: u8) -> ControlProfile {
+        ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        }
+    }
 
     #[test]
     fn prepare_move_uses_delta_from_current_state() {
@@ -517,6 +543,28 @@ mod tests {
             0,
             "warmup retries should not publish when the validated snapshot already matches target",
         );
+    }
+
+    #[test]
+    fn park_blocking_uses_profile_park_pose_and_park_speed_config() {
+        let profile = test_profile_with_park_speed(5);
+        let config = profile.park_position_mode_config().unwrap();
+        assert_eq!(config.speed_percent, 5);
+        assert_eq!(profile.park_pose(), [0.0, 0.0, 0.0, 0.02, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn active_park_blocking_reuses_existing_joint_motion_helper() {
+        let profile = test_profile_with_park_speed(5);
+        assert_eq!(
+            profile.park_pose(),
+            ParkOrientation::Upright.default_rest_pose()
+        );
+
+        let _active_park: fn(
+            &Piper<Active<PositionMode>, SoftRealtime>,
+            &ControlProfile,
+        ) -> Result<()> = crate::active_park_blocking::<SoftRealtime>;
     }
 
     #[test]
