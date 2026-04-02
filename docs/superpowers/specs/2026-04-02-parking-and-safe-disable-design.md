@@ -17,7 +17,7 @@ The repository also already distinguishes emergency behavior from non-emergency 
 
 - `stop` / `Ctrl+C` are emergency-style operators that cancel work and disable immediately.
 - `disable()` is a low-level state transition primitive.
-- `park` is a controlled motion workflow.
+- `park` is already a controlled motion workflow that parks and then disables.
 
 The design must preserve those semantics.
 
@@ -25,9 +25,11 @@ The design must preserve those semantics.
 
 - Make controlled parking a first-class success-path workflow for motion tools.
 - Reuse existing park orientation and pose concepts instead of inventing a parallel system.
+- Reuse the existing `park` / `park_blocking()` concept instead of introducing a second synonymous command.
 - Keep `stop`, `disable()`, and drop-time safety nets as direct disable paths.
 - Provide one shared parking workflow that HIL helpers and CLI can both use.
 - Avoid silently changing emergency behavior.
+- Ensure parking uses an explicit low-speed profile instead of inheriting `PositionModeConfig::default()`.
 
 ## Non-Goals
 
@@ -62,7 +64,7 @@ The system will continue to have three distinct meanings:
 
 - `stop`: immediate safe interruption, no parking.
 - `disable()`: direct disable primitive, no parking.
-- `park_then_disable`: controlled non-emergency shutdown workflow.
+- `park`: controlled non-emergency shutdown workflow that parks and then disables.
 
 The success path for selected HIL helpers should default to:
 
@@ -103,21 +105,13 @@ Examples and HIL helpers should call the shared parking workflow from `piper-con
 
 ## Workflow API
 
-Add a unified blocking workflow in `piper-control`.
+Phase 1 should reuse the existing blocking workflow names in `piper-control` instead of
+introducing a second synonymous API.
 
-Candidate names:
-
-- `park_then_disable_blocking()`
-- `move_to_park_and_disable_blocking()`
-
-Recommended name:
-
-- `park_then_disable_blocking()`
-
-Proposed shape:
+The existing `park_blocking()` remains the shared standby-entry workflow:
 
 ```rust
-pub fn park_then_disable_blocking<Capability>(
+pub fn park_blocking<Capability>(
     standby: Piper<Standby, Capability>,
     profile: &ControlProfile,
 ) -> Result<Piper<Standby, Capability>>
@@ -125,18 +119,24 @@ where
     Capability: MotionCapability
 ```
 
-and a companion for already-active joint-position flows:
+For already-active joint-position flows, Phase 1 should not add a by-value
+`active_park_then_disable_blocking(active, ...) -> Result<Piper<Standby, ...>>` API.
 
-```rust
-pub fn active_park_then_disable_blocking<Capability>(
-    active: Piper<Active<PositionMode>, Capability>,
-    profile: &ControlProfile,
-) -> Result<Piper<Standby, Capability>>
-where
-    Capability: MotionCapability
-```
+Reason:
 
-The second function avoids unnecessary re-enable/re-enter-mode cycles for helpers that are already in joint position mode.
+- an owned `Piper<Active<...>>` that errors during parking will be dropped on the error path
+- dropping `Active` currently triggers best-effort disable
+- therefore such an API cannot truthfully promise "return an error and leave the active robot
+  in the caller's control"
+
+Instead, Phase 1 helper integrations should explicitly:
+
+1. reuse the existing active robot they already hold
+2. move to `profile.park_pose()` using borrowed active-motion utilities
+3. call `disable()` only after park motion succeeds
+
+A reusable active parking helper can be added later, but only with an API shape that makes
+its error/ownership behavior explicit.
 
 ## Park Pose Source
 
@@ -148,6 +148,23 @@ Parking pose resolution will continue to use existing `ControlProfile` behavior:
 This keeps the source of truth single and preserves existing CLI config behavior.
 
 No new pose registry is needed in this change.
+
+## Park Speed Policy
+
+Parking must not implicitly inherit `PositionModeConfig::default()`, because that would use the
+current default speed percentage of 50%.
+
+Phase 1 should add a dedicated low-speed park configuration in `ControlProfile`, for example:
+
+- `park_speed_percent`
+- and a corresponding `park_position_mode_config()`
+
+Recommended default:
+
+- `park_speed_percent = 5`
+
+This keeps parking deliberately slow and aligns it with the low-risk HIL operating envelope that
+is already being used manually.
 
 ## Success-Path Policy
 
@@ -206,20 +223,8 @@ CLI already has `park`.
 
 Phase 1 recommendation:
 
-- keep `park` as-is
-- add a new explicit non-emergency command:
-  - `park-and-disable`
-  - or `safe-disable`
-
-Recommended name:
-
-- `park-and-disable`
-
-Reason:
-
-- explicit and unsurprising
-- distinguishes itself from raw `disable`
-- matches the workflow semantics exactly
+- keep `park` as the explicit non-emergency command
+- do not add a second synonymous command in Phase 1
 
 `disable` remains direct disable.
 
@@ -234,15 +239,18 @@ That behavior can be revisited after HIL validation.
 
 ### Parking motion fails before disable
 
-Return an error and keep control with the caller.
+Return an error.
 
 Do not silently continue to disable.
 
-Operator response remains explicit:
+Important caveat:
 
-- inspect state
-- choose `stop` if needed
-- decide whether to retry or manually recover
+- standby-based `park_blocking()` can cleanly return ownership on success
+- helper code that still owns an `Active` robot cannot promise "keep control with the caller" on
+  every error path, because dropping `Active` triggers best-effort disable today
+
+Phase 1 therefore must not specify stronger failure guarantees than the current ownership model
+can actually provide.
 
 ### Disable fails after successful park
 
@@ -266,8 +274,8 @@ This remains:
 Add unit coverage for:
 
 - `ParkOrientation` pose selection remains unchanged
-- `park_then_disable_blocking()` uses `profile.park_pose()`
-- active variant parks and disables without re-entering an unrelated mode
+- `park_blocking()` uses `profile.park_pose()`
+- `park_position_mode_config()` uses the dedicated low-speed park config instead of the default 50%
 
 ### `piper-sdk` HIL helper tests
 
@@ -281,7 +289,7 @@ Add example-local tests for:
 
 Add command tests for:
 
-- `park-and-disable` command construction and config resolution
+- `park` documentation / command flow continues to resolve profile-driven parking config correctly
 
 ### Documentation
 
@@ -296,14 +304,13 @@ to distinguish:
 - `stop`
 - `disable`
 - `park`
-- `park-and-disable`
 
 ## Rollout Plan
 
-1. Add shared parking workflow to `piper-control`.
-2. Integrate it into `hil_joint_position_check`.
-3. Add CLI `park-and-disable`.
-4. Update docs.
+1. Add dedicated low-speed park config to `ControlProfile` / `piper-control`.
+2. Reuse the existing `park_blocking()` standby workflow with that config.
+3. Integrate success-path parking into `hil_joint_position_check`.
+4. Update docs to clarify that `park` already implies `park -> disable`, while `disable` does not.
 5. Validate on hardware with the existing low-risk joint HIL path before expanding to more helpers.
 
 ## Risks
@@ -321,6 +328,6 @@ Mitigations:
 
 ## Recommendation
 
-Implement parking as a shared experience-layer workflow centered in `piper-control`, reuse existing `ControlProfile::park_pose()` and `ParkOrientation`, and adopt it first in `hil_joint_position_check` plus a new CLI `park-and-disable` command.
+Implement parking as a shared experience-layer workflow centered in `piper-control`, reuse existing `ControlProfile::park_pose()` and `ParkOrientation`, keep the existing `park` / `park_blocking()` naming, and adopt it first in `hil_joint_position_check`.
 
 Do not modify `piper-client::disable()`, `stop`, or drop-time disable semantics.
