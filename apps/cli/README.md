@@ -136,10 +136,11 @@ timeout_ms = 5000
 - 默认由 `orientation` 决定
 - 若配置了 `rest_pose_override`，优先使用自定义停靠位
 
-### `disable`
+### REPL `disable`
 
+- 这是 REPL 命令，不是 one-shot 顶层子命令
 - 只发送 raw disable，不附带任何移动或停靠动作
-- REPL 中的 `disable` 会保持连接，但把机器人回到失能状态
+- 会保持连接和会话，但把机器人回到失能状态
 
 ### `set-zero`
 
