@@ -308,6 +308,11 @@ fn parse_args_for_test<const N: usize>(extra_args: [&str; N]) -> Args {
     Args::try_parse_from(argv).expect("cli args should parse")
 }
 
+#[cfg(test)]
+fn expected_park_pose(orientation: CliParkOrientation) -> [f64; 6] {
+    ParkOrientation::from(orientation).default_rest_pose()
+}
+
 fn wait_for_monitor_snapshot<T, Read>(
     timeout: Duration,
     poll_interval: Duration,
@@ -659,6 +664,10 @@ fn park_profile_maps_orientation_and_wait_fields() {
     let profile = park_profile(&args);
 
     assert_eq!(profile.orientation, ParkOrientation::Left);
+    assert_eq!(
+        profile.park_pose(),
+        expected_park_pose(CliParkOrientation::Left)
+    );
     assert_eq!(profile.park_speed_percent, 7);
     assert_eq!(profile.wait.threshold_rad, POSITION_SETTLE_TOLERANCE_RAD);
     assert_eq!(profile.wait.timeout, Duration::from_millis(12_345));
