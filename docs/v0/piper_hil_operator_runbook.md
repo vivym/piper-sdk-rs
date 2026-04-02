@@ -234,7 +234,7 @@
    disable
    exit
    ```
-   这条命令是 raw disable，不做停靠或额外运动；它会等待 disable 完成并把会话留在 `Standby`。
+   这条命令是 raw disable，不做停靠或额外运动；它会等待 disable 完成并把会话留在 `Standby`。这和 `stop` / `Ctrl+C` 的 `disable_all()` 急停路径不同。
 6. `disable` 后，立刻用 `state_api_demo` 确认系统回到 disabled / non-driving state：
    ```bash
    cargo run -p piper-sdk --example state_api_demo -- --interface can0

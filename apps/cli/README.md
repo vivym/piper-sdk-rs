@@ -165,10 +165,10 @@ timeout_ms = 5000
 
 ### REPL 内急停
 
-`stop` 和 `Ctrl+C` 统一执行：
+`stop` 和 `Ctrl+C` 统一执行 REPL 的急停路径，不等同于普通的 `disable`：
 
 1. 取消当前 `move/home/park`（如果正在运行）
-2. 发送 `disable_all()`
+2. 发送 `disable_all()` 作为急停动作
 3. 保持连接
 4. 最终回到 `Standby`
 
