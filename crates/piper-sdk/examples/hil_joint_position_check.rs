@@ -261,7 +261,7 @@ where
         );
     }
 
-    println!("[PASS] hil_joint_position_check complete");
+    println!("{}", final_success_line(args));
 
     Ok(())
 }
@@ -279,6 +279,17 @@ fn park_profile(args: &Args) -> ControlProfile {
             republish_interval: POSITION_SETTLE_POLL_INTERVAL,
             timeout: Duration::from_millis(args.settle_timeout_ms),
         },
+    }
+}
+
+fn final_success_line(args: &Args) -> String {
+    if args.no_park {
+        "[PASS] hil_joint_position_check complete without parking (--no-park)".to_string()
+    } else {
+        format!(
+            "[PASS] hil_joint_position_check complete after parking orientation={}",
+            ParkOrientation::from(args.park_orientation)
+        )
     }
 }
 
@@ -550,6 +561,84 @@ fn validate_args_accepts_no_park() {
     };
 
     validate_args(&args).expect("no-park should be accepted");
+}
+
+#[test]
+fn cli_parses_no_park_flag() {
+    let args = Args::try_parse_from([
+        "hil_joint_position_check",
+        "--joint",
+        "1",
+        "--delta-rad",
+        "0.02",
+        "--no-park",
+    ])
+    .expect("cli args should parse");
+
+    assert!(args.no_park);
+}
+
+#[test]
+fn cli_parses_park_orientation_left() {
+    let args = Args::try_parse_from([
+        "hil_joint_position_check",
+        "--joint",
+        "1",
+        "--delta-rad",
+        "0.02",
+        "--park-orientation",
+        "left",
+    ])
+    .expect("cli args should parse");
+
+    assert_eq!(args.park_orientation, CliParkOrientation::Left);
+}
+
+#[test]
+fn cli_defaults_park_orientation_to_upright() {
+    let args = Args::try_parse_from([
+        "hil_joint_position_check",
+        "--joint",
+        "1",
+        "--delta-rad",
+        "0.02",
+    ])
+    .expect("cli args should parse");
+
+    assert_eq!(args.park_orientation, CliParkOrientation::Upright);
+}
+
+#[test]
+fn final_success_line_distinguishes_no_park_path() {
+    let no_park_args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 5,
+        settle_timeout_ms: 10_000,
+        no_park: true,
+        park_orientation: CliParkOrientation::Upright,
+    };
+    let parked_args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 5,
+        settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: CliParkOrientation::Left,
+    };
+
+    assert_eq!(
+        final_success_line(&no_park_args),
+        "[PASS] hil_joint_position_check complete without parking (--no-park)"
+    );
+    assert_eq!(
+        final_success_line(&parked_args),
+        "[PASS] hil_joint_position_check complete after parking orientation=left"
+    );
 }
 
 #[test]
