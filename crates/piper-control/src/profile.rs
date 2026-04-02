@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 pub const DEFAULT_PARK_SPEED_PERCENT: u8 = 5;
+const MIN_PARK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct ControlProfile {
@@ -43,6 +44,15 @@ impl ControlProfile {
             install_position: self.orientation.install_position(),
             ..piper_client::state::PositionModeConfig::default()
         })
+    }
+
+    pub fn park_wait_config(&self) -> MotionWaitConfig {
+        MotionWaitConfig {
+            threshold_rad: self.wait.threshold_rad,
+            poll_interval: self.wait.poll_interval,
+            republish_interval: self.wait.republish_interval,
+            timeout: self.wait.timeout.max(MIN_PARK_TIMEOUT),
+        }
     }
 }
 
@@ -195,5 +205,45 @@ mod tests {
         };
 
         assert!(profile.park_position_mode_config().is_err());
+    }
+
+    #[test]
+    fn park_wait_config_applies_timeout_floor_preserving_other_fields() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 5,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig {
+                threshold_rad: 0.01,
+                poll_interval: Duration::from_millis(25),
+                republish_interval: Duration::from_millis(125),
+                timeout: Duration::from_secs(2),
+            },
+        };
+
+        let park_wait = profile.park_wait_config();
+        assert_eq!(park_wait.threshold_rad, 0.01);
+        assert_eq!(park_wait.poll_interval, Duration::from_millis(25));
+        assert_eq!(park_wait.republish_interval, Duration::from_millis(125));
+        assert_eq!(park_wait.timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn park_wait_config_keeps_longer_existing_timeout() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 5,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig {
+                timeout: Duration::from_secs(20),
+                ..MotionWaitConfig::default()
+            },
+        };
+
+        assert_eq!(profile.park_wait_config().timeout, Duration::from_secs(20));
     }
 }

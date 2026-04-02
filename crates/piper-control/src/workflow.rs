@@ -160,7 +160,8 @@ fn active_park_blocking_with<Robot, Move>(
 where
     Move: FnMut(&Robot, [f64; 6], &MotionWaitConfig) -> Result<()>,
 {
-    move_to_joint_target(robot, profile.park_pose(), &profile.wait)
+    let park_wait = profile.park_wait_config();
+    move_to_joint_target(robot, profile.park_pose(), &park_wait)
 }
 
 fn park_blocking_with<StandbyRobot, ActiveRobot, Enable, Move, Disable>(
@@ -176,7 +177,8 @@ where
     Disable: FnMut(ActiveRobot) -> Result<StandbyRobot>,
 {
     let active = enable_position_mode(standby, profile.park_position_mode_config()?)?;
-    move_to_joint_target(&active, profile.park_pose(), &profile.wait)?;
+    let park_wait = profile.park_wait_config();
+    move_to_joint_target(&active, profile.park_pose(), &park_wait)?;
     disable(active)
 }
 
@@ -413,6 +415,7 @@ mod tests {
     use super::*;
     use crate::ParkOrientation;
     use piper_client::MonitorStateSource;
+    use piper_client::SoftRealtime;
     use piper_driver::ConnectionTarget;
     use piper_tools::SafetyConfig;
     use std::sync::{Arc, Mutex};
@@ -427,6 +430,15 @@ mod tests {
             safety: SafetyConfig::default_config(),
             wait: MotionWaitConfig::default(),
         }
+    }
+
+    fn test_profile_with_park_speed_and_timeout(
+        park_speed_percent: u8,
+        timeout: Duration,
+    ) -> ControlProfile {
+        let mut profile = test_profile_with_park_speed(park_speed_percent);
+        profile.wait.timeout = timeout;
+        profile
     }
 
     #[test]
@@ -577,8 +589,8 @@ mod tests {
     }
 
     #[test]
-    fn park_blocking_uses_profile_park_pose_and_park_speed_config() {
-        let profile = test_profile_with_park_speed(5);
+    fn park_blocking_uses_profile_park_pose_and_park_wait_budget() {
+        let profile = test_profile_with_park_speed_and_timeout(5, Duration::from_secs(2));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let standby = ();
         park_blocking_with(
@@ -598,11 +610,13 @@ mod tests {
             {
                 let calls = Arc::clone(&calls);
                 move |_, target, wait| {
-                    calls
-                        .lock()
-                        .unwrap()
-                        .push(format!("move:{target:?}:{:.3}", wait.threshold_rad));
+                    calls.lock().unwrap().push(format!(
+                        "move:{target:?}:{:.3}:{}",
+                        wait.threshold_rad,
+                        wait.timeout.as_secs()
+                    ));
                     assert_eq!(target, [0.0, 0.0, 0.0, 0.02, 0.5, 0.0]);
+                    assert_eq!(wait.timeout, Duration::from_secs(15));
                     Ok(())
                 }
             },
@@ -620,15 +634,15 @@ mod tests {
             *calls.lock().unwrap(),
             vec![
                 "enable:5:Horizontal".to_string(),
-                "move:[0.0, 0.0, 0.0, 0.02, 0.5, 0.0]:0.020".to_string(),
+                "move:[0.0, 0.0, 0.0, 0.02, 0.5, 0.0]:0.020:15".to_string(),
                 "disable".to_string(),
             ],
         );
     }
 
     #[test]
-    fn active_park_blocking_reuses_existing_joint_motion_helper() {
-        let profile = test_profile_with_park_speed(5);
+    fn active_park_blocking_reuses_existing_joint_motion_helper_with_park_wait_budget() {
+        let profile = test_profile_with_park_speed_and_timeout(5, Duration::from_secs(2));
         assert_eq!(
             profile.park_pose(),
             ParkOrientation::Upright.default_rest_pose()
@@ -639,9 +653,14 @@ mod tests {
         active_park_blocking_with(&robot, &profile, {
             let calls = Arc::clone(&calls);
             move |_, target, wait| {
-                calls.lock().unwrap().push(format!("move:{target:?}:{:.3}", wait.threshold_rad));
+                calls.lock().unwrap().push(format!(
+                    "move:{target:?}:{:.3}:{}",
+                    wait.threshold_rad,
+                    wait.timeout.as_secs()
+                ));
                 assert_eq!(target, ParkOrientation::Upright.default_rest_pose());
                 assert_eq!(wait.threshold_rad, profile.wait.threshold_rad);
+                assert_eq!(wait.timeout, Duration::from_secs(15));
                 Ok(())
             }
         })
@@ -649,8 +668,16 @@ mod tests {
 
         assert_eq!(
             *calls.lock().unwrap(),
-            vec!["move:[0.0, 0.0, 0.0, 0.02, 0.5, 0.0]:0.020".to_string()],
+            vec!["move:[0.0, 0.0, 0.0, 0.02, 0.5, 0.0]:0.020:15".to_string()],
         );
+    }
+
+    #[test]
+    fn active_park_blocking_is_available_from_public_api() {
+        let _active_park: fn(
+            &Piper<Active<PositionMode>, SoftRealtime>,
+            &ControlProfile,
+        ) -> Result<()> = crate::active_park_blocking::<SoftRealtime>;
     }
 
     #[test]
