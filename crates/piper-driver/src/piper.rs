@@ -6727,6 +6727,174 @@ mod tests {
         ));
     }
 
+    fn build_test_piper() -> Piper {
+        Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            MockTxAdapter,
+            Some(PipelineConfig {
+                low_speed_drive_state_freshness_ms: 75,
+                ..PipelineConfig::default()
+            }),
+        )
+        .expect("driver should start")
+    }
+
+    fn inject_low_speed_joint(
+        piper: &Piper,
+        joint_index: usize,
+        host_rx_mono_us: u64,
+        hardware_timestamp_us: Option<u64>,
+    ) {
+        let joint = JointDriverLowSpeedJoint {
+            motor_temp_c: 41.0 + joint_index as f32,
+            driver_temp_c: 51.0 + joint_index as f32,
+            joint_voltage_v: 24.0 + joint_index as f32,
+            joint_bus_current_a: 3.0 + joint_index as f32,
+            voltage_low: false,
+            motor_over_temp: false,
+            over_current: false,
+            driver_over_temp: false,
+            collision_protection: false,
+            driver_error: false,
+            enabled: joint_index % 2 == 0,
+            stall_protection: false,
+        };
+
+        piper
+            .ctx
+            .joint_driver_low_speed_observation
+            .write()
+            .expect("low-speed observation store lock")
+            .record_slot(joint_index, joint, host_rx_mono_us, hardware_timestamp_us);
+    }
+
+    fn inject_all_low_speed_joints(
+        piper: &Piper,
+        first_host_rx_mono_us: u64,
+        hardware_timestamp_us: Option<u64>,
+    ) {
+        for joint_index in 0..6 {
+            inject_low_speed_joint(
+                piper,
+                joint_index,
+                first_host_rx_mono_us + joint_index as u64,
+                hardware_timestamp_us,
+            );
+        }
+    }
+
+    fn inject_end_pose_group(
+        piper: &Piper,
+        first_host_rx_mono_us: u64,
+        hardware_timestamp_us: Option<u64>,
+    ) {
+        let members = [
+            EndPoseMembers {
+                first: 0.1,
+                second: 0.2,
+            },
+            EndPoseMembers {
+                first: 0.3,
+                second: 0.4,
+            },
+            EndPoseMembers {
+                first: 0.5,
+                second: 0.6,
+            },
+        ];
+
+        let mut store =
+            piper.ctx.end_pose_observation.write().expect("end-pose observation store lock");
+        for (slot, member) in members.into_iter().enumerate() {
+            store.record_slot(
+                slot,
+                member,
+                first_host_rx_mono_us + slot as u64,
+                hardware_timestamp_us,
+            );
+        }
+    }
+
+    #[test]
+    fn low_speed_group_can_be_partial_and_stale_at_once() {
+        let piper = build_test_piper();
+        inject_low_speed_joint(&piper, 0, 1_000_000, Some(100));
+
+        let observation = piper.get_joint_driver_low_speed_at(1_100_000);
+
+        match observation {
+            Observation::Available(available) => {
+                assert!(matches!(
+                    available.payload,
+                    ObservationPayload::Partial { .. }
+                ));
+                assert!(matches!(available.freshness, Freshness::Stale { .. }));
+            },
+            other => panic!("expected available observation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_speed_group_can_be_partial_and_fresh() {
+        let piper = build_test_piper();
+        inject_low_speed_joint(&piper, 0, 1_000_000, Some(100));
+
+        let observation = piper.get_joint_driver_low_speed_at(1_010_000);
+
+        match observation {
+            Observation::Available(available) => {
+                assert!(matches!(
+                    available.payload,
+                    ObservationPayload::Partial { .. }
+                ));
+                assert!(matches!(available.freshness, Freshness::Fresh));
+            },
+            other => panic!("expected fresh partial observation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_speed_group_can_be_complete_and_stale() {
+        let piper = build_test_piper();
+        inject_all_low_speed_joints(&piper, 1_000_000, Some(100));
+
+        let observation = piper.get_joint_driver_low_speed_at(1_100_000);
+
+        match observation {
+            Observation::Available(available) => {
+                assert!(matches!(available.payload, ObservationPayload::Complete(_)));
+                assert!(matches!(available.freshness, Freshness::Stale { .. }));
+            },
+            other => panic!("expected complete stale observation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_for_complete_low_speed_state_returns_complete_payload() {
+        let piper = build_test_piper();
+        let now = crate::heartbeat::monotonic_micros().max(1);
+        inject_all_low_speed_joints(&piper, now, Some(321));
+
+        let result = piper
+            .wait_for_complete_low_speed_state(Duration::from_millis(10))
+            .expect("complete low-speed observation should become available");
+
+        assert!(result.meta.host_rx_mono_us.is_some());
+    }
+
+    #[test]
+    fn complete_end_pose_wait_returns_complete_payload() {
+        let piper = build_test_piper();
+        let now = crate::heartbeat::monotonic_micros().max(1);
+        inject_end_pose_group(&piper, now, Some(654));
+
+        let result = piper
+            .wait_for_complete_end_pose(Duration::from_millis(10))
+            .expect("complete end-pose observation should become available");
+
+        assert!(result.meta.host_rx_mono_us.is_some());
+    }
+
     #[test]
     fn test_get_setting_response() {
         let mock_can = MockCanAdapter;
