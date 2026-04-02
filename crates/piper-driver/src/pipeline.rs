@@ -2932,24 +2932,8 @@ fn parse_and_update_state(
                     outcome.counts_as_robot_feedback = true;
                     outcome.maintenance_gate_may_have_changed = true;
                     outcome.low_speed_drive_state_updated = true;
-                    ctx.observation_metrics.record_low_speed_raw_frame();
                     let host_rx_mono_us = host_rx_mono_us();
                     if let Ok(mut store) = ctx.joint_driver_low_speed_observation.write() {
-                        let freshness_window_us =
-                            config.low_speed_drive_state_freshness_ms.saturating_mul(1_000);
-                        let complete_before = matches!(
-                            store.observe(
-                                host_rx_mono_us,
-                                freshness_window_us,
-                                JointDriverLowSpeed::from_slots,
-                            ),
-                            crate::observation::Observation::Available(
-                                crate::observation::Available {
-                                    payload: crate::observation::ObservationPayload::Complete(_),
-                                    ..
-                                }
-                            )
-                        );
                         store.record_slot(
                             joint_idx,
                             JointDriverLowSpeedJoint {
@@ -2972,23 +2956,8 @@ fn parse_and_update_state(
                             host_rx_mono_us,
                             (frame.timestamp_us != 0).then_some(frame.timestamp_us),
                         );
-                        let complete_after = matches!(
-                            store.observe(
-                                host_rx_mono_us,
-                                freshness_window_us,
-                                JointDriverLowSpeed::from_slots,
-                            ),
-                            crate::observation::Observation::Available(
-                                crate::observation::Available {
-                                    payload: crate::observation::ObservationPayload::Complete(_),
-                                    ..
-                                }
-                            )
-                        );
-                        if !complete_before && complete_after {
-                            ctx.observation_metrics.record_low_speed_complete_observation();
-                        }
                     }
+                    ctx.observation_metrics.record_low_speed_member_frame(joint_idx);
 
                     ctx.joint_driver_low_speed.rcu(|old| {
                         let mut new = (**old).clone();
@@ -4214,6 +4183,44 @@ mod tests {
         let snapshot = ctx.observation_metrics.snapshot_with_elapsed(Duration::from_secs(1));
         assert_eq!(snapshot.low_speed.raw_frame_rate, 5.0);
         assert_eq!(snapshot.low_speed.complete_observation_rate, 0.0);
+    }
+
+    #[test]
+    fn test_low_speed_complete_metrics_increment_for_successive_full_cycles() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+
+        feed_joint_driver_low_speed_cycle(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+            0,
+            1_000,
+        );
+        feed_joint_driver_low_speed_cycle(
+            &ctx,
+            &mut state,
+            &metrics,
+            &config,
+            &maintenance_gate,
+            &runtime_phase,
+            &last_fault,
+            0,
+            2_000,
+        );
+
+        let snapshot = ctx.observation_metrics.snapshot_with_elapsed(Duration::from_secs(1));
+        assert_eq!(snapshot.low_speed.raw_frame_rate, 12.0);
+        assert_eq!(snapshot.low_speed.complete_observation_rate, 2.0);
     }
 
     #[test]

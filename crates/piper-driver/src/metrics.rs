@@ -3,8 +3,10 @@
 //! 提供零开销的原子计数器，用于监控 IO 链路的健康状态和性能。
 //! 所有计数器都使用原子操作，可以在任何线程安全地读取，不会引入锁竞争。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+const LOW_SPEED_CYCLE_FULL_MASK: u8 = 0b11_1111;
 
 /// 重建观察族指标的单族快照。
 ///
@@ -77,11 +79,31 @@ impl ObservationFamilyCounters {
     }
 }
 
+#[derive(Debug, Default)]
+struct LowSpeedCycleTracker {
+    seen_mask: AtomicU8,
+}
+
+impl LowSpeedCycleTracker {
+    fn record_joint(&self, joint_idx: usize) -> bool {
+        debug_assert!(joint_idx < 6);
+        let bit = 1u8 << joint_idx;
+        let previous = self.seen_mask.fetch_or(bit, Ordering::Relaxed);
+        if previous | bit == LOW_SPEED_CYCLE_FULL_MASK {
+            self.seen_mask.store(0, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Dedicated rebuilt-family observation metrics store.
 #[derive(Debug)]
 pub struct ObservationMetricsStore {
     window_start: Instant,
     low_speed: ObservationFamilyCounters,
+    low_speed_cycle: LowSpeedCycleTracker,
     end_pose: ObservationFamilyCounters,
     collision_protection: ObservationFamilyCounters,
     joint_limit_config: ObservationFamilyCounters,
@@ -94,6 +116,7 @@ impl ObservationMetricsStore {
         Self {
             window_start: Instant::now(),
             low_speed: ObservationFamilyCounters::default(),
+            low_speed_cycle: LowSpeedCycleTracker::default(),
             end_pose: ObservationFamilyCounters::default(),
             collision_protection: ObservationFamilyCounters::default(),
             joint_limit_config: ObservationFamilyCounters::default(),
@@ -120,6 +143,13 @@ impl ObservationMetricsStore {
 
     pub fn record_low_speed_raw_frame(&self) {
         self.low_speed.record_raw_frame();
+    }
+
+    pub fn record_low_speed_member_frame(&self, joint_idx: usize) {
+        self.low_speed.record_raw_frame();
+        if self.low_speed_cycle.record_joint(joint_idx) {
+            self.low_speed.record_complete_observation();
+        }
     }
 
     pub fn record_low_speed_complete_observation(&self) {
@@ -783,6 +813,22 @@ mod tests {
         assert_eq!(snapshot.end_pose.raw_frame_rate, 0.5);
         assert_eq!(snapshot.end_pose.complete_observation_rate, 0.5);
         assert_eq!(snapshot.end_pose.diagnostic_rate, 0.0);
+    }
+
+    #[test]
+    fn low_speed_complete_metrics_count_successive_full_cycles() {
+        let store = ObservationMetricsStore::new();
+
+        for joint_idx in 0..6 {
+            store.record_low_speed_member_frame(joint_idx);
+        }
+        for joint_idx in [2, 4, 1, 5, 0, 3] {
+            store.record_low_speed_member_frame(joint_idx);
+        }
+
+        let snapshot = store.snapshot_with_elapsed(Duration::from_secs(1));
+        assert_eq!(snapshot.low_speed.raw_frame_rate, 12.0);
+        assert_eq!(snapshot.low_speed.complete_observation_rate, 2.0);
     }
 
     #[test]
