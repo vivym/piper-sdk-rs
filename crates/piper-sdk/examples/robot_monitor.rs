@@ -26,9 +26,10 @@
 //! ```
 
 use clap::Parser;
+use piper_sdk::driver::observation::{Freshness, Observation, ObservationPayload};
 use piper_sdk::driver::{
-    EndPoseState, FpsResult, GripperState, JointDynamicState, JointPositionState, PiperBuilder,
-    RobotControlState,
+    EndPose, FpsResult, GripperState, JointDynamicState, JointPositionState, PartialEndPose,
+    PiperBuilder, RobotControlState,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,7 +114,7 @@ fn motion_status_to_string(status: u8) -> &'static str {
 /// 打印反馈信息
 fn print_feedback(
     joint_position: &JointPositionState,
-    end_pose: &EndPoseState,
+    end_pose: &Observation<EndPose, PartialEndPose>,
     joint_dynamic: &JointDynamicState,
     robot_control: &RobotControlState,
     gripper: &GripperState,
@@ -138,6 +139,34 @@ fn print_feedback(
         "控制模式: {}",
         control_mode_to_string(robot_control.control_mode)
     );
+
+    println!("\n末端位姿观测:");
+    match end_pose {
+        Observation::Available(available) => {
+            match available.freshness {
+                Freshness::Fresh => println!("  新鲜度: fresh"),
+                Freshness::Stale { stale_for } => println!("  新鲜度: stale by {:?}", stale_for),
+            }
+            match &available.payload {
+                ObservationPayload::Complete(end_pose) => {
+                    println!(
+                        "  X={:.4} Y={:.4} Z={:.4} Rx={:.4} Ry={:.4} Rz={:.4}",
+                        end_pose.end_pose[0],
+                        end_pose.end_pose[1],
+                        end_pose.end_pose[2],
+                        end_pose.end_pose[3],
+                        end_pose.end_pose[4],
+                        end_pose.end_pose[5]
+                    );
+                },
+                ObservationPayload::Partial { partial, missing } => {
+                    println!("  部分位姿: {:?}", partial.end_pose);
+                    println!("  缺失成员: {:?}", missing.missing_indices);
+                },
+            }
+        },
+        Observation::Unavailable => println!("  unavailable"),
+    }
     println!(
         "机器人状态: {}",
         robot_status_to_string(robot_control.robot_status)
@@ -155,19 +184,6 @@ fn print_feedback(
         print!("  J{}: {:7.2}", i + 1, angle_deg);
     }
     println!();
-
-    // 末端位姿（米）
-    println!("\n末端位置 (m):");
-    println!(
-        "  X: {:7.4}  Y: {:7.4}  Z: {:7.4}",
-        end_pose.end_pose[0], end_pose.end_pose[1], end_pose.end_pose[2]
-    );
-
-    println!("\n末端姿态 (rad):");
-    println!(
-        "  Rx: {:7.4}  Ry: {:7.4}  Rz: {:7.4}",
-        end_pose.end_pose[3], end_pose.end_pose[4], end_pose.end_pose[5]
-    );
 
     // 关节速度
     println!("\n关节速度 (rad/s):");
@@ -289,7 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 读取各种状态
         let joint_position = piper.get_joint_position();
-        let end_pose = piper.get_raw_end_pose();
+        let end_pose = piper.get_end_pose();
         let joint_dynamic = piper.get_joint_dynamic();
         let robot_control = piper.get_robot_control();
         let gripper = piper.get_gripper();

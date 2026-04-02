@@ -13,7 +13,7 @@ use crate::diagnostics::{DiagnosticEvent, QueryDiagnostic};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
 use crate::metrics::{MetricsSnapshot, PiperMetrics};
-use crate::observation::{Complete, Observation, ObservationPayload};
+use crate::observation::{Complete, Freshness, Observation, ObservationPayload};
 use crate::pipeline::*;
 use crate::query_coordinator::{QueryError, QueryGuard, QueryKind};
 use crate::state::*;
@@ -2714,11 +2714,16 @@ impl Piper {
     ) -> Option<Complete<T>> {
         match observation {
             Observation::Available(available) => match available.payload {
-                ObservationPayload::Complete(value) => Some(Complete {
-                    value,
-                    meta: available.meta,
-                }),
+                ObservationPayload::Complete(value)
+                    if matches!(available.freshness, Freshness::Fresh) =>
+                {
+                    Some(Complete {
+                        value,
+                        meta: available.meta,
+                    })
+                },
                 ObservationPayload::Partial { .. } => None,
+                ObservationPayload::Complete(_) => None,
             },
             Observation::Unavailable => None,
         }
@@ -7000,9 +7005,9 @@ mod tests {
     #[test]
     fn wait_for_complete_low_speed_state_rejects_stale_complete_observation() {
         let piper = build_test_piper();
-        let stale_host_mono_us =
-            crate::heartbeat::monotonic_micros().max(1).saturating_sub(100_000);
-        inject_all_low_speed_joints(&piper, stale_host_mono_us, Some(321));
+        let now = crate::heartbeat::monotonic_micros().max(1);
+        inject_all_low_speed_joints(&piper, now, Some(321));
+        std::thread::sleep(Duration::from_millis(90));
 
         let err = piper
             .wait_for_complete_low_speed_state(Duration::from_millis(5))
@@ -7038,8 +7043,9 @@ mod tests {
     #[test]
     fn wait_for_complete_end_pose_rejects_stale_complete_observation() {
         let piper = build_test_piper();
-        let stale_host_mono_us = crate::heartbeat::monotonic_micros().max(1).saturating_sub(10_000);
-        inject_end_pose_group(&piper, stale_host_mono_us, Some(654));
+        let now = crate::heartbeat::monotonic_micros().max(1);
+        inject_end_pose_group(&piper, now, Some(654));
+        std::thread::sleep(Duration::from_millis(10));
 
         let err = piper
             .wait_for_complete_end_pose(Duration::from_millis(5))

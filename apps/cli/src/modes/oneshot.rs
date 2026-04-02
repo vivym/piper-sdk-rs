@@ -2,8 +2,10 @@
 
 use anyhow::Result;
 use piper_control::TargetSpec;
+use piper_sdk::driver::observation::{Freshness, Observation, ObservationPayload};
 use piper_sdk::driver::{
-    EndPoseState, FpsResult, GripperState, JointDynamicState, JointPositionState, RobotControlState,
+    EndPose, FpsResult, GripperState, JointDynamicState, JointPositionState, PartialEndPose,
+    RobotControlState,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,7 +94,7 @@ impl OneShotMode {
 
         while running.load(Ordering::SeqCst) {
             let joint_pos: JointPositionState = piper.get_joint_position();
-            let end_pose: EndPoseState = piper.get_raw_end_pose();
+            let end_pose = piper.get_end_pose();
             let dynamics: JointDynamicState = piper.get_joint_dynamic();
             let control: RobotControlState = piper.get_robot_control();
             let gripper: GripperState = piper.get_gripper();
@@ -130,14 +132,7 @@ impl OneShotMode {
 
                 println!();
                 println!("📌 End Pose:");
-                println!(
-                    "  X={:>7.4} Y={:>7.4} Z={:>7.4}",
-                    end_pose.end_pose[0], end_pose.end_pose[1], end_pose.end_pose[2]
-                );
-                println!(
-                    "  Rx={:>7.4} Ry={:>7.4} Rz={:>7.4}",
-                    end_pose.end_pose[3], end_pose.end_pose[4], end_pose.end_pose[5]
-                );
+                print_end_pose(&end_pose);
 
                 println!();
                 println!("🤖 Control State:");
@@ -177,6 +172,39 @@ impl OneShotMode {
 
         println!("✅ 已停止监控");
         Ok(())
+    }
+}
+
+fn print_end_pose(end_pose: &Observation<EndPose, PartialEndPose>) {
+    match end_pose {
+        Observation::Available(available) => {
+            match available.freshness {
+                Freshness::Fresh => println!("  freshness: fresh"),
+                Freshness::Stale { stale_for } => {
+                    println!("  freshness: stale by {:?}", stale_for)
+                },
+            }
+
+            match &available.payload {
+                ObservationPayload::Complete(end_pose) => {
+                    println!(
+                        "  X={:>7.4} Y={:>7.4} Z={:>7.4}",
+                        end_pose.end_pose[0], end_pose.end_pose[1], end_pose.end_pose[2]
+                    );
+                    println!(
+                        "  Rx={:>7.4} Ry={:>7.4} Rz={:>7.4}",
+                        end_pose.end_pose[3], end_pose.end_pose[4], end_pose.end_pose[5]
+                    );
+                },
+                ObservationPayload::Partial { partial, missing } => {
+                    println!("  partial pose: {:?}", partial.end_pose);
+                    println!("  missing members: {:?}", missing.missing_indices);
+                },
+            }
+        },
+        Observation::Unavailable => {
+            println!("  unavailable");
+        },
     }
 }
 
