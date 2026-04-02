@@ -6998,6 +6998,20 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_complete_low_speed_state_rejects_stale_complete_observation() {
+        let piper = build_test_piper();
+        let stale_host_mono_us =
+            crate::heartbeat::monotonic_micros().max(1).saturating_sub(100_000);
+        inject_all_low_speed_joints(&piper, stale_host_mono_us, Some(321));
+
+        let err = piper
+            .wait_for_complete_low_speed_state(Duration::from_millis(5))
+            .expect_err("stale complete low-speed observation must not satisfy wait helper");
+
+        assert!(matches!(err, WaitError::Timeout));
+    }
+
+    #[test]
     fn complete_end_pose_wait_returns_complete_payload() {
         let piper = build_test_piper();
         let now = crate::heartbeat::monotonic_micros().max(1);
@@ -7017,6 +7031,19 @@ mod tests {
         let err = piper
             .wait_for_complete_end_pose(Duration::from_millis(5))
             .expect_err("missing end-pose observation should time out");
+
+        assert!(matches!(err, WaitError::Timeout));
+    }
+
+    #[test]
+    fn wait_for_complete_end_pose_rejects_stale_complete_observation() {
+        let piper = build_test_piper();
+        let stale_host_mono_us = crate::heartbeat::monotonic_micros().max(1).saturating_sub(10_000);
+        inject_end_pose_group(&piper, stale_host_mono_us, Some(654));
+
+        let err = piper
+            .wait_for_complete_end_pose(Duration::from_millis(5))
+            .expect_err("stale complete end-pose observation must not satisfy wait helper");
 
         assert!(matches!(err, WaitError::Timeout));
     }
