@@ -6,6 +6,7 @@ use piper_sdk::client::state::{
 };
 use piper_sdk::client::types::{JointArray, Rad, Result as ClientResult, RobotError};
 use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
+use piper_sdk::driver::state::JointLimitConfig;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ const MIN_PROGRESS_RAD: f64 = 0.0005;
 const INITIAL_MONITOR_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(200);
 const INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const POSITION_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PREFLIGHT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
 #[command(name = "hil_joint_position_check")]
@@ -108,6 +110,29 @@ fn run_position_check<Capability>(
 where
     Capability: MotionCapability,
 {
+    let preflight_positions = {
+        let observer = standby.observer();
+        wait_for_monitor_snapshot(
+            INITIAL_MONITOR_SNAPSHOT_TIMEOUT,
+            INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL,
+            || observer.joint_positions(),
+        )?
+    };
+    match standby.query_joint_limit_config(PREFLIGHT_QUERY_TIMEOUT) {
+        Ok(limits) => {
+            let preflight = evaluate_joint_limit_preflight(&preflight_positions, &limits.value);
+            for line in &preflight.lines {
+                println!("{line}");
+            }
+            if let Some(error) = preflight.error {
+                return Err(error.into());
+            }
+        },
+        Err(error) => {
+            println!("[WARN] preflight joint-limit query failed: {error}");
+        },
+    }
+
     let robot = standby.enable_position_mode(PositionModeConfig {
         speed_percent: args.speed_percent,
         motion_type: MotionType::Joint,
@@ -291,6 +316,56 @@ fn validate_args(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+struct JointLimitPreflight {
+    lines: Vec<String>,
+    error: Option<String>,
+}
+
+fn evaluate_joint_limit_preflight(
+    joint_positions: &JointArray<Rad>,
+    limits: &JointLimitConfig,
+) -> JointLimitPreflight {
+    let violations: Vec<String> = joint_positions
+        .iter()
+        .zip(limits.joints.iter())
+        .enumerate()
+        .filter_map(|(index, (position, limit))| {
+            if position.0 < limit.min_angle_rad || position.0 > limit.max_angle_rad {
+                Some(format!(
+                    "J{}={:.6} rad outside [{:.6}, {:.6}]",
+                    index + 1,
+                    position.0,
+                    limit.min_angle_rad,
+                    limit.max_angle_rad
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if violations.is_empty() {
+        JointLimitPreflight {
+            lines: vec![
+                "[PASS] preflight joint-limit check all joints within queried limits".to_string(),
+            ],
+            error: None,
+        }
+    } else {
+        let mut lines = vec![
+            "[WARN] preflight joint-limit check found joints outside queried limits".to_string(),
+        ];
+        lines.extend(violations.into_iter().map(|violation| format!("[WARN] {violation}")));
+        JointLimitPreflight {
+            lines,
+            error: Some(
+                "preflight joint-limit check failed; current joints are outside queried limits"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 #[test]
 fn validate_args_rejects_excessive_speed() {
     let args = Args {
@@ -365,4 +440,91 @@ fn validate_args_rejects_zero_settle_timeout() {
 
     let error = validate_args(&args).expect_err("zero settle timeout must be rejected");
     assert!(error.contains("settle_timeout_ms"));
+}
+
+#[test]
+fn evaluate_joint_limit_preflight_reports_out_of_range_joints() {
+    let positions = JointArray::from([
+        Rad(0.0),
+        Rad(-0.04),
+        Rad(0.03),
+        Rad(0.0),
+        Rad(0.0),
+        Rad(0.0),
+    ]);
+    let limits = JointLimitConfig {
+        joints: [
+            piper_sdk::driver::state::JointLimit {
+                min_angle_rad: -1.0,
+                max_angle_rad: 1.0,
+                max_velocity_rad_s: 0.3,
+            },
+            piper_sdk::driver::state::JointLimit {
+                min_angle_rad: 0.0,
+                max_angle_rad: 1.0,
+                max_velocity_rad_s: 0.3,
+            },
+            piper_sdk::driver::state::JointLimit {
+                min_angle_rad: -1.0,
+                max_angle_rad: 0.0,
+                max_velocity_rad_s: 0.3,
+            },
+            piper_sdk::driver::state::JointLimit {
+                min_angle_rad: -1.0,
+                max_angle_rad: 1.0,
+                max_velocity_rad_s: 0.3,
+            },
+            piper_sdk::driver::state::JointLimit {
+                min_angle_rad: -1.0,
+                max_angle_rad: 1.0,
+                max_velocity_rad_s: 0.3,
+            },
+            piper_sdk::driver::state::JointLimit {
+                min_angle_rad: -1.0,
+                max_angle_rad: 1.0,
+                max_velocity_rad_s: 0.3,
+            },
+        ],
+    };
+
+    let preflight = evaluate_joint_limit_preflight(&positions, &limits);
+    let lines = preflight.lines;
+    assert_eq!(
+        lines.first().expect("summary line"),
+        "[WARN] preflight joint-limit check found joints outside queried limits"
+    );
+    assert_eq!(
+        preflight.error.as_deref(),
+        Some("preflight joint-limit check failed; current joints are outside queried limits")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("J2=-0.040000 rad outside [0.000000, 1.000000]"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("J3=0.030000 rad outside [-1.000000, 0.000000]"))
+    );
+}
+
+#[test]
+fn evaluate_joint_limit_preflight_reports_all_clear_when_in_range() {
+    let positions = JointArray::splat(Rad(0.0));
+    let limits = JointLimitConfig {
+        joints: [piper_sdk::driver::state::JointLimit {
+            min_angle_rad: -1.0,
+            max_angle_rad: 1.0,
+            max_velocity_rad_s: 0.3,
+        }; 6],
+    };
+
+    let preflight = evaluate_joint_limit_preflight(&positions, &limits);
+    let lines = preflight.lines;
+    assert_eq!(
+        lines,
+        vec!["[PASS] preflight joint-limit check all joints within queried limits".to_string()]
+    );
+    assert!(preflight.error.is_none());
 }

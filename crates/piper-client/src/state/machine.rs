@@ -1470,6 +1470,28 @@ where
             .map(|snapshot| snapshot.levels)
     }
 
+    /// 主动查询当前关节角度/速度限位并等待设备反馈。
+    pub fn query_joint_limit_config(
+        &self,
+        timeout: Duration,
+    ) -> Result<piper_driver::observation::Complete<piper_driver::state::JointLimitConfig>> {
+        self.ensure_runtime_health_healthy()?;
+
+        match self.driver.query_joint_limit_config(timeout) {
+            Ok(complete) => Ok(complete),
+            Err(QueryError::Busy) => Err(RobotError::ConfigError(
+                "joint limit query already in flight".to_string(),
+            )),
+            Err(QueryError::Timeout) => Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            }),
+            Err(QueryError::DiagnosticsOnlyTimeout) => Err(RobotError::ConfigError(
+                "joint limit query produced diagnostics but no publishable value".to_string(),
+            )),
+            Err(QueryError::Driver(error)) => Err(error.into()),
+        }
+    }
+
     /// 读取 driver 当前缓存的碰撞保护快照，不触发设备 query。
     pub fn collision_protection_cached(&self) -> Result<CollisionProtectionSnapshot> {
         self.collision_protection_cached_inner()
