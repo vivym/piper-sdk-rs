@@ -3378,7 +3378,10 @@ mod tests {
     use piper_driver::observation::{Observation, ObservationPayload};
     use piper_driver::{DriverMode, Piper as RobotPiper, RuntimeFaultKind};
     use piper_protocol::control::MitControlCommand;
-    use piper_protocol::ids::{ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56};
+    use piper_protocol::ids::{
+        ID_JOINT_CONTROL_12, ID_JOINT_CONTROL_34, ID_JOINT_CONTROL_56, ID_JOINT_FEEDBACK_12,
+        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
+    };
     use piper_tools::{PiperRecording, RecordingMetadata, TimestampSource, TimestampedFrame};
     use semver::Version;
     use std::collections::VecDeque;
@@ -6491,6 +6494,130 @@ mod tests {
         assert!(
             cartesian_sent.lock().expect("cartesian sent frames lock").is_empty(),
             "joint helper must not emit frames in cartesian mode"
+        );
+    }
+
+    #[test]
+    fn position_mode_runtime_motion_type_guard_allows_matching_helpers_and_emits_expected_frames() {
+        let joint_sent = Arc::new(Mutex::new(Vec::new()));
+        let joint_driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                RecordingTxAdapter::new(joint_sent.clone()),
+                None,
+            )
+            .expect("joint driver should start"),
+        );
+        let joint_robot =
+            build_active_position_piper_with_motion_type(joint_driver, MotionType::Joint);
+
+        joint_robot
+            .send_position_command(&JointArray::splat(Rad(0.0)))
+            .expect("joint mode should allow joint commands");
+        thread::sleep(Duration::from_millis(50));
+
+        let joint_ids: Vec<u32> = joint_sent
+            .lock()
+            .expect("joint sent frames lock")
+            .iter()
+            .map(|frame| frame.id)
+            .collect();
+        assert_eq!(
+            joint_ids,
+            vec![
+                ID_JOINT_CONTROL_12,
+                ID_JOINT_CONTROL_34,
+                ID_JOINT_CONTROL_56
+            ]
+        );
+
+        let cartesian_sent = Arc::new(Mutex::new(Vec::new()));
+        let cartesian_driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                RecordingTxAdapter::new(cartesian_sent.clone()),
+                None,
+            )
+            .expect("cartesian driver should start"),
+        );
+        let cartesian_robot =
+            build_active_position_piper_with_motion_type(cartesian_driver, MotionType::Cartesian);
+
+        cartesian_robot
+            .command_cartesian_pose(
+                Position3D::new(0.1, 0.0, 0.2),
+                EulerAngles::new(0.0, 0.0, 0.0),
+            )
+            .expect("Cartesian mode should allow end-pose commands");
+        thread::sleep(Duration::from_millis(50));
+
+        let cartesian_ids: Vec<u32> = cartesian_sent
+            .lock()
+            .expect("cartesian sent frames lock")
+            .iter()
+            .map(|frame| frame.id)
+            .collect();
+        assert_eq!(cartesian_ids, vec![0x152, 0x153, 0x154]);
+
+        let linear_sent = Arc::new(Mutex::new(Vec::new()));
+        let linear_driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                RecordingTxAdapter::new(linear_sent.clone()),
+                None,
+            )
+            .expect("linear driver should start"),
+        );
+        let linear_robot =
+            build_active_position_piper_with_motion_type(linear_driver, MotionType::Linear);
+
+        linear_robot
+            .move_linear(
+                Position3D::new(0.1, 0.0, 0.2),
+                EulerAngles::new(0.0, 0.0, 0.0),
+            )
+            .expect("Linear mode should allow linear commands");
+        thread::sleep(Duration::from_millis(50));
+
+        let linear_ids: Vec<u32> = linear_sent
+            .lock()
+            .expect("linear sent frames lock")
+            .iter()
+            .map(|frame| frame.id)
+            .collect();
+        assert_eq!(linear_ids, vec![0x152, 0x153, 0x154]);
+
+        let circular_sent = Arc::new(Mutex::new(Vec::new()));
+        let circular_driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(
+                IdleRxAdapter::new(),
+                RecordingTxAdapter::new(circular_sent.clone()),
+                None,
+            )
+            .expect("circular driver should start"),
+        );
+        let circular_robot =
+            build_active_position_piper_with_motion_type(circular_driver, MotionType::Circular);
+
+        circular_robot
+            .move_circular(
+                Position3D::new(0.1, 0.0, 0.2),
+                EulerAngles::new(0.0, 0.0, 0.0),
+                Position3D::new(0.12, 0.02, 0.2),
+                EulerAngles::new(0.0, 0.0, 0.0),
+            )
+            .expect("Circular mode should allow circular commands");
+        thread::sleep(Duration::from_millis(50));
+
+        let circular_ids: Vec<u32> = circular_sent
+            .lock()
+            .expect("circular sent frames lock")
+            .iter()
+            .map(|frame| frame.id)
+            .collect();
+        assert_eq!(
+            circular_ids,
+            vec![0x152, 0x153, 0x154, 0x158, 0x152, 0x153, 0x154, 0x158]
         );
     }
 

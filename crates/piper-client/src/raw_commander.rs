@@ -530,6 +530,64 @@ mod tests {
     }
 
     #[test]
+    fn test_send_position_command_batch_emits_joint_position_family() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+
+        commander
+            .send_position_command_batch(&JointArray::splat(Rad(0.0)), Duration::from_millis(20))
+            .expect("joint position batch should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 3);
+        let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
+        assert_eq!(ids, vec![0x155, 0x156, 0x157]);
+    }
+
+    #[test]
+    fn test_send_end_pose_command_emits_cartesian_frame_family() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+
+        commander
+            .send_end_pose_command(
+                Position3D::new(0.3, 0.0, 0.2),
+                EulerAngles::new(0.0, 180.0, 0.0),
+                Duration::from_millis(20),
+            )
+            .expect("end pose command should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 3);
+        let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
+        assert_eq!(ids, vec![0x152, 0x153, 0x154]);
+    }
+
+    #[test]
+    fn test_send_circular_motion_emits_via_and_target_arc_sequence() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+
+        commander
+            .send_circular_motion(
+                Position3D::new(0.2, 0.0, 0.2),
+                EulerAngles::new(0.0, 90.0, 0.0),
+                Position3D::new(0.3, 0.1, 0.2),
+                EulerAngles::new(0.0, 180.0, 0.0),
+                Duration::from_millis(20),
+            )
+            .expect("circular motion command should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 8);
+        let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
+        assert_eq!(
+            ids,
+            vec![0x152, 0x153, 0x154, 0x158, 0x152, 0x153, 0x154, 0x158]
+        );
+    }
+
+    #[test]
     fn test_send_gripper_command_full_effort_maps_to_protocol_full_scale() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = build_driver(sent_frames.clone());

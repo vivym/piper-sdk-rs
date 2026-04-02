@@ -119,17 +119,10 @@ impl RealtimeTxAdapter for MockTxAdapter {
 
 #[test]
 fn test_connect() {
-    // 测试连接功能
     let adapter = MockCanAdapter::new();
     let config = ConnectionConfig::default();
-
-    // 注意：MockCanAdapter 可能无法完全模拟真实连接
-    // 这个测试主要验证 API 调用不会 panic
     let result = Piper::connect(adapter, config);
-
-    // 由于 MockCanAdapter 可能无法提供有效反馈，这里只验证 API 调用
-    // 实际集成测试需要真实的 CAN 适配器
-    assert!(result.is_ok() || result.is_err());
+    assert!(result.is_err(), "connect without feedback must fail");
 }
 
 #[test]
