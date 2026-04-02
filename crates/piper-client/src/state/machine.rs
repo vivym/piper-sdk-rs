@@ -16,12 +16,12 @@ use crate::{
     raw_commander::RawCommander,
 };
 use piper_driver::{
-    BackendCapability, DriverError, ManualFaultRecoveryResult, QueryError, RuntimeFaultKind,
-    SettingResponseState,
+    BackendCapability, DriverError, ManualFaultRecoveryResult, Piper as DriverPiper, QueryError,
+    RuntimeFaultKind, SettingResponseState,
 };
 use piper_protocol::control::{InstallPosition, MitControlCommand, MitMode as ProtocolMitMode};
 use piper_protocol::feedback::{ControlMode, MoveMode, RobotStatus};
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 const COLLISION_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ZERO_SETTING_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
@@ -170,6 +170,118 @@ impl From<SettingResponseState> for SettingResponseSnapshot {
             is_valid: value.is_valid,
         }
     }
+}
+
+fn format_joint_mask(mask: u8) -> String {
+    format!("{mask:06b}")
+}
+
+fn format_optional_joint_mask(mask: Option<u8>) -> String {
+    match mask {
+        Some(mask) => format!("Some({})", format_joint_mask(mask)),
+        None => "None".to_string(),
+    }
+}
+
+fn enabled_mask_from_low_speed_complete(driver_state: &piper_driver::JointDriverLowSpeed) -> u8 {
+    driver_state.joints.iter().enumerate().fold(0, |mask, (index, joint)| {
+        if joint.enabled {
+            mask | (1 << index)
+        } else {
+            mask
+        }
+    })
+}
+
+fn enabled_mask_from_low_speed_partial(partial: &piper_driver::PartialJointDriverLowSpeed) -> u8 {
+    partial.joints.iter().enumerate().fold(0, |mask, (index, joint)| {
+        if joint.map(|joint| joint.enabled).unwrap_or(false) {
+            mask | (1 << index)
+        } else {
+            mask
+        }
+    })
+}
+
+fn summarize_low_speed_observation(
+    observation: &piper_driver::observation::Observation<
+        piper_driver::JointDriverLowSpeed,
+        piper_driver::PartialJointDriverLowSpeed,
+    >,
+) -> String {
+    match observation {
+        piper_driver::observation::Observation::Unavailable => "unavailable".to_string(),
+        piper_driver::observation::Observation::Available(available) => match &available.payload {
+            piper_driver::observation::ObservationPayload::Complete(driver_state) => format!(
+                "complete freshness={:?} meta={:?} enabled_mask={}",
+                available.freshness,
+                available.meta,
+                format_joint_mask(enabled_mask_from_low_speed_complete(driver_state))
+            ),
+            piper_driver::observation::ObservationPayload::Partial { partial, missing } => format!(
+                "partial freshness={:?} meta={:?} enabled_mask={} missing={:?}",
+                available.freshness,
+                available.meta,
+                format_joint_mask(enabled_mask_from_low_speed_partial(partial)),
+                missing.missing_indices
+            ),
+        },
+    }
+}
+
+fn enable_timeout_diagnostics_summary(driver: &DriverPiper, commit_host_mono_us: u64) -> String {
+    let robot_control = driver.get_robot_control();
+    let confirmed_after_commit =
+        driver.confirmed_driver_enabled_mask_after_host_mono(commit_host_mono_us);
+    let low_speed = driver.get_joint_driver_low_speed();
+    let health = driver.health();
+
+    format!(
+        "commit_host_mono_us={commit_host_mono_us} driver_enabled_mask={} confirmed_mask={} confirmed_after_commit={} robot_control={robot_control:?} low_speed={} health={health:?}",
+        format_joint_mask(robot_control.driver_enabled_mask),
+        format_optional_joint_mask(robot_control.confirmed_driver_enabled_mask),
+        format_optional_joint_mask(confirmed_after_commit),
+        summarize_low_speed_observation(&low_speed),
+    )
+}
+
+fn mode_confirmation_timeout_diagnostics_summary(
+    driver: &DriverPiper,
+    commit_host_mono_us: u64,
+    expected: ModeConfirmationExpectation,
+) -> String {
+    let robot_control = driver.get_robot_control();
+    let mode_echo = driver.get_control_mode_echo();
+    let low_speed = driver.get_joint_driver_low_speed();
+    let health = driver.health();
+
+    let robot_state_fresh = robot_control.host_rx_mono_us > commit_host_mono_us;
+    let robot_state_match = robot_control.is_fully_enabled_confirmed()
+        && robot_control.robot_status == RobotStatus::Normal as u8
+        && robot_control.control_mode == expected.control_mode
+        && robot_control.move_mode == expected.move_mode;
+    let mode_echo_fresh = mode_echo.is_valid && mode_echo.host_rx_mono_us > commit_host_mono_us;
+    let mode_echo_match = mode_echo.control_mode == expected.control_mode
+        && mode_echo.move_mode == expected.move_mode
+        && mode_echo.speed_percent == expected.speed_percent
+        && mode_echo.mit_mode == expected.mit_mode
+        && mode_echo.install_position == expected.install_position
+        && mode_echo.trajectory_stay_time == expected.trajectory_stay_time;
+
+    format!(
+        "commit_host_mono_us={commit_host_mono_us} expected={{control_mode={}, move_mode={}, speed_percent={}, mit_mode={}, install_position={}, trajectory_stay_time={}}} robot_state_fresh={} robot_state_match={} mode_echo_fresh={} mode_echo_match={} robot_control={robot_control:?} mode_echo={mode_echo:?} low_speed={} health={health:?}",
+        expected.control_mode,
+        expected.move_mode,
+        expected.speed_percent,
+        expected.mit_mode,
+        expected.install_position,
+        expected.trajectory_stay_time,
+        robot_state_fresh,
+        robot_state_match,
+        mode_echo_fresh,
+        mode_echo_match,
+        summarize_low_speed_observation(&low_speed),
+    )
 }
 
 // ==================== 运动类型 ====================
@@ -987,6 +1099,10 @@ where
 
             // 细粒度超时检查
             if start.elapsed() > timeout {
+                warn!(
+                    "Timed out waiting for all motors enabled: {}",
+                    enable_timeout_diagnostics_summary(&self.driver, commit_host_mono_us)
+                );
                 return Err(RobotError::Timeout {
                     timeout_ms: timeout.as_millis() as u64,
                 });
@@ -1023,6 +1139,14 @@ where
             self.ensure_runtime_health_healthy()?;
 
             if start.elapsed() > timeout {
+                warn!(
+                    "Timed out waiting for mode confirmation: {}",
+                    mode_confirmation_timeout_diagnostics_summary(
+                        &self.driver,
+                        commit_host_mono_us,
+                        expected,
+                    )
+                );
                 return Err(RobotError::Timeout {
                     timeout_ms: timeout.as_millis() as u64,
                 });
@@ -1043,11 +1167,8 @@ where
                 && mode_echo.mit_mode == expected.mit_mode
                 && mode_echo.install_position == expected.install_position
                 && mode_echo.trajectory_stay_time == expected.trajectory_stay_time;
-            if is_robot_state_fresh
-                && is_robot_state_match
-                && is_mode_echo_fresh
-                && is_mode_echo_match
-            {
+            let is_mode_echo_satisfied = !is_mode_echo_fresh || is_mode_echo_match;
+            if is_robot_state_fresh && is_robot_state_match && is_mode_echo_satisfied {
                 return Ok(());
             }
 
@@ -4027,7 +4148,7 @@ mod tests {
     }
 
     #[test]
-    fn enable_mit_mode_times_out_without_fresh_control_mode_echo() {
+    fn socketcan_without_control_mode_echo_allows_enable_mit_mode() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
         frames.push(TimedFrame {
@@ -4036,24 +4157,94 @@ mod tests {
         });
 
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
-        let error = match standby.enable_mit_mode(MitModeConfig {
-            timeout: Duration::from_millis(50),
-            debounce_threshold: 1,
-            poll_interval: Duration::from_millis(1),
-            speed_percent: 100,
-        }) {
-            Ok(_) => panic!("missing 0x151 echo must block Active<MitMode>"),
-            Err(error) => error,
-        };
+        let active = standby
+            .enable_mit_mode(MitModeConfig {
+                timeout: Duration::from_millis(50),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 100,
+            })
+            .expect("fresh matching 0x2A1 should allow Active<MitMode> even without 0x151 echo");
 
-        assert!(matches!(error, RobotError::Timeout { .. }));
+        assert!(active.observer().is_all_enabled());
+        assert!(active.observer().is_all_enabled_confirmed());
         assert!(
             sent_frames
                 .lock()
                 .expect("sent frames lock")
                 .iter()
                 .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
-            "mode switch command should still be sent before confirmation times out"
+            "mode switch command should still be sent before confirmation succeeds"
+        );
+    }
+
+    #[test]
+    fn socketcan_without_control_mode_echo_allows_enable_position_mode() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveJ, 100),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
+        let active = standby
+            .enable_position_mode(PositionModeConfig {
+                timeout: Duration::from_millis(50),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 10,
+                install_position: InstallPosition::Invalid,
+                motion_type: MotionType::Joint,
+                command_timeout: Duration::from_millis(20),
+            })
+            .expect(
+                "fresh matching 0x2A1 should allow Active<PositionMode> even without 0x151 echo",
+            );
+
+        assert!(active.observer().is_all_enabled());
+        assert!(active.observer().is_all_enabled_confirmed());
+        assert!(
+            sent_frames
+                .lock()
+                .expect("sent frames lock")
+                .iter()
+                .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
+            "mode switch command should still be sent before confirmation succeeds"
+        );
+    }
+
+    #[test]
+    fn socketcan_without_control_mode_echo_relies_on_robot_status_confirmation() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveJ, 100),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames);
+        let active = standby
+            .enable_position_mode(PositionModeConfig {
+                timeout: Duration::from_millis(50),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 10,
+                install_position: InstallPosition::Invalid,
+                motion_type: MotionType::Joint,
+                command_timeout: Duration::from_millis(20),
+            })
+            .expect("matching robot status should be sufficient when no 0x151 echo is observable");
+
+        let control = active.driver.get_robot_control();
+        let mode_echo = active.driver.get_control_mode_echo();
+
+        assert_eq!(control.control_mode, ControlMode::CanControl as u8);
+        assert_eq!(control.move_mode, MoveMode::MoveJ as u8);
+        assert!(control.is_fully_enabled_confirmed());
+        assert!(
+            !mode_echo.is_valid,
+            "SocketCAN loopback-disabled regression should not observe a 0x151 echo"
         );
     }
 
@@ -4063,10 +4254,6 @@ mod tests {
         let mut frames = enabled_joint_frames_after(Duration::from_millis(5));
         frames.push(TimedFrame {
             delay: Duration::from_millis(15),
-            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveL, 100),
-        });
-        frames.push(TimedFrame {
-            delay: Duration::from_millis(5),
             frame: control_mode_echo_frame(
                 piper_protocol::control::ControlModeCommand::CanControl,
                 MoveMode::MoveL,
@@ -4075,6 +4262,10 @@ mod tests {
                 InstallPosition::Invalid,
                 101,
             ),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::ZERO,
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveL, 100),
         });
 
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames);
@@ -4092,6 +4283,69 @@ mod tests {
         };
 
         assert!(matches!(error, RobotError::Timeout { .. }));
+    }
+
+    #[test]
+    fn enable_timeout_diagnostics_summary_reports_partial_low_speed_state() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(
+            PacedRxAdapter::new(vec![TimedFrame {
+                delay: Duration::ZERO,
+                frame: joint_driver_enabled_frame(1, 1_000),
+            }]),
+            sent_frames,
+        );
+
+        wait_until(
+            Duration::from_millis(100),
+            || standby.observer().joint_enabled_mask() == 0b000001,
+            "partial low-speed state should become visible",
+        );
+
+        let summary = enable_timeout_diagnostics_summary(&standby.driver, 500);
+
+        assert!(summary.contains("driver_enabled_mask=000001"), "{summary}");
+        assert!(summary.contains("confirmed_after_commit=None"), "{summary}");
+        assert!(summary.contains("low_speed=partial"), "{summary}");
+    }
+
+    #[test]
+    fn mode_confirmation_timeout_diagnostics_summary_reports_echo_predicates() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(5));
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveJ, 100),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames);
+        wait_until(
+            Duration::from_millis(200),
+            || standby.observer().is_all_enabled_confirmed(),
+            "enabled low-speed feedback should be confirmed",
+        );
+        wait_until(
+            Duration::from_millis(200),
+            || standby.driver.get_robot_control().control_mode == ControlMode::CanControl as u8,
+            "robot status frame should update control mode",
+        );
+
+        let summary = mode_confirmation_timeout_diagnostics_summary(
+            &standby.driver,
+            0,
+            ModeConfirmationExpectation {
+                control_mode: ControlMode::CanControl as u8,
+                move_mode: MoveMode::MoveJ as u8,
+                speed_percent: 10,
+                mit_mode: ProtocolMitMode::PositionVelocity as u8,
+                install_position: InstallPosition::Invalid as u8,
+                trajectory_stay_time: 0,
+            },
+        );
+
+        assert!(summary.contains("robot_state_match=true"), "{summary}");
+        assert!(summary.contains("mode_echo_fresh=false"), "{summary}");
+        assert!(summary.contains("mode_echo_match=false"), "{summary}");
     }
 
     #[test]
