@@ -2930,12 +2930,30 @@ impl Piper {
             .try_iter()
             .any(|event| Self::is_query_relevant_diagnostic(kind, &event))
         {
+            self.record_query_diagnostic_metric(kind);
             self.ctx.diagnostics.push(DiagnosticEvent::Query(
                 QueryDiagnostic::DiagnosticsOnlyTimeout { query: kind },
             ));
             QueryError::DiagnosticsOnlyTimeout
         } else {
             QueryError::Timeout
+        }
+    }
+
+    fn record_query_diagnostic_metric(&self, kind: QueryKind) {
+        match kind {
+            QueryKind::CollisionProtection => {
+                self.ctx.observation_metrics.record_collision_protection_diagnostic();
+            },
+            QueryKind::JointLimit => {
+                self.ctx.observation_metrics.record_joint_limit_config_diagnostic();
+            },
+            QueryKind::JointAccel => {
+                self.ctx.observation_metrics.record_joint_accel_config_diagnostic();
+            },
+            QueryKind::EndLimit => {
+                self.ctx.observation_metrics.record_end_limit_config_diagnostic();
+            },
         }
     }
 
@@ -8408,6 +8426,32 @@ mod tests {
         push_thread.join().expect("diagnostic thread should not panic");
 
         assert!(matches!(error, QueryError::Timeout));
+    }
+
+    #[test]
+    fn query_collision_protection_timeout_with_relevant_diagnostics_records_diagnostic_metric() {
+        let piper =
+            Piper::new_dual_thread_parts(BootstrappedMockRxAdapter::new(), MockTxAdapter, None)
+                .unwrap();
+        let diagnostics = piper.ctx.diagnostics.clone();
+        let push_thread = thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            diagnostics.push(DiagnosticEvent::Protocol(
+                ProtocolDiagnostic::InvalidLength {
+                    can_id: piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK,
+                    expected: 8,
+                    actual: 3,
+                },
+            ));
+        });
+
+        let error = piper.query_collision_protection(Duration::from_millis(60)).unwrap_err();
+        push_thread.join().expect("diagnostic thread should not panic");
+
+        assert!(matches!(error, QueryError::DiagnosticsOnlyTimeout));
+
+        let snapshot = piper.ctx.observation_metrics.snapshot_with_elapsed(Duration::from_secs(1));
+        assert_eq!(snapshot.collision_protection.diagnostic_rate, 1.0);
     }
 
     #[test]

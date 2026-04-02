@@ -2935,6 +2935,21 @@ fn parse_and_update_state(
                     ctx.observation_metrics.record_low_speed_raw_frame();
                     let host_rx_mono_us = host_rx_mono_us();
                     if let Ok(mut store) = ctx.joint_driver_low_speed_observation.write() {
+                        let freshness_window_us =
+                            config.low_speed_drive_state_freshness_ms.saturating_mul(1_000);
+                        let complete_before = matches!(
+                            store.observe(
+                                host_rx_mono_us,
+                                freshness_window_us,
+                                JointDriverLowSpeed::from_slots,
+                            ),
+                            crate::observation::Observation::Available(
+                                crate::observation::Available {
+                                    payload: crate::observation::ObservationPayload::Complete(_),
+                                    ..
+                                }
+                            )
+                        );
                         store.record_slot(
                             joint_idx,
                             JointDriverLowSpeedJoint {
@@ -2957,6 +2972,22 @@ fn parse_and_update_state(
                             host_rx_mono_us,
                             (frame.timestamp_us != 0).then_some(frame.timestamp_us),
                         );
+                        let complete_after = matches!(
+                            store.observe(
+                                host_rx_mono_us,
+                                freshness_window_us,
+                                JointDriverLowSpeed::from_slots,
+                            ),
+                            crate::observation::Observation::Available(
+                                crate::observation::Available {
+                                    payload: crate::observation::ObservationPayload::Complete(_),
+                                    ..
+                                }
+                            )
+                        );
+                        if !complete_before && complete_after {
+                            ctx.observation_metrics.record_low_speed_complete_observation();
+                        }
                     }
 
                     ctx.joint_driver_low_speed.rcu(|old| {
@@ -3041,9 +3072,6 @@ fn parse_and_update_state(
                         .load()
                         .joint_driver_low_speed_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if joint_idx == 5 {
-                        ctx.observation_metrics.record_low_speed_complete_observation();
-                    }
                 }
             }
         },
@@ -4158,6 +4186,34 @@ mod tests {
             maintenance_gate.current_state(),
             MaintenanceGateState::DeniedDriveStateUnknown
         );
+    }
+
+    #[test]
+    fn test_low_speed_complete_metrics_do_not_increment_for_joint_six_when_group_is_incomplete() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+        let maintenance_gate = Arc::new(MaintenanceGate::default());
+        let runtime_phase = Arc::new(AtomicU8::new(RuntimePhase::Running as u8));
+        let last_fault = Arc::new(AtomicU8::new(0));
+
+        for joint_index in [1, 2, 3, 4, 6] {
+            parse_frame_for_test_with_maintenance_refresh(
+                &ctx,
+                &mut state,
+                &metrics,
+                &config,
+                joint_driver_low_speed_frame(joint_index, false, 1_000 + u64::from(joint_index)),
+                &maintenance_gate,
+                &runtime_phase,
+                &last_fault,
+            );
+        }
+
+        let snapshot = ctx.observation_metrics.snapshot_with_elapsed(Duration::from_secs(1));
+        assert_eq!(snapshot.low_speed.raw_frame_rate, 5.0);
+        assert_eq!(snapshot.low_speed.complete_observation_rate, 0.0);
     }
 
     #[test]
