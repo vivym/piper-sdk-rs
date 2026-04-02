@@ -21,9 +21,10 @@
 use clap::Parser;
 use piper_sdk::driver::observation::{Freshness, Observation, ObservationPayload};
 use piper_sdk::driver::{
-    CollisionProtection, DiagnosticEvent, EndLimitConfig, EndPose, FamilyObservationMetrics,
-    JointAccelConfig, JointDriverLowSpeed, JointLimitConfig, PartialEndPose,
-    PartialJointAccelConfig, PartialJointDriverLowSpeed, PartialJointLimitConfig, PiperBuilder,
+    CollisionProtection, CollisionProtectionLevel, DiagnosticEvent, EndLimitConfig, EndPose,
+    FamilyObservationMetrics, JointAccelConfig, JointDriverLowSpeed, JointLimitConfig,
+    PartialEndPose, PartialJointAccelConfig, PartialJointDriverLowSpeed, PartialJointLimitConfig,
+    PiperBuilder,
 };
 use std::time::Duration;
 
@@ -196,8 +197,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(protection) => {
             println!("Collision protection levels:");
             for i in 0..6 {
-                let level = protection.value.levels[i].raw();
-                println!("  Joint {}: {}", i + 1, format_collision_level(level));
+                println!(
+                    "  Joint {}: {}",
+                    i + 1,
+                    render_collision_protection_level(protection.value.levels[i])
+                );
             }
         },
         Err(err) => {
@@ -354,11 +358,17 @@ where
     }
 }
 
-fn format_collision_level(level: u8) -> String {
-    if level <= 8 {
-        format!("Level {level}")
-    } else {
-        format!("invalid ({level})")
+fn render_collision_protection_level(level: CollisionProtectionLevel) -> &'static str {
+    match level {
+        CollisionProtectionLevel::Disabled => "Disabled",
+        CollisionProtectionLevel::Level1 => "Level 1",
+        CollisionProtectionLevel::Level2 => "Level 2",
+        CollisionProtectionLevel::Level3 => "Level 3",
+        CollisionProtectionLevel::Level4 => "Level 4",
+        CollisionProtectionLevel::Level5 => "Level 5",
+        CollisionProtectionLevel::Level6 => "Level 6",
+        CollisionProtectionLevel::Level7 => "Level 7",
+        CollisionProtectionLevel::Level8 => "Level 8",
     }
 }
 
@@ -511,22 +521,22 @@ fn print_low_speed_observation(
 mod tests {
     use super::*;
     use piper_sdk::driver::{
-        CollisionProtection, EndLimitConfig, JointAccelConfig, JointLimitConfig,
-        PartialJointAccelConfig, PartialJointLimitConfig,
+        CollisionProtection, CollisionProtectionLevel, EndLimitConfig, JointAccelConfig,
+        JointLimitConfig, PartialJointAccelConfig, PartialJointLimitConfig,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn format_collision_level_marks_invalid_values() {
-        assert_eq!(format_collision_level(255), "invalid (255)");
-        assert_eq!(format_collision_level(250), "invalid (250)");
-    }
-
-    #[test]
-    fn format_collision_level_preserves_valid_range() {
-        assert_eq!(format_collision_level(0), "Level 0");
-        assert_eq!(format_collision_level(8), "Level 8");
+    fn render_collision_protection_level_uses_typed_values_only() {
+        assert_eq!(
+            render_collision_protection_level(CollisionProtectionLevel::Disabled),
+            "Disabled"
+        );
+        assert_eq!(
+            render_collision_protection_level(CollisionProtectionLevel::Level8),
+            "Level 8"
+        );
     }
 
     #[test]
