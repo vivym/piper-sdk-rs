@@ -1734,11 +1734,19 @@ where
         }
     }
 
-    pub fn advance_query_min_host_rx_mono_us(&mut self, token: u64, min_host_rx_mono_us: u64) {
+    pub fn advance_query_min_host_rx_mono_us<F>(
+        &mut self,
+        token: u64,
+        min_host_rx_mono_us: u64,
+        assemble: F,
+    ) where
+        F: FnOnce(&[Option<TSlot>; N]) -> Option<TComplete>,
+    {
         if let Some(active_query) = self.active_query.as_mut()
             && active_query.token == token
         {
             active_query.min_host_rx_mono_us = min_host_rx_mono_us;
+            self.try_publish_staging(token, assemble);
         }
     }
 
@@ -1757,7 +1765,7 @@ where
         let Some(active_query) = self.active_query else {
             return false;
         };
-        if active_query.token != token || host_rx_mono_us <= active_query.min_host_rx_mono_us {
+        if active_query.token != token {
             return false;
         }
         if slot >= N {
@@ -1773,16 +1781,7 @@ where
             },
         });
 
-        let present_slots = self.present_slots();
-        if let Some(value) = assemble(&present_slots) {
-            let meta = self
-                .staging_meta()
-                .expect("complete query-backed frame group should have metadata");
-            self.published = Some(PublishedQueryValue {
-                token,
-                complete: Complete { value, meta },
-            });
-        }
+        self.try_publish_staging(token, assemble);
 
         true
     }
@@ -1796,23 +1795,26 @@ where
             });
         }
 
-        if self.active_query.is_none() || !self.staging.iter().any(Option::is_some) {
+        let Some(active_query) = self.active_query else {
+            return Observation::Unavailable;
+        };
+        if !self.has_eligible_staging(active_query) {
             return Observation::Unavailable;
         }
 
         let meta = self
-            .staging_meta()
-            .expect("partial query-backed frame group should have metadata");
-        let present_slots = self.present_slots();
+            .eligible_staging_meta(active_query)
+            .expect("eligible partial query-backed frame group should have metadata");
+        let present_slots = self.eligible_present_slots(active_query);
         Observation::Available(crate::observation::Available {
             payload: ObservationPayload::Partial {
                 partial: TPartial::from_present_slots(&present_slots),
                 missing: MissingSet {
                     missing_indices: self
-                        .staging
+                        .eligible_slot_mask(active_query)
                         .iter()
                         .enumerate()
-                        .filter_map(|(index, slot)| slot.is_none().then_some(index))
+                        .filter_map(|(index, present)| (!present).then_some(index))
                         .collect(),
                 },
             },
@@ -1830,12 +1832,60 @@ where
         self.staging = std::array::from_fn(|_| None);
     }
 
-    fn present_slots(&self) -> [Option<TSlot>; N] {
-        std::array::from_fn(|index| self.staging[index].as_ref().map(|slot| slot.value))
+    fn try_publish_staging<F>(&mut self, token: u64, assemble: F)
+    where
+        F: FnOnce(&[Option<TSlot>; N]) -> Option<TComplete>,
+    {
+        let Some(active_query) = self.active_query else {
+            return;
+        };
+        if active_query.token != token {
+            return;
+        }
+
+        let present_slots = self.eligible_present_slots(active_query);
+        if let Some(value) = assemble(&present_slots) {
+            let meta = self
+                .eligible_staging_meta(active_query)
+                .expect("eligible complete query-backed frame group should have metadata");
+            self.published = Some(PublishedQueryValue {
+                token,
+                complete: Complete { value, meta },
+            });
+        }
     }
 
-    fn staging_meta(&self) -> Option<ObservationMeta> {
-        let mut iter = self.staging.iter().flatten();
+    fn eligible_slot_mask(&self, active_query: ActiveQueryObservationWindow) -> [bool; N] {
+        std::array::from_fn(|index| self.is_slot_eligible(index, active_query))
+    }
+
+    fn eligible_present_slots(
+        &self,
+        active_query: ActiveQueryObservationWindow,
+    ) -> [Option<TSlot>; N] {
+        std::array::from_fn(|index| {
+            self.is_slot_eligible(index, active_query)
+                .then(|| self.staging[index].expect("eligible slot should exist").value)
+        })
+    }
+
+    fn has_eligible_staging(&self, active_query: ActiveQueryObservationWindow) -> bool {
+        self.staging
+            .iter()
+            .enumerate()
+            .any(|(index, _)| self.is_slot_eligible(index, active_query))
+    }
+
+    fn eligible_staging_meta(
+        &self,
+        active_query: ActiveQueryObservationWindow,
+    ) -> Option<ObservationMeta> {
+        let mut iter = self
+            .staging
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| self.is_slot_eligible(index, active_query).then_some(slot))
+            .flatten();
         let first = iter.next()?;
         let mut hardware_timestamp_us = first.meta.hardware_timestamp_us;
         let mut host_rx_mono_us = first.meta.host_rx_mono_us;
@@ -1855,6 +1905,14 @@ where
             host_rx_mono_us,
             source: ObservationSource::Query,
         })
+    }
+
+    fn is_slot_eligible(&self, index: usize, active_query: ActiveQueryObservationWindow) -> bool {
+        self.staging[index]
+            .map(|slot| {
+                slot.meta.host_rx_mono_us.unwrap_or_default() > active_query.min_host_rx_mono_us
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -4935,5 +4993,56 @@ mod tests {
         assert!(state.firmware_data.is_empty());
         assert!(!state.is_complete);
         assert!(state.version_string.is_none());
+    }
+
+    #[test]
+    fn query_backed_frame_group_store_keeps_post_commit_slots_staged_before_threshold_advances() {
+        let mut store = JointLimitObservationStore::new();
+        let token = 7;
+
+        store.begin_query(token, u64::MAX);
+
+        for slot in 0..6 {
+            assert!(store.record_query_slot(
+                token,
+                slot,
+                JointLimit {
+                    min_angle_rad: -(slot as f64) - 1.0,
+                    max_angle_rad: slot as f64 + 1.0,
+                    max_velocity_rad_s: slot as f64 + 0.5,
+                },
+                100 + slot as u64,
+                Some(1_000 + slot as u64),
+                JointLimitConfig::from_slots,
+            ));
+        }
+
+        for slot in 0..6 {
+            assert!(store.record_query_slot(
+                token,
+                slot,
+                JointLimit {
+                    min_angle_rad: -(slot as f64) - 10.0,
+                    max_angle_rad: slot as f64 + 10.0,
+                    max_velocity_rad_s: slot as f64 + 10.5,
+                },
+                200 + slot as u64,
+                Some(2_000 + slot as u64),
+                JointLimitConfig::from_slots,
+            ));
+        }
+
+        assert!(store.current_complete_for_token(token).is_none());
+        assert!(matches!(store.observe(), Observation::Unavailable));
+
+        store.advance_query_min_host_rx_mono_us(token, 150, JointLimitConfig::from_slots);
+
+        let complete = store
+            .current_complete_for_token(token)
+            .expect("post-commit staged slots should publish after threshold advances");
+        assert_eq!(complete.meta.host_rx_mono_us, Some(200));
+        assert_eq!(complete.value.joints[0].max_angle_rad, 10.0);
+        assert_eq!(complete.value.joints[5].min_angle_rad, -15.0);
+        assert_eq!(complete.value.joints[3].max_velocity_rad_s, 13.5);
     }
 }

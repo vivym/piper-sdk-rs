@@ -3018,7 +3018,11 @@ impl Piper {
                 .joint_limit_observation
                 .write()
                 .map(|mut store| {
-                    store.advance_query_min_host_rx_mono_us(token, commit_host_mono_us)
+                    store.advance_query_min_host_rx_mono_us(
+                        token,
+                        commit_host_mono_us,
+                        JointLimitConfig::from_slots,
+                    )
                 })
                 .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
@@ -3072,7 +3076,11 @@ impl Piper {
                 .joint_accel_observation
                 .write()
                 .map(|mut store| {
-                    store.advance_query_min_host_rx_mono_us(token, commit_host_mono_us)
+                    store.advance_query_min_host_rx_mono_us(
+                        token,
+                        commit_host_mono_us,
+                        JointAccelConfig::from_slots,
+                    )
                 })
                 .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
