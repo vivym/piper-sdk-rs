@@ -123,7 +123,7 @@ pub fn active_park_blocking<Capability>(
 where
     Capability: MotionCapability,
 {
-    active_move_to_joint_target_blocking(robot, profile.park_pose(), &profile.wait)
+    active_park_blocking_with(robot, profile, active_move_to_joint_target_blocking)
 }
 
 pub fn home_zero_blocking<Capability>(
@@ -143,9 +143,41 @@ pub fn park_blocking<Capability>(
 where
     Capability: MotionCapability,
 {
-    let active = standby.enable_position_mode(profile.park_position_mode_config()?)?;
-    active_move_to_joint_target_blocking(&active, profile.park_pose(), &profile.wait)?;
-    active.disable(DisableConfig::default()).map_err(Into::into)
+    park_blocking_with(
+        standby,
+        profile,
+        |standby, config| Ok(standby.enable_position_mode(config)?),
+        active_move_to_joint_target_blocking,
+        |active| active.disable(DisableConfig::default()).map_err(Into::into),
+    )
+}
+
+fn active_park_blocking_with<Robot, Move>(
+    robot: &Robot,
+    profile: &ControlProfile,
+    mut move_to_joint_target: Move,
+) -> Result<()>
+where
+    Move: FnMut(&Robot, [f64; 6], &MotionWaitConfig) -> Result<()>,
+{
+    move_to_joint_target(robot, profile.park_pose(), &profile.wait)
+}
+
+fn park_blocking_with<StandbyRobot, ActiveRobot, Enable, Move, Disable>(
+    standby: StandbyRobot,
+    profile: &ControlProfile,
+    mut enable_position_mode: Enable,
+    mut move_to_joint_target: Move,
+    mut disable: Disable,
+) -> Result<StandbyRobot>
+where
+    Enable: FnMut(StandbyRobot, piper_client::state::PositionModeConfig) -> Result<ActiveRobot>,
+    Move: FnMut(&ActiveRobot, [f64; 6], &MotionWaitConfig) -> Result<()>,
+    Disable: FnMut(ActiveRobot) -> Result<StandbyRobot>,
+{
+    let active = enable_position_mode(standby, profile.park_position_mode_config()?)?;
+    move_to_joint_target(&active, profile.park_pose(), &profile.wait)?;
+    disable(active)
 }
 
 pub fn set_joint_zero_blocking<Capability>(
@@ -381,7 +413,6 @@ mod tests {
     use super::*;
     use crate::ParkOrientation;
     use piper_client::MonitorStateSource;
-    use piper_client::state::{Active, Piper, PositionMode, SoftRealtime};
     use piper_driver::ConnectionTarget;
     use piper_tools::SafetyConfig;
     use std::sync::{Arc, Mutex};
@@ -548,9 +579,51 @@ mod tests {
     #[test]
     fn park_blocking_uses_profile_park_pose_and_park_speed_config() {
         let profile = test_profile_with_park_speed(5);
-        let config = profile.park_position_mode_config().unwrap();
-        assert_eq!(config.speed_percent, 5);
-        assert_eq!(profile.park_pose(), [0.0, 0.0, 0.0, 0.02, 0.5, 0.0]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let standby = ();
+        park_blocking_with(
+            standby,
+            &profile,
+            {
+                let calls = Arc::clone(&calls);
+                move |standby, config| {
+                    calls.lock().unwrap().push(format!(
+                        "enable:{}:{:?}",
+                        config.speed_percent, config.install_position
+                    ));
+                    assert_eq!(config.speed_percent, 5);
+                    Ok(standby)
+                }
+            },
+            {
+                let calls = Arc::clone(&calls);
+                move |_, target, wait| {
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("move:{target:?}:{:.3}", wait.threshold_rad));
+                    assert_eq!(target, [0.0, 0.0, 0.0, 0.02, 0.5, 0.0]);
+                    Ok(())
+                }
+            },
+            {
+                let calls = Arc::clone(&calls);
+                move |standby| {
+                    calls.lock().unwrap().push("disable".to_string());
+                    Ok(standby)
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "enable:5:Horizontal".to_string(),
+                "move:[0.0, 0.0, 0.0, 0.02, 0.5, 0.0]:0.020".to_string(),
+                "disable".to_string(),
+            ],
+        );
     }
 
     #[test]
@@ -561,10 +634,23 @@ mod tests {
             ParkOrientation::Upright.default_rest_pose()
         );
 
-        let _active_park: fn(
-            &Piper<Active<PositionMode>, SoftRealtime>,
-            &ControlProfile,
-        ) -> Result<()> = crate::active_park_blocking::<SoftRealtime>;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let robot = ();
+        active_park_blocking_with(&robot, &profile, {
+            let calls = Arc::clone(&calls);
+            move |_, target, wait| {
+                calls.lock().unwrap().push(format!("move:{target:?}:{:.3}", wait.threshold_rad));
+                assert_eq!(target, ParkOrientation::Upright.default_rest_pose());
+                assert_eq!(wait.threshold_rad, profile.wait.threshold_rad);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["move:[0.0, 0.0, 0.0, 0.02, 0.5, 0.0]:0.020".to_string()],
+        );
     }
 
     #[test]
