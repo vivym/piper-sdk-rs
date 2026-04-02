@@ -398,6 +398,10 @@ fn print_low_speed_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_sdk::driver::{
+        CollisionProtection, EndLimitConfig, JointAccelConfig, JointLimitConfig,
+        PartialJointAccelConfig, PartialJointLimitConfig,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -448,5 +452,30 @@ mod tests {
 
         assert!(started_at.elapsed() >= Duration::from_millis(20));
         assert!(value.is_none());
+    }
+
+    #[test]
+    fn state_api_demo_formats_unavailable_without_fake_zero_values() {
+        let collision = Observation::<CollisionProtection>::Unavailable;
+        let joint_limits = Observation::<JointLimitConfig, PartialJointLimitConfig>::Unavailable;
+        let joint_accel = Observation::<JointAccelConfig, PartialJointAccelConfig>::Unavailable;
+        let end_limits = Observation::<EndLimitConfig>::Unavailable;
+
+        let rendered = render_query_backed_observation_section(
+            &collision,
+            &joint_limits,
+            &joint_accel,
+            &end_limits,
+        );
+
+        assert!(rendered.contains("Collision protection: Unavailable"));
+        assert!(rendered.contains("Joint limits: Unavailable"));
+        assert!(rendered.contains("Joint acceleration limits: Unavailable"));
+        assert!(rendered.contains("End-effector limits: Unavailable"));
+        assert!(!rendered.contains("Level 0"));
+        assert!(!rendered.contains("0.00 rad/s"));
+        assert!(!rendered.contains("0.00 rad/s²"));
+        assert!(!rendered.contains("0.00 m/s"));
+        assert!(!rendered.contains("0.00 m/s²"));
     }
 }
