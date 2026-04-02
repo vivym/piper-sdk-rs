@@ -85,8 +85,8 @@
 这些阈值在 Phase 1-4 中都沿用相同含义：
 
 - `client_monitor_hil_check` 负责 connection budget、first snapshot budget 和 observation window
-- `hil_joint_position_check` 负责 Standby、enable、move、return 的低风险运动证据
-- `piper-cli` 负责 disable、stop、recovery gating 和故障后最小安全验证
+- `hil_joint_position_check` 负责低风险 motion 路径的主证据；默认成功路径会完成 Standby、enable、move、return、park、disable
+- `piper-cli` 仍负责显式 raw disable、stop、recovery gating 和故障后最小安全验证
 
 ## Phase 0: Preflight and Safety Baseline
 
@@ -220,7 +220,7 @@
    cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
    ```
 2. `hil_joint_position_check` 的成功路径默认按下面顺序收尾：先完成 `move`，再回到初始 snapshot，随后按配置的 rest pose 停靠，最后才会 disable。
-3. 如果显式传入 `--no-park`，则只跳过“停靠后再 disable”这一步，其他通过判据不变。
+3. 如果显式传入 `--no-park`，则只跳过停车步骤；helper 仍会在回到初始 snapshot 后 disable，其他通过判据不变。
 4. 重点看 helper 中下面这些 accepted evidence lines：
    - `[PASS] connected and confirmed Standby`
    - `[PASS] enabled PositionMode motion=Joint speed_percent=...`
