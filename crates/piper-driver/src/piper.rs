@@ -6812,6 +6812,11 @@ mod tests {
         .expect("driver should start")
     }
 
+    fn build_default_test_piper() -> Piper {
+        Piper::new_dual_thread_parts_unvalidated(MockRxAdapter, MockTxAdapter, None)
+            .expect("driver should start")
+    }
+
     fn inject_low_speed_joint(
         piper: &Piper,
         joint_index: usize,
@@ -6906,6 +6911,25 @@ mod tests {
                 assert!(matches!(available.freshness, Freshness::Stale { .. }));
             },
             other => panic!("expected available observation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuilt_low_speed_observation_uses_fixed_75ms_stale_policy_by_default() {
+        let piper = build_default_test_piper();
+        inject_low_speed_joint(&piper, 0, 1_000_000, Some(100));
+
+        let observation = piper.get_joint_driver_low_speed_at(1_076_000);
+
+        match observation {
+            Observation::Available(available) => {
+                assert!(matches!(
+                    available.payload,
+                    ObservationPayload::Partial { .. }
+                ));
+                assert!(matches!(available.freshness, Freshness::Stale { .. }));
+            },
+            other => panic!("expected stale rebuilt low-speed observation, got {other:?}"),
         }
     }
 
