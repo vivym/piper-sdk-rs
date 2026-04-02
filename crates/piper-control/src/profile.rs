@@ -11,6 +11,7 @@ pub struct ControlProfile {
     pub target: ConnectionTarget,
     pub orientation: ParkOrientation,
     pub rest_pose_override: Option<[f64; 6]>,
+    pub park_speed_percent: u8,
     pub safety: SafetyConfig,
     pub wait: MotionWaitConfig,
 }
@@ -22,6 +23,14 @@ impl ControlProfile {
 
     pub fn position_mode_config(&self) -> piper_client::state::PositionModeConfig {
         piper_client::state::PositionModeConfig {
+            install_position: self.orientation.install_position(),
+            ..piper_client::state::PositionModeConfig::default()
+        }
+    }
+
+    pub fn park_position_mode_config(&self) -> piper_client::state::PositionModeConfig {
+        piper_client::state::PositionModeConfig {
+            speed_percent: self.park_speed_percent,
             install_position: self.orientation.install_position(),
             ..piper_client::state::PositionModeConfig::default()
         }
@@ -114,6 +123,25 @@ mod tests {
         assert_eq!(
             ParkOrientation::Right.default_rest_pose(),
             [-1.66, 2.91, -2.74, 0.0545, -0.271, 0.0979]
+        );
+    }
+
+    #[test]
+    fn park_position_mode_config_defaults_to_slow_speed() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 5,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        };
+
+        let config = profile.park_position_mode_config();
+        assert_eq!(config.speed_percent, 5);
+        assert_eq!(
+            config.install_position,
+            profile.orientation.install_position()
         );
     }
 }

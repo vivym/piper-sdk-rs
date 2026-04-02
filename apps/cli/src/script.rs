@@ -63,6 +63,7 @@ impl ScriptExecutor {
                     target: ConnectionTarget::AutoStrict,
                     orientation: piper_control::ParkOrientation::Upright,
                     rest_pose_override: None,
+                    park_speed_percent: 5,
                     safety: piper_tools::SafetyConfig::default_config(),
                     wait: piper_control::MotionWaitConfig::default(),
                 },
