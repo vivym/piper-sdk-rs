@@ -13,15 +13,15 @@ use piper_control::{
     active_move_to_joint_target_with_cancel, prepare_move, query_collision_protection_blocking,
     set_collision_protection_verified, set_joint_zero_blocking,
 };
-use rustyline::Editor;
+use rustyline::{Editor, ExternalPrinter};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
 
@@ -30,6 +30,55 @@ use std::sync::atomic::AtomicUsize;
 
 const REPL_HISTORY_ENV_VAR: &str = "PIPER_HISTORY_FILE";
 const REPL_HISTORY_FILENAME: &str = "repl_history.txt";
+type ShellPrinter = Arc<Mutex<Box<dyn ExternalPrinter + Send>>>;
+
+static SHELL_PRINTER: OnceLock<Mutex<Option<ShellPrinter>>> = OnceLock::new();
+
+macro_rules! shell_outln {
+    ($($arg:tt)*) => {{
+        shell_stdout_line(format!($($arg)*));
+    }};
+}
+
+macro_rules! shell_errln {
+    ($($arg:tt)*) => {{
+        shell_stderr_line(format!($($arg)*));
+    }};
+}
+
+fn shell_printer_slot() -> &'static Mutex<Option<ShellPrinter>> {
+    SHELL_PRINTER.get_or_init(|| Mutex::new(None))
+}
+
+fn set_shell_printer(printer: Option<ShellPrinter>) {
+    if let Ok(mut slot) = shell_printer_slot().lock() {
+        *slot = printer;
+    }
+}
+
+fn shared_shell_printer() -> Option<ShellPrinter> {
+    shell_printer_slot().lock().ok().and_then(|slot| slot.as_ref().map(Arc::clone))
+}
+
+fn shell_stdout_line(message: String) {
+    if let Some(printer) = shared_shell_printer()
+        && let Ok(mut printer) = printer.lock()
+        && printer.print(format!("{message}\n")).is_ok()
+    {
+        return;
+    }
+    println!("{message}");
+}
+
+fn shell_stderr_line(message: String) {
+    if let Some(printer) = shared_shell_printer()
+        && let Ok(mut printer) = printer.lock()
+        && printer.print(format!("{message}\n")).is_ok()
+    {
+        return;
+    }
+    eprintln!("{message}");
+}
 
 fn resolve_history_path_with(
     env_override: Option<OsString>,
@@ -118,13 +167,13 @@ impl ReplSession {
 
     pub fn connect(&mut self, target: Option<TargetSpec>) -> Result<()> {
         if self.state.is_connected() {
-            println!("⚠️  已经连接");
+            shell_outln!("⚠️  已经连接");
             return Ok(());
         }
 
         self.profile = self.config.control_profile(target.as_ref());
-        println!("⏳ 连接到机器人...");
-        println!(
+        shell_outln!("⏳ 连接到机器人...");
+        shell_outln!(
             "🎯 target: {}",
             TargetSpec::from(self.profile.target.clone())
         );
@@ -144,35 +193,35 @@ impl ReplSession {
             },
         };
 
-        println!("✅ 已连接");
+        shell_outln!("✅ 已连接");
         Ok(())
     }
 
     pub fn disconnect(&mut self) {
         if !self.state.is_connected() {
-            println!("⚠️  未连接");
+            shell_outln!("⚠️  未连接");
             return;
         }
 
-        println!("⏳ 断开连接...");
+        shell_outln!("⏳ 断开连接...");
         self.state = ReplState::Disconnected;
-        println!("✅ 已断开");
+        shell_outln!("✅ 已断开");
     }
 
     pub fn enable(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, ReplState::Disconnected) {
             ReplState::StandbyStrict(robot) => {
-                println!("⏳ 使能电机...");
+                shell_outln!("⏳ 使能电机...");
                 let robot = robot.enable_position_mode(self.profile.position_mode_config())?;
                 self.state = ReplState::ActivePositionStrict(robot);
-                println!("✅ 已使能 Position Mode");
+                shell_outln!("✅ 已使能 Position Mode");
                 Ok(())
             },
             ReplState::StandbySoft(robot) => {
-                println!("⏳ 使能电机...");
+                shell_outln!("⏳ 使能电机...");
                 let robot = robot.enable_position_mode(self.profile.position_mode_config())?;
                 self.state = ReplState::ActivePositionSoft(robot);
-                println!("✅ 已使能 Position Mode");
+                shell_outln!("✅ 已使能 Position Mode");
                 Ok(())
             },
             ReplState::Disconnected => {
@@ -181,12 +230,12 @@ impl ReplSession {
             },
             ReplState::ActivePositionStrict(robot) => {
                 self.state = ReplState::ActivePositionStrict(robot);
-                println!("⚠️  已经使能");
+                shell_outln!("⚠️  已经使能");
                 Ok(())
             },
             ReplState::ActivePositionSoft(robot) => {
                 self.state = ReplState::ActivePositionSoft(robot);
-                println!("⚠️  已经使能");
+                shell_outln!("⚠️  已经使能");
                 Ok(())
             },
         }
@@ -195,27 +244,27 @@ impl ReplSession {
     pub fn disable(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, ReplState::Disconnected) {
             ReplState::ActivePositionStrict(robot) => {
-                println!("⏳ 去使能电机...");
+                shell_outln!("⏳ 去使能电机...");
                 let robot = robot.disable(DisableConfig::default())?;
                 self.state = ReplState::StandbyStrict(robot);
-                println!("✅ 已去使能");
+                shell_outln!("✅ 已去使能");
                 Ok(())
             },
             ReplState::ActivePositionSoft(robot) => {
-                println!("⏳ 去使能电机...");
+                shell_outln!("⏳ 去使能电机...");
                 let robot = robot.disable(DisableConfig::default())?;
                 self.state = ReplState::StandbySoft(robot);
-                println!("✅ 已去使能");
+                shell_outln!("✅ 已去使能");
                 Ok(())
             },
             ReplState::StandbyStrict(robot) => {
                 self.state = ReplState::StandbyStrict(robot);
-                println!("⚠️  未使能");
+                shell_outln!("⚠️  未使能");
                 Ok(())
             },
             ReplState::StandbySoft(robot) => {
                 self.state = ReplState::StandbySoft(robot);
-                println!("⚠️  未使能");
+                shell_outln!("⚠️  未使能");
                 Ok(())
             },
             ReplState::Disconnected => {
@@ -375,12 +424,19 @@ pub struct ReplInput {
 impl ReplInput {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel::<String>(10);
+        let (printer_tx, printer_rx) = std_mpsc::sync_channel::<Option<ShellPrinter>>(1);
 
         let input_thread = thread::spawn(move || {
             use rustyline::history::DefaultHistory;
 
             let mut rl = Editor::<(), DefaultHistory>::new()
                 .map_err(|e| anyhow::anyhow!("Failed to initialize readline: {}", e))?;
+            let printer = rl.create_external_printer().ok().map(|printer| {
+                Arc::new(Mutex::new(
+                    Box::new(printer) as Box<dyn ExternalPrinter + Send>
+                ))
+            });
+            let _ = printer_tx.send(printer);
 
             let history_path = match resolve_history_path() {
                 Ok(path) => {
@@ -442,6 +498,8 @@ impl ReplInput {
 
             Ok(())
         });
+        let printer = printer_rx.recv().ok().flatten();
+        set_shell_printer(printer);
 
         Self {
             command_rx,
@@ -451,6 +509,12 @@ impl ReplInput {
 
     pub async fn recv_command(&mut self) -> Option<String> {
         self.command_rx.recv().await
+    }
+}
+
+impl Drop for ReplInput {
+    fn drop(&mut self) {
+        set_shell_printer(None);
     }
 }
 
@@ -649,21 +713,21 @@ impl ReplExecutor {
         match completion.outcome {
             GuardedCommandOutcome::Success(CommandExecutionOutcome::Completed) => {},
             GuardedCommandOutcome::Success(CommandExecutionOutcome::MotionCancelled) => {
-                println!("🛑 当前运动已取消，连接保持在 {}", self.status());
+                shell_outln!("🛑 当前运动已取消，连接保持在 {}", self.status());
             },
             GuardedCommandOutcome::Error(error) => {
-                eprintln!("❌ Error: {}", error);
+                shell_errln!("❌ Error: {}", error);
                 print_help_hint(&completion.line);
             },
             GuardedCommandOutcome::Panicked(panic_err) => {
-                eprintln!("❌ Command panicked: {:?}", panic_err);
+                shell_errln!("❌ Command panicked: {:?}", panic_err);
             },
         }
 
         if let Some(stop_result) = completion.post_command_stop {
             match stop_result {
-                Ok(()) => println!("✅ 已确认失能全部关节，连接保持在 {}", self.status()),
-                Err(error) => eprintln!("❌ Emergency stop failed: {error}"),
+                Ok(()) => shell_outln!("✅ 已确认失能全部关节，连接保持在 {}", self.status()),
+                Err(error) => shell_errln!("❌ Emergency stop failed: {error}"),
             }
         }
     }
@@ -702,13 +766,13 @@ pub async fn run_repl() -> Result<()> {
     let mut input = ReplInput::new();
     let mut exit_after_completion = false;
 
-    println!();
-    println!("💡 提示: 使用 'connect' 连接到机器人，然后 'enable' 使能电机");
-    println!("💡 提示: 连接目标使用和 CLI 一样的 target spec，例如 socketcan:can0");
-    println!("💡 提示: `stop` 或 Ctrl+C 会请求并确认全关节失能，然后保持连接在 Standby");
-    println!("💡 提示: 命令执行期间只接受 `stop` / Ctrl+C / exit");
-    println!("💡 提示: shell 不做交互式确认；高风险 move / set-zero 请显式加 --force");
-    println!();
+    shell_outln!("");
+    shell_outln!("💡 提示: 使用 'connect' 连接到机器人，然后 'enable' 使能电机");
+    shell_outln!("💡 提示: 连接目标使用和 CLI 一样的 target spec，例如 socketcan:can0");
+    shell_outln!("💡 提示: `stop` 或 Ctrl+C 会请求并确认全关节失能，然后保持连接在 Standby");
+    shell_outln!("💡 提示: 命令执行期间只接受 `stop` / Ctrl+C / exit");
+    shell_outln!("💡 提示: shell 不做交互式确认；高风险 move / set-zero 请显式加 --force");
+    shell_outln!("");
 
     loop {
         if executor.is_busy() {
@@ -717,13 +781,13 @@ pub async fn run_repl() -> Result<()> {
                     match line {
                         Some(line) => {
                             if handle_line_while_busy(&mut executor, &line, &mut exit_after_completion)? {
-                                println!("👋 再见！");
+                                shell_outln!("👋 再见！");
                                 break;
                             }
                         },
                         None => {
                             if handle_input_closed_while_busy(&mut executor, &mut exit_after_completion)? {
-                                println!("👋 再见！");
+                                shell_outln!("👋 再见！");
                                 break;
                             }
                         },
@@ -732,7 +796,7 @@ pub async fn run_repl() -> Result<()> {
                 completion = executor.wait_for_completion() => {
                     executor.finish_completion(completion?);
                     if exit_after_completion {
-                        println!("👋 再见！");
+                        shell_outln!("👋 再见！");
                         break;
                     }
                 }
@@ -745,13 +809,13 @@ pub async fn run_repl() -> Result<()> {
                 match line {
                     Some(line) => {
                         if handle_line_when_idle(&mut executor, &line)? {
-                            println!("👋 再见！");
+                            shell_outln!("👋 再见！");
                             break;
                         }
                     },
                     None => {
                         if handle_input_closed_when_idle() {
-                            println!("👋 再见！");
+                            shell_outln!("👋 再见！");
                             break;
                         }
                     },
@@ -776,7 +840,7 @@ fn handle_line_when_idle(executor: &mut ReplExecutor, line: &str) -> Result<bool
             return Ok(false);
         },
         "status" => {
-            println!("📊 状态: {}", executor.status());
+            shell_outln!("📊 状态: {}", executor.status());
             return Ok(false);
         },
         "stop" => {
@@ -805,7 +869,7 @@ fn handle_line_while_busy(
         return Ok(false);
     }
 
-    println!("⚠️  当前命令仍在执行；请等待完成或先使用 `stop` / Ctrl+C");
+    shell_outln!("⚠️  当前命令仍在执行；请等待完成或先使用 `stop` / Ctrl+C");
     Ok(false)
 }
 
@@ -825,13 +889,13 @@ fn handle_input_closed_while_busy(
 fn announce_stop_request(outcome: EmergencyStopOutcome) {
     match outcome {
         EmergencyStopOutcome::StartedImmediate => {
-            eprintln!("\n🛑 Emergency stop activated!");
+            shell_errln!("\n🛑 Emergency stop activated!");
         },
         EmergencyStopOutcome::CancellingMotion => {
-            eprintln!("\n🛑 Emergency stop requested, cancelling current motion...");
+            shell_errln!("\n🛑 Emergency stop requested, cancelling current motion...");
         },
         EmergencyStopOutcome::QueuedAfterCurrent => {
-            eprintln!(
+            shell_errln!(
                 "\n🛑 Emergency stop queued; it will run after the current command finishes."
             );
         },
@@ -911,7 +975,7 @@ fn handle_move(
         control.cancel_requested()
     })? {
         MotionExecutionOutcome::Reached => {
-            println!("✅ 移动完成");
+            shell_outln!("✅ 移动完成");
             Ok(CommandExecutionOutcome::Completed)
         },
         MotionExecutionOutcome::Cancelled => Ok(CommandExecutionOutcome::MotionCancelled),
@@ -920,9 +984,9 @@ fn handle_move(
 
 fn handle_position(session: &ReplSession) -> Result<()> {
     let positions = session.observer_positions()?;
-    println!("📍 当前位置:");
+    shell_outln!("📍 当前位置:");
     for (index, position) in positions.iter().enumerate() {
-        println!(
+        shell_outln!(
             "  J{}: {:.3} rad ({:.1}°)",
             index + 1,
             position,
@@ -940,7 +1004,7 @@ fn handle_home(
     let robot = session.active_robot()?;
     match robot.move_with_cancel([0.0; 6], &session.profile, || control.cancel_requested())? {
         MotionExecutionOutcome::Reached => {
-            println!("✅ 回零完成");
+            shell_outln!("✅ 回零完成");
             Ok(CommandExecutionOutcome::Completed)
         },
         MotionExecutionOutcome::Cancelled => Ok(CommandExecutionOutcome::MotionCancelled),
@@ -957,7 +1021,7 @@ fn handle_park(
         control.cancel_requested()
     })? {
         MotionExecutionOutcome::Reached => {
-            println!("✅ 停靠完成");
+            shell_outln!("✅ 停靠完成");
             Ok(CommandExecutionOutcome::Completed)
         },
         MotionExecutionOutcome::Cancelled => Ok(CommandExecutionOutcome::MotionCancelled),
@@ -971,7 +1035,7 @@ fn handle_set_zero(session: &ReplSession, parts: &[&str]) -> Result<()> {
 
     let robot = session.standby_robot()?;
     robot.set_joint_zero(&joints)?;
-    println!("✅ 零点标定命令已发送");
+    shell_outln!("✅ 零点标定命令已发送");
     Ok(())
 }
 
@@ -997,7 +1061,7 @@ fn handle_collision_protection(session: &ReplSession, parts: &[&str]) -> Result<
     match parts.get(1).copied() {
         Some("get") => {
             let levels = robot.query_collision_protection(&session.profile)?;
-            println!("collision protection levels: {:?}", levels);
+            shell_outln!("collision protection levels: {:?}", levels);
             Ok(())
         },
         Some("set") => {
@@ -1008,7 +1072,7 @@ fn handle_collision_protection(session: &ReplSession, parts: &[&str]) -> Result<
             let levels = option_value(parts, "--levels");
             let desired = parse_collision_levels(level, levels)?;
             robot.set_collision_protection(desired, &session.profile)?;
-            println!("✅ 碰撞保护等级已写入并校验: {:?}", desired);
+            shell_outln!("✅ 碰撞保护等级已写入并校验: {:?}", desired);
             Ok(())
         },
         _ => bail!(
@@ -1018,9 +1082,9 @@ fn handle_collision_protection(session: &ReplSession, parts: &[&str]) -> Result<
 }
 
 fn handle_stop(session: &mut ReplSession) -> Result<()> {
-    println!("🛑 急停...");
+    shell_outln!("🛑 急停...");
     session.emergency_stop()?;
-    println!("✅ 已急停，连接保持在 {}", session.status());
+    shell_outln!("✅ 已急停，连接保持在 {}", session.status());
     Ok(())
 }
 
@@ -1032,38 +1096,38 @@ fn option_value<'a>(parts: &'a [&str], flag: &str) -> Option<&'a str> {
 }
 
 fn print_help() {
-    println!("可用命令:");
-    println!("  connect [target-spec]                 连接到机器人");
-    println!("  disconnect                            断开连接");
-    println!("  enable                                使能 Position Mode");
-    println!("  disable                               去使能电机");
-    println!("  move --joints <J1,..,Jn> [--force]    移动关节（1~6 个值）");
-    println!("  position                              查询当前位置");
-    println!("  home                                  回到零关节位");
-    println!("  park                                  前往停靠位");
-    println!("  set-zero [--joints 1,2,3] [--force]   写入零点标定");
-    println!("  collision-protection get              主动查询碰撞保护等级");
-    println!("  collision-protection set --level 5    设置统一碰撞保护等级");
-    println!("  stop                                  急停（确认全关节失能，保持连接）");
-    println!("  status                                显示连接状态");
-    println!("  help                                  显示帮助");
-    println!("  exit / quit                           退出");
-    println!("  Ctrl+C                                急停（确认全关节失能，保持连接）");
-    println!("  Ctrl+D                                退出 shell");
-    println!("  忙碌时                                仅接受 stop / Ctrl+C / exit");
-    println!("  需要确认的操作                        shell 中必须显式加 --force");
-    println!();
+    shell_outln!("可用命令:");
+    shell_outln!("  connect [target-spec]                 连接到机器人");
+    shell_outln!("  disconnect                            断开连接");
+    shell_outln!("  enable                                使能 Position Mode");
+    shell_outln!("  disable                               去使能电机");
+    shell_outln!("  move --joints <J1,..,Jn> [--force]    移动关节（1~6 个值）");
+    shell_outln!("  position                              查询当前位置");
+    shell_outln!("  home                                  回到零关节位");
+    shell_outln!("  park                                  前往停靠位");
+    shell_outln!("  set-zero [--joints 1,2,3] [--force]   写入零点标定");
+    shell_outln!("  collision-protection get              主动查询碰撞保护等级");
+    shell_outln!("  collision-protection set --level 5    设置统一碰撞保护等级");
+    shell_outln!("  stop                                  急停（确认全关节失能，保持连接）");
+    shell_outln!("  status                                显示连接状态");
+    shell_outln!("  help                                  显示帮助");
+    shell_outln!("  exit / quit                           退出");
+    shell_outln!("  Ctrl+C                                急停（确认全关节失能，保持连接）");
+    shell_outln!("  Ctrl+D                                退出 shell");
+    shell_outln!("  忙碌时                                仅接受 stop / Ctrl+C / exit");
+    shell_outln!("  需要确认的操作                        shell 中必须显式加 --force");
+    shell_outln!("");
 }
 
 fn print_help_hint(command: &str) {
     if command.starts_with("move") {
-        eprintln!("💡 提示: 使用 'move --joints 0.1,0.2,0.3 --force'；未指定的关节保持当前位姿");
+        shell_errln!("💡 提示: 使用 'move --joints 0.1,0.2,0.3 --force'；未指定的关节保持当前位姿");
     } else if command.starts_with("connect") {
-        eprintln!("💡 提示: 使用 'connect' 或 'connect socketcan:can0'");
+        shell_errln!("💡 提示: 使用 'connect' 或 'connect socketcan:can0'");
     } else if command.starts_with("set-zero") {
-        eprintln!("💡 提示: 使用 'set-zero --force' 或 'set-zero --joints 1,2,3 --force'");
+        shell_errln!("💡 提示: 使用 'set-zero --force' 或 'set-zero --joints 1,2,3 --force'");
     } else {
-        eprintln!("💡 提示: 输入 'help' 查看所有命令");
+        shell_errln!("💡 提示: 输入 'help' 查看所有命令");
     }
 }
 
@@ -1106,6 +1170,20 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+
+    static SHELL_PRINTER_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct RecordingPrinter {
+        lines: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl ExternalPrinter for RecordingPrinter {
+        fn print(&mut self, msg: String) -> rustyline::Result<()> {
+            self.lines.lock().unwrap().push(msg);
+            Ok(())
+        }
+    }
 
     #[test]
     fn history_path_prefers_explicit_env_override() {
@@ -1133,6 +1211,21 @@ mod tests {
             .expect("data_local_dir fallback should resolve history path");
 
         assert_eq!(path, PathBuf::from("/data-base/piper/repl_history.txt"));
+    }
+
+    #[test]
+    fn shell_stdout_uses_shared_printer_when_available() {
+        let _guard = SHELL_PRINTER_TEST_LOCK.lock().unwrap();
+        let lines = Arc::new(StdMutex::new(Vec::new()));
+        let printer: ShellPrinter = Arc::new(StdMutex::new(Box::new(RecordingPrinter {
+            lines: Arc::clone(&lines),
+        })));
+
+        set_shell_printer(Some(printer));
+        shell_stdout_line("hello prompt".to_string());
+        set_shell_printer(None);
+
+        assert_eq!(lines.lock().unwrap().as_slice(), ["hello prompt\n"]);
     }
 
     #[test]
