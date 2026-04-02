@@ -123,6 +123,7 @@ pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_
 const DEFAULT_MODE_SWITCH_TIMEOUT: Duration = Duration::from_millis(100);
 const CONFIG_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const END_POSE_FRESHNESS_WINDOW_US: u64 = 6_000;
+const REBUILT_LOW_SPEED_OBSERVATION_FRESHNESS_WINDOW_US: u64 = 75_000;
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -1904,6 +1905,10 @@ impl Piper {
         self.pipeline_config.low_speed_drive_state_freshness_ms.saturating_mul(1_000)
     }
 
+    fn rebuilt_low_speed_observation_freshness_window_us(&self) -> u64 {
+        REBUILT_LOW_SPEED_OBSERVATION_FRESHNESS_WINDOW_US
+    }
+
     fn end_pose_freshness_window_us(&self) -> u64 {
         END_POSE_FRESHNESS_WINDOW_US
     }
@@ -2699,7 +2704,7 @@ impl Piper {
 
         store.observe(
             now_host_mono_us,
-            self.low_speed_drive_state_freshness_window_us(),
+            self.rebuilt_low_speed_observation_freshness_window_us(),
             JointDriverLowSpeed::from_slots,
         )
     }
