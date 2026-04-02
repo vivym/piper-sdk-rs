@@ -454,9 +454,9 @@
 - Phase 3 出现 wrong direction、jump、oscillation、overshoot 或异常 transient
 - Phase 4 的 recovery 还不可信，或者 motion gating 还没被再次证明
 
-## 最小完整执行序列
+## 快速命令参考
 
-下面是一条最小、按顺序的执行链骨架。它**不替代**上面的 phase 细则，也不能跳过 rejected-state rerun、fault induction/restoration、fresh helper rerun、readable-state recovery confirmation 这些步骤：
+下面是一条按顺序排列的快速命令骨架，便于现场复制粘贴。它**不是**完整执行序列，不能替代上面的 phase 细则，也不能跳过 rejected-state rerun、fault induction/restoration、fresh helper rerun、readable-state recovery confirmation、Phase 3 的完整判据与操作步骤：
 
 ```bash
 # Phase 0: preflight
