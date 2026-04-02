@@ -1290,24 +1290,6 @@ pub struct JointLimitConfigState {
     pub joint_update_hardware_timestamps: [u64; 6],
     /// 每个关节的系统接收时间戳（微秒）[J1, J2, J3, J4, J5, J6]
     pub joint_update_host_rx_mono_timestamps: [u64; 6],
-
-    // === 有效性掩码 ===
-    /// 有效性掩码（Bit 0-5 对应 J1-J6）
-    /// - 1 表示该关节的配置已更新
-    /// - 0 表示该关节的配置未更新（可能未查询）
-    pub valid_mask: u8,
-}
-
-impl JointLimitConfigState {
-    /// 检查所有关节是否都已更新（`valid_mask == 0x3F`）
-    pub fn is_fully_valid(&self) -> bool {
-        self.valid_mask == 0b111111
-    }
-
-    /// 获取未更新的关节索引（用于调试）
-    pub fn missing_joints(&self) -> Vec<usize> {
-        (0..6).filter(|&i| (self.valid_mask & (1 << i)) == 0).collect()
-    }
 }
 
 /// 关节加速度限制配置状态（冷数据）
@@ -1334,24 +1316,6 @@ pub struct JointAccelConfigState {
     pub joint_update_hardware_timestamps: [u64; 6],
     /// 每个关节的系统接收时间戳（微秒）[J1, J2, J3, J4, J5, J6]
     pub joint_update_host_rx_mono_timestamps: [u64; 6],
-
-    // === 有效性掩码 ===
-    /// 有效性掩码（Bit 0-5 对应 J1-J6）
-    /// - 1 表示该关节的配置已更新
-    /// - 0 表示该关节的配置未更新（可能未查询）
-    pub valid_mask: u8,
-}
-
-impl JointAccelConfigState {
-    /// 检查所有关节是否都已更新（`valid_mask == 0x3F`）
-    pub fn is_fully_valid(&self) -> bool {
-        self.valid_mask == 0b111111
-    }
-
-    /// 获取未更新的关节索引（用于调试）
-    pub fn missing_joints(&self) -> Vec<usize> {
-        (0..6).filter(|&i| (self.valid_mask & (1 << i)) == 0).collect()
-    }
 }
 
 /// 末端限制配置状态（冷数据）
@@ -1378,10 +1342,6 @@ pub struct EndLimitConfigState {
     pub max_end_linear_accel: f64,
     /// 末端最大角加速度（rad/s²）
     pub max_end_angular_accel: f64,
-
-    // === 有效性标记 ===
-    /// 是否已更新（单帧响应，收到即有效）
-    pub is_valid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1436,14 +1396,6 @@ impl CollisionProtection {
         }
         Ok(Self { levels: typed })
     }
-
-    pub fn into_state(self, meta: ObservationMeta) -> CollisionProtectionState {
-        CollisionProtectionState {
-            hardware_timestamp_us: meta.hardware_timestamp_us.unwrap_or_default(),
-            host_rx_mono_us: meta.host_rx_mono_us.unwrap_or_default(),
-            protection_levels: self.levels.map(CollisionProtectionLevel::raw),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1465,22 +1417,6 @@ impl JointLimitConfig {
                 slots[0]?, slots[1]?, slots[2]?, slots[3]?, slots[4]?, slots[5]?,
             ],
         })
-    }
-
-    pub fn into_state(self, meta: ObservationMeta) -> JointLimitConfigState {
-        let hardware_timestamp_us = meta.hardware_timestamp_us.unwrap_or_default();
-        let host_rx_mono_us = meta.host_rx_mono_us.unwrap_or_default();
-
-        JointLimitConfigState {
-            last_update_hardware_timestamp_us: hardware_timestamp_us,
-            last_update_host_rx_mono_us: host_rx_mono_us,
-            joint_limits_max: self.joints.map(|joint| joint.max_angle_rad),
-            joint_limits_min: self.joints.map(|joint| joint.min_angle_rad),
-            joint_max_velocity: self.joints.map(|joint| joint.max_velocity_rad_s),
-            joint_update_hardware_timestamps: [hardware_timestamp_us; 6],
-            joint_update_host_rx_mono_timestamps: [host_rx_mono_us; 6],
-            valid_mask: 0b11_1111,
-        }
     }
 }
 
@@ -1512,20 +1448,6 @@ impl JointAccelConfig {
             ],
         })
     }
-
-    pub fn into_state(self, meta: ObservationMeta) -> JointAccelConfigState {
-        let hardware_timestamp_us = meta.hardware_timestamp_us.unwrap_or_default();
-        let host_rx_mono_us = meta.host_rx_mono_us.unwrap_or_default();
-
-        JointAccelConfigState {
-            last_update_hardware_timestamp_us: hardware_timestamp_us,
-            last_update_host_rx_mono_us: host_rx_mono_us,
-            max_acc_limits: self.max_accel_rad_s2,
-            joint_update_hardware_timestamps: [hardware_timestamp_us; 6],
-            joint_update_host_rx_mono_timestamps: [host_rx_mono_us; 6],
-            valid_mask: 0b11_1111,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1549,20 +1471,6 @@ pub struct EndLimitConfig {
     pub max_angular_velocity_rad_s: f64,
     pub max_linear_accel_m_s2: f64,
     pub max_angular_accel_rad_s2: f64,
-}
-
-impl EndLimitConfig {
-    pub fn into_state(self, meta: ObservationMeta) -> EndLimitConfigState {
-        EndLimitConfigState {
-            last_update_hardware_timestamp_us: meta.hardware_timestamp_us.unwrap_or_default(),
-            last_update_host_rx_mono_us: meta.host_rx_mono_us.unwrap_or_default(),
-            max_end_linear_velocity: self.max_linear_velocity_m_s,
-            max_end_angular_velocity: self.max_angular_velocity_rad_s,
-            max_end_linear_accel: self.max_linear_accel_m_s2,
-            max_end_angular_accel: self.max_angular_accel_rad_s2,
-            is_valid: true,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4776,44 +4684,6 @@ mod tests {
         assert_eq!(state.joint_max_velocity, [0.0; 6]);
         assert_eq!(state.joint_update_hardware_timestamps, [0; 6]);
         assert_eq!(state.joint_update_host_rx_mono_timestamps, [0; 6]);
-        assert_eq!(state.valid_mask, 0);
-    }
-
-    #[test]
-    fn test_joint_limit_config_state_is_fully_valid() {
-        // 完整状态（所有6个关节都已更新）
-        let state_complete = JointLimitConfigState {
-            valid_mask: 0b111111, // Bit 0-5 全部为 1
-            ..Default::default()
-        };
-        assert!(state_complete.is_fully_valid());
-
-        // 不完整状态（只有部分关节更新）
-        let state_incomplete = JointLimitConfigState {
-            valid_mask: 0b001111, // 只有 Bit 0-3
-            ..Default::default()
-        };
-        assert!(!state_incomplete.is_fully_valid());
-    }
-
-    #[test]
-    fn test_joint_limit_config_state_missing_joints() {
-        // 完整状态
-        let state_complete = JointLimitConfigState {
-            valid_mask: 0b111111,
-            ..Default::default()
-        };
-        assert_eq!(state_complete.missing_joints(), Vec::<usize>::new());
-
-        // 缺少 J1 和 J6
-        let state_missing = JointLimitConfigState {
-            valid_mask: 0b0011110, // Bit 1-4 有，Bit 0 和 5 没有
-            ..Default::default()
-        };
-        let missing = state_missing.missing_joints();
-        assert_eq!(missing.len(), 2);
-        assert!(missing.contains(&0));
-        assert!(missing.contains(&5));
     }
 
     #[test]
@@ -4826,7 +4696,6 @@ mod tests {
             joint_max_velocity: [PI, PI, PI, PI, PI, PI],           // 180度/s = π rad/s
             joint_update_hardware_timestamps: [100, 200, 300, 400, 500, 600],
             joint_update_host_rx_mono_timestamps: [1100, 1200, 1300, 1400, 1500, 1600],
-            valid_mask: 0b111111,
         };
         let cloned = state.clone();
         assert_eq!(
@@ -4836,8 +4705,6 @@ mod tests {
         assert_eq!(state.joint_limits_max, cloned.joint_limits_max);
         assert_eq!(state.joint_limits_min, cloned.joint_limits_min);
         assert_eq!(state.joint_max_velocity, cloned.joint_max_velocity);
-        assert_eq!(state.valid_mask, cloned.valid_mask);
-        assert_eq!(state.is_fully_valid(), cloned.is_fully_valid());
     }
 
     #[test]
@@ -4850,7 +4717,6 @@ mod tests {
         assert_eq!(state.joint_limits_max, [0.0; 6]);
         assert_eq!(state.joint_limits_min, [0.0; 6]);
         assert_eq!(state.joint_max_velocity, [0.0; 6]);
-        assert_eq!(state.valid_mask, 0);
     }
 
     // ============================================================
@@ -4865,44 +4731,6 @@ mod tests {
         assert_eq!(state.max_acc_limits, [0.0; 6]);
         assert_eq!(state.joint_update_hardware_timestamps, [0; 6]);
         assert_eq!(state.joint_update_host_rx_mono_timestamps, [0; 6]);
-        assert_eq!(state.valid_mask, 0);
-    }
-
-    #[test]
-    fn test_joint_accel_config_state_is_fully_valid() {
-        // 完整状态（所有6个关节都已更新）
-        let state_complete = JointAccelConfigState {
-            valid_mask: 0b111111, // Bit 0-5 全部为 1
-            ..Default::default()
-        };
-        assert!(state_complete.is_fully_valid());
-
-        // 不完整状态（只有部分关节更新）
-        let state_incomplete = JointAccelConfigState {
-            valid_mask: 0b001111, // 只有 Bit 0-3
-            ..Default::default()
-        };
-        assert!(!state_incomplete.is_fully_valid());
-    }
-
-    #[test]
-    fn test_joint_accel_config_state_missing_joints() {
-        // 完整状态
-        let state_complete = JointAccelConfigState {
-            valid_mask: 0b111111,
-            ..Default::default()
-        };
-        assert_eq!(state_complete.missing_joints(), Vec::<usize>::new());
-
-        // 缺少 J1 和 J6
-        let state_missing = JointAccelConfigState {
-            valid_mask: 0b0011110, // Bit 1-4 有，Bit 0 和 5 没有
-            ..Default::default()
-        };
-        let missing = state_missing.missing_joints();
-        assert_eq!(missing.len(), 2);
-        assert!(missing.contains(&0));
-        assert!(missing.contains(&5));
     }
 
     #[test]
@@ -4913,7 +4741,6 @@ mod tests {
             max_acc_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0], // 10 rad/s²
             joint_update_hardware_timestamps: [100, 200, 300, 400, 500, 600],
             joint_update_host_rx_mono_timestamps: [1100, 1200, 1300, 1400, 1500, 1600],
-            valid_mask: 0b111111,
         };
         let cloned = state.clone();
         assert_eq!(
@@ -4921,8 +4748,6 @@ mod tests {
             cloned.last_update_hardware_timestamp_us
         );
         assert_eq!(state.max_acc_limits, cloned.max_acc_limits);
-        assert_eq!(state.valid_mask, cloned.valid_mask);
-        assert_eq!(state.is_fully_valid(), cloned.is_fully_valid());
     }
 
     #[test]
@@ -4933,7 +4758,6 @@ mod tests {
         let state = ctx.joint_accel_config.read().unwrap();
         assert_eq!(state.last_update_hardware_timestamp_us, 0);
         assert_eq!(state.max_acc_limits, [0.0; 6]);
-        assert_eq!(state.valid_mask, 0);
     }
 
     // ============================================================
@@ -4949,7 +4773,6 @@ mod tests {
         assert_eq!(state.max_end_angular_velocity, 0.0);
         assert_eq!(state.max_end_linear_accel, 0.0);
         assert_eq!(state.max_end_angular_accel, 0.0);
-        assert!(!state.is_valid);
     }
 
     #[test]
@@ -4961,7 +4784,6 @@ mod tests {
             max_end_angular_velocity: 2.0, // 2 rad/s
             max_end_linear_accel: 0.5,     // 0.5 m/s²
             max_end_angular_accel: 1.5,    // 1.5 rad/s²
-            is_valid: true,
         };
         let cloned = state.clone();
         assert_eq!(
@@ -4978,7 +4800,6 @@ mod tests {
         );
         assert_eq!(state.max_end_linear_accel, cloned.max_end_linear_accel);
         assert_eq!(state.max_end_angular_accel, cloned.max_end_angular_accel);
-        assert_eq!(state.is_valid, cloned.is_valid);
     }
 
     #[test]
@@ -4992,7 +4813,6 @@ mod tests {
         assert_eq!(state.max_end_angular_velocity, 0.0);
         assert_eq!(state.max_end_linear_accel, 0.0);
         assert_eq!(state.max_end_angular_accel, 0.0);
-        assert!(!state.is_valid);
     }
 
     // ============================================================

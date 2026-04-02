@@ -1,6 +1,9 @@
 use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter};
+use piper_sdk::driver::observation::{Freshness, Observation, ObservationPayload};
 use piper_sdk::driver::{DiagnosticEvent, Piper, ProtocolDiagnostic, QueryDiagnostic, QueryError};
-use piper_sdk::protocol::ids::{ID_COLLISION_PROTECTION_LEVEL_FEEDBACK, ID_JOINT_FEEDBACK_12};
+use piper_sdk::protocol::ids::{
+    ID_COLLISION_PROTECTION_LEVEL_FEEDBACK, ID_JOINT_FEEDBACK_12, ID_MOTOR_LIMIT_FEEDBACK,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -118,6 +121,20 @@ fn build_test_piper(mock_can: &Arc<MockCanAdapter>) -> Piper {
     Piper::new_dual_thread(can_adapter, None).unwrap()
 }
 
+fn queue_complete_joint_limit_query_response(mock_can: &Arc<MockCanAdapter>) {
+    for joint_index in 1..=6 {
+        let mut data = [0u8; 8];
+        data[0] = joint_index;
+        data[1..3].copy_from_slice(&(1800i16 + i16::from(joint_index)).to_be_bytes());
+        data[3..5].copy_from_slice(&(-1800i16 - i16::from(joint_index)).to_be_bytes());
+        data[5..7].copy_from_slice(&(500u16 + u16::from(joint_index)).to_be_bytes());
+        mock_can.queue_frame(PiperFrame::new_standard(
+            ID_MOTOR_LIMIT_FEEDBACK as u16,
+            &data,
+        ));
+    }
+}
+
 #[test]
 fn busy_query_returns_query_error_busy() {
     let mock_can = Arc::new(MockCanAdapter::new());
@@ -200,4 +217,39 @@ fn busy_query_is_retained_in_diagnostics_snapshot() {
         let first_query = query_handle.join().unwrap();
         assert!(matches!(first_query, Err(QueryError::Timeout)));
     });
+}
+
+#[test]
+fn query_timeout_does_not_invalidate_prior_complete_joint_limit_config() {
+    let mock_can = Arc::new(MockCanAdapter::new());
+    let piper = build_test_piper(&mock_can);
+
+    std::thread::scope(|scope| {
+        let query_handle =
+            scope.spawn(|| piper.query_joint_limit_config(Duration::from_millis(250)));
+
+        assert!(
+            mock_can.wait_for_sent_frame_count(6, Duration::from_millis(100)),
+            "joint-limit query should send all six request frames before receiving the response"
+        );
+        queue_complete_joint_limit_query_response(&mock_can);
+
+        query_handle
+            .join()
+            .expect("query thread should not panic")
+            .expect("first query should complete from the injected response");
+    });
+
+    let err = piper
+        .query_joint_limit_config(Duration::from_millis(20))
+        .expect_err("second query should time out without a new response");
+    assert!(matches!(err, QueryError::Timeout));
+
+    let observation = piper.get_joint_limit_config();
+    assert!(matches!(
+        observation,
+        Observation::Available(available)
+            if matches!(available.payload, ObservationPayload::Complete(_))
+                && matches!(available.freshness, Freshness::Fresh)
+    ));
 }

@@ -3139,7 +3139,6 @@ fn parse_and_update_state(
                     joint_limit.last_update_hardware_timestamp_us =
                         typed.hardware_timestamp_us.unwrap_or_default();
                     joint_limit.last_update_host_rx_mono_us = host_rx_mono_us;
-                    joint_limit.valid_mask |= 1 << joint_idx;
                 }
 
                 if let Some(active_query) = ctx.query_coordinator.active_query() {
@@ -3208,7 +3207,6 @@ fn parse_and_update_state(
                         joint_accel.last_update_hardware_timestamp_us =
                             hardware_timestamp_us.unwrap_or_default();
                         joint_accel.last_update_host_rx_mono_us = host_rx_mono_us;
-                        joint_accel.valid_mask |= 1 << joint_idx;
                     }
 
                     if let Some(active_query) = ctx.query_coordinator.active_query() {
@@ -3297,7 +3295,6 @@ fn parse_and_update_state(
                     end_limit.last_update_hardware_timestamp_us =
                         hardware_timestamp_us.unwrap_or_default();
                     end_limit.last_update_host_rx_mono_us = host_rx_mono_us;
-                    end_limit.is_valid = true;
                 }
 
                 if let Some(active_query) = ctx.query_coordinator.active_query() {
