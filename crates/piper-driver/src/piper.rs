@@ -4829,7 +4829,7 @@ mod tests {
     use super::*;
     use crate::DriverMode;
     use crate::observation::{Available, Complete, Freshness, Observation, ObservationPayload};
-    use crate::{DiagnosticEvent, ProtocolDiagnostic, QueryError};
+    use crate::{DiagnosticEvent, ProtocolDiagnostic, QueryError, WaitError};
     use piper_can::{CanAdapter, PiperFrame, SplittableAdapter};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
@@ -6953,6 +6953,17 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_complete_low_speed_state_times_out_with_wait_error() {
+        let piper = build_test_piper();
+
+        let err = piper
+            .wait_for_complete_low_speed_state(Duration::from_millis(5))
+            .expect_err("missing low-speed observation should time out");
+
+        assert!(matches!(err, WaitError::Timeout));
+    }
+
+    #[test]
     fn complete_end_pose_wait_returns_complete_payload() {
         let piper = build_test_piper();
         let now = crate::heartbeat::monotonic_micros().max(1);
@@ -6963,6 +6974,17 @@ mod tests {
             .expect("complete end-pose observation should become available");
 
         assert!(result.meta.host_rx_mono_us.is_some());
+    }
+
+    #[test]
+    fn wait_for_complete_end_pose_times_out_with_wait_error() {
+        let piper = build_test_piper();
+
+        let err = piper
+            .wait_for_complete_end_pose(Duration::from_millis(5))
+            .expect_err("missing end-pose observation should time out");
+
+        assert!(matches!(err, WaitError::Timeout));
     }
 
     #[test]
