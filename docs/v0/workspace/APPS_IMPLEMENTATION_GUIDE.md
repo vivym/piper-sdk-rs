@@ -83,14 +83,15 @@ impl ReplInput {
                 .map_err(|e| anyhow::anyhow!("Failed to initialize readline: {}", e))?;
 
             // 配置历史记录
-            rl.load_history(".piper_history").ok(); // 忽略错误（首次运行）
+            let history_path = resolve_history_path()?;
+            rl.load_history(&history_path).ok(); // 忽略错误（首次运行）
 
             loop {
                 let readline = rl.readline("piper> ");
                 match readline {
                     Ok(line) => {
                         if line == "exit" || line == "quit" {
-                            rl.save_history(".piper_history").ok();
+                            rl.save_history(&history_path).ok();
                             let _ = command_tx.send(line);
                             break;
                         }
@@ -110,7 +111,7 @@ impl ReplInput {
                     }
                     Err(rustyline::error::ReadlineError::Eof) => {
                         // Ctrl+D：退出
-                        rl.save_history(".piper_history").ok();
+                        rl.save_history(&history_path).ok();
                         break;
                     }
                     Err(err) => {
@@ -188,7 +189,7 @@ pub async fn run_repl() -> anyhow::Result<()> {
 
 **优点**:
 - ✅ 保留历史记录（上下箭头可用）
-- ✅ 历史持久化到 `.piper_history`
+- ✅ 历史持久化到用户状态目录（可用 `PIPER_HISTORY_FILE` 覆盖）
 - ✅ 输入线程独立于 tokio，不影响异步任务
 - ✅ Ctrl+C 和 Ctrl+D 正确处理
 - ✅ 通过 `tokio::select!` 实现真正的并发监听

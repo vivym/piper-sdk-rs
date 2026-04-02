@@ -60,7 +60,8 @@ impl ReplInput {
         let (command_tx, command_rx) = bounded::<String>(10);
         let input_thread = thread::spawn(move || {
             let mut rl = Editor::<()>::new()?;
-            rl.load_history(".piper_history").ok(); // ⭐ 加载历史
+            let history_path = resolve_history_path()?;
+            rl.load_history(&history_path).ok(); // ⭐ 从用户状态目录加载历史
 
             loop {
                 let readline = rl.readline("piper> ");
@@ -75,7 +76,7 @@ impl ReplInput {
 
 **关键点**:
 - ✅ 保留历史记录（上下箭头可用）
-- ✅ 历史持久化到 `.piper_history`
+- ✅ 历史持久化到用户状态目录（可用 `PIPER_HISTORY_FILE` 覆盖）
 - ✅ 后台 CAN 监听正常
 - ✅ Ctrl+C 响应及时
 
@@ -465,7 +466,7 @@ Week 6: 日志分析
 3. **apps/cli - REPL 模式**（Week 2）
    ```bash
    # 实现 REPL 框架（使用方案 B：专用线程）
-   # 历史记录保留（.piper_history）
+   # 历史记录保留（用户状态目录；可用 PIPER_HISTORY_FILE 覆盖）
    # 错误隔离（catch_unwind）
    # Ctrl+C 急停处理
    ```

@@ -14,7 +14,11 @@ use piper_control::{
     set_collision_protection_verified, set_joint_zero_blocking,
 };
 use rustyline::Editor;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
 use std::panic;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +27,45 @@ use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+
+const REPL_HISTORY_ENV_VAR: &str = "PIPER_HISTORY_FILE";
+const REPL_HISTORY_FILENAME: &str = "repl_history.txt";
+
+fn resolve_history_path_with(
+    env_override: Option<OsString>,
+    state_dir: Option<PathBuf>,
+    data_local_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = env_override.map(PathBuf::from) {
+        if path.as_os_str().is_empty() {
+            bail!("{REPL_HISTORY_ENV_VAR} 不能为空");
+        }
+        return Ok(path);
+    }
+
+    let mut path = state_dir
+        .or(data_local_dir)
+        .ok_or_else(|| anyhow::anyhow!("无法确定 REPL 历史文件目录"))?;
+    path.push("piper");
+    path.push(REPL_HISTORY_FILENAME);
+    Ok(path)
+}
+
+fn resolve_history_path() -> Result<PathBuf> {
+    resolve_history_path_with(
+        env::var_os(REPL_HISTORY_ENV_VAR),
+        dirs::state_dir(),
+        dirs::data_local_dir(),
+    )
+}
+
+fn ensure_history_parent_dir(history_path: &Path) -> Result<()> {
+    let parent = history_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("历史文件路径缺少父目录: {}", history_path.display()))?;
+    fs::create_dir_all(parent)?;
+    Ok(())
+}
 
 pub enum ReplState {
     Disconnected,
@@ -339,8 +382,23 @@ impl ReplInput {
             let mut rl = Editor::<(), DefaultHistory>::new()
                 .map_err(|e| anyhow::anyhow!("Failed to initialize readline: {}", e))?;
 
-            let history_path = ".piper_history";
-            rl.load_history(history_path).ok();
+            let history_path = match resolve_history_path() {
+                Ok(path) => {
+                    if let Err(error) = ensure_history_parent_dir(&path) {
+                        eprintln!("Warning: 无法创建 REPL 历史目录: {error}");
+                        None
+                    } else {
+                        Some(path)
+                    }
+                },
+                Err(error) => {
+                    eprintln!("Warning: 无法解析 REPL 历史文件路径: {error}");
+                    None
+                },
+            };
+            if let Some(path) = history_path.as_ref() {
+                rl.load_history(path).ok();
+            }
 
             println!("Piper CLI v{} - 交互式 Shell", env!("CARGO_PKG_VERSION"));
             println!("输入 'help' 查看帮助，'exit' 退出");
@@ -354,7 +412,9 @@ impl ReplInput {
                             continue;
                         }
                         if line == "exit" || line == "quit" {
-                            rl.save_history(history_path).ok();
+                            if let Some(path) = history_path.as_ref() {
+                                rl.save_history(path).ok();
+                            }
                             let _ = command_tx.blocking_send(line);
                             break;
                         }
@@ -368,7 +428,9 @@ impl ReplInput {
                         let _ = command_tx.blocking_send("SIGINT".to_string());
                     },
                     Err(rustyline::error::ReadlineError::Eof) => {
-                        rl.save_history(history_path).ok();
+                        if let Some(path) = history_path.as_ref() {
+                            rl.save_history(path).ok();
+                        }
                         break;
                     },
                     Err(err) => {
@@ -1042,6 +1104,36 @@ static TEST_BUSY_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn history_path_prefers_explicit_env_override() {
+        let path = resolve_history_path_with(
+            Some(OsString::from("/tmp/custom-history.txt")),
+            Some(PathBuf::from("/state-base")),
+            Some(PathBuf::from("/data-base")),
+        )
+        .expect("env override should win");
+
+        assert_eq!(path, PathBuf::from("/tmp/custom-history.txt"));
+    }
+
+    #[test]
+    fn history_path_prefers_state_dir_when_available() {
+        let path = resolve_history_path_with(None, Some(PathBuf::from("/state-base")), None)
+            .expect("state dir should resolve history path");
+
+        assert_eq!(path, PathBuf::from("/state-base/piper/repl_history.txt"));
+    }
+
+    #[test]
+    fn history_path_falls_back_to_data_local_dir() {
+        let path = resolve_history_path_with(None, None, Some(PathBuf::from("/data-base")))
+            .expect("data_local_dir fallback should resolve history path");
+
+        assert_eq!(path, PathBuf::from("/data-base/piper/repl_history.txt"));
+    }
 
     #[test]
     fn run_guarded_command_executes_closure_once() {

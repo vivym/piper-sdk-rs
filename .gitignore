@@ -48,4 +48,7 @@ rust-project.json
 .history
 .ionide
 
+# Legacy Piper CLI REPL history path (current versions use user state dirs)
+.piper_history
+
 # End of https://www.toptal.com/developers/gitignore/api/rust,rust-analyzer,visualstudiocode

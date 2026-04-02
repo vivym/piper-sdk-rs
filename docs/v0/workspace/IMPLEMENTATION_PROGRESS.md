@@ -140,7 +140,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.20s
   - ✅ help 命令
 
 - [x] **1.7** 历史记录保留
-  - ✅ .piper_history 文件
+  - ✅ 用户状态目录中的历史文件（支持 `PIPER_HISTORY_FILE` 覆盖）
   - ✅ 上下箭头支持
 
 - [x] **1.8** Ctrl+C 处理

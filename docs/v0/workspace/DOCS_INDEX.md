@@ -118,7 +118,8 @@ impl ReplInput {
         let (command_tx, command_rx) = bounded::<String>(10);
         let input_thread = thread::spawn(move || {
             let mut rl = Editor::<()>::new()?;
-            rl.load_history(".piper_history").ok(); // ⭐ 历史持久化
+            let history_path = resolve_history_path()?;
+            rl.load_history(&history_path).ok(); // ⭐ 历史持久化（用户状态目录）
 
             loop {
                 let line = rl.readline("piper> ")?;
@@ -131,7 +132,7 @@ impl ReplInput {
 }
 ```
 
-**收益**: 保留上下箭头历史记录（用户体验大幅提升）
+**收益**: 保留上下箭头历史记录，并避免在仓库工作区生成 `.piper_history`
 
 **详见**: APPS_IMPLEMENTATION_GUIDE.md - 坑点 1（方案 B）
 
