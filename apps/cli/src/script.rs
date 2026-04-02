@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use piper_client::state::{DisableConfig, MotionCapability, Piper, Standby};
 use piper_client::{MotionConnectedPiper, MotionConnectedState};
 use piper_control::{
-    ControlProfile, home_zero_blocking, move_to_joint_target_blocking, park_blocking, prepare_move,
-    set_joint_zero_blocking,
+    ControlProfile, DEFAULT_PARK_SPEED_PERCENT, home_zero_blocking, move_to_joint_target_blocking,
+    park_blocking, prepare_move, set_joint_zero_blocking,
 };
 use piper_sdk::driver::ConnectionTarget;
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ impl ScriptExecutor {
                     target: ConnectionTarget::AutoStrict,
                     orientation: piper_control::ParkOrientation::Upright,
                     rest_pose_override: None,
-                    park_speed_percent: 5,
+                    park_speed_percent: DEFAULT_PARK_SPEED_PERCENT,
                     safety: piper_tools::SafetyConfig::default_config(),
                     wait: piper_control::MotionWaitConfig::default(),
                 },

@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use piper_control::{ControlProfile, MotionWaitConfig, ParkOrientation, TargetSpec};
+use piper_control::{
+    ControlProfile, DEFAULT_PARK_SPEED_PERCENT, MotionWaitConfig, ParkOrientation, TargetSpec,
+};
 use piper_tools::SafetyConfig;
 use std::fmt;
 use std::fs;
@@ -211,7 +213,7 @@ fn default_timeout_ms() -> u64 {
 }
 
 fn default_park_speed_percent() -> u8 {
-    5
+    DEFAULT_PARK_SPEED_PERCENT
 }
 
 #[derive(Subcommand, Debug)]

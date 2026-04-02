@@ -6,6 +6,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+pub const DEFAULT_PARK_SPEED_PERCENT: u8 = 5;
+
 #[derive(Debug, Clone)]
 pub struct ControlProfile {
     pub target: ConnectionTarget,
@@ -28,12 +30,19 @@ impl ControlProfile {
         }
     }
 
-    pub fn park_position_mode_config(&self) -> piper_client::state::PositionModeConfig {
-        piper_client::state::PositionModeConfig {
+    pub fn park_position_mode_config(
+        &self,
+    ) -> anyhow::Result<piper_client::state::PositionModeConfig> {
+        anyhow::ensure!(
+            (1..=100).contains(&self.park_speed_percent),
+            "park_speed_percent must be between 1 and 100"
+        );
+
+        Ok(piper_client::state::PositionModeConfig {
             speed_percent: self.park_speed_percent,
             install_position: self.orientation.install_position(),
             ..piper_client::state::PositionModeConfig::default()
-        }
+        })
     }
 }
 
@@ -138,10 +147,53 @@ mod tests {
         };
 
         let config = profile.park_position_mode_config();
-        assert_eq!(config.speed_percent, 5);
+        assert_eq!(config.unwrap().speed_percent, 5);
+    }
+
+    #[test]
+    fn position_mode_config_keeps_normal_speed() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 5,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        };
+
+        let config = profile.position_mode_config();
+        assert_eq!(config.speed_percent, 50);
         assert_eq!(
             config.install_position,
             profile.orientation.install_position()
         );
+    }
+
+    #[test]
+    fn park_position_mode_config_rejects_zero_speed() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 0,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        };
+
+        assert!(profile.park_position_mode_config().is_err());
+    }
+
+    #[test]
+    fn park_position_mode_config_rejects_speed_above_hundred() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 101,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        };
+
+        assert!(profile.park_position_mode_config().is_err());
     }
 }
