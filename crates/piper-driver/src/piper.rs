@@ -4452,7 +4452,7 @@ impl Piper {
         let deadline = Instant::now() + timeout;
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
         self.enqueue_reliable_timeout_until(
-            ReliableCommand::package_confirmed([frame], deadline, ack_tx),
+            ReliableCommand::package_confirmed_with_post_send_commit([frame], deadline, ack_tx),
             deadline,
         )?;
 
@@ -11319,6 +11319,58 @@ mod tests {
             .take()
             .expect("confirmed reliable result should be captured");
         send_result.expect("confirmed reliable send should succeed after delayed completion");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.as_slice(), &frames);
+    }
+
+    #[test]
+    fn test_reliable_commit_marker_stays_post_send() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Arc::new(
+            Piper::new_dual_thread_parts_unvalidated(
+                MockRxAdapter,
+                BlockingFirstSendTxAdapter {
+                    sent_frames: sent_frames.clone(),
+                    started_tx,
+                    release_rx,
+                    sends: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let frames = [PiperFrame::new_standard(0x202, &[0x02])];
+        let result = Arc::new(Mutex::new(None));
+        let result_clone = Arc::clone(&result);
+        let piper_clone = Arc::clone(&piper);
+
+        let handle = std::thread::spawn(move || {
+            let send_result = piper_clone
+                .send_reliable_package_confirmed_commit_marker(frames, Duration::from_millis(200));
+            *result_clone.lock().expect("result lock") = Some(send_result);
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("commit-marker reliable send should reach tx.send_control");
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            result.lock().expect("result lock").is_none(),
+            "commit-marker reliable send should keep waiting until the send completes"
+        );
+
+        let _ = release_tx.send(());
+        handle.join().expect("commit-marker reliable sender should finish");
+
+        let send_result = result
+            .lock()
+            .expect("result lock")
+            .take()
+            .expect("commit-marker reliable result should be captured");
+        send_result.expect("commit-marker reliable send should succeed after delayed completion");
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.as_slice(), &frames);

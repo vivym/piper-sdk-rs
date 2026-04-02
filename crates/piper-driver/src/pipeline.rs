@@ -2109,18 +2109,31 @@ pub(crate) fn tx_loop_mailbox(
                     break;
                 }
 
+                if !committed
+                    && matches!(
+                        commit_point,
+                        crate::command::ReliableCommitPoint::FirstFrame
+                    )
+                {
+                    if let Some(ack) = ack.as_ref() {
+                        let _ = ack.send(crate::command::DeliveryPhase::Committed {
+                            host_commit_mono_us: crate::heartbeat::monotonic_micros().max(1),
+                        });
+                    }
+                    committed = true;
+                }
+
                 match tx.send_control(frame, normal_send_budget) {
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-                        let should_emit_commit = !committed
-                            && match commit_point {
-                                crate::command::ReliableCommitPoint::FirstFrame => true,
-                                crate::command::ReliableCommitPoint::PackageComplete => {
-                                    sent_count == total_frames
-                                },
-                            };
-                        if should_emit_commit {
+                        if !committed
+                            && matches!(
+                                commit_point,
+                                crate::command::ReliableCommitPoint::PackageComplete
+                            )
+                            && sent_count == total_frames
+                        {
                             if let Some(ack) = ack.as_ref() {
                                 let _ = ack.send(crate::command::DeliveryPhase::Committed {
                                     host_commit_mono_us: crate::heartbeat::monotonic_micros()
