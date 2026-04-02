@@ -3453,6 +3453,10 @@ impl Piper {
         .map_err(WaitError::from)
     }
 
+    pub fn subscribe_diagnostics(&self) -> Receiver<DiagnosticEvent> {
+        self.ctx.diagnostics.subscribe()
+    }
+
     pub fn snapshot_diagnostics(&self) -> Vec<DiagnosticEvent> {
         self.ctx.diagnostics.snapshot()
     }

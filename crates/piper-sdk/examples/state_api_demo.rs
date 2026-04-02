@@ -21,7 +21,9 @@
 use clap::Parser;
 use piper_sdk::driver::observation::{Freshness, Observation, ObservationPayload};
 use piper_sdk::driver::{
-    EndPose, JointDriverLowSpeed, PartialEndPose, PartialJointDriverLowSpeed, PiperBuilder,
+    CollisionProtection, DiagnosticEvent, EndLimitConfig, EndPose, FamilyObservationMetrics,
+    JointAccelConfig, JointDriverLowSpeed, JointLimitConfig, PartialEndPose,
+    PartialJointAccelConfig, PartialJointDriverLowSpeed, PartialJointLimitConfig, PiperBuilder,
 };
 use std::time::Duration;
 
@@ -72,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Waiting for robot feedback on {}...", args.interface);
     robot.wait_for_feedback(Duration::from_secs(args.feedback_timeout_secs))?;
     println!("Robot feedback received!");
+    let diagnostics_rx = robot.subscribe_diagnostics();
 
     // 运行一段时间，收集数据
     println!("\n=== 状态 API 演示 ===\n");
@@ -178,20 +181,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. 读取配置状态（按需查询，读锁）
     println!("\n--- 配置状态（按需查询）---");
+    println!("Cached query-backed observations before querying:");
+    println!(
+        "{}",
+        render_query_backed_observation_section(
+            &robot.get_collision_protection(),
+            &robot.get_joint_limit_config(),
+            &robot.get_joint_accel_config(),
+            &robot.get_end_limit_config(),
+        )
+    );
 
     match robot.query_collision_protection(query_timeout) {
         Ok(protection) => {
             println!("Collision protection levels:");
-            let mut has_invalid_level = false;
             for i in 0..6 {
                 let level = protection.value.levels[i].raw();
-                if level > 8 {
-                    has_invalid_level = true;
-                }
                 println!("  Joint {}: {}", i + 1, format_collision_level(level));
-            }
-            if has_invalid_level {
-                println!("⚠ Collision protection feedback contains out-of-range values.");
             }
         },
         Err(err) => {
@@ -261,17 +267,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     }
 
-    // 6. 读取 FPS 统计
-    println!("\n--- FPS 统计 ---");
+    println!("\nCached query-backed observations after querying:");
+    println!(
+        "{}",
+        render_query_backed_observation_section(
+            &robot.get_collision_protection(),
+            &robot.get_joint_limit_config(),
+            &robot.get_joint_accel_config(),
+            &robot.get_end_limit_config(),
+        )
+    );
+
+    // 6. 读取诊断事件
+    println!("\n--- 诊断事件 ---");
+    let retained_diagnostics = robot.snapshot_diagnostics();
+    if retained_diagnostics.is_empty() {
+        println!("Retained diagnostics: none");
+    } else {
+        println!("Retained diagnostics:");
+        for event in &retained_diagnostics {
+            println!("  {}", format_diagnostic_event(event));
+        }
+    }
+
+    let live_diagnostics: Vec<_> = diagnostics_rx.try_iter().collect();
+    if live_diagnostics.is_empty() {
+        println!("Live diagnostics observed during this run: none");
+    } else {
+        println!("Live diagnostics observed during this run:");
+        for event in &live_diagnostics {
+            println!("  {}", format_diagnostic_event(event));
+        }
+    }
+
+    // 7. 读取速率统计
+    println!("\n--- 速率统计 ---");
     let fps = robot.get_fps();
     println!("Joint position FPS: {:.2}", fps.joint_position);
-    println!("End pose FPS: {:.2}", fps.end_pose);
     println!("Robot control FPS: {:.2}", fps.robot_control);
     println!("Gripper FPS: {:.2}", fps.gripper);
-    println!(
-        "Joint driver low speed FPS: {:.2}",
-        fps.joint_driver_low_speed
+
+    let observation_metrics = robot.get_observation_metrics();
+    print_family_observation_metrics("End pose", observation_metrics.end_pose);
+    print_family_observation_metrics("Joint driver low speed", observation_metrics.low_speed);
+    print_family_observation_metrics(
+        "Collision protection",
+        observation_metrics.collision_protection,
     );
+    print_family_observation_metrics("Joint limit config", observation_metrics.joint_limit_config);
+    print_family_observation_metrics("Joint accel config", observation_metrics.joint_accel_config);
+    print_family_observation_metrics("End limit config", observation_metrics.end_limit_config);
 
     println!("\n=== 示例完成 ===");
     Ok(())
@@ -317,6 +362,67 @@ fn format_collision_level(level: u8) -> String {
     }
 }
 
+fn format_freshness(freshness: &Freshness) -> String {
+    match freshness {
+        Freshness::Fresh => "fresh".to_owned(),
+        Freshness::Stale { stale_for } => format!("stale for {} ms", stale_for.as_millis()),
+    }
+}
+
+fn format_observation_status<T, TPartial>(observation: &Observation<T, TPartial>) -> String {
+    match observation {
+        Observation::Unavailable => "Unavailable".to_owned(),
+        Observation::Available(available) => match &available.payload {
+            ObservationPayload::Complete(_) => {
+                format!(
+                    "Available (complete, {})",
+                    format_freshness(&available.freshness)
+                )
+            },
+            ObservationPayload::Partial { missing, .. } => format!(
+                "Available (partial, {}, missing {:?})",
+                format_freshness(&available.freshness),
+                missing.missing_indices
+            ),
+        },
+    }
+}
+
+fn render_query_backed_observation_section(
+    collision: &Observation<CollisionProtection>,
+    joint_limits: &Observation<JointLimitConfig, PartialJointLimitConfig>,
+    joint_accel: &Observation<JointAccelConfig, PartialJointAccelConfig>,
+    end_limits: &Observation<EndLimitConfig>,
+) -> String {
+    [
+        format!(
+            "Collision protection: {}",
+            format_observation_status(collision)
+        ),
+        format!("Joint limits: {}", format_observation_status(joint_limits)),
+        format!(
+            "Joint acceleration limits: {}",
+            format_observation_status(joint_accel)
+        ),
+        format!(
+            "End-effector limits: {}",
+            format_observation_status(end_limits)
+        ),
+    ]
+    .join("\n")
+}
+
+fn format_diagnostic_event(event: &DiagnosticEvent) -> String {
+    format!("{event:?}")
+}
+
+fn print_family_observation_metrics(label: &str, metrics: FamilyObservationMetrics) {
+    println!(
+        "{label}: raw={:.2} complete={:.2} diagnostic={:.2}",
+        metrics.raw_frame_rate, metrics.complete_observation_rate, metrics.diagnostic_rate
+    );
+}
+
 fn observation_is_complete_and_fresh<T, TPartial>(state: &Observation<T, TPartial>) -> bool {
     matches!(
         state,
@@ -329,7 +435,10 @@ fn observation_is_complete_and_fresh<T, TPartial>(state: &Observation<T, TPartia
 fn print_end_pose_observation(observation: &Observation<EndPose, PartialEndPose>) {
     match observation {
         Observation::Available(available) => {
-            println!("End pose freshness: {:?}", available.freshness);
+            println!(
+                "End pose freshness: {}",
+                format_freshness(&available.freshness)
+            );
             println!("End pose meta: {:?}", available.meta);
             match &available.payload {
                 ObservationPayload::Complete(end_pose) => {
@@ -353,7 +462,10 @@ fn print_low_speed_observation(
 ) {
     match observation {
         Observation::Available(available) => {
-            println!("Low-speed freshness: {:?}", available.freshness);
+            println!(
+                "Low-speed freshness: {}",
+                format_freshness(&available.freshness)
+            );
             println!("Low-speed meta: {:?}", available.meta);
             match &available.payload {
                 ObservationPayload::Complete(driver_state) => {

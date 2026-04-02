@@ -8,7 +8,8 @@
 
 - **`state_api_demo`** - 状态 API 使用演示
   - 一次性读取所有机器人状态
-  - 展示所有 API 功能（包括配置状态）
+  - 展示 `Observation` 读取、按需查询、诊断快照/订阅和 observation metrics
+  - 未查询的配置状态会明确显示为 `Unavailable`，不会打印伪造的零值
   - 适合学习 API 用法和作为参考文档
   - 支持 `--interface` / `--baud-rate`
   - Linux 默认 `can0`；macOS/Windows 需要显式传 GS-USB serial
