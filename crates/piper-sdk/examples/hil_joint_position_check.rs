@@ -1,12 +1,15 @@
 use clap::Parser;
+use piper_control::{ControlProfile, MotionWaitConfig, ParkOrientation, active_park_blocking};
 use piper_sdk::PiperBuilder;
 use piper_sdk::client::state::machine::MotionType;
 use piper_sdk::client::state::{
-    ConnectedPiper, MotionCapability, Piper, PositionModeConfig, Standby,
+    ConnectedPiper, DisableConfig, MotionCapability, Piper, PositionModeConfig, Standby,
 };
 use piper_sdk::client::types::{JointArray, Rad, Result as ClientResult, RobotError};
 use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
+use piper_sdk::driver::ConnectionTarget;
 use piper_sdk::driver::state::JointLimitConfig;
+use piper_tools::SafetyConfig;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
@@ -49,6 +52,14 @@ struct Args {
     /// Settle timeout for each commanded move, in milliseconds.
     #[arg(long, default_value_t = DEFAULT_SETTLE_TIMEOUT_MS)]
     settle_timeout_ms: u64,
+
+    /// Skip success-path parking before disable.
+    #[arg(long)]
+    no_park: bool,
+
+    /// Parking orientation used after a successful return-to-initial check.
+    #[arg(long, default_value_t = ParkOrientation::Upright)]
+    park_orientation: ParkOrientation,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -211,9 +222,39 @@ where
         "[PASS] settle step=return joint=J{} final_position_rad={:.6} return_error_rad={:.6} tolerance_rad={:.6}",
         args.joint, returned_joint.0, return_error, POSITION_SETTLE_TOLERANCE_RAD
     );
+
+    if args.no_park {
+        let _robot = robot.disable(DisableConfig::default())?;
+        println!("[PASS] skipped parking via --no-park and disabled robot");
+    } else {
+        let park_profile = park_profile(args);
+        active_park_blocking(&robot, &park_profile)?;
+        let _robot = robot.disable(DisableConfig::default())?;
+        println!(
+            "[PASS] parked orientation={} before disable",
+            args.park_orientation
+        );
+    }
+
     println!("[PASS] hil_joint_position_check complete");
 
     Ok(())
+}
+
+fn park_profile(args: &Args) -> ControlProfile {
+    ControlProfile {
+        target: ConnectionTarget::AutoStrict,
+        orientation: args.park_orientation,
+        rest_pose_override: None,
+        park_speed_percent: args.speed_percent,
+        safety: SafetyConfig::default_config(),
+        wait: MotionWaitConfig {
+            threshold_rad: POSITION_SETTLE_TOLERANCE_RAD,
+            poll_interval: POSITION_SETTLE_POLL_INTERVAL,
+            republish_interval: POSITION_SETTLE_POLL_INTERVAL,
+            timeout: Duration::from_millis(args.settle_timeout_ms),
+        },
+    }
 }
 
 fn wait_for_monitor_snapshot<T, Read>(
@@ -393,6 +434,8 @@ fn validate_args_rejects_excessive_speed() {
         delta_rad: 0.02,
         speed_percent: 11,
         settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: ParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("speed > 10 must be rejected");
@@ -408,6 +451,8 @@ fn validate_args_rejects_excessive_delta() {
         delta_rad: 0.04,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: ParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("delta > 0.035 rad must be rejected");
@@ -423,6 +468,8 @@ fn validate_args_rejects_non_finite_delta() {
         delta_rad: f64::NAN,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: ParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("non-finite delta must be rejected");
@@ -439,6 +486,8 @@ fn validate_args_rejects_invalid_joint() {
         delta_rad: 0.02,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: ParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("joint outside 1..=6 must be rejected");
@@ -454,10 +503,36 @@ fn validate_args_rejects_zero_settle_timeout() {
         delta_rad: 0.02,
         speed_percent: 10,
         settle_timeout_ms: 0,
+        no_park: false,
+        park_orientation: ParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("zero settle timeout must be rejected");
     assert!(error.contains("settle_timeout_ms"));
+}
+
+#[test]
+fn validate_args_accepts_no_park() {
+    let args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 5,
+        settle_timeout_ms: 10_000,
+        no_park: true,
+        park_orientation: piper_control::ParkOrientation::Upright,
+    };
+
+    validate_args(&args).expect("no-park should be accepted");
+}
+
+#[test]
+fn park_pose_defaults_to_selected_orientation() {
+    assert_eq!(
+        piper_control::ParkOrientation::Left.default_rest_pose(),
+        [1.71, 2.96, -2.65, 1.41, -0.081, -0.190]
+    );
 }
 
 #[test]
