@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use piper_control::{ControlProfile, MotionWaitConfig, ParkOrientation, active_park_blocking};
 use piper_sdk::PiperBuilder;
 use piper_sdk::client::state::machine::MotionType;
@@ -13,6 +13,9 @@ use piper_tools::SafetyConfig;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use clap::CommandFactory;
+
 const MAX_SPEED_PERCENT: u8 = 10;
 const MAX_DELTA_RAD: f64 = 0.035;
 const DEFAULT_SETTLE_TIMEOUT_MS: u64 = 10_000;
@@ -23,6 +26,23 @@ const INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5
 const POSITION_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PREFLIGHT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const PREFLIGHT_TARGET_JOINT_FAIL_MARGIN_RAD: f64 = 0.05;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliParkOrientation {
+    Upright,
+    Left,
+    Right,
+}
+
+impl From<CliParkOrientation> for ParkOrientation {
+    fn from(value: CliParkOrientation) -> Self {
+        match value {
+            CliParkOrientation::Upright => ParkOrientation::Upright,
+            CliParkOrientation::Left => ParkOrientation::Left,
+            CliParkOrientation::Right => ParkOrientation::Right,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hil_joint_position_check")]
@@ -58,8 +78,13 @@ struct Args {
     no_park: bool,
 
     /// Parking orientation used after a successful return-to-initial check.
-    #[arg(long, default_value_t = ParkOrientation::Upright)]
-    park_orientation: ParkOrientation,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "upright|left|right",
+        default_value_t = CliParkOrientation::Upright
+    )]
+    park_orientation: CliParkOrientation,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -232,7 +257,7 @@ where
         let _robot = robot.disable(DisableConfig::default())?;
         println!(
             "[PASS] parked orientation={} before disable",
-            args.park_orientation
+            ParkOrientation::from(args.park_orientation)
         );
     }
 
@@ -244,7 +269,7 @@ where
 fn park_profile(args: &Args) -> ControlProfile {
     ControlProfile {
         target: ConnectionTarget::AutoStrict,
-        orientation: args.park_orientation,
+        orientation: args.park_orientation.into(),
         rest_pose_override: None,
         park_speed_percent: args.speed_percent,
         safety: SafetyConfig::default_config(),
@@ -435,7 +460,7 @@ fn validate_args_rejects_excessive_speed() {
         speed_percent: 11,
         settle_timeout_ms: 10_000,
         no_park: false,
-        park_orientation: ParkOrientation::Upright,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("speed > 10 must be rejected");
@@ -452,7 +477,7 @@ fn validate_args_rejects_excessive_delta() {
         speed_percent: 10,
         settle_timeout_ms: 10_000,
         no_park: false,
-        park_orientation: ParkOrientation::Upright,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("delta > 0.035 rad must be rejected");
@@ -469,7 +494,7 @@ fn validate_args_rejects_non_finite_delta() {
         speed_percent: 10,
         settle_timeout_ms: 10_000,
         no_park: false,
-        park_orientation: ParkOrientation::Upright,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("non-finite delta must be rejected");
@@ -487,7 +512,7 @@ fn validate_args_rejects_invalid_joint() {
         speed_percent: 10,
         settle_timeout_ms: 10_000,
         no_park: false,
-        park_orientation: ParkOrientation::Upright,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("joint outside 1..=6 must be rejected");
@@ -504,7 +529,7 @@ fn validate_args_rejects_zero_settle_timeout() {
         speed_percent: 10,
         settle_timeout_ms: 0,
         no_park: false,
-        park_orientation: ParkOrientation::Upright,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("zero settle timeout must be rejected");
@@ -521,10 +546,21 @@ fn validate_args_accepts_no_park() {
         speed_percent: 5,
         settle_timeout_ms: 10_000,
         no_park: true,
-        park_orientation: piper_control::ParkOrientation::Upright,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     validate_args(&args).expect("no-park should be accepted");
+}
+
+#[test]
+fn park_orientation_help_lists_explicit_allowed_values() {
+    let mut command = Args::command();
+    let mut buffer = Vec::new();
+    command.write_long_help(&mut buffer).expect("help should render");
+    let help = String::from_utf8(buffer).expect("help should be utf-8");
+
+    assert!(help.contains("--park-orientation <upright|left|right>"));
+    assert!(help.contains("[possible values: upright, left, right]"));
 }
 
 #[test]
