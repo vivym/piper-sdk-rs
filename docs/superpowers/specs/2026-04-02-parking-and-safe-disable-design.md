@@ -17,7 +17,9 @@ The repository also already distinguishes emergency behavior from non-emergency 
 
 - `stop` / `Ctrl+C` are emergency-style operators that cancel work and disable immediately.
 - `disable()` is a low-level state transition primitive.
-- `park` is already a controlled motion workflow that parks and then disables.
+- `park` already exists in two related forms:
+  - standby-entry workflows such as `park_blocking()` that park and then disable
+  - interactive active-session flows such as REPL `park` that currently only move to the park pose
 
 The design must preserve those semantics.
 
@@ -64,7 +66,7 @@ The system will continue to have three distinct meanings:
 
 - `stop`: immediate safe interruption, no parking.
 - `disable()`: direct disable primitive, no parking.
-- `park`: controlled non-emergency shutdown workflow that parks and then disables.
+- `park`: controlled non-emergency motion toward a configured rest pose; some entrypoints also disable afterward.
 
 The success path for selected HIL helpers should default to:
 
@@ -219,12 +221,20 @@ But those should not be changed in the first patch.
 
 ## CLI Changes
 
-CLI already has `park`.
+CLI already has `park`, but not all `park` entrypoints have identical post-park behavior today.
 
 Phase 1 recommendation:
 
-- keep `park` as the explicit non-emergency command
+- keep existing `park` entrypoints and naming
 - do not add a second synonymous command in Phase 1
+
+Clarify the existing split explicitly:
+
+- one-shot CLI `park` and script `Park` already use `park_blocking()` and end in `Standby`
+- REPL `park` currently performs only the move-to-park step and remains active
+
+Phase 1 should update documentation to make this distinction explicit, but should not silently
+change REPL `park` behavior yet.
 
 `disable` remains direct disable.
 
@@ -310,7 +320,7 @@ to distinguish:
 1. Add dedicated low-speed park config to `ControlProfile` / `piper-control`.
 2. Reuse the existing `park_blocking()` standby workflow with that config.
 3. Integrate success-path parking into `hil_joint_position_check`.
-4. Update docs to clarify that `park` already implies `park -> disable`, while `disable` does not.
+4. Update docs to clarify that standby-entry `park_blocking()` / one-shot CLI `park` imply `park -> disable`, while REPL `park` currently does not, and `disable` never does.
 5. Validate on hardware with the existing low-risk joint HIL path before expanding to more helpers.
 
 ## Risks
