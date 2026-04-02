@@ -234,20 +234,17 @@
    disable
    exit
    ```
-6. `disable` 后，立刻用只读 helper 确认系统回到 non-driving state：
-   ```bash
-   cargo run -p piper-sdk --example robot_monitor -- --interface can0
-   ```
-   或：
+6. `disable` 后，立刻用 `state_api_demo` 确认系统回到 disabled / non-driving state：
    ```bash
    cargo run -p piper-sdk --example state_api_demo -- --interface can0
    ```
+   `robot_monitor` 可以作为额外的只读视图，但不能单独作为 disable 证据。
    这一步要作为 disable 的一部分来执行，不要省略。
 7. 对外部 stop path，使用：
    ```bash
    cargo run -p piper-cli -- stop --target socketcan:can0
    ```
-8. `stop` 之后，同样立刻用 `robot_monitor` 或 `state_api_demo` 确认 non-driving state。
+8. `stop` 之后，同样立刻用 `state_api_demo` 确认 disabled / non-driving state；`robot_monitor` 仍然只作为可选的辅助观察。
 9. 对 rejected-state gating，使用一个可复现的流程：
    - `Terminal 3` 打开：
      ```bash

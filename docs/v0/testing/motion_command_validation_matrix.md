@@ -29,12 +29,12 @@
 | 模式 | Command API | HIL helper | 预期通过条件 | 安全参数上限 | 清理/停止 |
 |---|---|---|---|---|---|
 | Joint Position | `send_position_command()` | `hil_joint_position_check` | 去程/回程都观察到关节位移，最终误差在容差内 | `delta_rad <= 0.035`, `speed_percent <= 10` | 默认成功路径先按 `--park-orientation` 停靠再 disable；`--no-park` 则在回到初始 snapshot 后直接 disable；失败时先 `stop` |
-| Cartesian | `command_cartesian_pose()` | `hil_cartesian_pose_check` | 观察到末端位姿平移进展，目标与回程都在平移容差内 | `||delta|| <= 0.02 m`, `speed_percent <= 10` | helper 完成后自动 drop；失败时先 `stop` |
-| Linear | `move_linear()` | `hil_linear_motion_check` | 观察到末端平移进展，最终误差在容差内，采样轨迹未明显偏离直线段 | `|delta_x| <= 0.02 m`, `speed_percent <= 10` | helper 完成后自动 drop；失败时先 `stop` |
-| Circular | `move_circular()` | `hil_circular_motion_check` | 至少一个采样点进入 via 点邻域，最终点单独收敛 | `|delta_x| <= 0.02 m`, `|via_offset| <= 0.015 m`, `speed_percent <= 10` | helper 完成后自动 drop；失败时先 `stop` |
-| MIT | `command_torques()` | `hil_mit_hold_check` | 选定关节出现小但可观测的位置响应，回程误差在容差内 | `delta_rad <= 0.02`, `speed_percent <= 10`, 低增益起步 | helper 完成后自动 drop；失败时先 `stop` |
+| Cartesian | `command_cartesian_pose()` | `hil_cartesian_pose_check` | 观察到末端位姿平移进展，目标与回程都在平移容差内 | `||delta|| <= 0.02 m`, `speed_percent <= 10` | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
+| Linear | `move_linear()` | `hil_linear_motion_check` | 观察到末端平移进展，最终误差在容差内，采样轨迹未明显偏离直线段 | `|delta_x| <= 0.02 m`, `speed_percent <= 10` | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
+| Circular | `move_circular()` | `hil_circular_motion_check` | 至少一个采样点进入 via 点邻域，最终点单独收敛 | `|delta_x| <= 0.02 m`, `|via_offset| <= 0.015 m`, `speed_percent <= 10` | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
+| MIT | `command_torques()` | `hil_mit_hold_check` | 选定关节出现小但可观测的位置响应，回程误差在容差内 | `delta_rad <= 0.02`, `speed_percent <= 10`, 低增益起步 | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
 | ReplayMode | `replay_recording()` | `hil_replay_mode_check` | 成功进入 `ReplayMode`，回放完成后返回确认的 `Standby` | `speed <= 5.0`; 推荐 `<= 2.0` | 失败时检查录制文件并重新 `stop` |
-| Gripper | `open_gripper()`, `close_gripper()`, `set_gripper()` | `hil_gripper_check` | 打开、闭合、再次打开都观察到夹爪位置变化 | `close_effort <= 1.0`, `speed_percent <= 10` | helper 完成后自动 drop；失败时先 `stop` |
+| Gripper | `open_gripper()`, `close_gripper()`, `set_gripper()` | `hil_gripper_check` | 打开、闭合、再次打开都观察到夹爪位置变化 | `close_effort <= 1.0`, `speed_percent <= 10` | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
 
 ## 推荐命令
 
@@ -51,6 +51,7 @@ cargo run -p piper-sdk --example hil_gripper_check -- --interface can0 --close-e
 ## Soak 命令
 
 以下命令用于抓时序和偶发问题。任何一轮失败都应立即中止并排查。
+这些循环只假设上一轮 helper 自己完成了 drop-time best-effort disable，不假设已经单独验证过 confirmed Standby；如果要在轮与轮之间证明退出态，请插入 `state_api_demo` 或 `stop`。
 
 ```bash
 for i in $(seq 1 50); do
