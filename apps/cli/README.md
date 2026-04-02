@@ -140,7 +140,8 @@ timeout_ms = 5000
 
 - 这是 REPL 命令，不是 one-shot 顶层子命令
 - 只发送 raw disable，不附带任何移动或停靠动作
-- 会保持连接和会话，但把机器人回到失能状态
+- 会阻塞直到 disable 完成，并把连接和会话留在 `Standby`
+- 外部 one-shot 急停路径仍然是 `piper-cli stop`
 
 ### `set-zero`
 

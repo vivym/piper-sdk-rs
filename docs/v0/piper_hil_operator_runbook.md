@@ -226,7 +226,7 @@
    - `[PASS] enabled PositionMode motion=Joint speed_percent=...`
    - `[PASS] settle step=move ...`
    - `[PASS] settle step=return ...`
-5. 对 explicit disable path，使用：
+5. 对 explicit disable path，使用 REPL `disable`：
    ```bash
    cargo run -p piper-cli -- shell
    connect socketcan:can0
@@ -234,6 +234,7 @@
    disable
    exit
    ```
+   这条命令是 raw disable，不做停靠或额外运动；它会等待 disable 完成并把会话留在 `Standby`。
 6. `disable` 后，立刻用 `state_api_demo` 确认系统回到 disabled / non-driving state：
    ```bash
    cargo run -p piper-sdk --example state_api_demo -- --interface can0
@@ -284,7 +285,7 @@
 ### 需要填写到结果模板的字段与 checklist 勾选
 
 - Checklist: `Phase 2: Safe Lifecycle and State Transitions` 里的 `hil_joint_position_check`、确认 Standby、确认 enable 进入 `PositionMode + MotionType::Joint`、确认 move / return、explicit disable、`piper-cli stop`、rejected-state gating、reconnect re-check
-- Results template: `Phase 2: Safe Lifecycle and State Transitions`，必填 `Standby evidence`，`Enable evidence`，`Disable evidence`，`Drop or emergency-stop evidence`，`Rejected-state gating evidence`，`Reconnect evidence`，并补充 `Observed` / `Notes` / `Artifacts`；其中 disable / stop 之后的 `robot_monitor` 或 `state_api_demo` 输出也要放进 `Disable evidence` 或 `Drop or emergency-stop evidence`
+- Results template: `Phase 2: Safe Lifecycle and State Transitions`，必填 `Standby evidence`，`Enable evidence`，`Disable evidence`，`Drop or emergency-stop evidence`，`Rejected-state gating evidence`，`Reconnect evidence`，并补充 `Observed` / `Notes` / `Artifacts`；其中 disable / stop 之后的 `state_api_demo` 输出是必填证据，`robot_monitor` 只能作为可选的辅助观察
 
 ## Phase 3: Low-Risk Motion Validation
 
