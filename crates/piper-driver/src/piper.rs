@@ -2,6 +2,7 @@
 //!
 //! 提供对外的 `Piper` 结构体，封装底层 IO 线程和状态同步细节。
 
+use crate::ProtocolDiagnostic;
 use crate::command::{
     CommandPriority, DeliveryPhase, MaintenanceCommandMeta, PiperCommand, RealtimeCommand,
     ReliableCommand, ReliableCommandKind, SoftRealtimeCommand, SoftRealtimeMailbox,
@@ -2866,13 +2867,72 @@ impl Piper {
         kind: QueryKind,
         diagnostics_rx: &Receiver<DiagnosticEvent>,
     ) -> QueryError {
-        if diagnostics_rx.try_iter().next().is_some() {
+        if diagnostics_rx
+            .try_iter()
+            .any(|event| Self::is_query_relevant_diagnostic(kind, &event))
+        {
             self.ctx.diagnostics.push(DiagnosticEvent::Query(
                 QueryDiagnostic::DiagnosticsOnlyTimeout { query: kind },
             ));
             QueryError::DiagnosticsOnlyTimeout
         } else {
             QueryError::Timeout
+        }
+    }
+
+    fn is_query_relevant_diagnostic(kind: QueryKind, event: &DiagnosticEvent) -> bool {
+        match event {
+            DiagnosticEvent::Query(QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                query,
+                ..
+            }) => *query == kind,
+            DiagnosticEvent::Query(QueryDiagnostic::DiagnosticsOnlyTimeout { query }) => {
+                *query == kind
+            },
+            DiagnosticEvent::Query(QueryDiagnostic::Busy) => false,
+            DiagnosticEvent::Protocol(diagnostic) => match kind {
+                QueryKind::CollisionProtection => match diagnostic {
+                    ProtocolDiagnostic::InvalidLength { can_id, .. } => {
+                        *can_id == piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK
+                    },
+                    ProtocolDiagnostic::OutOfRange { field, .. }
+                    | ProtocolDiagnostic::UnsupportedValue { field, .. } => {
+                        *field == "collision_protection_level"
+                    },
+                    _ => false,
+                },
+                QueryKind::JointLimit => match diagnostic {
+                    ProtocolDiagnostic::InvalidLength { can_id, .. } => {
+                        *can_id == piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK
+                    },
+                    ProtocolDiagnostic::OutOfRange { field, .. } => *field == "joint_index",
+                    ProtocolDiagnostic::UnsupportedValue { field, .. } => {
+                        *field == "motor_limit_feedback"
+                    },
+                    _ => false,
+                },
+                QueryKind::JointAccel => match diagnostic {
+                    ProtocolDiagnostic::InvalidLength { can_id, .. } => {
+                        *can_id == piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK
+                    },
+                    ProtocolDiagnostic::OutOfRange { field, .. } => {
+                        *field == "motor_max_accel_joint_index"
+                    },
+                    ProtocolDiagnostic::UnsupportedValue { field, .. } => {
+                        *field == "motor_max_accel_feedback"
+                    },
+                    _ => false,
+                },
+                QueryKind::EndLimit => match diagnostic {
+                    ProtocolDiagnostic::InvalidLength { can_id, .. } => {
+                        *can_id == piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK
+                    },
+                    ProtocolDiagnostic::UnsupportedValue { field, .. } => {
+                        *field == "end_velocity_accel_feedback"
+                    },
+                    _ => false,
+                },
+            },
         }
     }
 
@@ -2885,12 +2945,11 @@ impl Piper {
 
         let query = self.try_begin_query(QueryKind::CollisionProtection)?;
         let token = query.token();
-        let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
         let diagnostics_rx = self.ctx.diagnostics.subscribe();
         self.ctx
             .collision_protection_observation
             .write()
-            .map(|mut store| store.begin_query(token, baseline_host_mono_us))
+            .map(|mut store| store.begin_query(token, u64::MAX))
             .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
         let result = (|| {
@@ -2900,8 +2959,16 @@ impl Piper {
                     .to_frame()
                     .map_err(DriverError::from)
                     .map_err(QueryError::from)?;
-            self.send_reliable_frame_confirmed_commit_marker(frame, timeout)
+            let commit_host_mono_us = self
+                .send_reliable_frame_confirmed_commit_marker(frame, timeout)
                 .map_err(QueryError::from)?;
+            self.ctx
+                .collision_protection_observation
+                .write()
+                .map(|mut store| {
+                    store.advance_query_min_host_rx_mono_us(token, commit_host_mono_us)
+                })
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
                 this.ctx
@@ -3028,12 +3095,11 @@ impl Piper {
 
         let query = self.try_begin_query(QueryKind::EndLimit)?;
         let token = query.token();
-        let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
         let diagnostics_rx = self.ctx.diagnostics.subscribe();
         self.ctx
             .end_limit_observation
             .write()
-            .map(|mut store| store.begin_query(token, baseline_host_mono_us))
+            .map(|mut store| store.begin_query(token, u64::MAX))
             .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
         let result = (|| {
@@ -3042,8 +3108,16 @@ impl Piper {
                 .to_frame()
                 .map_err(DriverError::from)
                 .map_err(QueryError::from)?;
-            self.send_reliable_frame_confirmed_commit_marker(frame, timeout)
+            let commit_host_mono_us = self
+                .send_reliable_frame_confirmed_commit_marker(frame, timeout)
                 .map_err(QueryError::from)?;
+            self.ctx
+                .end_limit_observation
+                .write()
+                .map(|mut store| {
+                    store.advance_query_min_host_rx_mono_us(token, commit_host_mono_us)
+                })
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
                 this.ctx
@@ -5149,6 +5223,35 @@ mod tests {
         }
     }
 
+    struct BlockingTxAdapter {
+        entered_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
+    }
+
+    impl piper_can::RealtimeTxAdapter for BlockingTxAdapter {
+        fn send_control(&mut self, _frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            let _ = self.entered_tx.send(());
+            self.release_rx
+                .recv_timeout(Duration::from_millis(100))
+                .map_err(|_| CanError::Timeout)?;
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            _frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+    }
+
     struct FailOnNthTxAdapter {
         fail_on: usize,
         sends: usize,
@@ -5384,6 +5487,67 @@ mod tests {
             }
             self.frames.pop_front().ok_or(CanError::Timeout)
         }
+    }
+
+    struct ChannelRxAdapter {
+        bootstrap: Option<PiperFrame>,
+        frames_rx: mpsc::Receiver<PiperFrame>,
+    }
+
+    impl ChannelRxAdapter {
+        fn new(frames_rx: mpsc::Receiver<PiperFrame>) -> Self {
+            Self {
+                bootstrap: Some({
+                    let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
+                    frame.timestamp_us = 1;
+                    frame
+                }),
+                frames_rx,
+            }
+        }
+    }
+
+    impl piper_can::RxAdapter for ChannelRxAdapter {
+        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+            if let Some(frame) = self.bootstrap.take() {
+                return Ok(frame);
+            }
+
+            self.frames_rx
+                .recv_timeout(Duration::from_millis(2))
+                .map_err(|_| CanError::Timeout)
+        }
+    }
+
+    fn collision_protection_feedback_frame(levels: [u8; 6], timestamp_us: u64) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[..6].copy_from_slice(&levels);
+        let mut frame = PiperFrame::new_standard(
+            piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
+            &data,
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn end_limit_feedback_frame(
+        linear_velocity_mm_s: u16,
+        angular_velocity_millirad_s: u16,
+        linear_accel_mm_s2: u16,
+        angular_accel_millirad_s2: u16,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&linear_velocity_mm_s.to_be_bytes());
+        data[2..4].copy_from_slice(&angular_velocity_millirad_s.to_be_bytes());
+        data[4..6].copy_from_slice(&linear_accel_mm_s2.to_be_bytes());
+        data[6..8].copy_from_slice(&angular_accel_millirad_s2.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(
+            piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK as u16,
+            &data,
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
     }
 
     #[test]
@@ -7231,6 +7395,55 @@ mod tests {
     }
 
     #[test]
+    fn query_collision_protection_ignores_pre_commit_feedback() {
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Piper::new_dual_thread_parts(
+            ChannelRxAdapter::new(frames_rx),
+            BlockingTxAdapter {
+                entered_tx,
+                release_rx,
+            },
+            None,
+        )
+        .unwrap();
+
+        let result = thread::scope(|scope| {
+            let query = scope.spawn(|| piper.query_collision_protection(Duration::from_millis(80)));
+            entered_rx
+                .recv_timeout(Duration::from_millis(40))
+                .expect("query should reach tx commit point");
+            frames_tx
+                .send(collision_protection_feedback_frame([1, 2, 3, 4, 5, 6], 42))
+                .expect("stale frame should be sent before commit");
+            wait_until(
+                Duration::from_millis(40),
+                || {
+                    piper
+                        .ctx
+                        .collision_protection
+                        .read()
+                        .map(|state| state.host_rx_mono_us != 0)
+                        .unwrap_or(false)
+                },
+                "stale collision-protection frame should be consumed before tx release",
+            );
+            release_tx.send(()).expect("tx barrier release should be delivered");
+            query.join().expect("query thread should not panic")
+        });
+
+        assert!(
+            matches!(result, Err(QueryError::Timeout)),
+            "expected timeout, got {result:?}"
+        );
+        assert!(matches!(
+            piper.get_collision_protection(),
+            Observation::Unavailable
+        ));
+    }
+
+    #[test]
     fn test_query_end_limit_config_returns_fresh_feedback_and_sends_query_frame() {
         let mut data = [0u8; 8];
         data[0..2].copy_from_slice(&1000u16.to_be_bytes());
@@ -7281,6 +7494,55 @@ mod tests {
             sent[0].data[0],
             piper_protocol::config::ParameterQueryType::EndVelocityAccel as u8
         );
+    }
+
+    #[test]
+    fn query_end_limit_config_ignores_pre_commit_feedback() {
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Piper::new_dual_thread_parts(
+            ChannelRxAdapter::new(frames_rx),
+            BlockingTxAdapter {
+                entered_tx,
+                release_rx,
+            },
+            None,
+        )
+        .unwrap();
+
+        let result = thread::scope(|scope| {
+            let query = scope.spawn(|| piper.query_end_limit_config(Duration::from_millis(80)));
+            entered_rx
+                .recv_timeout(Duration::from_millis(40))
+                .expect("query should reach tx commit point");
+            frames_tx
+                .send(end_limit_feedback_frame(1000, 2000, 3000, 4000, 84))
+                .expect("stale frame should be sent before commit");
+            wait_until(
+                Duration::from_millis(40),
+                || {
+                    piper
+                        .ctx
+                        .end_limit_config
+                        .read()
+                        .map(|state| state.last_update_host_rx_mono_us != 0)
+                        .unwrap_or(false)
+                },
+                "stale end-limit frame should be consumed before tx release",
+            );
+            release_tx.send(()).expect("tx barrier release should be delivered");
+            query.join().expect("query thread should not panic")
+        });
+
+        assert!(
+            matches!(result, Err(QueryError::Timeout)),
+            "expected timeout, got {result:?}"
+        );
+        assert!(matches!(
+            piper.get_end_limit_config(),
+            Observation::Unavailable
+        ));
     }
 
     #[test]
@@ -7469,6 +7731,29 @@ mod tests {
         let error = piper.query_collision_protection(Duration::from_millis(60)).unwrap_err();
 
         assert!(matches!(error, QueryError::DiagnosticsOnlyTimeout));
+    }
+
+    #[test]
+    fn query_collision_protection_timeout_ignores_unrelated_diagnostics() {
+        let piper =
+            Piper::new_dual_thread_parts(BootstrappedMockRxAdapter::new(), MockTxAdapter, None)
+                .unwrap();
+        let diagnostics = piper.ctx.diagnostics.clone();
+        let push_thread = thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            diagnostics.push(DiagnosticEvent::Protocol(
+                ProtocolDiagnostic::InvalidLength {
+                    can_id: piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK,
+                    expected: 8,
+                    actual: 3,
+                },
+            ));
+        });
+
+        let error = piper.query_collision_protection(Duration::from_millis(60)).unwrap_err();
+        push_thread.join().expect("diagnostic thread should not panic");
+
+        assert!(matches!(error, QueryError::Timeout));
     }
 
     #[test]

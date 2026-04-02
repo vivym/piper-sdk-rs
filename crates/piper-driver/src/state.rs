@@ -1586,6 +1586,7 @@ struct PublishedQueryValue<T: Copy> {
 pub struct QueryBackedSingleStore<T: Copy> {
     published: Option<PublishedQueryValue<T>>,
     active_query: Option<ActiveQueryObservationWindow>,
+    pending: Option<StoredQueryValue<T>>,
 }
 
 impl<T: Copy> QueryBackedSingleStore<T> {
@@ -1593,6 +1594,7 @@ impl<T: Copy> QueryBackedSingleStore<T> {
         Self {
             published: None,
             active_query: None,
+            pending: None,
         }
     }
 
@@ -1601,11 +1603,22 @@ impl<T: Copy> QueryBackedSingleStore<T> {
             token,
             min_host_rx_mono_us,
         });
+        self.pending = None;
     }
 
     pub fn finish_query(&mut self, token: u64) {
         if self.active_query.map(|query| query.token) == Some(token) {
             self.active_query = None;
+            self.pending = None;
+        }
+    }
+
+    pub fn advance_query_min_host_rx_mono_us(&mut self, token: u64, min_host_rx_mono_us: u64) {
+        if let Some(active_query) = self.active_query.as_mut()
+            && active_query.token == token
+        {
+            active_query.min_host_rx_mono_us = min_host_rx_mono_us;
+            self.try_publish_pending(token);
         }
     }
 
@@ -1619,21 +1632,19 @@ impl<T: Copy> QueryBackedSingleStore<T> {
         let Some(active_query) = self.active_query else {
             return false;
         };
-        if active_query.token != token || host_rx_mono_us <= active_query.min_host_rx_mono_us {
+        if active_query.token != token {
             return false;
         }
 
-        self.published = Some(PublishedQueryValue {
-            token,
-            complete: Complete {
-                value,
-                meta: ObservationMeta {
-                    hardware_timestamp_us,
-                    host_rx_mono_us: Some(host_rx_mono_us),
-                    source: ObservationSource::Query,
-                },
+        self.pending = Some(StoredQueryValue {
+            value,
+            meta: ObservationMeta {
+                hardware_timestamp_us,
+                host_rx_mono_us: Some(host_rx_mono_us),
+                source: ObservationSource::Query,
             },
         });
+        self.try_publish_pending(token);
         true
     }
 
@@ -1652,6 +1663,29 @@ impl<T: Copy> QueryBackedSingleStore<T> {
     pub fn current_complete_for_token(&self, token: u64) -> Option<Complete<T>> {
         let published = self.published.as_ref()?;
         (published.token == token).then(|| published.complete.clone())
+    }
+
+    fn try_publish_pending(&mut self, token: u64) {
+        let Some(active_query) = self.active_query else {
+            return;
+        };
+        let Some(pending) = self.pending else {
+            return;
+        };
+        if active_query.token != token {
+            return;
+        }
+        if pending.meta.host_rx_mono_us.unwrap_or_default() <= active_query.min_host_rx_mono_us {
+            return;
+        }
+
+        self.published = Some(PublishedQueryValue {
+            token,
+            complete: Complete {
+                value: pending.value,
+                meta: pending.meta,
+            },
+        });
     }
 }
 

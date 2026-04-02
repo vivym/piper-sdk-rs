@@ -2100,24 +2100,28 @@ pub(crate) fn tx_loop_mailbox(
                     Some(permit)
                 };
 
-                if !committed && let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
-                        deadline_missed = true;
-                        send_result = Err(crate::DriverError::Timeout);
-                        break;
-                    }
-                    if let Some(ack) = ack.as_ref() {
-                        let _ = ack.send(crate::command::DeliveryPhase::Committed {
-                            host_commit_mono_us: crate::heartbeat::monotonic_micros().max(1),
-                        });
-                    }
-                    committed = true;
+                if !committed
+                    && let Some(deadline) = deadline
+                    && Instant::now() >= deadline
+                {
+                    deadline_missed = true;
+                    send_result = Err(crate::DriverError::Timeout);
+                    break;
                 }
 
                 match tx.send_control(frame, normal_send_budget) {
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
+                        if !committed {
+                            if let Some(ack) = ack.as_ref() {
+                                let _ = ack.send(crate::command::DeliveryPhase::Committed {
+                                    host_commit_mono_us: crate::heartbeat::monotonic_micros()
+                                        .max(1),
+                                });
+                            }
+                            committed = true;
+                        }
 
                         if let Ok(hooks) = ctx.hooks.try_read() {
                             hooks.trigger_all_sent(&frame);
