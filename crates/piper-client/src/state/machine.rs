@@ -4251,6 +4251,63 @@ mod tests {
         );
     }
 
+    fn assert_enable_position_mode_succeeds_for_motion_type(
+        motion_type: MotionType,
+        expected_move_mode: MoveMode,
+    ) {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, expected_move_mode, 100),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
+        let active = standby
+            .enable_position_mode(PositionModeConfig {
+                timeout: Duration::from_millis(50),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 10,
+                install_position: InstallPosition::Invalid,
+                motion_type,
+                command_timeout: Duration::from_millis(20),
+            })
+            .expect("matching 0x2A1 should allow Active<PositionMode>");
+
+        assert_eq!(active._state.0.motion_type, motion_type);
+        let control = active.driver.get_robot_control();
+        assert_eq!(control.control_mode, ControlMode::CanControl as u8);
+        assert_eq!(control.move_mode, expected_move_mode as u8);
+        assert!(control.is_fully_enabled_confirmed());
+        assert!(
+            sent_frames
+                .lock()
+                .expect("sent frames lock")
+                .iter()
+                .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
+            "mode switch command should be sent before confirmation succeeds"
+        );
+    }
+
+    #[test]
+    fn enable_position_mode_cartesian_succeeds_with_matching_robot_status_move_p() {
+        assert_enable_position_mode_succeeds_for_motion_type(
+            MotionType::Cartesian,
+            MoveMode::MoveP,
+        );
+    }
+
+    #[test]
+    fn enable_position_mode_linear_succeeds_with_matching_robot_status_move_l() {
+        assert_enable_position_mode_succeeds_for_motion_type(MotionType::Linear, MoveMode::MoveL);
+    }
+
+    #[test]
+    fn enable_position_mode_circular_succeeds_with_matching_robot_status_move_c() {
+        assert_enable_position_mode_succeeds_for_motion_type(MotionType::Circular, MoveMode::MoveC);
+    }
+
     #[test]
     fn enable_position_mode_rejects_mismatched_control_mode_echo() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
