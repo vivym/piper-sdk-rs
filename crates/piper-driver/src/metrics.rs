@@ -3,7 +3,189 @@
 //! 提供零开销的原子计数器，用于监控 IO 链路的健康状态和性能。
 //! 所有计数器都使用原子操作，可以在任何线程安全地读取，不会引入锁竞争。
 
+use crate::{
+    DiagnosticEvent, FpsCounts, FpsResult, Piper, ProtocolDiagnostic, QueryDiagnostic, QueryKind,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 重建观察族指标的单族快照。
+///
+/// 这些指标明确区分：
+/// - `raw_frame_rate`: 原始成员帧速率
+/// - `complete_observation_rate`: 完整观察速率
+/// - `diagnostic_rate`: 诊断事件速率
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FamilyObservationMetrics {
+    pub raw_frame_rate: f64,
+    pub complete_observation_rate: f64,
+    pub diagnostic_rate: f64,
+}
+
+/// 重建观察族指标快照。
+///
+/// 仅覆盖本轮重建的六个家族。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ObservationMetrics {
+    pub low_speed: FamilyObservationMetrics,
+    pub end_pose: FamilyObservationMetrics,
+    pub collision_protection: FamilyObservationMetrics,
+    pub joint_limit_config: FamilyObservationMetrics,
+    pub joint_accel_config: FamilyObservationMetrics,
+    pub end_limit_config: FamilyObservationMetrics,
+}
+
+fn rate_from_count(count: u64, elapsed_secs: f64) -> f64 {
+    if elapsed_secs <= 0.0 {
+        return 0.0;
+    }
+    count as f64 / elapsed_secs
+}
+
+fn family_metrics(
+    raw_count: u64,
+    complete_count: u64,
+    diagnostic_count: u64,
+    elapsed_secs: f64,
+) -> FamilyObservationMetrics {
+    FamilyObservationMetrics {
+        raw_frame_rate: rate_from_count(raw_count, elapsed_secs),
+        complete_observation_rate: rate_from_count(complete_count, elapsed_secs),
+        diagnostic_rate: rate_from_count(diagnostic_count, elapsed_secs),
+    }
+}
+
+fn elapsed_secs_from_legacy_fps(fps: FpsResult, counts: FpsCounts) -> f64 {
+    let candidates = [
+        (counts.joint_position, fps.joint_position),
+        (counts.end_pose, fps.end_pose),
+        (counts.joint_dynamic, fps.joint_dynamic),
+        (counts.robot_control, fps.robot_control),
+        (counts.gripper, fps.gripper),
+        (counts.joint_driver_low_speed, fps.joint_driver_low_speed),
+        (counts.collision_protection, fps.collision_protection),
+        (counts.joint_limit_config, fps.joint_limit_config),
+        (counts.joint_accel_config, fps.joint_accel_config),
+        (counts.end_limit_config, fps.end_limit_config),
+        (counts.firmware_version, fps.firmware_version),
+        (
+            counts.master_slave_control_mode,
+            fps.master_slave_control_mode,
+        ),
+        (
+            counts.master_slave_joint_control,
+            fps.master_slave_joint_control,
+        ),
+        (
+            counts.master_slave_gripper_control,
+            fps.master_slave_gripper_control,
+        ),
+    ];
+
+    for (count, rate) in candidates {
+        if count > 0 && rate > 0.0 {
+            return count as f64 / rate;
+        }
+    }
+
+    0.0
+}
+
+fn count_collision_protection_diagnostics(diagnostics: &[DiagnosticEvent]) -> u64 {
+    diagnostics
+        .iter()
+        .filter(|event| match event {
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::InvalidLength { can_id, .. }) => {
+                *can_id == 0x47B
+            },
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::OutOfRange { field, .. }) => {
+                *field == "collision_protection_level"
+            },
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::UnsupportedValue { field, .. }) => {
+                *field == "collision_protection_level"
+            },
+            DiagnosticEvent::Query(QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                query,
+                ..
+            }) => *query == QueryKind::CollisionProtection,
+            DiagnosticEvent::Query(QueryDiagnostic::DiagnosticsOnlyTimeout { query }) => {
+                *query == QueryKind::CollisionProtection
+            },
+            _ => false,
+        })
+        .count() as u64
+}
+
+fn count_joint_limit_diagnostics(diagnostics: &[DiagnosticEvent]) -> u64 {
+    diagnostics
+        .iter()
+        .filter(|event| match event {
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::InvalidLength { can_id, .. }) => {
+                *can_id == 0x473
+            },
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::OutOfRange { field, .. }) => {
+                *field == "joint_index"
+            },
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::UnsupportedValue { field, .. }) => {
+                *field == "motor_limit_feedback"
+            },
+            DiagnosticEvent::Query(QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                query,
+                ..
+            }) => *query == QueryKind::JointLimit,
+            DiagnosticEvent::Query(QueryDiagnostic::DiagnosticsOnlyTimeout { query }) => {
+                *query == QueryKind::JointLimit
+            },
+            _ => false,
+        })
+        .count() as u64
+}
+
+fn count_joint_accel_diagnostics(diagnostics: &[DiagnosticEvent]) -> u64 {
+    diagnostics
+        .iter()
+        .filter(|event| match event {
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::InvalidLength { can_id, .. }) => {
+                *can_id == 0x47C
+            },
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::OutOfRange { field, .. }) => {
+                *field == "joint_index"
+            },
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::UnsupportedValue { field, .. }) => {
+                *field == "motor_max_accel_feedback"
+            },
+            DiagnosticEvent::Query(QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                query,
+                ..
+            }) => *query == QueryKind::JointAccel,
+            DiagnosticEvent::Query(QueryDiagnostic::DiagnosticsOnlyTimeout { query }) => {
+                *query == QueryKind::JointAccel
+            },
+            _ => false,
+        })
+        .count() as u64
+}
+
+fn count_end_limit_diagnostics(diagnostics: &[DiagnosticEvent]) -> u64 {
+    diagnostics
+        .iter()
+        .filter(|event| match event {
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::InvalidLength { can_id, .. }) => {
+                *can_id == 0x478
+            },
+            DiagnosticEvent::Protocol(ProtocolDiagnostic::UnsupportedValue { field, .. }) => {
+                *field == "end_velocity_accel_feedback"
+            },
+            DiagnosticEvent::Query(QueryDiagnostic::UnexpectedFrameForActiveQuery {
+                query,
+                ..
+            }) => *query == QueryKind::EndLimit,
+            DiagnosticEvent::Query(QueryDiagnostic::DiagnosticsOnlyTimeout { query }) => {
+                *query == QueryKind::EndLimit
+            },
+            _ => false,
+        })
+        .count() as u64
+}
 
 /// Piper SDK 实时指标
 ///
@@ -408,6 +590,55 @@ impl MetricsSnapshot {
     }
 }
 
+impl Piper {
+    /// 获取重建观察族的专用指标快照。
+    pub fn get_observation_metrics(&self) -> ObservationMetrics {
+        let fps = self.get_fps();
+        let counts = self.get_fps_counts();
+        let elapsed_secs = elapsed_secs_from_legacy_fps(fps, counts);
+        let diagnostics = self.snapshot_diagnostics();
+
+        ObservationMetrics {
+            low_speed: family_metrics(
+                counts.joint_driver_low_speed.saturating_mul(6),
+                counts.joint_driver_low_speed,
+                0,
+                elapsed_secs,
+            ),
+            end_pose: family_metrics(
+                counts.end_pose.saturating_mul(3),
+                counts.end_pose,
+                0,
+                elapsed_secs,
+            ),
+            collision_protection: family_metrics(
+                counts.collision_protection,
+                counts.collision_protection,
+                count_collision_protection_diagnostics(&diagnostics),
+                elapsed_secs,
+            ),
+            joint_limit_config: family_metrics(
+                counts.joint_limit_config,
+                counts.joint_limit_config / 6,
+                count_joint_limit_diagnostics(&diagnostics),
+                elapsed_secs,
+            ),
+            joint_accel_config: family_metrics(
+                counts.joint_accel_config,
+                counts.joint_accel_config / 6,
+                count_joint_accel_diagnostics(&diagnostics),
+                elapsed_secs,
+            ),
+            end_limit_config: family_metrics(
+                counts.end_limit_config,
+                counts.end_limit_config,
+                count_end_limit_diagnostics(&diagnostics),
+                elapsed_secs,
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,6 +801,15 @@ mod tests {
         assert_eq!(snapshot.echo_filter_rate(), 0.0);
         assert_eq!(snapshot.valid_frame_rate(), 0.0);
         assert_eq!(snapshot.overwrite_rate(), 0.0);
+    }
+
+    #[test]
+    fn observation_metrics_separate_raw_and_complete_rates() {
+        let snapshot = family_metrics(6, 1, 0, 1.0);
+
+        assert_eq!(snapshot.raw_frame_rate, 6.0);
+        assert_eq!(snapshot.complete_observation_rate, 1.0);
+        assert_eq!(snapshot.diagnostic_rate, 0.0);
     }
 
     #[test]

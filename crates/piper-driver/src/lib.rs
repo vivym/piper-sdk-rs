@@ -39,7 +39,7 @@ pub use error::{DriverError, WaitError}; // 原 DriverError
 pub use fps_stats::{FpsCounts, FpsResult};
 pub use heartbeat::ConnectionMonitor;
 pub use hooks::{FrameCallback, HookHandle, HookManager};
-pub use metrics::{MetricsSnapshot, PiperMetrics};
+pub use metrics::{FamilyObservationMetrics, MetricsSnapshot, ObservationMetrics, PiperMetrics};
 pub use mode::{AtomicDriverMode, DriverMode};
 pub use pipeline::{PipelineConfig, rx_loop};
 pub use piper::{
