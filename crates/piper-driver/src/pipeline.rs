@@ -2667,6 +2667,17 @@ fn parse_and_update_state(
                 state.pending_end_pose[0] = feedback.x() / 1000.0;
                 state.pending_end_pose[1] = feedback.y() / 1000.0;
                 state.end_pose_group.write_slot(0, alignment_timestamp_us, host_rx_mono_us);
+                if let Ok(mut store) = ctx.end_pose_observation.write() {
+                    store.record_slot(
+                        0,
+                        EndPoseMembers {
+                            first: state.pending_end_pose[0],
+                            second: state.pending_end_pose[1],
+                        },
+                        host_rx_mono_us,
+                        (frame.timestamp_us != 0).then_some(frame.timestamp_us),
+                    );
+                }
 
                 ctx.publish_raw_end_pose(EndPoseState {
                     hardware_timestamp_us: state.end_pose_group.max_alignment_timestamp_us(),
@@ -2692,6 +2703,17 @@ fn parse_and_update_state(
                 state.pending_end_pose[2] = feedback.z() / 1000.0;
                 state.pending_end_pose[3] = feedback.rx_rad();
                 state.end_pose_group.write_slot(1, alignment_timestamp_us, host_rx_mono_us);
+                if let Ok(mut store) = ctx.end_pose_observation.write() {
+                    store.record_slot(
+                        1,
+                        EndPoseMembers {
+                            first: state.pending_end_pose[2],
+                            second: state.pending_end_pose[3],
+                        },
+                        host_rx_mono_us,
+                        (frame.timestamp_us != 0).then_some(frame.timestamp_us),
+                    );
+                }
 
                 ctx.publish_raw_end_pose(EndPoseState {
                     hardware_timestamp_us: state.end_pose_group.max_alignment_timestamp_us(),
@@ -2717,6 +2739,17 @@ fn parse_and_update_state(
                 state.pending_end_pose[4] = feedback.ry_rad();
                 state.pending_end_pose[5] = feedback.rz_rad();
                 state.end_pose_group.write_slot(2, alignment_timestamp_us, host_rx_mono_us);
+                if let Ok(mut store) = ctx.end_pose_observation.write() {
+                    store.record_slot(
+                        2,
+                        EndPoseMembers {
+                            first: state.pending_end_pose[4],
+                            second: state.pending_end_pose[5],
+                        },
+                        host_rx_mono_us,
+                        (frame.timestamp_us != 0).then_some(frame.timestamp_us),
+                    );
+                }
 
                 let new_end_pose_state = EndPoseState {
                     hardware_timestamp_us: state.end_pose_group.max_alignment_timestamp_us(),
@@ -2896,6 +2929,27 @@ fn parse_and_update_state(
                     outcome.maintenance_gate_may_have_changed = true;
                     outcome.low_speed_drive_state_updated = true;
                     let host_rx_mono_us = host_rx_mono_us();
+                    if let Ok(mut store) = ctx.joint_driver_low_speed_observation.write() {
+                        store.record_slot(
+                            joint_idx,
+                            JointDriverLowSpeedJoint {
+                                motor_temp_c: feedback.motor_temp() as f32,
+                                driver_temp_c: feedback.driver_temp() as f32,
+                                joint_voltage_v: feedback.voltage() as f32,
+                                joint_bus_current_a: feedback.bus_current() as f32,
+                                voltage_low: feedback.status.voltage_low(),
+                                motor_over_temp: feedback.status.motor_over_temp(),
+                                over_current: feedback.status.driver_over_current(),
+                                driver_over_temp: feedback.status.driver_over_temp(),
+                                collision_protection: feedback.status.collision_protection(),
+                                driver_error: feedback.status.driver_error(),
+                                enabled: feedback.status.enabled(),
+                                stall_protection: feedback.status.stall_protection(),
+                            },
+                            host_rx_mono_us,
+                            (frame.timestamp_us != 0).then_some(frame.timestamp_us),
+                        );
+                    }
 
                     ctx.joint_driver_low_speed.rcu(|old| {
                         let mut new = (**old).clone();

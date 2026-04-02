@@ -4,8 +4,8 @@ use crate::diagnostics::DiagnosticBuffer;
 use crate::fps_stats::FpsStatistics;
 use crate::metrics::PiperMetrics;
 use crate::observation::{
-    Complete, Freshness, MissingSet, Observation, ObservationMeta, ObservationPayload,
-    ObservationSource, PartialPayload,
+    Complete, FrameGroupStore, Freshness, MissingSet, Observation, ObservationMeta,
+    ObservationPayload, ObservationSource, PartialPayload,
 };
 use crate::query_coordinator::QueryCoordinator;
 use arc_swap::ArcSwap;
@@ -1565,6 +1565,108 @@ impl EndLimitConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointDriverLowSpeedJoint {
+    pub motor_temp_c: f32,
+    pub driver_temp_c: f32,
+    pub joint_voltage_v: f32,
+    pub joint_bus_current_a: f32,
+    pub voltage_low: bool,
+    pub motor_over_temp: bool,
+    pub over_current: bool,
+    pub driver_over_temp: bool,
+    pub collision_protection: bool,
+    pub driver_error: bool,
+    pub enabled: bool,
+    pub stall_protection: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointDriverLowSpeed {
+    pub joints: [JointDriverLowSpeedJoint; 6],
+}
+
+impl JointDriverLowSpeed {
+    pub fn from_slots(slots: &[Option<JointDriverLowSpeedJoint>; 6]) -> Option<Self> {
+        Some(Self {
+            joints: [
+                slots[0]?, slots[1]?, slots[2]?, slots[3]?, slots[4]?, slots[5]?,
+            ],
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartialJointDriverLowSpeed {
+    pub joints: [Option<JointDriverLowSpeedJoint>; 6],
+}
+
+impl PartialPayload<JointDriverLowSpeedJoint, 6> for PartialJointDriverLowSpeed {
+    fn from_present_slots(slots: &[Option<JointDriverLowSpeedJoint>]) -> Self {
+        let mut joints = [None; 6];
+        for (index, slot) in slots.iter().take(6).enumerate() {
+            joints[index] = *slot;
+        }
+        Self { joints }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EndPoseMembers {
+    pub first: f64,
+    pub second: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EndPose {
+    pub end_pose: [f64; 6],
+}
+
+impl EndPose {
+    pub fn from_slots(slots: &[Option<EndPoseMembers>; 3]) -> Option<Self> {
+        let xy = slots[0]?;
+        let zrx = slots[1]?;
+        let ryrz = slots[2]?;
+
+        Some(Self {
+            end_pose: [
+                xy.first,
+                xy.second,
+                zrx.first,
+                zrx.second,
+                ryrz.first,
+                ryrz.second,
+            ],
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartialEndPose {
+    pub end_pose: [Option<f64>; 6],
+}
+
+impl PartialPayload<EndPoseMembers, 3> for PartialEndPose {
+    fn from_present_slots(slots: &[Option<EndPoseMembers>]) -> Self {
+        let mut end_pose = [None; 6];
+
+        if let Some(member) = slots.first().copied().flatten() {
+            end_pose[0] = Some(member.first);
+            end_pose[1] = Some(member.second);
+        }
+        if let Some(member) = slots.get(1).copied().flatten() {
+            end_pose[2] = Some(member.first);
+            end_pose[3] = Some(member.second);
+        }
+        if let Some(member) = slots.get(2).copied().flatten() {
+            end_pose[4] = Some(member.first);
+            end_pose[5] = Some(member.second);
+        }
+
+        Self { end_pose }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ActiveQueryObservationWindow {
     token: u64,
@@ -1932,6 +2034,9 @@ pub type JointLimitObservationStore =
 pub type JointAccelObservationStore =
     QueryBackedFrameGroupStore<f64, 6, JointAccelConfig, PartialJointAccelConfig>;
 pub type EndLimitObservationStore = QueryBackedSingleStore<EndLimitConfig>;
+pub type JointDriverLowSpeedObservationStore =
+    FrameGroupStore<JointDriverLowSpeedJoint, 6, JointDriverLowSpeed, PartialJointDriverLowSpeed>;
+pub type EndPoseObservationStore = FrameGroupStore<EndPoseMembers, 3, EndPose, PartialEndPose>;
 
 // ============================================================================
 // 固件版本状态
@@ -2242,6 +2347,10 @@ pub struct PiperContext {
     pub joint_accel_observation: Arc<RwLock<JointAccelObservationStore>>,
     /// Rebuilt end limit observation store.
     pub end_limit_observation: Arc<RwLock<EndLimitObservationStore>>,
+    /// Rebuilt low-speed grouped runtime observation store.
+    pub joint_driver_low_speed_observation: Arc<RwLock<JointDriverLowSpeedObservationStore>>,
+    /// Rebuilt end-pose grouped runtime observation store.
+    pub end_pose_observation: Arc<RwLock<EndPoseObservationStore>>,
 
     // === 冷数据（固件版本）===
     /// 固件版本状态（按需查询：0x4AF）
@@ -2378,6 +2487,10 @@ impl PiperContext {
             joint_limit_observation: Arc::new(RwLock::new(JointLimitObservationStore::new())),
             joint_accel_observation: Arc::new(RwLock::new(JointAccelObservationStore::new())),
             end_limit_observation: Arc::new(RwLock::new(EndLimitObservationStore::new())),
+            joint_driver_low_speed_observation: Arc::new(RwLock::new(
+                JointDriverLowSpeedObservationStore::new(),
+            )),
+            end_pose_observation: Arc::new(RwLock::new(EndPoseObservationStore::new())),
 
             // 冷数据：固件版本
             firmware_version: Arc::new(RwLock::new(FirmwareVersionState::default())),

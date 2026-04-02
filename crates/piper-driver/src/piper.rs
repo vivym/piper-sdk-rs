@@ -12,7 +12,7 @@ use crate::diagnostics::{DiagnosticEvent, QueryDiagnostic};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
 use crate::metrics::{MetricsSnapshot, PiperMetrics};
-use crate::observation::{Complete, Observation};
+use crate::observation::{Complete, Observation, ObservationPayload};
 use crate::pipeline::*;
 use crate::query_coordinator::{QueryError, QueryGuard, QueryKind};
 use crate::state::*;
@@ -121,6 +121,7 @@ pub(crate) const SOFT_DEADLINE_MISS_FAULT_THRESHOLD: u32 = 3;
 pub(crate) const STRICT_TIMESTAMP_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_MODE_SWITCH_TIMEOUT: Duration = Duration::from_millis(100);
 const CONFIG_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const END_POSE_FRESHNESS_WINDOW_US: u64 = 6_000;
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -1902,6 +1903,10 @@ impl Piper {
         self.pipeline_config.low_speed_drive_state_freshness_ms.saturating_mul(1_000)
     }
 
+    fn end_pose_freshness_window_us(&self) -> u64 {
+        END_POSE_FRESHNESS_WINDOW_US
+    }
+
     fn replay_mode_active(&self) -> bool {
         self.mode().is_replay()
     }
@@ -2484,7 +2489,7 @@ impl Piper {
     ) -> Result<ManualFaultRecoveryResult, DriverError> {
         self.validate_manual_fault_recovery_preconditions()?;
 
-        let baseline_driver_state = self.get_joint_driver_low_speed();
+        let baseline_driver_state = self.ctx.joint_driver_low_speed.load().as_ref().clone();
         let post_resume_baseline = baseline_driver_state.post_resume_feedback_baseline();
         let baseline_host_mono_us = crate::heartbeat::monotonic_micros();
 
@@ -2496,7 +2501,7 @@ impl Piper {
                 return Err(DriverError::Timeout);
             }
 
-            let driver_state = self.get_joint_driver_low_speed();
+            let driver_state = self.ctx.joint_driver_low_speed.load().as_ref().clone();
             let now_host_mono_us = crate::heartbeat::monotonic_micros();
             if let Some(confirmed_mask) = driver_state
                 .confirmed_driver_enabled_mask_after_post_resume_feedback(
@@ -2671,21 +2676,61 @@ impl Piper {
         self.ctx.capture_joint_position_monitor_snapshot()
     }
 
-    /// 获取末端位姿状态（无锁，纳秒级返回）
+    fn observe_end_pose_at(&self, now_host_mono_us: u64) -> Observation<EndPose, PartialEndPose> {
+        let Ok(store) = self.ctx.end_pose_observation.read() else {
+            return Observation::Unavailable;
+        };
+
+        store.observe(
+            now_host_mono_us,
+            self.end_pose_freshness_window_us(),
+            EndPose::from_slots,
+        )
+    }
+
+    fn observe_joint_driver_low_speed_at(
+        &self,
+        now_host_mono_us: u64,
+    ) -> Observation<JointDriverLowSpeed, PartialJointDriverLowSpeed> {
+        let Ok(store) = self.ctx.joint_driver_low_speed_observation.read() else {
+            return Observation::Unavailable;
+        };
+
+        store.observe(
+            now_host_mono_us,
+            self.low_speed_drive_state_freshness_window_us(),
+            JointDriverLowSpeed::from_slots,
+        )
+    }
+
+    fn complete_from_observation<T, TPartial>(
+        observation: Observation<T, TPartial>,
+    ) -> Option<Complete<T>> {
+        match observation {
+            Observation::Available(available) => match available.payload {
+                ObservationPayload::Complete(value) => Some(Complete {
+                    value,
+                    meta: available.meta,
+                }),
+                ObservationPayload::Partial { .. } => None,
+            },
+            Observation::Unavailable => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn get_joint_driver_low_speed_at(
+        &self,
+        now_host_mono_us: u64,
+    ) -> Observation<JointDriverLowSpeed, PartialJointDriverLowSpeed> {
+        self.observe_joint_driver_low_speed_at(now_host_mono_us)
+    }
+
+    /// 获取末端位姿观测（无锁，纳秒级返回）
     ///
-    /// 包含末端执行器的位置和姿态信息（500Hz更新）。
-    ///
-    /// # 性能
-    /// - 无锁读取（固定槽位快照单元）
-    /// - 返回快照副本（按值复制）
-    /// - 适合 500Hz 控制循环
-    ///
-    /// # 注意
-    /// - 此状态与 `JointPositionState` 不是原子更新的，如需同时获取，请使用 `capture_motion_snapshot()`
-    pub fn get_end_pose(&self) -> EndPoseState {
-        self.get_end_pose_monitor_snapshot()
-            .latest_complete_cloned()
-            .unwrap_or_default()
+    /// 末端执行器的位置和姿态信息通过 `Observation` 返回，完整性和新鲜度正交表达。
+    pub fn get_end_pose(&self) -> Observation<EndPose, PartialEndPose> {
+        self.observe_end_pose_at(crate::heartbeat::monotonic_micros().max(1))
     }
 
     /// 获取原始末端位姿状态（允许部分帧组，仅供诊断）
@@ -2755,15 +2800,13 @@ impl Piper {
         self.ctx.gripper.load().as_ref().clone()
     }
 
-    /// 获取关节驱动器低速反馈状态（无锁）
+    /// 获取关节驱动器低速反馈观测（无锁）
     ///
-    /// 包含温度、电压、电流、驱动器状态等（40Hz更新）。
-    ///
-    /// # 性能
-    /// - 无锁读取（ArcSwap::load，Wait-Free）
-    /// - 返回快照副本
-    pub fn get_joint_driver_low_speed(&self) -> JointDriverLowSpeedState {
-        self.ctx.joint_driver_low_speed.load().as_ref().clone()
+    /// 返回 `Observation`，将完整性和新鲜度分离表达。
+    pub fn get_joint_driver_low_speed(
+        &self,
+    ) -> Observation<JointDriverLowSpeed, PartialJointDriverLowSpeed> {
+        self.observe_joint_driver_low_speed_at(crate::heartbeat::monotonic_micros().max(1))
     }
 
     #[doc(hidden)]
@@ -3278,6 +3321,32 @@ impl Piper {
         };
 
         store.observe()
+    }
+
+    pub fn wait_for_complete_low_speed_state(
+        &self,
+        timeout: Duration,
+    ) -> Result<Complete<JointDriverLowSpeed>, DriverError> {
+        let deadline = Instant::now() + timeout;
+
+        self.wait_for_cached_update(deadline, Duration::from_millis(1), |this| {
+            Ok(Self::complete_from_observation(
+                this.observe_joint_driver_low_speed_at(crate::heartbeat::monotonic_micros().max(1)),
+            ))
+        })
+    }
+
+    pub fn wait_for_complete_end_pose(
+        &self,
+        timeout: Duration,
+    ) -> Result<Complete<EndPose>, DriverError> {
+        let deadline = Instant::now() + timeout;
+
+        self.wait_for_cached_update(deadline, Duration::from_millis(1), |this| {
+            Ok(Self::complete_from_observation(this.observe_end_pose_at(
+                crate::heartbeat::monotonic_micros().max(1),
+            )))
+        })
     }
 
     pub fn snapshot_diagnostics(&self) -> Vec<DiagnosticEvent> {
@@ -6711,9 +6780,10 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        let driver_state = piper.get_joint_driver_low_speed();
-        assert_eq!(driver_state.hardware_timestamp_us, 0);
-        assert_eq!(driver_state.motor_temps, [0.0; 6]);
+        assert!(matches!(
+            piper.get_joint_driver_low_speed(),
+            Observation::Unavailable
+        ));
     }
 
     #[test]
@@ -11089,9 +11159,7 @@ mod tests {
         assert_eq!(joint_pos.hardware_timestamp_us, 0);
         assert_eq!(joint_pos.joint_pos, [0.0; 6]);
 
-        let end_pose = piper.get_end_pose();
-        assert_eq!(end_pose.hardware_timestamp_us, 0);
-        assert_eq!(end_pose.end_pose, [0.0; 6]);
+        assert!(matches!(piper.get_end_pose(), Observation::Unavailable));
     }
 
     #[test]
@@ -11099,13 +11167,12 @@ mod tests {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
 
-        // 测试读取并克隆诊断状态
+        // 测试可以多次读取 observation 状态
         let driver1 = piper.get_joint_driver_low_speed();
         let driver2 = piper.get_joint_driver_low_speed();
 
-        // 验证可以多次读取（ArcSwap 无锁读取）
-        assert_eq!(driver1.hardware_timestamp_us, driver2.hardware_timestamp_us);
-        assert_eq!(driver1.motor_temps, driver2.motor_temps);
+        assert!(matches!(driver1, Observation::Unavailable));
+        assert!(matches!(driver2, Observation::Unavailable));
     }
 
     #[test]
