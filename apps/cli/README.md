@@ -49,7 +49,7 @@ piper-cli position --format json
 # 回到零关节位
 piper-cli home
 
-# 前往安全停靠位
+# 前往安全停靠位并在完成后 disable
 piper-cli park
 
 # 写入零点
@@ -76,6 +76,7 @@ piper> exit
 REPL 现在使用“前台输入 + 后台命令 worker”模型：
 
 - `move` / `home` / `park` 在后台执行
+- REPL 的 `park` 只会移动到当前配置的 `park_pose()`，不会自动 disable
 - 运行期间主线程仍能处理 `stop` 和 `Ctrl+C`
 - 当前运动会被取消，然后统一执行 `disable_all()`
 - 连接会保留在 `Standby`
@@ -130,9 +131,15 @@ timeout_ms = 5000
 
 ### `park`
 
-- 前往配置中的安全停靠位
+- one-shot CLI `park` 和脚本里的 `Park` 会先进入停靠流程，再 disable
+- REPL 的 `park` 只前往配置中的安全停靠位，不会自动 disable
 - 默认由 `orientation` 决定
 - 若配置了 `rest_pose_override`，优先使用自定义停靠位
+
+### `disable`
+
+- 只发送 raw disable，不附带任何移动或停靠动作
+- REPL 中的 `disable` 会保持连接，但把机器人回到失能状态
 
 ### `set-zero`
 
@@ -200,6 +207,7 @@ piper-cli run --script examples/move_sequence.json
 ```
 
 脚本中的 `move` / `home` / `park` / `set-zero` 与 CLI one-shot 共享同一套控制 workflow。
+其中 `Park` 会走与 one-shot `piper-cli park` 相同的 standby-entry park 流程，然后再 disable。
 
 ## 开发
 

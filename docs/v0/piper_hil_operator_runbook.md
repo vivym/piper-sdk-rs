@@ -219,12 +219,14 @@
    ```bash
    cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
    ```
-2. 重点看 helper 中下面这些 accepted evidence lines：
+2. `hil_joint_position_check` 的成功路径默认按下面顺序收尾：先完成 `move`，再回到初始 snapshot，随后按配置的 rest pose 停靠，最后才会 disable。
+3. 如果显式传入 `--no-park`，则只跳过“停靠后再 disable”这一步，其他通过判据不变。
+4. 重点看 helper 中下面这些 accepted evidence lines：
    - `[PASS] connected and confirmed Standby`
    - `[PASS] enabled PositionMode motion=Joint speed_percent=...`
    - `[PASS] settle step=move ...`
    - `[PASS] settle step=return ...`
-3. 对 explicit disable path，使用：
+5. 对 explicit disable path，使用：
    ```bash
    cargo run -p piper-cli -- shell
    connect socketcan:can0
@@ -232,7 +234,7 @@
    disable
    exit
    ```
-4. `disable` 后，立刻用只读 helper 确认系统回到 non-driving state：
+6. `disable` 后，立刻用只读 helper 确认系统回到 non-driving state：
    ```bash
    cargo run -p piper-sdk --example robot_monitor -- --interface can0
    ```
@@ -241,12 +243,12 @@
    cargo run -p piper-sdk --example state_api_demo -- --interface can0
    ```
    这一步要作为 disable 的一部分来执行，不要省略。
-5. 对外部 stop path，使用：
+7. 对外部 stop path，使用：
    ```bash
    cargo run -p piper-cli -- stop --target socketcan:can0
    ```
-6. `stop` 之后，同样立刻用 `robot_monitor` 或 `state_api_demo` 确认 non-driving state。
-7. 对 rejected-state gating，使用一个可复现的流程：
+8. `stop` 之后，同样立刻用 `robot_monitor` 或 `state_api_demo` 确认 non-driving state。
+9. 对 rejected-state gating，使用一个可复现的流程：
    - `Terminal 3` 打开：
      ```bash
      cargo run -p piper-cli -- shell
