@@ -530,6 +530,40 @@ mod tests {
     }
 
     #[test]
+    fn test_send_mit_command_batch_preserves_payloads_for_each_joint() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+        let commands = [
+            MitControlCommand::try_new(1, 0.10, 0.00, 5.0, 0.5, 0.10)
+                .expect("joint 1 command should be valid"),
+            MitControlCommand::try_new(2, 0.20, 0.10, 6.0, 0.6, 0.20)
+                .expect("joint 2 command should be valid"),
+            MitControlCommand::try_new(3, 0.30, 0.20, 7.0, 0.7, 0.30)
+                .expect("joint 3 command should be valid"),
+            MitControlCommand::try_new(4, 0.40, 0.30, 8.0, 0.8, 0.40)
+                .expect("joint 4 command should be valid"),
+            MitControlCommand::try_new(5, 0.50, 0.40, 9.0, 0.9, 0.50)
+                .expect("joint 5 command should be valid"),
+            MitControlCommand::try_new(6, 0.60, 0.50, 10.0, 1.0, 0.60)
+                .expect("joint 6 command should be valid"),
+        ];
+
+        commander
+            .send_validated_mit_command_batch(commands)
+            .expect("MIT batch send should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 6);
+        let expected_frames: Vec<_> = commands.iter().map(|command| command.to_frame()).collect();
+
+        assert_eq!(frames.len(), expected_frames.len());
+        for (observed, expected) in frames.iter().zip(expected_frames.iter()) {
+            assert_eq!(observed.id, expected.id);
+            assert_eq!(observed.data, expected.data);
+        }
+    }
+
+    #[test]
     fn test_send_position_command_batch_emits_joint_position_family() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let driver = build_driver(sent_frames.clone());
