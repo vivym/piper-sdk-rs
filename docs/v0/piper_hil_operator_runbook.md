@@ -479,7 +479,7 @@ enable
 # keep this shell session active; do not `disable` yet
 cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
 disable
-cargo run -p piper-sdk --example robot_monitor -- --interface can0
+cargo run -p piper-sdk --example state_api_demo -- --interface can0
 exit
 
 # Phase 2: explicit stop path and read-only corroboration

@@ -51,7 +51,7 @@ cargo run -p piper-sdk --example hil_gripper_check -- --interface can0 --close-e
 ## Soak 命令
 
 以下命令用于抓时序和偶发问题。任何一轮失败都应立即中止并排查。
-这些循环只假设上一轮 helper 自己完成了 drop-time best-effort disable，不假设已经单独验证过 confirmed Standby；如果要在轮与轮之间证明退出态，请插入 `state_api_demo` 或 `stop`。
+这些循环里，`hil_joint_position_check` 的成功路径会在返回前显式 disable（无论是否停车）；其余 helper 仍只依赖 drop-time best-effort disable。若要在轮与轮之间证明退出态，请插入 `state_api_demo` 或 `stop`。
 
 ```bash
 for i in $(seq 1 50); do
