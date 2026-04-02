@@ -2933,6 +2933,9 @@ fn parse_and_update_state(
                         store.record_slot(
                             joint_idx,
                             JointDriverLowSpeedJoint {
+                                hardware_timestamp_us: (frame.timestamp_us != 0)
+                                    .then_some(frame.timestamp_us),
+                                host_rx_mono_us,
                                 motor_temp_c: feedback.motor_temp() as f32,
                                 driver_temp_c: feedback.driver_temp() as f32,
                                 joint_voltage_v: feedback.voltage() as f32,

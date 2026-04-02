@@ -1567,6 +1567,8 @@ impl EndLimitConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JointDriverLowSpeedJoint {
+    pub hardware_timestamp_us: Option<u64>,
+    pub host_rx_mono_us: u64,
     pub motor_temp_c: f32,
     pub driver_temp_c: f32,
     pub joint_voltage_v: f32,

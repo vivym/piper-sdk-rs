@@ -3254,6 +3254,7 @@ mod tests {
     use crate::observer::CollisionProtectionSnapshot;
     use crate::observer::Observer;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
+    use piper_driver::observation::{Observation, ObservationPayload};
     use piper_driver::{DriverMode, Piper as RobotPiper, RuntimeFaultKind};
     use piper_protocol::control::MitControlCommand;
     use piper_protocol::ids::{ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56};
@@ -3599,6 +3600,20 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("{message}");
+    }
+
+    fn latest_joint_6_low_speed_hardware_timestamp(driver: &RobotPiper) -> Option<u64> {
+        match driver.get_joint_driver_low_speed() {
+            Observation::Available(available) => match available.payload {
+                ObservationPayload::Complete(driver_state) => {
+                    driver_state.joints[5].hardware_timestamp_us
+                },
+                ObservationPayload::Partial { partial, .. } => {
+                    partial.joints[5].and_then(|joint| joint.hardware_timestamp_us)
+                },
+            },
+            Observation::Unavailable => None,
+        }
     }
 
     fn build_active_mit_piper(
@@ -4870,7 +4885,7 @@ mod tests {
         );
         wait_until(
             Duration::from_millis(200),
-            || driver.get_joint_driver_low_speed().hardware_timestamps[5] == 106,
+            || latest_joint_6_low_speed_hardware_timestamp(&driver) == Some(106),
             "pre-resume low-speed feedback should establish the disabled hardware baseline",
         );
 
@@ -5110,7 +5125,7 @@ mod tests {
         );
         wait_until(
             Duration::from_millis(200),
-            || driver.get_joint_driver_low_speed().hardware_timestamps[5] == 206,
+            || latest_joint_6_low_speed_hardware_timestamp(&driver) == Some(206),
             "pre-resume low-speed feedback should establish the enabled hardware baseline",
         );
 
@@ -5211,7 +5226,7 @@ mod tests {
         let driver = Arc::clone(&error.driver);
         wait_until(
             Duration::from_millis(200),
-            || driver.get_joint_driver_low_speed().hardware_timestamps[5] == 1_005,
+            || latest_joint_6_low_speed_hardware_timestamp(&driver) == Some(1_005),
             "pre-resume low-speed feedback should establish the hardware timestamp baseline",
         );
 

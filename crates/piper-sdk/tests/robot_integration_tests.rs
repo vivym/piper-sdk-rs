@@ -366,7 +366,7 @@ fn test_piper_end_to_end_complete_frame_groups() {
 
     // 验证状态已更新
     let joint_pos = piper.get_joint_position();
-    let end_pose = piper.get_end_pose();
+    let end_pose = piper.get_raw_end_pose();
 
     // 验证至少处理了帧（不会崩溃）
     // 由于异步性和帧组完整性要求，主要验证不会崩溃
@@ -506,7 +506,7 @@ fn test_piper_stress_incomplete_joint_pos_frame_group() {
 
     // 验证状态（不完整帧组不应该提交）
     let joint_pos = piper.get_joint_position();
-    let end_pose = piper.get_end_pose();
+    let end_pose = piper.get_raw_end_pose();
 
     // 验证不会崩溃（即使帧组不完整）
     // 注意：由于帧组不完整，可能不会提交，但应该不会崩溃

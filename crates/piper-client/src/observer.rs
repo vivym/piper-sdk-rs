@@ -44,9 +44,10 @@ use std::time::Duration;
 
 use crate::state::{CapabilityMarker, StrictCapability, UnspecifiedCapability};
 use crate::types::*;
+use piper_driver::observation::{Observation, ObservationPayload};
 use piper_driver::{
-    AlignmentResult, BackendCapability, DriverError, HealthStatus, Piper as RobotPiper,
-    RuntimeFaultKind,
+    AlignmentResult, BackendCapability, DriverError, HealthStatus, PartialJointDriverLowSpeed,
+    Piper as RobotPiper, RuntimeFaultKind,
 };
 use piper_protocol::constants::*;
 
@@ -435,8 +436,31 @@ where
     ///
     /// 该接口只适合诊断和兼容旧逻辑；安全门控请使用 confirmed API。
     pub fn joint_enabled_mask(&self) -> u8 {
-        let driver_state = self.driver.get_joint_driver_low_speed();
-        driver_state.driver_enabled_mask
+        fn enabled_mask_from_partial(partial: &PartialJointDriverLowSpeed) -> u8 {
+            partial.joints.iter().enumerate().fold(0, |mask, (index, joint)| {
+                if joint.map(|joint| joint.enabled).unwrap_or(false) {
+                    mask | (1 << index)
+                } else {
+                    mask
+                }
+            })
+        }
+
+        match self.driver.get_joint_driver_low_speed() {
+            Observation::Available(available) => match &available.payload {
+                ObservationPayload::Complete(driver_state) => {
+                    driver_state.joints.iter().enumerate().fold(0, |mask, (index, joint)| {
+                        if joint.enabled {
+                            mask | (1 << index)
+                        } else {
+                            mask
+                        }
+                    })
+                },
+                ObservationPayload::Partial { partial, .. } => enabled_mask_from_partial(partial),
+            },
+            Observation::Unavailable => 0,
+        }
     }
 
     /// 获取已确认的驱动器使能位掩码。
@@ -448,8 +472,7 @@ where
 
     /// 检查指定关节是否使能（raw cached bits）
     pub fn is_joint_enabled(&self, joint_index: usize) -> bool {
-        let driver_state = self.driver.get_joint_driver_low_speed();
-        (driver_state.driver_enabled_mask & (1 << joint_index)) != 0
+        (self.joint_enabled_mask() & (1 << joint_index)) != 0
     }
 
     /// 检查指定关节是否已确认使能。

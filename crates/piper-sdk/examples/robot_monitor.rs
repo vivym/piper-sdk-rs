@@ -289,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 读取各种状态
         let joint_position = piper.get_joint_position();
-        let end_pose = piper.get_end_pose();
+        let end_pose = piper.get_raw_end_pose();
         let joint_dynamic = piper.get_joint_dynamic();
         let robot_control = piper.get_robot_control();
         let gripper = piper.get_gripper();

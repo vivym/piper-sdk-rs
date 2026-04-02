@@ -35,7 +35,7 @@ mod test_support;
 pub use builder::{ConnectionTarget, PiperBuilder};
 pub use command::{CommandPriority, PiperCommand};
 pub use diagnostics::{DiagnosticBuffer, DiagnosticEvent, QueryDiagnostic};
-pub use error::DriverError; // 原 DriverError
+pub use error::{DriverError, WaitError}; // 原 DriverError
 pub use fps_stats::{FpsCounts, FpsResult};
 pub use heartbeat::ConnectionMonitor;
 pub use hooks::{FrameCallback, HookHandle, HookManager};

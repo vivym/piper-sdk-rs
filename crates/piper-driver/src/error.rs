@@ -132,9 +132,26 @@ pub enum DriverError {
     RealtimeDeliveryTimeout,
 }
 
+#[derive(Error, Debug)]
+pub enum WaitError {
+    #[error("wait timed out before a complete observation became available")]
+    Timeout,
+    #[error("wait infrastructure error: {0}")]
+    Driver(DriverError),
+}
+
+impl From<DriverError> for WaitError {
+    fn from(error: DriverError) -> Self {
+        match error {
+            DriverError::Timeout => Self::Timeout,
+            other => Self::Driver(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DriverError;
+    use super::{DriverError, WaitError};
     use piper_can::CanError;
     use piper_protocol::ProtocolError;
 
@@ -276,5 +293,20 @@ mod tests {
             },
             _ => panic!("Expected Protocol variant"),
         }
+    }
+
+    #[test]
+    fn wait_error_maps_driver_timeout_to_timeout_variant() {
+        let wait_error = WaitError::from(DriverError::Timeout);
+        assert!(matches!(wait_error, WaitError::Timeout));
+    }
+
+    #[test]
+    fn wait_error_wraps_non_timeout_driver_errors() {
+        let wait_error = WaitError::from(DriverError::ChannelClosed);
+        assert!(matches!(
+            wait_error,
+            WaitError::Driver(DriverError::ChannelClosed)
+        ));
     }
 }

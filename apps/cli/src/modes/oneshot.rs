@@ -92,7 +92,7 @@ impl OneShotMode {
 
         while running.load(Ordering::SeqCst) {
             let joint_pos: JointPositionState = piper.get_joint_position();
-            let end_pose: EndPoseState = piper.get_end_pose();
+            let end_pose: EndPoseState = piper.get_raw_end_pose();
             let dynamics: JointDynamicState = piper.get_joint_dynamic();
             let control: RobotControlState = piper.get_robot_control();
             let gripper: GripperState = piper.get_gripper();

@@ -3,6 +3,7 @@
 //! 提供对外的 `Piper` 结构体，封装底层 IO 线程和状态同步细节。
 
 use crate::ProtocolDiagnostic;
+use crate::WaitError;
 use crate::command::{
     CommandPriority, DeliveryPhase, MaintenanceCommandMeta, PiperCommand, RealtimeCommand,
     ReliableCommand, ReliableCommandKind, SoftRealtimeCommand, SoftRealtimeMailbox,
@@ -3326,7 +3327,7 @@ impl Piper {
     pub fn wait_for_complete_low_speed_state(
         &self,
         timeout: Duration,
-    ) -> Result<Complete<JointDriverLowSpeed>, DriverError> {
+    ) -> Result<Complete<JointDriverLowSpeed>, WaitError> {
         let deadline = Instant::now() + timeout;
 
         self.wait_for_cached_update(deadline, Duration::from_millis(1), |this| {
@@ -3334,12 +3335,13 @@ impl Piper {
                 this.observe_joint_driver_low_speed_at(crate::heartbeat::monotonic_micros().max(1)),
             ))
         })
+        .map_err(WaitError::from)
     }
 
     pub fn wait_for_complete_end_pose(
         &self,
         timeout: Duration,
-    ) -> Result<Complete<EndPose>, DriverError> {
+    ) -> Result<Complete<EndPose>, WaitError> {
         let deadline = Instant::now() + timeout;
 
         self.wait_for_cached_update(deadline, Duration::from_millis(1), |this| {
@@ -3347,6 +3349,7 @@ impl Piper {
                 crate::heartbeat::monotonic_micros().max(1),
             )))
         })
+        .map_err(WaitError::from)
     }
 
     pub fn snapshot_diagnostics(&self) -> Vec<DiagnosticEvent> {
@@ -6816,6 +6819,8 @@ mod tests {
         hardware_timestamp_us: Option<u64>,
     ) {
         let joint = JointDriverLowSpeedJoint {
+            hardware_timestamp_us,
+            host_rx_mono_us,
             motor_temp_c: 41.0 + joint_index as f32,
             driver_temp_c: 51.0 + joint_index as f32,
             joint_voltage_v: 24.0 + joint_index as f32,
@@ -6826,7 +6831,7 @@ mod tests {
             driver_over_temp: false,
             collision_protection: false,
             driver_error: false,
-            enabled: joint_index % 2 == 0,
+            enabled: joint_index.is_multiple_of(2),
             stall_protection: false,
         };
 

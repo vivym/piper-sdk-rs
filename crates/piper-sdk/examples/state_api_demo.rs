@@ -19,7 +19,10 @@
 //! ```
 
 use clap::Parser;
-use piper_sdk::driver::PiperBuilder;
+use piper_sdk::driver::observation::{Freshness, Observation, ObservationPayload};
+use piper_sdk::driver::{
+    EndPose, JointDriverLowSpeed, PartialEndPose, PartialJointDriverLowSpeed, PiperBuilder,
+};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -92,19 +95,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         motion_wait_timeout,
         poll_interval,
         || robot.get_end_pose(),
-        |state| state.is_fully_valid(),
+        observation_is_complete_and_fresh,
     )
     .unwrap_or_else(|| robot.get_end_pose());
 
     println!("Joint positions: {:?}", joint_pos.joint_pos);
-    println!("End pose: {:?}", end_pose.end_pose);
+    print_end_pose_observation(&end_pose);
     println!(
         "Joint hardware timestamp: {} us",
         joint_pos.hardware_timestamp_us
-    );
-    println!(
-        "End pose hardware timestamp: {} us",
-        end_pose.hardware_timestamp_us
     );
 
     // 检查帧完整性
@@ -115,12 +114,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "⚠ Missing joint position frames: {:?}",
             joint_pos.missing_frames()
         );
-    }
-
-    if end_pose.is_fully_valid() {
-        println!("✓ All end pose frames received");
-    } else {
-        println!("⚠ Missing end pose frames: {:?}", end_pose.missing_frames());
     }
 
     // 方案2：使用快照（适合需要逻辑原子性的场景）
@@ -178,60 +171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         low_speed_wait_timeout,
         poll_interval,
         || robot.get_joint_driver_low_speed(),
-        |state| state.is_fully_valid(),
+        observation_is_complete_and_fresh,
     )
     .unwrap_or_else(|| robot.get_joint_driver_low_speed());
-
-    if driver_state.valid_mask == 0 {
-        println!("No joint driver low-speed feedback received yet.");
-        println!("Expected CAN IDs: 0x261-0x266.");
-    } else {
-        println!("Motor temperatures:");
-        for i in 0..6 {
-            println!("  Joint {}: {:.1}°C", i + 1, driver_state.motor_temps[i]);
-        }
-
-        println!("\nDriver temperatures:");
-        for i in 0..6 {
-            println!("  Joint {}: {:.1}°C", i + 1, driver_state.driver_temps[i]);
-        }
-
-        println!("\nVoltages:");
-        for i in 0..6 {
-            println!("  Joint {}: {:.2}V", i + 1, driver_state.joint_voltage[i]);
-        }
-
-        println!("\nCurrents:");
-        for i in 0..6 {
-            println!(
-                "  Joint {}: {:.2}A",
-                i + 1,
-                driver_state.joint_bus_current[i]
-            );
-        }
-
-        println!("\nDriver status:");
-        for i in 0..6 {
-            if driver_state.is_voltage_low(i) {
-                println!("  Joint {}: ⚠ Voltage low", i + 1);
-            }
-            if driver_state.is_motor_over_temp(i) {
-                println!("  Joint {}: ⚠ Motor over temperature", i + 1);
-            }
-            if driver_state.is_over_current(i) {
-                println!("  Joint {}: ⚠ Over current", i + 1);
-            }
-            if driver_state.is_enabled(i) {
-                println!("  Joint {}: ✓ Driver enabled", i + 1);
-            }
-        }
-
-        if driver_state.is_fully_valid() {
-            println!("\n✓ All joint driver states received");
-        } else {
-            println!("\n⚠ Missing joints: {:?}", driver_state.missing_joints());
-        }
-    }
+    print_low_speed_observation(&driver_state);
 
     // 5. 读取配置状态（按需查询，读锁）
     println!("\n--- 配置状态（按需查询）---");
@@ -371,6 +314,84 @@ fn format_collision_level(level: u8) -> String {
         format!("Level {level}")
     } else {
         format!("invalid ({level})")
+    }
+}
+
+fn observation_is_complete_and_fresh<T, TPartial>(state: &Observation<T, TPartial>) -> bool {
+    matches!(
+        state,
+        Observation::Available(available)
+            if matches!(available.payload, ObservationPayload::Complete(_))
+                && matches!(available.freshness, Freshness::Fresh)
+    )
+}
+
+fn print_end_pose_observation(observation: &Observation<EndPose, PartialEndPose>) {
+    match observation {
+        Observation::Available(available) => {
+            println!("End pose freshness: {:?}", available.freshness);
+            println!("End pose meta: {:?}", available.meta);
+            match &available.payload {
+                ObservationPayload::Complete(end_pose) => {
+                    println!("End pose: {:?}", end_pose.end_pose);
+                    println!("✓ All end pose frames received");
+                },
+                ObservationPayload::Partial { partial, missing } => {
+                    println!("Partial end pose: {:?}", partial.end_pose);
+                    println!("⚠ Missing end pose members: {:?}", missing.missing_indices);
+                },
+            }
+        },
+        Observation::Unavailable => {
+            println!("End pose observation unavailable");
+        },
+    }
+}
+
+fn print_low_speed_observation(
+    observation: &Observation<JointDriverLowSpeed, PartialJointDriverLowSpeed>,
+) {
+    match observation {
+        Observation::Available(available) => {
+            println!("Low-speed freshness: {:?}", available.freshness);
+            println!("Low-speed meta: {:?}", available.meta);
+            match &available.payload {
+                ObservationPayload::Complete(driver_state) => {
+                    println!("✓ All joint driver states received");
+                    for (index, joint) in driver_state.joints.iter().enumerate() {
+                        println!(
+                            "  Joint {}: motor={:.1}°C driver={:.1}°C voltage={:.2}V current={:.2}A enabled={}",
+                            index + 1,
+                            joint.motor_temp_c,
+                            joint.driver_temp_c,
+                            joint.joint_voltage_v,
+                            joint.joint_bus_current_a,
+                            joint.enabled
+                        );
+                    }
+                },
+                ObservationPayload::Partial { partial, missing } => {
+                    println!("⚠ Missing joints: {:?}", missing.missing_indices);
+                    for (index, joint) in partial.joints.iter().enumerate() {
+                        if let Some(joint) = joint {
+                            println!(
+                                "  Joint {}: motor={:.1}°C driver={:.1}°C voltage={:.2}V current={:.2}A enabled={}",
+                                index + 1,
+                                joint.motor_temp_c,
+                                joint.driver_temp_c,
+                                joint.joint_voltage_v,
+                                joint.joint_bus_current_a,
+                                joint.enabled
+                            );
+                        }
+                    }
+                },
+            }
+        },
+        Observation::Unavailable => {
+            println!("No joint driver low-speed feedback received yet.");
+            println!("Expected CAN IDs: 0x261-0x266.");
+        },
     }
 }
 
