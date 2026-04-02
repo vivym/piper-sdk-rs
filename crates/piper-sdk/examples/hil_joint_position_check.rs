@@ -293,6 +293,21 @@ fn final_success_line(args: &Args) -> String {
     }
 }
 
+#[cfg(test)]
+fn parse_args_for_test<const N: usize>(extra_args: [&str; N]) -> Args {
+    let mut argv = vec![
+        "hil_joint_position_check",
+        "--interface",
+        "test-interface",
+        "--joint",
+        "1",
+        "--delta-rad",
+        "0.02",
+    ];
+    argv.extend(extra_args);
+    Args::try_parse_from(argv).expect("cli args should parse")
+}
+
 fn wait_for_monitor_snapshot<T, Read>(
     timeout: Duration,
     poll_interval: Duration,
@@ -565,45 +580,21 @@ fn validate_args_accepts_no_park() {
 
 #[test]
 fn cli_parses_no_park_flag() {
-    let args = Args::try_parse_from([
-        "hil_joint_position_check",
-        "--joint",
-        "1",
-        "--delta-rad",
-        "0.02",
-        "--no-park",
-    ])
-    .expect("cli args should parse");
+    let args = parse_args_for_test(["--no-park"]);
 
     assert!(args.no_park);
 }
 
 #[test]
 fn cli_parses_park_orientation_left() {
-    let args = Args::try_parse_from([
-        "hil_joint_position_check",
-        "--joint",
-        "1",
-        "--delta-rad",
-        "0.02",
-        "--park-orientation",
-        "left",
-    ])
-    .expect("cli args should parse");
+    let args = parse_args_for_test(["--park-orientation", "left"]);
 
     assert_eq!(args.park_orientation, CliParkOrientation::Left);
 }
 
 #[test]
 fn cli_defaults_park_orientation_to_upright() {
-    let args = Args::try_parse_from([
-        "hil_joint_position_check",
-        "--joint",
-        "1",
-        "--delta-rad",
-        "0.02",
-    ])
-    .expect("cli args should parse");
+    let args = parse_args_for_test([]);
 
     assert_eq!(args.park_orientation, CliParkOrientation::Upright);
 }
@@ -653,11 +644,24 @@ fn park_orientation_help_lists_explicit_allowed_values() {
 }
 
 #[test]
-fn park_pose_defaults_to_selected_orientation() {
-    assert_eq!(
-        piper_control::ParkOrientation::Left.default_rest_pose(),
-        [1.71, 2.96, -2.65, 1.41, -0.081, -0.190]
-    );
+fn park_profile_maps_orientation_and_wait_fields() {
+    let args = Args {
+        interface: "test-interface".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 7,
+        settle_timeout_ms: 12_345,
+        no_park: false,
+        park_orientation: CliParkOrientation::Left,
+    };
+
+    let profile = park_profile(&args);
+
+    assert_eq!(profile.orientation, ParkOrientation::Left);
+    assert_eq!(profile.park_speed_percent, 7);
+    assert_eq!(profile.wait.threshold_rad, POSITION_SETTLE_TOLERANCE_RAD);
+    assert_eq!(profile.wait.timeout, Duration::from_millis(12_345));
 }
 
 #[test]
