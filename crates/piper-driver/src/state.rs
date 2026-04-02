@@ -2,7 +2,7 @@
 
 use crate::diagnostics::DiagnosticBuffer;
 use crate::fps_stats::FpsStatistics;
-use crate::metrics::PiperMetrics;
+use crate::metrics::{ObservationMetricsStore, PiperMetrics};
 use crate::observation::{
     Complete, FrameGroupStore, Freshness, MissingSet, Observation, ObservationMeta,
     ObservationPayload, ObservationSource, PartialPayload,
@@ -2339,6 +2339,8 @@ pub struct PiperContext {
 
     /// Task 4 rebuilt-family diagnostics buffer.
     pub diagnostics: DiagnosticBuffer,
+    /// Dedicated rebuilt-family observation metrics store.
+    pub(crate) observation_metrics: Arc<ObservationMetricsStore>,
     /// Single-flight query coordinator for rebuilt query-backed families.
     pub query_coordinator: Arc<QueryCoordinator>,
     /// Rebuilt collision protection observation store.
@@ -2482,6 +2484,7 @@ impl PiperContext {
             joint_accel_config: Arc::new(RwLock::new(JointAccelConfigState::default())),
             end_limit_config: Arc::new(RwLock::new(EndLimitConfigState::default())),
             diagnostics: DiagnosticBuffer::new(256),
+            observation_metrics: Arc::new(ObservationMetricsStore::new()),
             query_coordinator: Arc::new(QueryCoordinator::new()),
             collision_protection_observation: Arc::new(RwLock::new(
                 CollisionProtectionObservationStore::new(),

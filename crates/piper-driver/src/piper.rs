@@ -12,7 +12,7 @@ use crate::command::{
 use crate::diagnostics::{DiagnosticEvent, QueryDiagnostic};
 use crate::error::DriverError;
 use crate::fps_stats::{FpsCounts, FpsResult};
-use crate::metrics::{MetricsSnapshot, PiperMetrics};
+use crate::metrics::{MetricsSnapshot, ObservationMetrics, PiperMetrics};
 use crate::observation::{Complete, Freshness, Observation, ObservationPayload};
 use crate::pipeline::*;
 use crate::query_coordinator::{QueryError, QueryGuard, QueryKind};
@@ -2620,6 +2620,11 @@ impl Piper {
         self.metrics.snapshot()
     }
 
+    /// 获取重建观察族的专用指标快照。
+    pub fn get_observation_metrics(&self) -> ObservationMetrics {
+        self.ctx.observation_metrics.snapshot()
+    }
+
     /// 获取关节动态状态（无锁，纳秒级返回）
     ///
     /// 包含关节速度和电流（独立帧 + Buffered Commit）。
@@ -3014,6 +3019,13 @@ impl Piper {
             let commit_host_mono_us = self
                 .send_reliable_frame_confirmed_commit_marker(frame, timeout)
                 .map_err(QueryError::from)?;
+            let complete_before = self
+                .ctx
+                .collision_protection_observation
+                .read()
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?
+                .current_complete_for_token(token)
+                .is_some();
             self.ctx
                 .collision_protection_observation
                 .write()
@@ -3021,6 +3033,16 @@ impl Piper {
                     store.advance_query_min_host_rx_mono_us(token, commit_host_mono_us)
                 })
                 .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
+            let complete_after = self
+                .ctx
+                .collision_protection_observation
+                .read()
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?
+                .current_complete_for_token(token)
+                .is_some();
+            if !complete_before && complete_after {
+                self.ctx.observation_metrics.record_collision_protection_complete_observation();
+            }
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
                 this.ctx
@@ -3068,6 +3090,13 @@ impl Piper {
             let commit_host_mono_us = self
                 .send_reliable_package_confirmed_commit_marker(frames, timeout)
                 .map_err(QueryError::from)?;
+            let complete_before = self
+                .ctx
+                .joint_limit_observation
+                .read()
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?
+                .current_complete_for_token(token)
+                .is_some();
             self.ctx
                 .joint_limit_observation
                 .write()
@@ -3079,6 +3108,16 @@ impl Piper {
                     )
                 })
                 .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
+            let complete_after = self
+                .ctx
+                .joint_limit_observation
+                .read()
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?
+                .current_complete_for_token(token)
+                .is_some();
+            if !complete_before && complete_after {
+                self.ctx.observation_metrics.record_joint_limit_config_complete_observation();
+            }
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
                 this.ctx
@@ -3126,6 +3165,13 @@ impl Piper {
             let commit_host_mono_us = self
                 .send_reliable_package_confirmed_commit_marker(frames, timeout)
                 .map_err(QueryError::from)?;
+            let complete_before = self
+                .ctx
+                .joint_accel_observation
+                .read()
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?
+                .current_complete_for_token(token)
+                .is_some();
             self.ctx
                 .joint_accel_observation
                 .write()
@@ -3137,6 +3183,16 @@ impl Piper {
                     )
                 })
                 .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
+            let complete_after = self
+                .ctx
+                .joint_accel_observation
+                .read()
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?
+                .current_complete_for_token(token)
+                .is_some();
+            if !complete_before && complete_after {
+                self.ctx.observation_metrics.record_joint_accel_config_complete_observation();
+            }
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
                 this.ctx
@@ -3185,6 +3241,13 @@ impl Piper {
             let commit_host_mono_us = self
                 .send_reliable_frame_confirmed_commit_marker(frame, timeout)
                 .map_err(QueryError::from)?;
+            let complete_before = self
+                .ctx
+                .end_limit_observation
+                .read()
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?
+                .current_complete_for_token(token)
+                .is_some();
             self.ctx
                 .end_limit_observation
                 .write()
@@ -3192,6 +3255,16 @@ impl Piper {
                     store.advance_query_min_host_rx_mono_us(token, commit_host_mono_us)
                 })
                 .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
+            let complete_after = self
+                .ctx
+                .end_limit_observation
+                .read()
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?
+                .current_complete_for_token(token)
+                .is_some();
+            if !complete_before && complete_after {
+                self.ctx.observation_metrics.record_end_limit_config_complete_observation();
+            }
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
                 this.ctx

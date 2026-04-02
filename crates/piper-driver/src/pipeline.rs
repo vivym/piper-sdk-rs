@@ -2654,6 +2654,7 @@ fn parse_and_update_state(
         ID_END_POSE_1 => {
             if let Ok(feedback) = EndPoseFeedback1::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
+                ctx.observation_metrics.record_end_pose_raw_frame();
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
@@ -2690,6 +2691,7 @@ fn parse_and_update_state(
         ID_END_POSE_2 => {
             if let Ok(feedback) = EndPoseFeedback2::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
+                ctx.observation_metrics.record_end_pose_raw_frame();
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
@@ -2726,6 +2728,7 @@ fn parse_and_update_state(
         ID_END_POSE_3 => {
             if let Ok(feedback) = EndPoseFeedback3::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
+                ctx.observation_metrics.record_end_pose_raw_frame();
                 let host_rx_mono_us = host_rx_mono_us();
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
@@ -2759,6 +2762,7 @@ fn parse_and_update_state(
                 };
                 if complete_group_ready(state.end_pose_group.mask) {
                     ctx.publish_end_pose(new_end_pose_state);
+                    ctx.observation_metrics.record_end_pose_complete_observation();
                     ctx.fps_stats
                         .load()
                         .end_pose_updates
@@ -2928,6 +2932,7 @@ fn parse_and_update_state(
                     outcome.counts_as_robot_feedback = true;
                     outcome.maintenance_gate_may_have_changed = true;
                     outcome.low_speed_drive_state_updated = true;
+                    ctx.observation_metrics.record_low_speed_raw_frame();
                     let host_rx_mono_us = host_rx_mono_us();
                     if let Ok(mut store) = ctx.joint_driver_low_speed_observation.write() {
                         store.record_slot(
@@ -3036,6 +3041,9 @@ fn parse_and_update_state(
                         .load()
                         .joint_driver_low_speed_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if joint_idx == 5 {
+                        ctx.observation_metrics.record_low_speed_complete_observation();
+                    }
                 }
             }
         },
@@ -3043,6 +3051,7 @@ fn parse_and_update_state(
             match decode_collision_protection_feedback(*frame) {
                 DecodeResult::Data(typed) => {
                     outcome.counts_as_robot_feedback = true;
+                    ctx.observation_metrics.record_collision_protection_raw_frame();
                     let host_rx_mono_us = host_rx_mono_us();
 
                     if let Ok(mut collision) = ctx.collision_protection.try_write() {
@@ -3060,14 +3069,26 @@ fn parse_and_update_state(
                                 CollisionProtection::try_from_raw_levels(typed.payload.levels)
                                 && let Ok(mut store) = ctx.collision_protection_observation.write()
                             {
-                                let _ = store.record_query_value(
+                                let complete_before =
+                                    store.current_complete_for_token(active_query.token).is_some();
+                                let accepted = store.record_query_value(
                                     active_query.token,
                                     levels,
                                     host_rx_mono_us,
                                     typed.hardware_timestamp_us,
                                 );
+                                if accepted
+                                    && !complete_before
+                                    && store
+                                        .current_complete_for_token(active_query.token)
+                                        .is_some()
+                                {
+                                    ctx.observation_metrics
+                                        .record_collision_protection_complete_observation();
+                                }
                             }
                         } else {
+                            ctx.observation_metrics.record_collision_protection_diagnostic();
                             ctx.diagnostics.push(DiagnosticEvent::Query(
                                 QueryDiagnostic::UnexpectedFrameForActiveQuery {
                                     query: active_query.kind,
@@ -3083,6 +3104,7 @@ fn parse_and_update_state(
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 },
                 DecodeResult::Diagnostic(diagnostic) => {
+                    ctx.observation_metrics.record_collision_protection_diagnostic();
                     ctx.diagnostics.push(DiagnosticEvent::Protocol(diagnostic));
                 },
                 DecodeResult::Ignore => {},
@@ -3107,6 +3129,7 @@ fn parse_and_update_state(
                 let feedback = typed.payload;
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 outcome.counts_as_robot_feedback = true;
+                ctx.observation_metrics.record_joint_limit_config_raw_frame();
                 let host_rx_mono_us = host_rx_mono_us();
 
                 if let Ok(mut joint_limit) = ctx.joint_limit_config.write() {
@@ -3125,7 +3148,9 @@ fn parse_and_update_state(
                 if let Some(active_query) = ctx.query_coordinator.active_query() {
                     if active_query.kind == crate::query_coordinator::QueryKind::JointLimit {
                         if let Ok(mut store) = ctx.joint_limit_observation.write() {
-                            let _ = store.record_query_slot(
+                            let complete_before =
+                                store.current_complete_for_token(active_query.token).is_some();
+                            let accepted = store.record_query_slot(
                                 active_query.token,
                                 joint_idx,
                                 JointLimit {
@@ -3137,8 +3162,16 @@ fn parse_and_update_state(
                                 typed.hardware_timestamp_us,
                                 JointLimitConfig::from_slots,
                             );
+                            if accepted
+                                && !complete_before
+                                && store.current_complete_for_token(active_query.token).is_some()
+                            {
+                                ctx.observation_metrics
+                                    .record_joint_limit_config_complete_observation();
+                            }
                         }
                     } else {
+                        ctx.observation_metrics.record_joint_limit_config_diagnostic();
                         ctx.diagnostics.push(DiagnosticEvent::Query(
                             QueryDiagnostic::UnexpectedFrameForActiveQuery {
                                 query: active_query.kind,
@@ -3154,6 +3187,7 @@ fn parse_and_update_state(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
             DecodeResult::Diagnostic(diagnostic) => {
+                ctx.observation_metrics.record_joint_limit_config_diagnostic();
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(diagnostic));
             },
             DecodeResult::Ignore => {},
@@ -3163,6 +3197,7 @@ fn parse_and_update_state(
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
                     outcome.counts_as_robot_feedback = true;
+                    ctx.observation_metrics.record_joint_accel_config_raw_frame();
                     let host_rx_mono_us = host_rx_mono_us();
                     let hardware_timestamp_us =
                         (frame.timestamp_us != 0).then_some(frame.timestamp_us);
@@ -3182,7 +3217,9 @@ fn parse_and_update_state(
                     if let Some(active_query) = ctx.query_coordinator.active_query() {
                         if active_query.kind == crate::query_coordinator::QueryKind::JointAccel {
                             if let Ok(mut store) = ctx.joint_accel_observation.write() {
-                                let _ = store.record_query_slot(
+                                let complete_before =
+                                    store.current_complete_for_token(active_query.token).is_some();
+                                let accepted = store.record_query_slot(
                                     active_query.token,
                                     joint_idx,
                                     feedback.max_accel(),
@@ -3190,8 +3227,18 @@ fn parse_and_update_state(
                                     hardware_timestamp_us,
                                     JointAccelConfig::from_slots,
                                 );
+                                if accepted
+                                    && !complete_before
+                                    && store
+                                        .current_complete_for_token(active_query.token)
+                                        .is_some()
+                                {
+                                    ctx.observation_metrics
+                                        .record_joint_accel_config_complete_observation();
+                                }
                             }
                         } else {
+                            ctx.observation_metrics.record_joint_accel_config_diagnostic();
                             ctx.diagnostics.push(DiagnosticEvent::Query(
                                 QueryDiagnostic::UnexpectedFrameForActiveQuery {
                                     query: active_query.kind,
@@ -3206,6 +3253,7 @@ fn parse_and_update_state(
                         .joint_accel_config_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
+                    ctx.observation_metrics.record_joint_accel_config_diagnostic();
                     ctx.diagnostics.push(DiagnosticEvent::Protocol(
                         ProtocolDiagnostic::OutOfRange {
                             field: "joint_index",
@@ -3217,6 +3265,7 @@ fn parse_and_update_state(
                 }
             },
             Err(piper_protocol::ProtocolError::InvalidLength { expected, actual }) => {
+                ctx.observation_metrics.record_joint_accel_config_diagnostic();
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(
                     ProtocolDiagnostic::InvalidLength {
                         can_id: frame.id,
@@ -3227,6 +3276,7 @@ fn parse_and_update_state(
             },
             Err(piper_protocol::ProtocolError::InvalidCanId { .. }) => {},
             Err(_) => {
+                ctx.observation_metrics.record_joint_accel_config_diagnostic();
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(
                     ProtocolDiagnostic::UnsupportedValue {
                         field: "motor_max_accel_feedback",
@@ -3238,6 +3288,7 @@ fn parse_and_update_state(
         ID_END_VELOCITY_ACCEL_FEEDBACK => match EndVelocityAccelFeedback::try_from(*frame) {
             Ok(feedback) => {
                 outcome.counts_as_robot_feedback = true;
+                ctx.observation_metrics.record_end_limit_config_raw_frame();
                 let host_rx_mono_us = host_rx_mono_us();
                 let hardware_timestamp_us = (frame.timestamp_us != 0).then_some(frame.timestamp_us);
 
@@ -3255,7 +3306,9 @@ fn parse_and_update_state(
                 if let Some(active_query) = ctx.query_coordinator.active_query() {
                     if active_query.kind == crate::query_coordinator::QueryKind::EndLimit {
                         if let Ok(mut store) = ctx.end_limit_observation.write() {
-                            let _ = store.record_query_value(
+                            let complete_before =
+                                store.current_complete_for_token(active_query.token).is_some();
+                            let accepted = store.record_query_value(
                                 active_query.token,
                                 EndLimitConfig {
                                     max_linear_velocity_m_s: feedback.max_linear_velocity(),
@@ -3266,8 +3319,16 @@ fn parse_and_update_state(
                                 host_rx_mono_us,
                                 hardware_timestamp_us,
                             );
+                            if accepted
+                                && !complete_before
+                                && store.current_complete_for_token(active_query.token).is_some()
+                            {
+                                ctx.observation_metrics
+                                    .record_end_limit_config_complete_observation();
+                            }
                         }
                     } else {
+                        ctx.observation_metrics.record_end_limit_config_diagnostic();
                         ctx.diagnostics.push(DiagnosticEvent::Query(
                             QueryDiagnostic::UnexpectedFrameForActiveQuery {
                                 query: active_query.kind,
@@ -3283,6 +3344,7 @@ fn parse_and_update_state(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
             Err(piper_protocol::ProtocolError::InvalidLength { expected, actual }) => {
+                ctx.observation_metrics.record_end_limit_config_diagnostic();
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(
                     ProtocolDiagnostic::InvalidLength {
                         can_id: frame.id,
@@ -3293,6 +3355,7 @@ fn parse_and_update_state(
             },
             Err(piper_protocol::ProtocolError::InvalidCanId { .. }) => {},
             Err(_) => {
+                ctx.observation_metrics.record_end_limit_config_diagnostic();
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(
                     ProtocolDiagnostic::UnsupportedValue {
                         field: "end_velocity_accel_feedback",
