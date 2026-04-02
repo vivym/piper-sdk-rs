@@ -2040,7 +2040,7 @@ pub(crate) fn tx_loop_mailbox(
             running_idle_backoff_us = TX_IDLE_BACKOFF_MIN_US;
             let total_frames = command.len();
             let package_command = total_frames > 1;
-            let (frames, mut ack, kind, maintenance, deadline) = command.into_parts();
+            let (frames, mut ack, kind, commit_point, maintenance, deadline) = command.into_parts();
             debug_assert!(maintenance.is_none());
             let current_mode = driver_mode.get(Ordering::Acquire);
 
@@ -2113,7 +2113,14 @@ pub(crate) fn tx_loop_mailbox(
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-                        if !committed {
+                        let should_emit_commit = !committed
+                            && match commit_point {
+                                crate::command::ReliableCommitPoint::FirstFrame => true,
+                                crate::command::ReliableCommitPoint::PackageComplete => {
+                                    sent_count == total_frames
+                                },
+                            };
+                        if should_emit_commit {
                             if let Some(ack) = ack.as_ref() {
                                 let _ = ack.send(crate::command::DeliveryPhase::Committed {
                                     host_commit_mono_us: crate::heartbeat::monotonic_micros()

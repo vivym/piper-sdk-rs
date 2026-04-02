@@ -1734,6 +1734,14 @@ where
         }
     }
 
+    pub fn advance_query_min_host_rx_mono_us(&mut self, token: u64, min_host_rx_mono_us: u64) {
+        if let Some(active_query) = self.active_query.as_mut()
+            && active_query.token == token
+        {
+            active_query.min_host_rx_mono_us = min_host_rx_mono_us;
+        }
+    }
+
     pub fn record_query_slot<F>(
         &mut self,
         token: u64,

@@ -2915,9 +2915,7 @@ impl Piper {
                     ProtocolDiagnostic::InvalidLength { can_id, .. } => {
                         *can_id == piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK
                     },
-                    ProtocolDiagnostic::OutOfRange { field, .. } => {
-                        *field == "motor_max_accel_joint_index"
-                    },
+                    ProtocolDiagnostic::OutOfRange { field, .. } => *field == "joint_index",
                     ProtocolDiagnostic::UnsupportedValue { field, .. } => {
                         *field == "motor_max_accel_feedback"
                     },
@@ -3001,12 +2999,11 @@ impl Piper {
 
         let query = self.try_begin_query(QueryKind::JointLimit)?;
         let token = query.token();
-        let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
         let diagnostics_rx = self.ctx.diagnostics.subscribe();
         self.ctx
             .joint_limit_observation
             .write()
-            .map(|mut store| store.begin_query(token, baseline_host_mono_us))
+            .map(|mut store| store.begin_query(token, u64::MAX))
             .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
         let result = (|| {
@@ -3014,8 +3011,16 @@ impl Piper {
             let frames = (1..=6u8).map(|joint_index| {
                 QueryMotorLimitCommand::query_angle_and_max_velocity(joint_index).to_frame()
             });
-            self.send_reliable_package_confirmed(frames, timeout)
+            let commit_host_mono_us = self
+                .send_reliable_package_confirmed_commit_marker(frames, timeout)
                 .map_err(QueryError::from)?;
+            self.ctx
+                .joint_limit_observation
+                .write()
+                .map(|mut store| {
+                    store.advance_query_min_host_rx_mono_us(token, commit_host_mono_us)
+                })
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
                 this.ctx
@@ -3048,12 +3053,11 @@ impl Piper {
 
         let query = self.try_begin_query(QueryKind::JointAccel)?;
         let token = query.token();
-        let baseline_host_mono_us = crate::heartbeat::monotonic_micros().max(1);
         let diagnostics_rx = self.ctx.diagnostics.subscribe();
         self.ctx
             .joint_accel_observation
             .write()
-            .map(|mut store| store.begin_query(token, baseline_host_mono_us))
+            .map(|mut store| store.begin_query(token, u64::MAX))
             .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
         let result = (|| {
@@ -3061,8 +3065,16 @@ impl Piper {
             let frames = (1..=6u8).map(|joint_index| {
                 QueryMotorLimitCommand::query_max_acceleration(joint_index).to_frame()
             });
-            self.send_reliable_package_confirmed(frames, timeout)
+            let commit_host_mono_us = self
+                .send_reliable_package_confirmed_commit_marker(frames, timeout)
                 .map_err(QueryError::from)?;
+            self.ctx
+                .joint_accel_observation
+                .write()
+                .map(|mut store| {
+                    store.advance_query_min_host_rx_mono_us(token, commit_host_mono_us)
+                })
+                .map_err(|_| QueryError::from(DriverError::PoisonedLock))?;
 
             self.wait_for_cached_update(deadline, CONFIG_QUERY_POLL_INTERVAL, |this| {
                 this.ctx
@@ -4211,6 +4223,39 @@ impl Piper {
         )?;
 
         wait_for_delivery_result(ack_rx, deadline, || DriverError::Timeout)
+    }
+
+    #[doc(hidden)]
+    pub fn send_reliable_package_confirmed_commit_marker(
+        &self,
+        frames: impl IntoIterator<Item = PiperFrame>,
+        timeout: Duration,
+    ) -> Result<u64, DriverError> {
+        use crate::command::FrameBuffer;
+
+        let buffer: FrameBuffer = frames.into_iter().collect();
+        if buffer.is_empty() {
+            return Err(DriverError::InvalidInput(
+                "Reliable frame package cannot be empty".to_string(),
+            ));
+        }
+        if buffer.len() > Self::MAX_RELIABLE_PACKAGE_SIZE {
+            return Err(DriverError::InvalidInput(format!(
+                "Reliable frame package too large: {} (max: {})",
+                buffer.len(),
+                Self::MAX_RELIABLE_PACKAGE_SIZE
+            )));
+        }
+
+        let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+        self.enqueue_reliable_timeout_until(
+            ReliableCommand::package_confirmed_with_post_send_commit(buffer, deadline, ack_tx),
+            deadline,
+        )?;
+
+        wait_for_delivery_result_with_commit(ack_rx, deadline, || DriverError::Timeout)?
+            .ok_or(DriverError::ChannelClosed)
     }
 
     #[doc(hidden)]
@@ -5544,6 +5589,40 @@ mod tests {
         data[6..8].copy_from_slice(&angular_accel_millirad_s2.to_be_bytes());
         let mut frame = PiperFrame::new_standard(
             piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK as u16,
+            &data,
+        );
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn joint_limit_feedback_frame(
+        joint_index: u8,
+        max_angle_deci_deg: i16,
+        min_angle_deci_deg: i16,
+        max_velocity_millirad_s: u16,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0] = joint_index;
+        data[1..3].copy_from_slice(&max_angle_deci_deg.to_be_bytes());
+        data[3..5].copy_from_slice(&min_angle_deci_deg.to_be_bytes());
+        data[5..7].copy_from_slice(&max_velocity_millirad_s.to_be_bytes());
+        let mut frame =
+            PiperFrame::new_standard(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK as u16, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn joint_accel_feedback_frame(
+        joint_index: u8,
+        max_accel_millirad_s2: u16,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0] = joint_index;
+        data[1..3].copy_from_slice(&max_accel_millirad_s2.to_be_bytes());
+        let mut frame = PiperFrame::new_standard(
+            piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK as u16,
             &data,
         );
         frame.timestamp_us = timestamp_us;
@@ -7598,6 +7677,83 @@ mod tests {
     }
 
     #[test]
+    fn query_joint_limit_config_ignores_pre_commit_group_feedback() {
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Piper::new_dual_thread_parts(
+            ChannelRxAdapter::new(frames_rx),
+            BlockingTxAdapter {
+                entered_tx,
+                release_rx,
+            },
+            None,
+        )
+        .unwrap();
+
+        let result = thread::scope(|scope| {
+            let query = scope.spawn(|| piper.query_joint_limit_config(Duration::from_millis(120)));
+            entered_rx
+                .recv_timeout(Duration::from_millis(40))
+                .expect("query should block before the reliable package fully commits");
+
+            for joint_index in 1..=6 {
+                frames_tx
+                    .send(joint_limit_feedback_frame(
+                        joint_index,
+                        1800 + i16::from(joint_index),
+                        -1800 - i16::from(joint_index),
+                        500 + u16::from(joint_index),
+                        100 + u64::from(joint_index),
+                    ))
+                    .expect("stale frame should be injected before package commit");
+            }
+
+            let stale_visible = {
+                let deadline = Instant::now() + Duration::from_millis(40);
+                let mut visible = false;
+                while Instant::now() < deadline {
+                    if matches!(
+                        piper.get_joint_limit_config(),
+                        Observation::Available(Available {
+                            payload: ObservationPayload::Complete(_),
+                            ..
+                        })
+                    ) {
+                        visible = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                visible
+            };
+
+            for _ in 0..6 {
+                release_tx.send(()).expect("package send release should be delivered");
+            }
+
+            (
+                stale_visible,
+                query.join().expect("query thread should not panic"),
+            )
+        });
+
+        assert!(
+            !result.0,
+            "pre-commit group feedback must stay hidden from the query observation store"
+        );
+        assert!(
+            matches!(result.1, Err(QueryError::Timeout)),
+            "expected timeout, got {:?}",
+            result.1
+        );
+        assert!(matches!(
+            piper.get_joint_limit_config(),
+            Observation::Unavailable
+        ));
+    }
+
+    #[test]
     fn test_query_joint_accel_config_queries_all_joints_and_waits_for_full_state() {
         let frames: Vec<PiperFrame> = (1..=6)
             .map(|joint_index| {
@@ -7644,6 +7800,81 @@ mod tests {
                 piper_protocol::config::QueryType::MaxAcceleration as u8
             );
         }
+    }
+
+    #[test]
+    fn query_joint_accel_config_ignores_pre_commit_group_feedback() {
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let piper = Piper::new_dual_thread_parts(
+            ChannelRxAdapter::new(frames_rx),
+            BlockingTxAdapter {
+                entered_tx,
+                release_rx,
+            },
+            None,
+        )
+        .unwrap();
+
+        let result = thread::scope(|scope| {
+            let query = scope.spawn(|| piper.query_joint_accel_config(Duration::from_millis(120)));
+            entered_rx
+                .recv_timeout(Duration::from_millis(40))
+                .expect("query should block before the reliable package fully commits");
+
+            for joint_index in 1..=6 {
+                frames_tx
+                    .send(joint_accel_feedback_frame(
+                        joint_index,
+                        1000 + 10 * u16::from(joint_index),
+                        200 + u64::from(joint_index),
+                    ))
+                    .expect("stale frame should be injected before package commit");
+            }
+
+            let stale_visible = {
+                let deadline = Instant::now() + Duration::from_millis(40);
+                let mut visible = false;
+                while Instant::now() < deadline {
+                    if matches!(
+                        piper.get_joint_accel_config(),
+                        Observation::Available(Available {
+                            payload: ObservationPayload::Complete(_),
+                            ..
+                        })
+                    ) {
+                        visible = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                visible
+            };
+
+            for _ in 0..6 {
+                release_tx.send(()).expect("package send release should be delivered");
+            }
+
+            (
+                stale_visible,
+                query.join().expect("query thread should not panic"),
+            )
+        });
+
+        assert!(
+            !result.0,
+            "pre-commit accel feedback must stay hidden from the query observation store"
+        );
+        assert!(
+            matches!(result.1, Err(QueryError::Timeout)),
+            "expected timeout, got {:?}",
+            result.1
+        );
+        assert!(matches!(
+            piper.get_joint_accel_config(),
+            Observation::Unavailable
+        ));
     }
 
     #[test]
@@ -7729,6 +7960,21 @@ mod tests {
         .unwrap();
 
         let error = piper.query_collision_protection(Duration::from_millis(60)).unwrap_err();
+
+        assert!(matches!(error, QueryError::DiagnosticsOnlyTimeout));
+    }
+
+    #[test]
+    fn query_joint_accel_invalid_feedback_returns_diagnostics_only_timeout() {
+        let frame = joint_accel_feedback_frame(7, 1000, 20);
+        let piper = Piper::new_dual_thread_parts(
+            ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
+            MockTxAdapter,
+            None,
+        )
+        .unwrap();
+
+        let error = piper.query_joint_accel_config(Duration::from_millis(60)).unwrap_err();
 
         assert!(matches!(error, QueryError::DiagnosticsOnlyTimeout));
     }

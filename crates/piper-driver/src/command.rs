@@ -71,6 +71,12 @@ pub enum ReliableCommandKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliableCommitPoint {
+    FirstFrame,
+    PackageComplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceCommandMeta {
     session_id: u32,
     session_key: u64,
@@ -206,6 +212,7 @@ pub struct ReliableCommand {
     frames: FrameBuffer,
     ack: Option<ReliableAck>,
     kind: ReliableCommandKind,
+    commit_point: ReliableCommitPoint,
     maintenance: Option<MaintenanceCommandMeta>,
     deadline: Option<Instant>,
 }
@@ -490,6 +497,7 @@ impl ReliableCommand {
             frames,
             ack: None,
             kind: ReliableCommandKind::Standard,
+            commit_point: ReliableCommitPoint::FirstFrame,
             maintenance: None,
             deadline: None,
         }
@@ -503,6 +511,7 @@ impl ReliableCommand {
             frames,
             ack: Some(ack),
             kind: ReliableCommandKind::Standard,
+            commit_point: ReliableCommitPoint::FirstFrame,
             maintenance: None,
             deadline: Some(deadline),
         }
@@ -514,6 +523,7 @@ impl ReliableCommand {
             frames: frames.into_iter().collect(),
             ack: None,
             kind: ReliableCommandKind::Standard,
+            commit_point: ReliableCommitPoint::FirstFrame,
             maintenance: None,
             deadline: None,
         }
@@ -529,6 +539,23 @@ impl ReliableCommand {
             frames: frames.into_iter().collect(),
             ack: Some(ack),
             kind: ReliableCommandKind::Standard,
+            commit_point: ReliableCommitPoint::FirstFrame,
+            maintenance: None,
+            deadline: Some(deadline),
+        }
+    }
+
+    #[inline]
+    pub fn package_confirmed_with_post_send_commit(
+        frames: impl IntoIterator<Item = PiperFrame>,
+        deadline: Instant,
+        ack: ReliableAck,
+    ) -> Self {
+        Self {
+            frames: frames.into_iter().collect(),
+            ack: Some(ack),
+            kind: ReliableCommandKind::Standard,
+            commit_point: ReliableCommitPoint::PackageComplete,
             maintenance: None,
             deadline: Some(deadline),
         }
@@ -548,6 +575,7 @@ impl ReliableCommand {
             frames,
             ack: Some(ack),
             kind: ReliableCommandKind::Maintenance,
+            commit_point: ReliableCommitPoint::FirstFrame,
             maintenance: Some(MaintenanceCommandMeta::new(
                 session_id,
                 session_key,
@@ -565,6 +593,7 @@ impl ReliableCommand {
             frames,
             ack: None,
             kind: ReliableCommandKind::Replay,
+            commit_point: ReliableCommitPoint::FirstFrame,
             maintenance: None,
             deadline: None,
         }
@@ -578,6 +607,7 @@ impl ReliableCommand {
             frames,
             ack: Some(ack),
             kind: ReliableCommandKind::Replay,
+            commit_point: ReliableCommitPoint::FirstFrame,
             maintenance: None,
             deadline: Some(deadline),
         }
@@ -616,6 +646,7 @@ impl ReliableCommand {
         FrameBuffer,
         Option<ReliableAck>,
         ReliableCommandKind,
+        ReliableCommitPoint,
         Option<MaintenanceCommandMeta>,
         Option<Instant>,
     ) {
@@ -623,6 +654,7 @@ impl ReliableCommand {
             self.frames,
             self.ack,
             self.kind,
+            self.commit_point,
             self.maintenance,
             self.deadline,
         )
