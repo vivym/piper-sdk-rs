@@ -1,14 +1,23 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use piper_control::{
+    ControlProfile, MotionProgressSnapshot, MotionWaitConfig, ParkOrientation,
+    active_park_blocking_with_progress,
+};
 use piper_sdk::PiperBuilder;
 use piper_sdk::client::state::machine::MotionType;
 use piper_sdk::client::state::{
-    ConnectedPiper, MotionCapability, Piper, PositionModeConfig, Standby,
+    ConnectedPiper, DisableConfig, MotionCapability, Piper, PositionModeConfig, Standby,
 };
 use piper_sdk::client::types::{JointArray, Rad, Result as ClientResult, RobotError};
 use piper_sdk::client::{MotionConnectedPiper, MotionConnectedState};
+use piper_sdk::driver::ConnectionTarget;
 use piper_sdk::driver::state::JointLimitConfig;
+use piper_tools::SafetyConfig;
 use std::error::Error;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use clap::CommandFactory;
 
 const MAX_SPEED_PERCENT: u8 = 10;
 const MAX_DELTA_RAD: f64 = 0.035;
@@ -20,6 +29,24 @@ const INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5
 const POSITION_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PREFLIGHT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const PREFLIGHT_TARGET_JOINT_FAIL_MARGIN_RAD: f64 = 0.05;
+const PARK_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliParkOrientation {
+    Upright,
+    Left,
+    Right,
+}
+
+impl From<CliParkOrientation> for ParkOrientation {
+    fn from(value: CliParkOrientation) -> Self {
+        match value {
+            CliParkOrientation::Upright => ParkOrientation::Upright,
+            CliParkOrientation::Left => ParkOrientation::Left,
+            CliParkOrientation::Right => ParkOrientation::Right,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hil_joint_position_check")]
@@ -49,6 +76,19 @@ struct Args {
     /// Settle timeout for each commanded move, in milliseconds.
     #[arg(long, default_value_t = DEFAULT_SETTLE_TIMEOUT_MS)]
     settle_timeout_ms: u64,
+
+    /// Skip success-path parking before disable.
+    #[arg(long)]
+    no_park: bool,
+
+    /// Parking orientation used after a successful return-to-initial check.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "upright|left|right",
+        default_value_t = CliParkOrientation::Upright
+    )]
+    park_orientation: CliParkOrientation,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -211,9 +251,107 @@ where
         "[PASS] settle step=return joint=J{} final_position_rad={:.6} return_error_rad={:.6} tolerance_rad={:.6}",
         args.joint, returned_joint.0, return_error, POSITION_SETTLE_TOLERANCE_RAD
     );
-    println!("[PASS] hil_joint_position_check complete");
+
+    if args.no_park {
+        let _robot = robot.disable(DisableConfig::default())?;
+        println!("[PASS] skipped parking via --no-park and disabled robot");
+    } else {
+        let park_profile = park_profile(args);
+        let park_target = park_profile.park_pose();
+        println!(
+            "[PASS] command step=park orientation={} target_rad={}",
+            ParkOrientation::from(args.park_orientation),
+            format_joint_values(&park_target)
+        );
+        let mut next_park_log_at = PARK_PROGRESS_LOG_INTERVAL;
+        active_park_blocking_with_progress(&robot, &park_profile, |snapshot| {
+            if should_emit_park_progress_log(snapshot.elapsed, &mut next_park_log_at) {
+                println!("{}", format_park_progress_line(snapshot));
+            }
+        })?;
+        let _robot = robot.disable(DisableConfig::default())?;
+        println!(
+            "[PASS] parked orientation={} before disable",
+            ParkOrientation::from(args.park_orientation)
+        );
+    }
+
+    println!("{}", final_success_line(args));
 
     Ok(())
+}
+
+fn park_profile(args: &Args) -> ControlProfile {
+    ControlProfile {
+        target: ConnectionTarget::AutoStrict,
+        orientation: args.park_orientation.into(),
+        rest_pose_override: None,
+        park_speed_percent: args.speed_percent,
+        safety: SafetyConfig::default_config(),
+        wait: MotionWaitConfig {
+            threshold_rad: POSITION_SETTLE_TOLERANCE_RAD,
+            poll_interval: POSITION_SETTLE_POLL_INTERVAL,
+            republish_interval: POSITION_SETTLE_POLL_INTERVAL,
+            timeout: Duration::from_millis(args.settle_timeout_ms),
+        },
+    }
+}
+
+fn final_success_line(args: &Args) -> String {
+    if args.no_park {
+        "[PASS] hil_joint_position_check complete without parking (--no-park)".to_string()
+    } else {
+        format!(
+            "[PASS] hil_joint_position_check complete after parking orientation={}",
+            ParkOrientation::from(args.park_orientation)
+        )
+    }
+}
+
+fn should_emit_park_progress_log(elapsed: Duration, next_log_at: &mut Duration) -> bool {
+    if elapsed >= *next_log_at {
+        *next_log_at = elapsed + PARK_PROGRESS_LOG_INTERVAL;
+        true
+    } else {
+        false
+    }
+}
+
+fn format_park_progress_line(snapshot: &MotionProgressSnapshot) -> String {
+    format!(
+        "[INFO] park progress t={:.1}s current_rad={} joint_error_rad={} max_error_rad={:.4}",
+        snapshot.elapsed.as_secs_f64(),
+        format_joint_values(&snapshot.current),
+        format_joint_values(&snapshot.joint_errors),
+        snapshot.max_error,
+    )
+}
+
+fn format_joint_values(values: &[f64; 6]) -> String {
+    format!(
+        "[J1={:.4}, J2={:.4}, J3={:.4}, J4={:.4}, J5={:.4}, J6={:.4}]",
+        values[0], values[1], values[2], values[3], values[4], values[5]
+    )
+}
+
+#[cfg(test)]
+fn parse_args_for_test<const N: usize>(extra_args: [&str; N]) -> Args {
+    let mut argv = vec![
+        "hil_joint_position_check",
+        "--interface",
+        "test-interface",
+        "--joint",
+        "1",
+        "--delta-rad",
+        "0.02",
+    ];
+    argv.extend(extra_args);
+    Args::try_parse_from(argv).expect("cli args should parse")
+}
+
+#[cfg(test)]
+fn expected_park_pose(orientation: CliParkOrientation) -> [f64; 6] {
+    ParkOrientation::from(orientation).default_rest_pose()
 }
 
 fn wait_for_monitor_snapshot<T, Read>(
@@ -393,6 +531,8 @@ fn validate_args_rejects_excessive_speed() {
         delta_rad: 0.02,
         speed_percent: 11,
         settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("speed > 10 must be rejected");
@@ -408,6 +548,8 @@ fn validate_args_rejects_excessive_delta() {
         delta_rad: 0.04,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("delta > 0.035 rad must be rejected");
@@ -423,6 +565,8 @@ fn validate_args_rejects_non_finite_delta() {
         delta_rad: f64::NAN,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("non-finite delta must be rejected");
@@ -439,6 +583,8 @@ fn validate_args_rejects_invalid_joint() {
         delta_rad: 0.02,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("joint outside 1..=6 must be rejected");
@@ -454,10 +600,173 @@ fn validate_args_rejects_zero_settle_timeout() {
         delta_rad: 0.02,
         speed_percent: 10,
         settle_timeout_ms: 0,
+        no_park: false,
+        park_orientation: CliParkOrientation::Upright,
     };
 
     let error = validate_args(&args).expect_err("zero settle timeout must be rejected");
     assert!(error.contains("settle_timeout_ms"));
+}
+
+#[test]
+fn validate_args_accepts_no_park() {
+    let args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 5,
+        settle_timeout_ms: 10_000,
+        no_park: true,
+        park_orientation: CliParkOrientation::Upright,
+    };
+
+    validate_args(&args).expect("no-park should be accepted");
+}
+
+#[test]
+fn cli_parses_no_park_flag() {
+    let args = parse_args_for_test(["--no-park"]);
+
+    assert!(args.no_park);
+}
+
+#[test]
+fn cli_parses_park_orientation_left() {
+    let args = parse_args_for_test(["--park-orientation", "left"]);
+
+    assert_eq!(args.park_orientation, CliParkOrientation::Left);
+}
+
+#[test]
+fn cli_defaults_park_orientation_to_upright() {
+    let args = parse_args_for_test([]);
+
+    assert_eq!(args.park_orientation, CliParkOrientation::Upright);
+}
+
+#[test]
+fn final_success_line_distinguishes_no_park_path() {
+    let no_park_args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 5,
+        settle_timeout_ms: 10_000,
+        no_park: true,
+        park_orientation: CliParkOrientation::Upright,
+    };
+    let parked_args = Args {
+        interface: "can0".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 5,
+        settle_timeout_ms: 10_000,
+        no_park: false,
+        park_orientation: CliParkOrientation::Left,
+    };
+
+    assert_eq!(
+        final_success_line(&no_park_args),
+        "[PASS] hil_joint_position_check complete without parking (--no-park)"
+    );
+    assert_eq!(
+        final_success_line(&parked_args),
+        "[PASS] hil_joint_position_check complete after parking orientation=left"
+    );
+}
+
+#[test]
+fn park_orientation_help_lists_explicit_allowed_values() {
+    let mut command = Args::command();
+    let mut buffer = Vec::new();
+    command.write_long_help(&mut buffer).expect("help should render");
+    let help = String::from_utf8(buffer).expect("help should be utf-8");
+
+    assert!(help.contains("--park-orientation <upright|left|right>"));
+    assert!(help.contains("[possible values: upright, left, right]"));
+}
+
+#[test]
+fn park_profile_maps_orientation_and_wait_fields() {
+    let args = Args {
+        interface: "test-interface".to_string(),
+        baud_rate: 1_000_000,
+        joint: 1,
+        delta_rad: 0.02,
+        speed_percent: 7,
+        settle_timeout_ms: 12_345,
+        no_park: false,
+        park_orientation: CliParkOrientation::Left,
+    };
+
+    let profile = park_profile(&args);
+
+    assert_eq!(profile.orientation, ParkOrientation::Left);
+    assert_eq!(
+        profile.park_pose(),
+        expected_park_pose(CliParkOrientation::Left)
+    );
+    assert_eq!(profile.park_speed_percent, 7);
+    assert_eq!(profile.wait.threshold_rad, POSITION_SETTLE_TOLERANCE_RAD);
+    assert_eq!(profile.wait.timeout, Duration::from_millis(12_345));
+}
+
+#[test]
+fn park_progress_log_interval_throttles_to_once_per_second() {
+    let mut next_log_at = Duration::from_secs(1);
+
+    assert!(!should_emit_park_progress_log(
+        Duration::from_millis(900),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_secs(1));
+
+    assert!(should_emit_park_progress_log(
+        Duration::from_secs(1),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_secs(2));
+
+    assert!(!should_emit_park_progress_log(
+        Duration::from_millis(1500),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_secs(2));
+
+    assert!(should_emit_park_progress_log(
+        Duration::from_secs(2),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_secs(3));
+}
+
+#[test]
+fn park_progress_log_interval_does_not_burst_after_large_gap() {
+    let mut next_log_at = Duration::from_secs(1);
+
+    assert!(should_emit_park_progress_log(
+        Duration::from_millis(3200),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_millis(4200));
+
+    assert!(!should_emit_park_progress_log(
+        Duration::from_millis(3210),
+        &mut next_log_at
+    ));
+    assert!(!should_emit_park_progress_log(
+        Duration::from_millis(4199),
+        &mut next_log_at
+    ));
+
+    assert!(should_emit_park_progress_log(
+        Duration::from_millis(4200),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_millis(5200));
 }
 
 #[test]

@@ -6,11 +6,15 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+pub const DEFAULT_PARK_SPEED_PERCENT: u8 = 5;
+const MIN_PARK_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[derive(Debug, Clone)]
 pub struct ControlProfile {
     pub target: ConnectionTarget,
     pub orientation: ParkOrientation,
     pub rest_pose_override: Option<[f64; 6]>,
+    pub park_speed_percent: u8,
     pub safety: SafetyConfig,
     pub wait: MotionWaitConfig,
 }
@@ -24,6 +28,30 @@ impl ControlProfile {
         piper_client::state::PositionModeConfig {
             install_position: self.orientation.install_position(),
             ..piper_client::state::PositionModeConfig::default()
+        }
+    }
+
+    pub fn park_position_mode_config(
+        &self,
+    ) -> anyhow::Result<piper_client::state::PositionModeConfig> {
+        anyhow::ensure!(
+            (1..=100).contains(&self.park_speed_percent),
+            "park_speed_percent must be between 1 and 100"
+        );
+
+        Ok(piper_client::state::PositionModeConfig {
+            speed_percent: self.park_speed_percent,
+            install_position: self.orientation.install_position(),
+            ..piper_client::state::PositionModeConfig::default()
+        })
+    }
+
+    pub fn park_wait_config(&self) -> MotionWaitConfig {
+        MotionWaitConfig {
+            threshold_rad: self.wait.threshold_rad,
+            poll_interval: self.wait.poll_interval,
+            republish_interval: self.wait.republish_interval,
+            timeout: self.wait.timeout.max(MIN_PARK_TIMEOUT),
         }
     }
 }
@@ -115,5 +143,107 @@ mod tests {
             ParkOrientation::Right.default_rest_pose(),
             [-1.66, 2.91, -2.74, 0.0545, -0.271, 0.0979]
         );
+    }
+
+    #[test]
+    fn park_position_mode_config_defaults_to_slow_speed() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 5,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        };
+
+        let config = profile.park_position_mode_config();
+        assert_eq!(config.unwrap().speed_percent, 5);
+    }
+
+    #[test]
+    fn position_mode_config_keeps_normal_speed() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 5,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        };
+
+        let config = profile.position_mode_config();
+        assert_eq!(config.speed_percent, 50);
+        assert_eq!(
+            config.install_position,
+            profile.orientation.install_position()
+        );
+    }
+
+    #[test]
+    fn park_position_mode_config_rejects_zero_speed() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 0,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        };
+
+        assert!(profile.park_position_mode_config().is_err());
+    }
+
+    #[test]
+    fn park_position_mode_config_rejects_speed_above_hundred() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 101,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        };
+
+        assert!(profile.park_position_mode_config().is_err());
+    }
+
+    #[test]
+    fn park_wait_config_applies_timeout_floor_preserving_other_fields() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 5,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig {
+                threshold_rad: 0.01,
+                poll_interval: Duration::from_millis(25),
+                republish_interval: Duration::from_millis(125),
+                timeout: Duration::from_secs(2),
+            },
+        };
+
+        let park_wait = profile.park_wait_config();
+        assert_eq!(park_wait.threshold_rad, 0.01);
+        assert_eq!(park_wait.poll_interval, Duration::from_millis(25));
+        assert_eq!(park_wait.republish_interval, Duration::from_millis(125));
+        assert_eq!(park_wait.timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn park_wait_config_keeps_longer_existing_timeout() {
+        let profile = ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent: 5,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig {
+                timeout: Duration::from_secs(20),
+                ..MotionWaitConfig::default()
+            },
+        };
+
+        assert_eq!(profile.park_wait_config().timeout, Duration::from_secs(20));
     }
 }

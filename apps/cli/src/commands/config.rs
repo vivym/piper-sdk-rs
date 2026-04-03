@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use piper_control::{ControlProfile, MotionWaitConfig, ParkOrientation, TargetSpec};
+use piper_control::{
+    ControlProfile, DEFAULT_PARK_SPEED_PERCENT, MotionWaitConfig, ParkOrientation, TargetSpec,
+};
 use piper_tools::SafetyConfig;
 use std::fmt;
 use std::fs;
@@ -86,6 +88,7 @@ impl CliConfig {
             target: self.resolved_target_spec(override_target).into_connection_target(),
             orientation: self.park.orientation,
             rest_pose_override: self.park.rest_pose_override,
+            park_speed_percent: self.park.park_speed_percent,
             safety,
             wait: self.motion.to_wait_config(),
         }
@@ -99,6 +102,7 @@ impl CliConfig {
             "  rest_pose_override = {}",
             format_optional_pose(self.park.rest_pose_override)
         );
+        println!("  park_speed_percent = {}", self.park.park_speed_percent);
         println!(
             "  confirmation = enabled:{} threshold:{:.1}°",
             self.safety.confirm_large_motion, self.safety.confirmation_threshold_deg
@@ -119,6 +123,8 @@ pub struct ParkConfig {
     pub orientation: ParkOrientation,
     #[serde(default)]
     pub rest_pose_override: Option<[f64; 6]>,
+    #[serde(default = "default_park_speed_percent")]
+    pub park_speed_percent: u8,
 }
 
 impl Default for ParkConfig {
@@ -126,6 +132,7 @@ impl Default for ParkConfig {
         Self {
             orientation: ParkOrientation::Upright,
             rest_pose_override: None,
+            park_speed_percent: default_park_speed_percent(),
         }
     }
 }
@@ -203,6 +210,10 @@ fn default_republish_interval_ms() -> u64 {
 
 fn default_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_park_speed_percent() -> u8 {
+    DEFAULT_PARK_SPEED_PERCENT
 }
 
 #[derive(Subcommand, Debug)]
@@ -340,6 +351,13 @@ mod tests {
         assert_eq!(config.target, TargetSpec::AutoStrict);
         assert_eq!(config.park.orientation, ParkOrientation::Upright);
         assert!(config.park.rest_pose_override.is_none());
+    }
+
+    #[test]
+    fn cli_default_config_uses_safe_park_speed() {
+        let config = CliConfig::default();
+        let profile = config.control_profile(None);
+        assert_eq!(profile.park_speed_percent, 5);
     }
 
     #[test]

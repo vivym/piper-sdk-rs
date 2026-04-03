@@ -49,7 +49,7 @@ piper-cli position --format json
 # 回到零关节位
 piper-cli home
 
-# 前往安全停靠位
+# 前往安全停靠位并在完成后 disable
 piper-cli park
 
 # 写入零点
@@ -76,9 +76,11 @@ piper> exit
 REPL 现在使用“前台输入 + 后台命令 worker”模型：
 
 - `move` / `home` / `park` 在后台执行
+- REPL 的 `park` 只会移动到当前配置的 `park_pose()`，不会自动 disable
 - 运行期间主线程仍能处理 `stop` 和 `Ctrl+C`
-- 当前运动会被取消，然后统一执行 `disable_all()`
-- 连接会保留在 `Standby`
+- 若当前有 motion 在运行，这两个命令会先取消该 motion，再把 REPL 会话带回 `Standby`
+- 这是面向 active session 的交互式急停路径
+- 它和 REPL 的显式 `disable` 流程不同
 - shell 中不做交互式确认；需要确认的 `move` / `set-zero` 必须显式加 `--force`
 - 若需要交互确认，请使用 one-shot CLI
 - `Ctrl+D` 会直接退出 shell；若当前命令仍在运行，会先请求急停并在命令收尾后退出
@@ -130,9 +132,18 @@ timeout_ms = 5000
 
 ### `park`
 
-- 前往配置中的安全停靠位
+- one-shot CLI `park` 和脚本里的 `Park` 会先进入停靠流程，再 disable
+- REPL 的 `park` 只前往配置中的安全停靠位，不会自动 disable
 - 默认由 `orientation` 决定
 - 若配置了 `rest_pose_override`，优先使用自定义停靠位
+
+### REPL `disable`
+
+- 这是 REPL 命令，不是 one-shot 顶层子命令
+- 只发送 raw disable，不附带任何移动或停靠动作
+- 会阻塞直到 disable 完成，并把连接和会话留在 `Standby`
+- 它是没有停靠、没有额外 motion 的明确 disable 路径
+- 外部 one-shot 急停路径仍然是 `piper-cli stop`
 
 ### `set-zero`
 
@@ -156,12 +167,12 @@ timeout_ms = 5000
 
 ### REPL 内急停
 
-`stop` 和 `Ctrl+C` 统一执行：
+`stop` 和 `Ctrl+C` 统一执行 REPL 的急停路径，不等同于普通的 `disable`：
 
 1. 取消当前 `move/home/park`（如果正在运行）
-2. 发送 `disable_all()`
-3. 保持连接
-4. 最终回到 `Standby`
+2. 把 REPL 会话带回 `Standby`
+3. 这是交互式急停路径，用来处理中断中的 motion
+4. 与 REPL 的显式 `disable` 流程分开处理
 
 这是推荐的交互式急停路径。
 
@@ -200,6 +211,7 @@ piper-cli run --script examples/move_sequence.json
 ```
 
 脚本中的 `move` / `home` / `park` / `set-zero` 与 CLI one-shot 共享同一套控制 workflow。
+其中 `Park` 会走与 one-shot `piper-cli park` 相同的 standby-entry park 流程，然后再 disable。
 
 ## 开发
 

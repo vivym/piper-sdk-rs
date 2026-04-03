@@ -23,6 +23,15 @@ pub enum MotionExecutionOutcome {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MotionProgressSnapshot {
+    pub elapsed: std::time::Duration,
+    pub current: [f64; 6],
+    pub target: [f64; 6],
+    pub joint_errors: [f64; 6],
+    pub max_error: f64,
+}
+
 pub fn prepare_move(
     current: [f64; 6],
     requested_joints: &[f64],
@@ -83,6 +92,28 @@ where
     }
 }
 
+pub(crate) fn active_move_to_joint_target_blocking_with_progress<Capability, ReportProgress>(
+    robot: &Piper<Active<PositionMode>, Capability>,
+    target: [f64; 6],
+    wait: &MotionWaitConfig,
+    report_progress: ReportProgress,
+) -> Result<()>
+where
+    Capability: MotionCapability,
+    ReportProgress: FnMut(&MotionProgressSnapshot),
+{
+    match active_move_to_joint_target_with_cancel_and_progress(
+        robot,
+        target,
+        wait,
+        || false,
+        report_progress,
+    )? {
+        MotionExecutionOutcome::Reached => Ok(()),
+        MotionExecutionOutcome::Cancelled => bail!("motion was cancelled before completion"),
+    }
+}
+
 pub fn active_move_to_joint_target_with_cancel<Capability, ShouldCancel>(
     robot: &Piper<Active<PositionMode>, Capability>,
     target: [f64; 6],
@@ -103,6 +134,33 @@ where
     )
 }
 
+pub(crate) fn active_move_to_joint_target_with_cancel_and_progress<
+    Capability,
+    ShouldCancel,
+    ReportProgress,
+>(
+    robot: &Piper<Active<PositionMode>, Capability>,
+    target: [f64; 6],
+    wait: &MotionWaitConfig,
+    should_cancel: ShouldCancel,
+    report_progress: ReportProgress,
+) -> Result<MotionExecutionOutcome>
+where
+    Capability: MotionCapability,
+    ShouldCancel: Fn() -> bool,
+    ReportProgress: FnMut(&MotionProgressSnapshot),
+{
+    let target_positions = joint_array_from_f64(target);
+    blocking_motion_loop_with_cancel_and_progress(
+        target,
+        wait,
+        || observer_positions(robot.observer()).map_err(Into::into),
+        || robot.send_position_command(&target_positions).map_err(Into::into),
+        should_cancel,
+        report_progress,
+    )
+}
+
 pub fn move_to_joint_target_blocking<Capability>(
     standby: Piper<Standby, Capability>,
     profile: &ControlProfile,
@@ -114,6 +172,37 @@ where
     let active = standby.enable_position_mode(profile.position_mode_config())?;
     active_move_to_joint_target_blocking(&active, target, &profile.wait)?;
     active.disable(DisableConfig::default()).map_err(Into::into)
+}
+
+pub fn active_park_blocking<Capability>(
+    robot: &Piper<Active<PositionMode>, Capability>,
+    profile: &ControlProfile,
+) -> Result<()>
+where
+    Capability: MotionCapability,
+{
+    active_park_blocking_with_progress(robot, profile, |_| {})
+}
+
+pub fn active_park_blocking_with_progress<Capability, ReportProgress>(
+    robot: &Piper<Active<PositionMode>, Capability>,
+    profile: &ControlProfile,
+    mut report_progress: ReportProgress,
+) -> Result<()>
+where
+    Capability: MotionCapability,
+    ReportProgress: FnMut(&MotionProgressSnapshot),
+{
+    active_park_blocking_with(
+        robot,
+        profile,
+        |robot, config| robot.reapply_position_mode_config(config).map_err(Into::into),
+        |robot, target, wait| {
+            active_move_to_joint_target_blocking_with_progress(robot, target, wait, |snapshot| {
+                report_progress(snapshot);
+            })
+        },
+    )
 }
 
 pub fn home_zero_blocking<Capability>(
@@ -133,7 +222,46 @@ pub fn park_blocking<Capability>(
 where
     Capability: MotionCapability,
 {
-    move_to_joint_target_blocking(standby, profile, profile.park_pose())
+    park_blocking_with(
+        standby,
+        profile,
+        |standby, config| Ok(standby.enable_position_mode(config)?),
+        active_move_to_joint_target_blocking,
+        |active| active.disable(DisableConfig::default()).map_err(Into::into),
+    )
+}
+
+fn active_park_blocking_with<Robot, Reapply, Move>(
+    robot: &Robot,
+    profile: &ControlProfile,
+    mut reapply_position_mode: Reapply,
+    mut move_to_joint_target: Move,
+) -> Result<()>
+where
+    Reapply: FnMut(&Robot, piper_client::state::PositionModeConfig) -> Result<()>,
+    Move: FnMut(&Robot, [f64; 6], &MotionWaitConfig) -> Result<()>,
+{
+    reapply_position_mode(robot, profile.park_position_mode_config()?)?;
+    let park_wait = profile.park_wait_config();
+    move_to_joint_target(robot, profile.park_pose(), &park_wait)
+}
+
+fn park_blocking_with<StandbyRobot, ActiveRobot, Enable, Move, Disable>(
+    standby: StandbyRobot,
+    profile: &ControlProfile,
+    mut enable_position_mode: Enable,
+    mut move_to_joint_target: Move,
+    mut disable: Disable,
+) -> Result<StandbyRobot>
+where
+    Enable: FnMut(StandbyRobot, piper_client::state::PositionModeConfig) -> Result<ActiveRobot>,
+    Move: FnMut(&ActiveRobot, [f64; 6], &MotionWaitConfig) -> Result<()>,
+    Disable: FnMut(ActiveRobot) -> Result<StandbyRobot>,
+{
+    let active = enable_position_mode(standby, profile.park_position_mode_config()?)?;
+    let park_wait = profile.park_wait_config();
+    move_to_joint_target(&active, profile.park_pose(), &park_wait)?;
+    disable(active)
 }
 
 pub fn set_joint_zero_blocking<Capability>(
@@ -206,8 +334,8 @@ fn is_monitor_warmup_error(error: &anyhow::Error) -> bool {
 fn blocking_motion_loop_with_cancel<ReadCurrent, Publish, ShouldCancel>(
     target: [f64; 6],
     wait: &MotionWaitConfig,
-    mut read_current: ReadCurrent,
-    mut publish: Publish,
+    read_current: ReadCurrent,
+    publish: Publish,
     should_cancel: ShouldCancel,
 ) -> Result<MotionExecutionOutcome>
 where
@@ -215,13 +343,35 @@ where
     Publish: FnMut() -> Result<()>,
     ShouldCancel: Fn() -> bool,
 {
-    let max_error = |current: [f64; 6]| {
-        current
-            .iter()
-            .zip(target.iter())
-            .map(|(current, target)| (target - current).abs())
-            .fold(0.0_f64, f64::max)
-    };
+    blocking_motion_loop_with_cancel_and_progress(
+        target,
+        wait,
+        read_current,
+        publish,
+        should_cancel,
+        |_| {},
+    )
+}
+
+fn blocking_motion_loop_with_cancel_and_progress<
+    ReadCurrent,
+    Publish,
+    ShouldCancel,
+    ReportProgress,
+>(
+    target: [f64; 6],
+    wait: &MotionWaitConfig,
+    mut read_current: ReadCurrent,
+    mut publish: Publish,
+    should_cancel: ShouldCancel,
+    mut report_progress: ReportProgress,
+) -> Result<MotionExecutionOutcome>
+where
+    ReadCurrent: FnMut() -> Result<[f64; 6]>,
+    Publish: FnMut() -> Result<()>,
+    ShouldCancel: Fn() -> bool,
+    ReportProgress: FnMut(&MotionProgressSnapshot),
+{
     let start = Instant::now();
 
     if should_cancel() {
@@ -231,7 +381,9 @@ where
     let initial_error = loop {
         match read_current() {
             Ok(current) => {
-                if max_error(current) <= wait.threshold_rad {
+                if motion_progress_snapshot(start.elapsed(), current, target).max_error
+                    <= wait.threshold_rad
+                {
                     return Ok(MotionExecutionOutcome::Reached);
                 }
                 break None;
@@ -264,8 +416,8 @@ where
             return Ok(MotionExecutionOutcome::Cancelled);
         }
 
-        let max_error = match read_current() {
-            Ok(current) => max_error(current),
+        let snapshot = match read_current() {
+            Ok(current) => motion_progress_snapshot(start.elapsed(), current, target),
             Err(error) if is_monitor_warmup_error(&error) => {
                 if start.elapsed() >= wait.timeout {
                     return Err(error);
@@ -281,17 +433,21 @@ where
             },
             Err(error) => return Err(error),
         };
+        report_progress(&snapshot);
 
-        if max_error <= wait.threshold_rad {
+        if snapshot.max_error <= wait.threshold_rad {
             return Ok(MotionExecutionOutcome::Reached);
         }
 
         let now = Instant::now();
         if now.duration_since(start) >= wait.timeout {
             bail!(
-                "motion did not reach target within {:.2}s (remaining max error {:.4} rad)",
+                "motion did not reach target within {:.2}s (remaining max error {:.4} rad, current={}, target={}, joint_errors={})",
                 wait.timeout.as_secs_f64(),
-                max_error
+                snapshot.max_error,
+                format_joint_values(&snapshot.current),
+                format_joint_values(&snapshot.target),
+                format_joint_values(&snapshot.joint_errors),
             );
         }
 
@@ -309,6 +465,30 @@ where
         }
         std::thread::sleep(wait.poll_interval.min(remaining));
     }
+}
+
+fn motion_progress_snapshot(
+    elapsed: std::time::Duration,
+    current: [f64; 6],
+    target: [f64; 6],
+) -> MotionProgressSnapshot {
+    let joint_errors = std::array::from_fn(|index| (target[index] - current[index]).abs());
+    let max_error = joint_errors.iter().copied().fold(0.0_f64, f64::max);
+
+    MotionProgressSnapshot {
+        elapsed,
+        current,
+        target,
+        joint_errors,
+        max_error,
+    }
+}
+
+fn format_joint_values(values: &[f64; 6]) -> String {
+    format!(
+        "[{:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+        values[0], values[1], values[2], values[3], values[4], values[5]
+    )
 }
 
 fn verify_collision_protection_after_write<Query, Publish>(
@@ -367,10 +547,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ParkOrientation;
     use piper_client::MonitorStateSource;
+    use piper_client::SoftRealtime;
+    use piper_driver::ConnectionTarget;
     use piper_tools::SafetyConfig;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    fn test_profile_with_park_speed(park_speed_percent: u8) -> ControlProfile {
+        ControlProfile {
+            target: ConnectionTarget::AutoStrict,
+            orientation: ParkOrientation::Upright,
+            rest_pose_override: None,
+            park_speed_percent,
+            safety: SafetyConfig::default_config(),
+            wait: MotionWaitConfig::default(),
+        }
+    }
+
+    fn test_profile_with_park_speed_and_timeout(
+        park_speed_percent: u8,
+        timeout: Duration,
+    ) -> ControlProfile {
+        let mut profile = test_profile_with_park_speed(park_speed_percent);
+        profile.wait.timeout = timeout;
+        profile
+    }
 
     #[test]
     fn prepare_move_uses_delta_from_current_state() {
@@ -520,6 +723,117 @@ mod tests {
     }
 
     #[test]
+    fn park_blocking_uses_profile_park_pose_and_park_wait_budget() {
+        let profile = test_profile_with_park_speed_and_timeout(5, Duration::from_secs(2));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let standby = ();
+        park_blocking_with(
+            standby,
+            &profile,
+            {
+                let calls = Arc::clone(&calls);
+                move |standby, config| {
+                    calls.lock().unwrap().push(format!(
+                        "enable:{}:{:?}",
+                        config.speed_percent, config.install_position
+                    ));
+                    assert_eq!(config.speed_percent, 5);
+                    Ok(standby)
+                }
+            },
+            {
+                let calls = Arc::clone(&calls);
+                move |_, target, wait| {
+                    calls.lock().unwrap().push(format!(
+                        "move:{target:?}:{:.3}:{}",
+                        wait.threshold_rad,
+                        wait.timeout.as_secs()
+                    ));
+                    assert_eq!(target, [0.0, 0.0, 0.0, 0.02, 0.5, 0.0]);
+                    assert_eq!(wait.timeout, Duration::from_secs(15));
+                    Ok(())
+                }
+            },
+            {
+                let calls = Arc::clone(&calls);
+                move |standby| {
+                    calls.lock().unwrap().push("disable".to_string());
+                    Ok(standby)
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "enable:5:Horizontal".to_string(),
+                "move:[0.0, 0.0, 0.0, 0.02, 0.5, 0.0]:0.020:15".to_string(),
+                "disable".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn active_park_blocking_applies_park_position_mode_config_before_move() {
+        let mut profile = test_profile_with_park_speed_and_timeout(5, Duration::from_secs(2));
+        profile.orientation = ParkOrientation::Left;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let robot = ();
+        active_park_blocking_with(
+            &robot,
+            &profile,
+            {
+                let calls = Arc::clone(&calls);
+                move |_, config| {
+                    calls.lock().unwrap().push(format!(
+                        "reconfigure:{}:{:?}",
+                        config.speed_percent, config.install_position
+                    ));
+                    assert_eq!(config.speed_percent, 5);
+                    assert_eq!(
+                        config.install_position,
+                        profile.orientation.install_position()
+                    );
+                    Ok(())
+                }
+            },
+            {
+                let calls = Arc::clone(&calls);
+                move |_, target, wait| {
+                    calls.lock().unwrap().push(format!(
+                        "move:{target:?}:{:.3}:{}",
+                        wait.threshold_rad,
+                        wait.timeout.as_secs()
+                    ));
+                    assert_eq!(target, ParkOrientation::Left.default_rest_pose());
+                    assert_eq!(wait.threshold_rad, profile.wait.threshold_rad);
+                    assert_eq!(wait.timeout, Duration::from_secs(15));
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "reconfigure:5:SideLeft".to_string(),
+                "move:[1.71, 2.96, -2.65, 1.41, -0.081, -0.19]:0.020:15".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn active_park_blocking_is_available_from_public_api() {
+        let _active_park: fn(
+            &Piper<Active<PositionMode>, SoftRealtime>,
+            &ControlProfile,
+        ) -> Result<()> = crate::active_park_blocking::<SoftRealtime>;
+    }
+
+    #[test]
     fn verify_collision_protection_after_write_accepts_query_match() {
         let wait = MotionWaitConfig {
             threshold_rad: 0.02,
@@ -573,6 +887,41 @@ mod tests {
             error.to_string().contains("motion did not reach target within 0.02s"),
             "unexpected timeout error: {error}",
         );
+    }
+
+    #[test]
+    fn blocking_motion_loop_progress_variant_reports_snapshots_and_timeout_details() {
+        let wait = MotionWaitConfig {
+            threshold_rad: 0.01,
+            poll_interval: Duration::from_millis(1),
+            republish_interval: Duration::from_millis(50),
+            timeout: Duration::from_millis(5),
+        };
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+
+        let error = blocking_motion_loop_with_cancel_and_progress(
+            [1.0, 0.5, 0.0, 0.0, 0.0, 0.0],
+            &wait,
+            || Ok([0.25, 0.1, 0.0, 0.0, 0.0, 0.0]),
+            || Ok(()),
+            || false,
+            {
+                let snapshots = Arc::clone(&snapshots);
+                move |snapshot| snapshots.lock().unwrap().push(snapshot.clone())
+            },
+        )
+        .expect_err("unreached target should time out with progress details");
+
+        let snapshots = snapshots.lock().unwrap();
+        assert!(
+            !snapshots.is_empty(),
+            "progress callback should receive snapshots"
+        );
+        assert_eq!(snapshots[0].target, [1.0, 0.5, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(snapshots[0].current, [0.25, 0.1, 0.0, 0.0, 0.0, 0.0]);
+        assert!(error.to_string().contains("current=["));
+        assert!(error.to_string().contains("target=["));
+        assert!(error.to_string().contains("joint_errors=["));
     }
 
     #[test]

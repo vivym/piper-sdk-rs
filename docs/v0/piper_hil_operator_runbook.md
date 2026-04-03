@@ -85,8 +85,8 @@
 这些阈值在 Phase 1-4 中都沿用相同含义：
 
 - `client_monitor_hil_check` 负责 connection budget、first snapshot budget 和 observation window
-- `hil_joint_position_check` 负责 Standby、enable、move、return 的低风险运动证据
-- `piper-cli` 负责 disable、stop、recovery gating 和故障后最小安全验证
+- `hil_joint_position_check` 负责低风险 motion 路径的主证据；默认成功路径会完成 Standby、enable、move、return、park、disable
+- `piper-cli` 仍负责显式 raw disable、stop、recovery gating 和故障后最小安全验证
 
 ## Phase 0: Preflight and Safety Baseline
 
@@ -219,12 +219,14 @@
    ```bash
    cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
    ```
-2. 重点看 helper 中下面这些 accepted evidence lines：
+2. `hil_joint_position_check` 的成功路径默认按下面顺序收尾：先完成 `move`，再回到初始 snapshot，随后按 `--park-orientation` 选择的内置 rest pose 停靠，最后才会 disable。
+3. 如果显式传入 `--no-park`，则只跳过停车步骤；helper 仍会在回到初始 snapshot 后 disable，其他通过判据不变。
+4. 重点看 helper 中下面这些 accepted evidence lines：
    - `[PASS] connected and confirmed Standby`
    - `[PASS] enabled PositionMode motion=Joint speed_percent=...`
    - `[PASS] settle step=move ...`
    - `[PASS] settle step=return ...`
-3. 对 explicit disable path，使用：
+5. 对 explicit disable path，使用 REPL `disable`：
    ```bash
    cargo run -p piper-cli -- shell
    connect socketcan:can0
@@ -232,21 +234,19 @@
    disable
    exit
    ```
-4. `disable` 后，立刻用只读 helper 确认系统回到 non-driving state：
-   ```bash
-   cargo run -p piper-sdk --example robot_monitor -- --interface can0
-   ```
-   或：
+   这条命令是 raw disable，不做停靠或额外运动；它会等待 disable 完成并把会话留在 `Standby`。这和 REPL 的 `stop` / `Ctrl+C` 交互式急停路径不同；若当前有 motion 在运行，后者会先取消该 motion，再把 REPL 会话带回 `Standby`。
+6. `disable` 后，立刻用 `state_api_demo` 确认系统回到 disabled / non-driving state：
    ```bash
    cargo run -p piper-sdk --example state_api_demo -- --interface can0
    ```
+   `robot_monitor` 可以作为额外的只读视图，但不能单独作为 disable 证据。
    这一步要作为 disable 的一部分来执行，不要省略。
-5. 对外部 stop path，使用：
+7. 对外部 stop path，使用：
    ```bash
    cargo run -p piper-cli -- stop --target socketcan:can0
    ```
-6. `stop` 之后，同样立刻用 `robot_monitor` 或 `state_api_demo` 确认 non-driving state。
-7. 对 rejected-state gating，使用一个可复现的流程：
+8. `stop` 之后，同样立刻用 `state_api_demo` 确认 disabled / non-driving state；`robot_monitor` 仍然只作为可选的辅助观察。
+9. 对 rejected-state gating，使用一个可复现的流程：
    - `Terminal 3` 打开：
      ```bash
      cargo run -p piper-cli -- shell
@@ -285,7 +285,7 @@
 ### 需要填写到结果模板的字段与 checklist 勾选
 
 - Checklist: `Phase 2: Safe Lifecycle and State Transitions` 里的 `hil_joint_position_check`、确认 Standby、确认 enable 进入 `PositionMode + MotionType::Joint`、确认 move / return、explicit disable、`piper-cli stop`、rejected-state gating、reconnect re-check
-- Results template: `Phase 2: Safe Lifecycle and State Transitions`，必填 `Standby evidence`，`Enable evidence`，`Disable evidence`，`Drop or emergency-stop evidence`，`Rejected-state gating evidence`，`Reconnect evidence`，并补充 `Observed` / `Notes` / `Artifacts`；其中 disable / stop 之后的 `robot_monitor` 或 `state_api_demo` 输出也要放进 `Disable evidence` 或 `Drop or emergency-stop evidence`
+- Results template: `Phase 2: Safe Lifecycle and State Transitions`，必填 `Standby evidence`，`Enable evidence`，`Disable evidence`，`Drop or emergency-stop evidence`，`Rejected-state gating evidence`，`Reconnect evidence`，并补充 `Observed` / `Notes` / `Artifacts`；其中 disable / stop 之后的 `state_api_demo` 输出是必填证据，`robot_monitor` 只能作为可选的辅助观察
 
 ## Phase 3: Low-Risk Motion Validation
 
@@ -454,9 +454,9 @@
 - Phase 3 出现 wrong direction、jump、oscillation、overshoot 或异常 transient
 - Phase 4 的 recovery 还不可信，或者 motion gating 还没被再次证明
 
-## 最小完整执行序列
+## 快速命令参考
 
-下面是一条最小、按顺序的执行链骨架。它**不替代**上面的 phase 细则，也不能跳过 rejected-state rerun、fault induction/restoration、fresh helper rerun、readable-state recovery confirmation 这些步骤：
+下面是一条按顺序排列的快速命令骨架，便于现场复制粘贴。它**不是**完整执行序列，不能替代上面的 phase 细则，也不能跳过 rejected-state rerun、fault induction/restoration、fresh helper rerun、readable-state recovery confirmation、Phase 3 的完整判据与操作步骤：
 
 ```bash
 # Phase 0: preflight
@@ -479,7 +479,7 @@ enable
 # keep this shell session active; do not `disable` yet
 cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
 disable
-cargo run -p piper-sdk --example robot_monitor -- --interface can0
+cargo run -p piper-sdk --example state_api_demo -- --interface can0
 exit
 
 # Phase 2: explicit stop path and read-only corroboration
