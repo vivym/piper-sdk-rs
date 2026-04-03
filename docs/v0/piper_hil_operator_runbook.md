@@ -234,7 +234,7 @@
    disable
    exit
    ```
-   这条命令是 raw disable，不做停靠或额外运动；它会等待 disable 完成并把会话留在 `Standby`。这和 REPL 的 `stop` / `Ctrl+C` 交互式急停路径不同，后者会取消当前 motion 并把 REPL 会话带回 `Standby`。
+   这条命令是 raw disable，不做停靠或额外运动；它会等待 disable 完成并把会话留在 `Standby`。这和 REPL 的 `stop` / `Ctrl+C` 交互式急停路径不同；若当前有 motion 在运行，后者会先取消该 motion，再把 REPL 会话带回 `Standby`。
 6. `disable` 后，立刻用 `state_api_demo` 确认系统回到 disabled / non-driving state：
    ```bash
    cargo run -p piper-sdk --example state_api_demo -- --interface can0
