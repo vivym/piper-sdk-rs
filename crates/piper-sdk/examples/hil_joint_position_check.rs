@@ -30,6 +30,7 @@ const POSITION_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PREFLIGHT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const PREFLIGHT_TARGET_JOINT_FAIL_MARGIN_RAD: f64 = 0.05;
 const PARK_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_NON_TARGET_DELTA_RAD: f64 = 0.003;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliParkOrientation {
@@ -76,6 +77,10 @@ struct Args {
     /// Settle timeout for each commanded move, in milliseconds.
     #[arg(long, default_value_t = DEFAULT_SETTLE_TIMEOUT_MS)]
     settle_timeout_ms: u64,
+
+    /// Maximum allowed absolute motion on any non-target joint during each step.
+    #[arg(long, default_value_t = DEFAULT_MAX_NON_TARGET_DELTA_RAD)]
+    max_non_target_delta_rad: f64,
 
     /// Skip success-path parking before disable.
     #[arg(long)]
@@ -229,6 +234,13 @@ where
         "[PASS] settle step=move joint=J{} observed_delta_rad={:.6} target_delta_rad={:.6} position_error_rad={:.6}",
         args.joint, observed_delta, args.delta_rad, move_error
     );
+    let move_summary = summarize_joint_motion(&initial_positions, &moved_positions, joint_index);
+    println!(
+        "[INFO] {}",
+        format_motion_delta_summary("move", &move_summary)
+    );
+    validate_joint_isolation("move", &move_summary, args.max_non_target_delta_rad)
+        .map_err(Box::<dyn Error>::from)?;
 
     robot.send_position_command(&initial_positions)?;
     println!(
@@ -251,6 +263,13 @@ where
         "[PASS] settle step=return joint=J{} final_position_rad={:.6} return_error_rad={:.6} tolerance_rad={:.6}",
         args.joint, returned_joint.0, return_error, POSITION_SETTLE_TOLERANCE_RAD
     );
+    let return_summary = summarize_joint_motion(&moved_positions, &returned_positions, joint_index);
+    println!(
+        "[INFO] {}",
+        format_motion_delta_summary("return", &return_summary)
+    );
+    validate_joint_isolation("return", &return_summary, args.max_non_target_delta_rad)
+        .map_err(Box::<dyn Error>::from)?;
 
     if args.no_park {
         let _robot = robot.disable(DisableConfig::default())?;
@@ -332,6 +351,61 @@ fn format_joint_values(values: &[f64; 6]) -> String {
         "[J1={:.4}, J2={:.4}, J3={:.4}, J4={:.4}, J5={:.4}, J6={:.4}]",
         values[0], values[1], values[2], values[3], values[4], values[5]
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JointMotionSummary {
+    joint_deltas: [f64; 6],
+    max_non_target_joint_index: usize,
+    max_non_target_joint_delta_rad: f64,
+}
+
+fn summarize_joint_motion(
+    before: &JointArray<Rad>,
+    after: &JointArray<Rad>,
+    target_joint_index: usize,
+) -> JointMotionSummary {
+    let joint_deltas = std::array::from_fn(|index| after[index].0 - before[index].0);
+    let (max_non_target_joint_index, max_non_target_joint_delta_rad) = joint_deltas
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != target_joint_index)
+        .map(|(index, delta)| (index, delta.abs()))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap_or((target_joint_index, 0.0));
+
+    JointMotionSummary {
+        joint_deltas,
+        max_non_target_joint_index,
+        max_non_target_joint_delta_rad,
+    }
+}
+
+fn format_motion_delta_summary(step: &str, summary: &JointMotionSummary) -> String {
+    format!(
+        "step={} joint_delta_rad={} max_non_target_joint_delta_rad={:.6} joint=J{}",
+        step,
+        format_joint_values(&summary.joint_deltas),
+        summary.max_non_target_joint_delta_rad,
+        summary.max_non_target_joint_index + 1,
+    )
+}
+
+fn validate_joint_isolation(
+    step: &str,
+    summary: &JointMotionSummary,
+    max_non_target_delta_rad: f64,
+) -> Result<(), String> {
+    if summary.max_non_target_joint_delta_rad > max_non_target_delta_rad {
+        return Err(format!(
+            "non-target joint drift exceeded threshold during {}: {} threshold_rad={:.6}",
+            step,
+            format_motion_delta_summary(step, summary),
+            max_non_target_delta_rad,
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -455,6 +529,12 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if args.settle_timeout_ms == 0 {
         return Err("settle_timeout_ms must be > 0".to_string());
     }
+    if !args.max_non_target_delta_rad.is_finite() {
+        return Err("max_non_target_delta_rad must be finite".to_string());
+    }
+    if args.max_non_target_delta_rad < 0.0 {
+        return Err("max_non_target_delta_rad must be >= 0".to_string());
+    }
 
     Ok(())
 }
@@ -531,6 +611,7 @@ fn validate_args_rejects_excessive_speed() {
         delta_rad: 0.02,
         speed_percent: 11,
         settle_timeout_ms: 10_000,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -548,6 +629,7 @@ fn validate_args_rejects_excessive_delta() {
         delta_rad: 0.04,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -565,6 +647,7 @@ fn validate_args_rejects_non_finite_delta() {
         delta_rad: f64::NAN,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -583,6 +666,7 @@ fn validate_args_rejects_invalid_joint() {
         delta_rad: 0.02,
         speed_percent: 10,
         settle_timeout_ms: 10_000,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -600,6 +684,7 @@ fn validate_args_rejects_zero_settle_timeout() {
         delta_rad: 0.02,
         speed_percent: 10,
         settle_timeout_ms: 0,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -617,6 +702,7 @@ fn validate_args_accepts_no_park() {
         delta_rad: 0.02,
         speed_percent: 5,
         settle_timeout_ms: 10_000,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: true,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -654,6 +740,7 @@ fn final_success_line_distinguishes_no_park_path() {
         delta_rad: 0.02,
         speed_percent: 5,
         settle_timeout_ms: 10_000,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: true,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -664,6 +751,7 @@ fn final_success_line_distinguishes_no_park_path() {
         delta_rad: 0.02,
         speed_percent: 5,
         settle_timeout_ms: 10_000,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: false,
         park_orientation: CliParkOrientation::Left,
     };
@@ -698,6 +786,7 @@ fn park_profile_maps_orientation_and_wait_fields() {
         delta_rad: 0.02,
         speed_percent: 7,
         settle_timeout_ms: 12_345,
+        max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         no_park: false,
         park_orientation: CliParkOrientation::Left,
     };
@@ -767,6 +856,87 @@ fn park_progress_log_interval_does_not_burst_after_large_gap() {
         &mut next_log_at
     ));
     assert_eq!(next_log_at, Duration::from_millis(5200));
+}
+
+#[test]
+fn motion_summary_reports_all_joint_deltas_and_max_non_target() {
+    let before = JointArray::from([
+        Rad(0.0),
+        Rad(-0.04),
+        Rad(0.03),
+        Rad(0.02),
+        Rad(0.42),
+        Rad(0.0),
+    ]);
+    let after = JointArray::from([
+        Rad(0.02),
+        Rad(-0.0388),
+        Rad(0.0305),
+        Rad(0.0205),
+        Rad(0.4202),
+        Rad(-0.0004),
+    ]);
+
+    let summary = summarize_joint_motion(&before, &after, 0);
+
+    assert_eq!(summary.joint_deltas[0], 0.02);
+    assert_eq!(summary.max_non_target_joint_index, 1);
+    assert!((summary.max_non_target_joint_delta_rad - 0.0012).abs() < 1e-9);
+    assert!(format_motion_delta_summary("move", &summary).contains("joint=J2"));
+}
+
+#[test]
+fn joint_isolation_rejects_large_non_target_drift() {
+    let before = JointArray::from([
+        Rad(0.0),
+        Rad(-0.0462),
+        Rad(0.0411),
+        Rad(0.0191),
+        Rad(0.4208),
+        Rad(0.0),
+    ]);
+    let after = JointArray::from([
+        Rad(0.0),
+        Rad(-0.0178),
+        Rad(0.0129),
+        Rad(0.0485),
+        Rad(0.4231),
+        Rad(0.0),
+    ]);
+
+    let summary = summarize_joint_motion(&before, &after, 3);
+    let error = validate_joint_isolation("move", &summary, 0.003)
+        .expect_err("large non-target drift must fail the single-joint check");
+
+    assert!(error.contains("non-target joint drift"));
+    assert!(error.contains("step=move"));
+    assert!(error.contains("joint=J2"));
+    assert!(error.contains("0.028"));
+}
+
+#[test]
+fn joint_isolation_accepts_small_non_target_drift() {
+    let before = JointArray::from([
+        Rad(0.0),
+        Rad(-0.04),
+        Rad(0.03),
+        Rad(0.02),
+        Rad(0.42),
+        Rad(0.0),
+    ]);
+    let after = JointArray::from([
+        Rad(0.02),
+        Rad(-0.0388),
+        Rad(0.0305),
+        Rad(0.0205),
+        Rad(0.4202),
+        Rad(-0.0004),
+    ]);
+
+    let summary = summarize_joint_motion(&before, &after, 0);
+
+    validate_joint_isolation("move", &summary, 0.003)
+        .expect("small non-target drift should be accepted");
 }
 
 #[test]
