@@ -103,23 +103,7 @@ impl<'a> RawCommander<'a> {
         positions: &JointArray<Rad>,
         timeout: Duration,
     ) -> Result<()> {
-        use piper_protocol::control::{JointControl12, JointControl34, JointControl56};
-
-        // 准备所有关节的角度（度）
-        let j1_deg = positions[Joint::J1].to_deg().0;
-        let j2_deg = positions[Joint::J2].to_deg().0;
-        let j3_deg = positions[Joint::J3].to_deg().0;
-        let j4_deg = positions[Joint::J4].to_deg().0;
-        let j5_deg = positions[Joint::J5].to_deg().0;
-        let j6_deg = positions[Joint::J6].to_deg().0;
-
-        // 创建 3 个 CAN 帧（使用数组，栈上分配，零堆内存分配）
-        let frames = [
-            JointControl12::new(j1_deg, j2_deg).to_frame(), // 0x155
-            JointControl34::new(j3_deg, j4_deg).to_frame(), // 0x156
-            JointControl56::new(j5_deg, j6_deg).to_frame(), // 0x157
-        ];
-
+        let frames = build_joint_position_frames(positions);
         self.driver.send_reliable_package_confirmed(frames, timeout)?;
         Ok(())
     }
@@ -395,6 +379,23 @@ impl<'a> RawCommander<'a> {
     }
 }
 
+fn build_joint_position_frames(positions: &JointArray<Rad>) -> [PiperFrame; 3] {
+    use piper_protocol::control::{JointControl12, JointControl34, JointControl56};
+
+    let j1_deg = positions[Joint::J1].to_deg().0;
+    let j2_deg = positions[Joint::J2].to_deg().0;
+    let j3_deg = positions[Joint::J3].to_deg().0;
+    let j4_deg = positions[Joint::J4].to_deg().0;
+    let j5_deg = positions[Joint::J5].to_deg().0;
+    let j6_deg = positions[Joint::J6].to_deg().0;
+
+    [
+        JointControl12::new(j1_deg, j2_deg).to_frame(),
+        JointControl34::new(j3_deg, j4_deg).to_frame(),
+        JointControl56::new(j5_deg, j6_deg).to_frame(),
+    ]
+}
+
 // 确保 Send + Sync
 unsafe impl<'a> Send for RawCommander<'a> {}
 unsafe impl<'a> Sync for RawCommander<'a> {}
@@ -576,6 +577,34 @@ mod tests {
         let frames = wait_for_sent_frames(&sent_frames, 3);
         let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
         assert_eq!(ids, vec![0x155, 0x156, 0x157]);
+    }
+
+    #[test]
+    fn test_send_position_command_batch_encodes_target_payloads() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let driver = build_driver(sent_frames.clone());
+        let commander = RawCommander::new(&driver);
+        let positions = JointArray::from([
+            Rad(0.11),
+            Rad(-0.22),
+            Rad(0.33),
+            Rad(-0.44),
+            Rad(0.55),
+            Rad(-0.66),
+        ]);
+
+        commander
+            .send_position_command_batch(&positions, Duration::from_millis(20))
+            .expect("joint position batch should succeed");
+
+        let frames = wait_for_sent_frames(&sent_frames, 3);
+        let expected_frames = build_joint_position_frames(&positions);
+
+        assert_eq!(frames.len(), expected_frames.len());
+        for (observed, expected) in frames.iter().zip(expected_frames.iter()) {
+            assert_eq!(observed.id, expected.id);
+            assert_eq!(observed.data, expected.data);
+        }
     }
 
     #[test]

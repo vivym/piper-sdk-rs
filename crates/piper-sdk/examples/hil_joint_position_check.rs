@@ -3,6 +3,7 @@ use piper_control::{
     ControlProfile, MotionProgressSnapshot, MotionWaitConfig, ParkOrientation,
     active_park_blocking_with_progress,
 };
+use piper_protocol::control::{JointControl12, JointControl34, JointControl56};
 use piper_sdk::PiperBuilder;
 use piper_sdk::client::state::machine::MotionType;
 use piper_sdk::client::state::{
@@ -81,6 +82,10 @@ struct Args {
     /// Maximum allowed absolute motion on any non-target joint during each step.
     #[arg(long, default_value_t = DEFAULT_MAX_NON_TARGET_DELTA_RAD)]
     max_non_target_delta_rad: f64,
+
+    /// Trace encoded joint command payloads before transmission.
+    #[arg(long, default_value_t = false)]
+    trace_command_payload: bool,
 
     /// Skip success-path parking before disable.
     #[arg(long)]
@@ -215,6 +220,12 @@ where
         "[PASS] command step=move joint=J{} target_rad={:.6} delta_rad={:.6} speed_percent={}",
         args.joint, target_joint.0, args.delta_rad, args.speed_percent
     );
+    if args.trace_command_payload {
+        println!(
+            "[INFO] {}",
+            format_joint_command_payload_trace("move", &target_positions)
+        );
+    }
 
     robot.send_position_command(&target_positions)?;
 
@@ -247,6 +258,12 @@ where
         "[PASS] command step=return joint=J{} target_rad={:.6}",
         args.joint, initial_joint.0
     );
+    if args.trace_command_payload {
+        println!(
+            "[INFO] {}",
+            format_joint_command_payload_trace("return", &initial_positions)
+        );
+    }
 
     let returned_positions = wait_for_joint_settle(
         observer,
@@ -350,6 +367,41 @@ fn format_joint_values(values: &[f64; 6]) -> String {
     format!(
         "[J1={:.4}, J2={:.4}, J3={:.4}, J4={:.4}, J5={:.4}, J6={:.4}]",
         values[0], values[1], values[2], values[3], values[4], values[5]
+    )
+}
+
+fn format_joint_command_payload_trace(step: &str, positions: &JointArray<Rad>) -> String {
+    let frames = build_joint_command_frames(positions);
+    let target_values = std::array::from_fn(|index| positions[index].0);
+    format!(
+        "step={} target_rad={} 0x155={} 0x156={} 0x157={}",
+        step,
+        format_joint_values(&target_values),
+        format_frame_hex(&frames[0].data),
+        format_frame_hex(&frames[1].data),
+        format_frame_hex(&frames[2].data),
+    )
+}
+
+fn build_joint_command_frames(positions: &JointArray<Rad>) -> [piper_can::PiperFrame; 3] {
+    let j1_deg = positions[0].to_deg().0;
+    let j2_deg = positions[1].to_deg().0;
+    let j3_deg = positions[2].to_deg().0;
+    let j4_deg = positions[3].to_deg().0;
+    let j5_deg = positions[4].to_deg().0;
+    let j6_deg = positions[5].to_deg().0;
+
+    [
+        JointControl12::new(j1_deg, j2_deg).to_frame(),
+        JointControl34::new(j3_deg, j4_deg).to_frame(),
+        JointControl56::new(j5_deg, j6_deg).to_frame(),
+    ]
+}
+
+fn format_frame_hex(data: &[u8; 8]) -> String {
+    format!(
+        "[{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}]",
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]
     )
 }
 
@@ -612,6 +664,7 @@ fn validate_args_rejects_excessive_speed() {
         speed_percent: 11,
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -630,6 +683,7 @@ fn validate_args_rejects_excessive_delta() {
         speed_percent: 10,
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -648,6 +702,7 @@ fn validate_args_rejects_non_finite_delta() {
         speed_percent: 10,
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -667,6 +722,7 @@ fn validate_args_rejects_invalid_joint() {
         speed_percent: 10,
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -685,6 +741,7 @@ fn validate_args_rejects_zero_settle_timeout() {
         speed_percent: 10,
         settle_timeout_ms: 0,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -703,6 +760,7 @@ fn validate_args_accepts_no_park() {
         speed_percent: 5,
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: true,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -741,6 +799,7 @@ fn final_success_line_distinguishes_no_park_path() {
         speed_percent: 5,
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: true,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -752,6 +811,7 @@ fn final_success_line_distinguishes_no_park_path() {
         speed_percent: 5,
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: false,
         park_orientation: CliParkOrientation::Left,
     };
@@ -787,6 +847,7 @@ fn park_profile_maps_orientation_and_wait_fields() {
         speed_percent: 7,
         settle_timeout_ms: 12_345,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
+        trace_command_payload: false,
         no_park: false,
         park_orientation: CliParkOrientation::Left,
     };
@@ -801,6 +862,33 @@ fn park_profile_maps_orientation_and_wait_fields() {
     assert_eq!(profile.park_speed_percent, 7);
     assert_eq!(profile.wait.threshold_rad, POSITION_SETTLE_TOLERANCE_RAD);
     assert_eq!(profile.wait.timeout, Duration::from_millis(12_345));
+}
+
+#[test]
+fn cli_parses_trace_command_payload_flag() {
+    let args = parse_args_for_test(["--trace-command-payload"]);
+
+    assert!(args.trace_command_payload);
+}
+
+#[test]
+fn command_payload_trace_includes_targets_and_can_frames() {
+    let positions = JointArray::from([
+        Rad(0.11),
+        Rad(-0.22),
+        Rad(0.33),
+        Rad(-0.44),
+        Rad(0.55),
+        Rad(-0.66),
+    ]);
+
+    let trace = format_joint_command_payload_trace("move", &positions);
+
+    assert!(trace.contains("step=move"));
+    assert!(trace.contains("target_rad=[J1=0.1100"));
+    assert!(trace.contains("0x155="));
+    assert!(trace.contains("0x156="));
+    assert!(trace.contains("0x157="));
 }
 
 #[test]
