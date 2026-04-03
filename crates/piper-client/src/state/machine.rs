@@ -2585,7 +2585,10 @@ where
     ///
     /// 借用态重新配置只能更新由控制器保存并可通过 0x151 确认的字段，例如
     /// `speed_percent` 和 `install_position`。`motion_type` 与 `command_timeout`
-    /// 仍由当前 `Active<PositionMode>` 的本地状态定义，因此必须保持一致。
+    /// 仍由当前 `Active<PositionMode>` 的本地状态定义。
+    ///
+    /// `motion_type` 必须与当前 Active 状态一致；传入的 `command_timeout`
+    /// 不会发送到控制器，因此会被忽略，并继续沿用当前 Active 状态里的本地值。
     pub fn reapply_position_mode_config(&self, config: PositionModeConfig) -> Result<()> {
         let position_mode = &self._state.0;
         if config.motion_type != position_mode.motion_type {
@@ -2595,18 +2598,19 @@ where
                 actual = config.motion_type,
             )));
         }
-        if config.command_timeout != position_mode.command_timeout {
-            return Err(RobotError::ConfigError(format!(
-                "reapply_position_mode_config cannot change command_timeout from {:?} to {:?} on a borrowed Active<PositionMode>",
-                position_mode.command_timeout, config.command_timeout,
-            )));
-        }
+
+        let effective_config = PositionModeConfig {
+            command_timeout: position_mode.command_timeout,
+            ..config
+        };
 
         debug!(
             "Reapplying Position mode config (motion_type={:?}, speed_percent={}, install_position={:?})",
-            config.motion_type, config.speed_percent, config.install_position
+            effective_config.motion_type,
+            effective_config.speed_percent,
+            effective_config.install_position
         );
-        self.apply_position_mode_control_config(&config)
+        self.apply_position_mode_control_config(&effective_config)
     }
 
     /// 发送位置命令（批量发送所有关节）
@@ -4380,6 +4384,80 @@ mod tests {
                 piper_protocol::control::MitMode::PositionVelocity,
                 0,
                 InstallPosition::SideLeft,
+            )
+            .to_frame()
+        );
+    }
+
+    #[test]
+    fn active_position_mode_reapply_config_allows_incoming_command_timeout_mismatch() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveJ, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(5),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveJ, 200),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(1),
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveJ,
+                5,
+                piper_protocol::control::MitMode::PositionVelocity,
+                InstallPosition::SideRight,
+                201,
+            ),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
+        let active = standby
+            .enable_position_mode(PositionModeConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 10,
+                install_position: InstallPosition::Invalid,
+                motion_type: MotionType::Joint,
+                command_timeout: Duration::from_millis(75),
+            })
+            .expect(
+                "matching 0x2A1 should allow Active<PositionMode> with non-default command_timeout",
+            );
+
+        active
+            .reapply_position_mode_config(PositionModeConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 5,
+                install_position: InstallPosition::SideRight,
+                motion_type: MotionType::Joint,
+                command_timeout: Duration::from_millis(20),
+            })
+            .expect("borrowed reapply should ignore incoming command_timeout mismatch");
+
+        let control_mode_frames: Vec<_> = sent_frames
+            .lock()
+            .expect("sent frames lock")
+            .iter()
+            .filter(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE)
+            .copied()
+            .collect();
+
+        assert_eq!(control_mode_frames.len(), 2);
+        assert_eq!(
+            control_mode_frames[1],
+            piper_protocol::control::ControlModeCommandFrame::new(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveJ,
+                5,
+                piper_protocol::control::MitMode::PositionVelocity,
+                0,
+                InstallPosition::SideRight,
             )
             .to_frame()
         );
