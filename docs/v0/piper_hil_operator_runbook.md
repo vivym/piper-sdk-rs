@@ -219,7 +219,7 @@
    ```bash
    cargo run -p piper-sdk --example hil_joint_position_check -- --interface can0 --baud-rate 1000000 --joint 1 --delta-rad 0.02 --speed-percent 10
    ```
-2. `hil_joint_position_check` 的成功路径默认按下面顺序收尾：先完成 `move`，再回到初始 snapshot，随后按配置的 rest pose 停靠，最后才会 disable。
+2. `hil_joint_position_check` 的成功路径默认按下面顺序收尾：先完成 `move`，再回到初始 snapshot，随后按 `--park-orientation` 选择的内置 rest pose 停靠，最后才会 disable。
 3. 如果显式传入 `--no-park`，则只跳过停车步骤；helper 仍会在回到初始 snapshot 后 disable，其他通过判据不变。
 4. 重点看 helper 中下面这些 accepted evidence lines：
    - `[PASS] connected and confirmed Standby`
@@ -234,7 +234,7 @@
    disable
    exit
    ```
-   这条命令是 raw disable，不做停靠或额外运动；它会等待 disable 完成并把会话留在 `Standby`。这和 `stop` / `Ctrl+C` 的 `disable_all()` 急停路径不同。
+   这条命令是 raw disable，不做停靠或额外运动；它会等待 disable 完成并把会话留在 `Standby`。这和 REPL 的 `stop` / `Ctrl+C` 交互式急停路径不同，后者会取消当前 motion 并把 REPL 会话带回 `Standby`。
 6. `disable` 后，立刻用 `state_api_demo` 确认系统回到 disabled / non-driving state：
    ```bash
    cargo run -p piper-sdk --example state_api_demo -- --interface can0

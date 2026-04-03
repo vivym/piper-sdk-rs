@@ -34,7 +34,7 @@
 | Circular | `move_circular()` | `hil_circular_motion_check` | 至少一个采样点进入 via 点邻域，最终点单独收敛 | `|delta_x| <= 0.02 m`, `|via_offset| <= 0.015 m`, `speed_percent <= 10` | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
 | MIT | `command_torques()` | `hil_mit_hold_check` | 选定关节出现小但可观测的位置响应，回程误差在容差内 | `delta_rad <= 0.02`, `speed_percent <= 10`, 低增益起步 | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
 | ReplayMode | `replay_recording()` | `hil_replay_mode_check` | 成功进入 `ReplayMode`，回放完成后返回确认的 `Standby` | `speed <= 5.0`; 推荐 `<= 2.0` | 失败时检查录制文件并重新 `stop` |
-| Gripper | `open_gripper()`, `close_gripper()`, `set_gripper()` | `hil_gripper_check` | 打开、闭合、再次打开都观察到夹爪位置变化 | `close_effort <= 1.0`, `speed_percent <= 10` | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
+| Gripper | `open_gripper()`, `close_gripper()` | `hil_gripper_check` | 打开、闭合、再次打开都观察到夹爪位置变化 | `close_effort <= 1.0`, `speed_percent <= 10` | 成功后仅依赖 drop-time best-effort disable；不要把它当作已确认的 Standby。若要证明退出态，请单独做 `state_api_demo` 或 `stop`。 |
 
 ## 推荐命令
 
