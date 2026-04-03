@@ -530,6 +530,13 @@ where
         Ok(*latest_complete)
     }
 
+    /// 获取当前缓存的机器人控制状态快照。
+    ///
+    /// 该接口直接返回 driver 最近一次发布的 `0x2A1` 状态，用于诊断和监控。
+    pub fn robot_control_snapshot(&self) -> piper_driver::state::RobotControlState {
+        self.driver.get_robot_control()
+    }
+
     /// 检查是否全部使能（raw cached bits）
     pub fn is_all_enabled(&self) -> bool {
         self.joint_enabled_mask() == 0b111111
@@ -824,7 +831,7 @@ mod tests {
     use piper_protocol::ids::{
         ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_GRIPPER_FEEDBACK,
         ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE, ID_JOINT_FEEDBACK_12,
-        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
+        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56, ID_ROBOT_STATUS,
     };
     use std::collections::VecDeque;
     use std::thread;
@@ -1056,6 +1063,20 @@ mod tests {
         data[0..4].copy_from_slice(&first_raw.to_be_bytes());
         data[4..8].copy_from_slice(&second_raw.to_be_bytes());
         let mut frame = PiperFrame::new_standard(can_id, &data);
+        frame.timestamp_us = timestamp_us;
+        frame
+    }
+
+    fn robot_status_frame(
+        control_mode: u8,
+        robot_status: u8,
+        move_mode: u8,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut frame = PiperFrame::new_standard(
+            ID_ROBOT_STATUS as u16,
+            &[control_mode, robot_status, move_mode, 0, 0, 0, 0, 0],
+        );
         frame.timestamp_us = timestamp_us;
         frame
     }
@@ -1927,6 +1948,22 @@ mod tests {
             .expect("last complete end pose should remain readable");
 
         assert_eq!(end_pose.end_pose, [0.0; 6]);
+    }
+
+    #[test]
+    fn test_robot_control_snapshot_returns_cached_status() {
+        let timestamp_us = 1_000;
+        let frames = vec![robot_status_frame(1, 4, 2, timestamp_us)];
+        let (driver, observer) = start_observer_with_frames(frames);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("robot status feedback should arrive");
+
+        let snapshot = observer.robot_control_snapshot();
+        assert_eq!(snapshot.control_mode, 1);
+        assert_eq!(snapshot.robot_status, 4);
+        assert_eq!(snapshot.move_mode, 2);
     }
 
     #[test]
