@@ -1,5 +1,8 @@
 use clap::{Parser, ValueEnum};
-use piper_control::{ControlProfile, MotionWaitConfig, ParkOrientation, active_park_blocking};
+use piper_control::{
+    ControlProfile, MotionProgressSnapshot, MotionWaitConfig, ParkOrientation,
+    active_park_blocking_with_progress,
+};
 use piper_sdk::PiperBuilder;
 use piper_sdk::client::state::machine::MotionType;
 use piper_sdk::client::state::{
@@ -26,6 +29,7 @@ const INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5
 const POSITION_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PREFLIGHT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const PREFLIGHT_TARGET_JOINT_FAIL_MARGIN_RAD: f64 = 0.05;
+const PARK_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliParkOrientation {
@@ -253,7 +257,18 @@ where
         println!("[PASS] skipped parking via --no-park and disabled robot");
     } else {
         let park_profile = park_profile(args);
-        active_park_blocking(&robot, &park_profile)?;
+        let park_target = park_profile.park_pose();
+        println!(
+            "[PASS] command step=park orientation={} target_rad={}",
+            ParkOrientation::from(args.park_orientation),
+            format_joint_values(&park_target)
+        );
+        let mut next_park_log_at = PARK_PROGRESS_LOG_INTERVAL;
+        active_park_blocking_with_progress(&robot, &park_profile, |snapshot| {
+            if should_emit_park_progress_log(snapshot.elapsed, &mut next_park_log_at) {
+                println!("{}", format_park_progress_line(snapshot));
+            }
+        })?;
         let _robot = robot.disable(DisableConfig::default())?;
         println!(
             "[PASS] parked orientation={} before disable",
@@ -291,6 +306,32 @@ fn final_success_line(args: &Args) -> String {
             ParkOrientation::from(args.park_orientation)
         )
     }
+}
+
+fn should_emit_park_progress_log(elapsed: Duration, next_log_at: &mut Duration) -> bool {
+    if elapsed >= *next_log_at {
+        *next_log_at = elapsed + PARK_PROGRESS_LOG_INTERVAL;
+        true
+    } else {
+        false
+    }
+}
+
+fn format_park_progress_line(snapshot: &MotionProgressSnapshot) -> String {
+    format!(
+        "[INFO] park progress t={:.1}s current_rad={} joint_error_rad={} max_error_rad={:.4}",
+        snapshot.elapsed.as_secs_f64(),
+        format_joint_values(&snapshot.current),
+        format_joint_values(&snapshot.joint_errors),
+        snapshot.max_error,
+    )
+}
+
+fn format_joint_values(values: &[f64; 6]) -> String {
+    format!(
+        "[J1={:.4}, J2={:.4}, J3={:.4}, J4={:.4}, J5={:.4}, J6={:.4}]",
+        values[0], values[1], values[2], values[3], values[4], values[5]
+    )
 }
 
 #[cfg(test)]
@@ -671,6 +712,61 @@ fn park_profile_maps_orientation_and_wait_fields() {
     assert_eq!(profile.park_speed_percent, 7);
     assert_eq!(profile.wait.threshold_rad, POSITION_SETTLE_TOLERANCE_RAD);
     assert_eq!(profile.wait.timeout, Duration::from_millis(12_345));
+}
+
+#[test]
+fn park_progress_log_interval_throttles_to_once_per_second() {
+    let mut next_log_at = Duration::from_secs(1);
+
+    assert!(!should_emit_park_progress_log(
+        Duration::from_millis(900),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_secs(1));
+
+    assert!(should_emit_park_progress_log(
+        Duration::from_secs(1),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_secs(2));
+
+    assert!(!should_emit_park_progress_log(
+        Duration::from_millis(1500),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_secs(2));
+
+    assert!(should_emit_park_progress_log(
+        Duration::from_secs(2),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_secs(3));
+}
+
+#[test]
+fn park_progress_log_interval_does_not_burst_after_large_gap() {
+    let mut next_log_at = Duration::from_secs(1);
+
+    assert!(should_emit_park_progress_log(
+        Duration::from_millis(3200),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_millis(4200));
+
+    assert!(!should_emit_park_progress_log(
+        Duration::from_millis(3210),
+        &mut next_log_at
+    ));
+    assert!(!should_emit_park_progress_log(
+        Duration::from_millis(4199),
+        &mut next_log_at
+    ));
+
+    assert!(should_emit_park_progress_log(
+        Duration::from_millis(4200),
+        &mut next_log_at
+    ));
+    assert_eq!(next_log_at, Duration::from_millis(5200));
 }
 
 #[test]
