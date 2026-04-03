@@ -32,6 +32,7 @@ const PREFLIGHT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const PREFLIGHT_TARGET_JOINT_FAIL_MARGIN_RAD: f64 = 0.05;
 const PARK_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_NON_TARGET_DELTA_RAD: f64 = 0.003;
+const NORMALIZE_J2J3_INDICES: [usize; 2] = [1, 2];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliParkOrientation {
@@ -86,6 +87,10 @@ struct Args {
     /// Trace encoded joint command payloads before transmission.
     #[arg(long, default_value_t = false)]
     trace_command_payload: bool,
+
+    /// Precondition the arm by commanding J2/J3 to 0 before the target-joint move.
+    #[arg(long, default_value_t = false)]
+    normalize_j2j3: bool,
 
     /// Skip success-path parking before disable.
     #[arg(long)]
@@ -204,6 +209,11 @@ where
         INITIAL_MONITOR_SNAPSHOT_POLL_INTERVAL,
         || observer.joint_positions(),
     )?;
+    let initial_positions = if args.normalize_j2j3 {
+        run_j2j3_normalization_step(&robot, observer, &initial_positions, args)?
+    } else {
+        initial_positions
+    };
 
     let joint_index = usize::from(args.joint - 1);
     let initial_joint = initial_positions[joint_index];
@@ -381,6 +391,74 @@ fn format_joint_command_payload_trace(step: &str, positions: &JointArray<Rad>) -
         format_frame_hex(&frames[1].data),
         format_frame_hex(&frames[2].data),
     )
+}
+
+fn normalize_j2j3_positions(current: &JointArray<Rad>) -> JointArray<Rad> {
+    let mut normalized = *current;
+    normalized.as_array_mut()[1] = Rad(0.0);
+    normalized.as_array_mut()[2] = Rad(0.0);
+    normalized
+}
+
+fn run_j2j3_normalization_step<Capability>(
+    robot: &Piper<
+        piper_sdk::client::state::Active<piper_sdk::client::state::PositionMode>,
+        Capability,
+    >,
+    observer: &piper_sdk::client::observer::Observer<Capability>,
+    current_positions: &JointArray<Rad>,
+    args: &Args,
+) -> Result<JointArray<Rad>, Box<dyn Error>>
+where
+    Capability: MotionCapability,
+{
+    let normalized_targets = normalize_j2j3_positions(current_positions);
+    if joints_within_tolerance(
+        current_positions,
+        &normalized_targets,
+        &NORMALIZE_J2J3_INDICES,
+        POSITION_SETTLE_TOLERANCE_RAD,
+    ) {
+        println!("[PASS] skipped step=normalize-j2j3 already within tolerance");
+        return Ok(*current_positions);
+    }
+
+    println!(
+        "[PASS] command step=normalize-j2j3 target_rad={}",
+        format_joint_values(&std::array::from_fn(|index| normalized_targets[index].0))
+    );
+    if args.trace_command_payload {
+        println!(
+            "[INFO] {}",
+            format_joint_command_payload_trace("normalize-j2j3", &normalized_targets)
+        );
+    }
+
+    robot.send_position_command(&normalized_targets)?;
+    let normalized_positions = wait_for_joint_subset_settle(
+        observer,
+        current_positions,
+        &normalized_targets,
+        &NORMALIZE_J2J3_INDICES,
+        Duration::from_millis(args.settle_timeout_ms),
+        POSITION_SETTLE_POLL_INTERVAL,
+    )?;
+    println!(
+        "[PASS] settle step=normalize-j2j3 final_rad={}",
+        format_joint_values(&std::array::from_fn(|index| normalized_positions[index].0))
+    );
+    Ok(normalized_positions)
+}
+
+fn joints_within_tolerance(
+    current: &JointArray<Rad>,
+    target: &JointArray<Rad>,
+    indices: &[usize],
+    tolerance_rad: f64,
+) -> bool {
+    indices
+        .iter()
+        .all(|index| (current[*index].0 - target[*index].0).abs() <= tolerance_rad)
 }
 
 fn build_joint_command_frames(positions: &JointArray<Rad>) -> [piper_can::PiperFrame; 3] {
@@ -565,6 +643,63 @@ where
     }
 }
 
+fn wait_for_joint_subset_settle<Capability>(
+    observer: &piper_sdk::client::observer::Observer<Capability>,
+    start_positions: &JointArray<Rad>,
+    target_positions: &JointArray<Rad>,
+    indices: &[usize],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> ClientResult<JointArray<Rad>>
+where
+    Capability: MotionCapability,
+{
+    let start = Instant::now();
+    let max_total_delta = indices
+        .iter()
+        .map(|index| (target_positions[*index].0 - start_positions[*index].0).abs())
+        .fold(0.0_f64, f64::max);
+    let progress_threshold = (max_total_delta * 0.25).max(MIN_PROGRESS_RAD).min(max_total_delta);
+    let mut progress_seen = max_total_delta <= POSITION_SETTLE_TOLERANCE_RAD;
+
+    loop {
+        if start.elapsed() >= timeout {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let positions =
+            wait_for_monitor_snapshot(remaining, poll_interval, || observer.joint_positions())?;
+        let max_observed_delta = indices
+            .iter()
+            .map(|index| (positions[*index].0 - start_positions[*index].0).abs())
+            .fold(0.0_f64, f64::max);
+        let all_within_tolerance = indices.iter().all(|index| {
+            (positions[*index].0 - target_positions[*index].0).abs()
+                <= POSITION_SETTLE_TOLERANCE_RAD
+        });
+
+        if !progress_seen && max_observed_delta >= progress_threshold {
+            progress_seen = true;
+        }
+
+        if progress_seen && all_within_tolerance {
+            return Ok(positions);
+        }
+
+        let sleep_duration = poll_interval.min(timeout.saturating_sub(start.elapsed()));
+        if sleep_duration.is_zero() {
+            return Err(RobotError::Timeout {
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        std::thread::sleep(sleep_duration);
+    }
+}
+
 fn validate_args(args: &Args) -> Result<(), String> {
     if !(1..=6).contains(&args.joint) {
         return Err("joint must be between 1 and 6".to_string());
@@ -665,6 +800,7 @@ fn validate_args_rejects_excessive_speed() {
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -684,6 +820,7 @@ fn validate_args_rejects_excessive_delta() {
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -703,6 +840,7 @@ fn validate_args_rejects_non_finite_delta() {
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -723,6 +861,7 @@ fn validate_args_rejects_invalid_joint() {
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -742,6 +881,7 @@ fn validate_args_rejects_zero_settle_timeout() {
         settle_timeout_ms: 0,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: false,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -761,6 +901,7 @@ fn validate_args_accepts_no_park() {
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: true,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -773,6 +914,13 @@ fn cli_parses_no_park_flag() {
     let args = parse_args_for_test(["--no-park"]);
 
     assert!(args.no_park);
+}
+
+#[test]
+fn cli_parses_normalize_j2j3_flag() {
+    let args = parse_args_for_test(["--normalize-j2j3"]);
+
+    assert!(args.normalize_j2j3);
 }
 
 #[test]
@@ -800,6 +948,7 @@ fn final_success_line_distinguishes_no_park_path() {
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: true,
         park_orientation: CliParkOrientation::Upright,
     };
@@ -812,6 +961,7 @@ fn final_success_line_distinguishes_no_park_path() {
         settle_timeout_ms: 10_000,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: false,
         park_orientation: CliParkOrientation::Left,
     };
@@ -848,6 +998,7 @@ fn park_profile_maps_orientation_and_wait_fields() {
         settle_timeout_ms: 12_345,
         max_non_target_delta_rad: DEFAULT_MAX_NON_TARGET_DELTA_RAD,
         trace_command_payload: false,
+        normalize_j2j3: false,
         no_park: false,
         park_orientation: CliParkOrientation::Left,
     };
@@ -889,6 +1040,27 @@ fn command_payload_trace_includes_targets_and_can_frames() {
     assert!(trace.contains("0x155="));
     assert!(trace.contains("0x156="));
     assert!(trace.contains("0x157="));
+}
+
+#[test]
+fn normalize_j2j3_positions_zeroes_j2_j3_and_preserves_others() {
+    let current = JointArray::from([
+        Rad(0.11),
+        Rad(-0.22),
+        Rad(0.33),
+        Rad(-0.44),
+        Rad(0.55),
+        Rad(-0.66),
+    ]);
+
+    let normalized = normalize_j2j3_positions(&current);
+
+    assert_eq!(normalized[0].0, 0.11);
+    assert_eq!(normalized[1].0, 0.0);
+    assert_eq!(normalized[2].0, 0.0);
+    assert_eq!(normalized[3].0, -0.44);
+    assert_eq!(normalized[4].0, 0.55);
+    assert_eq!(normalized[5].0, -0.66);
 }
 
 #[test]
