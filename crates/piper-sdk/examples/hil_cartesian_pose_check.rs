@@ -26,6 +26,7 @@ struct CartesianSettleRequest {
     baseline_robot_control: RobotControlState,
     timeout: Duration,
     poll_interval: Duration,
+    trace_robot_status: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +78,10 @@ struct Args {
     /// Settle timeout for each commanded move, in milliseconds.
     #[arg(long, default_value_t = DEFAULT_SETTLE_TIMEOUT_MS)]
     settle_timeout_ms: u64,
+
+    /// Trace robot_control changes during settle; prints only when the state changes.
+    #[arg(long, default_value_t = false)]
+    trace_robot_status: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -186,6 +191,7 @@ where
             baseline_robot_control: move_baseline_control,
             timeout: Duration::from_millis(args.settle_timeout_ms),
             poll_interval: POSITION_SETTLE_POLL_INTERVAL,
+            trace_robot_status: args.trace_robot_status,
         },
     )?;
     let moved_position = position_from_end_pose(moved_pose.end_pose);
@@ -212,6 +218,7 @@ where
             baseline_robot_control: return_baseline_control,
             timeout: Duration::from_millis(args.settle_timeout_ms),
             poll_interval: POSITION_SETTLE_POLL_INTERVAL,
+            trace_robot_status: args.trace_robot_status,
         },
     )?;
     let returned_position = position_from_end_pose(returned_pose.end_pose);
@@ -251,6 +258,19 @@ fn validate_args(args: &Args) -> Result<(), String> {
         return Err("settle_timeout_ms must be > 0".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn parse_args_for_test(extra_args: &[&str]) -> Args {
+    let mut argv = vec![
+        "hil_cartesian_pose_check",
+        "--interface",
+        "test-interface",
+        "--delta-x",
+        "0.01",
+    ];
+    argv.extend_from_slice(extra_args);
+    Args::try_parse_from(argv).expect("cli args should parse")
 }
 
 #[allow(dead_code)]
@@ -329,6 +349,51 @@ fn format_cartesian_timeout_diagnostics(diagnostics: &CartesianTimeoutDiagnostic
     )
 }
 
+fn format_confirmed_driver_enabled_mask(mask: Option<u8>) -> String {
+    match mask {
+        Some(mask) => format!("{mask:06b}"),
+        None => "<pending>".to_string(),
+    }
+}
+
+fn format_robot_control_trace_line(
+    elapsed: Duration,
+    observed_delta_m: f64,
+    state: &RobotControlState,
+) -> String {
+    format!(
+        "[TRACE] t={:.3}s robot_status={} control_mode={} move_mode={} motion_status={} driver_enabled_mask={:06b} confirmed_driver_enabled_mask={} observed_delta_m={:.6}",
+        elapsed.as_secs_f64(),
+        state.robot_status,
+        state.control_mode,
+        state.move_mode,
+        state.motion_status,
+        state.driver_enabled_mask,
+        format_confirmed_driver_enabled_mask(state.confirmed_driver_enabled_mask),
+        observed_delta_m,
+    )
+}
+
+fn maybe_emit_robot_control_trace<EmitTrace>(
+    trace_enabled: bool,
+    elapsed: Duration,
+    observed_delta_m: f64,
+    current_control: &RobotControlState,
+    last_traced_control: &mut RobotControlState,
+    mut emit_trace: EmitTrace,
+) where
+    EmitTrace: FnMut(String),
+{
+    if trace_enabled && has_control_state_changed(last_traced_control, current_control) {
+        emit_trace(format_robot_control_trace_line(
+            elapsed,
+            observed_delta_m,
+            current_control,
+        ));
+        *last_traced_control = current_control.clone();
+    }
+}
+
 fn wait_for_monitor_snapshot<T, Read>(
     timeout: Duration,
     poll_interval: Duration,
@@ -402,6 +467,7 @@ where
     let total_delta = translation_distance(request.start_position, request.target_position);
     let min_progress = progress_threshold(total_delta);
     let mut progress_seen = false;
+    let mut last_traced_control = request.baseline_robot_control.clone();
     let mut progress = CartesianSettleProgress {
         min_progress_m: min_progress,
         max_observed_delta_m: 0.0,
@@ -431,6 +497,14 @@ where
         let observed_delta = translation_distance(observed_position, request.start_position);
         let remaining_error = translation_distance(observed_position, request.target_position);
         let current_control = read_control();
+        maybe_emit_robot_control_trace(
+            request.trace_robot_status,
+            start.elapsed(),
+            observed_delta,
+            &current_control,
+            &mut last_traced_control,
+            |line| println!("{line}"),
+        );
         progress.max_observed_delta_m = progress.max_observed_delta_m.max(observed_delta);
         progress.remaining_error_m = remaining_error;
         progress.last_pose = Some(pose);
@@ -506,6 +580,7 @@ fn validate_args_rejects_non_positive_speed_percent() {
         delta_z: 0.0,
         speed_percent: 0,
         settle_timeout_ms: 10_000,
+        trace_robot_status: false,
     };
 
     let error = validate_args(&args).expect_err("speed 0 must be rejected");
@@ -522,6 +597,7 @@ fn validate_args_rejects_zero_translation_delta() {
         delta_z: 0.0,
         speed_percent: 5,
         settle_timeout_ms: 10_000,
+        trace_robot_status: false,
     };
 
     let error = validate_args(&args).expect_err("zero translation must be rejected");
@@ -559,6 +635,7 @@ fn format_cartesian_timeout_diagnostics_includes_last_pose_and_robot_state() {
             },
             timeout: Duration::from_secs(10),
             poll_interval: Duration::from_millis(10),
+            trace_robot_status: false,
         },
         progress: CartesianSettleProgress {
             min_progress_m: 0.0025,
@@ -621,6 +698,7 @@ fn format_cartesian_timeout_diagnostics_marks_missing_last_pose() {
             baseline_robot_control: RobotControlState::default(),
             timeout: Duration::from_secs(10),
             poll_interval: Duration::from_millis(10),
+            trace_robot_status: false,
         },
         progress: CartesianSettleProgress {
             min_progress_m: 0.0025,
@@ -685,6 +763,7 @@ fn settle_emits_timeout_warning_when_end_pose_read_times_out() {
             baseline_robot_control: baseline.clone(),
             timeout: Duration::from_millis(10),
             poll_interval: Duration::from_millis(1),
+            trace_robot_status: false,
         },
         |_remaining, _poll_interval| Err(RobotError::Timeout { timeout_ms: 10 }),
         || baseline.clone(),
@@ -699,4 +778,61 @@ fn settle_emits_timeout_warning_when_end_pose_read_times_out() {
         other => panic!("expected timeout, got {other:?}"),
     }
     assert!(warned.get(), "timeout path should emit diagnostics");
+}
+
+#[test]
+fn cli_parses_trace_robot_status_flag() {
+    let args = parse_args_for_test(&["--trace-robot-status"]);
+    assert!(args.trace_robot_status);
+}
+
+#[test]
+fn robot_control_trace_only_emits_on_change() {
+    let baseline = RobotControlState {
+        robot_status: 0,
+        control_mode: 1,
+        move_mode: 0,
+        motion_status: 0,
+        driver_enabled_mask: 0,
+        confirmed_driver_enabled_mask: Some(0),
+        ..Default::default()
+    };
+    let changed = RobotControlState {
+        robot_status: 4,
+        driver_enabled_mask: 0b11_1111,
+        confirmed_driver_enabled_mask: Some(0b11_1111),
+        ..baseline.clone()
+    };
+    let mut last_traced = baseline.clone();
+    let mut lines: Vec<String> = Vec::new();
+
+    maybe_emit_robot_control_trace(
+        true,
+        Duration::from_millis(10),
+        0.0,
+        &baseline,
+        &mut last_traced,
+        |line| lines.push(line),
+    );
+    maybe_emit_robot_control_trace(
+        true,
+        Duration::from_millis(20),
+        0.0,
+        &changed,
+        &mut last_traced,
+        |line| lines.push(line),
+    );
+    maybe_emit_robot_control_trace(
+        true,
+        Duration::from_millis(30),
+        0.001,
+        &changed,
+        &mut last_traced,
+        |line| lines.push(line),
+    );
+
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("t=0.020s"));
+    assert!(lines[0].contains("robot_status=4"));
+    assert!(lines[0].contains("driver_enabled_mask=111111"));
 }
