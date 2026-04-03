@@ -123,7 +123,12 @@ pub fn active_park_blocking<Capability>(
 where
     Capability: MotionCapability,
 {
-    active_park_blocking_with(robot, profile, active_move_to_joint_target_blocking)
+    active_park_blocking_with(
+        robot,
+        profile,
+        |robot, config| robot.reapply_position_mode_config(config).map_err(Into::into),
+        active_move_to_joint_target_blocking,
+    )
 }
 
 pub fn home_zero_blocking<Capability>(
@@ -152,14 +157,17 @@ where
     )
 }
 
-fn active_park_blocking_with<Robot, Move>(
+fn active_park_blocking_with<Robot, Reapply, Move>(
     robot: &Robot,
     profile: &ControlProfile,
+    mut reapply_position_mode: Reapply,
     mut move_to_joint_target: Move,
 ) -> Result<()>
 where
+    Reapply: FnMut(&Robot, piper_client::state::PositionModeConfig) -> Result<()>,
     Move: FnMut(&Robot, [f64; 6], &MotionWaitConfig) -> Result<()>,
 {
+    reapply_position_mode(robot, profile.park_position_mode_config()?)?;
     let park_wait = profile.park_wait_config();
     move_to_joint_target(robot, profile.park_pose(), &park_wait)
 }
@@ -641,34 +649,53 @@ mod tests {
     }
 
     #[test]
-    fn active_park_blocking_reuses_existing_joint_motion_helper_with_park_wait_budget() {
-        let profile = test_profile_with_park_speed_and_timeout(5, Duration::from_secs(2));
-        assert_eq!(
-            profile.park_pose(),
-            ParkOrientation::Upright.default_rest_pose()
-        );
+    fn active_park_blocking_applies_park_position_mode_config_before_move() {
+        let mut profile = test_profile_with_park_speed_and_timeout(5, Duration::from_secs(2));
+        profile.orientation = ParkOrientation::Left;
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let robot = ();
-        active_park_blocking_with(&robot, &profile, {
-            let calls = Arc::clone(&calls);
-            move |_, target, wait| {
-                calls.lock().unwrap().push(format!(
-                    "move:{target:?}:{:.3}:{}",
-                    wait.threshold_rad,
-                    wait.timeout.as_secs()
-                ));
-                assert_eq!(target, ParkOrientation::Upright.default_rest_pose());
-                assert_eq!(wait.threshold_rad, profile.wait.threshold_rad);
-                assert_eq!(wait.timeout, Duration::from_secs(15));
-                Ok(())
-            }
-        })
+        active_park_blocking_with(
+            &robot,
+            &profile,
+            {
+                let calls = Arc::clone(&calls);
+                move |_, config| {
+                    calls.lock().unwrap().push(format!(
+                        "reconfigure:{}:{:?}",
+                        config.speed_percent, config.install_position
+                    ));
+                    assert_eq!(config.speed_percent, 5);
+                    assert_eq!(
+                        config.install_position,
+                        profile.orientation.install_position()
+                    );
+                    Ok(())
+                }
+            },
+            {
+                let calls = Arc::clone(&calls);
+                move |_, target, wait| {
+                    calls.lock().unwrap().push(format!(
+                        "move:{target:?}:{:.3}:{}",
+                        wait.threshold_rad,
+                        wait.timeout.as_secs()
+                    ));
+                    assert_eq!(target, ParkOrientation::Left.default_rest_pose());
+                    assert_eq!(wait.threshold_rad, profile.wait.threshold_rad);
+                    assert_eq!(wait.timeout, Duration::from_secs(15));
+                    Ok(())
+                }
+            },
+        )
         .unwrap();
 
         assert_eq!(
             *calls.lock().unwrap(),
-            vec!["move:[0.0, 0.0, 0.0, 0.02, 0.5, 0.0]:0.020:15".to_string()],
+            vec![
+                "reconfigure:5:SideLeft".to_string(),
+                "move:[1.71, 2.96, -2.65, 1.41, -0.081, -0.19]:0.020:15".to_string(),
+            ],
         );
     }
 

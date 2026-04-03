@@ -963,7 +963,6 @@ where
     where
         Capability: MotionCapability,
     {
-        use piper_protocol::control::*;
         debug!(
             "Enabling Position mode (motion_type={:?}, speed_percent={})",
             config.motion_type, config.speed_percent
@@ -978,7 +977,7 @@ where
         // === PHASE 1: All operations that can panic ===
 
         // 1. 发送使能指令
-        let enable_cmd = MotorEnableCommand::enable_all();
+        let enable_cmd = piper_protocol::control::MotorEnableCommand::enable_all();
         let enable_commit_host_mono_us = self
             .driver
             .send_reliable_frame_confirmed_commit_marker(enable_cmd.to_frame(), config.timeout)?;
@@ -994,33 +993,7 @@ where
         debug!("All motors enabled (debounced)");
 
         // 3. 设置位置模式
-        // ✅ 修改：使用配置的 motion_type
-        let move_mode: MoveMode = config.motion_type.into();
-
-        let control_cmd = ControlModeCommandFrame::new(
-            ControlModeCommand::CanControl,
-            move_mode,
-            config.speed_percent,
-            piper_protocol::control::MitMode::PositionVelocity,
-            0,
-            config.install_position,
-        );
-        let commit_host_mono_us = self
-            .driver
-            .send_reliable_frame_confirmed_commit_marker(control_cmd.to_frame(), config.timeout)?;
-        self.wait_for_mode_confirmation(
-            commit_host_mono_us,
-            config.timeout,
-            config.poll_interval,
-            ModeConfirmationExpectation {
-                control_mode: ControlMode::CanControl as u8,
-                move_mode: move_mode as u8,
-                speed_percent: config.speed_percent,
-                mit_mode: ProtocolMitMode::PositionVelocity as u8,
-                install_position: config.install_position as u8,
-                trajectory_stay_time: 0,
-            },
-        )?;
+        self.apply_position_mode_control_config(&config)?;
         info!("Robot enabled - Active<PositionMode>");
         Ok(transition_piper_state(
             self,
@@ -1120,56 +1093,6 @@ where
             } else {
                 // 状态跳变，重置计数器
                 stable_count = 0;
-            }
-
-            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
-        }
-    }
-
-    fn wait_for_mode_confirmation(
-        &self,
-        commit_host_mono_us: u64,
-        timeout: Duration,
-        poll_interval: Duration,
-        expected: ModeConfirmationExpectation,
-    ) -> Result<()> {
-        let start = Instant::now();
-
-        loop {
-            self.ensure_runtime_health_healthy()?;
-
-            if start.elapsed() > timeout {
-                warn!(
-                    "Timed out waiting for mode confirmation: {}",
-                    mode_confirmation_timeout_diagnostics_summary(
-                        &self.driver,
-                        commit_host_mono_us,
-                        expected,
-                    )
-                );
-                return Err(RobotError::Timeout {
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-
-            let current = self.driver.get_robot_control();
-            let mode_echo = self.driver.get_control_mode_echo();
-            let is_robot_state_fresh = current.host_rx_mono_us > commit_host_mono_us;
-            let is_robot_state_match = current.is_fully_enabled_confirmed()
-                && current.robot_status == RobotStatus::Normal as u8
-                && current.control_mode == expected.control_mode
-                && current.move_mode == expected.move_mode;
-            let is_mode_echo_fresh =
-                mode_echo.is_valid && mode_echo.host_rx_mono_us > commit_host_mono_us;
-            let is_mode_echo_match = mode_echo.control_mode == expected.control_mode
-                && mode_echo.move_mode == expected.move_mode
-                && mode_echo.speed_percent == expected.speed_percent
-                && mode_echo.mit_mode == expected.mit_mode
-                && mode_echo.install_position == expected.install_position
-                && mode_echo.trajectory_stay_time == expected.trajectory_stay_time;
-            let is_mode_echo_satisfied = !is_mode_echo_fresh || is_mode_echo_match;
-            if is_robot_state_fresh && is_robot_state_match && is_mode_echo_satisfied {
-                return Ok(());
             }
 
             self.sleep_with_fail_fast(start, timeout, poll_interval)?;
@@ -1728,6 +1651,95 @@ where
                 STATE_TRANSITION_SEND_TIMEOUT,
             )
             .map_err(Into::into)
+    }
+
+    fn wait_for_mode_confirmation(
+        &self,
+        commit_host_mono_us: u64,
+        timeout: Duration,
+        poll_interval: Duration,
+        expected: ModeConfirmationExpectation,
+    ) -> Result<()> {
+        let start = Instant::now();
+
+        loop {
+            self.ensure_runtime_health_healthy()?;
+
+            if start.elapsed() > timeout {
+                warn!(
+                    "Timed out waiting for mode confirmation: {}",
+                    mode_confirmation_timeout_diagnostics_summary(
+                        &self.driver,
+                        commit_host_mono_us,
+                        expected,
+                    )
+                );
+                return Err(RobotError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+
+            let current = self.driver.get_robot_control();
+            let mode_echo = self.driver.get_control_mode_echo();
+            let is_robot_state_fresh = current.host_rx_mono_us > commit_host_mono_us;
+            let is_robot_state_match = current.is_fully_enabled_confirmed()
+                && current.robot_status == RobotStatus::Normal as u8
+                && current.control_mode == expected.control_mode
+                && current.move_mode == expected.move_mode;
+            let is_mode_echo_fresh =
+                mode_echo.is_valid && mode_echo.host_rx_mono_us > commit_host_mono_us;
+            let is_mode_echo_match = mode_echo.control_mode == expected.control_mode
+                && mode_echo.move_mode == expected.move_mode
+                && mode_echo.speed_percent == expected.speed_percent
+                && mode_echo.mit_mode == expected.mit_mode
+                && mode_echo.install_position == expected.install_position
+                && mode_echo.trajectory_stay_time == expected.trajectory_stay_time;
+            let is_mode_echo_satisfied = !is_mode_echo_fresh || is_mode_echo_match;
+            if is_robot_state_fresh && is_robot_state_match && is_mode_echo_satisfied {
+                return Ok(());
+            }
+
+            self.sleep_with_fail_fast(start, timeout, poll_interval)?;
+        }
+    }
+
+    fn apply_position_mode_control_config(&self, config: &PositionModeConfig) -> Result<()>
+    where
+        Capability: MotionCapability,
+    {
+        use piper_protocol::control::{ControlModeCommand, ControlModeCommandFrame, MitMode};
+
+        if config.motion_type == MotionType::ContinuousPositionVelocity {
+            return Err(RobotError::ConfigError(
+                "MotionType::ContinuousPositionVelocity is not implemented yet".to_string(),
+            ));
+        }
+
+        let move_mode: MoveMode = config.motion_type.into();
+        let control_cmd = ControlModeCommandFrame::new(
+            ControlModeCommand::CanControl,
+            move_mode,
+            config.speed_percent,
+            MitMode::PositionVelocity,
+            0,
+            config.install_position,
+        );
+        let commit_host_mono_us = self
+            .driver
+            .send_reliable_frame_confirmed_commit_marker(control_cmd.to_frame(), config.timeout)?;
+        self.wait_for_mode_confirmation(
+            commit_host_mono_us,
+            config.timeout,
+            config.poll_interval,
+            ModeConfirmationExpectation {
+                control_mode: ControlMode::CanControl as u8,
+                move_mode: move_mode as u8,
+                speed_percent: config.speed_percent,
+                mit_mode: ProtocolMitMode::PositionVelocity as u8,
+                install_position: config.install_position as u8,
+                trajectory_stay_time: 0,
+            },
+        )
     }
 
     fn into_state<NextState>(
@@ -2567,6 +2579,34 @@ where
         }
 
         Ok(position_mode)
+    }
+
+    /// 重新应用位置模式的控制配置（0x151），保持当前 Active<PositionMode> 不变。
+    ///
+    /// 借用态重新配置只能更新由控制器保存并可通过 0x151 确认的字段，例如
+    /// `speed_percent` 和 `install_position`。`motion_type` 与 `command_timeout`
+    /// 仍由当前 `Active<PositionMode>` 的本地状态定义，因此必须保持一致。
+    pub fn reapply_position_mode_config(&self, config: PositionModeConfig) -> Result<()> {
+        let position_mode = &self._state.0;
+        if config.motion_type != position_mode.motion_type {
+            return Err(RobotError::ConfigError(format!(
+                "reapply_position_mode_config requires MotionType::{expected:?}, but config requested MotionType::{actual:?}",
+                expected = position_mode.motion_type,
+                actual = config.motion_type,
+            )));
+        }
+        if config.command_timeout != position_mode.command_timeout {
+            return Err(RobotError::ConfigError(format!(
+                "reapply_position_mode_config cannot change command_timeout from {:?} to {:?} on a borrowed Active<PositionMode>",
+                position_mode.command_timeout, config.command_timeout,
+            )));
+        }
+
+        debug!(
+            "Reapplying Position mode config (motion_type={:?}, speed_percent={}, install_position={:?})",
+            config.motion_type, config.speed_percent, config.install_position
+        );
+        self.apply_position_mode_control_config(&config)
     }
 
     /// 发送位置命令（批量发送所有关节）
@@ -4270,6 +4310,120 @@ mod tests {
         assert!(
             !mode_echo.is_valid,
             "SocketCAN loopback-disabled regression should not observe a 0x151 echo"
+        );
+    }
+
+    #[test]
+    fn active_position_mode_reapply_config_sends_confirmed_control_mode_update() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveJ, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(5),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveJ, 200),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(1),
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveJ,
+                5,
+                piper_protocol::control::MitMode::PositionVelocity,
+                InstallPosition::SideLeft,
+                201,
+            ),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
+        let active = standby
+            .enable_position_mode(PositionModeConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 10,
+                install_position: InstallPosition::Invalid,
+                motion_type: MotionType::Joint,
+                command_timeout: Duration::from_millis(20),
+            })
+            .expect("matching 0x2A1 should allow Active<PositionMode>");
+
+        active
+            .reapply_position_mode_config(PositionModeConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 5,
+                install_position: InstallPosition::SideLeft,
+                motion_type: MotionType::Joint,
+                command_timeout: Duration::from_millis(20),
+            })
+            .expect("borrowed Active<PositionMode> should confirm a fresh 0x151 update");
+
+        let control_mode_frames: Vec<_> = sent_frames
+            .lock()
+            .expect("sent frames lock")
+            .iter()
+            .filter(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE)
+            .copied()
+            .collect();
+
+        assert_eq!(control_mode_frames.len(), 2);
+        assert_eq!(
+            control_mode_frames[1],
+            piper_protocol::control::ControlModeCommandFrame::new(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveJ,
+                5,
+                piper_protocol::control::MitMode::PositionVelocity,
+                0,
+                InstallPosition::SideLeft,
+            )
+            .to_frame()
+        );
+    }
+
+    #[test]
+    fn active_position_mode_reapply_config_rejects_motion_type_change() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(10));
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveJ, 100),
+        });
+
+        let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
+        let active = standby
+            .enable_position_mode(PositionModeConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 10,
+                install_position: InstallPosition::Invalid,
+                motion_type: MotionType::Joint,
+                command_timeout: Duration::from_millis(20),
+            })
+            .expect("matching 0x2A1 should allow Active<PositionMode>");
+
+        let error = active
+            .reapply_position_mode_config(PositionModeConfig {
+                motion_type: MotionType::Linear,
+                ..PositionModeConfig::default()
+            })
+            .expect_err("borrowed Active<PositionMode> must not silently change motion type");
+
+        assert!(matches!(error, RobotError::ConfigError(_)));
+        let control_mode_frames = sent_frames
+            .lock()
+            .expect("sent frames lock")
+            .iter()
+            .filter(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE)
+            .count();
+        assert_eq!(
+            control_mode_frames, 1,
+            "rejected reconfiguration must not send an extra 0x151 frame"
         );
     }
 
