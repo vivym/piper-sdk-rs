@@ -78,7 +78,7 @@ REPL 现在使用“前台输入 + 后台命令 worker”模型：
 - `move` / `home` / `park` 在后台执行
 - REPL 的 `park` 只会移动到当前配置的 `park_pose()`，不会自动 disable
 - 运行期间主线程仍能处理 `stop` 和 `Ctrl+C`
-- 这两个命令会取消当前 motion，并把 REPL 会话带回 `Standby`
+- 若当前有 motion 在运行，这两个命令会先取消该 motion，再把 REPL 会话带回 `Standby`
 - 这是面向 active session 的交互式急停路径
 - 它和 REPL 的显式 `disable` 流程不同
 - shell 中不做交互式确认；需要确认的 `move` / `set-zero` 必须显式加 `--force`
