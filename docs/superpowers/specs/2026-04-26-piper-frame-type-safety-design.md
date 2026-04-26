@@ -382,6 +382,8 @@ struct BincodeRecordedFrameV3 {
 
 `BincodeRecordingMetadataV3::start_time` is wall-clock metadata encoded as Unix seconds. It is not the scheduling timebase; frame timestamps provide recording-local elapsed microseconds.
 
+The helper schema above is the wire schema, not permission to derive unbounded `Deserialize` blindly. Metadata strings must deserialize through a bounded string helper that uses the same bincode string wire representation but rejects byte lengths above `MAX_METADATA_STRING_BYTES` before allocating an owned `String`. The frames sequence must deserialize through a bounded sequence visitor that checks bincode's declared sequence length before allocation or element decoding and rejects lengths above `MAX_RECORDING_FRAMES`.
+
 `direction` wire values are fixed:
 
 - `0` means RX.
@@ -400,7 +402,7 @@ struct BincodeRecordedFrameV3 {
 
 The implementation may use public enums such as `RecordedFrameDirection` and `TimestampSource`, but it must convert through the fixed helper schema above before bincode serialization. Tests must lock representative bytes for the full v3 body, not only for individual `PiperFrame` values.
 
-Version `3` recordings must use the current workspace `bincode = "1.3"` fixed-int little-endian wire encoding for this helper schema, with fields encoded in the declaration order shown above. Do not use top-level `bincode::serialize` or `bincode::deserialize` for v3 recording bodies. Top-level `serialize` does not enforce the v3 body limit, and top-level `deserialize` allows trailing bytes. Use one shared bincode 1.3 options helper equivalent to `DefaultOptions::new().with_fixint_encoding().with_limit(MAX_RECORDING_BODY_BYTES).reject_trailing_bytes()` for both writing and reading recording bodies so appended bytes and oversized bodies are rejected. Do not switch to bincode 2.x, varint encoding, or a hand-written binary layout without bumping the recording version again. Tests should lock representative v3 byte payloads so the wire contract is explicit.
+Version `3` recordings must use the current workspace `bincode = "1.3"` fixed-int little-endian wire encoding for this helper schema, with fields encoded in the declaration order shown above. Do not use top-level `bincode::serialize` or `bincode::deserialize` for v3 recording bodies. Top-level `serialize` does not enforce the v3 body limit, and top-level `deserialize` allows trailing bytes. Use explicit bincode 1.3 options for the body wire format, and enforce the byte limit at the file-container boundary so appended bytes and oversized bodies are rejected. Spell the options out with `.with_little_endian().with_fixint_encoding()` rather than relying on bincode defaults. Do not switch to bincode 2.x, varint encoding, or a hand-written binary layout without bumping the recording version again. Tests should lock representative v3 byte payloads so the wire contract is explicit.
 
 The v3 file container is:
 
@@ -410,9 +412,17 @@ version: u8 = 3
 body: bincode(BincodePiperRecordingV3)
 ```
 
-Do not keep the historical segmented body shape with metadata JSON length, metadata JSON, frame count, and separately serialized frames. After the magic and version byte, the rest of the file is exactly one bounded bincode v3 body. The reader must enforce `MAX_RECORDING_BODY_BYTES` before or while reading the body, for example by checking file metadata when available and by reading through a bounded reader that detects one byte over the limit. It must not call `read_to_end` into an unbounded `Vec` and only then apply the bincode limit.
+Do not keep the historical segmented body shape with metadata JSON length, metadata JSON, frame count, and separately serialized frames. After the magic and version byte, the rest of the file is exactly one bounded bincode v3 body. The reader must enforce `MAX_RECORDING_BODY_BYTES` before or while reading the body, for example by checking file metadata when available and by reading through a bounded reader that detects one byte over the limit. It must not call `read_to_end` into an unbounded `Vec` and only then apply the bincode limit. Once the bounded body bytes are available, decode that exact slice with options equivalent to `DefaultOptions::new().with_little_endian().with_fixint_encoding().reject_trailing_bytes()`. Do not rely on `with_limit()` during slice deserialization; in bincode 1.3 the slice path receives an already-buffered byte slice, so the file-container read limit is the allocation guard.
 
-The v3 body reader must not allow unbounded allocation through `String` or `Vec` length prefixes. Define explicit limits such as `MAX_RECORDING_BODY_BYTES`, `MAX_RECORDING_FRAMES`, and `MAX_METADATA_STRING_BYTES`; apply the bincode byte limit during decode and validate `frames.len()` plus every metadata string byte length after decode. The writer must validate the same frame-count, metadata string, and serialized body-size limits before producing a v3 file, so the SDK cannot write recordings that its reader rejects. If future recordings need to exceed the default limits, expose that as an explicit reader/writer option rather than using unlimited bincode serialization or deserialization. Tests must include oversized body limits, oversized frame-count prefixes, and oversized metadata string lengths.
+The v3 body reader must not allow unbounded allocation through `String` or `Vec` length prefixes. These v3 limits are part of the wire contract and must be shared by reader and writer:
+
+```rust
+pub const MAX_RECORDING_BODY_BYTES: u64 = 1_073_741_824; // 1 GiB
+pub const MAX_RECORDING_FRAMES: usize = 20_000_000;
+pub const MAX_METADATA_STRING_BYTES: usize = 16_384;
+```
+
+Apply the bincode byte limit during file-container body read, reject frame-count and metadata-string lengths during deserialization before allocating beyond their v3 limits, and validate the decoded `frames.len()` plus every metadata string byte length as a defensive postcondition. String limits are UTF-8 byte lengths, not character counts. The writer must validate the same frame-count, metadata string, and serialized body-size limits before producing a v3 file, using serialization options equivalent to `DefaultOptions::new().with_little_endian().with_fixint_encoding().with_limit(MAX_RECORDING_BODY_BYTES)`, so the SDK cannot write recordings that its reader rejects. Do not expose a writer option that creates noncanonical v3 recordings above these limits; larger recordings require a future recording version or an explicitly separate file profile. Tests must include oversized body limits, oversized frame-count prefixes, and oversized metadata string lengths.
 
 `format` values are fixed:
 
@@ -428,7 +438,7 @@ Both serde branches must validate by constructing `CanId`, `CanData`, and `Piper
 
 Recording files must reject historical formats using the recording version before attempting to deserialize old frame bodies. The new recording version is `3`; existing version `1` and `2` files must be rejected, not converted. Keep the existing `PIPERV1\0` magic unless there is a separate file-container migration; the version byte is the compatibility boundary for this refactor.
 
-`PiperRecording::version` may remain in the serialized body, but if it remains it must also be `3`. A file with header version `3` and body `recording.version != 3` must be rejected after deserializing the v3 body. If the body version field is removed instead, the header version is the single source of truth and tests must prove there is no second conflicting version field.
+The v3 body version field is mandatory because `BincodePiperRecordingV3` includes `version: u8`. A file with header version `3` and body `recording.version != 3` must be rejected after deserializing the bounded v3 body. The body version is redundant by design, but it gives tests a concrete mismatch case and prevents accidental serialization of a public struct with a stale version field.
 
 Tests should include crafted invalid bincode payloads for bad format values, invalid IDs, `data_len > 8`, nonzero trailing data bytes beyond `data_len`, appended top-level trailing bytes in recording bodies, mismatched header/body versions, and old recording version/shape rejection.
 
@@ -602,7 +612,11 @@ Bridge v3 should use new request tags for every request that carries filters:
 The public bridge filter type should be typed and hard to misuse:
 
 ```rust
-pub enum CanIdFilter {
+pub struct CanIdFilter {
+    kind: CanIdFilterKind,
+}
+
+enum CanIdFilterKind {
     Standard {
         min: StandardCanId,
         max: StandardCanId,
@@ -616,9 +630,10 @@ pub enum CanIdFilter {
 CanIdFilter::standard(min: StandardCanId, max: StandardCanId) -> Result<Self, CanIdFilterError>
 CanIdFilter::extended(min: ExtendedCanId, max: ExtendedCanId) -> Result<Self, CanIdFilterError>
 CanIdFilter::matches(&self, id: CanId) -> bool
+CanIdFilter::bounds(&self) -> (CanId, CanId)
 ```
 
-Filter constructors must reject `min > max`. `CanIdFilterError` may be a bridge-local public error or an existing bridge protocol error, but it must distinguish invalid range from malformed wire decode. If public fields are kept instead, the encoder must validate them before writing and return an error for invalid local values; it must not serialize invalid filters.
+Filter constructors must reject `min > max`. `CanIdFilterError` may be a bridge-local public error or an existing bridge protocol error, but it must distinguish invalid local range construction from malformed wire decode. The filter's fields must be private or hidden behind private internal enum variants so local code cannot bypass constructor validation with a struct/enum literal. The encoder may still validate defensively, but invalid local filter values should be unconstructible through the public API.
 
 The v3 filter wire schema is:
 
@@ -753,6 +768,8 @@ The same format-aware rule applies to non-protocol callers that classify, count,
 
 These APIs should store `CanId` or typed standard/extended IDs. If a human-facing report needs a numeric key, it should display both format and raw ID, such as `standard:0x251` or `extended:0x251`.
 
+Human-facing configuration must also stop accepting ambiguous raw CAN IDs. CLI and config inputs such as recording `--stop-on-id` should require an explicit format, for example `standard:0x2A5` / `extended:0x2A5`, or separate `--stop-on-standard-id` and `--stop-on-extended-id` flags. Parsing must construct `CanId` immediately and reject invalid IDs at the command/config boundary instead of passing a raw `u32` into recording code.
+
 ## Driver And Client Impact
 
 Driver and client code should treat `PiperFrame` as immutable.
@@ -886,10 +903,11 @@ Required targeted tests:
 - `piper-protocol` tests proving raw numeric protocol ID constants are not used by builders/classifiers, or are only diagnostics-only aliases derived from typed constants.
 - `piper-protocol` and `piper-driver` tests proving classification/filter APIs take `CanId` or `StandardCanId`, accept `standard 0x251`, and reject/classify as unknown `extended 0x251`.
 - tests for recording stop conditions, statistics, diagnostics, and ID aggregation proving `standard 0x123` and `extended 0x123` are distinct.
+- CLI/config parsing tests proving recording stop conditions require explicit `standard` or `extended` format, reject invalid IDs at parse time, and no longer pass ambiguous raw `u32` IDs into `StopCondition::OnCanId`.
 - `piper-protocol` tests proving constrained subtypes cannot be deserialized into invalid values when serde is enabled.
 - `piper-protocol` tests for `CanData::from_padded`: reject `len > 8`, preserve active bytes, and zero nonzero bytes beyond DLC.
 - `piper-tools` bincode roundtrip tests for version `3` recordings containing standard and extended frames using direct `PiperFrame` storage, plus locked representative byte payloads for the `magic + version + bincode(BincodePiperRecordingV3)` file contract and full recording-body bincode 1.3 fixed-int wire contract.
-- `piper-tools` rejection tests for version `1` and `2` recordings, historical segmented metadata/frame-count body shapes, header/body version mismatch, appended top-level bincode trailing bytes, oversized body/frame-count/metadata string limits including one-byte-over body reads and writer-side oversized-recording rejection, nonzero trailing bytes inside frame payload storage, invalid direction values, invalid timestamp source values, and old recording frame shapes that lack explicit frame format.
+- `piper-tools` rejection tests for version `1` and `2` recordings, historical segmented metadata/frame-count body shapes, header/body version mismatch, appended top-level bincode trailing bytes, exact v3 limit boundaries and one-over failures for body bytes, frame count, and metadata string byte lengths, writer-side oversized-recording rejection, nonzero trailing bytes inside frame payload storage, invalid direction values, invalid timestamp source values, and old recording frame shapes that lack explicit frame format. Boundary tests must not require allocating a 1 GiB body or 20,000,000 frames; factor the bounded reader/deserializer around private `RecordingLimits` or equivalent test-only limit injection so exact-boundary logic is exercised with small limits, while cheap metadata/fake-reader tests still prove production `MAX_RECORDING_BODY_BYTES + 1`, `MAX_RECORDING_FRAMES + 1`, and `MAX_METADATA_STRING_BYTES + 1` are rejected before large allocation.
 - `piper-tools` and `piper-driver` structure tests or static checks proving recording types do not duplicate timestamp, ID, or data beside `PiperFrame`.
 - `piper-driver` recording tests proving `TimestampedFrame` stores `PiperFrame` directly, records normalized recording-local monotonic timestamps, records only active payload semantics, and preserves RX/TX direction plus `Hardware` / `Kernel` / `Userspace` / `None` timestamp provenance through receive metadata and hook APIs.
 - `piper-driver` TX recording tests proving a replayable TX recording stamps a copy with a post-send userspace timestamp normalized into the recording-local timebase while the frame observed by backend send remains `timestamp_us() == 0`.
@@ -949,7 +967,7 @@ Recording code has no remaining legacy conversion path from ambiguous `can_id + 
 
 Recording files use version `3`; version `1` and `2` files are rejected before old frame bodies are deserialized.
 
-Recording bincode uses the declared `magic + version + bincode(BincodePiperRecordingV3)` file contract and bincode 1.3 fixed-int body contract, rejects historical segmented bodies, rejects appended top-level body bytes, enforces explicit body/frame-count/metadata string limits before unbounded allocation, rejects nonzero unused frame payload bytes, rejects invalid direction/source values, and rejects header/body version mismatches.
+Recording bincode uses the declared `magic + version + bincode(BincodePiperRecordingV3)` file contract and bincode 1.3 little-endian fixed-int body contract, rejects historical segmented bodies, rejects appended top-level body bytes, enforces the exact v3 body/frame-count/metadata string limits before allocation beyond those limits, rejects nonzero unused frame payload bytes, rejects invalid direction/source values, and rejects header/body version mismatches.
 
 Recording types store `PiperFrame` directly and do not duplicate timestamp, ID, format, or data state.
 
