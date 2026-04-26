@@ -3,7 +3,9 @@
 //! 提供独立的 RX 和 TX 适配器，支持双线程并发访问。
 //! 基于 `Arc<GsUsbDevice>` 实现，利用 `rusb::DeviceHandle` 的 `Sync` 特性。
 
-use crate::gs_usb::classify::parse_gs_usb_batch;
+use crate::gs_usb::classify::{
+    GsUsbFrameClass, RecoverableGsUsbFrameStatus, classify_gs_usb_frame,
+};
 use crate::gs_usb::device::{GS_USB_BATCH_FRAME_CAPACITY, GS_USB_READ_BUFFER_SIZE, GsUsbDevice};
 use crate::gs_usb::frame::GsUsbFrame;
 use crate::gs_usb::protocol::{CAN_EFF_FLAG, GS_USB_ECHO_ID};
@@ -119,6 +121,34 @@ impl GsUsbRxAdapter {
         }
     }
 
+    fn handle_recoverable_status(&self, status: RecoverableGsUsbFrameStatus) {
+        if matches!(status, RecoverableGsUsbFrameStatus::ErrorPassive)
+            && let Some(ref callback) = self.error_passive_callback
+        {
+            callback(true);
+        }
+    }
+
+    fn parse_batch_with_side_effects(
+        &self,
+        raw: &[GsUsbFrame],
+    ) -> Result<Vec<PiperFrame>, CanError> {
+        let mut parsed = Vec::with_capacity(raw.len());
+        for frame in raw {
+            match classify_gs_usb_frame(frame) {
+                GsUsbFrameClass::ValidData(frame) => parsed.push(frame),
+                GsUsbFrameClass::RecoverableNonData(status) => {
+                    self.handle_recoverable_status(status);
+                },
+                GsUsbFrameClass::FatalMalformedData(error)
+                | GsUsbFrameClass::FatalDeviceStatus(error)
+                | GsUsbFrameClass::FatalTransport(error) => return Err(error),
+            }
+        }
+
+        Ok(parsed)
+    }
+
     /// 接收 CAN 帧（带 Echo 帧过滤）
     ///
     /// 在双线程模式下，RX 线程会读到 TX 线程发送的回显帧。
@@ -171,7 +201,7 @@ impl GsUsbRxAdapter {
                 continue;
             }
 
-            let parsed = parse_gs_usb_batch(&self.rx_batch_frames);
+            let parsed = self.parse_batch_with_side_effects(&self.rx_batch_frames);
             self.rx_batch_frames.clear();
             let parsed = match parsed {
                 Ok(parsed) => parsed,
@@ -377,8 +407,12 @@ impl BridgeTxAdapter for GsUsbBridgeTxAdapter {
 mod tests {
     use super::*;
     use crate::gs_usb::protocol::{
-        GS_CAN_FLAG_OVERFLOW, GS_USB_FRAME_SIZE, GS_USB_FRAME_SIZE_HW_TIMESTAMP, GS_USB_RX_ECHO_ID,
+        CAN_ERR_CRTL_RX_PASSIVE, CAN_ERR_FLAG, GS_CAN_FLAG_OVERFLOW, GS_USB_FRAME_SIZE,
+        GS_USB_FRAME_SIZE_HW_TIMESTAMP, GS_USB_RX_ECHO_ID,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const CAN_ERR_CRTL: u32 = 0x0000_0004;
 
     fn pack_packet(frames: &[GsUsbFrame], hw_timestamp: bool) -> Vec<u8> {
         let frame_size = if hw_timestamp {
@@ -427,6 +461,12 @@ mod tests {
         }
     }
 
+    fn controller_error_frame(status: u8) -> GsUsbFrame {
+        let mut frame = rx_frame(CAN_ERR_FLAG | CAN_ERR_CRTL, 0, 0xEE);
+        frame.data[1] = status;
+        frame
+    }
+
     #[test]
     fn split_receive_discards_batch_on_overflow_status() {
         let (device, harness) = GsUsbDevice::new_test_device(false, false);
@@ -462,6 +502,30 @@ mod tests {
         let mut adapter = GsUsbRxAdapter::new(Arc::new(device), Duration::from_millis(2), 0, false);
 
         assert_eq!(adapter.receive().unwrap().frame.raw_id(), 0x100);
+        assert_eq!(adapter.receive().unwrap().frame.raw_id(), 0x101);
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn split_receive_error_passive_triggers_callback_and_skips_frame() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(pack_packet(
+            &[
+                rx_frame(0x100, 0, 0x10),
+                controller_error_frame(CAN_ERR_CRTL_RX_PASSIVE),
+                rx_frame(0x101, 0, 0x11),
+            ],
+            false,
+        ));
+        let mut adapter = GsUsbRxAdapter::new(Arc::new(device), Duration::from_millis(2), 0, false);
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_for_rx = callback_called.clone();
+        adapter.set_error_passive_callback(move |is_passive| {
+            callback_called_for_rx.store(is_passive, Ordering::SeqCst);
+        });
+
+        assert_eq!(adapter.receive().unwrap().frame.raw_id(), 0x100);
+        assert!(callback_called.load(Ordering::SeqCst));
         assert_eq!(adapter.receive().unwrap().frame.raw_id(), 0x101);
         assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
     }

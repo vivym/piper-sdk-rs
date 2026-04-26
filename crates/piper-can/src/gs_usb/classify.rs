@@ -20,10 +20,18 @@ const GS_CAN_FLAG_BRS: u8 = 1 << 2;
 const GS_CAN_FLAG_ESI: u8 = 1 << 3;
 const GS_CAN_FLAG_NON_CLASSIC_MASK: u8 = GS_CAN_FLAG_FD | GS_CAN_FLAG_BRS | GS_CAN_FLAG_ESI;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverableGsUsbFrameStatus {
+    NonData,
+    ErrorActive,
+    ErrorWarning,
+    ErrorPassive,
+}
+
 #[derive(Debug)]
 pub enum GsUsbFrameClass {
     ValidData(PiperFrame),
-    RecoverableNonData,
+    RecoverableNonData(RecoverableGsUsbFrameStatus),
     FatalMalformedData(CanError),
     FatalDeviceStatus(CanError),
     FatalTransport(CanError),
@@ -63,11 +71,21 @@ fn classify_error_frame(raw: &GsUsbFrame) -> GsUsbFrameClass {
                 | CAN_ERR_CRTL_TX_PASSIVE))
             != 0
         {
-            return GsUsbFrameClass::RecoverableNonData;
+            if (controller_status & (CAN_ERR_CRTL_RX_PASSIVE | CAN_ERR_CRTL_TX_PASSIVE)) != 0 {
+                return GsUsbFrameClass::RecoverableNonData(
+                    RecoverableGsUsbFrameStatus::ErrorPassive,
+                );
+            }
+            if (controller_status & (CAN_ERR_CRTL_RX_WARNING | CAN_ERR_CRTL_TX_WARNING)) != 0 {
+                return GsUsbFrameClass::RecoverableNonData(
+                    RecoverableGsUsbFrameStatus::ErrorWarning,
+                );
+            }
+            return GsUsbFrameClass::RecoverableNonData(RecoverableGsUsbFrameStatus::ErrorActive);
         }
     }
 
-    GsUsbFrameClass::RecoverableNonData
+    GsUsbFrameClass::RecoverableNonData(RecoverableGsUsbFrameStatus::NonData)
 }
 
 pub fn classify_gs_usb_frame(raw: &GsUsbFrame) -> GsUsbFrameClass {
@@ -80,15 +98,15 @@ pub fn classify_gs_usb_frame(raw: &GsUsbFrame) -> GsUsbFrameClass {
     }
 
     if raw.echo_id != GS_USB_RX_ECHO_ID {
-        return GsUsbFrameClass::RecoverableNonData;
+        return GsUsbFrameClass::RecoverableNonData(RecoverableGsUsbFrameStatus::NonData);
     }
 
     if (raw.can_id & CAN_RTR_FLAG) != 0 {
-        return GsUsbFrameClass::RecoverableNonData;
+        return GsUsbFrameClass::RecoverableNonData(RecoverableGsUsbFrameStatus::NonData);
     }
 
     if (raw.flags & GS_CAN_FLAG_NON_CLASSIC_MASK) != 0 {
-        return GsUsbFrameClass::RecoverableNonData;
+        return GsUsbFrameClass::RecoverableNonData(RecoverableGsUsbFrameStatus::NonData);
     }
 
     if raw.reserved != 0 || raw.flags != 0 {
@@ -131,7 +149,7 @@ pub fn parse_gs_usb_batch(raw: &[GsUsbFrame]) -> Result<Vec<PiperFrame>, CanErro
     for frame in raw {
         match classify_gs_usb_frame(frame) {
             GsUsbFrameClass::ValidData(frame) => parsed.push(frame),
-            GsUsbFrameClass::RecoverableNonData => {},
+            GsUsbFrameClass::RecoverableNonData(_) => {},
             GsUsbFrameClass::FatalMalformedData(error)
             | GsUsbFrameClass::FatalDeviceStatus(error)
             | GsUsbFrameClass::FatalTransport(error) => return Err(error),
@@ -143,7 +161,9 @@ pub fn parse_gs_usb_batch(raw: &[GsUsbFrame]) -> Result<Vec<PiperFrame>, CanErro
 
 #[cfg(test)]
 mod tests {
-    use super::{GsUsbFrameClass, classify_gs_usb_frame, parse_gs_usb_batch};
+    use super::{
+        GsUsbFrameClass, RecoverableGsUsbFrameStatus, classify_gs_usb_frame, parse_gs_usb_batch,
+    };
     use crate::CanError;
     use crate::FrameError;
     use crate::gs_usb::frame::GsUsbFrame;
@@ -195,7 +215,7 @@ mod tests {
     fn assert_recoverable(frame: GsUsbFrame) {
         assert!(matches!(
             classify_gs_usb_frame(&frame),
-            GsUsbFrameClass::RecoverableNonData
+            GsUsbFrameClass::RecoverableNonData(_)
         ));
     }
 
@@ -299,7 +319,17 @@ mod tests {
             CAN_ERR_CRTL_RX_PASSIVE,
             CAN_ERR_CRTL_TX_PASSIVE,
         ] {
-            assert_recoverable(error_frame(CAN_ERR_CRTL, status));
+            let expected = if matches!(status, CAN_ERR_CRTL_RX_PASSIVE | CAN_ERR_CRTL_TX_PASSIVE) {
+                RecoverableGsUsbFrameStatus::ErrorPassive
+            } else if matches!(status, CAN_ERR_CRTL_RX_WARNING | CAN_ERR_CRTL_TX_WARNING) {
+                RecoverableGsUsbFrameStatus::ErrorWarning
+            } else {
+                RecoverableGsUsbFrameStatus::ErrorActive
+            };
+            assert!(matches!(
+                classify_gs_usb_frame(&error_frame(CAN_ERR_CRTL, status)),
+                GsUsbFrameClass::RecoverableNonData(actual) if actual == expected
+            ));
         }
     }
 
