@@ -123,11 +123,14 @@ Payload construction:
 ```rust
 CanData::new(data: impl AsRef<[u8]>) -> Result<Self, FrameError>
 CanData::from_array(bytes: [u8; 8]) -> Self
+CanData::from_padded(bytes: [u8; 8], len: u8) -> Result<Self, FrameError>
 CanData::as_slice(&self) -> &[u8]
 CanData::as_padded(&self) -> &[u8; 8]
 CanData::len(&self) -> u8
 CanData::is_empty(&self) -> bool
 ```
+
+`CanData::from_array([u8; 8])` represents an active 8-byte payload. It must not be used to mean "padded storage with unknown or inferred length." Backend decode paths that receive fixed storage plus DLC should use `CanData::from_padded(bytes, len)`.
 
 Frame construction:
 
@@ -216,6 +219,8 @@ pub struct TimestampedFrame {
 
 This makes recording files use the same explicit serde format as live frames. The recorded timestamp is `frame.timestamp_us()`. There must not be a second top-level `timestamp_us` field when the type already stores a `PiperFrame`.
 
+If `piper-tools::TimestampedFrame` stores `PiperFrame` directly, `piper-tools` must enable the `piper-protocol/serde` feature for its recording serialization dependency path. Recording serialization should not rely on a local duplicate frame representation just to avoid enabling serde on `piper-protocol`.
+
 For `piper_driver::recording::TimestampedFrame`, the preferred shape is:
 
 ```rust
@@ -241,6 +246,8 @@ The bridge protocol must encode explicit frame format.
 The binary bridge protocol already carries `id`, `is_extended`, `len`, and 8 data bytes. The decoder should construct a `PiperFrame` through the checked constructors instead of a struct literal.
 
 The bridge decoder must treat `is_extended` as a canonical boolean field. Accept only `0` and `1`; reject any other value as malformed protocol data.
+
+Bridge send-frame requests do not encode or trust a timestamp from the client. A request decoded into `PiperFrame` should have `timestamp_us() == 0`. Receive-frame events carry the host/device timestamp and should apply it through `with_timestamp_us()` when constructing the event frame.
 
 The encoder should read from frame methods:
 
