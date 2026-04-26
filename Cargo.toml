@@ -86,6 +86,7 @@ proptest = "1.4"
 serial_test = "3.3"
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 rcgen = "0.13"
+trybuild = "1.0"
 
 # Workspace 发布配置（用于 cargo-release 工具）
 [workspace.metadata.release]

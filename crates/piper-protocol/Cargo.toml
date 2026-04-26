@@ -17,3 +17,8 @@ bilge = { workspace = true }
 num_enum = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+bincode = "1.3"
+serde_json = { workspace = true }
+trybuild = { workspace = true }
