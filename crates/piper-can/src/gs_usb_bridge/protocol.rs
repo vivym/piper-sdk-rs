@@ -4,21 +4,21 @@
 //! and responses are correlated by full-width `u32` request ids. Events are
 //! asynchronous and do not carry request ids.
 
-use crate::{CanData, ExtendedCanId, FrameError, PiperFrame, StandardCanId};
+use crate::{CanData, CanId, ExtendedCanId, FrameError, PiperFrame, StandardCanId};
 use rand::random;
 use std::io::{self, Read, Write};
 
 pub const SESSION_TOKEN_LEN: usize = 16;
 pub const MAX_PAYLOAD_LEN: usize = 8 * 1024;
 
-const TAG_HELLO: u8 = 0x01;
 const TAG_GET_STATUS: u8 = 0x02;
-const TAG_SET_FILTERS: u8 = 0x03;
 const TAG_SET_RAW_FRAME_TAP: u8 = 0x04;
 const TAG_ACQUIRE_WRITER_LEASE: u8 = 0x05;
 const TAG_RELEASE_WRITER_LEASE: u8 = 0x06;
 const TAG_SEND_FRAME: u8 = 0x07;
 const TAG_PING: u8 = 0x08;
+const TAG_HELLO_V3: u8 = 0x09;
+const TAG_SET_FILTERS_V3: u8 = 0x0A;
 
 const TAG_HELLO_ACK: u8 = 0x81;
 const TAG_OK: u8 = 0x82;
@@ -120,17 +120,53 @@ impl ErrorCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanIdFilter {
-    pub min_id: u32,
-    pub max_id: u32,
+    kind: CanIdFilterKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanIdFilterKind {
+    Standard {
+        min: StandardCanId,
+        max: StandardCanId,
+    },
+    Extended {
+        min: ExtendedCanId,
+        max: ExtendedCanId,
+    },
 }
 
 impl CanIdFilter {
-    pub fn new(min_id: u32, max_id: u32) -> Self {
-        Self { min_id, max_id }
+    pub fn standard(min: StandardCanId, max: StandardCanId) -> Result<Self, ProtocolError> {
+        if min > max {
+            return Err(ProtocolError::InvalidData("invalid bridge filter range"));
+        }
+        Ok(Self {
+            kind: CanIdFilterKind::Standard { min, max },
+        })
     }
 
-    pub fn matches(&self, can_id: u32) -> bool {
-        self.min_id <= can_id && can_id <= self.max_id
+    pub fn extended(min: ExtendedCanId, max: ExtendedCanId) -> Result<Self, ProtocolError> {
+        if min > max {
+            return Err(ProtocolError::InvalidData("invalid bridge filter range"));
+        }
+        Ok(Self {
+            kind: CanIdFilterKind::Extended { min, max },
+        })
+    }
+
+    pub fn matches(&self, id: CanId) -> bool {
+        match (self.kind, id) {
+            (CanIdFilterKind::Standard { min, max }, CanId::Standard(id)) => min <= id && id <= max,
+            (CanIdFilterKind::Extended { min, max }, CanId::Extended(id)) => min <= id && id <= max,
+            _ => false,
+        }
+    }
+
+    pub fn bounds(&self) -> (CanId, CanId) {
+        match self.kind {
+            CanIdFilterKind::Standard { min, max } => (CanId::from(min), CanId::from(max)),
+            CanIdFilterKind::Extended { min, max } => (CanId::from(min), CanId::from(max)),
+        }
     }
 }
 
@@ -282,6 +318,14 @@ fn put_u64(buf: &mut Vec<u8>, value: u64) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
+fn decode_bool(value: u8, field: &'static str) -> Result<bool, ProtocolError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(ProtocolError::InvalidData(field)),
+    }
+}
+
 fn put_token(buf: &mut Vec<u8>, token: SessionToken) {
     buf.extend_from_slice(token.as_bytes());
 }
@@ -291,8 +335,18 @@ fn put_filters(buf: &mut Vec<u8>, filters: &[CanIdFilter]) -> Result<(), Protoco
         u16::try_from(filters.len()).map_err(|_| ProtocolError::InvalidData("too many filters"))?;
     put_u16(buf, count);
     for filter in filters {
-        put_u32(buf, filter.min_id);
-        put_u32(buf, filter.max_id);
+        match filter.kind {
+            CanIdFilterKind::Standard { min, max } => {
+                put_u8(buf, 0);
+                put_u32(buf, min.raw() as u32);
+                put_u32(buf, max.raw() as u32);
+            },
+            CanIdFilterKind::Extended { min, max } => {
+                put_u8(buf, 1);
+                put_u32(buf, min.raw());
+                put_u32(buf, max.raw());
+            },
+        }
     }
     Ok(())
 }
@@ -376,7 +430,25 @@ impl<'a> Cursor<'a> {
         let count = self.u16()? as usize;
         let mut filters = Vec::with_capacity(count);
         for _ in 0..count {
-            filters.push(CanIdFilter::new(self.u32()?, self.u32()?));
+            let format = self.u8()?;
+            let min = self.u32()?;
+            let max = self.u32()?;
+            let filter = match format {
+                0 => CanIdFilter::standard(
+                    StandardCanId::new(min)
+                        .map_err(|err| map_frame_error("invalid bridge standard filter id", err))?,
+                    StandardCanId::new(max)
+                        .map_err(|err| map_frame_error("invalid bridge standard filter id", err))?,
+                )?,
+                1 => CanIdFilter::extended(
+                    ExtendedCanId::new(min)
+                        .map_err(|err| map_frame_error("invalid bridge extended filter id", err))?,
+                    ExtendedCanId::new(max)
+                        .map_err(|err| map_frame_error("invalid bridge extended filter id", err))?,
+                )?,
+                _ => return Err(ProtocolError::InvalidData("invalid bridge filter format")),
+            };
+            filters.push(filter);
         }
         Ok(filters)
     }
@@ -389,11 +461,7 @@ impl<'a> Cursor<'a> {
 
     fn frame_request(&mut self) -> Result<PiperFrame, ProtocolError> {
         let id = self.u32()?;
-        let is_extended = match self.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(ProtocolError::InvalidData("invalid bridge frame format")),
-        };
+        let is_extended = decode_bool(self.u8()?, "invalid bridge frame format")?;
         let len = self.u8()?;
         let mut data = [0u8; 8];
         data.copy_from_slice(self.take(8)?);
@@ -426,7 +494,7 @@ fn encode_payload_from_request(message: &ClientRequest) -> Result<Vec<u8>, Proto
             session_token,
             filters,
         } => {
-            put_u8(&mut buf, TAG_HELLO);
+            put_u8(&mut buf, TAG_HELLO_V3);
             put_u32(&mut buf, *request_id);
             put_token(&mut buf, *session_token);
             put_filters(&mut buf, filters)?;
@@ -439,7 +507,7 @@ fn encode_payload_from_request(message: &ClientRequest) -> Result<Vec<u8>, Proto
             request_id,
             filters,
         } => {
-            put_u8(&mut buf, TAG_SET_FILTERS);
+            put_u8(&mut buf, TAG_SET_FILTERS_V3);
             put_u32(&mut buf, *request_id);
             put_filters(&mut buf, filters)?;
         },
@@ -580,19 +648,19 @@ pub fn decode_client_request(payload: &[u8]) -> Result<ClientRequest, ProtocolEr
     let tag = cursor.u8()?;
     let request_id = cursor.u32()?;
     let message = match tag {
-        TAG_HELLO => ClientRequest::Hello {
+        TAG_HELLO_V3 => ClientRequest::Hello {
             request_id,
             session_token: cursor.token()?,
             filters: cursor.filters()?,
         },
         TAG_GET_STATUS => ClientRequest::GetStatus { request_id },
-        TAG_SET_FILTERS => ClientRequest::SetFilters {
+        TAG_SET_FILTERS_V3 => ClientRequest::SetFilters {
             request_id,
             filters: cursor.filters()?,
         },
         TAG_SET_RAW_FRAME_TAP => ClientRequest::SetRawFrameTap {
             request_id,
-            enabled: cursor.u8()? != 0,
+            enabled: decode_bool(cursor.u8()?, "set raw frame tap enabled")?,
         },
         TAG_ACQUIRE_WRITER_LEASE => ClientRequest::AcquireWriterLease {
             request_id,
@@ -667,7 +735,7 @@ pub fn decode_server_message(payload: &[u8]) -> Result<ServerMessage, ProtocolEr
         },
         TAG_LEASE_DENIED => {
             let request_id = cursor.u32()?;
-            let has_holder = cursor.u8()? != 0;
+            let has_holder = decode_bool(cursor.u8()?, "lease denied has holder")?;
             let holder = cursor.u32()?;
             ServerMessage::Response(ServerResponse::LeaseDenied {
                 request_id,
@@ -711,8 +779,18 @@ pub fn read_framed<R: Read>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CanId, ExtendedCanId, StandardCanId};
 
     const TEST_TOKEN: SessionToken = SessionToken::new([0xAB; SESSION_TOKEN_LEN]);
+    const HELLO_V3_STANDARD_FILTER_BYTES: &[u8] = &[
+        0x09, 0x07, 0x00, 0x00, 0x00, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
+        0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xFF, 0x01,
+        0x00, 0x00,
+    ];
+    const SET_FILTERS_V3_EXTENDED_FILTER_BYTES: &[u8] = &[
+        0x0A, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0x01, 0x00,
+        0x00,
+    ];
 
     fn sample_status() -> BridgeStatus {
         BridgeStatus {
@@ -738,11 +816,99 @@ mod tests {
         let request = ClientRequest::Hello {
             request_id: 7,
             session_token: TEST_TOKEN,
-            filters: vec![CanIdFilter::new(0x100, 0x1FF)],
+            filters: vec![
+                CanIdFilter::standard(
+                    StandardCanId::new(0x100).unwrap(),
+                    StandardCanId::new(0x1FF).unwrap(),
+                )
+                .unwrap(),
+            ],
         };
         let encoded = encode_client_request(&request).unwrap();
         let decoded = decode_client_request(&encoded[4..]).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn rejects_noncanonical_boolean_values() {
+        let payload = [TAG_SET_RAW_FRAME_TAP, 11, 0, 0, 0, 2];
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("set raw frame tap enabled")
+        ));
+    }
+
+    #[test]
+    fn hello_v3_filter_bytes_are_locked() {
+        let request = ClientRequest::Hello {
+            request_id: 7,
+            session_token: TEST_TOKEN,
+            filters: vec![
+                CanIdFilter::standard(
+                    StandardCanId::new(0x100).unwrap(),
+                    StandardCanId::new(0x1FF).unwrap(),
+                )
+                .unwrap(),
+            ],
+        };
+
+        let encoded = encode_client_request(&request).unwrap();
+
+        assert_eq!(&encoded[4..], HELLO_V3_STANDARD_FILTER_BYTES);
+        assert_eq!(
+            decode_client_request(HELLO_V3_STANDARD_FILTER_BYTES).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn set_filters_v3_filter_bytes_are_locked() {
+        let request = ClientRequest::SetFilters {
+            request_id: 8,
+            filters: vec![
+                CanIdFilter::extended(
+                    ExtendedCanId::new(0x100).unwrap(),
+                    ExtendedCanId::new(0x1FF).unwrap(),
+                )
+                .unwrap(),
+            ],
+        };
+
+        let encoded = encode_client_request(&request).unwrap();
+
+        assert_eq!(&encoded[4..], SET_FILTERS_V3_EXTENDED_FILTER_BYTES);
+        assert_eq!(
+            decode_client_request(SET_FILTERS_V3_EXTENDED_FILTER_BYTES).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn old_filter_tags_are_rejected() {
+        let mut old_hello = Vec::new();
+        put_u8(&mut old_hello, 0x01);
+        put_u32(&mut old_hello, 7);
+        put_token(&mut old_hello, TEST_TOKEN);
+        put_u16(&mut old_hello, 0);
+
+        let error = decode_client_request(&old_hello).unwrap_err();
+
+        assert_eq!(error, ProtocolError::InvalidTag(0x01));
+    }
+
+    #[test]
+    fn set_filters_old_tag_is_rejected() {
+        let mut old_set_filters = Vec::new();
+        put_u8(&mut old_set_filters, 0x03);
+        put_u32(&mut old_set_filters, 8);
+        put_u16(&mut old_set_filters, 0);
+
+        let error = decode_client_request(&old_set_filters).unwrap_err();
+
+        assert_eq!(error, ProtocolError::InvalidTag(0x03));
     }
 
     #[test]
@@ -768,12 +934,41 @@ mod tests {
     }
 
     #[test]
+    fn lease_denied_rejects_noncanonical_has_holder() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, TAG_LEASE_DENIED);
+        put_u32(&mut payload, 9);
+        put_u8(&mut payload, 2);
+        put_u32(&mut payload, 123);
+
+        let error = decode_server_message(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("lease denied has holder")
+        ));
+    }
+
+    #[test]
     fn test_event_roundtrip() {
         let message = ServerMessage::Event(BridgeEvent::ReceiveFrame(
-            PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap(),
+            PiperFrame::new_standard(0x123, [1, 2, 3, 4]).unwrap(),
         ));
         let encoded = encode_server_message(&message).unwrap();
         let decoded = decode_server_message(&encoded[4..]).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn receive_frame_event_decode_preserves_timestamp() {
+        let frame = PiperFrame::new_standard(0x123, [1, 2, 3, 4])
+            .unwrap()
+            .with_timestamp_us(0x0102_0304_0506_0708);
+        let message = ServerMessage::Event(BridgeEvent::ReceiveFrame(frame));
+
+        let encoded = encode_server_message(&message).unwrap();
+        let decoded = decode_server_message(&encoded[4..]).unwrap();
+
         assert_eq!(decoded, message);
     }
 
@@ -796,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_send_frame_rejects_invalid_format_byte() {
+    fn decode_send_frame_rejects_noncanonical_is_extended() {
         let mut payload = Vec::new();
         put_u8(&mut payload, TAG_SEND_FRAME);
         put_u32(&mut payload, 43);
@@ -811,6 +1006,162 @@ mod tests {
             error,
             ProtocolError::InvalidData("invalid bridge frame format")
         ));
+    }
+
+    #[test]
+    fn decode_send_frame_rejects_invalid_standard_id() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, TAG_SEND_FRAME);
+        put_u32(&mut payload, 44);
+        put_u32(&mut payload, 0x800);
+        put_u8(&mut payload, 0);
+        put_u8(&mut payload, 1);
+        payload.extend_from_slice(&[0xAA, 0, 0, 0, 0, 0, 0, 0]);
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("invalid bridge standard can id")
+        ));
+    }
+
+    #[test]
+    fn decode_send_frame_rejects_invalid_extended_id() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, TAG_SEND_FRAME);
+        put_u32(&mut payload, 45);
+        put_u32(&mut payload, 0x2000_0000);
+        put_u8(&mut payload, 1);
+        put_u8(&mut payload, 1);
+        payload.extend_from_slice(&[0xAA, 0, 0, 0, 0, 0, 0, 0]);
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("invalid bridge extended can id")
+        ));
+    }
+
+    #[test]
+    fn decode_send_frame_rejects_invalid_dlc() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, TAG_SEND_FRAME);
+        put_u32(&mut payload, 46);
+        put_u32(&mut payload, 0x123);
+        put_u8(&mut payload, 0);
+        put_u8(&mut payload, 9);
+        payload.extend_from_slice(&[0xAA, 0, 0, 0, 0, 0, 0, 0]);
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("invalid bridge frame data padding")
+        ));
+    }
+
+    #[test]
+    fn send_frame_request_decode_discards_frame_timestamp() {
+        let request = ClientRequest::SendFrame {
+            request_id: 47,
+            frame: PiperFrame::new_standard(0x123, [1, 2, 3]).unwrap().with_timestamp_us(999),
+        };
+
+        let encoded = encode_client_request(&request).unwrap();
+        let ClientRequest::SendFrame { frame, .. } = decode_client_request(&encoded[4..]).unwrap()
+        else {
+            panic!("expected send frame request");
+        };
+
+        assert_eq!(frame.timestamp_us(), 0);
+    }
+
+    #[test]
+    fn standard_and_extended_same_raw_id_match_different_filters() {
+        let standard = CanIdFilter::standard(
+            StandardCanId::new(0x123).unwrap(),
+            StandardCanId::new(0x123).unwrap(),
+        )
+        .unwrap();
+        let extended = CanIdFilter::extended(
+            ExtendedCanId::new(0x123).unwrap(),
+            ExtendedCanId::new(0x123).unwrap(),
+        )
+        .unwrap();
+
+        assert!(standard.matches(CanId::standard(0x123).unwrap()));
+        assert!(!standard.matches(CanId::extended(0x123).unwrap()));
+        assert!(extended.matches(CanId::extended(0x123).unwrap()));
+        assert!(!extended.matches(CanId::standard(0x123).unwrap()));
+    }
+
+    #[test]
+    fn decode_filters_reject_invalid_format_values() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, 0x0A);
+        put_u32(&mut payload, 8);
+        put_u16(&mut payload, 1);
+        put_u8(&mut payload, 2);
+        put_u32(&mut payload, 0x100);
+        put_u32(&mut payload, 0x1FF);
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("invalid bridge filter format")
+        ));
+    }
+
+    #[test]
+    fn decode_filters_reject_invalid_ranges() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, 0x0A);
+        put_u32(&mut payload, 8);
+        put_u16(&mut payload, 1);
+        put_u8(&mut payload, 0);
+        put_u32(&mut payload, 0x200);
+        put_u32(&mut payload, 0x100);
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("invalid bridge filter range")
+        ));
+    }
+
+    #[test]
+    fn local_filter_construction_rejects_invalid_ranges() {
+        let error = CanIdFilter::standard(
+            StandardCanId::new(0x200).unwrap(),
+            StandardCanId::new(0x100).unwrap(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ProtocolError::InvalidData("invalid bridge filter range")
+        );
+    }
+
+    #[test]
+    fn valid_filters_expose_typed_bounds_for_encoding() {
+        let filter = CanIdFilter::extended(
+            ExtendedCanId::new(0x100).unwrap(),
+            ExtendedCanId::new(0x1FF).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            filter.bounds(),
+            (
+                CanId::extended(0x100).unwrap(),
+                CanId::extended(0x1FF).unwrap()
+            )
+        );
     }
 
     #[test]

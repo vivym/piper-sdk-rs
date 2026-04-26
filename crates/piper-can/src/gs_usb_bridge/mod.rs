@@ -626,7 +626,7 @@ fn load_private_key(path: &std::path::Path) -> BridgeResult<PrivateKeyDer<'stati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PiperFrame;
+    use crate::{PiperFrame, StandardCanId};
     use protocol::{CanIdFilter, SESSION_TOKEN_LEN, decode_client_request, encode_server_message};
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     use rustls::server::{ServerConfig, ServerConnection, WebPkiClientVerifier};
@@ -638,6 +638,14 @@ mod tests {
     use std::thread;
 
     static NEXT_TLS_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn standard_filter(min: u32, max: u32) -> CanIdFilter {
+        CanIdFilter::standard(
+            StandardCanId::new(min).unwrap(),
+            StandardCanId::new(max).unwrap(),
+        )
+        .unwrap()
+    }
 
     struct TestTlsFixture {
         dir: PathBuf,
@@ -755,7 +763,7 @@ mod tests {
                     filters,
                 } => {
                     assert_eq!(session_token, SessionToken::new([7; SESSION_TOKEN_LEN]));
-                    assert_eq!(filters, vec![CanIdFilter::new(0x100, 0x200)]);
+                    assert_eq!(filters, vec![standard_filter(0x100, 0x200)]);
                     let response = ServerMessage::Response(ServerResponse::HelloAck {
                         request_id,
                         session_id: 42,
@@ -770,7 +778,7 @@ mod tests {
 
         let options = BridgeClientOptions {
             session_token: SessionToken::new([7; SESSION_TOKEN_LEN]),
-            filters: vec![CanIdFilter::new(0x100, 0x200)],
+            filters: vec![standard_filter(0x100, 0x200)],
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
             tcp_tls: Some(tls.client_tls_config()),
@@ -831,7 +839,7 @@ mod tests {
                 panic!("expected ping");
             };
             let event = ServerMessage::Event(BridgeEvent::ReceiveFrame(
-                PiperFrame::new_standard(0x111, &[1, 2, 3, 4]).unwrap(),
+                PiperFrame::new_standard(0x111, [1, 2, 3, 4]).unwrap(),
             ));
             write_framed(&mut stream, &encode_server_message(&event).unwrap()).unwrap();
             let ok = ServerMessage::Response(ServerResponse::Ok { request_id });

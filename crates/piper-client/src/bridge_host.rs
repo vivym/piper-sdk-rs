@@ -10,11 +10,11 @@ use mio::net::TcpStream as MioTcpStream;
 #[cfg(unix)]
 use mio::net::UnixStream as MioUnixStream;
 use mio::{Events, Interest, Poll, Token, Waker};
-use piper_can::PiperFrame;
 use piper_can::bridge::protocol::{
     self, BridgeDeviceState, BridgeEvent, BridgeRole, BridgeStatus, CanIdFilter, ClientRequest,
     ErrorCode, MAX_PAYLOAD_LEN, ServerMessage, ServerResponse, SessionToken,
 };
+use piper_can::{CanId, PiperFrame};
 use piper_driver::hooks::FrameCallback;
 use piper_driver::{
     DriverError, HealthStatus, HookHandle, MaintenanceGateState, MaintenanceLeaseAcquireResult,
@@ -1186,7 +1186,7 @@ impl BridgeSession {
         *self.filters.write().unwrap() = filters;
     }
 
-    fn matches_filter(&self, can_id: u32) -> bool {
+    fn matches_filter(&self, can_id: CanId) -> bool {
         let filters = self.filters.read().unwrap();
         if filters.is_empty() {
             return true;
@@ -1487,7 +1487,7 @@ impl SessionManager {
         };
         let mut stats = BroadcastFrameStats::default();
         for session in sessions {
-            if !session.matches_filter(frame.id) {
+            if !session.matches_filter(frame.id()) {
                 continue;
             }
             match session.enqueue_frame(frame) {
@@ -2800,7 +2800,9 @@ fn message_kind(request: &ClientRequest) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piper_can::{BackendCapability, CanError, RealtimeTxAdapter, RxAdapter};
+    use piper_can::{
+        BackendCapability, CanError, ExtendedCanId, RealtimeTxAdapter, RxAdapter, StandardCanId,
+    };
     use piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_BASE;
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -2932,9 +2934,15 @@ mod tests {
         data[4] = 50;
         data[5] = if enabled { 0x40 } else { 0x00 };
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(id as u16, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
+    }
+
+    fn standard_filter(min: u32, max: u32) -> CanIdFilter {
+        CanIdFilter::standard(
+            StandardCanId::new(min).unwrap(),
+            StandardCanId::new(max).unwrap(),
+        )
+        .unwrap()
     }
 
     struct BootstrappedFeedbackRxAdapter {
@@ -3084,7 +3092,7 @@ mod tests {
         assert_eq!(snapshot.holder_session_key(), None);
 
         let err = broker
-            .send(&authority, PiperFrame::new_standard(0x321, &[0x01]))
+            .send(&authority, PiperFrame::new_standard(0x321, [0x01]).unwrap())
             .expect_err("runtime-closed maintenance send must be rejected before driver send");
 
         assert_eq!(err.code(), ErrorCode::PermissionDenied);
@@ -3117,10 +3125,10 @@ mod tests {
         old.replace_and_close();
         assert!(!old.is_active());
         assert!(second.session.is_active());
-        assert!(!manager.set_filters(old.session_id(), vec![CanIdFilter::new(0x100, 0x1FF)]));
+        assert!(!manager.set_filters(old.session_id(), vec![standard_filter(0x100, 0x1FF)]));
         assert!(manager.set_filters(
             second.session.session_id(),
-            vec![CanIdFilter::new(0x100, 0x1FF)]
+            vec![standard_filter(0x100, 0x1FF)]
         ));
     }
 
@@ -3188,7 +3196,7 @@ mod tests {
 
         for _ in 0..OUTBOUND_QUEUE_CAPACITY {
             assert_eq!(
-                session.enqueue_frame(PiperFrame::new_standard(0x123, &[1])),
+                session.enqueue_frame(PiperFrame::new_standard(0x123, [1]).unwrap()),
                 EnqueueFrameResult::Delivered
             );
         }
@@ -3214,12 +3222,80 @@ mod tests {
         register.session.mark_closing();
 
         assert_eq!(
-            manager.broadcast_frame(PiperFrame::new_standard(0x120, &[1, 2, 3])),
+            manager.broadcast_frame(PiperFrame::new_standard(0x120, [1, 2, 3]).unwrap()),
             BroadcastFrameStats {
                 dropped: 0,
                 inactive: 1,
             }
         );
+    }
+
+    #[test]
+    fn raw_tap_dispatch_routes_standard_and_extended_same_raw_id_separately() {
+        let manager = Arc::new(SessionManager::new());
+        let standard_filter = CanIdFilter::standard(
+            StandardCanId::new(0x123).unwrap(),
+            StandardCanId::new(0x123).unwrap(),
+        )
+        .unwrap();
+        let extended_filter = CanIdFilter::extended(
+            ExtendedCanId::new(0x123).unwrap(),
+            ExtendedCanId::new(0x123).unwrap(),
+        )
+        .unwrap();
+
+        let standard_prepared = manager.prepare_session(
+            token(10),
+            BridgeRole::Observer,
+            vec![standard_filter],
+            Arc::new(NoopWake),
+        );
+        let standard_rx = standard_prepared.event_rx.clone();
+        let standard = manager.commit_prepared(standard_prepared);
+        assert!(manager.set_raw_tap_subscription(standard.session.session_key(), true));
+
+        let extended_prepared = manager.prepare_session(
+            token(11),
+            BridgeRole::Observer,
+            vec![extended_filter],
+            Arc::new(NoopWake),
+        );
+        let extended_rx = extended_prepared.event_rx.clone();
+        let extended = manager.commit_prepared(extended_prepared);
+        assert!(manager.set_raw_tap_subscription(extended.session.session_key(), true));
+
+        assert_eq!(
+            manager.broadcast_frame(PiperFrame::new_standard(0x123, [1]).unwrap()),
+            BroadcastFrameStats {
+                dropped: 0,
+                inactive: 0
+            }
+        );
+        assert_eq!(
+            manager.broadcast_frame(PiperFrame::new_extended(0x123, &[2]).unwrap()),
+            BroadcastFrameStats {
+                dropped: 0,
+                inactive: 0
+            }
+        );
+
+        match standard_rx.try_recv().expect("standard session should receive standard frame") {
+            ConnectionOutput::Event(BridgeEvent::ReceiveFrame(frame)) => {
+                assert!(frame.is_standard());
+                assert_eq!(frame.raw_id(), 0x123);
+            },
+            other => panic!("unexpected standard output: {other:?}"),
+        }
+        assert!(standard_rx.try_recv().is_err());
+
+        match extended_rx.try_recv().expect("extended session should receive extended frame") {
+            ConnectionOutput::Event(BridgeEvent::ReceiveFrame(frame)) => {
+                assert!(frame.is_extended());
+                assert_eq!(frame.raw_id(), 0x123);
+            },
+            other => panic!("unexpected extended output: {other:?}"),
+        }
+        assert!(extended_rx.try_recv().is_err());
     }
 
     #[test]
