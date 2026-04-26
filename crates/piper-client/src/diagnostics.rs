@@ -69,7 +69,7 @@
 //! // 在后台线程处理录制数据
 //! std::thread::spawn(move || {
 //!     while let Ok(frame) = rx.recv() {
-//!         println!("Received CAN frame: 0x{:03X}", frame.id);
+//!         println!("Received CAN frame: 0x{:03X}", frame.raw_id());
 //!     }
 //! });
 //!
@@ -283,13 +283,7 @@ impl PiperDiagnostics {
     /// let diag = active.diagnostics();
     ///
     /// // 发送配置帧（安全）
-    /// let frame = PiperFrame {
-    ///     id: 0x5A1,
-    ///     data: [0, 1, 2, 3, 4, 5, 6, 7],
-    ///     len: 8,
-    ///     is_extended: false,
-    ///     timestamp_us: 0,
-    /// };
+    /// let frame = PiperFrame::new_standard(0x5A1, [0, 1, 2, 3, 4, 5, 6, 7])?;
     /// diag.send_frame(&frame)?;
     /// # Ok(())
     /// # }

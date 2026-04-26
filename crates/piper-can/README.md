@@ -74,13 +74,13 @@ piper-can = "0.0.3"  # 自动选择平台合适的后端
 
 **使用示例**：
 ```rust
-use piper_can::SocketCanAdapter;
+use piper_can::{CanAdapter, PiperFrame, SocketCanAdapter};
 
 // 打开 can0 接口
 let mut adapter = SocketCanAdapter::new("can0")?;
 
 // 发送帧
-let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+let frame = PiperFrame::new_standard(0x123, [1, 2, 3, 4])?;
 adapter.send(frame)?;
 
 // 接收帧
@@ -97,7 +97,7 @@ let rx_frame = adapter.receive()?;
 
 **使用示例**：
 ```rust
-use piper_can::GsUsbCanAdapter;
+use piper_can::{CanAdapter, GsUsbCanAdapter, PiperFrame};
 
 // 自动打开第一个可用的 GS-USB 设备
 let mut adapter = GsUsbCanAdapter::new()?;
@@ -109,7 +109,7 @@ let mut adapter = GsUsbCanAdapter::new_with_serial("ABC123456")?;
 adapter.configure(1_000_000)?;
 
 // 发送帧
-let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+let frame = PiperFrame::new_standard(0x123, [1, 2, 3, 4])?;
 adapter.send(frame)?;
 
 // 接收帧
@@ -123,13 +123,15 @@ let rx_frame = adapter.receive()?;
 `PiperFrame` 是贯穿所有 SDK 层次的中央数据结构：
 
 ```rust
-pub struct PiperFrame {
-    pub id: u32,           // CAN ID（标准帧 11 位或扩展帧 29 位）
-    pub data: [u8; 8],     // 数据载荷（最多 8 字节）
-    pub len: u8,           // 实际数据长度
-    pub is_extended: bool, // 是否为扩展帧
-    pub timestamp_us: u64, // 硬件时间戳（微秒）
-}
+let frame = PiperFrame::new_standard(0x123, [1, 2, 3, 4])?
+    .with_timestamp_us(timestamp_us);
+
+let id = frame.id();                  // 类型化 CAN ID
+let raw_id = frame.raw_id();          // 原始 CAN ID 数值
+let data = frame.data();              // 有效数据载荷
+let padded = frame.data_padded();     // 固定 8 字节载荷
+let dlc = frame.dlc();                // 实际数据长度
+let timestamp_us = frame.timestamp_us();
 ```
 
 **特性**：
@@ -307,22 +309,22 @@ piper-can = { version = "0.0.3", features = ["mock"], default-features = false }
 ### 使用示例
 
 ```rust
-use piper_can::{MockCanAdapter, CanAdapter, PiperFrame};
+use piper_can::{CanAdapter, MockCanAdapter, PiperFrame};
 
 let mut adapter = MockCanAdapter::new();
 
 // 注入测试帧
-let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
-adapter.inject(frame.clone())?;
+let frame = PiperFrame::new_standard(0x123, [1, 2, 3, 4])?;
+adapter.inject(frame)?;
 
 // 接收帧
 let rx_frame = adapter.receive()?;
-assert_eq!(rx_frame.id, 0x123);
+assert_eq!(rx_frame.raw_id(), 0x123);
 
 // 回环模式：发送的帧自动进入接收队列
 adapter.send(frame)?;
 let rx_frame2 = adapter.receive()?;
-assert_eq!(rx_frame2.id, 0x123);
+assert_eq!(rx_frame2.raw_id(), 0x123);
 ```
 
 ### Mock 特性
@@ -352,13 +354,15 @@ test-mock:
 `PiperFrame` 是贯穿所有 SDK 层次的中央数据结构：
 
 ```rust
-pub struct PiperFrame {
-    pub id: u32,           // CAN ID（标准帧 11 位或扩展帧 29 位）
-    pub data: [u8; 8],     // 数据载荷（最多 8 字节）
-    pub len: u8,           // 实际数据长度
-    pub is_extended: bool, // 是否为扩展帧
-    pub timestamp_us: u64, // 硬件时间戳（微秒）
-}
+let frame = PiperFrame::new_standard(0x123, [1, 2, 3, 4])?
+    .with_timestamp_us(timestamp_us);
+
+let id = frame.id();                  // 类型化 CAN ID
+let raw_id = frame.raw_id();          // 原始 CAN ID 数值
+let data = frame.data();              // 有效数据载荷
+let padded = frame.data_padded();     // 固定 8 字节载荷
+let dlc = frame.dlc();                // 实际数据长度
+let timestamp_us = frame.timestamp_us();
 ```
 
 **特性**：
