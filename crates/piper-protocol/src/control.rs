@@ -7,18 +7,6 @@ use crate::{CanData, PiperFrame, ProtocolError, i16_to_bytes_be, i32_to_bytes_be
 use bilge::prelude::*;
 use std::fmt;
 
-fn mit_control_standard_id(joint_index: u8) -> crate::StandardCanId {
-    match joint_index {
-        1 => ID_MIT_CONTROL_1,
-        2 => ID_MIT_CONTROL_2,
-        3 => ID_MIT_CONTROL_3,
-        4 => ID_MIT_CONTROL_4,
-        5 => ID_MIT_CONTROL_5,
-        6 => ID_MIT_CONTROL_6,
-        _ => unreachable!("MIT control joint index is validated by constructors"),
-    }
-}
-
 // ============================================================================
 // 控制模式指令相关枚举
 // ============================================================================
@@ -1490,21 +1478,17 @@ impl fmt::Display for MitControlField {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MitControlCommand {
-    joint_index: u8, // 从 ID 推导：0x15A -> 1, 0x15B -> 2, ...
-    pos_ref: f32,    // 位置参考值
-    vel_ref: f32,    // 速度参考值
-    kp: f32,         // 比例增益（参考值：10）
-    kd: f32,         // 微分增益（参考值：0.8）
-    t_ref: f32,      // 力矩参考值
+    joint_index: JointIndex, // 从 ID 推导：0x15A -> 1, 0x15B -> 2, ...
+    pos_ref: f32,            // 位置参考值
+    vel_ref: f32,            // 速度参考值
+    kp: f32,                 // 比例增益（参考值：10）
+    kd: f32,                 // 微分增益（参考值：0.8）
+    t_ref: f32,              // 力矩参考值
 }
 
 impl MitControlCommand {
-    fn validate_joint_index(joint_index: u8) -> Result<(), ProtocolError> {
-        if (1..=6).contains(&joint_index) {
-            Ok(())
-        } else {
-            Err(ProtocolError::InvalidJointIndex { joint_index })
-        }
+    fn validate_joint_index(joint_index: u8) -> Result<JointIndex, ProtocolError> {
+        JointIndex::new(joint_index)
     }
 
     fn validate_range(
@@ -1628,7 +1612,7 @@ impl MitControlCommand {
         kd: f32,
         t_ref: f32,
     ) -> Result<Self, ProtocolError> {
-        Self::validate_joint_index(joint_index)?;
+        let joint = Self::validate_joint_index(joint_index)?;
         Self::validate_range(
             joint_index,
             MitControlField::PositionReference,
@@ -1666,7 +1650,7 @@ impl MitControlCommand {
         )?;
 
         Ok(Self {
-            joint_index,
+            joint_index: joint,
             pos_ref,
             vel_ref,
             kp,
@@ -1772,16 +1756,13 @@ impl MitControlCommand {
         // 2. 基于前 7 字节计算 CRC
         // 注意：data[0..7] 包含了 T_ref 的高 4 位，这是正确的，
         // 因为 CRC 通常覆盖所有数据位（除了 CRC 本身）
-        let crc = Self::calculate_crc(data[0..7].try_into().unwrap(), self.joint_index);
+        let crc = Self::calculate_crc(data[0..7].try_into().unwrap(), self.joint_index.get());
 
         // 3. 将 CRC 填入第 8 字节的低 4 位
         // 使用 | 操作符，因为 encode_to_bytes 已经把低 4 位清零了
         data[7] |= crc & 0x0F;
 
-        PiperFrame::standard(
-            mit_control_standard_id(self.joint_index),
-            CanData::from_array(data),
-        )
+        PiperFrame::standard(mit_control_id(self.joint_index), CanData::from_array(data))
     }
 
     /// 测试专用：允许注入自定义 CRC
@@ -1803,10 +1784,7 @@ impl MitControlCommand {
         // 强制使用指定 CRC（替换低 4 位）
         data[7] = (data[7] & 0xF0) | (custom_crc & 0x0F);
 
-        PiperFrame::standard(
-            mit_control_standard_id(self.joint_index),
-            CanData::from_array(data),
-        )
+        PiperFrame::standard(mit_control_id(self.joint_index), CanData::from_array(data))
     }
 }
 
@@ -1855,7 +1833,7 @@ mod mit_control_tests {
         // v2.1: 移除了 crc 参数，CRC 在 to_frame 时自动计算
         let cmd = MitControlCommand::try_new(1, 1.0, 2.0, 10.0, 0.8, 5.0)
             .expect("valid MIT command should build");
-        assert_eq!(cmd.joint_index, 1);
+        assert_eq!(cmd.joint_index.get(), 1);
         assert_eq!(cmd.pos_ref, 1.0);
         assert_eq!(cmd.vel_ref, 2.0);
         assert_eq!(cmd.kp, 10.0);

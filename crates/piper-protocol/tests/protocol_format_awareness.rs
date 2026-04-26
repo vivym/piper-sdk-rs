@@ -1,6 +1,7 @@
 use piper_protocol::{
-    ControlModeCommandFrame, MotorLimitFeedback, PiperFrame, ProtocolError, RobotStatusFeedback,
-    SettingResponse, ids,
+    ControlModeCommandFeedback, ControlModeCommandFrame, GripperControlFeedback,
+    JointControl12Feedback, JointControl34Feedback, JointControl56Feedback, MotorLimitFeedback,
+    PiperFrame, ProtocolError, RobotStatusFeedback, SettingResponse, ids,
 };
 
 fn assert_invalid_can_id<T: core::fmt::Debug>(
@@ -37,6 +38,43 @@ fn config_parsers_reject_extended_frames_with_matching_raw_ids() {
     assert_invalid_can_id(
         SettingResponse::try_from(setting_response),
         ids::ID_SETTING_RESPONSE.raw() as u32,
+    );
+}
+
+#[test]
+fn control_parsers_reject_extended_frames_with_matching_raw_ids() {
+    let control_mode =
+        PiperFrame::new_extended(ids::ID_CONTROL_MODE.raw() as u32, [0u8; 8]).unwrap();
+    assert_invalid_can_id(
+        ControlModeCommandFeedback::try_from(control_mode),
+        ids::ID_CONTROL_MODE.raw() as u32,
+    );
+
+    let joint_12 =
+        PiperFrame::new_extended(ids::ID_JOINT_CONTROL_12.raw() as u32, [0u8; 8]).unwrap();
+    assert_invalid_can_id(
+        JointControl12Feedback::try_from(joint_12),
+        ids::ID_JOINT_CONTROL_12.raw() as u32,
+    );
+
+    let joint_34 =
+        PiperFrame::new_extended(ids::ID_JOINT_CONTROL_34.raw() as u32, [0u8; 8]).unwrap();
+    assert_invalid_can_id(
+        JointControl34Feedback::try_from(joint_34),
+        ids::ID_JOINT_CONTROL_34.raw() as u32,
+    );
+
+    let joint_56 =
+        PiperFrame::new_extended(ids::ID_JOINT_CONTROL_56.raw() as u32, [0u8; 8]).unwrap();
+    assert_invalid_can_id(
+        JointControl56Feedback::try_from(joint_56),
+        ids::ID_JOINT_CONTROL_56.raw() as u32,
+    );
+
+    let gripper = PiperFrame::new_extended(ids::ID_GRIPPER_CONTROL.raw() as u32, [0u8; 8]).unwrap();
+    assert_invalid_can_id(
+        GripperControlFeedback::try_from(gripper),
+        ids::ID_GRIPPER_CONTROL.raw() as u32,
     );
 }
 
