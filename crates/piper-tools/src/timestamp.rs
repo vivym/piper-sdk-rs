@@ -137,4 +137,25 @@ mod tests {
             TimestampSource::Hardware | TimestampSource::Kernel | TimestampSource::Userspace => {},
         }
     }
+
+    #[test]
+    fn test_timestamp_source_option_bincode_roundtrip_supports_none() {
+        use bincode::Options;
+
+        let options = bincode::DefaultOptions::new()
+            .with_little_endian()
+            .with_fixint_encoding()
+            .reject_trailing_bytes();
+
+        for source in [
+            None,
+            Some(TimestampSource::Hardware),
+            Some(TimestampSource::Kernel),
+            Some(TimestampSource::Userspace),
+        ] {
+            let encoded = options.serialize(&source).unwrap();
+            let decoded: Option<TimestampSource> = options.deserialize(&encoded).unwrap();
+            assert_eq!(decoded, source);
+        }
+    }
 }

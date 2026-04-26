@@ -7,7 +7,9 @@
 //! piper-tools = { workspace = true, features = ["statistics"] }
 //! ```
 
+use piper_protocol::frame::PiperFrame;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// CAN 总线统计
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,11 +135,34 @@ impl LatencyStatistics {
     }
 }
 
+/// Format-aware CAN ID distribution key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CanIdDistributionKey {
+    Standard(u32),
+    Extended(u32),
+}
+
+impl CanIdDistributionKey {
+    pub fn from_frame(frame: &PiperFrame) -> Self {
+        if frame.is_standard() {
+            Self::Standard(frame.raw_id())
+        } else {
+            Self::Extended(frame.raw_id())
+        }
+    }
+
+    pub fn raw_id(self) -> u32 {
+        match self {
+            Self::Standard(id) | Self::Extended(id) => id,
+        }
+    }
+}
+
 /// CAN ID 分布统计
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanIdDistribution {
-    /// 每个 CAN ID 的帧数
-    pub counts: std::collections::HashMap<u32, u64>,
+    /// 每个 CAN ID/format pair 的帧数
+    pub counts: HashMap<CanIdDistributionKey, u64>,
 
     /// 总帧数
     pub total_frames: u64,
@@ -147,29 +172,44 @@ impl CanIdDistribution {
     /// 创建新的分布统计
     pub fn new() -> Self {
         Self {
-            counts: std::collections::HashMap::new(),
+            counts: HashMap::new(),
             total_frames: 0,
         }
     }
 
-    /// 添加帧
+    /// 添加 standard CAN ID 帧（兼容旧调用点）
     pub fn add_frame(&mut self, can_id: u32) {
-        *self.counts.entry(can_id).or_insert(0) += 1;
+        self.add_key(CanIdDistributionKey::Standard(can_id));
+    }
+
+    /// 添加 typed PiperFrame.
+    pub fn add_piper_frame(&mut self, frame: &PiperFrame) {
+        self.add_key(CanIdDistributionKey::from_frame(frame));
+    }
+
+    /// 添加格式感知 CAN ID key.
+    pub fn add_key(&mut self, key: CanIdDistributionKey) {
+        *self.counts.entry(key).or_insert(0) += 1;
         self.total_frames += 1;
     }
 
-    /// 获取某个 CAN ID 的频率（%）
+    /// 获取某个 standard CAN ID 的频率（%）
     pub fn frequency(&self, can_id: u32) -> f64 {
+        self.frequency_for_key(CanIdDistributionKey::Standard(can_id))
+    }
+
+    /// 获取某个格式感知 CAN ID key 的频率（%）
+    pub fn frequency_for_key(&self, key: CanIdDistributionKey) -> f64 {
         if self.total_frames == 0 {
             return 0.0;
         }
 
-        let count = *self.counts.get(&can_id).unwrap_or(&0);
+        let count = *self.counts.get(&key).unwrap_or(&0);
         (count as f64 / self.total_frames as f64) * 100.0
     }
 
     /// 获取最常见的 CAN ID
-    pub fn most_common(&self, limit: usize) -> Vec<(u32, u64)> {
+    pub fn most_common(&self, limit: usize) -> Vec<(CanIdDistributionKey, u64)> {
         let mut items: Vec<_> = self.counts.iter().map(|(&k, &v)| (k, v)).collect();
         items.sort_by(|a, b| b.1.cmp(&a.1));
         items.into_iter().take(limit).collect()
@@ -246,8 +286,8 @@ mod tests {
         assert_eq!(dist.frequency(0x200), (1.0 / 3.0 * 100.0));
 
         let common = dist.most_common(2);
-        assert_eq!(common[0], (0x100, 2));
-        assert_eq!(common[1], (0x200, 1));
+        assert_eq!(common[0], (CanIdDistributionKey::Standard(0x100), 2));
+        assert_eq!(common[1], (CanIdDistributionKey::Standard(0x200), 1));
     }
 
     #[test]
@@ -255,5 +295,34 @@ mod tests {
         let dist = CanIdDistribution::default();
         assert_eq!(dist.total_frames, 0);
         assert_eq!(dist.frequency(0x100), 0.0);
+    }
+
+    #[test]
+    fn test_can_id_distribution_distinguishes_standard_and_extended_raw_equal_ids() {
+        let mut dist = CanIdDistribution::new();
+        let standard = PiperFrame::new_standard(0x123, [1]).unwrap();
+        let extended = PiperFrame::new_extended(0x123, [2]).unwrap();
+
+        dist.add_piper_frame(&standard);
+        dist.add_piper_frame(&extended);
+        dist.add_piper_frame(&extended);
+
+        assert_eq!(dist.total_frames, 3);
+        assert_eq!(
+            dist.counts.get(&CanIdDistributionKey::Standard(0x123)).copied(),
+            Some(1)
+        );
+        assert_eq!(
+            dist.counts.get(&CanIdDistributionKey::Extended(0x123)).copied(),
+            Some(2)
+        );
+        assert_eq!(
+            dist.frequency_for_key(CanIdDistributionKey::Standard(0x123)),
+            (1.0 / 3.0 * 100.0)
+        );
+        assert_eq!(
+            dist.frequency_for_key(CanIdDistributionKey::Extended(0x123)),
+            (2.0 / 3.0 * 100.0)
+        );
     }
 }

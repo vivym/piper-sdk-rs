@@ -16,7 +16,7 @@ statistics = ["dep:statrs"]
 
 [dependencies]
 # ✅ 只依赖协议层（无状态）
-piper-protocol = { workspace = true }
+piper-protocol = { workspace = true, features = ["serde"] }
 
 # ✅ 序列化（必需）
 serde = { workspace = true, features = ["derive"] }
