@@ -21,6 +21,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn received(frame: PiperFrame) -> piper_can::ReceivedFrame {
+    piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
+}
+
 /// 检测是否在CI环境中运行
 fn is_ci_env() -> bool {
     std::env::var("CI").is_ok()
@@ -61,7 +65,7 @@ impl MockRxAdapter {
 }
 
 impl RxAdapter for MockRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
         if self.should_fail.load(Ordering::Relaxed) {
             return Err(CanError::Device(CanDeviceError::new(
                 CanDeviceErrorKind::NoDevice,
@@ -71,7 +75,7 @@ impl RxAdapter for MockRxAdapter {
 
         thread::sleep(self.receive_delay);
 
-        self.frames.pop_front().ok_or(CanError::Timeout)
+        self.frames.pop_front().map(received).ok_or(CanError::Timeout)
     }
 }
 

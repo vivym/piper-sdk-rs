@@ -837,6 +837,10 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    fn received(frame: PiperFrame) -> piper_can::ReceivedFrame {
+        piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
+    }
+
     struct ScriptedRxAdapter {
         bootstrap: Option<PiperFrame>,
         frames: VecDeque<PiperFrame>,
@@ -852,11 +856,11 @@ mod tests {
     }
 
     impl RxAdapter for ScriptedRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             if let Some(frame) = self.bootstrap.take() {
-                return Ok(frame);
+                return Ok(received(frame));
             }
-            self.frames.pop_front().ok_or(CanError::Timeout)
+            self.frames.pop_front().map(received).ok_or(CanError::Timeout)
         }
     }
 
@@ -873,7 +877,7 @@ mod tests {
     }
 
     impl RxAdapter for MonitorOnlyRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             self.inner.receive()
         }
 
@@ -902,16 +906,16 @@ mod tests {
     }
 
     impl RxAdapter for PacedRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             if let Some(frame) = self.bootstrap.take() {
-                return Ok(frame);
+                return Ok(received(frame));
             }
             match self.frames.pop_front() {
                 Some(timed) => {
                     if !timed.delay.is_zero() {
                         thread::sleep(timed.delay);
                     }
-                    Ok(timed.frame)
+                    Ok(received(timed.frame))
                 },
                 None => Err(CanError::Timeout),
             }

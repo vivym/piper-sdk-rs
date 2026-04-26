@@ -1681,17 +1681,20 @@ mod tests {
     where
         R: RxAdapter,
     {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             match self.inner.receive() {
                 Ok(frame) => Ok(frame),
                 Err(CanError::Timeout) => {
                     let Some(joint_index) = self.harness.next_disabled_joint() else {
                         return Err(CanError::Timeout);
                     };
-                    Ok(joint_driver_low_speed_frame(
-                        joint_index,
-                        false,
-                        self.harness.next_timestamp_us(),
+                    Ok(piper_can::ReceivedFrame::new(
+                        joint_driver_low_speed_frame(
+                            joint_index,
+                            false,
+                            self.harness.next_timestamp_us(),
+                        ),
+                        piper_can::TimestampProvenance::None,
                     ))
                 },
                 Err(error) => Err(error),
@@ -1770,8 +1773,13 @@ mod tests {
     }
 
     impl RxAdapter for ScriptedRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
-            self.frames.pop_front().ok_or(CanError::Timeout)
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
+            self.frames
+                .pop_front()
+                .map(|frame| {
+                    piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
+                })
+                .ok_or(CanError::Timeout)
         }
     }
 
@@ -1788,12 +1796,15 @@ mod tests {
     }
 
     impl RxAdapter for DelayedScriptedRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             let (delay, frame) = self.frames.pop_front().ok_or(CanError::Timeout)?;
             if !delay.is_zero() {
                 thread::sleep(delay);
             }
-            Ok(frame)
+            Ok(piper_can::ReceivedFrame::new(
+                frame,
+                piper_can::TimestampProvenance::None,
+            ))
         }
     }
 
@@ -1812,9 +1823,12 @@ mod tests {
     }
 
     impl RxAdapter for FailAfterFramesRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             if let Some(frame) = self.frames.pop_front() {
-                return Ok(frame);
+                return Ok(piper_can::ReceivedFrame::new(
+                    frame,
+                    piper_can::TimestampProvenance::None,
+                ));
             }
             if !self.tripped {
                 self.tripped = true;

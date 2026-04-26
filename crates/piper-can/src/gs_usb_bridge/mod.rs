@@ -830,10 +830,9 @@ mod tests {
             let ClientRequest::Ping { request_id } = request else {
                 panic!("expected ping");
             };
-            let event = ServerMessage::Event(BridgeEvent::ReceiveFrame(PiperFrame::new_standard(
-                0x111,
-                &[1, 2, 3, 4],
-            )));
+            let event = ServerMessage::Event(BridgeEvent::ReceiveFrame(
+                PiperFrame::new_standard(0x111, &[1, 2, 3, 4]).unwrap(),
+            ));
             write_framed(&mut stream, &encode_server_message(&event).unwrap()).unwrap();
             let ok = ServerMessage::Response(ServerResponse::Ok { request_id });
             write_framed(&mut stream, &encode_server_message(&ok).unwrap()).unwrap();

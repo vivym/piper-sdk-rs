@@ -34,9 +34,12 @@ impl MockRxAdapter {
 }
 
 impl RxAdapter for MockRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
         thread::sleep(self.receive_delay);
-        self.frames.pop_front().ok_or(CanError::Timeout)
+        self.frames
+            .pop_front()
+            .map(|frame| piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None))
+            .ok_or(CanError::Timeout)
     }
 }
 

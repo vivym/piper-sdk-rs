@@ -2,7 +2,10 @@
 //!
 //! 提供无硬件依赖的 CAN 适配器实现，用于 CI 测试和单元测试。
 
-use crate::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, RxAdapter, SplittableAdapter};
+use crate::{
+    CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, ReceivedFrame, RxAdapter,
+    SplittableAdapter, TimestampProvenance,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,12 +32,12 @@ use std::time::{Duration, Instant};
 /// let mut adapter = MockCanAdapter::new();
 ///
 /// // 注入测试帧
-/// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
-/// adapter.inject(frame.clone());
+/// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4])?;
+/// adapter.inject(frame);
 ///
 /// // 接收帧
-/// let rx_frame = adapter.receive()?;
-/// assert_eq!(rx_frame.id, 0x123);
+/// let received = adapter.receive()?;
+/// assert_eq!(received.frame.raw_id(), 0x123);
 /// # Ok::<(), CanError>(())
 /// ```
 pub struct MockCanAdapter {
@@ -69,11 +72,19 @@ impl MockCanAdapter {
     /// use piper_can::{MockCanAdapter, PiperFrame};
     ///
     /// let mut adapter = MockCanAdapter::new();
-    /// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]);
+    /// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap();
     /// adapter.inject(frame);
     /// ```
     pub fn inject(&mut self, frame: PiperFrame) {
-        self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
+        self.push_rx_frame(frame);
+    }
+
+    pub fn push_rx_frame(&mut self, frame: PiperFrame) {
+        self.push_received_frame(ReceivedFrame::new(frame, TimestampProvenance::None));
+    }
+
+    pub fn push_received_frame(&mut self, received: ReceivedFrame) {
+        self.inner.lock().expect("mock bus poisoned").frames.push_back(received);
     }
 
     /// 启用超时模式（用于测试超时逻辑）
@@ -124,7 +135,7 @@ impl MockCanAdapter {
     /// let mut adapter = MockCanAdapter::new();
     /// assert_eq!(adapter.len(), 0);
     ///
-    /// adapter.inject(PiperFrame::new_standard(0x123, &[1]));
+    /// adapter.inject(PiperFrame::new_standard(0x123, &[1]).unwrap());
     /// assert_eq!(adapter.len(), 1);
     /// ```
     pub fn len(&self) -> usize {
@@ -153,7 +164,7 @@ impl MockCanAdapter {
     /// use piper_can::{MockCanAdapter, PiperFrame};
     ///
     /// let mut adapter = MockCanAdapter::new();
-    /// adapter.inject(PiperFrame::new_standard(0x123, &[1]));
+    /// adapter.inject(PiperFrame::new_standard(0x123, &[1]).unwrap());
     /// adapter.clear();
     /// assert!(adapter.is_empty());
     /// ```
@@ -179,16 +190,16 @@ impl CanAdapter for MockCanAdapter {
     /// use piper_can::{MockCanAdapter, CanAdapter, PiperFrame};
     ///
     /// let mut adapter = MockCanAdapter::new();
-    /// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+    /// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap();
     ///
     /// adapter.send(frame.clone()).unwrap();
     ///
     /// // 接收回环的帧
-    /// let rx_frame = adapter.receive().unwrap();
-    /// assert_eq!(rx_frame.id, 0x123);
+    /// let received = adapter.receive().unwrap();
+    /// assert_eq!(received.frame.raw_id(), 0x123);
     /// ```
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
-        self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
+        self.push_rx_frame(frame);
         Ok(())
     }
 
@@ -207,11 +218,11 @@ impl CanAdapter for MockCanAdapter {
     /// assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
     ///
     /// // 注入帧后可以接收
-    /// adapter.inject(PiperFrame::new_standard(0x123, &[1, 2, 3]));
-    /// let frame = adapter.receive().unwrap();
-    /// assert_eq!(frame.id, 0x123);
+    /// adapter.inject(PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap());
+    /// let received = adapter.receive().unwrap();
+    /// assert_eq!(received.frame.raw_id(), 0x123);
     /// ```
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<ReceivedFrame, CanError> {
         MockRxAdapter {
             inner: Arc::clone(&self.inner),
         }
@@ -248,7 +259,7 @@ impl SplittableAdapter for MockCanAdapter {
 
 #[derive(Default)]
 struct MockBusInner {
-    frames: VecDeque<PiperFrame>,
+    frames: VecDeque<ReceivedFrame>,
     timeout_mode: bool,
     timeout_count: usize,
 }
@@ -258,7 +269,7 @@ pub struct MockRxAdapter {
 }
 
 impl RxAdapter for MockRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<ReceivedFrame, CanError> {
         let mut inner = self.inner.lock().expect("mock bus poisoned");
 
         if inner.timeout_mode && inner.timeout_count > 0 {
@@ -279,7 +290,11 @@ impl RealtimeTxAdapter for MockTxAdapter {
         if budget.is_zero() {
             return Err(CanError::Timeout);
         }
-        self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
+        self.inner
+            .lock()
+            .expect("mock bus poisoned")
+            .frames
+            .push_back(ReceivedFrame::new(frame, TimestampProvenance::None));
         Ok(())
     }
 
@@ -291,7 +306,11 @@ impl RealtimeTxAdapter for MockTxAdapter {
         if deadline <= Instant::now() {
             return Err(CanError::Timeout);
         }
-        self.inner.lock().expect("mock bus poisoned").frames.push_back(frame);
+        self.inner
+            .lock()
+            .expect("mock bus poisoned")
+            .frames
+            .push_back(ReceivedFrame::new(frame, TimestampProvenance::None));
         Ok(())
     }
 }
@@ -299,6 +318,14 @@ impl RealtimeTxAdapter for MockTxAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn standard_frame(id: u32, data: &[u8]) -> PiperFrame {
+        PiperFrame::new_standard(id, data).unwrap()
+    }
+
+    fn extended_frame(id: u32, data: &[u8]) -> PiperFrame {
+        PiperFrame::new_extended(id, data).unwrap()
+    }
 
     #[test]
     fn test_mock_adapter_new() {
@@ -315,7 +342,7 @@ mod tests {
     #[test]
     fn test_mock_adapter_inject() {
         let mut adapter = MockCanAdapter::new();
-        let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+        let frame = standard_frame(0x123, &[1, 2, 3, 4]);
 
         adapter.inject(frame);
 
@@ -326,15 +353,15 @@ mod tests {
     #[test]
     fn test_mock_adapter_send_loopback() {
         let mut adapter = MockCanAdapter::new();
-        let frame = PiperFrame::new_standard(0x456, &[5, 6, 7, 8]);
+        let frame = standard_frame(0x456, &[5, 6, 7, 8]);
 
         adapter.send(frame).unwrap();
 
         assert_eq!(adapter.len(), 1);
 
-        let rx_frame = adapter.receive().unwrap();
-        assert_eq!(rx_frame.id, 0x456);
-        assert_eq!(rx_frame.data[..4], [5, 6, 7, 8]);
+        let rx_frame = adapter.receive().unwrap().frame;
+        assert_eq!(rx_frame.raw_id(), 0x456);
+        assert_eq!(rx_frame.data(), [5, 6, 7, 8]);
     }
 
     #[test]
@@ -349,12 +376,27 @@ mod tests {
     #[test]
     fn test_mock_adapter_receive_injected() {
         let mut adapter = MockCanAdapter::new();
-        let frame = PiperFrame::new_standard(0x789, &[9, 10, 11, 12]);
+        let frame = standard_frame(0x789, &[9, 10, 11, 12]);
 
         adapter.inject(frame);
 
-        let rx_frame = adapter.receive().unwrap();
-        assert_eq!(rx_frame.id, 0x789);
+        let rx_frame = adapter.receive().unwrap().frame;
+        assert_eq!(rx_frame.raw_id(), 0x789);
+    }
+
+    #[test]
+    fn mock_receive_returns_received_frame_with_none_provenance() {
+        let mut adapter = MockCanAdapter::new();
+        let frame = standard_frame(0x321, &[1, 2, 3, 4]);
+
+        adapter.push_rx_frame(frame);
+
+        let received = adapter.receive().unwrap();
+        assert_eq!(received.frame, frame);
+        assert_eq!(
+            received.timestamp_provenance,
+            crate::TimestampProvenance::None
+        );
     }
 
     #[test]
@@ -362,29 +404,29 @@ mod tests {
         let mut adapter = MockCanAdapter::new();
 
         // 注入多个帧
-        adapter.inject(PiperFrame::new_standard(0x100, &[1]));
-        adapter.inject(PiperFrame::new_standard(0x200, &[2]));
-        adapter.inject(PiperFrame::new_standard(0x300, &[3]));
+        adapter.inject(standard_frame(0x100, &[1]));
+        adapter.inject(standard_frame(0x200, &[2]));
+        adapter.inject(standard_frame(0x300, &[3]));
 
         assert_eq!(adapter.len(), 3);
 
         // FIFO 顺序
-        let frame1 = adapter.receive().unwrap();
-        assert_eq!(frame1.id, 0x100);
+        let frame1 = adapter.receive().unwrap().frame;
+        assert_eq!(frame1.raw_id(), 0x100);
 
-        let frame2 = adapter.receive().unwrap();
-        assert_eq!(frame2.id, 0x200);
+        let frame2 = adapter.receive().unwrap().frame;
+        assert_eq!(frame2.raw_id(), 0x200);
 
-        let frame3 = adapter.receive().unwrap();
-        assert_eq!(frame3.id, 0x300);
+        let frame3 = adapter.receive().unwrap().frame;
+        assert_eq!(frame3.raw_id(), 0x300);
     }
 
     #[test]
     fn test_mock_adapter_clear() {
         let mut adapter = MockCanAdapter::new();
 
-        adapter.inject(PiperFrame::new_standard(0x123, &[1]));
-        adapter.inject(PiperFrame::new_standard(0x456, &[2]));
+        adapter.inject(standard_frame(0x123, &[1]));
+        adapter.inject(standard_frame(0x456, &[2]));
 
         assert_eq!(adapter.len(), 2);
 
@@ -404,11 +446,11 @@ mod tests {
         assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
 
         // 注入帧
-        adapter.inject(PiperFrame::new_standard(0x123, &[1]));
+        adapter.inject(standard_frame(0x123, &[1]));
 
         // 第 3 次应该成功
-        let frame = adapter.receive().unwrap();
-        assert_eq!(frame.id, 0x123);
+        let frame = adapter.receive().unwrap().frame;
+        assert_eq!(frame.raw_id(), 0x123);
     }
 
     #[test]
@@ -419,11 +461,11 @@ mod tests {
         adapter.clear_timeout_mode();
 
         // 注入帧
-        adapter.inject(PiperFrame::new_standard(0x123, &[1]));
+        adapter.inject(standard_frame(0x123, &[1]));
 
         // 应该立即成功（不再超时）
-        let frame = adapter.receive().unwrap();
-        assert_eq!(frame.id, 0x123);
+        let frame = adapter.receive().unwrap().frame;
+        assert_eq!(frame.raw_id(), 0x123);
     }
 
     #[test]
@@ -437,13 +479,13 @@ mod tests {
     #[test]
     fn test_mock_adapter_extended_frame() {
         let mut adapter = MockCanAdapter::new();
-        let frame = PiperFrame::new_extended(0x12345678, &[1, 2, 3, 4]);
+        let frame = extended_frame(0x12345678, &[1, 2, 3, 4]);
 
         adapter.send(frame).unwrap();
 
-        let rx_frame = adapter.receive().unwrap();
-        assert_eq!(rx_frame.id, 0x12345678);
-        assert!(rx_frame.is_extended);
+        let rx_frame = adapter.receive().unwrap().frame;
+        assert_eq!(rx_frame.raw_id(), 0x12345678);
+        assert!(rx_frame.is_extended());
     }
 
     #[test]
@@ -451,12 +493,9 @@ mod tests {
         let adapter = MockCanAdapter::new();
         let (mut rx, mut tx) = adapter.split().unwrap();
 
-        tx.send_control(
-            PiperFrame::new_standard(0x123, &[1, 2, 3]),
-            Duration::from_millis(10),
-        )
-        .unwrap();
-        let frame = rx.receive().unwrap();
-        assert_eq!(frame.id, 0x123);
+        tx.send_control(standard_frame(0x123, &[1, 2, 3]), Duration::from_millis(10))
+            .unwrap();
+        let frame = rx.receive().unwrap().frame;
+        assert_eq!(frame.raw_id(), 0x123);
     }
 }

@@ -5,8 +5,8 @@
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-// 重新导出 piper-protocol 中的 PiperFrame
-pub use piper_protocol::PiperFrame;
+// 重新导出 piper-protocol 中的 typed frame primitives.
+pub use piper_protocol::{CanData, CanId, ExtendedCanId, FrameError, PiperFrame, StandardCanId};
 
 // SocketCAN (Linux only)
 // 优先级：mock 优先级最高，然后是显式 feature，最后是 auto-backend
@@ -103,6 +103,8 @@ pub enum CanError {
     Io(#[from] std::io::Error),
     #[error("Device Error: {0}")]
     Device(#[from] CanDeviceError),
+    #[error("Frame Error: {0}")]
+    Frame(#[from] FrameError),
     #[error("Read timeout")]
     Timeout,
     #[error("Buffer overflow")]
@@ -111,6 +113,31 @@ pub enum CanError {
     BusOff,
     #[error("Device not started")]
     NotStarted,
+}
+
+/// Source class for a received frame timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimestampProvenance {
+    Hardware,
+    Kernel,
+    Userspace,
+    None,
+}
+
+/// CAN frame plus receive-side timestamp provenance metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReceivedFrame {
+    pub frame: PiperFrame,
+    pub timestamp_provenance: TimestampProvenance,
+}
+
+impl ReceivedFrame {
+    pub fn new(frame: PiperFrame, timestamp_provenance: TimestampProvenance) -> Self {
+        Self {
+            frame,
+            timestamp_provenance,
+        }
+    }
 }
 
 /// 设备/后端错误的结构化分类
@@ -167,13 +194,13 @@ impl From<&str> for CanDeviceError {
 
 pub trait CanAdapter {
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError>;
-    fn receive(&mut self) -> Result<PiperFrame, CanError>;
+    fn receive(&mut self) -> Result<ReceivedFrame, CanError>;
     fn set_receive_timeout(&mut self, _timeout: Duration) {}
-    fn receive_timeout(&mut self, timeout: Duration) -> Result<PiperFrame, CanError> {
+    fn receive_timeout(&mut self, timeout: Duration) -> Result<ReceivedFrame, CanError> {
         self.set_receive_timeout(timeout);
         self.receive()
     }
-    fn try_receive(&mut self) -> Result<Option<PiperFrame>, CanError> {
+    fn try_receive(&mut self) -> Result<Option<ReceivedFrame>, CanError> {
         match self.receive_timeout(Duration::ZERO) {
             Ok(frame) => Ok(Some(frame)),
             Err(CanError::Timeout) => Ok(None),
@@ -186,7 +213,7 @@ pub trait CanAdapter {
 }
 
 pub trait RxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError>;
+    fn receive(&mut self) -> Result<ReceivedFrame, CanError>;
 
     fn backend_capability(&self) -> BackendCapability {
         BackendCapability::StrictRealtime
@@ -210,7 +237,7 @@ impl<T> RxAdapter for Box<T>
 where
     T: RxAdapter + ?Sized,
 {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<ReceivedFrame, CanError> {
         (**self).receive()
     }
 

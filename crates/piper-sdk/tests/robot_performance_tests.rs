@@ -24,6 +24,10 @@ fn bootstrap_timestamp_frame() -> PiperFrame {
     frame
 }
 
+fn received(frame: PiperFrame) -> piper_sdk::can::ReceivedFrame {
+    piper_sdk::can::ReceivedFrame::new(frame, piper_sdk::can::TimestampProvenance::None)
+}
+
 struct MockCanAdapter {
     bootstrap_emitted: bool,
 }
@@ -33,10 +37,10 @@ impl CanAdapter for MockCanAdapter {
         Ok(())
     }
 
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<piper_sdk::can::ReceivedFrame, CanError> {
         if !self.bootstrap_emitted {
             self.bootstrap_emitted = true;
-            return Ok(bootstrap_timestamp_frame());
+            return Ok(received(bootstrap_timestamp_frame()));
         }
         Err(CanError::Timeout)
     }
@@ -47,10 +51,10 @@ struct MockRxAdapter {
 }
 
 impl piper_sdk::can::RxAdapter for MockRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<piper_sdk::can::ReceivedFrame, CanError> {
         if !self.bootstrap_emitted {
             self.bootstrap_emitted = true;
-            return Ok(bootstrap_timestamp_frame());
+            return Ok(received(bootstrap_timestamp_frame()));
         }
         Err(CanError::Timeout)
     }

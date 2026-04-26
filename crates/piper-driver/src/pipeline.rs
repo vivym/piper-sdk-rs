@@ -1105,7 +1105,7 @@ pub(crate) fn io_loop(
         // 1. 接收 CAN 帧（带超时，避免阻塞）
         // ============================================================
         let frame = match can.receive() {
-            Ok(frame) => frame,
+            Ok(received) => received.frame,
             Err(CanError::Timeout) => {
                 // 超时是正常情况，检查各个 pending 状态的年龄
 
@@ -1280,9 +1280,9 @@ pub fn rx_loop(
         // 1. 接收 CAN 帧（带超时，避免阻塞）
         // ============================================================
         let frame = match rx.receive() {
-            Ok(frame) => {
+            Ok(received) => {
                 metrics.rx_frames_total.fetch_add(1, Ordering::Relaxed);
-                frame
+                received.frame
             },
             Err(CanError::Timeout) => {
                 // 超时是正常情况，检查各个 pending 状态的年龄
@@ -3553,8 +3553,13 @@ mod tests {
             Ok(())
         }
 
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
-            self.receive_queue.pop_front().ok_or(CanError::Timeout)
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
+            self.receive_queue
+                .pop_front()
+                .map(|frame| {
+                    piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
+                })
+                .ok_or(CanError::Timeout)
         }
     }
 

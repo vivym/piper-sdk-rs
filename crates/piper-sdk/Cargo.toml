@@ -11,12 +11,15 @@ readme = "../../README.md"
 [features]
 default = []
 serde = ["piper-client/serde", "piper-can/serde", "piper-protocol/serde"]
-mock = ["piper-can/mock"]
+mock = ["piper-client/mock", "piper-driver/mock", "piper-can/mock"]
+auto-backend = ["piper-client/auto-backend", "piper-driver/auto-backend", "piper-can/auto-backend"]
+socketcan = ["piper-client/socketcan", "piper-driver/socketcan", "piper-can/socketcan"]
+gs_usb = ["piper-client/gs_usb", "piper-driver/gs_usb", "piper-can/gs_usb"]
 
 [dependencies]
-piper-client = { workspace = true }
-piper-driver = { workspace = true }
-piper-can = { workspace = true }
+piper-client = { workspace = true, default-features = false }
+piper-driver = { workspace = true, default-features = false }
+piper-can = { workspace = true, default-features = false }
 piper-protocol = { workspace = true }
 # ✅ 日志初始化宏支持
 log = "0.4"

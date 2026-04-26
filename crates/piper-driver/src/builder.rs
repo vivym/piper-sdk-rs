@@ -5,9 +5,14 @@
 use crate::error::DriverError;
 use crate::pipeline::PipelineConfig;
 use crate::piper::{Piper, StartupValidationDeadline};
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "socketcan", feature = "auto-backend")
+))]
 use piper_can::SocketCanAdapter;
+#[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
 use piper_can::gs_usb::GsUsbCanAdapter;
+#[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
 use piper_can::gs_usb::device::GsUsbDeviceSelector;
 use piper_can::{
     CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, RealtimeTxAdapter, RxAdapter,
@@ -95,7 +100,10 @@ impl BackendFactory for RealBackendFactory {
         baud_rate: u32,
         receive_timeout: Duration,
     ) -> Result<BuiltBackend, DriverError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "socketcan", feature = "auto-backend")
+        ))]
         {
             let mut can = SocketCanAdapter::new(iface).map_err(DriverError::Can)?;
             can.configure(baud_rate).map_err(DriverError::Can)?;
@@ -103,12 +111,15 @@ impl BackendFactory for RealBackendFactory {
             let (rx, tx) = can.split().map_err(DriverError::Can)?;
             Ok(BuiltBackend::new(rx, tx, iface, baud_rate))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(
+            target_os = "linux",
+            any(feature = "socketcan", feature = "auto-backend")
+        )))]
         {
             let _ = (iface, baud_rate, receive_timeout);
             Err(DriverError::Can(CanError::Device(CanDeviceError::new(
                 CanDeviceErrorKind::UnsupportedConfig,
-                "SocketCAN is only available on Linux",
+                "SocketCAN backend is not enabled",
             ))))
         }
     }
@@ -119,29 +130,40 @@ impl BackendFactory for RealBackendFactory {
         baud_rate: u32,
         receive_timeout: Duration,
     ) -> Result<BuiltBackend, DriverError> {
-        let device_selector = match &selector {
-            GsUsbSelectorSpec::Auto => GsUsbDeviceSelector::any(),
-            GsUsbSelectorSpec::Serial(serial) => GsUsbDeviceSelector::by_serial(serial),
-            GsUsbSelectorSpec::BusAddress { bus, address } => {
-                GsUsbDeviceSelector::by_bus_address(*bus, *address)
-            },
-        };
+        #[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
+        {
+            let device_selector = match &selector {
+                GsUsbSelectorSpec::Auto => GsUsbDeviceSelector::any(),
+                GsUsbSelectorSpec::Serial(serial) => GsUsbDeviceSelector::by_serial(serial),
+                GsUsbSelectorSpec::BusAddress { bus, address } => {
+                    GsUsbDeviceSelector::by_bus_address(*bus, *address)
+                },
+            };
 
-        let mut can =
-            GsUsbCanAdapter::new_with_selector(device_selector).map_err(DriverError::Can)?;
-        can.configure(baud_rate).map_err(DriverError::Can)?;
-        can.set_receive_timeout(receive_timeout);
-        let (rx, tx) = can.split().map_err(DriverError::Can)?;
+            let mut can =
+                GsUsbCanAdapter::new_with_selector(device_selector).map_err(DriverError::Can)?;
+            can.configure(baud_rate).map_err(DriverError::Can)?;
+            can.set_receive_timeout(receive_timeout);
+            let (rx, tx) = can.split().map_err(DriverError::Can)?;
 
-        let interface = match selector {
-            GsUsbSelectorSpec::Auto => "gs-usb:auto".to_string(),
-            GsUsbSelectorSpec::Serial(serial) => format!("gs-usb:serial:{serial}"),
-            GsUsbSelectorSpec::BusAddress { bus, address } => {
-                format!("gs-usb:bus-address:{bus}:{address}")
-            },
-        };
+            let interface = match selector {
+                GsUsbSelectorSpec::Auto => "gs-usb:auto".to_string(),
+                GsUsbSelectorSpec::Serial(serial) => format!("gs-usb:serial:{serial}"),
+                GsUsbSelectorSpec::BusAddress { bus, address } => {
+                    format!("gs-usb:bus-address:{bus}:{address}")
+                },
+            };
 
-        Ok(BuiltBackend::new(rx, tx, interface, baud_rate))
+            Ok(BuiltBackend::new(rx, tx, interface, baud_rate))
+        }
+        #[cfg(not(any(feature = "gs_usb", feature = "auto-backend")))]
+        {
+            let _ = (selector, baud_rate, receive_timeout);
+            Err(DriverError::Can(CanError::Device(CanDeviceError::new(
+                CanDeviceErrorKind::UnsupportedConfig,
+                "GS-USB backend is not enabled",
+            ))))
+        }
     }
 }
 
@@ -501,10 +523,14 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Instant;
 
+    fn received(frame: piper_can::PiperFrame) -> piper_can::ReceivedFrame {
+        piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
+    }
+
     struct TestRxAdapter;
 
     impl RxAdapter for TestRxAdapter {
-        fn receive(&mut self) -> Result<piper_can::PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             Err(CanError::Timeout)
         }
 
@@ -516,7 +542,7 @@ mod tests {
     struct StrictNoTimestampRxAdapter;
 
     impl RxAdapter for StrictNoTimestampRxAdapter {
-        fn receive(&mut self) -> Result<piper_can::PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             Err(CanError::Timeout)
         }
     }
@@ -536,9 +562,9 @@ mod tests {
     }
 
     impl RxAdapter for StrictBootstrapRxAdapter {
-        fn receive(&mut self) -> Result<piper_can::PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if let Some(frame) = self.bootstrap.take() {
-                return Ok(frame);
+                return Ok(received(frame));
             }
             Err(CanError::Timeout)
         }
@@ -572,9 +598,9 @@ mod tests {
     }
 
     impl RxAdapter for SoftBootstrapRxAdapter {
-        fn receive(&mut self) -> Result<piper_can::PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if let Some(frame) = self.bootstrap.take() {
-                return Ok(frame);
+                return Ok(received(frame));
             }
             Err(CanError::Timeout)
         }

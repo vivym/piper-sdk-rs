@@ -408,6 +408,10 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    fn received(frame: PiperFrame) -> piper_can::ReceivedFrame {
+        piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
+    }
+
     struct IdleRxAdapter {
         bootstrap_emitted: bool,
     }
@@ -421,12 +425,12 @@ mod tests {
     }
 
     impl RxAdapter for IdleRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             if !self.bootstrap_emitted {
                 self.bootstrap_emitted = true;
                 let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
                 frame.timestamp_us = 1;
-                return Ok(frame);
+                return Ok(received(frame));
             }
             Err(CanError::Timeout)
         }

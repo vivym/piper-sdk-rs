@@ -10,6 +10,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+fn received(frame: PiperFrame) -> piper_sdk::can::ReceivedFrame {
+    piper_sdk::can::ReceivedFrame::new(frame, piper_sdk::can::TimestampProvenance::None)
+}
+
 /// MockCanAdapter 用于测试
 struct MockCanAdapter {
     receive_queue: Arc<Mutex<VecDeque<PiperFrame>>>,
@@ -35,8 +39,13 @@ impl CanAdapter for MockCanAdapter {
         Ok(())
     }
 
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
-        self.receive_queue.lock().unwrap().pop_front().ok_or(CanError::Timeout)
+    fn receive(&mut self) -> Result<piper_sdk::can::ReceivedFrame, CanError> {
+        self.receive_queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(received)
+            .ok_or(CanError::Timeout)
     }
 }
 
@@ -45,8 +54,13 @@ struct MockRxAdapter {
 }
 
 impl piper_sdk::can::RxAdapter for MockRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
-        self.receive_queue.lock().unwrap().pop_front().ok_or(CanError::Timeout)
+    fn receive(&mut self) -> Result<piper_sdk::can::ReceivedFrame, CanError> {
+        self.receive_queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(received)
+            .ok_or(CanError::Timeout)
     }
 }
 

@@ -270,7 +270,7 @@ impl SimpleRxAdapter {
 }
 
 impl RxAdapter for SimpleRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
         let elapsed = self.start_time.elapsed();
         let expected_frame_index = (elapsed.as_millis() / self.interval.as_millis()) as usize;
 
@@ -285,7 +285,10 @@ impl RxAdapter for SimpleRxAdapter {
         }
 
         self.frame_count.fetch_add(1, Ordering::Relaxed);
-        self.frames.pop_front().ok_or(CanError::Timeout)
+        self.frames
+            .pop_front()
+            .map(|frame| piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None))
+            .ok_or(CanError::Timeout)
     }
 }
 

@@ -10,11 +10,15 @@ readme = "../../README.md"
 
 [features]
 default = []
-serde = ["dep:serde", "piper-protocol/serde"]
+serde = ["dep:serde", "piper-can/serde", "piper-protocol/serde"]
+mock = ["piper-can/mock", "piper-driver/mock"]
+auto-backend = ["piper-can/auto-backend", "piper-driver/auto-backend"]
+socketcan = ["piper-can/socketcan", "piper-driver/socketcan"]
+gs_usb = ["piper-can/gs_usb", "piper-driver/gs_usb"]
 
 [dependencies]
-piper-driver = { workspace = true }
-piper-can = { workspace = true }
+piper-driver = { workspace = true, default-features = false }
+piper-can = { workspace = true, default-features = false }
 piper-protocol = { workspace = true }
 piper-tools = { workspace = true }
 thiserror = { workspace = true }

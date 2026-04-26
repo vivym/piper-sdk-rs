@@ -41,8 +41,11 @@ impl QueueRxAdapter {
 }
 
 impl RxAdapter for QueueRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
-        self.frames.pop_front().ok_or(CanError::Timeout)
+    fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
+        self.frames
+            .pop_front()
+            .map(|frame| piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None))
+            .ok_or(CanError::Timeout)
     }
 }
 

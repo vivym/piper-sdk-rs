@@ -2911,7 +2911,7 @@ mod tests {
     struct PanickingRxAdapter;
 
     impl RxAdapter for PanickingRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             panic!("test rx panic")
         }
 
@@ -2942,8 +2942,13 @@ mod tests {
     }
 
     impl RxAdapter for BootstrappedFeedbackRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
-            self.frames.pop_front().ok_or(CanError::Timeout)
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
+            self.frames
+                .pop_front()
+                .map(|frame| {
+                    piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
+                })
+                .ok_or(CanError::Timeout)
         }
 
         fn backend_capability(&self) -> BackendCapability {

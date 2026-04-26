@@ -286,7 +286,7 @@ impl ConfigurableRxAdapter {
 }
 
 impl RxAdapter for ConfigurableRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
         // 模拟延迟
         if rand::random::<f64>() < self.delay_probability {
             thread::sleep(self.delay_duration);
@@ -313,7 +313,10 @@ impl RxAdapter for ConfigurableRxAdapter {
         }
 
         self.frame_count.fetch_add(1, Ordering::Relaxed);
-        self.frames.pop_front().ok_or(CanError::Timeout)
+        self.frames
+            .pop_front()
+            .map(|frame| piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None))
+            .ok_or(CanError::Timeout)
     }
 }
 

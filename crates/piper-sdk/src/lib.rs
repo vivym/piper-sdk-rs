@@ -31,12 +31,17 @@
 pub mod can {
     #[cfg(feature = "mock")]
     pub use piper_can::MockCanAdapter;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "socketcan", feature = "auto-backend")
+    ))]
     pub use piper_can::SocketCanAdapter;
+    #[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
     pub use piper_can::gs_usb::GsUsbCanAdapter;
     pub use piper_can::{
-        BridgeTxAdapter, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame,
-        RealtimeTxAdapter, RxAdapter, SplittableAdapter,
+        BridgeTxAdapter, CanAdapter, CanData, CanDeviceError, CanDeviceErrorKind, CanError, CanId,
+        ExtendedCanId, FrameError, PiperFrame, RealtimeTxAdapter, ReceivedFrame, RxAdapter,
+        SplittableAdapter, StandardCanId, TimestampProvenance,
     };
 }
 

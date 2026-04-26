@@ -25,9 +25,9 @@ categories = ["hardware-support"]
 [workspace.dependencies]
 # 内部 crates
 piper-protocol = { version = "0.0.3", path = "crates/piper-protocol" }
-piper-can = { version = "0.0.3", path = "crates/piper-can" }
-piper-driver = { version = "0.0.3", path = "crates/piper-driver" }
-piper-client = { version = "0.0.3", path = "crates/piper-client" }
+piper-can = { version = "0.0.3", path = "crates/piper-can", default-features = false }
+piper-driver = { version = "0.0.3", path = "crates/piper-driver", default-features = false }
+piper-client = { version = "0.0.3", path = "crates/piper-client", default-features = false }
 piper-control = { version = "0.0.3", path = "crates/piper-control" }
 piper-sdk = { version = "0.0.3", path = "crates/piper-sdk" }
 piper-tools = { version = "0.0.3", path = "crates/piper-tools" }

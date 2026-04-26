@@ -14,10 +14,13 @@ default = []
 realtime = ["dep:thread-priority"]
 # Mock mode for testing without hardware
 mock = ["piper-can/mock"]
+auto-backend = ["piper-can/auto-backend"]
+socketcan = ["piper-can/socketcan"]
+gs_usb = ["piper-can/gs_usb"]
 
 [dependencies]
 piper-protocol = { workspace = true }
-piper-can = { workspace = true }
+piper-can = { workspace = true, default-features = false }
 crossbeam-channel = { workspace = true }
 arc-swap = { workspace = true }
 thiserror = { workspace = true }

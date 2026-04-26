@@ -4,7 +4,7 @@
 //! and responses are correlated by full-width `u32` request ids. Events are
 //! asynchronous and do not carry request ids.
 
-use crate::PiperFrame;
+use crate::{CanData, ExtendedCanId, FrameError, PiperFrame, StandardCanId};
 use rand::random;
 use std::io::{self, Read, Write};
 
@@ -306,15 +306,19 @@ fn put_string(buf: &mut Vec<u8>, value: &str) -> Result<(), ProtocolError> {
 }
 
 fn put_frame_request(buf: &mut Vec<u8>, frame: &PiperFrame) {
-    put_u32(buf, frame.id);
-    put_u8(buf, u8::from(frame.is_extended));
-    put_u8(buf, frame.len);
-    buf.extend_from_slice(&frame.data);
+    put_u32(buf, frame.raw_id());
+    put_u8(buf, u8::from(frame.is_extended()));
+    put_u8(buf, frame.dlc());
+    buf.extend_from_slice(frame.data_padded());
 }
 
 fn put_frame_event(buf: &mut Vec<u8>, frame: &PiperFrame) {
     put_frame_request(buf, frame);
-    put_u64(buf, frame.timestamp_us);
+    put_u64(buf, frame.timestamp_us());
+}
+
+fn map_frame_error(context: &'static str, _error: FrameError) -> ProtocolError {
+    ProtocolError::InvalidData(context)
 }
 
 struct Cursor<'a> {
@@ -387,24 +391,24 @@ impl<'a> Cursor<'a> {
         let id = self.u32()?;
         let is_extended = self.u8()? != 0;
         let len = self.u8()?;
-        if len > 8 {
-            return Err(ProtocolError::InvalidData("invalid can len"));
-        }
         let mut data = [0u8; 8];
         data.copy_from_slice(self.take(8)?);
-        Ok(PiperFrame {
-            id,
-            data,
-            len,
-            is_extended,
-            timestamp_us: 0,
-        })
+        let data = CanData::from_padded(data, len)
+            .map_err(|err| map_frame_error("invalid bridge frame data", err))?;
+        if is_extended {
+            let id = ExtendedCanId::new(id)
+                .map_err(|err| map_frame_error("invalid bridge extended can id", err))?;
+            Ok(PiperFrame::extended(id, data))
+        } else {
+            let id = StandardCanId::new(id)
+                .map_err(|err| map_frame_error("invalid bridge standard can id", err))?;
+            Ok(PiperFrame::standard(id, data))
+        }
     }
 
     fn frame_event(&mut self) -> Result<PiperFrame, ProtocolError> {
-        let mut frame = self.frame_request()?;
-        frame.timestamp_us = self.u64()?;
-        Ok(frame)
+        let frame = self.frame_request()?;
+        Ok(frame.with_timestamp_us(self.u64()?))
     }
 }
 
@@ -759,10 +763,9 @@ mod tests {
 
     #[test]
     fn test_event_roundtrip() {
-        let message = ServerMessage::Event(BridgeEvent::ReceiveFrame(PiperFrame::new_standard(
-            0x123,
-            &[1, 2, 3, 4],
-        )));
+        let message = ServerMessage::Event(BridgeEvent::ReceiveFrame(
+            PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap(),
+        ));
         let encoded = encode_server_message(&message).unwrap();
         let decoded = decode_server_message(&encoded[4..]).unwrap();
         assert_eq!(decoded, message);

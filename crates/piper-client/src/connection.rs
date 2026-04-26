@@ -166,10 +166,13 @@ mod tests {
     }
 
     impl RxAdapter for PacedRxAdapter {
-        fn receive(&mut self) -> std::result::Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             if !self.bootstrap {
                 self.bootstrap = true;
-                return Ok(bootstrap_timestamp_frame());
+                return Ok(piper_can::ReceivedFrame::new(
+                    bootstrap_timestamp_frame(),
+                    piper_can::TimestampProvenance::None,
+                ));
             }
 
             match self.frames.pop_front() {
@@ -177,7 +180,10 @@ mod tests {
                     if !timed.delay.is_zero() {
                         std::thread::sleep(timed.delay);
                     }
-                    Ok(timed.frame)
+                    Ok(piper_can::ReceivedFrame::new(
+                        timed.frame,
+                        piper_can::TimestampProvenance::None,
+                    ))
                 },
                 None => Err(CanError::Timeout),
             }

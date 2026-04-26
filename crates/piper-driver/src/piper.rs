@@ -1713,6 +1713,7 @@ fn clone_can_error(error: &CanError) -> CanError {
             CanError::Io(std::io::Error::new(source.kind(), source.to_string()))
         },
         CanError::Device(source) => CanError::Device(source.clone()),
+        CanError::Frame(source) => CanError::Frame(*source),
         CanError::Timeout => CanError::Timeout,
         CanError::BufferOverflow => CanError::BufferOverflow,
         CanError::BusOff => CanError::BusOff,
@@ -4956,12 +4957,16 @@ mod tests {
 
     struct MockCanAdapter;
 
+    fn received(frame: PiperFrame) -> piper_can::ReceivedFrame {
+        piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
+    }
+
     impl CanAdapter for MockCanAdapter {
         fn send(&mut self, _frame: PiperFrame) -> Result<(), CanError> {
             Ok(())
         }
 
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             // 永远超时，避免阻塞测试
             Err(CanError::Timeout)
         }
@@ -4970,7 +4975,7 @@ mod tests {
     struct MockRxAdapter;
 
     impl piper_can::RxAdapter for MockRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             Err(CanError::Timeout)
         }
     }
@@ -5071,9 +5076,9 @@ mod tests {
     }
 
     impl piper_can::RxAdapter for BootstrappedMockRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if let Some(frame) = self.bootstrap.take() {
-                return Ok(frame);
+                return Ok(received(frame));
             }
             Err(CanError::Timeout)
         }
@@ -5096,8 +5101,8 @@ mod tests {
     }
 
     impl piper_can::RxAdapter for ProbedBootstrapRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
-            self.bootstrap.pop_front().ok_or(CanError::Timeout)
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
+            self.bootstrap.pop_front().map(received).ok_or(CanError::Timeout)
         }
 
         fn backend_capability(&self) -> BackendCapability {
@@ -5121,7 +5126,7 @@ mod tests {
     struct SoftRxAdapter;
 
     impl piper_can::RxAdapter for SoftRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             Err(CanError::Timeout)
         }
 
@@ -5141,12 +5146,12 @@ mod tests {
     }
 
     impl piper_can::RxAdapter for TimestampedJunkRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if !self.emitted {
                 self.emitted = true;
                 let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
                 frame.timestamp_us = 123;
-                return Ok(frame);
+                return Ok(received(frame));
             }
             Err(CanError::Timeout)
         }
@@ -5167,7 +5172,7 @@ mod tests {
     }
 
     impl piper_can::RxAdapter for DelayedTimestampedFeedbackRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if !self.emitted {
                 self.emitted = true;
                 if !self.delay.is_zero() {
@@ -5175,7 +5180,7 @@ mod tests {
                 }
                 let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
                 frame.timestamp_us = 1;
-                return Ok(frame);
+                return Ok(received(frame));
             }
             Err(CanError::Timeout)
         }
@@ -5186,7 +5191,7 @@ mod tests {
     }
 
     impl piper_can::RxAdapter for FatalRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if !self.tripped {
                 self.tripped = true;
                 Err(CanError::BufferOverflow)
@@ -5202,7 +5207,7 @@ mod tests {
     }
 
     impl piper_can::RxAdapter for TriggeredFatalRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if !self.tripped && self.trigger.load(std::sync::atomic::Ordering::Acquire) {
                 self.tripped = true;
                 return Err(CanError::BufferOverflow);
@@ -5214,7 +5219,7 @@ mod tests {
     struct PanickingRxAdapter;
 
     impl piper_can::RxAdapter for PanickingRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             panic!("rx panic injected by test");
         }
     }
@@ -5667,7 +5672,7 @@ mod tests {
             Ok(())
         }
 
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             Err(CanError::Timeout)
         }
     }
@@ -5716,15 +5721,15 @@ mod tests {
     }
 
     impl piper_can::RxAdapter for ScriptedRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if let Some(frame) = self.bootstrap.take() {
-                return Ok(frame);
+                return Ok(received(frame));
             }
             if !self.emitted_first_frame && !self.first_delay.is_zero() {
                 std::thread::sleep(self.first_delay);
                 self.emitted_first_frame = true;
             }
-            self.frames.pop_front().ok_or(CanError::Timeout)
+            self.frames.pop_front().map(received).ok_or(CanError::Timeout)
         }
     }
 
@@ -5747,13 +5752,14 @@ mod tests {
     }
 
     impl piper_can::RxAdapter for ChannelRxAdapter {
-        fn receive(&mut self) -> Result<PiperFrame, CanError> {
+        fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if let Some(frame) = self.bootstrap.take() {
-                return Ok(frame);
+                return Ok(received(frame));
             }
 
             self.frames_rx
                 .recv_timeout(Duration::from_millis(2))
+                .map(received)
                 .map_err(|_| CanError::Timeout)
         }
     }
