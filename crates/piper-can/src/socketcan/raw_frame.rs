@@ -200,6 +200,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_other_non_classic_mtu() {
+        let bytes = raw_frame_bytes(0x123, 1, [0; 8]);
+
+        let message = fatal_message(parse(&bytes, 12, 0));
+
+        assert!(message.contains("non-classic CAN MTU"));
+    }
+
+    #[test]
     fn rejects_truncated_message_flag() {
         let bytes = raw_frame_bytes(0x123, 1, [0; 8]);
 
@@ -232,6 +241,18 @@ mod tests {
     fn treats_controller_overflow_error_frame_as_fatal() {
         let mut data = [0u8; 8];
         data[1] = libc::CAN_ERR_CRTL_RX_OVERFLOW as u8;
+        let bytes = raw_frame_bytes(libc::CAN_ERR_FLAG | libc::CAN_ERR_CRTL, 8, data);
+
+        assert!(matches!(
+            parse(&bytes, libc::CAN_MTU as usize, 0),
+            ParsedSocketCanFrame::Fatal(CanError::BufferOverflow)
+        ));
+    }
+
+    #[test]
+    fn treats_controller_tx_overflow_error_frame_as_fatal() {
+        let mut data = [0u8; 8];
+        data[1] = libc::CAN_ERR_CRTL_TX_OVERFLOW as u8;
         let bytes = raw_frame_bytes(libc::CAN_ERR_FLAG | libc::CAN_ERR_CRTL, 8, data);
 
         assert!(matches!(

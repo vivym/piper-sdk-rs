@@ -23,7 +23,7 @@
 //! - **权限要求**：可能需要 `dialout` 组权限或 `sudo`
 
 use crate::{
-    BackendCapability, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame,
+    BackendCapability, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, CanId, PiperFrame,
     ReceivedFrame, TimestampProvenance,
 };
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -292,25 +292,21 @@ impl SocketCanAdapter {
         Ok(())
     }
 
-    /// 接收帧并提取时间戳（带超时）
+    /// 接收帧并提取时间戳（带来源信息）
     ///
-    /// 此方法使用 `poll + recvmsg` 接收 CAN 帧，并同时提取硬件/软件时间戳。
+    /// 此方法使用 `poll + recvmsg` 接收 CAN 帧，并同时提取硬件/软件时间戳与来源。
     ///
     ///
     /// # 返回值
-    /// - `Ok((frame, timestamp_us))`: 成功接收帧和时间戳（微秒）
+    /// - `Ok(ReceivedFrame)`: 成功接收帧、时间戳（写入 `frame.timestamp_us()`）和来源
     /// - `Err(CanError::Timeout)`: 读取超时
     /// - `Err(CanError::Io)`: IO 错误
     ///
     /// # 注意
     /// - 此方法会过滤错误帧，只返回有效数据帧
     /// - 时间戳优先级：硬件时间戳（Transformed） > 软件时间戳 > 0（不可用）
-    pub fn receive_with_timestamp(&mut self) -> Result<(PiperFrame, u64), CanError> {
-        let received = self.receive_received_frame()?;
-        Ok((received.frame, received.frame.timestamp_us()))
-    }
-
-    fn receive_received_frame(&mut self) -> Result<ReceivedFrame, CanError> {
+    /// - SocketCAN cmsg timestamps report `TimestampProvenance::Kernel`; missing timestamps report `None`.
+    pub fn receive_with_timestamp(&mut self) -> Result<ReceivedFrame, CanError> {
         if !self.started {
             return Err(CanError::NotStarted);
         }
@@ -594,9 +590,8 @@ impl CanAdapter for SocketCanAdapter {
 
         // 1. 转换 PiperFrame -> CanFrame
         let payload = &frame.data_padded()[..frame.dlc() as usize];
-        let can_frame = if frame.is_extended() {
-            // 扩展帧
-            ExtendedId::new(frame.raw_id())
+        let can_frame = match frame.id() {
+            CanId::Extended(id) => ExtendedId::new(id.raw())
                 .and_then(|id| CanFrame::new(id, payload))
                 .ok_or_else(|| {
                     CanError::Device(
@@ -606,10 +601,8 @@ impl CanAdapter for SocketCanAdapter {
                         )
                         .into(),
                     )
-                })?
-        } else {
-            // 标准帧
-            StandardId::new(frame.raw_id() as u16)
+                })?,
+            CanId::Standard(id) => StandardId::new(id.raw())
                 .and_then(|id| CanFrame::new(id, payload))
                 .ok_or_else(|| {
                     CanError::Device(
@@ -619,7 +612,7 @@ impl CanAdapter for SocketCanAdapter {
                         )
                         .into(),
                     )
-                })?
+                })?,
         };
 
         // 2. 发送（Fire-and-Forget）
@@ -655,7 +648,7 @@ impl CanAdapter for SocketCanAdapter {
         }
 
         // Hot path: removed trace! call (200Hz+)
-        self.receive_received_frame()
+        self.receive_with_timestamp()
     }
 
     /// 设置接收超时
@@ -897,9 +890,9 @@ mod tests {
                     "Timeout should take at least ~1ms"
                 );
             },
-            Ok((_frame, _timestamp_us)) => {
-                // 如果收到了帧（可能来自其他测试），验证时间戳格式
-                // 时间戳应该被提取（可能非零，也可能溢出为 u32::MAX）
+            Ok(received) => {
+                let _timestamp_us = received.frame.timestamp_us();
+                let _provenance = received.timestamp_provenance;
             },
             Err(e) => panic!("Expected Timeout or Ok, got: {:?}", e),
         }
@@ -949,7 +942,8 @@ mod tests {
         tx_adapter.send(tx_frame).unwrap();
 
         // 使用 receive_with_timestamp 接收
-        let (can_frame, timestamp_us) = rx_adapter.receive_with_timestamp().unwrap();
+        let received = rx_adapter.receive_with_timestamp().unwrap();
+        let can_frame = received.frame;
 
         // 验证接收到的帧
         // raw_id() 返回包含标志位的完整 ID，标准帧使用低 11 位
@@ -971,8 +965,13 @@ mod tests {
         // 我们的实现会截断为 u32::MAX，这是预期的行为
         // 实际使用中，可能需要使用相对时间戳（从某个基准时间开始）
         assert!(
-            timestamp_us > 0,
+            can_frame.timestamp_us() > 0,
             "Timestamp should be extracted (should be non-zero for software timestamp on vcan0)"
+        );
+        assert_eq!(
+            received.timestamp_provenance,
+            TimestampProvenance::Kernel,
+            "SocketCAN timestamps from control messages should expose kernel provenance"
         );
     }
 
@@ -1047,7 +1046,8 @@ mod tests {
                     "Timeout should complete within ~50ms"
                 );
             },
-            Ok((frame, _)) => {
+            Ok(received) => {
+                let frame = received.frame;
                 panic!(
                     "Expected Timeout error, but received frame: ID=0x{:X}, len={}",
                     frame.raw_id(),
@@ -1132,7 +1132,7 @@ mod tests {
                 );
             }
 
-            let (can_frame, timestamp_us) = match rx_adapter.receive_with_timestamp() {
+            let received = match rx_adapter.receive_with_timestamp() {
                 Ok(frame) => frame,
                 Err(CanError::Timeout) => {
                     // 如果超时，但还没收到所有帧，可能是帧丢失或缓冲区问题
@@ -1144,6 +1144,8 @@ mod tests {
                 },
                 Err(e) => panic!("Unexpected error during receive: {:?}", e),
             };
+            let can_frame = received.frame;
+            let timestamp_us = can_frame.timestamp_us();
 
             // 提取帧 ID
             let received_id = if can_frame.is_extended() {
@@ -1183,7 +1185,8 @@ mod tests {
         let mut consecutive_timeouts = 0;
         loop {
             match rx_adapter.receive_with_timestamp() {
-                Ok((frame, _)) => {
+                Ok(received) => {
+                    let frame = received.frame;
                     cleared_count += 1;
                     consecutive_timeouts = 0; // 重置超时计数
                     let frame_id = if frame.is_extended() {
@@ -1215,7 +1218,8 @@ mod tests {
 
         // 再次确认缓冲区已清空（额外清空一次）
         match rx_adapter.receive_with_timestamp() {
-            Ok((frame, _)) => {
+            Ok(received) => {
+                let frame = received.frame;
                 let frame_id = if frame.is_extended() {
                     frame.raw_id() & 0x1FFFFFFF
                 } else {
@@ -1251,7 +1255,7 @@ mod tests {
         tx_adapter.send(tx_frame).unwrap();
 
         // 接收扩展帧
-        let (can_frame, _timestamp_us) = rx_adapter.receive_with_timestamp().unwrap();
+        let can_frame = rx_adapter.receive_with_timestamp().unwrap().frame;
 
         // 验证扩展帧
         // 注意：vcan0 可能将扩展帧转换为标准帧，但至少应该能接收数据

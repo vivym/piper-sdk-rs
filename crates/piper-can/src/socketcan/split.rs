@@ -23,8 +23,8 @@
 //! - **时间戳支持**：使用 `recvmsg` 和 CMSG 提取硬件/软件时间戳（与 `SocketCanAdapter` 一致）
 
 use crate::{
-    BackendCapability, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter,
-    ReceivedFrame, RxAdapter, TimestampProvenance,
+    BackendCapability, CanDeviceError, CanDeviceErrorKind, CanError, CanId, PiperFrame,
+    RealtimeTxAdapter, ReceivedFrame, RxAdapter, TimestampProvenance,
 };
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
@@ -575,8 +575,8 @@ impl SocketCanTxAdapter {
 
     fn build_can_frame(frame: PiperFrame) -> Result<CanFrame, CanError> {
         let payload = &frame.data_padded()[..frame.dlc() as usize];
-        if frame.is_extended() {
-            ExtendedId::new(frame.raw_id())
+        match frame.id() {
+            CanId::Extended(id) => ExtendedId::new(id.raw())
                 .and_then(|id| CanFrame::new(id, payload))
                 .ok_or_else(|| {
                     CanError::Device(
@@ -586,9 +586,8 @@ impl SocketCanTxAdapter {
                         )
                         .into(),
                     )
-                })
-        } else {
-            StandardId::new(frame.raw_id() as u16)
+                }),
+            CanId::Standard(id) => StandardId::new(id.raw())
                 .and_then(|id| CanFrame::new(id, payload))
                 .ok_or_else(|| {
                     CanError::Device(
@@ -598,7 +597,7 @@ impl SocketCanTxAdapter {
                         )
                         .into(),
                     )
-                })
+                }),
         }
     }
 
