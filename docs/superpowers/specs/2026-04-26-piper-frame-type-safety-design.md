@@ -78,6 +78,8 @@ pub struct CanData {
 
 All fields are private. The only way to construct a frame is through constructors that enforce classic CAN limits.
 
+The frame value types must live in a dedicated module, such as `piper-protocol/src/frame.rs`, and be re-exported from `lib.rs`. They must not be defined directly in `lib.rs` or another ancestor module of protocol submodules, because Rust privacy would allow child modules to construct private fields directly. Do not expose `pub(crate)`, `pub(super)`, or unchecked constructors for these types. Protocol-owned infallible helpers must still go through a small audited construction path that preserves the invariants.
+
 ## Type Invariants
 
 `StandardCanId` must only contain IDs in `0x000..=0x7FF`.
@@ -207,12 +209,17 @@ Deserialization must fail when:
 - `format` is `"standard"` and `id > 0x7FF`
 - `format` is `"extended"` and `id > 0x1FFF_FFFF`
 - `data` has more than 8 bytes
+- `id`, `data`, or `timestamp_us` is missing
+- duplicate fields are present
+- unknown fields are present, including old-shape fields such as `len` or `is_extended`
 
 The serialized `data` field should contain only the active payload bytes, not the padded 8-byte storage.
 
-The serde implementation should not accept the old field shape. Historical recording compatibility is intentionally out of scope.
+The serde implementation should not accept the old field shape. Historical recording compatibility is intentionally out of scope. For self-describing formats such as JSON, use a custom visitor or equivalent `deny_unknown_fields` behavior so stale fields cannot be ignored.
 
 The same strict serde model applies to every serializer used by the workspace. JSON examples document the logical shape, but recording files use `bincode`; implementation must verify that bincode serialization and deserialization enforce the same invariants.
+
+For `bincode`, the canonical frame schema is the same logical helper shape in declaration order: `id`, `format`, `data`, `timestamp_us`. `format` must be an explicit standard/extended value, not derived from `id`. Recording files must reject historical formats using the recording version before attempting to deserialize old frame bodies. Tests should include crafted invalid bincode payloads for bad format values, invalid IDs, oversized payloads, and old recording version/shape rejection.
 
 The constrained subtypes also need safe serde behavior. `StandardCanId`, `ExtendedCanId`, `CanId`, and `CanData` must not derive unchecked `Deserialize` implementations that can bypass their constructors. Either they do not expose serde implementations directly, or their deserializers must enforce the same invariants as their constructors.
 
@@ -258,6 +265,8 @@ Both recording types must store `PiperFrame` directly. They must not keep a loca
 
 Historical recording compatibility is intentionally removed. Existing legacy recording conversion paths, including `LegacyPiperRecording`-style readers that deserialize old `can_id + Vec<u8>` frames, should be deleted. The recording file format version should be bumped, and tests should prove old-shape serialized data is rejected rather than silently converted.
 
+Replay must treat the recorded frame timestamp as scheduling metadata only. When replay converts a recorded frame into a TX frame, it must clear the timestamp with `with_timestamp_us(0)` before sending so capture timestamps do not leak into TX hooks, TX recordings, or backend send paths.
+
 ## Bridge Protocol Format
 
 The bridge protocol must encode explicit frame format.
@@ -268,7 +277,7 @@ The bridge decoder must treat `is_extended` as a canonical boolean field. Accept
 
 Bridge send-frame requests do not encode or trust a timestamp from the client. A request decoded into `PiperFrame` should have `timestamp_us() == 0`. Receive-frame events carry the host/device timestamp and should apply it through `with_timestamp_us()` when constructing the event frame.
 
-The encoder should read from frame methods:
+The request encoder should not include `timestamp_us()`. The event encoder should read from frame methods:
 
 - `raw_id()`
 - `is_extended()`
@@ -293,6 +302,8 @@ Backend encoding should use:
 RX conversion should validate backend-provided IDs and DLC values through `PiperFrame` constructors. Invalid frames received from a device or raw socket should become backend errors instead of invalid SDK values.
 
 RX conversion must also reject non-data frames before constructing `PiperFrame`. The invariant is that remote/RTR frames, error frames, CAN FD frames, and backend control/status frames are never exposed as `PiperFrame`. The backend may preserve its current strategy for those frames: return an error for fatal conditions, ignore/log recoverable conditions, or map them to backend-specific events. This refactor should not force every non-data frame to become a hard receive error.
+
+This requirement applies to every RX conversion surface, including split and unsplit SocketCAN paths, split and unsplit GS-USB paths, GS-USB batch receive paths, and bridge protocol decode paths.
 
 ## Protocol Layer Impact
 
@@ -342,7 +353,7 @@ Recommended order:
 3. Migrate `piper-protocol` internals and tests.
 4. Migrate `piper-can` backend encode/decode and bridge protocol.
 5. Migrate `piper-tools` recording format.
-6. Migrate `piper-driver`, `piper-client`, `piper-sdk`, examples, and addon tests.
+6. Migrate remaining workspace crates: `piper-driver`, `piper-client`, `piper-control`, `piper-sdk`, `apps/cli`, examples, and addon tests.
 7. Remove all remaining direct field access and struct literals.
 
 The refactor should not keep deprecated constructors or public fields. Compile errors should guide migration.
@@ -357,6 +368,7 @@ cargo check --all-targets
 cargo test -p piper-protocol --features serde
 cargo test -p piper-tools
 cargo test --workspace --all-targets
+cargo test --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --document-private-items
 ```
@@ -379,8 +391,10 @@ Required targeted tests:
 - `piper-protocol` tests for `CanData::from_padded`: reject `len > 8`, preserve active bytes, and zero nonzero bytes beyond DLC.
 - `piper-tools` bincode roundtrip tests for recordings containing standard and extended frames.
 - `piper-tools` rejection tests for old recording frame shapes that lack explicit frame format.
+- `piper-driver` recording tests proving `TimestampedFrame` stores `PiperFrame` directly, preserves `frame.timestamp_us()`, and does not duplicate timestamp, ID, or data state.
+- replay tests proving recorded timestamps are used for scheduling but cleared to `0` before TX.
 - `piper-can` bridge protocol tests for invalid frame format booleans, invalid IDs, invalid DLC, request timestamp zeroing, and event timestamp preservation.
-- Backend decode tests for RTR/error frame rejection where such frames can be constructed without hardware.
+- Backend decode tests for RTR/error frame rejection where such frames can be constructed without hardware. Cover split and unsplit SocketCAN, split and unsplit GS-USB, and GS-USB batch receive paths where those paths exist.
 
 ## Acceptance Criteria
 
@@ -392,6 +406,8 @@ No code in the repository uses `PiperFrame { ... }` struct literals.
 
 No code in the repository directly reads or writes `PiperFrame` fields.
 
+Implementation verification should include repository searches for remaining Rust direct-access patterns, at minimum over `*.rs` files. Documentation snippets, READMEs, and examples should be migrated when they show public API usage.
+
 Serde deserialization rejects malformed frames.
 
 Recording and bridge boundaries preserve explicit standard versus extended frame format.
@@ -399,5 +415,7 @@ Recording and bridge boundaries preserve explicit standard versus extended frame
 Recording code has no remaining legacy conversion path from ambiguous `can_id + Vec<u8>` frames.
 
 SocketCAN and GS-USB TX paths do not have unchecked indexing or slicing based on untrusted frame length.
+
+SocketCAN and GS-USB RX paths never expose remote/RTR, error, CAN FD, or backend control/status frames as `PiperFrame`.
 
 All required verification commands pass.
