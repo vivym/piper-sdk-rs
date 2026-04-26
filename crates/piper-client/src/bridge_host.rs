@@ -927,6 +927,9 @@ struct RawFrameTap {
 
 impl FrameCallback for RawFrameTap {
     fn on_frame(&self, event: RecordedFrameEvent) {
+        if event.direction != piper_driver::recording::RecordedFrameDirection::Rx {
+            return;
+        }
         let _ = self.tx.try_send(event.frame);
     }
 }
@@ -2817,6 +2820,28 @@ mod tests {
 
     fn token(byte: u8) -> SessionToken {
         SessionToken::new([byte; 16])
+    }
+
+    #[test]
+    fn raw_frame_tap_forwards_rx_only() {
+        let (tx, rx) = bounded(4);
+        let tap = RawFrameTap { tx };
+        let rx_frame = PiperFrame::new_standard(0x251, [0x01]).unwrap();
+        let tx_frame = PiperFrame::new_standard(0x155, [0x02]).unwrap();
+
+        tap.on_frame(RecordedFrameEvent {
+            frame: tx_frame,
+            direction: piper_driver::recording::RecordedFrameDirection::Tx,
+            timestamp_provenance: piper_driver::recording::TimestampProvenance::Userspace,
+        });
+        tap.on_frame(RecordedFrameEvent {
+            frame: rx_frame,
+            direction: piper_driver::recording::RecordedFrameDirection::Rx,
+            timestamp_provenance: piper_driver::recording::TimestampProvenance::Kernel,
+        });
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames, vec![rx_frame]);
     }
 
     struct TestRawTapCleanup {

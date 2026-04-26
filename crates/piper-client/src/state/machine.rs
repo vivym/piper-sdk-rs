@@ -2893,6 +2893,12 @@ where
 
 // ==================== ReplayMode 状态 ====================
 
+struct ReplayScheduleItem<'a> {
+    file_index: usize,
+    recorded: &'a piper_tools::TimestampedFrame,
+    delay: Duration,
+}
+
 impl<Capability> Piper<ReplayMode, Capability>
 where
     Capability: MotionCapability,
@@ -2944,6 +2950,54 @@ where
             DropPolicy::Noop,
             DriverModeDropPolicy::Preserve,
         )
+    }
+
+    fn build_replay_schedule<'a>(
+        recording: &'a piper_tools::PiperRecording,
+        speed_factor: f64,
+    ) -> Result<Vec<ReplayScheduleItem<'a>>> {
+        let selected_tx: Vec<_> = recording
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.direction == piper_tools::RecordedFrameDirection::Tx)
+            .collect();
+
+        let Some((first_index, first_tx)) = selected_tx.first() else {
+            return Ok(Vec::new());
+        };
+        if first_tx.frame.timestamp_us() == 0 {
+            return Err(crate::RobotError::ConfigError(format!(
+                "first replay TX timestamp is zero (frame {first_index})"
+            )));
+        }
+
+        let mut schedule = Vec::with_capacity(selected_tx.len());
+        let mut previous_tx_timestamp = first_tx.frame.timestamp_us();
+
+        for (index, recorded) in selected_tx {
+            let timestamp = recorded.frame.timestamp_us();
+            if timestamp == 0 {
+                return Err(crate::RobotError::ConfigError(format!(
+                    "replay TX frame {index} has timestamp 0"
+                )));
+            }
+            if timestamp < previous_tx_timestamp {
+                return Err(crate::RobotError::ConfigError(format!(
+                    "replay TX frame {index} timestamp decreased"
+                )));
+            }
+
+            let delay_us = ((timestamp - previous_tx_timestamp) as f64 / speed_factor) as u64;
+            schedule.push(ReplayScheduleItem {
+                file_index: index,
+                recorded,
+                delay: Duration::from_micros(delay_us),
+            });
+            previous_tx_timestamp = timestamp;
+        }
+
+        Ok(schedule)
     }
 
     /// 回放预先录制的 CAN 帧
@@ -2998,7 +3052,7 @@ where
         recording_path: impl AsRef<std::path::Path>,
         speed_factor: f64,
     ) -> Result<Piper<Standby, Capability>> {
-        use piper_tools::{PiperRecording, RecordedFrameDirection};
+        use piper_tools::PiperRecording;
         use std::thread;
         use std::time::Duration;
         const REPLAY_FRAME_COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -3057,47 +3111,19 @@ where
 
         // === 回放帧序列 ===
 
-        let selected_tx: Vec<_> = recording
-            .frames
-            .iter()
-            .enumerate()
-            .filter(|(_, frame)| frame.direction == RecordedFrameDirection::Tx)
-            .collect();
-
-        let Some((_, first_tx)) = selected_tx.first() else {
+        let schedule = Self::build_replay_schedule(&recording, speed_factor)?;
+        if schedule.is_empty() {
             tracing::warn!("Recording file has no TX frames to replay");
             return Ok(self.exit_replay_mode_to_standby());
-        };
-        if first_tx.frame.timestamp_us() == 0 {
-            return Err(crate::RobotError::ConfigError(
-                "first replay TX timestamp is zero".into(),
-            ));
         }
 
-        let mut previous_tx_timestamp = first_tx.frame.timestamp_us();
-
-        for (index, frame) in selected_tx {
-            let timestamp = frame.frame.timestamp_us();
-            if timestamp == 0 {
-                return Err(crate::RobotError::ConfigError(format!(
-                    "replay TX frame {index} has timestamp 0"
-                )));
-            }
-            if timestamp < previous_tx_timestamp {
-                return Err(crate::RobotError::ConfigError(format!(
-                    "replay TX frame {index} timestamp decreased"
-                )));
-            }
-
-            // 等待适当的延迟
-            let delay_us = ((timestamp - previous_tx_timestamp) as f64 / speed_factor) as u64;
-            if delay_us > 0 {
-                let delay = Duration::from_micros(delay_us);
-                thread::sleep(delay);
+        for item in schedule {
+            if !item.delay.is_zero() {
+                thread::sleep(item.delay);
             }
 
             // 发送帧
-            let piper_frame = Self::recording_frame_to_piper_frame(&frame)?;
+            let piper_frame = Self::recording_frame_to_piper_frame(item.recorded)?;
 
             self.driver
                 .send_replay_frame_confirmed(piper_frame, REPLAY_FRAME_COMMIT_TIMEOUT)
@@ -3108,10 +3134,14 @@ where
                 })?;
 
             // 跟踪进度（每 1000 帧打印一次）
+            let timestamp = item.recorded.frame.timestamp_us();
             if timestamp % 1_000_000 < 1000 {
-                trace!("Replayed frame at {:.3}s", timestamp as f64 / 1_000_000.0);
+                trace!(
+                    "Replayed frame {} at {:.3}s",
+                    item.file_index,
+                    timestamp as f64 / 1_000_000.0
+                );
             }
-            previous_tx_timestamp = timestamp;
         }
 
         tracing::info!("Replay completed successfully");
@@ -3187,7 +3217,7 @@ where
         speed_factor: f64,
         cancel_signal: &std::sync::atomic::AtomicBool,
     ) -> Result<Piper<Standby, Capability>> {
-        use piper_tools::{PiperRecording, RecordedFrameDirection};
+        use piper_tools::PiperRecording;
         use std::time::Duration;
         const REPLAY_FRAME_COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -3245,49 +3275,22 @@ where
 
         // === 回放帧序列（带取消检查） ===
 
-        let selected_tx: Vec<_> = recording
-            .frames
-            .iter()
-            .enumerate()
-            .filter(|(_, frame)| frame.direction == RecordedFrameDirection::Tx)
-            .collect();
-
-        let Some((_, first_tx)) = selected_tx.first() else {
+        let schedule = Self::build_replay_schedule(&recording, speed_factor)?;
+        if schedule.is_empty() {
             tracing::warn!("Recording file has no TX frames to replay");
             return Ok(self.exit_replay_mode_to_standby());
-        };
-        if first_tx.frame.timestamp_us() == 0 {
-            return Err(crate::RobotError::ConfigError(
-                "first replay TX timestamp is zero".into(),
-            ));
         }
 
-        let mut previous_tx_timestamp = first_tx.frame.timestamp_us();
-
-        for (index, frame) in selected_tx {
+        for item in schedule {
             // ✅ 每一帧都检查取消信号
             if Self::replay_cancel_requested(cancel_signal) {
                 tracing::warn!("Replay cancelled by user signal");
                 return Ok(self.exit_replay_mode_to_standby());
             }
 
-            let timestamp = frame.frame.timestamp_us();
-            if timestamp == 0 {
-                return Err(crate::RobotError::ConfigError(format!(
-                    "replay TX frame {index} has timestamp 0"
-                )));
-            }
-            if timestamp < previous_tx_timestamp {
-                return Err(crate::RobotError::ConfigError(format!(
-                    "replay TX frame {index} timestamp decreased"
-                )));
-            }
-
             // 等待适当的延迟
-            let delay_us = ((timestamp - previous_tx_timestamp) as f64 / speed_factor) as u64;
-            if delay_us > 0 {
-                let delay = Duration::from_micros(delay_us);
-                if !Self::wait_replay_delay_or_cancel(delay, cancel_signal) {
+            if !item.delay.is_zero() {
+                if !Self::wait_replay_delay_or_cancel(item.delay, cancel_signal) {
                     tracing::warn!("Replay cancelled by user signal");
                     return Ok(self.exit_replay_mode_to_standby());
                 }
@@ -3299,7 +3302,7 @@ where
             }
 
             // 发送帧
-            let piper_frame = Self::recording_frame_to_piper_frame(&frame)?;
+            let piper_frame = Self::recording_frame_to_piper_frame(item.recorded)?;
 
             self.driver
                 .send_replay_frame_confirmed(piper_frame, REPLAY_FRAME_COMMIT_TIMEOUT)
@@ -3310,10 +3313,14 @@ where
                 })?;
 
             // 跟踪进度（每 1000 帧打印一次）
+            let timestamp = item.recorded.frame.timestamp_us();
             if timestamp % 1_000_000 < 1000 {
-                trace!("Replayed frame at {:.3}s", timestamp as f64 / 1_000_000.0);
+                trace!(
+                    "Replayed frame {} at {:.3}s",
+                    item.file_index,
+                    timestamp as f64 / 1_000_000.0
+                );
             }
-            previous_tx_timestamp = timestamp;
         }
 
         tracing::info!("Replay completed successfully");
@@ -6844,19 +6851,25 @@ mod tests {
 
     #[test]
     fn replay_recording_rejects_zero_timestamp_on_selected_tx() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let recording_path = write_test_recording_frames(&[
             (
-                PiperFrame::new_standard(0x251, [0xAA]).unwrap().with_timestamp_us(1_000),
+                PiperFrame::new_standard(0x155, [0x01]).unwrap().with_timestamp_us(1_000),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x251, [0xAA]).unwrap().with_timestamp_us(2_000),
                 ToolsRecordedFrameDirection::Rx,
                 Some(TimestampSource::Hardware),
             ),
             (
-                PiperFrame::new_standard(0x155, [0x01]).unwrap().with_timestamp_us(0),
+                PiperFrame::new_standard(0x156, [0x02]).unwrap().with_timestamp_us(0),
                 ToolsRecordedFrameDirection::Tx,
                 Some(TimestampSource::Hardware),
             ),
         ]);
-        let replay = build_standby_piper(IdleRxAdapter::new(), Arc::new(Mutex::new(Vec::new())))
+        let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
             .enter_replay_mode()
             .expect("enter_replay_mode should succeed");
 
@@ -6865,7 +6878,11 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            matches!(error, RobotError::ConfigError(message) if message.contains("timestamp is zero"))
+            matches!(error, RobotError::ConfigError(message) if message.contains("timestamp 0"))
+        );
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "replay prevalidation must reject a later zero timestamp before sending earlier TX frames"
         );
 
         let _ = std::fs::remove_file(recording_path);
@@ -6873,6 +6890,7 @@ mod tests {
 
     #[test]
     fn replay_recording_rejects_decreasing_selected_tx_timestamps() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let recording_path = write_test_recording_frames(&[
             (
                 PiperFrame::new_standard(0x155, [0x01]).unwrap().with_timestamp_us(2_000),
@@ -6890,7 +6908,7 @@ mod tests {
                 Some(TimestampSource::Hardware),
             ),
         ]);
-        let replay = build_standby_piper(IdleRxAdapter::new(), Arc::new(Mutex::new(Vec::new())))
+        let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
             .enter_replay_mode()
             .expect("enter_replay_mode should succeed");
 
@@ -6900,6 +6918,48 @@ mod tests {
         };
         assert!(
             matches!(error, RobotError::ConfigError(message) if message.contains("timestamp decreased"))
+        );
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "replay prevalidation must reject decreasing timestamps before sending earlier TX frames"
+        );
+
+        let _ = std::fs::remove_file(recording_path);
+    }
+
+    #[test]
+    fn replay_recording_with_cancel_rejects_later_zero_timestamp_before_any_send() {
+        use std::sync::atomic::AtomicBool;
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let recording_path = write_test_recording_frames(&[
+            (
+                PiperFrame::new_standard(0x155, [0x01]).unwrap().with_timestamp_us(1_000),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x156, [0x02]).unwrap().with_timestamp_us(0),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+        ]);
+        let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+        let cancel_signal = AtomicBool::new(true);
+
+        let error = match replay.replay_recording_with_cancel(&recording_path, 1.0, &cancel_signal)
+        {
+            Ok(_) => panic!("zero timestamp on selected TX frame must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, RobotError::ConfigError(message) if message.contains("timestamp 0"))
+        );
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "cancel replay prevalidation must reject invalid TX timestamps before sending"
         );
 
         let _ = std::fs::remove_file(recording_path);
