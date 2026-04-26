@@ -6,5 +6,5 @@ error[E0624]: associated function `new_const` is private
   |
  ::: src/frame.rs
   |
-  |     const fn new_const(raw: u16) -> Self {
-  |     ------------------------------------ private associated function defined here
+  |     pub(crate) const fn new_const(raw: u16) -> Self {
+  |     ----------------------------------------------- private associated function defined here
