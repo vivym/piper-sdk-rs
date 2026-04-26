@@ -20,6 +20,7 @@ pub mod constants;
 pub mod control;
 pub mod diagnostics;
 pub mod feedback;
+pub mod frame;
 pub mod ids;
 
 // 重新导出常用类型

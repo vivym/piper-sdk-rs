@@ -1,0 +1,10 @@
+error[E0624]: associated function `new_const` is private
+ --> tests/ui/unchecked_const_constructor.rs:2:51
+  |
+2 |     let _ = piper_protocol::frame::StandardCanId::new_const(0x123);
+  |                                                   ^^^^^^^^^ private associated function
+  |
+ ::: src/frame.rs
+  |
+  |     const fn new_const(raw: u16) -> Self {
+  |     ------------------------------------ private associated function defined here

@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `frame::CanDataLen<9>: frame::CanDataLenAtMost8` is not satisfied
+ --> tests/ui/from_exact_too_long.rs:2:56
+  |
+2 |     let _ = piper_protocol::frame::CanData::from_exact([0u8; 9]);
+  |             ------------------------------------------ ^^^^^^^^ the trait `frame::CanDataLenAtMost8` is not implemented for `frame::CanDataLen<9>`
+  |             |
+  |             required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `frame::CanDataLenAtMost8`:
+            frame::CanDataLen<0>
+            frame::CanDataLen<1>
+            frame::CanDataLen<2>
+            frame::CanDataLen<3>
+            frame::CanDataLen<4>
+            frame::CanDataLen<5>
+            frame::CanDataLen<6>
+            frame::CanDataLen<7>
+            frame::CanDataLen<8>
+note: required by a bound in `CanData::from_exact`
+ --> src/frame.rs
+  |
+  |     pub fn from_exact<const N: usize>(bytes: [u8; N]) -> Self
+  |            ---------- required by a bound in this associated function
+  |     where
+  |         CanDataLen<N>: CanDataLenAtMost8,
+  |                        ^^^^^^^^^^^^^^^^^ required by this bound in `CanData::from_exact`
