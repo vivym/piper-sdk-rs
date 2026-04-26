@@ -6872,6 +6872,7 @@ mod tests {
         let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
             .enter_replay_mode()
             .expect("enter_replay_mode should succeed");
+        let driver = replay.driver.clone();
 
         let error = match replay.replay_recording(&recording_path, 1.0) {
             Ok(_) => panic!("zero timestamp on selected TX frame must be rejected"),
@@ -6883,6 +6884,11 @@ mod tests {
         assert!(
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "replay prevalidation must reject a later zero timestamp before sending earlier TX frames"
+        );
+        assert_eq!(
+            driver.mode(),
+            DriverMode::Normal,
+            "failed replay prevalidation must restore driver mode to Normal"
         );
 
         let _ = std::fs::remove_file(recording_path);
@@ -6911,6 +6917,7 @@ mod tests {
         let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
             .enter_replay_mode()
             .expect("enter_replay_mode should succeed");
+        let driver = replay.driver.clone();
 
         let error = match replay.replay_recording(&recording_path, 1.0) {
             Ok(_) => panic!("decreasing selected TX timestamps must be rejected"),
@@ -6922,6 +6929,11 @@ mod tests {
         assert!(
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "replay prevalidation must reject decreasing timestamps before sending earlier TX frames"
+        );
+        assert_eq!(
+            driver.mode(),
+            DriverMode::Normal,
+            "failed replay prevalidation must restore driver mode to Normal"
         );
 
         let _ = std::fs::remove_file(recording_path);
@@ -6947,6 +6959,7 @@ mod tests {
         let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
             .enter_replay_mode()
             .expect("enter_replay_mode should succeed");
+        let driver = replay.driver.clone();
         let cancel_signal = AtomicBool::new(true);
 
         let error = match replay.replay_recording_with_cancel(&recording_path, 1.0, &cancel_signal)
@@ -6960,6 +6973,11 @@ mod tests {
         assert!(
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "cancel replay prevalidation must reject invalid TX timestamps before sending"
+        );
+        assert_eq!(
+            driver.mode(),
+            DriverMode::Normal,
+            "failed cancel replay prevalidation must restore driver mode to Normal"
         );
 
         let _ = std::fs::remove_file(recording_path);

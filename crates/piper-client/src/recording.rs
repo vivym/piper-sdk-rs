@@ -55,7 +55,9 @@
 //! ```
 
 use piper_can::CanId;
-use piper_driver::recording::{RecordedFrameEvent, TimestampProvenance, TimestampedFrame};
+use piper_driver::recording::{
+    RecordedFrameDirection, RecordedFrameEvent, TimestampProvenance, TimestampedFrame,
+};
 use piper_driver::{FrameCallback, HookHandle, HookManager};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -139,6 +141,12 @@ pub(super) struct RecordingGate {
     frame_count_limit: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RecordingGateDecision {
+    accepted: bool,
+    closed_after_accept: bool,
+}
+
 impl RecordingGate {
     fn new(condition: RecordingStopCondition) -> Self {
         let (deadline_us, stop_on_id, frame_count_limit) = match condition {
@@ -165,9 +173,16 @@ impl RecordingGate {
         self.accepting = false;
     }
 
-    fn accept(&mut self, frame: &piper_can::PiperFrame) -> bool {
+    fn accept(
+        &mut self,
+        frame: &piper_can::PiperFrame,
+        direction: RecordedFrameDirection,
+    ) -> RecordingGateDecision {
         if !self.accepting {
-            return false;
+            return RecordingGateDecision {
+                accepted: false,
+                closed_after_accept: false,
+            };
         }
 
         self.accepted_count = self.accepted_count.saturating_add(1);
@@ -176,13 +191,17 @@ impl RecordingGate {
             self.deadline_us.is_some_and(|deadline_us| frame.timestamp_us() >= deadline_us);
         let reached_frame_count =
             self.frame_count_limit.is_some_and(|limit| self.accepted_count >= limit);
-        let reached_can_id = self.stop_on_id.is_some_and(|id| frame.id() == id);
+        let reached_can_id = direction == RecordedFrameDirection::Rx
+            && self.stop_on_id.is_some_and(|id| frame.id() == id);
 
         if reached_deadline || reached_frame_count || reached_can_id {
             self.accepting = false;
         }
 
-        true
+        RecordingGateDecision {
+            accepted: true,
+            closed_after_accept: !self.accepting,
+        }
     }
 }
 
@@ -301,12 +320,12 @@ impl FrameCallback for ClientRecordingHook {
         }
 
         let event = self.normalize_event(event);
-        let accepted = match self.gate.lock() {
-            Ok(mut gate) => gate.accept(&event.frame),
-            Err(poisoned) => poisoned.into_inner().accept(&event.frame),
+        let gate_decision = match self.gate.lock() {
+            Ok(mut gate) => gate.accept(&event.frame, event.direction),
+            Err(poisoned) => poisoned.into_inner().accept(&event.frame, event.direction),
         };
 
-        if !accepted {
+        if !gate_decision.accepted {
             self.stop_requested.store(true, Ordering::Release);
             return;
         }
@@ -318,11 +337,7 @@ impl FrameCallback for ClientRecordingHook {
             self.frame_counter.fetch_add(1, Ordering::Relaxed);
         }
 
-        let accepting = match self.gate.lock() {
-            Ok(gate) => gate.accepting,
-            Err(poisoned) => poisoned.into_inner().accepting,
-        };
-        if !accepting {
+        if gate_decision.closed_after_accept {
             self.stop_requested.store(true, Ordering::Release);
         }
     }
@@ -360,30 +375,23 @@ impl RecordingHandle {
         }
     }
 
-    fn refresh_stop_condition(&self) {
-        let _ = self.stop_requested.load(Ordering::Acquire);
-    }
-
     /// 获取当前已录制的帧数（线程安全，无阻塞）
     ///
     /// # 返回
     ///
     /// 当前已成功录制的帧数
     pub fn frame_count(&self) -> u64 {
-        self.refresh_stop_condition();
         self.frame_counter.load(Ordering::Relaxed)
     }
 
     /// 获取当前丢帧数量
     pub fn dropped_count(&self) -> u64 {
-        self.refresh_stop_condition();
         self.dropped_frames.load(Ordering::Relaxed)
     }
 
     /// 检查是否已请求停止（用于循环条件判断）
     pub fn is_stop_requested(&self) -> bool {
-        self.refresh_stop_condition();
-        self.stop_requested.load(Ordering::Relaxed)
+        self.stop_requested.load(Ordering::Acquire)
     }
 
     /// 手动停止录制（请求停止）
@@ -397,9 +405,7 @@ impl RecordingHandle {
 
     /// 获取录制时长
     pub fn elapsed(&self) -> std::time::Duration {
-        let elapsed = self.start_time.elapsed();
-        self.refresh_stop_condition();
-        elapsed
+        self.start_time.elapsed()
     }
 
     /// 获取输出文件路径
