@@ -2,12 +2,14 @@
 //!
 //! 支持 Linux/macOS/Windows 平台的 GS-USB 协议实现
 
+pub mod classify;
 pub mod device;
 pub mod error;
 pub mod frame;
 pub mod protocol;
 pub mod split;
 
+use crate::gs_usb::classify::parse_gs_usb_batch;
 use crate::gs_usb::device::{
     GS_USB_BATCH_FRAME_CAPACITY, GS_USB_READ_BUFFER_SIZE, GsUsbDevice, GsUsbDeviceSelector,
 };
@@ -15,13 +17,13 @@ use crate::gs_usb::frame::GsUsbFrame;
 use crate::gs_usb::protocol::*;
 use crate::gs_usb::split::{GsUsbRxAdapter, GsUsbTxAdapter};
 use crate::{
-    BackendCapability, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame,
-    SplittableAdapter,
+    BackendCapability, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, CanId, PiperFrame,
+    ReceivedFrame, SplittableAdapter, TimestampProvenance,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
 
 /// GS-USB CAN 适配器
 ///
@@ -36,13 +38,11 @@ pub struct GsUsbCanAdapter {
     /// 接收队列：用于缓存 USB 包中解包出的多余帧
     /// USB 硬件会将多个 CAN 帧打包在一个 USB Bulk 包中发送
     /// 我们需要缓存这些帧，以便逐帧返回给上层应用
-    rx_queue: VecDeque<PiperFrame>,
+    rx_queue: VecDeque<ReceivedFrame>,
     /// 复用 USB 读缓冲，避免热路径每包分配
     rx_usb_buf: [u8; GS_USB_READ_BUFFER_SIZE],
     /// 复用 GS-USB 帧容器，避免 steady-state 堆分配
     rx_batch_frames: Vec<GsUsbFrame>,
-    /// 当前批次检测到 overflow，待在已缓存有效帧消费完成后上报
-    overflow_pending: bool,
     /// 实时模式标志
     /// - `true`：写超时设为 5ms（快速失败）
     /// - `false`：写超时保持 1000ms（默认，更可靠）
@@ -151,7 +151,6 @@ impl GsUsbCanAdapter {
             rx_queue: VecDeque::with_capacity(64), // 初始化队列，预分配容量
             rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
             rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
-            overflow_pending: false,
             realtime_mode: false, // 默认非实时模式
             consecutive_write_timeouts: 0,
         })
@@ -202,7 +201,7 @@ impl GsUsbCanAdapter {
     ///
     /// If the queue is full, drops the oldest frame to make room.
     /// This prevents unbounded memory growth if consumer stops consuming.
-    fn push_to_rx_queue(&mut self, frame: PiperFrame) {
+    fn push_to_rx_queue(&mut self, frame: ReceivedFrame) {
         if self.rx_queue.len() >= Self::MAX_QUEUE_SIZE {
             warn!(
                 "RX queue full ({} frames), dropping oldest frame",
@@ -211,6 +210,14 @@ impl GsUsbCanAdapter {
             self.rx_queue.pop_front();
         }
         self.rx_queue.push_back(frame);
+    }
+
+    fn timestamp_provenance(&self) -> TimestampProvenance {
+        if self.device.hw_timestamp_enabled() {
+            TimestampProvenance::Hardware
+        } else {
+            TimestampProvenance::None
+        }
     }
 
     /// 分离为独立的 RX 和 TX 适配器
@@ -261,8 +268,8 @@ impl GsUsbCanAdapter {
         // 先把队列里剩余的帧吐出来（保持语义一致）
         if !self.rx_queue.is_empty() {
             let mut out = Vec::with_capacity(self.rx_queue.len());
-            while let Some(f) = self.rx_queue.pop_front() {
-                out.push(f);
+            while let Some(received) = self.rx_queue.pop_front() {
+                out.push(received.frame);
             }
             return Ok(out);
         }
@@ -306,42 +313,9 @@ impl GsUsbCanAdapter {
             return Ok(Vec::new());
         }
 
-        let is_loopback = (self.mode & GS_CAN_MODE_LOOP_BACK) != 0;
-        let mut out = Vec::with_capacity(self.rx_batch_frames.len());
-
-        for idx in 0..self.rx_batch_frames.len() {
-            let gs_frame = self.rx_batch_frames[idx];
-            if !is_loopback && gs_frame.is_tx_echo() {
-                continue;
-            }
-
-            // Check for overflow flag but DON'T return early - log and continue
-            // The overflow flag indicates PAST data loss (before this batch),
-            // not a problem with the current frames. Processing valid frames
-            // prevents compounding the data loss.
-            if gs_frame.has_overflow() {
-                warn!(
-                    "CAN Controller Buffer Overflow detected - some frames were lost BEFORE this batch. \
-                     Processing remaining valid frames in this batch."
-                );
-                // NOTE: Don't return Err here - we still want to process valid frames
-            }
-
-            out.push(PiperFrame {
-                id: gs_frame.can_id & CAN_EFF_MASK,
-                data: gs_frame.data,
-                len: gs_frame.can_dlc.min(8),
-                is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-                timestamp_us: gs_frame.timestamp_us as u64,
-            });
-        }
+        let out = parse_gs_usb_batch(&self.rx_batch_frames);
         self.rx_batch_frames.clear();
-
-        // Note: We don't return a special error for overflow_detected because:
-        // 1. The overflow was for PAST frames (before this batch)
-        // 2. We've already preserved all valid frames in THIS batch
-        // 3. Applications can monitor the warn!() log for overflow events
-        Ok(out)
+        out
     }
 
     /// 获取当前打开设备的基础信息（用于日志/诊断）
@@ -502,19 +476,20 @@ impl CanAdapter for GsUsbCanAdapter {
             return Err(CanError::NotStarted);
         }
 
+        let can_id = match frame.id() {
+            CanId::Standard(id) => id.raw() as u32,
+            CanId::Extended(id) => id.raw() | CAN_EFF_FLAG,
+        };
+
         // 1. 转换 PiperFrame -> GsUsbFrame
         let gs_frame = GsUsbFrame {
             echo_id: GS_USB_ECHO_ID,
-            can_id: if frame.is_extended {
-                frame.id | CAN_EFF_FLAG
-            } else {
-                frame.id
-            },
-            can_dlc: frame.len,
+            can_id,
+            can_dlc: frame.dlc(),
             channel: 0,
             flags: 0,
             reserved: 0,
-            data: frame.data,
+            data: *frame.data_padded(),
             timestamp_us: 0, // 发送时时间戳值（如果启用了硬件时间戳模式，pack_to 会包含该字段）
         };
 
@@ -584,7 +559,7 @@ impl CanAdapter for GsUsbCanAdapter {
     /// 1. 使用内部队列 (`rx_queue`) 缓存从 USB 包中解析出的所有帧
     /// 2. 优先从队列中返回帧（如果队列非空）
     /// 3. 队列为空时，从 USB 读取一个包，解析出所有帧并放入队列
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
+    fn receive(&mut self) -> Result<ReceivedFrame, CanError> {
         if !self.started {
             return Err(CanError::NotStarted);
         }
@@ -594,11 +569,6 @@ impl CanAdapter for GsUsbCanAdapter {
             // Hot path: removed trace! call (queue return is 200Hz+)
             return Ok(frame);
         }
-        if self.overflow_pending {
-            self.overflow_pending = false;
-            return Err(CanError::BufferOverflow);
-        }
-
         // 2. 队列为空，从 USB 读取一批数据
         // USB 硬件可能将一个或多个 CAN 帧打包在一个 USB Bulk 包中
         // 我们需要一次性解析所有帧，并将它们放入队列
@@ -645,96 +615,19 @@ impl CanAdapter for GsUsbCanAdapter {
                 continue;
             }
 
-            // 3. 处理这批帧：过滤 Echo 和错误帧，将有效帧放入队列
-            let is_loopback = (self.mode & GS_CAN_MODE_LOOP_BACK) != 0;
-            let mut batch_overflow = false;
-
-            // 优化：如果只有一个帧，且是有效帧，直接返回（避免队列操作）
-            if self.rx_batch_frames.len() == 1 {
-                let gs_frame = self.rx_batch_frames[0];
-
-                // 检查是否为有效帧
-                let is_valid = if !is_loopback && gs_frame.is_tx_echo() {
-                    // 是 Echo 且非 Loopback 模式，跳过
-                    false
-                } else {
-                    if gs_frame.has_overflow() {
-                        batch_overflow = true;
-                    }
-                    // 有效帧
-                    true
-                };
-
-                self.rx_batch_frames.clear();
-                if batch_overflow && !self.overflow_pending {
-                    error!("CAN Buffer Overflow!");
-                    self.overflow_pending = true;
-                }
-                if is_valid {
-                    // 直接返回，不需要队列操作
-                    let frame = PiperFrame {
-                        id: gs_frame.can_id & CAN_EFF_MASK,
-                        data: gs_frame.data,
-                        len: gs_frame.can_dlc.min(8),
-                        is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-                        timestamp_us: gs_frame.timestamp_us as u64, // GS-USB 使用 u32，转换为 u64
-                    };
-                    // Hot path: removed trace! call (200Hz+)
-                    return Ok(frame);
-                }
-                // 如果是 Echo 且非 Loopback，继续循环读取下一个包
-                if self.overflow_pending {
-                    self.overflow_pending = false;
-                    return Err(CanError::BufferOverflow);
-                }
-                continue;
-            }
-
-            // 多个帧：批量处理并放入队列
-            for idx in 0..self.rx_batch_frames.len() {
-                let gs_frame = self.rx_batch_frames[idx];
-                // 3.1 过滤 TX Echo（静默丢弃）
-                // 注意：在 Loopback 模式下，Echo 是测试的一部分，不应该被过滤
-                if !is_loopback && gs_frame.is_tx_echo() {
-                    // TX echo filtering - removed trace! call (high frequency)
-                    continue;
-                }
-
-                // 3.2 检查致命错误：缓冲区溢出
-                if gs_frame.has_overflow() {
-                    batch_overflow = true;
-                }
-
-                // 注意：Bus Off 和 Error Passive 检测功能已在 `GsUsbRxAdapter::receive()` 中实现
-                // （通过回调机制，详见 `src/can/gs_usb/split.rs`）
-                // 如果需要 Bus Off 检测，请使用 `split()` 后的 `GsUsbRxAdapter`
-
-                // 3.3 转换格式并放入队列（保留硬件时间戳）
-                let frame = PiperFrame {
-                    id: gs_frame.can_id & CAN_EFF_MASK, // 移除标志位
-                    data: gs_frame.data,
-                    len: gs_frame.can_dlc.min(8),
-                    is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-                    timestamp_us: gs_frame.timestamp_us as u64, // 保留硬件时间戳（GS-USB 使用 u32，转换为 u64）
-                };
-
-                self.push_to_rx_queue(frame);
-            }
+            let parsed = parse_gs_usb_batch(&self.rx_batch_frames);
             self.rx_batch_frames.clear();
-            if batch_overflow && !self.overflow_pending {
-                error!("CAN Buffer Overflow!");
-                self.overflow_pending = true;
+            let parsed = parsed?;
+            let provenance = self.timestamp_provenance();
+            for frame in parsed {
+                self.push_to_rx_queue(ReceivedFrame::new(frame, provenance));
             }
 
             // 4. 如果队列里有东西了，返回第一个；否则继续循环读 USB
-            // 注意：如果这批数据都被过滤掉了（例如全是 Echo 且非 Loopback），循环继续
+            // 注意：如果这批数据都被过滤掉了（例如全是 Echo），循环继续
             if let Some(frame) = self.rx_queue.pop_front() {
                 // Hot path: removed trace! call (200Hz+)
                 return Ok(frame);
-            }
-            if self.overflow_pending {
-                self.overflow_pending = false;
-                return Err(CanError::BufferOverflow);
             }
             // 如果这批数据都被过滤掉了，继续读下一个 USB 包
         }
@@ -748,7 +641,7 @@ impl CanAdapter for GsUsbCanAdapter {
     }
 
     /// 带超时的接收
-    fn receive_timeout(&mut self, timeout: Duration) -> Result<PiperFrame, CanError> {
+    fn receive_timeout(&mut self, timeout: Duration) -> Result<ReceivedFrame, CanError> {
         // 保存原超时
         let old_timeout = self.rx_timeout;
 
@@ -765,7 +658,7 @@ impl CanAdapter for GsUsbCanAdapter {
     }
 
     /// 非阻塞接收
-    fn try_receive(&mut self) -> Result<Option<PiperFrame>, CanError> {
+    fn try_receive(&mut self) -> Result<Option<ReceivedFrame>, CanError> {
         // 使用零超时模拟非阻塞
         match self.receive_timeout(Duration::ZERO) {
             Ok(frame) => Ok(Some(frame)),
@@ -824,6 +717,34 @@ mod tests {
         }
     }
 
+    fn recoverable_echo_frame() -> GsUsbFrame {
+        GsUsbFrame {
+            echo_id: GS_USB_ECHO_ID,
+            ..rx_frame(0x120, 0, 0xEE)
+        }
+    }
+
+    fn malformed_dlc_frame(dlc: u8) -> GsUsbFrame {
+        GsUsbFrame {
+            can_dlc: dlc,
+            ..rx_frame(0x120, 0, 0xEE)
+        }
+    }
+
+    fn started_adapter(device: GsUsbDevice) -> GsUsbCanAdapter {
+        GsUsbCanAdapter {
+            device,
+            started: true,
+            mode: 0,
+            rx_timeout: Duration::from_millis(2),
+            rx_queue: VecDeque::with_capacity(64),
+            rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
+            rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
+            realtime_mode: false,
+            consecutive_write_timeouts: 0,
+        }
+    }
+
     #[test]
     fn test_unsplit_adapter_drop_cleans_up_once() {
         let (device, harness) = GsUsbDevice::new_test_device(true, true);
@@ -835,7 +756,6 @@ mod tests {
             rx_queue: VecDeque::with_capacity(64),
             rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
             rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
-            overflow_pending: false,
             realtime_mode: false,
             consecutive_write_timeouts: 0,
         };
@@ -857,7 +777,6 @@ mod tests {
             rx_queue: VecDeque::with_capacity(64),
             rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
             rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
-            overflow_pending: false,
             realtime_mode: false,
             consecutive_write_timeouts: 0,
         };
@@ -874,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unsplit_receive_returns_valid_frame_before_deferred_overflow_error() {
+    fn test_unsplit_receive_discards_batch_on_overflow_status() {
         let (device, harness) = GsUsbDevice::new_test_device(false, false);
         harness.enqueue_read_packet(pack_packet(
             &[
@@ -891,25 +810,135 @@ mod tests {
             rx_queue: VecDeque::with_capacity(64),
             rx_usb_buf: [0u8; GS_USB_READ_BUFFER_SIZE],
             rx_batch_frames: Vec::with_capacity(GS_USB_BATCH_FRAME_CAPACITY),
-            overflow_pending: false,
             realtime_mode: false,
             consecutive_write_timeouts: 0,
         };
 
-        let first = adapter
-            .receive()
-            .expect("first valid frame should be delivered even when batch overflowed");
-        let second = adapter
-            .receive()
-            .expect("second valid frame should stay readable before overflow surfaces");
-        let overflow = adapter
-            .receive()
-            .expect_err("overflow should be surfaced only after queued valid frames drain");
+        let overflow =
+            adapter.receive().expect_err("overflow should reject the whole device batch");
+        let later =
+            adapter.receive().expect_err("valid frames from fatal batch must not be queued");
 
-        assert_eq!(first.id, 0x251);
-        assert_eq!(first.data[0], 0x11);
-        assert_eq!(second.id, 0x252);
-        assert_eq!(second.data[0], 0x22);
         assert!(matches!(overflow, CanError::BufferOverflow));
+        assert!(matches!(later, CanError::Timeout));
+    }
+
+    #[test]
+    fn unsplit_batch_skips_recoverable_between_valid_frames() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(pack_packet(
+            &[
+                rx_frame(0x100, 0, 0x10),
+                recoverable_echo_frame(),
+                rx_frame(0x101, 0, 0x11),
+            ],
+            false,
+        ));
+        let mut adapter = started_adapter(device);
+
+        let frames = adapter.receive_batch_frames().unwrap();
+
+        assert_eq!(
+            frames.iter().map(|frame| frame.raw_id()).collect::<Vec<_>>(),
+            vec![0x100, 0x101]
+        );
+    }
+
+    #[test]
+    fn unsplit_batch_malformed_discards_whole_batch() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(pack_packet(
+            &[
+                rx_frame(0x100, 0, 0x10),
+                malformed_dlc_frame(9),
+                rx_frame(0x101, 0, 0x11),
+            ],
+            false,
+        ));
+        let mut adapter = started_adapter(device);
+
+        assert!(adapter.receive_batch_frames().is_err());
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn unsplit_batch_fatal_status_discards_whole_batch() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(pack_packet(
+            &[
+                rx_frame(0x100, 0, 0x10),
+                rx_frame(0x120, GS_CAN_FLAG_OVERFLOW, 0xEE),
+                rx_frame(0x101, 0, 0x11),
+            ],
+            false,
+        ));
+        let mut adapter = started_adapter(device);
+
+        assert!(matches!(
+            adapter.receive_batch_frames(),
+            Err(CanError::BufferOverflow)
+        ));
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn unsplit_receive_skips_recoverable_between_valid_frames() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(pack_packet(
+            &[
+                rx_frame(0x100, 0, 0x10),
+                recoverable_echo_frame(),
+                rx_frame(0x101, 0, 0x11),
+            ],
+            false,
+        ));
+        let mut adapter = started_adapter(device);
+
+        assert_eq!(adapter.receive().unwrap().frame.raw_id(), 0x100);
+        assert_eq!(adapter.receive().unwrap().frame.raw_id(), 0x101);
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn unsplit_receive_malformed_discards_whole_batch() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(pack_packet(
+            &[
+                rx_frame(0x100, 0, 0x10),
+                malformed_dlc_frame(9),
+                rx_frame(0x101, 0, 0x11),
+            ],
+            false,
+        ));
+        let mut adapter = started_adapter(device);
+
+        assert!(adapter.receive().is_err());
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn unsplit_receive_fatal_status_discards_whole_batch() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(pack_packet(
+            &[
+                rx_frame(0x100, 0, 0x10),
+                rx_frame(0x120, GS_CAN_FLAG_OVERFLOW, 0xEE),
+                rx_frame(0x101, 0, 0x11),
+            ],
+            false,
+        ));
+        let mut adapter = started_adapter(device);
+
+        assert!(matches!(adapter.receive(), Err(CanError::BufferOverflow)));
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn unsplit_receive_transport_timeout_queues_no_frame() {
+        let (device, _harness) = GsUsbDevice::new_test_device(false, false);
+        let mut adapter = started_adapter(device);
+
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
     }
 }
