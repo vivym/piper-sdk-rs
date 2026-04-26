@@ -1,0 +1,335 @@
+# PiperFrame Type-Safety Redesign
+
+## Goal
+
+Redesign `PiperFrame` so it is always a valid classic CAN 2.0 data frame once constructed.
+
+The current `PiperFrame` is a public-field struct:
+
+```rust
+pub struct PiperFrame {
+    pub id: u32,
+    pub data: [u8; 8],
+    pub len: u8,
+    pub is_extended: bool,
+    pub timestamp_us: u64,
+}
+```
+
+That shape allows invalid states that the type claims to abstract away:
+
+- standard frames with IDs above `0x7FF`
+- extended frames with IDs above `0x1FFF_FFFF`
+- DLC values above 8
+- mismatch between `len` and the accessible payload
+- silent truncation when constructors receive more than 8 bytes
+- ambiguous frame format inference from `id > 0x7FF`
+
+The new design must move these checks into the type boundary. CAN adapters, protocol parsers, recording, bridge code, and user code should be able to trust a `PiperFrame` value without re-validating the same invariants.
+
+## Explicit Constraints
+
+This is an intentional breaking API change.
+
+The redesign may break:
+
+- `PiperFrame { ... }` struct literals
+- direct field access such as `frame.id`, `frame.data`, `frame.len`, `frame.is_extended`, and `frame.timestamp_us`
+- existing `new_standard` / `new_extended` call sites if they assume infallible construction
+- existing recording files and bridge protocol payloads
+- serde JSON shape for `PiperFrame`
+
+No historical recording or bridge compatibility is required. The new format should be clear and strict rather than backward compatible.
+
+## Non-Goals
+
+This work should not add CAN FD support.
+
+This work should not split timestamp metadata out of `PiperFrame`. Keeping `timestamp_us` inside the frame is less semantically pure than a separate `TimestampedFrame`, but it keeps the change focused on eliminating invalid frame states.
+
+This work should not refactor unrelated protocol parsing or motion-control behavior except where direct `PiperFrame` API usage must change.
+
+## Chosen Approach
+
+Use a strong value-object model:
+
+```rust
+pub struct PiperFrame {
+    id: CanId,
+    data: CanData,
+    timestamp_us: u64,
+}
+
+pub enum CanId {
+    Standard(StandardCanId),
+    Extended(ExtendedCanId),
+}
+
+pub struct StandardCanId(u16);
+pub struct ExtendedCanId(u32);
+
+pub struct CanData {
+    bytes: [u8; 8],
+    len: u8,
+}
+```
+
+All fields are private. The only way to construct a frame is through constructors that enforce classic CAN limits.
+
+## Type Invariants
+
+`StandardCanId` must only contain IDs in `0x000..=0x7FF`.
+
+`ExtendedCanId` must only contain IDs in `0x00000000..=0x1FFF_FFFF`.
+
+`CanData` must only contain payloads with length `0..=8`.
+
+`PiperFrame::data()` must always return exactly the valid payload slice.
+
+`PiperFrame::data_padded()` must always return the fixed 8-byte padded storage for backend encoders.
+
+`PiperFrame::dlc()` must always return a value in `0..=8`.
+
+Frame format must be explicit. Code must not infer standard versus extended from the numeric ID.
+
+## Public API
+
+The protocol crate should expose these core types:
+
+```rust
+pub struct PiperFrame;
+pub enum CanId;
+pub struct StandardCanId;
+pub struct ExtendedCanId;
+pub struct CanData;
+pub enum FrameError;
+```
+
+ID construction:
+
+```rust
+StandardCanId::new(raw: u16) -> Result<Self, FrameError>
+ExtendedCanId::new(raw: u32) -> Result<Self, FrameError>
+CanId::standard(raw: u16) -> Result<Self, FrameError>
+CanId::extended(raw: u32) -> Result<Self, FrameError>
+```
+
+Payload construction:
+
+```rust
+CanData::new(data: impl AsRef<[u8]>) -> Result<Self, FrameError>
+CanData::from_array(bytes: [u8; 8]) -> Self
+CanData::as_slice(&self) -> &[u8]
+CanData::as_padded(&self) -> &[u8; 8]
+CanData::len(&self) -> u8
+CanData::is_empty(&self) -> bool
+```
+
+Frame construction:
+
+```rust
+PiperFrame::standard(id: StandardCanId, data: CanData) -> Self
+PiperFrame::extended(id: ExtendedCanId, data: CanData) -> Self
+PiperFrame::new_standard(id: u16, data: impl AsRef<[u8]>) -> Result<Self, FrameError>
+PiperFrame::new_extended(id: u32, data: impl AsRef<[u8]>) -> Result<Self, FrameError>
+```
+
+Frame access:
+
+```rust
+PiperFrame::id(&self) -> CanId
+PiperFrame::raw_id(&self) -> u32
+PiperFrame::is_standard(&self) -> bool
+PiperFrame::is_extended(&self) -> bool
+PiperFrame::dlc(&self) -> u8
+PiperFrame::data(&self) -> &[u8]
+PiperFrame::data_padded(&self) -> &[u8; 8]
+PiperFrame::timestamp_us(&self) -> u64
+PiperFrame::with_timestamp_us(self, timestamp_us: u64) -> Self
+```
+
+`CanId` should be `Copy`. `CanData` and `PiperFrame` should remain `Copy` if practical, preserving the current zero-allocation hot-path behavior.
+
+## Error Model
+
+Add `FrameError` to `piper-protocol`.
+
+Required variants:
+
+- invalid standard ID
+- invalid extended ID
+- payload too long
+- invalid serialized frame format
+
+`FrameError` should be independent from `ProtocolError`. `ProtocolError` is for robot protocol parsing failures after a valid CAN frame exists. `FrameError` is for malformed CAN frame construction or deserialization.
+
+Existing higher-level errors can wrap `FrameError` where needed. For example, replay conversion can map `FrameError` to `RobotError::ConfigError` with context about the recording frame.
+
+## Serde Format
+
+When the `serde` feature is enabled, `PiperFrame` should use a strict explicit shape:
+
+```json
+{
+  "id": 291,
+  "format": "standard",
+  "data": [1, 2, 3, 4],
+  "timestamp_us": 12345
+}
+```
+
+`format` must be either `"standard"` or `"extended"`.
+
+Deserialization must fail when:
+
+- `format` is missing
+- `format` is not recognized
+- `format` is `"standard"` and `id > 0x7FF`
+- `format` is `"extended"` and `id > 0x1FFF_FFFF`
+- `data` has more than 8 bytes
+
+The serialized `data` field should contain only the active payload bytes, not the padded 8-byte storage.
+
+The serde implementation should not accept the old field shape. Historical recording compatibility is intentionally out of scope.
+
+## Recording Format
+
+`piper-tools::TimestampedFrame` should no longer store an ambiguous `can_id + Vec<u8>` model that infers extended frames from `can_id > 0x7FF`.
+
+Preferred shape:
+
+```rust
+pub struct TimestampedFrame {
+    pub timestamp_us: u64,
+    pub frame: PiperFrame,
+    pub source: TimestampSource,
+}
+```
+
+This makes recording files use the same explicit serde format as live frames.
+
+If dependency direction makes direct reuse of `PiperFrame` impractical, `TimestampedFrame` must still store explicit `format`, `id`, and `data` fields and validate them on construction and deserialization. It must not infer frame format from numeric ID.
+
+## Bridge Protocol Format
+
+The bridge protocol must encode explicit frame format.
+
+The binary bridge protocol already carries `id`, `is_extended`, `len`, and 8 data bytes. The decoder should construct a `PiperFrame` through the checked constructors instead of a struct literal.
+
+The encoder should read from frame methods:
+
+- `raw_id()`
+- `is_extended()`
+- `dlc()`
+- `data_padded()`
+- `timestamp_us()`
+
+Malformed bridge payloads should fail decode at the protocol boundary, not produce invalid `PiperFrame` values.
+
+## CAN Backend Impact
+
+SocketCAN and GS-USB TX paths should stop defensively slicing with unchecked `frame.len`.
+
+Backend encoding should use:
+
+- `frame.raw_id()`
+- `frame.is_extended()`
+- `frame.dlc()`
+- `frame.data()`
+- `frame.data_padded()` where the backend protocol requires fixed storage
+
+RX conversion should validate backend-provided IDs and DLC values through `PiperFrame` constructors. Invalid frames received from a device or raw socket should become backend errors instead of invalid SDK values.
+
+## Protocol Layer Impact
+
+Protocol parsing should replace direct field access with methods.
+
+Examples:
+
+- `frame.id` becomes `frame.raw_id()`
+- `frame.len` becomes `frame.dlc()`
+- `frame.data[0]` becomes `frame.data()[0]` after length checks
+- `frame.data[..copy_len]` becomes `frame.data()[..copy_len]`
+
+Tests that currently use invalid standard CAN IDs such as `0x999` for "unknown robot protocol ID" should use a legal CAN ID outside the robot protocol set, such as `0x700`, or explicitly construct an extended frame when the test needs an extended ID.
+
+## Driver And Client Impact
+
+Driver and client code should treat `PiperFrame` as immutable.
+
+Timestamp updates should use:
+
+```rust
+frame = frame.with_timestamp_us(timestamp_us);
+```
+
+Tests should use small helper builders instead of struct literals. This keeps test setup clear and prevents test-only invalid frames from re-entering the codebase.
+
+## Public Re-Exports
+
+`piper-can` and `piper-sdk` should re-export the new frame types alongside `PiperFrame`:
+
+```rust
+pub use piper_protocol::{
+    CanData, CanId, ExtendedCanId, FrameError, PiperFrame, StandardCanId,
+};
+```
+
+This keeps downstream users from needing to depend on `piper-protocol` only to construct frames.
+
+## Migration Strategy
+
+The implementation should be done as a single focused refactor rather than compatibility layers.
+
+Recommended order:
+
+1. Add RED tests in `piper-protocol` for invalid IDs, oversized payloads, timestamp preservation, and serde rejection.
+2. Implement the new frame value types and private `PiperFrame` fields.
+3. Migrate `piper-protocol` internals and tests.
+4. Migrate `piper-can` backend encode/decode and bridge protocol.
+5. Migrate `piper-tools` recording format.
+6. Migrate `piper-driver`, `piper-client`, `piper-sdk`, examples, and addon tests.
+7. Remove all remaining direct field access and struct literals.
+
+The refactor should not keep deprecated constructors or public fields. Compile errors should guide migration.
+
+## Verification Plan
+
+Required checks:
+
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo doc --workspace --no-deps --document-private-items
+```
+
+Addon checks should also run because examples currently use `PiperFrame` through public API paths:
+
+```bash
+cargo fmt --manifest-path addons/piper-physics-mujoco/Cargo.toml -- --check
+just check-physics
+just test-physics
+just clippy-physics
+```
+
+Hardware ignored tests are not required for this refactor unless hardware is explicitly available.
+
+## Acceptance Criteria
+
+No public API can construct a `PiperFrame` with invalid standard ID, invalid extended ID, or DLC above 8.
+
+No `PiperFrame` constructor silently truncates payload data.
+
+No code in the repository uses `PiperFrame { ... }` struct literals.
+
+No code in the repository directly reads or writes `PiperFrame` fields.
+
+Serde deserialization rejects malformed frames.
+
+Recording and bridge boundaries preserve explicit standard versus extended frame format.
+
+SocketCAN and GS-USB TX paths do not have unchecked indexing or slicing based on untrusted frame length.
+
+All required verification commands pass.
