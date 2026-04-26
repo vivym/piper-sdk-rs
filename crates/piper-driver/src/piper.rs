@@ -2980,7 +2980,10 @@ impl Piper {
             DiagnosticEvent::Protocol(diagnostic) => match kind {
                 QueryKind::CollisionProtection => match diagnostic {
                     ProtocolDiagnostic::InvalidLength { can_id, .. } => {
-                        *can_id == piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK
+                        *can_id
+                            == u32::from(
+                                piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw(),
+                            )
                     },
                     ProtocolDiagnostic::OutOfRange { field, .. }
                     | ProtocolDiagnostic::UnsupportedValue { field, .. } => {
@@ -2990,7 +2993,7 @@ impl Piper {
                 },
                 QueryKind::JointLimit => match diagnostic {
                     ProtocolDiagnostic::InvalidLength { can_id, .. } => {
-                        *can_id == piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK
+                        *can_id == u32::from(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK.raw())
                     },
                     ProtocolDiagnostic::OutOfRange { field, .. } => *field == "joint_index",
                     ProtocolDiagnostic::UnsupportedValue { field, .. } => {
@@ -3000,7 +3003,7 @@ impl Piper {
                 },
                 QueryKind::JointAccel => match diagnostic {
                     ProtocolDiagnostic::InvalidLength { can_id, .. } => {
-                        *can_id == piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK
+                        *can_id == u32::from(piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK.raw())
                     },
                     ProtocolDiagnostic::OutOfRange { field, .. } => *field == "joint_index",
                     ProtocolDiagnostic::UnsupportedValue { field, .. } => {
@@ -3010,7 +3013,8 @@ impl Piper {
                 },
                 QueryKind::EndLimit => match diagnostic {
                     ProtocolDiagnostic::InvalidLength { can_id, .. } => {
-                        *can_id == piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK
+                        *can_id
+                            == u32::from(piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK.raw())
                     },
                     ProtocolDiagnostic::UnsupportedValue { field, .. } => {
                         *field == "end_velocity_accel_feedback"

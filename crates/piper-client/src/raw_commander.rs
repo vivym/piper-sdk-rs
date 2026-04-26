@@ -428,8 +428,7 @@ mod tests {
         fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             if !self.bootstrap_emitted {
                 self.bootstrap_emitted = true;
-                let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-                frame.timestamp_us = 1;
+                let frame = PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1);
                 return Ok(received(frame));
             }
             Err(CanError::Timeout)
@@ -530,7 +529,7 @@ mod tests {
             .expect("MIT batch send should succeed");
 
         let frames = wait_for_sent_frames(&sent_frames, 6);
-        let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
+        let ids: Vec<u32> = frames.iter().map(PiperFrame::raw_id).collect();
         assert_eq!(ids, vec![0x15A, 0x15B, 0x15C, 0x15D, 0x15E, 0x15F]);
     }
 
@@ -563,8 +562,8 @@ mod tests {
 
         assert_eq!(frames.len(), expected_frames.len());
         for (observed, expected) in frames.iter().zip(expected_frames.iter()) {
-            assert_eq!(observed.id, expected.id);
-            assert_eq!(observed.data, expected.data);
+            assert_eq!(observed.id(), expected.id());
+            assert_eq!(observed.data(), expected.data());
         }
     }
 
@@ -579,7 +578,7 @@ mod tests {
             .expect("joint position batch should succeed");
 
         let frames = wait_for_sent_frames(&sent_frames, 3);
-        let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
+        let ids: Vec<u32> = frames.iter().map(PiperFrame::raw_id).collect();
         assert_eq!(ids, vec![0x155, 0x156, 0x157]);
     }
 
@@ -606,8 +605,8 @@ mod tests {
 
         assert_eq!(frames.len(), expected_frames.len());
         for (observed, expected) in frames.iter().zip(expected_frames.iter()) {
-            assert_eq!(observed.id, expected.id);
-            assert_eq!(observed.data, expected.data);
+            assert_eq!(observed.id(), expected.id());
+            assert_eq!(observed.data(), expected.data());
         }
     }
 
@@ -626,7 +625,7 @@ mod tests {
             .expect("end pose command should succeed");
 
         let frames = wait_for_sent_frames(&sent_frames, 3);
-        let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
+        let ids: Vec<u32> = frames.iter().map(PiperFrame::raw_id).collect();
         assert_eq!(ids, vec![0x152, 0x153, 0x154]);
     }
 
@@ -647,7 +646,7 @@ mod tests {
             .expect("circular motion command should succeed");
 
         let frames = wait_for_sent_frames(&sent_frames, 8);
-        let ids: Vec<u32> = frames.iter().map(|frame| frame.id).collect();
+        let ids: Vec<u32> = frames.iter().map(PiperFrame::raw_id).collect();
         assert_eq!(
             ids,
             vec![0x152, 0x153, 0x154, 0x158, 0x152, 0x153, 0x154, 0x158]
@@ -666,9 +665,9 @@ mod tests {
 
         let frames = wait_for_sent_frames(&sent_frames, 1);
         let frame = &frames[0];
-        assert_eq!(frame.id, ID_GRIPPER_CONTROL);
+        assert_eq!(frame.id(), ID_GRIPPER_CONTROL.into());
         assert_eq!(
-            i16::from_be_bytes([frame.data[4], frame.data[5]]),
+            i16::from_be_bytes([frame.data()[4], frame.data()[5]]),
             5000,
             "effort=1.0 should map to 5.0 N·m full scale"
         );
@@ -688,12 +687,13 @@ mod tests {
 
         let frames = wait_for_sent_frames(&sent_frames, 1);
         let frame = &frames[0];
-        assert_eq!(frame.id, ID_PARAMETER_QUERY_SET);
+        assert_eq!(frame.id(), ID_PARAMETER_QUERY_SET.into());
         assert_eq!(
-            frame.data[0], 0x02,
+            frame.data()[0],
+            0x02,
             "query type must be collision protection"
         );
-        assert_eq!(frame.data[1], 0x00, "set type must remain unset");
+        assert_eq!(frame.data()[1], 0x00, "set type must remain unset");
     }
 
     #[test]

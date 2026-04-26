@@ -16,6 +16,7 @@ use piper_can::bridge::protocol::{
 };
 use piper_can::{CanId, PiperFrame};
 use piper_driver::hooks::FrameCallback;
+use piper_driver::recording::RecordedFrameEvent;
 use piper_driver::{
     DriverError, HealthStatus, HookHandle, MaintenanceGateState, MaintenanceLeaseAcquireResult,
     MaintenanceRevocationEvent, Piper as RobotPiper,
@@ -925,8 +926,8 @@ struct RawFrameTap {
 }
 
 impl FrameCallback for RawFrameTap {
-    fn on_frame_received(&self, frame: &PiperFrame) {
-        let _ = self.tx.try_send(*frame);
+    fn on_frame(&self, event: RecordedFrameEvent) {
+        let _ = self.tx.try_send(event.frame);
     }
 }
 

@@ -1187,31 +1187,25 @@ where
         config: crate::recording::RecordingConfig,
     ) -> Result<(Self, crate::recording::RecordingHandle)> {
         use crate::recording::{
-            RecordingHandle, RecordingHandleParts, RecordingStopCondition, StopCondition,
+            ClientRecordingHook, RecordingHandle, RecordingHandleParts, RecordingStopCondition,
+            StopCondition,
         };
 
-        let stop_on_id = match &config.stop_condition {
-            StopCondition::OnCanId(id) => Some(*id),
-            _ => None,
-        };
-        let stop_duration = match &config.stop_condition {
-            StopCondition::Duration(seconds) => Some(Duration::from_secs(*seconds)),
-            _ => None,
-        };
-        let stop_after_frame_count = match &config.stop_condition {
-            StopCondition::FrameCount(count) => Some(*count as u64),
-            _ => None,
+        let stop_condition = match &config.stop_condition {
+            StopCondition::Manual => RecordingStopCondition::Manual,
+            StopCondition::OnCanId(id) => RecordingStopCondition::OnCanId(*id),
+            StopCondition::Duration(seconds) => {
+                RecordingStopCondition::Duration(std::time::Duration::from_secs(*seconds))
+            },
+            StopCondition::FrameCount(count) => RecordingStopCondition::FrameCount(*count as u64),
         };
 
-        let (hook, rx) = piper_driver::recording::AsyncRecordingHook::with_auto_stop(
-            stop_on_id,
-            stop_duration,
-            stop_after_frame_count,
-        );
+        let (hook, rx) = ClientRecordingHook::new(stop_condition);
 
         let dropped = hook.dropped_frames().clone();
         let counter = hook.frame_counter().clone();
         let stop_requested = hook.stop_requested().clone();
+        let gate = hook.gate().clone();
 
         // 注册钩子
         let callback = std::sync::Arc::new(hook) as std::sync::Arc<dyn piper_driver::FrameCallback>;
@@ -1223,19 +1217,12 @@ where
             })?
             .add_callback(callback);
 
-        let stop_condition = match &config.stop_condition {
-            StopCondition::Manual => RecordingStopCondition::Manual,
-            StopCondition::OnCanId(_) => RecordingStopCondition::OnCanId,
-            StopCondition::Duration(seconds) => {
-                RecordingStopCondition::Duration(std::time::Duration::from_secs(*seconds))
-            },
-            StopCondition::FrameCount(count) => RecordingStopCondition::FrameCount(*count as u64),
-        };
         let handle = RecordingHandle::new(RecordingHandleParts {
             rx,
             dropped_frames: dropped,
             frame_counter: counter,
             stop_requested,
+            gate,
             output_path: config.output_path.clone(),
             metadata: config.metadata.clone(),
             start_time_unix_secs: std::time::SystemTime::now()
@@ -1245,7 +1232,6 @@ where
             start_time: std::time::Instant::now(),
             hook_manager,
             hook_handle,
-            stop_condition,
         });
 
         tracing::info!("Recording started: {:?}", config.output_path);
@@ -1288,7 +1274,9 @@ where
         self,
         handle: crate::recording::RecordingHandle,
     ) -> Result<(Self, crate::recording::RecordingStats)> {
-        use piper_tools::{PiperRecording, TimestampSource, TimestampedFrame};
+        use piper_tools::{
+            PiperRecording, RecordedFrameDirection as ToolsRecordedFrameDirection, TimestampedFrame,
+        };
 
         handle.stop();
         handle.detach_hook();
@@ -1306,11 +1294,18 @@ where
         let mut frame_count = 0;
         while let Ok(driver_frame) = handle.receiver().try_recv() {
             // 转换 piper_driver::TimestampedFrame -> piper_tools::TimestampedFrame
+            let direction = match driver_frame.direction {
+                piper_driver::recording::RecordedFrameDirection::Rx => {
+                    ToolsRecordedFrameDirection::Rx
+                },
+                piper_driver::recording::RecordedFrameDirection::Tx => {
+                    ToolsRecordedFrameDirection::Tx
+                },
+            };
             let tools_frame = TimestampedFrame::new(
-                driver_frame.timestamp_us,
-                driver_frame.id,
-                driver_frame.data,
-                TimestampSource::Hardware, // 使用硬件时间戳
+                driver_frame.frame,
+                direction,
+                crate::recording::map_source(driver_frame.timestamp_provenance),
             );
             recording.add_frame(tools_frame);
             frame_count += 1;
@@ -2190,31 +2185,25 @@ where
         config: crate::recording::RecordingConfig,
     ) -> Result<(Self, crate::recording::RecordingHandle)> {
         use crate::recording::{
-            RecordingHandle, RecordingHandleParts, RecordingStopCondition, StopCondition,
+            ClientRecordingHook, RecordingHandle, RecordingHandleParts, RecordingStopCondition,
+            StopCondition,
         };
 
-        let stop_on_id = match &config.stop_condition {
-            StopCondition::OnCanId(id) => Some(*id),
-            _ => None,
-        };
-        let stop_duration = match &config.stop_condition {
-            StopCondition::Duration(seconds) => Some(Duration::from_secs(*seconds)),
-            _ => None,
-        };
-        let stop_after_frame_count = match &config.stop_condition {
-            StopCondition::FrameCount(count) => Some(*count as u64),
-            _ => None,
+        let stop_condition = match &config.stop_condition {
+            StopCondition::Manual => RecordingStopCondition::Manual,
+            StopCondition::OnCanId(id) => RecordingStopCondition::OnCanId(*id),
+            StopCondition::Duration(seconds) => {
+                RecordingStopCondition::Duration(std::time::Duration::from_secs(*seconds))
+            },
+            StopCondition::FrameCount(count) => RecordingStopCondition::FrameCount(*count as u64),
         };
 
-        let (hook, rx) = piper_driver::recording::AsyncRecordingHook::with_auto_stop(
-            stop_on_id,
-            stop_duration,
-            stop_after_frame_count,
-        );
+        let (hook, rx) = ClientRecordingHook::new(stop_condition);
 
         let dropped = hook.dropped_frames().clone();
         let counter = hook.frame_counter().clone();
         let stop_requested = hook.stop_requested().clone();
+        let gate = hook.gate().clone();
 
         // 注册钩子
         let callback = std::sync::Arc::new(hook) as std::sync::Arc<dyn piper_driver::FrameCallback>;
@@ -2226,19 +2215,12 @@ where
             })?
             .add_callback(callback);
 
-        let stop_condition = match &config.stop_condition {
-            StopCondition::Manual => RecordingStopCondition::Manual,
-            StopCondition::OnCanId(_) => RecordingStopCondition::OnCanId,
-            StopCondition::Duration(seconds) => {
-                RecordingStopCondition::Duration(std::time::Duration::from_secs(*seconds))
-            },
-            StopCondition::FrameCount(count) => RecordingStopCondition::FrameCount(*count as u64),
-        };
         let handle = RecordingHandle::new(RecordingHandleParts {
             rx,
             dropped_frames: dropped,
             frame_counter: counter,
             stop_requested,
+            gate,
             output_path: config.output_path.clone(),
             metadata: config.metadata.clone(),
             start_time_unix_secs: std::time::SystemTime::now()
@@ -2248,7 +2230,6 @@ where
             start_time: std::time::Instant::now(),
             hook_manager,
             hook_handle,
-            stop_condition,
         });
 
         tracing::info!("Recording started (Active): {:?}", config.output_path);
@@ -2292,7 +2273,9 @@ where
         self,
         handle: crate::recording::RecordingHandle,
     ) -> Result<(Self, crate::recording::RecordingStats)> {
-        use piper_tools::{PiperRecording, TimestampSource, TimestampedFrame};
+        use piper_tools::{
+            PiperRecording, RecordedFrameDirection as ToolsRecordedFrameDirection, TimestampedFrame,
+        };
 
         handle.stop();
         handle.detach_hook();
@@ -2310,11 +2293,18 @@ where
         let mut frame_count = 0;
         while let Ok(driver_frame) = handle.receiver().try_recv() {
             // 转换 piper_driver::TimestampedFrame -> piper_tools::TimestampedFrame
+            let direction = match driver_frame.direction {
+                piper_driver::recording::RecordedFrameDirection::Rx => {
+                    ToolsRecordedFrameDirection::Rx
+                },
+                piper_driver::recording::RecordedFrameDirection::Tx => {
+                    ToolsRecordedFrameDirection::Tx
+                },
+            };
             let tools_frame = TimestampedFrame::new(
-                driver_frame.timestamp_us,
-                driver_frame.id,
-                driver_frame.data,
-                TimestampSource::Hardware, // 使用硬件时间戳
+                driver_frame.frame,
+                direction,
+                crate::recording::map_source(driver_frame.timestamp_provenance),
             );
             recording.add_frame(tools_frame);
             frame_count += 1;
@@ -2910,26 +2900,7 @@ where
     fn recording_frame_to_piper_frame(
         frame: &piper_tools::TimestampedFrame,
     ) -> Result<piper_can::PiperFrame> {
-        if frame.data.len() > 8 {
-            return Err(RobotError::ConfigError(format!(
-                "recording frame 0x{:X} has {} data bytes; CAN 2.0 frames support at most 8",
-                frame.can_id,
-                frame.data.len()
-            )));
-        }
-
-        let mut data = [0u8; 8];
-        data[..frame.data.len()].copy_from_slice(&frame.data);
-
-        Ok(piper_can::PiperFrame {
-            id: frame.can_id,
-            data,
-            len: frame.data.len() as u8,
-            is_extended: frame.can_id > 0x7FF,
-            // Replay timing is enforced by the inter-frame delay schedule, not by carrying the
-            // historical capture timestamp into a new TX event.
-            timestamp_us: 0,
-        })
+        Ok(frame.frame.with_timestamp_us(0))
     }
 
     fn replay_cancel_requested(cancel_signal: &std::sync::atomic::AtomicBool) -> bool {
@@ -3027,7 +2998,7 @@ where
         recording_path: impl AsRef<std::path::Path>,
         speed_factor: f64,
     ) -> Result<Piper<Standby, Capability>> {
-        use piper_tools::PiperRecording;
+        use piper_tools::{PiperRecording, RecordedFrameDirection};
         use std::thread;
         use std::time::Duration;
         const REPLAY_FRAME_COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -3086,23 +3057,40 @@ where
 
         // === 回放帧序列 ===
 
-        let mut first_frame = true;
-        let mut last_timestamp_us = 0u64;
+        let selected_tx: Vec<_> = recording
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.direction == RecordedFrameDirection::Tx)
+            .collect();
 
-        for frame in recording.frames {
-            // 计算时间间隔（考虑速度因子）
-            let delay_us = if first_frame {
-                first_frame = false;
-                0 // 第一帧立即发送
-            } else {
-                let elapsed_us = frame.timestamp_us.saturating_sub(last_timestamp_us);
-                // 应用速度因子：速度越快，延迟越短
-                (elapsed_us as f64 / speed_factor) as u64
-            };
+        let Some((_, first_tx)) = selected_tx.first() else {
+            tracing::warn!("Recording file has no TX frames to replay");
+            return Ok(self.exit_replay_mode_to_standby());
+        };
+        if first_tx.frame.timestamp_us() == 0 {
+            return Err(crate::RobotError::ConfigError(
+                "first replay TX timestamp is zero".into(),
+            ));
+        }
 
-            last_timestamp_us = frame.timestamp_us;
+        let mut previous_tx_timestamp = first_tx.frame.timestamp_us();
+
+        for (index, frame) in selected_tx {
+            let timestamp = frame.frame.timestamp_us();
+            if timestamp == 0 {
+                return Err(crate::RobotError::ConfigError(format!(
+                    "replay TX frame {index} has timestamp 0"
+                )));
+            }
+            if timestamp < previous_tx_timestamp {
+                return Err(crate::RobotError::ConfigError(format!(
+                    "replay TX frame {index} timestamp decreased"
+                )));
+            }
 
             // 等待适当的延迟
+            let delay_us = ((timestamp - previous_tx_timestamp) as f64 / speed_factor) as u64;
             if delay_us > 0 {
                 let delay = Duration::from_micros(delay_us);
                 thread::sleep(delay);
@@ -3120,12 +3108,10 @@ where
                 })?;
 
             // 跟踪进度（每 1000 帧打印一次）
-            if frame.timestamp_us % 1_000_000 < 1000 {
-                trace!(
-                    "Replayed frame at {:.3}s",
-                    frame.timestamp_us as f64 / 1_000_000.0
-                );
+            if timestamp % 1_000_000 < 1000 {
+                trace!("Replayed frame at {:.3}s", timestamp as f64 / 1_000_000.0);
             }
+            previous_tx_timestamp = timestamp;
         }
 
         tracing::info!("Replay completed successfully");
@@ -3201,7 +3187,7 @@ where
         speed_factor: f64,
         cancel_signal: &std::sync::atomic::AtomicBool,
     ) -> Result<Piper<Standby, Capability>> {
-        use piper_tools::PiperRecording;
+        use piper_tools::{PiperRecording, RecordedFrameDirection};
         use std::time::Duration;
         const REPLAY_FRAME_COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -3259,29 +3245,46 @@ where
 
         // === 回放帧序列（带取消检查） ===
 
-        let mut first_frame = true;
-        let mut last_timestamp_us = 0u64;
+        let selected_tx: Vec<_> = recording
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.direction == RecordedFrameDirection::Tx)
+            .collect();
 
-        for frame in recording.frames {
+        let Some((_, first_tx)) = selected_tx.first() else {
+            tracing::warn!("Recording file has no TX frames to replay");
+            return Ok(self.exit_replay_mode_to_standby());
+        };
+        if first_tx.frame.timestamp_us() == 0 {
+            return Err(crate::RobotError::ConfigError(
+                "first replay TX timestamp is zero".into(),
+            ));
+        }
+
+        let mut previous_tx_timestamp = first_tx.frame.timestamp_us();
+
+        for (index, frame) in selected_tx {
             // ✅ 每一帧都检查取消信号
             if Self::replay_cancel_requested(cancel_signal) {
                 tracing::warn!("Replay cancelled by user signal");
                 return Ok(self.exit_replay_mode_to_standby());
             }
 
-            // 计算时间间隔（考虑速度因子）
-            let delay_us = if first_frame {
-                first_frame = false;
-                0 // 第一帧立即发送
-            } else {
-                let elapsed_us = frame.timestamp_us.saturating_sub(last_timestamp_us);
-                // 应用速度因子：速度越快，延迟越短
-                (elapsed_us as f64 / speed_factor) as u64
-            };
-
-            last_timestamp_us = frame.timestamp_us;
+            let timestamp = frame.frame.timestamp_us();
+            if timestamp == 0 {
+                return Err(crate::RobotError::ConfigError(format!(
+                    "replay TX frame {index} has timestamp 0"
+                )));
+            }
+            if timestamp < previous_tx_timestamp {
+                return Err(crate::RobotError::ConfigError(format!(
+                    "replay TX frame {index} timestamp decreased"
+                )));
+            }
 
             // 等待适当的延迟
+            let delay_us = ((timestamp - previous_tx_timestamp) as f64 / speed_factor) as u64;
             if delay_us > 0 {
                 let delay = Duration::from_micros(delay_us);
                 if !Self::wait_replay_delay_or_cancel(delay, cancel_signal) {
@@ -3307,12 +3310,10 @@ where
                 })?;
 
             // 跟踪进度（每 1000 帧打印一次）
-            if frame.timestamp_us % 1_000_000 < 1000 {
-                trace!(
-                    "Replayed frame at {:.3}s",
-                    frame.timestamp_us as f64 / 1_000_000.0
-                );
+            if timestamp % 1_000_000 < 1000 {
+                trace!("Replayed frame at {:.3}s", timestamp as f64 / 1_000_000.0);
             }
+            previous_tx_timestamp = timestamp;
         }
 
         tracing::info!("Replay completed successfully");
@@ -3481,7 +3482,10 @@ mod tests {
         ID_JOINT_CONTROL_12, ID_JOINT_CONTROL_34, ID_JOINT_CONTROL_56, ID_JOINT_FEEDBACK_12,
         ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
     };
-    use piper_tools::{PiperRecording, RecordingMetadata, TimestampSource, TimestampedFrame};
+    use piper_tools::{
+        PiperRecording, RecordedFrameDirection as ToolsRecordedFrameDirection, RecordingMetadata,
+        TimestampSource, TimestampedFrame,
+    };
     use semver::Version;
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -3785,17 +3789,34 @@ mod tests {
     }
 
     fn write_test_recording(frames: &[(u64, u32, &[u8])]) -> PathBuf {
+        let frames: Vec<_> = frames
+            .iter()
+            .map(|(timestamp_us, can_id, data)| {
+                (
+                    PiperFrame::new_standard(*can_id, *data)
+                        .unwrap()
+                        .with_timestamp_us(*timestamp_us),
+                    ToolsRecordedFrameDirection::Tx,
+                    Some(TimestampSource::Hardware),
+                )
+            })
+            .collect();
+        write_test_recording_frames(&frames)
+    }
+
+    fn write_test_recording_frames(
+        frames: &[(
+            PiperFrame,
+            ToolsRecordedFrameDirection,
+            Option<TimestampSource>,
+        )],
+    ) -> PathBuf {
         static NEXT_RECORDING_ID: AtomicUsize = AtomicUsize::new(0);
 
         let mut recording =
             PiperRecording::new(RecordingMetadata::new("can0".to_string(), 1_000_000));
-        for (timestamp_us, can_id, data) in frames {
-            recording.add_frame(TimestampedFrame::new(
-                *timestamp_us,
-                *can_id,
-                data.to_vec(),
-                TimestampSource::Hardware,
-            ));
+        for (frame, direction, source) in frames {
+            recording.add_frame(TimestampedFrame::new(*frame, *direction, *source));
         }
 
         let path = std::env::temp_dir().join(format!(
@@ -6167,6 +6188,53 @@ mod tests {
     }
 
     #[test]
+    fn stop_recording_detaches_then_drains_only_previously_accepted_frames() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let driver = Arc::clone(&standby.driver);
+        let output_path = temp_recording_path("recording-detach-drain");
+
+        let (standby, handle) = standby
+            .start_recording(crate::recording::RecordingConfig {
+                output_path: output_path.clone(),
+                stop_condition: crate::recording::StopCondition::Manual,
+                metadata: crate::recording::RecordingMetadata {
+                    notes: "test".to_string(),
+                    operator: "tester".to_string(),
+                },
+            })
+            .expect("recording should start");
+
+        driver
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x11]).unwrap())
+            .expect("driver should send accepted frame");
+        wait_until(
+            Duration::from_millis(200),
+            || handle.frame_count() == 1,
+            "recording should accept first frame before detach",
+        );
+
+        handle.stop();
+        handle.detach_hook();
+        driver
+            .send_reliable(PiperFrame::new_standard(0x152, &[0x22]).unwrap())
+            .expect("driver should send frame after detach");
+        thread::sleep(Duration::from_millis(20));
+
+        let (_standby, stats) = standby
+            .stop_recording(handle)
+            .expect("recording should stop cleanly after detach");
+        assert_eq!(stats.frame_count, 1);
+
+        let saved = PiperRecording::load(&output_path).expect("saved recording should load");
+        assert_eq!(saved.frames.len(), 1);
+        assert_eq!(saved.frames[0].frame.raw_id(), 0x151);
+        assert_eq!(saved.frames[0].frame.data(), &[0x11]);
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
     fn stop_recording_persists_user_metadata_to_recording_file() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
@@ -6249,12 +6317,13 @@ mod tests {
     }
 
     #[test]
-    fn duration_recording_stop_condition_sets_stop_requested_after_deadline() {
+    fn duration_recording_stop_condition_includes_deadline_frame() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let driver = Arc::clone(&standby.driver);
         let output_path = temp_recording_path("recording-duration-stop");
 
-        let (_standby, handle) = standby
+        let (standby, handle) = standby
             .start_recording(crate::recording::RecordingConfig {
                 output_path: output_path.clone(),
                 stop_condition: crate::recording::StopCondition::Duration(0),
@@ -6265,25 +6334,41 @@ mod tests {
             })
             .expect("recording should start");
 
-        assert!(
-            handle.is_stop_requested(),
-            "zero-duration recordings should request stop immediately once observed"
+        driver
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x77]).unwrap())
+            .expect("driver should send deadline frame");
+        wait_until(
+            Duration::from_millis(200),
+            || handle.is_stop_requested(),
+            "duration stop should request stop after accepting the deadline frame",
         );
+
+        driver
+            .send_reliable(PiperFrame::new_standard(0x152, &[0x88]).unwrap())
+            .expect("driver should send post-deadline frame");
+        thread::sleep(Duration::from_millis(20));
+
+        let (_standby, stats) =
+            standby.stop_recording(handle).expect("recording should stop cleanly");
+        assert_eq!(stats.frame_count, 1);
+        let saved = PiperRecording::load(&output_path).expect("saved recording should load");
+        assert_eq!(saved.frames.len(), 1);
+        assert_eq!(saved.frames[0].frame.raw_id(), 0x151);
 
         let _ = std::fs::remove_file(output_path);
     }
 
     #[test]
-    fn frame_count_recording_stop_condition_sets_stop_requested_after_threshold() {
+    fn frame_count_recording_stop_condition_saves_exactly_first_n_frames() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
         let driver = Arc::clone(&standby.driver);
         let output_path = temp_recording_path("recording-framecount-stop");
 
-        let (_standby, handle) = standby
+        let (standby, handle) = standby
             .start_recording(crate::recording::RecordingConfig {
                 output_path: output_path.clone(),
-                stop_condition: crate::recording::StopCondition::FrameCount(1),
+                stop_condition: crate::recording::StopCondition::FrameCount(2),
                 metadata: crate::recording::RecordingMetadata {
                     notes: "test".to_string(),
                     operator: "tester".to_string(),
@@ -6292,12 +6377,28 @@ mod tests {
             .expect("recording should start");
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x55]))
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x55]).unwrap())
             .expect("driver should send a frame for frame-count stop");
+        driver
+            .send_reliable(PiperFrame::new_standard(0x152, &[0x56]).unwrap())
+            .expect("driver should send the threshold frame for frame-count stop");
         wait_until(
             Duration::from_millis(200),
             || handle.is_stop_requested(),
-            "frame-count stop should request stop after the first recorded frame",
+            "frame-count stop should request stop after the second recorded frame",
+        );
+        driver
+            .send_reliable(PiperFrame::new_standard(0x153, &[0x57]).unwrap())
+            .expect("driver should send a post-threshold frame");
+        thread::sleep(Duration::from_millis(20));
+
+        let (_standby, stats) =
+            standby.stop_recording(handle).expect("recording should stop cleanly");
+        assert_eq!(stats.frame_count, 2);
+        let saved = PiperRecording::load(&output_path).expect("saved recording should load");
+        assert_eq!(
+            saved.frames.iter().map(|frame| frame.frame.raw_id()).collect::<Vec<_>>(),
+            vec![0x151, 0x152]
         );
 
         let _ = std::fs::remove_file(output_path);
@@ -6705,6 +6806,160 @@ mod tests {
     }
 
     #[test]
+    fn replay_recording_sends_only_tx_frames_and_skips_rx_frames() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let recording_path = write_test_recording_frames(&[
+            (
+                PiperFrame::new_standard(0x251, [0xAA]).unwrap().with_timestamp_us(1_000),
+                ToolsRecordedFrameDirection::Rx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x155, [0x01]).unwrap().with_timestamp_us(2_000),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x252, [0xBB]).unwrap().with_timestamp_us(3_000),
+                ToolsRecordedFrameDirection::Rx,
+                Some(TimestampSource::Hardware),
+            ),
+        ]);
+        let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+
+        let standby = replay
+            .replay_recording(&recording_path, 1.0)
+            .expect("replay should complete successfully");
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].raw_id(), 0x155);
+        assert_eq!(sent[0].data(), &[0x01]);
+        drop(sent);
+        drop(standby);
+        let _ = std::fs::remove_file(recording_path);
+    }
+
+    #[test]
+    fn replay_recording_rejects_zero_timestamp_on_selected_tx() {
+        let recording_path = write_test_recording_frames(&[
+            (
+                PiperFrame::new_standard(0x251, [0xAA]).unwrap().with_timestamp_us(1_000),
+                ToolsRecordedFrameDirection::Rx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x155, [0x01]).unwrap().with_timestamp_us(0),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+        ]);
+        let replay = build_standby_piper(IdleRxAdapter::new(), Arc::new(Mutex::new(Vec::new())))
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+
+        let error = match replay.replay_recording(&recording_path, 1.0) {
+            Ok(_) => panic!("zero timestamp on selected TX frame must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, RobotError::ConfigError(message) if message.contains("timestamp is zero"))
+        );
+
+        let _ = std::fs::remove_file(recording_path);
+    }
+
+    #[test]
+    fn replay_recording_rejects_decreasing_selected_tx_timestamps() {
+        let recording_path = write_test_recording_frames(&[
+            (
+                PiperFrame::new_standard(0x155, [0x01]).unwrap().with_timestamp_us(2_000),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x251, [0xAA]).unwrap().with_timestamp_us(10_000),
+                ToolsRecordedFrameDirection::Rx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x156, [0x02]).unwrap().with_timestamp_us(1_000),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+        ]);
+        let replay = build_standby_piper(IdleRxAdapter::new(), Arc::new(Mutex::new(Vec::new())))
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+
+        let error = match replay.replay_recording(&recording_path, 1.0) {
+            Ok(_) => panic!("decreasing selected TX timestamps must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, RobotError::ConfigError(message) if message.contains("timestamp decreased"))
+        );
+
+        let _ = std::fs::remove_file(recording_path);
+    }
+
+    #[test]
+    fn replay_recording_schedules_relative_to_selected_tx_frames_only() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let recording_path = write_test_recording_frames(&[
+            (
+                PiperFrame::new_standard(0x251, [0xAA]).unwrap().with_timestamp_us(1_000_000),
+                ToolsRecordedFrameDirection::Rx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x155, [0x01]).unwrap().with_timestamp_us(10_000),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x252, [0xBB]).unwrap().with_timestamp_us(60_000),
+                ToolsRecordedFrameDirection::Rx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x156, [0x02]).unwrap().with_timestamp_us(12_000),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+            (
+                PiperFrame::new_standard(0x157, [0x03]).unwrap().with_timestamp_us(12_000),
+                ToolsRecordedFrameDirection::Tx,
+                Some(TimestampSource::Hardware),
+            ),
+        ]);
+        let replay = build_standby_piper(IdleRxAdapter::new(), sent_frames.clone())
+            .enter_replay_mode()
+            .expect("enter_replay_mode should succeed");
+
+        let started = Instant::now();
+        let standby = replay
+            .replay_recording(&recording_path, 1.0)
+            .expect("replay should complete successfully");
+        let elapsed = started.elapsed();
+
+        let sent = sent_frames.lock().expect("sent frames lock");
+        assert_eq!(
+            sent.iter().map(PiperFrame::raw_id).collect::<Vec<_>>(),
+            vec![0x155, 0x156, 0x157]
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "replay must not wait relative to RX timestamps; elapsed was {elapsed:?}"
+        );
+        drop(sent);
+        drop(standby);
+        let _ = std::fs::remove_file(recording_path);
+    }
+
+    #[test]
     fn replay_recording_with_cancel_returns_standby_and_restores_driver_mode() {
         use piper_driver::mode::DriverMode;
         use std::sync::atomic::AtomicBool;
@@ -6781,10 +7036,10 @@ mod tests {
             1,
             "cancel observed during inter-frame wait must prevent the next replay frame"
         );
-        assert_eq!(sent[0].id, 0x155);
-        assert_eq!(sent[0].len, 1);
-        assert_eq!(sent[0].data[0], 0x01);
-        assert_eq!(sent[0].timestamp_us, 0);
+        assert_eq!(sent[0].raw_id(), 0x155);
+        assert_eq!(sent[0].dlc(), 1);
+        assert_eq!(sent[0].data()[0], 0x01);
+        assert_eq!(sent[0].timestamp_us(), 0);
 
         drop(standby);
         let _ = std::fs::remove_file(recording_path);
@@ -6805,11 +7060,11 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].id, 0x155);
-        assert_eq!(sent[0].len, 2);
-        assert_eq!(sent[0].data[0], 0x01);
-        assert_eq!(sent[0].data[1], 0x02);
-        assert_eq!(sent[0].timestamp_us, 0);
+        assert_eq!(sent[0].raw_id(), 0x155);
+        assert_eq!(sent[0].dlc(), 2);
+        assert_eq!(sent[0].data()[0], 0x01);
+        assert_eq!(sent[0].data()[1], 0x02);
+        assert_eq!(sent[0].timestamp_us(), 0);
 
         drop(standby);
         let _ = std::fs::remove_file(recording_path);

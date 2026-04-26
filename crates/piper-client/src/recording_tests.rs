@@ -139,3 +139,93 @@ mod tests {
         speed > RECOMMENDED && is_valid_speed(speed)
     }
 }
+
+#[cfg(test)]
+mod recording_gate_tests {
+    use crate::recording::{ClientRecordingHook, RecordingStopCondition};
+    use piper_can::{CanId, PiperFrame, TimestampProvenance};
+    use piper_driver::FrameCallback;
+    use piper_driver::recording::{RecordedFrameDirection, RecordedFrameEvent};
+    use std::time::Duration;
+
+    fn event(frame: PiperFrame) -> RecordedFrameEvent {
+        RecordedFrameEvent {
+            frame,
+            direction: RecordedFrameDirection::Rx,
+            timestamp_provenance: TimestampProvenance::Hardware,
+        }
+    }
+
+    fn standard(id: u32, timestamp_us: u64) -> PiperFrame {
+        PiperFrame::new_standard(id, [id as u8])
+            .unwrap()
+            .with_timestamp_us(timestamp_us)
+    }
+
+    fn extended(id: u32, timestamp_us: u64) -> PiperFrame {
+        PiperFrame::new_extended(id, [id as u8])
+            .unwrap()
+            .with_timestamp_us(timestamp_us)
+    }
+
+    #[test]
+    fn frame_count_stop_includes_exactly_first_n_frames() {
+        let (hook, rx) = ClientRecordingHook::new(RecordingStopCondition::FrameCount(2));
+
+        hook.on_frame(event(standard(0x101, 10_000)));
+        hook.on_frame(event(standard(0x102, 11_000)));
+        hook.on_frame(event(standard(0x103, 12_000)));
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].frame.raw_id(), 0x101);
+        assert_eq!(frames[1].frame.raw_id(), 0x102);
+        assert!(hook.is_stop_requested());
+    }
+
+    #[test]
+    fn duration_stop_includes_deadline_frame() {
+        let (hook, rx) = ClientRecordingHook::new(RecordingStopCondition::Duration(Duration::ZERO));
+
+        hook.on_frame(event(standard(0x123, 10_000)));
+        hook.on_frame(event(standard(0x124, 11_000)));
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame.raw_id(), 0x123);
+        assert!(hook.is_stop_requested());
+    }
+
+    #[test]
+    fn can_id_stop_includes_trigger_and_distinguishes_standard_from_extended() {
+        let (hook, rx) = ClientRecordingHook::new(RecordingStopCondition::OnCanId(
+            CanId::standard(0x123).unwrap(),
+        ));
+
+        hook.on_frame(event(extended(0x123, 10_000)));
+        hook.on_frame(event(standard(0x123, 11_000)));
+        hook.on_frame(event(standard(0x124, 12_000)));
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].frame.is_extended());
+        assert_eq!(frames[0].frame.raw_id(), 0x123);
+        assert!(frames[1].frame.is_standard());
+        assert_eq!(frames[1].frame.raw_id(), 0x123);
+        assert!(hook.is_stop_requested());
+    }
+
+    #[test]
+    fn manual_stop_detaches_gate_then_drains_accepted_frames() {
+        let (hook, rx) = ClientRecordingHook::new(RecordingStopCondition::Manual);
+
+        hook.on_frame(event(standard(0x151, 10_000)));
+        hook.request_stop();
+        hook.on_frame(event(standard(0x152, 11_000)));
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame.raw_id(), 0x151);
+        assert!(hook.is_stop_requested());
+    }
+}
