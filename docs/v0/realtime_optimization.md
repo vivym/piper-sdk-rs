@@ -63,7 +63,7 @@ For high-frequency control commands (500Hz-1kHz), use `send_realtime()`:
 
 ```rust
 // Real-time command: If queue is full, new command overwrites old one
-let frame = piper_sdk::PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03]);
+let frame = piper_sdk::PiperFrame::new_standard(0x1A1, [0x01, 0x02, 0x03])?;
 robot.send_realtime(frame)?;
 ```
 
@@ -78,7 +78,7 @@ For configuration frames and state machine transitions, use `send_reliable()`:
 
 ```rust
 // Reliable command: FIFO queue, no overwriting
-let frame = piper_sdk::PiperFrame::new_standard(0x1A2, &[0x04, 0x05, 0x06]);
+let frame = piper_sdk::PiperFrame::new_standard(0x1A2, [0x04, 0x05, 0x06])?;
 robot.send_reliable(frame)?;
 ```
 
@@ -95,12 +95,12 @@ For type-safe command sending, use `PiperCommand`:
 use piper_sdk::robot::command::{CommandPriority, PiperCommand};
 
 // Create real-time command
-let frame = piper_sdk::PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03]);
+let frame = piper_sdk::PiperFrame::new_standard(0x1A1, [0x01, 0x02, 0x03])?;
 let cmd = PiperCommand::realtime(frame);
 robot.send_command(cmd)?;
 
 // Create reliable command
-let frame = piper_sdk::PiperFrame::new_standard(0x1A2, &[0x04, 0x05, 0x06]);
+let frame = piper_sdk::PiperFrame::new_standard(0x1A2, [0x04, 0x05, 0x06])?;
 let cmd = PiperCommand::reliable(frame);
 robot.send_command(cmd)?;
 ```
@@ -301,4 +301,3 @@ Typical performance in mock test environment:
 - [CAN IO Threading Improvement Plan](can_io_threading_improvement_plan_v2.md)
 - [Phase 1 Technical Summary](phase1_technical_summary.md)
 - [Real-time Configuration Guide](realtime_configuration.md)
-

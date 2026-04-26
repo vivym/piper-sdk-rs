@@ -9,7 +9,7 @@ description = "IO management and state synchronization driver for Piper robot ar
 readme = "../../README.md"
 
 [features]
-default = []
+default = ["auto-backend"]
 # Real-time thread priority support (Linux/macOS/Windows)
 realtime = ["dep:thread-priority"]
 # Mock mode for testing without hardware

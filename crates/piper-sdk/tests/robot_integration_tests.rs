@@ -2,7 +2,9 @@
 //!
 //! 使用 MockCanAdapter 模拟 CAN 帧输入，验证完整的状态更新流程。
 
-use piper_sdk::can::{CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter};
+use piper_sdk::can::{
+    CanAdapter, CanError, PiperFrame, RealtimeTxAdapter, SplittableAdapter, StandardCanId,
+};
 use piper_sdk::driver::DriverError;
 use piper_sdk::driver::observation::Observation;
 use piper_sdk::driver::*;
@@ -138,23 +140,28 @@ impl SplittableAdapter for MockCanAdapter {
 }
 
 // 辅助函数：创建关节位置反馈帧
-fn create_joint_feedback_frame(id: u32, j1_deg: f64, j2_deg: f64, timestamp: u32) -> PiperFrame {
+fn create_joint_feedback_frame(
+    id: StandardCanId,
+    j1_deg: f64,
+    j2_deg: f64,
+    timestamp: u32,
+) -> PiperFrame {
     let j1_raw = (j1_deg * 1000.0) as i32;
     let j2_raw = (j2_deg * 1000.0) as i32;
     let mut data = [0u8; 8];
     data[0..4].copy_from_slice(&j1_raw.to_be_bytes());
     data[4..8].copy_from_slice(&j2_raw.to_be_bytes());
 
-    let mut frame = PiperFrame::new_standard(id as u16, &data);
-    frame.timestamp_us = timestamp as u64;
-    frame
+    PiperFrame::new_standard(id.raw() as u32, data)
+        .unwrap()
+        .with_timestamp_us(timestamp as u64)
 }
 
 // 辅助函数：创建 RobotStatusFeedback 帧
 fn create_robot_status_frame() -> PiperFrame {
-    let mut frame = PiperFrame::new_standard(
-        ID_ROBOT_STATUS as u16,
-        &[
+    PiperFrame::new_standard(
+        ID_ROBOT_STATUS.raw() as u32,
+        [
             0x01,        // Byte 0: CanControl 模式
             0x00,        // Byte 1: Normal 状态
             0x01,        // Byte 2: MOVE J 模式
@@ -164,9 +171,9 @@ fn create_robot_status_frame() -> PiperFrame {
             0b0000_0000, // Byte 6: 无角度超限位
             0b0000_0000, // Byte 7: 无通信异常
         ],
-    );
-    frame.timestamp_us = 2000;
-    frame
+    )
+    .unwrap()
+    .with_timestamp_us(2000)
 }
 
 fn build_strict_test_piper(mock_can: &Arc<MockCanAdapter>) -> Piper {
@@ -275,7 +282,7 @@ fn test_piper_end_to_end_command_send() {
     let piper = build_strict_test_piper(&mock_can_clone);
 
     // 发送命令帧
-    let cmd_frame = PiperFrame::new_standard(0x150, &[0x01, 0x02, 0x03]);
+    let cmd_frame = PiperFrame::new_standard(0x150, [0x01, 0x02, 0x03]).unwrap();
     piper.send_frame(cmd_frame).unwrap();
 
     // 等待 IO 线程处理命令
@@ -317,16 +324,16 @@ fn test_piper_end_to_end_full_state_read() {
 }
 
 // 辅助函数：创建末端位姿反馈帧
-fn create_end_pose_frame(id: u32, val1: f64, val2: f64, timestamp: u32) -> PiperFrame {
+fn create_end_pose_frame(id: StandardCanId, val1: f64, val2: f64, timestamp: u32) -> PiperFrame {
     let val1_raw = (val1 * 1000.0) as i32;
     let val2_raw = (val2 * 1000.0) as i32;
     let mut data = [0u8; 8];
     data[0..4].copy_from_slice(&val1_raw.to_be_bytes());
     data[4..8].copy_from_slice(&val2_raw.to_be_bytes());
 
-    let mut frame = PiperFrame::new_standard(id as u16, &data);
-    frame.timestamp_us = timestamp as u64;
-    frame
+    PiperFrame::new_standard(id.raw() as u32, data)
+        .unwrap()
+        .with_timestamp_us(timestamp as u64)
 }
 
 // 辅助函数：创建速度帧（0x251-0x256）
@@ -344,10 +351,8 @@ fn create_velocity_frame(
     // position_rad 字段（Byte 4-7）设置为 0（测试中不使用）
     data[4..8].copy_from_slice(&[0; 4]);
 
-    let id = ID_JOINT_DRIVER_HIGH_SPEED_BASE + (joint_index as u32 - 1);
-    let mut frame = PiperFrame::new_standard(id as u16, &data);
-    frame.timestamp_us = timestamp as u64;
-    frame
+    let id = joint_driver_high_speed_id(JointIndex::new(joint_index).unwrap()).raw() as u32;
+    PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp as u64)
 }
 
 /// 端到端测试：完整的关节位置 + 末端位姿帧组更新
@@ -541,7 +546,7 @@ fn test_piper_stress_command_channel_full() {
     let mut sent_count = 0;
 
     for i in 0..15 {
-        let cmd_frame = PiperFrame::new_standard(0x150 + i, &[i as u8; 4]);
+        let cmd_frame = PiperFrame::new_standard(0x150 + i, [i as u8; 4]).unwrap();
         match piper.send_frame(cmd_frame) {
             Ok(()) => sent_count += 1,
             Err(DriverError::ChannelFull) => {
@@ -609,8 +614,7 @@ fn test_piper_stress_mixed_frame_sequence() {
     // 添加状态帧
     for i in 0..5 {
         let status_frame = create_robot_status_frame();
-        let mut frame = status_frame;
-        frame.timestamp_us = 9000 + i;
+        let frame = status_frame.with_timestamp_us(9000 + i);
         frames.push(frame);
     }
 

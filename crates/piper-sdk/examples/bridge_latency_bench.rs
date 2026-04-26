@@ -292,10 +292,8 @@ fn run_send_bench(
     let mut lease = client.acquire_maintenance_lease(Duration::from_millis(500))?;
     let mut stats = LatencyStats::new();
     for index in 0..count {
-        let frame = PiperFrame::new_standard(
-            0x300 + (index as u16 % 0x20),
-            &[index as u8, 0xAA, 0xBB, 0xCC],
-        );
+        let frame =
+            PiperFrame::new_standard(0x300 + (index % 0x20), [index as u8, 0xAA, 0xBB, 0xCC])?;
         let start = Instant::now();
         lease.send_frame(frame)?;
         stats.push(start.elapsed());

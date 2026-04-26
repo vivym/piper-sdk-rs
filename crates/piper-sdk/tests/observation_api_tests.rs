@@ -121,9 +121,9 @@ impl SplittableAdapter for MockCanAdapter {
 }
 
 fn bootstrap_timestamp_frame() -> PiperFrame {
-    let mut frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-    frame.timestamp_us = 1;
-    frame
+    PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8])
+        .unwrap()
+        .with_timestamp_us(1)
 }
 
 fn build_test_piper(mock_can: &Arc<MockCanAdapter>) -> Piper {
@@ -142,10 +142,9 @@ fn queue_complete_joint_limit_query_response(mock_can: &Arc<MockCanAdapter>) {
         data[1..3].copy_from_slice(&(1800i16 + i16::from(joint_index)).to_be_bytes());
         data[3..5].copy_from_slice(&(-1800i16 - i16::from(joint_index)).to_be_bytes());
         data[5..7].copy_from_slice(&(500u16 + u16::from(joint_index)).to_be_bytes());
-        mock_can.queue_frame(PiperFrame::new_standard(
-            ID_MOTOR_LIMIT_FEEDBACK as u16,
-            &data,
-        ));
+        mock_can.queue_frame(
+            PiperFrame::new_standard(ID_MOTOR_LIMIT_FEEDBACK.raw() as u32, data).unwrap(),
+        );
     }
 }
 
@@ -177,10 +176,13 @@ fn diagnostics_snapshot_and_subscription_expose_protocol_events() {
     let piper = build_test_piper(&mock_can);
     let diagnostics_rx = piper.subscribe_diagnostics();
 
-    mock_can.queue_frame(PiperFrame::new_standard(
-        ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
-        &[255, 0, 0, 0, 0, 0, 0, 0],
-    ));
+    mock_can.queue_frame(
+        PiperFrame::new_standard(
+            ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw() as u32,
+            [255, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .unwrap(),
+    );
 
     let event = diagnostics_rx
         .recv_timeout(Duration::from_millis(250))

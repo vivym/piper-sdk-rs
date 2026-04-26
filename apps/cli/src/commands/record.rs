@@ -7,6 +7,7 @@ use crate::connection::{TargetArgs, client_builder, resolved_target_spec};
 use anyhow::{Context, Result};
 use clap::Args;
 use piper_control::TargetSpec;
+use piper_sdk::can::CanId;
 use piper_sdk::client::state::{CapabilityMarker, Standby};
 use piper_sdk::client::{ConnectedPiper, MotionConnectedState, Piper};
 use piper_sdk::driver::ConnectionTarget;
@@ -35,12 +36,42 @@ pub struct RecordCommand {
     pub duration: u64,
 
     /// 自动停止（接收到特定 CAN ID 时停止）
-    #[arg(short, long)]
-    pub stop_on_id: Option<u32>,
+    #[arg(short, long, value_parser = parse_can_id_arg)]
+    pub stop_on_id: Option<CanId>,
 
     /// 跳过确认提示
     #[arg(long)]
     pub force: bool,
+}
+
+fn parse_can_id_arg(value: &str) -> std::result::Result<CanId, String> {
+    let (format, raw) = value.split_once(':').ok_or_else(|| {
+        "CAN ID must be explicit: use standard:0x123 or extended:0x123".to_string()
+    })?;
+
+    let id = parse_u32_arg(raw)?;
+    match format {
+        "standard" => CanId::standard(id).map_err(|err| err.to_string()),
+        "extended" => CanId::extended(id).map_err(|err| err.to_string()),
+        _ => Err("CAN ID format must be standard or extended".to_string()),
+    }
+}
+
+fn parse_u32_arg(value: &str) -> std::result::Result<u32, String> {
+    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).map_err(|err| format!("invalid hex CAN ID: {err}"))
+    } else {
+        value.parse::<u32>().map_err(|err| format!("invalid CAN ID: {err}"))
+    }
+}
+
+fn format_can_id_arg(id: CanId) -> String {
+    let format = if id.is_standard() {
+        "standard"
+    } else {
+        "extended"
+    };
+    format!("{format}:0x{:X}", id.raw())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +96,7 @@ fn classify_recording_outcome(
 }
 
 impl RecordCommand {
-    fn effective_stop_condition(duration: u64, stop_on_id: Option<u32>) -> StopCondition {
+    fn effective_stop_condition(duration: u64, stop_on_id: Option<CanId>) -> StopCondition {
         if let Some(id) = stop_on_id {
             StopCondition::OnCanId(id)
         } else if duration > 0 {
@@ -75,7 +106,7 @@ impl RecordCommand {
         }
     }
 
-    fn effective_loop_timeout_secs(duration: u64, stop_on_id: Option<u32>) -> u64 {
+    fn effective_loop_timeout_secs(duration: u64, stop_on_id: Option<CanId>) -> u64 {
         if stop_on_id.is_some() { 0 } else { duration }
     }
 
@@ -133,7 +164,7 @@ impl RecordCommand {
             }
         );
         if let Some(stop_id) = self.stop_on_id {
-            println!("🛑 停止条件: CAN ID 0x{:X}", stop_id);
+            println!("🛑 停止条件: CAN ID {}", format_can_id_arg(stop_id));
         }
         let config = CliConfig::load()?;
         let target_spec = resolved_target_spec(&config, self.target.target.as_ref());
@@ -250,7 +281,7 @@ impl RecordCommand {
         duration: u64,
         target: ConnectionTarget,
         target_spec: TargetSpec,
-        stop_on_id: Option<u32>,
+        stop_on_id: Option<CanId>,
         running: Arc<AtomicBool>,
     ) -> Result<(piper_sdk::RecordingStats, RecordRunOutcome)> {
         // === 1. 连接到机器人 ===
@@ -282,7 +313,9 @@ impl RecordCommand {
 
         let metadata = RecordingMetadata {
             notes: match stop_condition {
-                StopCondition::OnCanId(id) => format!("CLI recording, stop_on_id=0x{id:X}"),
+                StopCondition::OnCanId(id) => {
+                    format!("CLI recording, stop_on_id={}", format_can_id_arg(id))
+                },
                 StopCondition::Duration(seconds) => {
                     format!("CLI recording, duration={seconds}")
                 },
@@ -420,6 +453,7 @@ impl RecordCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use piper_sdk::can::CanId;
 
     #[test]
     fn test_record_command_creation() {
@@ -431,13 +465,13 @@ mod tests {
                 }),
             },
             duration: 10,
-            stop_on_id: Some(0x2A5),
+            stop_on_id: Some(CanId::standard(0x2A5).unwrap()),
             force: false,
         };
 
         assert_eq!(cmd.output, "test.bin");
         assert_eq!(cmd.duration, 10);
-        assert_eq!(cmd.stop_on_id, Some(0x2A5));
+        assert_eq!(cmd.stop_on_id, Some(CanId::standard(0x2A5).unwrap()));
         assert!(!cmd.force);
     }
 
@@ -481,9 +515,12 @@ mod tests {
 
     #[test]
     fn effective_stop_condition_prefers_stop_on_id_over_duration() {
-        match RecordCommand::effective_stop_condition(30, Some(0x2A5)) {
-            StopCondition::OnCanId(0x2A5) => {},
-            StopCondition::OnCanId(other) => panic!("unexpected CAN ID: 0x{other:X}"),
+        let expected = CanId::standard(0x2A5).unwrap();
+        match RecordCommand::effective_stop_condition(30, Some(expected)) {
+            StopCondition::OnCanId(id) if id == expected => {},
+            StopCondition::OnCanId(other) => {
+                panic!("unexpected CAN ID: {}", format_can_id_arg(other))
+            },
             StopCondition::Duration(seconds) => {
                 panic!("expected OnCanId, got Duration({seconds})")
             },
@@ -493,7 +530,7 @@ mod tests {
             },
         }
         assert_eq!(
-            RecordCommand::effective_loop_timeout_secs(30, Some(0x2A5)),
+            RecordCommand::effective_loop_timeout_secs(30, Some(expected)),
             0
         );
     }
@@ -503,7 +540,9 @@ mod tests {
         match RecordCommand::effective_stop_condition(30, None) {
             StopCondition::Duration(30) => {},
             StopCondition::Duration(other) => panic!("unexpected duration: {other}"),
-            StopCondition::OnCanId(id) => panic!("expected Duration, got OnCanId(0x{id:X})"),
+            StopCondition::OnCanId(id) => {
+                panic!("expected Duration, got OnCanId({})", format_can_id_arg(id))
+            },
             StopCondition::Manual => panic!("expected Duration, got Manual"),
             StopCondition::FrameCount(count) => {
                 panic!("expected Duration, got FrameCount({count})")
@@ -557,5 +596,23 @@ mod tests {
             classify_recording_outcome(true, false, true),
             RecordRunOutcome::Completed
         );
+    }
+
+    #[test]
+    fn parses_explicit_standard_stop_id() {
+        assert_eq!(
+            parse_can_id_arg("standard:0x2A5").unwrap(),
+            CanId::standard(0x2A5).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_stop_id() {
+        assert!(parse_can_id_arg("0x2A5").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_standard_stop_id() {
+        assert!(parse_can_id_arg("standard:0x800").is_err());
     }
 }

@@ -233,8 +233,8 @@ fn run_send(
     let mut lease = client.acquire_maintenance_lease(Duration::from_millis(500))?;
     for index in 0..count {
         let frame = PiperFrame::new_standard(
-            0x120 + (index as u16 % 0x10),
-            &[
+            0x120 + (index % 0x10),
+            [
                 index as u8,
                 (index.wrapping_mul(2)) as u8,
                 (index.wrapping_mul(3)) as u8,
@@ -244,13 +244,13 @@ fn run_send(
                 0xDD,
                 0xEE,
             ],
-        );
+        )?;
         lease.send_frame(frame)?;
         println!(
             "sent #{:03}: id=0x{:03X} data={:02X?}",
             index + 1,
-            frame.id,
-            &frame.data[..frame.len as usize]
+            frame.raw_id(),
+            frame.data()
         );
         if index + 1 != count {
             std::thread::sleep(interval);
@@ -273,10 +273,10 @@ fn run_receive(
                 println!(
                     "recv #{:03}: id=0x{:03X} len={} data={:02X?} ts_us={}",
                     received,
-                    frame.id,
-                    frame.len,
-                    &frame.data[..frame.len as usize],
-                    frame.timestamp_us
+                    frame.raw_id(),
+                    frame.dlc(),
+                    frame.data(),
+                    frame.timestamp_us()
                 );
             },
             BridgeEvent::Gap { dropped } => {
@@ -305,18 +305,12 @@ fn parse_interactive_send_frame(parts: &[&str]) -> Result<PiperFrame, Box<dyn st
         return Err("at most 8 data bytes are allowed".into());
     }
 
-    let mut data = [0u8; 8];
-    for (index, token) in data_tokens.iter().enumerate() {
-        data[index] = u8::from_str_radix(token.trim_start_matches("0x"), 16)?;
-    }
+    let data: Vec<u8> = data_tokens
+        .iter()
+        .map(|token| u8::from_str_radix(token.trim_start_matches("0x"), 16))
+        .collect::<Result<_, _>>()?;
 
-    Ok(PiperFrame {
-        id,
-        data,
-        len: data_tokens.len() as u8,
-        is_extended: false,
-        timestamp_us: 0,
-    })
+    Ok(PiperFrame::new_standard(id, data)?)
 }
 
 fn run_interactive(
@@ -350,7 +344,7 @@ fn run_interactive(
                 let mut lease = client.acquire_maintenance_lease(Duration::from_millis(500))?;
                 lease.send_frame(frame)?;
                 lease.release()?;
-                println!("sent frame id=0x{:03X}", frame.id);
+                println!("sent frame id=0x{:03X}", frame.raw_id());
             },
             "quit" | "exit" => break,
             other => println!("unknown command: {}", other),

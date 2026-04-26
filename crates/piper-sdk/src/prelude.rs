@@ -23,6 +23,10 @@ pub use crate::client::types::*;
 
 // CAN 层（常用 Trait）
 pub use crate::can::CanAdapter;
+pub use crate::{
+    CanData, CanId, ExtendedCanId, FrameError, JointIndex, PiperFrame, ReceivedFrame,
+    StandardCanId, TimestampProvenance,
+};
 
 // 驱动层（高级用户使用）
 // 注意：不导出 driver::PiperBuilder，避免与 client::PiperBuilder 命名冲突

@@ -426,7 +426,7 @@ cargo run -p piper-sdk --example frame_dump --features serde
 use piper_sdk::can::PiperFrame;
 use serde_json;
 
-let frame = PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03]);
+let frame = PiperFrame::new_standard(0x1A1, [0x01, 0x02, 0x03])?;
 let json = serde_json::to_string(&frame)?;
 ```
 

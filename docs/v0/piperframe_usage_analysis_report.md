@@ -339,7 +339,7 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
 #### 改进 3: 添加构建器模式
 当前创建帧需要：
 ```rust
-let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]);
+let frame = PiperFrame::new_standard(0x123, [1, 2, 3])?;
 ```
 
 可以考虑添加链式构建器：

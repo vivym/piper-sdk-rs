@@ -37,7 +37,7 @@ fn test_can_adapter_basic() {
     println!("✓ Adapter configured (250 kbps)");
 
     // 3. 发送测试帧
-    let tx_frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
+    let tx_frame = PiperFrame::new_standard(0x123, [0x01, 0x02, 0x03, 0x04]).unwrap();
     adapter.send(tx_frame).expect("Failed to send frame");
     println!("✓ Frame sent via CanAdapter");
 
@@ -51,7 +51,7 @@ fn test_send_fire_and_forget() {
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
     adapter.configure(250_000).expect("Failed to configure");
 
-    let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+    let frame = PiperFrame::new_standard(0x123, [0x01, 0x02]).unwrap();
 
     // 连续快速发送，验证不会阻塞
     let start = std::time::Instant::now();
@@ -86,7 +86,11 @@ fn test_receive_filter_funnel() {
     let start = std::time::Instant::now();
     match adapter.receive() {
         Ok(frame) => {
-            println!("Received frame: ID=0x{:X}, len={}", frame.id, frame.len);
+            println!(
+                "Received frame: ID=0x{:X}, len={}",
+                frame.frame.raw_id(),
+                frame.frame.dlc()
+            );
         },
         Err(piper_sdk::can::CanError::Timeout) => {
             println!("✓ Timeout as expected (no CAN traffic)");
@@ -115,7 +119,7 @@ fn test_send_not_started() {
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
     // 不调用 configure()
 
-    let frame = PiperFrame::new_standard(0x123, &[0x01]);
+    let frame = PiperFrame::new_standard(0x123, [0x01]).unwrap();
     let result = adapter.send(frame);
 
     match result {

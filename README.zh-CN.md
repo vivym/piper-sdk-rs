@@ -267,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok(frame) = rx.recv() {
             // 处理帧：写入文件、分析等
             println!("接收帧: ID=0x{:03X}, timestamp={}us",
-                     frame.id, frame.timestamp_us);
+                     frame.raw_id(), frame.timestamp_us());
         }
         Ok::<_, Box<dyn std::error::Error>>(())
     });
@@ -401,7 +401,7 @@ fn main() -> anyhow::Result<()> {
         while let Ok(frame) = rx.recv() {
             frame_count += 1;
             if frame_count % 1000 == 0 {
-                println!("收到帧: ID=0x{:03X}", frame.id);
+                println!("收到帧: ID=0x{:03X}", frame.raw_id());
             }
         }
 
@@ -552,7 +552,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("关节位置: {:?}", joint_pos.joint_pos);
 
     // 发送控制帧
-    let frame = piper_sdk::PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03]);
+    let frame = piper_sdk::PiperFrame::new_standard(0x1A1, [0x01, 0x02, 0x03])?;
     robot.send_frame(frame)?;
 
     Ok(())

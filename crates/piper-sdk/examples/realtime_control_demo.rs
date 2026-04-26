@@ -163,7 +163,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         if args.allow_raw_tx {
             // Deliberately use demo-only IDs outside the Piper protocol ranges.
-            let frame = PiperFrame::new_standard(DEMO_REALTIME_ID, &[iteration_count as u8; 8]);
+            let frame =
+                PiperFrame::new_standard(DEMO_REALTIME_ID as u32, [iteration_count as u8; 8])?;
             match robot.send_realtime(frame) {
                 Ok(_) => {},
                 Err(e) => {
@@ -228,13 +229,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     if args.allow_raw_tx {
         // Use demo-only IDs so this example never emits robot protocol traffic.
-        let config_frame = PiperFrame::new_standard(DEMO_RELIABLE_ID, &[0x01, 0x02, 0x03, 0x04]);
+        let config_frame =
+            PiperFrame::new_standard(DEMO_RELIABLE_ID as u32, [0x01, 0x02, 0x03, 0x04])?;
         match robot.send_reliable(config_frame) {
             Ok(_) => println!("   ✓ Reliable command sent (FIFO queue)"),
             Err(e) => eprintln!("   ✗ Failed to send reliable command: {}", e),
         }
 
-        let control_frame = PiperFrame::new_standard(DEMO_REALTIME_ID, &[0x05, 0x06, 0x07, 0x08]);
+        let control_frame =
+            PiperFrame::new_standard(DEMO_REALTIME_ID as u32, [0x05, 0x06, 0x07, 0x08])?;
         let cmd = PiperCommand::realtime(control_frame);
         match robot.send_command(cmd) {
             Ok(_) => println!("   ✓ Real-time command sent (overwritable queue)"),

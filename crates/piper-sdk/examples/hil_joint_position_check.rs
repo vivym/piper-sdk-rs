@@ -387,9 +387,9 @@ fn format_joint_command_payload_trace(step: &str, positions: &JointArray<Rad>) -
         "step={} target_rad={} 0x155={} 0x156={} 0x157={}",
         step,
         format_joint_values(&target_values),
-        format_frame_hex(&frames[0].data),
-        format_frame_hex(&frames[1].data),
-        format_frame_hex(&frames[2].data),
+        format_frame_hex(frames[0].data_padded()),
+        format_frame_hex(frames[1].data_padded()),
+        format_frame_hex(frames[2].data_padded()),
     )
 }
 

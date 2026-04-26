@@ -19,9 +19,9 @@ fn is_ci_env() -> bool {
 
 // Mock CanAdapter 用于性能测试
 fn bootstrap_timestamp_frame() -> PiperFrame {
-    let mut frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-    frame.timestamp_us = 1;
-    frame
+    PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8])
+        .unwrap()
+        .with_timestamp_us(1)
 }
 
 fn received(frame: PiperFrame) -> piper_sdk::can::ReceivedFrame {

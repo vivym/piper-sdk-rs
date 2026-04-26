@@ -30,9 +30,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         // 创建一些示例帧
         let frames = vec![
-            PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]),
-            PiperFrame::new_standard(0x456, &[0x05, 0x06, 0x07, 0x08]),
-            PiperFrame::new_extended(0x12345678, &[0xFF, 0xFF, 0xFF, 0xFF]),
+            PiperFrame::new_standard(0x123, [0x01, 0x02, 0x03, 0x04])?,
+            PiperFrame::new_standard(0x456, [0x05, 0x06, 0x07, 0x08])?,
+            PiperFrame::new_extended(0x12345678, [0xFF, 0xFF, 0xFF, 0xFF])?,
         ];
 
         println!("📝 Original frames:");
@@ -40,9 +40,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             println!(
                 "  Frame {}: ID=0x{:03X}, len={}, data={:?}",
                 i,
-                frame.id,
-                frame.len,
-                &frame.data[..frame.len as usize]
+                frame.raw_id(),
+                frame.dlc(),
+                frame.data()
             );
         }
 

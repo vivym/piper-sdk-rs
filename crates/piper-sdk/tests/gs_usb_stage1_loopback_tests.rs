@@ -51,7 +51,7 @@ fn test_loopback_end_to_end() {
     println!("✓ Adapter configured in LOOP_BACK mode (250 kbps)");
 
     // 3. 发送标准帧
-    let tx_frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
+    let tx_frame = PiperFrame::new_standard(0x123, [0x01, 0x02, 0x03, 0x04]).unwrap();
     adapter.send(tx_frame).expect("Failed to send frame");
     println!("✓ Frame sent: ID=0x123, data=[0x01, 0x02, 0x03, 0x04]");
 
@@ -65,18 +65,20 @@ fn test_loopback_end_to_end() {
             Ok(rx_frame) => {
                 println!(
                     "✓ Frame received on attempt {}: ID=0x{:X}, len={}",
-                    attempt, rx_frame.id, rx_frame.len
+                    attempt,
+                    rx_frame.frame.raw_id(),
+                    rx_frame.frame.dlc()
                 );
 
                 // 验证帧内容
-                assert_eq!(rx_frame.id, 0x123, "Frame ID mismatch");
-                assert_eq!(rx_frame.len, 4, "Frame length mismatch");
+                assert_eq!(rx_frame.frame.raw_id(), 0x123, "Frame ID mismatch");
+                assert_eq!(rx_frame.frame.dlc(), 4, "Frame length mismatch");
                 assert_eq!(
-                    rx_frame.data[0..4],
+                    rx_frame.frame.data(),
                     [0x01, 0x02, 0x03, 0x04],
                     "Frame data mismatch"
                 );
-                assert!(!rx_frame.is_extended, "Should be standard frame");
+                assert!(rx_frame.frame.is_standard(), "Should be standard frame");
 
                 received = true;
                 break;
@@ -128,7 +130,7 @@ fn test_loopback_echo_filtering() {
 
     // 发送多个帧
     for i in 0..5 {
-        let frame = PiperFrame::new_standard(0x100 + i, &[i as u8]);
+        let frame = PiperFrame::new_standard(0x100 + i, [i as u8]).unwrap();
         adapter.send(frame).expect("Failed to send frame");
         println!("✓ Sent frame {}: ID=0x{:X}", i, 0x100 + i);
     }
@@ -150,7 +152,7 @@ fn test_loopback_echo_filtering() {
             Ok(frame) => {
                 // 在 Loopback 模式下，应该能收到 Echo
                 echo_count += 1;
-                println!("  ✓ Received echo frame: ID=0x{:X}", frame.id);
+                println!("  ✓ Received echo frame: ID=0x{:X}", frame.frame.raw_id());
 
                 // 如果已经收到 5 个 Echo，可以提前退出
                 if echo_count >= 5 {
@@ -182,7 +184,7 @@ fn test_loopback_standard_and_extended_frames() {
     adapter.configure_loopback(250_000).expect("Failed to configure");
 
     // 测试标准帧（11-bit ID）
-    let std_frame = PiperFrame::new_standard(0x7FF, &[0xAA, 0xBB]);
+    let std_frame = PiperFrame::new_standard(0x7FF, [0xAA, 0xBB]).unwrap();
     adapter.send(std_frame).expect("Failed to send standard frame");
     println!("✓ Sent standard frame: ID=0x7FF");
 
@@ -190,8 +192,8 @@ fn test_loopback_standard_and_extended_frames() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     match adapter.receive() {
         Ok(rx_frame) => {
-            assert_eq!(rx_frame.id, 0x7FF);
-            assert!(!rx_frame.is_extended);
+            assert_eq!(rx_frame.frame.raw_id(), 0x7FF);
+            assert!(rx_frame.frame.is_standard());
             println!("✓ Received standard frame correctly");
         },
         Err(piper_sdk::can::CanError::Timeout) => {
@@ -201,7 +203,7 @@ fn test_loopback_standard_and_extended_frames() {
     }
 
     // 测试扩展帧（29-bit ID）
-    let ext_frame = PiperFrame::new_extended(0x1FFFFFFF, &[0xCC, 0xDD, 0xEE]);
+    let ext_frame = PiperFrame::new_extended(0x1FFFFFFF, [0xCC, 0xDD, 0xEE]).unwrap();
     adapter.send(ext_frame).expect("Failed to send extended frame");
     println!("✓ Sent extended frame: ID=0x1FFFFFFF");
 
@@ -209,8 +211,8 @@ fn test_loopback_standard_and_extended_frames() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     match adapter.receive() {
         Ok(rx_frame) => {
-            assert_eq!(rx_frame.id, 0x1FFFFFFF);
-            assert!(rx_frame.is_extended);
+            assert_eq!(rx_frame.frame.raw_id(), 0x1FFFFFFF);
+            assert!(rx_frame.frame.is_extended());
             println!("✓ Received extended frame correctly");
         },
         Err(piper_sdk::can::CanError::Timeout) => {
@@ -235,7 +237,7 @@ fn test_loopback_various_data_lengths() {
     let lengths = [0, 1, 2, 4, 8];
     for &len in &lengths {
         let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
-        let frame = PiperFrame::new_standard((0x200 + len) as u16, &data);
+        let frame = PiperFrame::new_standard(0x200 + len as u32, &data).unwrap();
         adapter
             .send(frame)
             .unwrap_or_else(|_| panic!("Failed to send frame with {} bytes", len));
@@ -246,13 +248,14 @@ fn test_loopback_various_data_lengths() {
         match adapter.receive() {
             Ok(rx_frame) => {
                 assert_eq!(
-                    rx_frame.len, len as u8,
+                    rx_frame.frame.dlc(),
+                    len as u8,
                     "Data length mismatch for {} byte frame",
                     len
                 );
                 assert_eq!(
-                    rx_frame.data[..len],
-                    data[..],
+                    rx_frame.frame.data(),
+                    &data[..],
                     "Data mismatch for {} byte frame",
                     len
                 );
@@ -308,7 +311,7 @@ fn test_loopback_fire_and_forget() {
     // 给设备时间从 Reset 中恢复（参考诊断测试：500ms）
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let frame = PiperFrame::new_standard(0x300, &[0xAA, 0xBB, 0xCC]);
+    let frame = PiperFrame::new_standard(0x300, [0xAA, 0xBB, 0xCC]).unwrap();
 
     // 执行 Ping-Pong 测试
     // 降低 Batch Size 到 1，但增加总次数来验证稳定性
@@ -339,7 +342,12 @@ fn test_loopback_fire_and_forget() {
         while start_receive.elapsed().as_secs() < 2 {
             match adapter.receive() {
                 Ok(rx_frame) => {
-                    assert_eq!(rx_frame.id, 0x300, "Frame ID mismatch at frame {}", i);
+                    assert_eq!(
+                        rx_frame.frame.raw_id(),
+                        0x300,
+                        "Frame ID mismatch at frame {}",
+                        i
+                    );
                     received = true;
                     break;
                 },
@@ -393,7 +401,7 @@ fn test_loopback_device_state() {
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
 
     // 未启动时应该无法发送
-    let frame = PiperFrame::new_standard(0x123, &[0x01]);
+    let frame = PiperFrame::new_standard(0x123, [0x01]).unwrap();
     let result = adapter.send(frame);
     match result {
         Err(piper_sdk::can::CanError::NotStarted) => {

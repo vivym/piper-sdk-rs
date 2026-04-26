@@ -9,7 +9,7 @@ description = "High-level type-safe API with type state pattern for Piper robot 
 readme = "../../README.md"
 
 [features]
-default = []
+default = ["auto-backend"]
 serde = ["dep:serde", "piper-can/serde", "piper-protocol/serde"]
 mock = ["piper-can/mock", "piper-driver/mock"]
 auto-backend = ["piper-can/auto-backend", "piper-driver/auto-backend"]

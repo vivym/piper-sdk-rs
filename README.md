@@ -265,7 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok(frame) = rx.recv() {
             println!(
                 "Received frame: ID=0x{:03X}, timestamp={}us",
-                frame.id, frame.timestamp_us
+                frame.raw_id(), frame.timestamp_us()
             );
         }
     });
@@ -413,7 +413,7 @@ fn main() -> anyhow::Result<()> {
 
             // Custom analysis: e.g., CAN ID distribution, timing analysis
             if frame_count % 1000 == 0 {
-                println!("Received frame: ID=0x{:03X}", frame.id);
+                println!("Received frame: ID=0x{:03X}", frame.raw_id());
             }
         }
 
@@ -577,7 +577,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("Joint positions: {:?}", joint_pos.joint_pos);
 
     // Send control frame
-    let frame = piper_sdk::PiperFrame::new_standard(0x1A1, &[0x01, 0x02, 0x03]);
+    let frame = piper_sdk::PiperFrame::new_standard(0x1A1, [0x01, 0x02, 0x03])?;
     robot.send_frame(frame)?;
 
     Ok(())

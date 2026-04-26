@@ -68,7 +68,8 @@ fn test_command_latency_quiet_bus() {
         .build()
         .expect("Failed to create Piper");
 
-    let frame = piper_sdk::can::PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
+    let frame = piper_sdk::can::PiperFrame::new_standard(0x123, [0x01, 0x02, 0x03, 0x04])
+        .expect("valid test frame");
 
     // 测量 100 次命令发送的延迟
     let mut latencies = Vec::new();
@@ -153,7 +154,10 @@ fn test_socketcan_timeout_config() {
             );
         },
         Ok(frame) => {
-            println!("Received frame unexpectedly: ID=0x{:X}", frame.id);
+            println!(
+                "Received frame unexpectedly: ID=0x{:X}",
+                frame.frame.raw_id()
+            );
         },
         Err(e) => panic!("Unexpected error: {}", e),
     }
@@ -190,7 +194,10 @@ fn test_gs_usb_timeout_config() {
             );
         },
         Ok(frame) => {
-            println!("Received frame unexpectedly: ID=0x{:X}", frame.id);
+            println!(
+                "Received frame unexpectedly: ID=0x{:X}",
+                frame.frame.raw_id()
+            );
         },
         Err(e) => panic!("Unexpected error: {}", e),
     }

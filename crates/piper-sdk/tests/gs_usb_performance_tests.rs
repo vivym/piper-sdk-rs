@@ -31,7 +31,7 @@ fn test_1khz_send_performance() {
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
     adapter.configure(500_000).expect("Failed to configure");
 
-    let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
+    let frame = PiperFrame::new_standard(0x123, [0x01, 0x02, 0x03, 0x04]).unwrap();
 
     let start = std::time::Instant::now();
     let mut count = 0;
@@ -63,7 +63,7 @@ fn test_send_latency() {
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
     adapter.configure(500_000).expect("Failed to configure");
 
-    let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
+    let frame = PiperFrame::new_standard(0x123, [0x01, 0x02, 0x03, 0x04]).unwrap();
 
     // 测量单帧发送时间（Fire-and-Forget）
     let mut latencies = Vec::new();
@@ -116,7 +116,10 @@ fn test_receive_timeout_latency() {
             );
         },
         Ok(frame) => {
-            println!("Received frame unexpectedly: ID=0x{:X}", frame.id);
+            println!(
+                "Received frame unexpectedly: ID=0x{:X}",
+                frame.frame.raw_id()
+            );
         },
         Err(e) => panic!("Unexpected error: {}", e),
     }
@@ -129,7 +132,7 @@ fn test_batch_send_performance() {
     let mut adapter = GsUsbCanAdapter::new().expect("Failed to create adapter");
     adapter.configure(500_000).expect("Failed to configure");
 
-    let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
+    let frame = PiperFrame::new_standard(0x123, [0x01, 0x02, 0x03, 0x04]).unwrap();
     let batch_size = 1000;
 
     let start = std::time::Instant::now();

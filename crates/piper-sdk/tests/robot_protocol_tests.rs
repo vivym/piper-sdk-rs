@@ -107,9 +107,9 @@ impl SplittableAdapter for MockCanAdapter {
 }
 
 fn bootstrap_timestamp_frame() -> PiperFrame {
-    let mut frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-    frame.timestamp_us = 1;
-    frame
+    PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8])
+        .unwrap()
+        .with_timestamp_us(1)
 }
 
 fn build_strict_test_piper(mock_can: &Arc<MockCanAdapter>) -> Piper {
@@ -131,8 +131,8 @@ fn test_robot_status_feedback_update() {
 
     // 创建 RobotStatusFeedback 帧 (0x2A1)
     let status_frame = PiperFrame::new_standard(
-        ID_ROBOT_STATUS as u16,
-        &[
+        ID_ROBOT_STATUS.raw() as u32,
+        [
             0x01,        // Byte 0: CanControl 模式
             0x00,        // Byte 1: Normal 状态
             0x01,        // Byte 2: MOVE J 模式
@@ -142,7 +142,8 @@ fn test_robot_status_feedback_update() {
             0b0011_1111, // Byte 6: 所有关节角度超限位（Bit 0-5 = 1）
             0b0000_0000, // Byte 7: 无通信异常
         ],
-    );
+    )
+    .unwrap();
     mock_can_clone.queue_frame(status_frame);
 
     // 等待 IO 线程处理
@@ -177,7 +178,7 @@ fn test_gripper_feedback_update() {
     data[6] = status_byte;
     // Byte 7: 保留
 
-    let gripper_frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
+    let gripper_frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw() as u32, data).unwrap();
     mock_can_clone.queue_frame(gripper_frame);
 
     // 等待 IO 线程处理
@@ -198,7 +199,7 @@ fn test_command_channel_send() {
     let piper = build_strict_test_piper(&mock_can_clone);
 
     // 发送命令帧
-    let cmd_frame = PiperFrame::new_standard(0x150, &[0x01, 0x02, 0x03]);
+    let cmd_frame = PiperFrame::new_standard(0x150, [0x01, 0x02, 0x03]).unwrap();
     piper.send_frame(cmd_frame).unwrap();
 
     // 等待 IO 线程处理命令
@@ -245,7 +246,8 @@ fn test_joint_driver_low_speed_feedback_update() {
 
     // 创建 6 个关节的低速反馈帧 (0x261-0x266)
     for joint_index in 1..=6 {
-        let id = ID_JOINT_DRIVER_LOW_SPEED_BASE + (joint_index as u32 - 1);
+        let id =
+            joint_driver_low_speed_id(JointIndex::new(joint_index as u8).unwrap()).raw() as u32;
         let voltage = 240 + joint_index as u16 * 10; // 24.0V + 0.1V * joint_index (0.1V 单位)
         let driver_temp = 35 + joint_index as i16;
         let motor_temp = 30 + joint_index as i8;
@@ -258,8 +260,9 @@ fn test_joint_driver_low_speed_feedback_update() {
         data[5] = 0; // 状态位（简化）
         data[6..8].copy_from_slice(&bus_current.to_be_bytes());
 
-        let mut frame = PiperFrame::new_standard(id as u16, &data);
-        frame.timestamp_us = 3000 + joint_index;
+        let frame = PiperFrame::new_standard(id, data)
+            .unwrap()
+            .with_timestamp_us(3000 + joint_index as u64);
         mock_can_clone.queue_frame(frame);
     }
 
@@ -281,8 +284,8 @@ fn test_collision_protection_level_feedback_update() {
     // 创建 CollisionProtectionLevelFeedback 帧 (0x47B)
     // Byte 0-5: 6 个关节的保护等级 (0-8)
     let protection_frame = PiperFrame::new_standard(
-        ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
-        &[
+        ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw() as u32,
+        [
             0x05, // J1: 等级 5
             0x05, // J2: 等级 5
             0x05, // J3: 等级 5
@@ -292,7 +295,8 @@ fn test_collision_protection_level_feedback_update() {
             0x00, // Byte 6: 保留
             0x00, // Byte 7: 保留
         ],
-    );
+    )
+    .unwrap();
     mock_can_clone.queue_frame(protection_frame);
 
     // 等待 IO 线程处理
@@ -322,8 +326,9 @@ fn test_motor_limit_feedback_accumulation() {
         data[3..5].copy_from_slice(&min_angle_deg.to_be_bytes());
         data[5..7].copy_from_slice(&max_velocity_rad_s.to_be_bytes());
 
-        let mut frame = PiperFrame::new_standard(ID_MOTOR_LIMIT_FEEDBACK as u16, &data);
-        frame.timestamp_us = 4000 + joint_index as u64;
+        let frame = PiperFrame::new_standard(ID_MOTOR_LIMIT_FEEDBACK.raw() as u32, data)
+            .unwrap()
+            .with_timestamp_us(4000 + joint_index as u64);
         mock_can_clone.queue_frame(frame);
     }
 
@@ -362,8 +367,9 @@ fn test_motor_max_accel_feedback_accumulation() {
         data[1..3].copy_from_slice(&max_accel_rad_s2.to_be_bytes());
         // Byte 3-7: 保留
 
-        let mut frame = PiperFrame::new_standard(ID_MOTOR_MAX_ACCEL_FEEDBACK as u16, &data);
-        frame.timestamp_us = 5000 + joint_index as u64;
+        let frame = PiperFrame::new_standard(ID_MOTOR_MAX_ACCEL_FEEDBACK.raw() as u32, data)
+            .unwrap()
+            .with_timestamp_us(5000 + joint_index as u64);
         mock_can_clone.queue_frame(frame);
     }
 
@@ -408,8 +414,9 @@ fn test_end_velocity_accel_feedback_update() {
     data[4..6].copy_from_slice(&max_linear_accel.to_be_bytes());
     data[6..8].copy_from_slice(&max_angular_accel.to_be_bytes());
 
-    let mut frame = PiperFrame::new_standard(ID_END_VELOCITY_ACCEL_FEEDBACK as u16, &data);
-    frame.timestamp_us = 6000;
+    let frame = PiperFrame::new_standard(ID_END_VELOCITY_ACCEL_FEEDBACK.raw() as u32, data)
+        .unwrap()
+        .with_timestamp_us(6000);
     mock_can_clone.queue_frame(frame);
 
     // 等待 IO 线程处理
@@ -455,7 +462,7 @@ fn test_can_send_error_handling() {
     let piper = build_strict_test_piper(&mock_can_clone);
 
     // 发送命令帧（应该成功）
-    let cmd_frame = PiperFrame::new_standard(0x150, &[0x01]);
+    let cmd_frame = PiperFrame::new_standard(0x150, [0x01]).unwrap();
     assert!(piper.send_frame(cmd_frame).is_ok());
 }
 
@@ -469,7 +476,7 @@ fn test_frame_parse_error_invalid_frame() {
 
     // 创建一个无效的 CAN 帧（错误的 ID 或数据长度）
     // 例如：使用正确 ID 但数据长度不足
-    let invalid_frame = PiperFrame::new_standard(ID_ROBOT_STATUS as u16, &[0x01; 4]); // 只有 4 字节，应该是 8 字节
+    let invalid_frame = PiperFrame::new_standard(ID_ROBOT_STATUS.raw() as u32, [0x01; 4]).unwrap(); // 只有 4 字节，应该是 8 字节
     mock_can_clone.queue_frame(invalid_frame);
 
     // 等待 IO 线程处理

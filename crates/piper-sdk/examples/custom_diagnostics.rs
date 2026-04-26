@@ -62,7 +62,7 @@ fn drain_recorded_frames(
                 "   后台线程：已接收 {} 帧，平均 FPS: {:.1}",
                 frame_count, fps
             );
-            println!("   帧ID: 0x{:03X}", frame.id);
+            println!("   帧ID: 0x{:03X}", frame.frame.raw_id());
         }
     }
 

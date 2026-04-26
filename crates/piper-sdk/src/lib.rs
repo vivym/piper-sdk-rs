@@ -49,6 +49,10 @@ pub mod protocol {
     pub use piper_protocol::*;
 }
 
+pub mod ids {
+    pub use piper_protocol::ids::*;
+}
+
 pub mod driver {
     pub use piper_driver::*;
 }
@@ -63,7 +67,11 @@ pub mod prelude;
 // --- 用户以此为界 ---
 
 // CAN 层常用类型
-pub use can::{CanAdapter, CanError, PiperFrame};
+pub use can::{CanAdapter, CanError};
+pub use piper_can::{ReceivedFrame, TimestampProvenance};
+pub use piper_protocol::{
+    CanData, CanId, ExtendedCanId, FrameError, JointIndex, PiperFrame, StandardCanId,
+};
 
 // 协议层错误
 pub use protocol::ProtocolError;

@@ -9,7 +9,7 @@ description = "Unified SDK for Piper robot arm control with real-time performanc
 readme = "../../README.md"
 
 [features]
-default = []
+default = ["auto-backend"]
 serde = ["piper-client/serde", "piper-can/serde", "piper-protocol/serde"]
 mock = ["piper-client/mock", "piper-driver/mock", "piper-can/mock"]
 auto-backend = ["piper-client/auto-backend", "piper-driver/auto-backend", "piper-can/auto-backend"]
