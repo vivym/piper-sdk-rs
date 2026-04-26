@@ -341,7 +341,8 @@ impl PiperFrame {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{FrameError, PiperFrame};
+    use super::{CAN_DATA_MAX_LEN, FrameError, PiperFrame};
+    use std::fmt;
 
     const FORMAT_STANDARD: &str = "standard";
     const FORMAT_EXTENDED: &str = "extended";
@@ -361,8 +362,59 @@ mod serde_impl {
     struct HumanFrameOwned {
         id: u32,
         format: String,
-        data: Vec<u8>,
+        data: BoundedHumanData,
         timestamp_us: u64,
+    }
+
+    struct BoundedHumanData {
+        bytes: [u8; CAN_DATA_MAX_LEN],
+        len: u8,
+    }
+
+    impl BoundedHumanData {
+        fn as_slice(&self) -> &[u8] {
+            &self.bytes[..self.len as usize]
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for BoundedHumanData {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct BoundedHumanDataVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for BoundedHumanDataVisitor {
+                type Value = BoundedHumanData;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("at most 8 data bytes")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: serde::de::SeqAccess<'de>,
+                {
+                    let mut bytes = [0u8; CAN_DATA_MAX_LEN];
+                    let mut len = 0usize;
+
+                    while let Some(value) = seq.next_element()? {
+                        if len == CAN_DATA_MAX_LEN {
+                            return Err(serde::de::Error::invalid_length(len + 1, &self));
+                        }
+                        bytes[len] = value;
+                        len += 1;
+                    }
+
+                    Ok(BoundedHumanData {
+                        bytes,
+                        len: len as u8,
+                    })
+                }
+            }
+
+            deserializer.deserialize_seq(BoundedHumanDataVisitor)
+        }
     }
 
     #[derive(serde::Serialize, serde::Deserialize)]
@@ -427,8 +479,8 @@ mod serde_impl {
                 } = frame;
 
                 let parsed = match format.as_str() {
-                    FORMAT_STANDARD => PiperFrame::new_standard(id, data),
-                    FORMAT_EXTENDED => PiperFrame::new_extended(id, data),
+                    FORMAT_STANDARD => PiperFrame::new_standard(id, data.as_slice()),
+                    FORMAT_EXTENDED => PiperFrame::new_extended(id, data.as_slice()),
                     format => {
                         return Err(serde::de::Error::custom(format!(
                             "invalid frame format {format:?}, expected \"standard\" or \"extended\""

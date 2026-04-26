@@ -101,6 +101,22 @@ fn json_rejects_invalid_ids_and_oversized_data() {
 }
 
 #[test]
+fn json_rejects_large_human_data_with_bounded_error() {
+    let large_data = r#"{
+        "id": 291,
+        "format": "standard",
+        "data": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "timestamp_us": 0
+    }"#;
+
+    let error = serde_json::from_str::<PiperFrame>(large_data).unwrap_err();
+    assert!(
+        error.to_string().contains("at most 8 data bytes"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn bincode_uses_canonical_frame_helper_and_rejects_bad_values() {
     let frame = PiperFrame::new_extended(0x123, [1, 2]).unwrap().with_timestamp_us(7);
     let encoded = bincode::DefaultOptions::new()
@@ -122,6 +138,19 @@ fn bincode_uses_canonical_frame_helper_and_rejects_bad_values() {
     assert_eq!(decoded.id(), CanId::extended(0x123).unwrap());
     assert_eq!(decoded.data(), &[1, 2]);
     assert_eq!(decoded.timestamp_us(), 7);
+}
+
+#[test]
+fn bincode_rejects_truncated_frame_payload() {
+    let mut bytes = fixed_bincode_frame_bytes(0x123, 0, 2, [1, 2, 0, 0, 0, 0, 0, 0], 7);
+    bytes.truncate(10);
+
+    let result: Result<PiperFrame, _> = bincode::DefaultOptions::new()
+        .with_little_endian()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(&bytes);
+    assert!(result.is_err());
 }
 
 #[test]
