@@ -5,8 +5,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         GravityCompensationRunStats, GravityCompensationRunner, GravityCompensationRunnerConfig,
         MujocoGravityCompensation,
     };
-    use piper_sdk::{ConnectedPiper, PiperBuilder};
     use piper_sdk::client::state::MitModeConfig;
+    use piper_sdk::{ConnectedPiper, PiperBuilder};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
@@ -53,7 +53,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     println!("Enabling MIT mode...");
     let robot = match standby {
-        ConnectedPiper::Strict(standby) => standby.enable_mit_mode(MitModeConfig::default())?,
+        ConnectedPiper::Strict(state) => {
+            state.require_standby()?.enable_mit_mode(MitModeConfig::default())?
+        },
         ConnectedPiper::Soft(_) | ConnectedPiper::Monitor(_) => {
             return Err("gravity compensation requires a strict-realtime backend".into());
         },

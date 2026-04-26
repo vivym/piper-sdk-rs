@@ -1819,12 +1819,13 @@ mod tests {
                 rest_position: Some([Rad(0.0); 6]),
                 read_policy: ControlReadPolicy {
                     max_state_skew_us: 2_000,
-                    max_feedback_age: Duration::from_millis(5),
+                    max_feedback_age: Duration::from_millis(50),
                 },
                 ..MitControllerConfig::default()
             },
         )
         .expect("strict realtime driver should support MitController");
+        controller.config.read_policy.max_feedback_age = Duration::from_millis(5);
         thread::sleep(Duration::from_millis(10));
         controller.last_hold_anchor = Some(JointArray::from([Rad(0.0); 6]));
 
@@ -1931,12 +1932,13 @@ mod tests {
             MitControllerConfig {
                 read_policy: ControlReadPolicy {
                     max_state_skew_us: 2_000,
-                    max_feedback_age: Duration::from_millis(5),
+                    max_feedback_age: Duration::from_millis(50),
                 },
                 ..MitControllerConfig::default()
             },
         )
         .expect("strict realtime driver should support MitController");
+        controller.config.read_policy.max_feedback_age = Duration::from_millis(5);
         thread::sleep(Duration::from_millis(10));
 
         let error = controller

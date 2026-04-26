@@ -758,9 +758,13 @@ where
 {
     let this = std::mem::ManuallyDrop::new(this);
 
+    // SAFETY: `this` is ManuallyDrop, and each field is moved exactly once into
+    // the replacement state wrapper.
     let driver = unsafe { std::ptr::read(&this.driver) };
+    // SAFETY: see `driver` above.
     let observer = unsafe { std::ptr::read(&this.observer) };
-    let quirks = this.quirks.clone();
+    // SAFETY: see `driver` above. Moving avoids leaking the original Version allocation.
+    let quirks = unsafe { std::ptr::read(&this.quirks) };
 
     Piper {
         driver,
@@ -1749,9 +1753,13 @@ where
         driver_mode_drop_policy: DriverModeDropPolicy,
     ) -> Piper<NextState, Capability> {
         let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is ManuallyDrop, and each field is moved exactly once
+        // into the replacement state wrapper.
         let driver = unsafe { std::ptr::read(&this.driver) };
+        // SAFETY: see `driver` above.
         let observer = unsafe { std::ptr::read(&this.observer) };
-        let quirks = this.quirks.clone();
+        // SAFETY: see `driver` above. Moving avoids leaking the original Version allocation.
+        let quirks = unsafe { std::ptr::read(&this.quirks) };
 
         Piper {
             driver,
@@ -2581,7 +2589,7 @@ where
         Ok(position_mode)
     }
 
-    /// 重新应用位置模式的控制配置（0x151），保持当前 Active<PositionMode> 不变。
+    /// 重新应用位置模式的控制配置（0x151），保持当前 `Active<PositionMode>` 不变。
     ///
     /// 借用态重新配置只能更新由控制器保存并可通过 0x151 确认的字段，例如
     /// `speed_percent` 和 `install_position`。`motion_type` 与 `command_timeout`
