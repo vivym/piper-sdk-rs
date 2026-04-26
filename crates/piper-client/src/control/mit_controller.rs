@@ -1342,6 +1342,23 @@ mod tests {
         }
     }
 
+    fn wait_for_sent_frame(
+        sent_frames: &Arc<Mutex<Vec<PiperFrame>>>,
+        expected: PiperFrame,
+    ) -> Vec<PiperFrame> {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let frames = sent_frames.lock().expect("sent frames lock").clone();
+            if frames.contains(&expected) {
+                return frames;
+            }
+            if Instant::now() >= deadline {
+                panic!("expected sent frame {expected:?}, got {frames:?}");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn test_config_default() {
         let config = MitControllerConfig::default();
@@ -1954,8 +1971,10 @@ mod tests {
         ));
         assert!(controller.is_safed_out());
 
-        let frames = wait_for_sent_frames(&sent_frames, 7);
-        assert!(frames.contains(&EmergencyStopCommand::emergency_stop().to_frame()));
+        wait_for_sent_frame(
+            &sent_frames,
+            EmergencyStopCommand::emergency_stop().to_frame(),
+        );
     }
 
     #[test]

@@ -580,6 +580,62 @@ pub enum MotionConnectedPiper {
     Soft(MotionConnectedState<SoftRealtime>),
 }
 
+struct PiperTransitionParts<Capability>
+where
+    Capability: CapabilityMarker,
+{
+    driver: Arc<piper_driver::Piper>,
+    observer: Observer<Capability>,
+    quirks: DeviceQuirks,
+}
+
+impl<Capability> PiperTransitionParts<Capability>
+where
+    Capability: CapabilityMarker,
+{
+    fn into_piper<NewState>(
+        self,
+        new_state: NewState,
+        drop_policy: DropPolicy,
+        driver_mode_drop_policy: DriverModeDropPolicy,
+    ) -> Piper<NewState, Capability> {
+        Piper {
+            driver: self.driver,
+            observer: self.observer,
+            quirks: self.quirks,
+            drop_policy,
+            driver_mode_drop_policy,
+            _state: new_state,
+        }
+    }
+}
+
+fn split_piper_for_transition<State, Capability>(
+    this: Piper<State, Capability>,
+) -> (PiperTransitionParts<Capability>, State)
+where
+    Capability: CapabilityMarker,
+{
+    let this = std::mem::ManuallyDrop::new(this);
+
+    // SAFETY: `this` is ManuallyDrop, so the original Piper destructor will not
+    // run. Each field is moved exactly once, including `_state`, so no field is
+    // double-dropped or leaked during a type-state transition.
+    let driver = unsafe { std::ptr::read(&this.driver) };
+    let observer = unsafe { std::ptr::read(&this.observer) };
+    let quirks = unsafe { std::ptr::read(&this.quirks) };
+    let state = unsafe { std::ptr::read(&this._state) };
+
+    (
+        PiperTransitionParts {
+            driver,
+            observer,
+            quirks,
+        },
+        state,
+    )
+}
+
 impl<State, Capability> Piper<State, Capability>
 where
     Capability: CapabilityMarker,
@@ -756,24 +812,9 @@ fn transition_piper_state<State, NewState, Capability>(
 where
     Capability: CapabilityMarker,
 {
-    let this = std::mem::ManuallyDrop::new(this);
-
-    // SAFETY: `this` is ManuallyDrop, and each field is moved exactly once into
-    // the replacement state wrapper.
-    let driver = unsafe { std::ptr::read(&this.driver) };
-    // SAFETY: see `driver` above.
-    let observer = unsafe { std::ptr::read(&this.observer) };
-    // SAFETY: see `driver` above. Moving avoids leaking the original Version allocation.
-    let quirks = unsafe { std::ptr::read(&this.quirks) };
-
-    Piper {
-        driver,
-        observer,
-        quirks,
-        drop_policy,
-        driver_mode_drop_policy,
-        _state: new_state,
-    }
+    let (parts, old_state) = split_piper_for_transition(this);
+    drop(old_state);
+    parts.into_piper(new_state, drop_policy, driver_mode_drop_policy)
 }
 
 // ==================== Disconnected 状态 ====================
@@ -1752,23 +1793,7 @@ where
         drop_policy: DropPolicy,
         driver_mode_drop_policy: DriverModeDropPolicy,
     ) -> Piper<NextState, Capability> {
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `this` is ManuallyDrop, and each field is moved exactly once
-        // into the replacement state wrapper.
-        let driver = unsafe { std::ptr::read(&this.driver) };
-        // SAFETY: see `driver` above.
-        let observer = unsafe { std::ptr::read(&this.observer) };
-        // SAFETY: see `driver` above. Moving avoids leaking the original Version allocation.
-        let quirks = unsafe { std::ptr::read(&this.quirks) };
-
-        Piper {
-            driver,
-            observer,
-            quirks,
-            drop_policy,
-            driver_mode_drop_policy,
-            _state: next_state,
-        }
+        transition_piper_state(self, next_state, drop_policy, driver_mode_drop_policy)
     }
 
     fn query_collision_protection_with_poll(
@@ -1975,7 +2000,7 @@ where
             };
             if confirmed_mask == Some(0) {
                 stable_count += 1;
-                if stable_count >= debounce_threshold {
+                if stable_count >= debounce_threshold && self.driver.normal_control_path_open() {
                     return Ok(());
                 }
             } else {
@@ -6317,6 +6342,56 @@ mod tests {
         assert!(
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "stale read-modify-write helper must not send frames"
+        );
+    }
+
+    #[test]
+    fn transition_piper_state_drops_replaced_state_once() {
+        struct DropCountingState {
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DropCountingState {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent_frames);
+        let counted = transition_piper_state(
+            standby,
+            DropCountingState {
+                drops: drops.clone(),
+            },
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        );
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "installing a state must transfer ownership without dropping it"
+        );
+
+        let standby = transition_piper_state(
+            counted,
+            Standby,
+            DropPolicy::Noop,
+            DriverModeDropPolicy::Preserve,
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "replacing a state must drop the previous state exactly once"
+        );
+
+        drop(standby);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "dropping the replacement Piper must not drop the old state again"
         );
     }
 

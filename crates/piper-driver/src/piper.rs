@@ -1885,6 +1885,15 @@ impl Piper {
             && self.normal_send_gate.accepts_front_door_submissions()
     }
 
+    /// Returns whether normal control submissions are currently accepted.
+    ///
+    /// This is false while state-transition sends are held closed, even if the
+    /// latest feedback already shows the requested state. Callers that publish a
+    /// higher-level Standby state should wait for this to become true first.
+    pub fn normal_control_path_open(&self) -> bool {
+        self.normal_control_open()
+    }
+
     fn reliable_front_door_open(&self, kind: ReliableCommandKind) -> bool {
         if self.runtime_phase() != RuntimePhase::Running
             || self.runtime_fault.load(Ordering::Acquire) != 0
