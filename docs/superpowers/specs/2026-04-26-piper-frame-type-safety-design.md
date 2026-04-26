@@ -166,6 +166,10 @@ PiperFrame::with_timestamp_us(self, timestamp_us: u64) -> Self
 
 `CanId` should be `Copy`. `CanData` and `PiperFrame` should remain `Copy` if practical, preserving the current zero-allocation hot-path behavior.
 
+The new frame types should preserve the existing ergonomics traits where practical: `Debug`, `Clone`, `Copy`, `PartialEq`, and `Eq`. Losing these traits would expand the breaking change beyond the frame-construction problem and would make tests and diagnostics worse.
+
+Protocol-layer command builders that use compile-time CAN ID constants should remain infallible where the IDs and payload sizes are statically known to be valid. Implementations should avoid spreading `unwrap()` or `expect()` through every `to_frame()` method. Acceptable patterns include pre-validated ID constants, private infallible helpers for protocol-owned constants, or a clearly documented conversion layer that proves the constants are valid once. Public constructors for user-provided IDs and payloads must remain fallible.
+
 ## Error Model
 
 Add `FrameError` to `piper-protocol`.
@@ -286,7 +290,7 @@ Backend encoding should use:
 
 RX conversion should validate backend-provided IDs and DLC values through `PiperFrame` constructors. Invalid frames received from a device or raw socket should become backend errors instead of invalid SDK values.
 
-RX conversion must also reject non-data frames before constructing `PiperFrame`. SocketCAN remote frames and error frames should return backend errors. GS-USB frames carrying RTR/error flags or backend control/status semantics should be handled as backend events/errors, not exposed as `PiperFrame`.
+RX conversion must also reject non-data frames before constructing `PiperFrame`. The invariant is that remote/RTR frames, error frames, CAN FD frames, and backend control/status frames are never exposed as `PiperFrame`. The backend may preserve its current strategy for those frames: return an error for fatal conditions, ignore/log recoverable conditions, or map them to backend-specific events. This refactor should not force every non-data frame to become a hard receive error.
 
 ## Protocol Layer Impact
 
