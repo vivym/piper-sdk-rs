@@ -7,7 +7,7 @@
 //! - **Bounded Queue**: 使用 `bounded(100_000)` 防止 OOM
 //! - **非阻塞**: 使用 `try_send`，队列满时丢帧而非阻塞
 //! - **丢帧监控**: 提供 `dropped_frames` 计数器
-//! - **时间戳精度**: 直接使用 `frame.timestamp_us`（硬件时间戳）
+//! - **时间戳精度**: 保留来源元数据，并在录制边界归一化为会话内 elapsed timestamp
 //!
 //! # 性能分析
 //!
@@ -43,36 +43,43 @@
 
 use crate::hooks::FrameCallback;
 use crossbeam_channel::{Receiver, Sender, bounded};
+pub use piper_can::TimestampProvenance;
 use piper_protocol::PiperFrame;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// 带时间戳的帧
-///
-/// 保存 CAN 帧及其硬件时间戳，用于录制和回放。
-#[derive(Debug, Clone)]
-pub struct TimestampedFrame {
-    /// 硬件时间戳（微秒）
-    ///
-    /// ⏱️ **时间戳精度**: 必须直接使用 `frame.timestamp_us`（硬件时间戳）
-    /// 禁止在回调中调用 `SystemTime::now()`，因为回调执行时间已晚于帧到达时间。
-    pub timestamp_us: u64,
-
-    /// CAN ID
-    pub id: u32,
-
-    /// 帧数据（最多 8 bytes）
-    pub data: Vec<u8>,
+/// 录制帧方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedFrameDirection {
+    Rx,
+    Tx,
 }
 
-impl From<&PiperFrame> for TimestampedFrame {
-    fn from(frame: &PiperFrame) -> Self {
+/// 带时间戳的帧。
+#[derive(Debug, Clone)]
+pub struct TimestampedFrame {
+    /// CAN 帧，`timestamp_us()` 已归一化为录制会话开始后的微秒数。
+    pub frame: PiperFrame,
+    /// RX/TX 方向。
+    pub direction: RecordedFrameDirection,
+    /// 归一化后时间戳来源。
+    pub timestamp_provenance: TimestampProvenance,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RecordedFrameEvent {
+    pub frame: PiperFrame,
+    pub direction: RecordedFrameDirection,
+    pub timestamp_provenance: TimestampProvenance,
+}
+
+impl From<RecordedFrameEvent> for TimestampedFrame {
+    fn from(event: RecordedFrameEvent) -> Self {
         Self {
-            // ⏱️ 直接透传硬件时间戳
-            timestamp_us: frame.timestamp_us,
-            id: frame.id,
-            data: frame.data.to_vec(),
+            frame: event.frame,
+            direction: event.direction,
+            timestamp_provenance: event.timestamp_provenance,
         }
     }
 }
@@ -135,6 +142,14 @@ pub struct AsyncRecordingHook {
 
     /// 停止请求标志（原子操作，用于跨线程通信）
     stop_requested: Arc<AtomicBool>,
+
+    /// 录制会话开始时间，用于将 TX/Userspace 时间戳归一化为 elapsed 微秒。
+    session_start: Instant,
+
+    hardware_origin_raw_us: AtomicU64,
+    hardware_origin_elapsed_us: AtomicU64,
+    kernel_origin_raw_us: AtomicU64,
+    kernel_origin_elapsed_us: AtomicU64,
 }
 
 impl AsyncRecordingHook {
@@ -188,6 +203,11 @@ impl AsyncRecordingHook {
             stop_deadline: stop_duration.map(|duration| Instant::now() + duration),
             stop_after_frame_count,
             stop_requested: Arc::new(AtomicBool::new(false)),
+            session_start: Instant::now(),
+            hardware_origin_raw_us: AtomicU64::new(0),
+            hardware_origin_elapsed_us: AtomicU64::new(0),
+            kernel_origin_raw_us: AtomicU64::new(0),
+            kernel_origin_elapsed_us: AtomicU64::new(0),
         };
 
         (hook, rx)
@@ -311,6 +331,84 @@ impl AsyncRecordingHook {
     pub fn frame_count(&self) -> u64 {
         self.frame_counter.load(Ordering::Relaxed)
     }
+
+    fn elapsed_us_since_start(&self) -> u64 {
+        self.session_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn normalize_source_timestamp(
+        &self,
+        raw_timestamp_us: u64,
+        provenance: TimestampProvenance,
+    ) -> Option<u64> {
+        if raw_timestamp_us == 0 {
+            return None;
+        }
+
+        let (origin_raw, origin_elapsed) = match provenance {
+            TimestampProvenance::Hardware => (
+                &self.hardware_origin_raw_us,
+                &self.hardware_origin_elapsed_us,
+            ),
+            TimestampProvenance::Kernel => {
+                (&self.kernel_origin_raw_us, &self.kernel_origin_elapsed_us)
+            },
+            _ => return None,
+        };
+
+        let elapsed_now = self.elapsed_us_since_start().max(1);
+        let observed_origin = origin_raw.load(Ordering::Acquire);
+        if observed_origin == 0
+            && origin_raw
+                .compare_exchange(0, raw_timestamp_us, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            origin_elapsed.store(elapsed_now, Ordering::Release);
+        }
+
+        let raw_origin = origin_raw.load(Ordering::Acquire);
+        let elapsed_origin = origin_elapsed.load(Ordering::Acquire);
+        if raw_origin == 0 || elapsed_origin == 0 || raw_timestamp_us < raw_origin {
+            None
+        } else {
+            Some(elapsed_origin.saturating_add(raw_timestamp_us - raw_origin))
+        }
+    }
+
+    fn normalize_event(&self, event: RecordedFrameEvent) -> RecordedFrameEvent {
+        let raw_timestamp_us = event.frame.timestamp_us();
+        let mapped_source_timestamp =
+            self.normalize_source_timestamp(raw_timestamp_us, event.timestamp_provenance);
+
+        match (event.timestamp_provenance, mapped_source_timestamp) {
+            (TimestampProvenance::Hardware | TimestampProvenance::Kernel, Some(timestamp_us)) => {
+                RecordedFrameEvent {
+                    frame: event.frame.with_timestamp_us(timestamp_us),
+                    ..event
+                }
+            },
+            _ => RecordedFrameEvent {
+                frame: event.frame.with_timestamp_us(self.elapsed_us_since_start().max(1)),
+                timestamp_provenance: TimestampProvenance::Userspace,
+                ..event
+            },
+        }
+    }
+
+    fn try_record_event(&self, event: RecordedFrameEvent) {
+        let ts_frame = TimestampedFrame::from(self.normalize_event(event));
+
+        if self.tx.try_send(ts_frame).is_err() {
+            self.dropped_frames.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let new_count = self.frame_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(limit) = self.stop_after_frame_count
+                && new_count >= limit
+            {
+                self.stop_requested.store(true, Ordering::Release);
+            }
+        }
+    }
 }
 
 impl FrameCallback for AsyncRecordingHook {
@@ -341,7 +439,7 @@ impl FrameCallback for AsyncRecordingHook {
     ///
     #[inline]
     #[allow(clippy::collapsible_if)] // 嵌套 if 结构更清晰：先检查 Option，再比较 ID
-    fn on_frame_received(&self, frame: &PiperFrame) {
+    fn on_frame(&self, event: RecordedFrameEvent) {
         if self.stop_requested.load(Ordering::Acquire) {
             return;
         }
@@ -356,58 +454,16 @@ impl FrameCallback for AsyncRecordingHook {
         // ✅ 性能优化：先记录所有帧（包括触发帧），再检查停止条件（v1.4 修正）
 
         // 1. 先记录帧（无论是否为触发帧）
-        let ts_frame = TimestampedFrame::from(frame);
-        if self.tx.try_send(ts_frame).is_err() {
-            // ⚠️ 缓冲区满时，丢弃"新"帧，保留"旧"帧
-            self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-        } else {
-            let new_count = self.frame_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Some(limit) = self.stop_after_frame_count
-                && new_count >= limit
-            {
-                self.stop_requested.store(true, Ordering::Release);
-            }
-        }
+        self.try_record_event(event);
 
         // 2. 再检查停止条件（原子操作，极快）
-        if let Some(stop_id) = self.stop_on_id {
-            if frame.id() == stop_id {
+        if event.direction == RecordedFrameDirection::Rx {
+            if let Some(stop_id) = self.stop_on_id
+                && event.frame.raw_id() == stop_id
+            {
                 // ✅ 原子存储，不会阻塞
                 self.stop_requested.store(true, Ordering::SeqCst);
                 // ✅ 注意：不使用 return，因为已经记录了触发帧
-            }
-        }
-    }
-
-    /// 当发送 CAN 帧成功后调用（可选）
-    ///
-    /// # 时机
-    ///
-    /// 仅在 `tx.send()` 成功后调用，确保录制的是实际发送的帧。
-    #[inline]
-    fn on_frame_sent(&self, frame: &PiperFrame) {
-        if self.stop_requested.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(deadline) = self.stop_deadline
-            && Instant::now() >= deadline
-        {
-            self.stop_requested.store(true, Ordering::Release);
-            return;
-        }
-
-        // ⏱️ 直接透传硬件时间戳
-        let ts_frame = TimestampedFrame::from(frame);
-
-        // 🛡️ 非阻塞发送
-        if self.tx.try_send(ts_frame).is_err() {
-            self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-        } else {
-            let new_count = self.frame_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Some(limit) = self.stop_after_frame_count
-                && new_count >= limit
-            {
-                self.stop_requested.store(true, Ordering::Release);
             }
         }
     }
@@ -416,31 +472,128 @@ impl FrameCallback for AsyncRecordingHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::HookManager;
+    use piper_can::{ReceivedFrame, TimestampProvenance};
     use std::thread;
     use std::time::Duration;
+
+    fn frame_with_timestamp(id: u32, data: &[u8], timestamp_us: u64) -> PiperFrame {
+        PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
+    }
+
+    fn event(
+        frame: PiperFrame,
+        direction: RecordedFrameDirection,
+        timestamp_provenance: TimestampProvenance,
+    ) -> RecordedFrameEvent {
+        RecordedFrameEvent {
+            frame,
+            direction,
+            timestamp_provenance,
+        }
+    }
+
+    #[test]
+    fn timestamped_frame_stores_piper_frame_directly() {
+        let frame = frame_with_timestamp(0x2A5, &[0, 1, 2, 3, 4, 5, 6, 7], 12345);
+
+        let timestamped = TimestampedFrame {
+            frame,
+            direction: RecordedFrameDirection::Rx,
+            timestamp_provenance: TimestampProvenance::Hardware,
+        };
+
+        assert_eq!(timestamped.frame, frame);
+        assert_eq!(timestamped.frame.raw_id(), 0x2A5);
+        assert_eq!(timestamped.frame.data(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(timestamped.direction, RecordedFrameDirection::Rx);
+        assert_eq!(
+            timestamped.timestamp_provenance,
+            TimestampProvenance::Hardware
+        );
+    }
+
+    #[test]
+    fn rx_recording_preserves_received_frame_provenance() {
+        let (hook, rx) = AsyncRecordingHook::new();
+        let mut hooks = HookManager::new();
+        hooks.add_callback(Arc::new(hook));
+
+        let received_frame = ReceivedFrame::new(
+            frame_with_timestamp(0x2A5, &[1, 2, 3, 4], 99_000),
+            TimestampProvenance::Kernel,
+        );
+        hooks.trigger_all(received_frame);
+
+        let recorded = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(recorded.frame.raw_id(), 0x2A5);
+        assert_eq!(recorded.direction, RecordedFrameDirection::Rx);
+        assert_eq!(recorded.timestamp_provenance, TimestampProvenance::Kernel);
+    }
+
+    #[test]
+    fn tx_recording_event_uses_tx_direction() {
+        let (hook, rx) = AsyncRecordingHook::new();
+        let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+
+        callback.on_frame(RecordedFrameEvent {
+            frame: frame_with_timestamp(0x1A1, &[1, 2, 3, 4], 0),
+            direction: RecordedFrameDirection::Tx,
+            timestamp_provenance: TimestampProvenance::Userspace,
+        });
+
+        let recorded = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(recorded.direction, RecordedFrameDirection::Tx);
+    }
+
+    #[test]
+    fn tx_recording_stamps_replayable_userspace_copy_after_send() {
+        let (hook, rx) = AsyncRecordingHook::new();
+        std::thread::sleep(Duration::from_millis(1));
+
+        let mut hooks = HookManager::new();
+        hooks.add_callback(Arc::new(hook));
+        let backend_observed = frame_with_timestamp(0x1A1, &[1, 2, 3, 4], 0);
+
+        hooks.trigger_all_sent(&backend_observed);
+
+        let recorded = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(recorded.direction, RecordedFrameDirection::Tx);
+        assert_eq!(
+            recorded.timestamp_provenance,
+            TimestampProvenance::Userspace
+        );
+        assert!(
+            recorded.frame.timestamp_us() > 0,
+            "recording copy must be replayable with elapsed userspace timestamp"
+        );
+        assert_eq!(
+            backend_observed.timestamp_us(),
+            0,
+            "backend-observed frame must remain unstamped"
+        );
+    }
 
     #[test]
     fn test_async_recording_hook_basic() {
         let (hook, rx) = AsyncRecordingHook::new();
         let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
 
-        // 创建测试帧
-        let frame = PiperFrame {
-            id: 0x2A5,
-            data: [0, 1, 2, 3, 4, 5, 6, 7],
-            len: 8,
-            is_extended: false,
-            timestamp_us: 12345,
-        };
+        let frame = frame_with_timestamp(0x2A5, &[0, 1, 2, 3, 4, 5, 6, 7], 12345);
 
         // 触发回调
-        callback.on_frame_received(&frame);
+        callback.on_frame(event(
+            frame,
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
 
         // 验证接收到帧
         let received = rx.recv_timeout(Duration::from_millis(100)).unwrap();
-        assert_eq!(received.timestamp_us, 12345);
-        assert_eq!(received.id, 0x2A5);
-        assert_eq!(received.data, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(received.frame.raw_id(), 0x2A5);
+        assert_eq!(received.frame.data(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(received.direction, RecordedFrameDirection::Rx);
+        assert_eq!(received.timestamp_provenance, TimestampProvenance::Hardware);
     }
 
     #[test]
@@ -449,17 +602,14 @@ mod tests {
         let dropped_counter = hook.dropped_frames().clone();
         let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
 
-        // 创建测试帧
-        let frame = PiperFrame {
-            id: 0x2A5,
-            data: [0, 1, 2, 3, 4, 5, 6, 7],
-            len: 8,
-            is_extended: false,
-            timestamp_us: 12345,
-        };
+        let frame = frame_with_timestamp(0x2A5, &[0, 1, 2, 3, 4, 5, 6, 7], 12345);
 
         // 正常情况：无丢帧
-        callback.on_frame_received(&frame);
+        callback.on_frame(event(
+            frame,
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
         assert_eq!(dropped_counter.load(Ordering::Relaxed), 0);
 
         // 清空接收端，模拟队列满的情况
@@ -467,7 +617,11 @@ mod tests {
 
         // 现在发送会失败（队列已关闭）
         for _ in 0..10 {
-            callback.on_frame_received(&frame);
+            callback.on_frame(event(
+                frame,
+                RecordedFrameDirection::Rx,
+                TimestampProvenance::Hardware,
+            ));
         }
 
         // 应该记录了 10 个丢帧
@@ -479,22 +633,23 @@ mod tests {
         let (hook, rx) = AsyncRecordingHook::new();
         let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
 
-        // 创建测试帧
-        let frame = PiperFrame {
-            id: 0x1A1,
-            data: [1, 2, 3, 4, 5, 6, 7, 8],
-            len: 8,
-            is_extended: false,
-            timestamp_us: 54321,
-        };
+        let frame = frame_with_timestamp(0x1A1, &[1, 2, 3, 4, 5, 6, 7, 8], 0);
 
         // 触发 TX 回调
-        callback.on_frame_sent(&frame);
+        callback.on_frame(event(
+            frame,
+            RecordedFrameDirection::Tx,
+            TimestampProvenance::Userspace,
+        ));
 
         // 验证接收到帧
         let received = rx.recv_timeout(Duration::from_millis(100)).unwrap();
-        assert_eq!(received.timestamp_us, 54321);
-        assert_eq!(received.id, 0x1A1);
+        assert_eq!(received.frame.raw_id(), 0x1A1);
+        assert_eq!(received.direction, RecordedFrameDirection::Tx);
+        assert_eq!(
+            received.timestamp_provenance,
+            TimestampProvenance::Userspace
+        );
     }
 
     #[test]
@@ -502,22 +657,21 @@ mod tests {
         let (hook, rx) = AsyncRecordingHook::with_auto_stop(None, None, Some(1));
         let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
 
-        let frame = PiperFrame {
-            id: 0x2A5,
-            data: [0; 8],
-            len: 8,
-            is_extended: false,
-            timestamp_us: 100,
-        };
+        let frame = frame_with_timestamp(0x2A5, &[0; 8], 100);
 
-        callback.on_frame_received(&frame);
-        callback.on_frame_received(&PiperFrame {
-            timestamp_us: 200,
-            ..frame
-        });
+        callback.on_frame(event(
+            frame,
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
+        callback.on_frame(event(
+            frame.with_timestamp_us(200),
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
 
         let first = rx.recv_timeout(Duration::from_millis(100)).unwrap();
-        assert_eq!(first.timestamp_us, 100);
+        assert_eq!(first.frame.raw_id(), 0x2A5);
         assert!(
             rx.try_recv().is_err(),
             "second frame must be ignored after auto-stop"
@@ -529,15 +683,13 @@ mod tests {
         let (hook, rx) = AsyncRecordingHook::with_auto_stop(None, Some(Duration::ZERO), None);
         let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
 
-        let frame = PiperFrame {
-            id: 0x2A5,
-            data: [0; 8],
-            len: 8,
-            is_extended: false,
-            timestamp_us: 100,
-        };
+        let frame = frame_with_timestamp(0x2A5, &[0; 8], 100);
 
-        callback.on_frame_received(&frame);
+        callback.on_frame(event(
+            frame,
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
         assert!(
             rx.try_recv().is_err(),
             "expired duration stop must reject new frames"
@@ -545,20 +697,19 @@ mod tests {
     }
 
     #[test]
-    fn test_timestamped_frame_from_piper_frame() {
-        let frame = PiperFrame {
-            id: 0x2A5,
-            data: [0, 1, 2, 3, 4, 5, 6, 7],
-            len: 8,
-            is_extended: false,
-            timestamp_us: 99999,
-        };
+    fn test_timestamped_frame_from_recorded_event() {
+        let frame = frame_with_timestamp(0x2A5, &[0, 1, 2, 3, 4, 5, 6, 7], 99999);
 
-        let ts_frame = TimestampedFrame::from(&frame);
+        let ts_frame = TimestampedFrame::from(event(
+            frame,
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
 
-        assert_eq!(ts_frame.timestamp_us, 99999);
-        assert_eq!(ts_frame.id, 0x2A5);
-        assert_eq!(ts_frame.data, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(ts_frame.frame.timestamp_us(), 99999);
+        assert_eq!(ts_frame.frame.raw_id(), 0x2A5);
+        assert_eq!(ts_frame.frame.data(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(ts_frame.direction, RecordedFrameDirection::Rx);
     }
 
     #[test]
@@ -571,14 +722,12 @@ mod tests {
             .map(|i| {
                 let cb = callback.clone();
                 thread::spawn(move || {
-                    let frame = PiperFrame {
-                        id: 0x2A5,
-                        data: [i as u8; 8],
-                        len: 8,
-                        is_extended: false,
-                        timestamp_us: i as u64,
-                    };
-                    cb.on_frame_received(&frame);
+                    let frame = frame_with_timestamp(0x2A5, &[i as u8; 8], i as u64 + 1);
+                    cb.on_frame(event(
+                        frame,
+                        RecordedFrameDirection::Rx,
+                        TimestampProvenance::Hardware,
+                    ));
                 })
             })
             .collect();

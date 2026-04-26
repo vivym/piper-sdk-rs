@@ -51,5 +51,8 @@ pub use piper::{
 pub use piper_can::BackendCapability;
 pub use piper_protocol::ProtocolDiagnostic;
 pub use query_coordinator::{ActiveQuery, QueryCoordinator, QueryError, QueryGuard, QueryKind};
-pub use recording::{AsyncRecordingHook, TimestampedFrame};
+pub use recording::{
+    AsyncRecordingHook, RecordedFrameDirection, RecordedFrameEvent, TimestampProvenance,
+    TimestampedFrame,
+};
 pub use state::*;

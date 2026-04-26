@@ -37,12 +37,52 @@ const ALL_DRIVES_ENABLED_MASK: u8 = 0b11_1111;
 const TX_IDLE_BACKOFF_MIN_US: u64 = 50;
 const TX_IDLE_BACKOFF_RUNNING_MAX_US: u64 = 200;
 const TX_IDLE_BACKOFF_FAULT_LATCHED_MAX_US: u64 = 1_000;
+const ID_JOINT_DRIVER_HIGH_SPEED_BASE_RAW: u32 = 0x251;
+const ID_JOINT_DRIVER_LOW_SPEED_BASE_RAW: u32 = 0x261;
 
 #[inline]
 fn tx_idle_backoff(min_us: u64, current: u64, max_us: u64) -> (Duration, u64) {
     let sleep_us = current.clamp(min_us, max_us);
     let next_us = sleep_us.saturating_mul(2).min(max_us);
     (Duration::from_micros(sleep_us), next_us)
+}
+
+#[inline]
+fn backend_tx_frame(frame: PiperFrame) -> PiperFrame {
+    frame.with_timestamp_us(0)
+}
+
+#[inline]
+fn record_sent_frame(ctx: &Arc<PiperContext>, frame: &PiperFrame) {
+    if let Ok(hooks) = ctx.hooks.try_read() {
+        hooks.trigger_all_sent(frame);
+    }
+}
+
+#[inline]
+fn send_control_and_record(
+    tx: &mut impl RealtimeTxAdapter,
+    ctx: &Arc<PiperContext>,
+    frame: PiperFrame,
+    budget: Duration,
+) -> Result<(), CanError> {
+    let backend_frame = backend_tx_frame(frame);
+    tx.send_control(backend_frame, budget)?;
+    record_sent_frame(ctx, &backend_frame);
+    Ok(())
+}
+
+#[inline]
+fn send_shutdown_and_record(
+    tx: &mut impl RealtimeTxAdapter,
+    ctx: &Arc<PiperContext>,
+    frame: PiperFrame,
+    deadline: Instant,
+) -> Result<(), CanError> {
+    let backend_frame = backend_tx_frame(frame);
+    tx.send_shutdown_until(backend_frame, deadline)?;
+    record_sent_frame(ctx, &backend_frame);
+    Ok(())
 }
 
 #[inline]
@@ -885,7 +925,7 @@ fn group_alignment_timestamp(
     backend_capability: BackendCapability,
 ) -> u64 {
     if backend_capability.is_strict_realtime() {
-        frame.timestamp_us
+        frame.timestamp_us()
     } else {
         host_rx_mono_us
     }
@@ -1143,7 +1183,7 @@ pub(crate) fn io_loop(
             &metrics,
         );
 
-        if parsed.counts_as_robot_feedback && frame.timestamp_us > 0 {
+        if parsed.counts_as_robot_feedback && frame.timestamp_us() > 0 {
             ctx.register_timestamped_robot_feedback(host_rx_mono_us());
         }
 
@@ -1279,10 +1319,10 @@ pub fn rx_loop(
         // ============================================================
         // 1. 接收 CAN 帧（带超时，避免阻塞）
         // ============================================================
-        let frame = match rx.receive() {
+        let received = match rx.receive() {
             Ok(received) => {
                 metrics.rx_frames_total.fetch_add(1, Ordering::Relaxed);
-                received.frame
+                received
             },
             Err(CanError::Timeout) => {
                 // 超时是正常情况，检查各个 pending 状态的年龄
@@ -1343,6 +1383,7 @@ pub fn rx_loop(
                 continue;
             },
         };
+        let frame = received.frame;
 
         metrics.rx_frames_valid.fetch_add(1, Ordering::Relaxed);
 
@@ -1351,7 +1392,7 @@ pub fn rx_loop(
         // ============================================================
         // 使用 try_read 避免阻塞，如果锁被持有则跳过本次触发
         if let Ok(hooks) = ctx.hooks.try_read() {
-            hooks.trigger_all(&frame);
+            hooks.trigger_all(received);
             // ^^^v 所有回调必须使用 try_send，<1μs，非阻塞
         }
 
@@ -1368,7 +1409,7 @@ pub fn rx_loop(
             &metrics,
         );
 
-        if parsed.counts_as_robot_feedback && frame.timestamp_us > 0 {
+        if parsed.counts_as_robot_feedback && frame.timestamp_us() > 0 {
             ctx.register_timestamped_robot_feedback(host_rx_mono_us());
         }
 
@@ -1545,14 +1586,15 @@ pub(crate) fn tx_loop_mailbox(
                             Err(denied)
                         } else {
                             maintenance_dispatch_committed(&dispatch);
-                            match tx.send_control(dispatch.frame, normal_send_budget) {
+                            match send_control_and_record(
+                                &mut tx,
+                                &ctx,
+                                dispatch.frame,
+                                normal_send_budget,
+                            ) {
                                 Ok(_) => {
                                     soft_deadline_miss_streak = 0;
                                     metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-
-                                    if let Ok(hooks) = ctx.hooks.try_read() {
-                                        hooks.trigger_all_sent(&dispatch.frame);
-                                    }
                                     Ok(())
                                 },
                                 Err(CanError::Timeout) => {
@@ -1652,14 +1694,11 @@ pub(crate) fn tx_loop_mailbox(
                     Err(denied)
                 } else {
                     maintenance_dispatch_committed(&dispatch);
-                    match tx.send_control(dispatch.frame, normal_send_budget) {
+                    match send_control_and_record(&mut tx, &ctx, dispatch.frame, normal_send_budget)
+                    {
                         Ok(_) => {
                             soft_deadline_miss_streak = 0;
                             metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-
-                            if let Ok(hooks) = ctx.hooks.try_read() {
-                                hooks.trigger_all_sent(&dispatch.frame);
-                            }
                             Ok(())
                         },
                         Err(CanError::Timeout) if backend_capability.is_soft_realtime() => {
@@ -1813,13 +1852,10 @@ pub(crate) fn tx_loop_mailbox(
                     committed = true;
                 }
 
-                match tx.send_control(frame, NORMAL_FRAME_SEND_BUDGET) {
+                match send_control_and_record(&mut tx, &ctx, frame, NORMAL_FRAME_SEND_BUDGET) {
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-                        if let Ok(hooks) = ctx.hooks.try_read() {
-                            hooks.trigger_all_sent(&frame);
-                        }
 
                         if let Some(dispatch) = shutdown_lane.take_pending() {
                             let should_break = send_shutdown_dispatch(
@@ -1958,13 +1994,10 @@ pub(crate) fn tx_loop_mailbox(
                     break;
                 };
 
-                match tx.send_control(frame, remaining) {
+                match send_control_and_record(&mut tx, &ctx, frame, remaining) {
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
-                        if let Ok(hooks) = ctx.hooks.try_read() {
-                            hooks.trigger_all_sent(&frame);
-                        }
                     },
                     Err(CanError::Timeout) => {
                         metrics.tx_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -2123,7 +2156,7 @@ pub(crate) fn tx_loop_mailbox(
                     committed = true;
                 }
 
-                match tx.send_control(frame, normal_send_budget) {
+                match send_control_and_record(&mut tx, &ctx, frame, normal_send_budget) {
                     Ok(_) => {
                         sent_count += 1;
                         metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
@@ -2141,10 +2174,6 @@ pub(crate) fn tx_loop_mailbox(
                                 });
                             }
                             committed = true;
-                        }
-
-                        if let Ok(hooks) = ctx.hooks.try_read() {
-                            hooks.trigger_all_sent(&frame);
                         }
                     },
                     Err(CanError::Timeout) => {
@@ -2434,9 +2463,10 @@ fn drain_soft_realtime_queue(
 
 fn reliable_command_contains_normal_control(command: &crate::command::ReliableCommand) -> bool {
     command.kind() == crate::command::ReliableCommandKind::Standard
-        && command
-            .iter()
-            .any(|frame| (CONTROL_BASE_ID..=CONTROL_END_ID).contains(&frame.id))
+        && command.iter().any(|frame| {
+            let raw_id = frame.id().as_standard().map(|id| id.raw()).unwrap_or(0);
+            (CONTROL_BASE_ID.raw()..=CONTROL_END_ID.raw()).contains(&raw_id)
+        })
 }
 
 fn abort_pending_normal_control_for_state_transition(
@@ -2483,13 +2513,10 @@ fn send_shutdown_dispatch(
     error_prefix: &str,
 ) -> bool {
     let frame = dispatch.frame;
-    let send_result = match tx.send_shutdown_until(frame, dispatch.deadline) {
+    let send_result = match send_shutdown_and_record(tx, ctx, frame, dispatch.deadline) {
         Ok(_) => {
             metrics.tx_frames_sent_total.fetch_add(1, Ordering::Relaxed);
             metrics.tx_shutdown_sent_total.fetch_add(1, Ordering::Relaxed);
-            if let Ok(hooks) = ctx.hooks.try_read() {
-                hooks.trigger_all_sent(&frame);
-            }
             Ok(())
         },
         Err(e) => {
@@ -2565,8 +2592,8 @@ fn parse_and_update_state(
     let mut outcome = ParsedFeedbackOutcome::default();
     let frame_group_timeout = Duration::from_millis(config.frame_group_timeout_ms);
 
-    match frame.id {
-        ID_JOINT_FEEDBACK_12 => {
+    match frame.id().as_standard() {
+        Some(ID_JOINT_FEEDBACK_12) => {
             if let Ok(feedback) = JointFeedback12::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
@@ -2590,10 +2617,13 @@ fn parse_and_update_state(
                     frame_valid_mask: state.joint_pos_group.mask,
                 });
             } else {
-                warn!("Failed to parse JointFeedback12: CAN ID 0x{:X}", frame.id);
+                warn!(
+                    "Failed to parse JointFeedback12: CAN ID 0x{:X}",
+                    frame.raw_id()
+                );
             }
         },
-        ID_JOINT_FEEDBACK_34 => {
+        Some(ID_JOINT_FEEDBACK_34) => {
             if let Ok(feedback) = JointFeedback34::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
@@ -2617,10 +2647,13 @@ fn parse_and_update_state(
                     frame_valid_mask: state.joint_pos_group.mask,
                 });
             } else {
-                warn!("Failed to parse JointFeedback34: CAN ID 0x{:X}", frame.id);
+                warn!(
+                    "Failed to parse JointFeedback34: CAN ID 0x{:X}",
+                    frame.raw_id()
+                );
             }
         },
-        ID_JOINT_FEEDBACK_56 => {
+        Some(ID_JOINT_FEEDBACK_56) => {
             if let Ok(feedback) = JointFeedback56::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
@@ -2661,10 +2694,13 @@ fn parse_and_update_state(
                     ctx.publish_raw_joint_position(new_joint_pos_state);
                 }
             } else {
-                warn!("Failed to parse JointFeedback56: CAN ID 0x{:X}", frame.id);
+                warn!(
+                    "Failed to parse JointFeedback56: CAN ID 0x{:X}",
+                    frame.raw_id()
+                );
             }
         },
-        ID_END_POSE_1 => {
+        Some(ID_END_POSE_1) => {
             if let Ok(feedback) = EndPoseFeedback1::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_end_pose_raw_frame();
@@ -2689,7 +2725,7 @@ fn parse_and_update_state(
                             second: state.pending_end_pose[1],
                         },
                         host_rx_mono_us,
-                        (frame.timestamp_us != 0).then_some(frame.timestamp_us),
+                        (frame.timestamp_us() != 0).then_some(frame.timestamp_us()),
                     );
                 }
 
@@ -2701,7 +2737,7 @@ fn parse_and_update_state(
                 });
             }
         },
-        ID_END_POSE_2 => {
+        Some(ID_END_POSE_2) => {
             if let Ok(feedback) = EndPoseFeedback2::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_end_pose_raw_frame();
@@ -2726,7 +2762,7 @@ fn parse_and_update_state(
                             second: state.pending_end_pose[3],
                         },
                         host_rx_mono_us,
-                        (frame.timestamp_us != 0).then_some(frame.timestamp_us),
+                        (frame.timestamp_us() != 0).then_some(frame.timestamp_us()),
                     );
                 }
 
@@ -2738,7 +2774,7 @@ fn parse_and_update_state(
                 });
             }
         },
-        ID_END_POSE_3 => {
+        Some(ID_END_POSE_3) => {
             if let Ok(feedback) = EndPoseFeedback3::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_end_pose_raw_frame();
@@ -2763,7 +2799,7 @@ fn parse_and_update_state(
                             second: state.pending_end_pose[5],
                         },
                         host_rx_mono_us,
-                        (frame.timestamp_us != 0).then_some(frame.timestamp_us),
+                        (frame.timestamp_us() != 0).then_some(frame.timestamp_us()),
                     );
                 }
 
@@ -2786,10 +2822,12 @@ fn parse_and_update_state(
                 }
             }
         },
-        id if (ID_JOINT_DRIVER_HIGH_SPEED_BASE..=ID_JOINT_DRIVER_HIGH_SPEED_BASE + 5)
-            .contains(&id) =>
+        Some(id)
+            if (ID_JOINT_DRIVER_HIGH_SPEED_BASE_RAW..=ID_JOINT_DRIVER_HIGH_SPEED_BASE_RAW + 5)
+                .contains(&(id.raw() as u32)) =>
         {
-            let joint_index = (id - ID_JOINT_DRIVER_HIGH_SPEED_BASE) as usize;
+            let id = id.raw() as u32;
+            let joint_index = (id - ID_JOINT_DRIVER_HIGH_SPEED_BASE_RAW) as usize;
 
             if let Ok(feedback) = JointDriverHighSpeedFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
@@ -2828,15 +2866,15 @@ fn parse_and_update_state(
                 let host_rx_mono_us = host_rx_mono_us();
                 state.pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                 state.pending_joint_dynamic.joint_current[joint_index] = feedback.current();
-                state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us;
+                state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us();
                 state.pending_joint_dynamic.group_host_rx_mono_us = host_rx_mono_us;
-                state.pending_joint_dynamic.group_timestamp_us = frame.timestamp_us;
+                state.pending_joint_dynamic.group_timestamp_us = frame.timestamp_us();
 
                 if state.vel_update_mask == 0 {
                     state.pending_velocity_started_at = Some(now);
                 }
                 state.vel_update_mask |= 1 << joint_index;
-                state.last_vel_packet_time_us = frame.timestamp_us;
+                state.last_vel_packet_time_us = frame.timestamp_us();
                 state.pending_joint_dynamic.valid_mask = state.vel_update_mask;
 
                 if state.vel_update_mask == 0b111111 {
@@ -2844,7 +2882,7 @@ fn parse_and_update_state(
                         ctx,
                         backend_capability,
                         state,
-                        frame.timestamp_us,
+                        frame.timestamp_us(),
                         None,
                         true,
                         metrics,
@@ -2854,7 +2892,7 @@ fn parse_and_update_state(
                 }
             }
         },
-        ID_ROBOT_STATUS => {
+        Some(ID_ROBOT_STATUS) => {
             if let Ok(feedback) = RobotStatusFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 outcome.maintenance_gate_may_have_changed = true;
@@ -2883,7 +2921,7 @@ fn parse_and_update_state(
                     config.low_speed_drive_state_freshness_ms.saturating_mul(1_000),
                 );
                 let new_robot_control_state = RobotControlState {
-                    hardware_timestamp_us: frame.timestamp_us,
+                    hardware_timestamp_us: frame.timestamp_us(),
                     host_rx_mono_us,
                     control_mode: feedback.control_mode as u8,
                     robot_status: feedback.robot_status as u8,
@@ -2907,7 +2945,7 @@ fn parse_and_update_state(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         },
-        ID_GRIPPER_FEEDBACK => {
+        Some(ID_GRIPPER_FEEDBACK) => {
             if let Ok(feedback) = GripperFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
@@ -2916,7 +2954,7 @@ fn parse_and_update_state(
                 let last_travel = current.last_travel;
 
                 let new_gripper_state = GripperState {
-                    hardware_timestamp_us: frame.timestamp_us,
+                    hardware_timestamp_us: frame.timestamp_us(),
                     host_rx_mono_us,
                     travel: feedback.travel(),
                     torque: feedback.torque(),
@@ -2936,8 +2974,9 @@ fn parse_and_update_state(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         },
-        id if (ID_JOINT_DRIVER_LOW_SPEED_BASE..=ID_JOINT_DRIVER_LOW_SPEED_BASE + 5)
-            .contains(&id) =>
+        Some(id)
+            if (ID_JOINT_DRIVER_LOW_SPEED_BASE_RAW..=ID_JOINT_DRIVER_LOW_SPEED_BASE_RAW + 5)
+                .contains(&(id.raw() as u32)) =>
         {
             if let Ok(feedback) = JointDriverLowSpeedFeedback::try_from(*frame) {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
@@ -2950,8 +2989,8 @@ fn parse_and_update_state(
                         store.record_slot(
                             joint_idx,
                             JointDriverLowSpeedJoint {
-                                hardware_timestamp_us: (frame.timestamp_us != 0)
-                                    .then_some(frame.timestamp_us),
+                                hardware_timestamp_us: (frame.timestamp_us() != 0)
+                                    .then_some(frame.timestamp_us()),
                                 host_rx_mono_us,
                                 motor_temp_c: feedback.motor_temp() as f32,
                                 driver_temp_c: feedback.driver_temp() as f32,
@@ -2967,7 +3006,7 @@ fn parse_and_update_state(
                                 stall_protection: feedback.status.stall_protection(),
                             },
                             host_rx_mono_us,
-                            (frame.timestamp_us != 0).then_some(frame.timestamp_us),
+                            (frame.timestamp_us() != 0).then_some(frame.timestamp_us()),
                         );
                     }
                     ctx.observation_metrics.record_low_speed_member_frame(joint_idx);
@@ -2978,9 +3017,9 @@ fn parse_and_update_state(
                         new.driver_temps[joint_idx] = feedback.driver_temp() as f32;
                         new.joint_voltage[joint_idx] = feedback.voltage() as f32;
                         new.joint_bus_current[joint_idx] = feedback.bus_current() as f32;
-                        new.hardware_timestamps[joint_idx] = frame.timestamp_us;
+                        new.hardware_timestamps[joint_idx] = frame.timestamp_us();
                         new.host_rx_mono_timestamps[joint_idx] = host_rx_mono_us;
-                        new.hardware_timestamp_us = frame.timestamp_us;
+                        new.hardware_timestamp_us = frame.timestamp_us();
                         new.host_rx_mono_us = host_rx_mono_us;
                         new.valid_mask |= 1 << joint_idx;
 
@@ -3057,7 +3096,7 @@ fn parse_and_update_state(
                 }
             }
         },
-        ID_COLLISION_PROTECTION_LEVEL_FEEDBACK => {
+        Some(ID_COLLISION_PROTECTION_LEVEL_FEEDBACK) => {
             match decode_collision_protection_feedback(*frame) {
                 DecodeResult::Data(typed) => {
                     outcome.counts_as_robot_feedback = true;
@@ -3120,13 +3159,13 @@ fn parse_and_update_state(
                 DecodeResult::Ignore => {},
             }
         },
-        ID_SETTING_RESPONSE => {
+        Some(ID_SETTING_RESPONSE) => {
             if let Ok(feedback) = SettingResponse::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 if let Ok(mut setting_response) = ctx.setting_response.write() {
-                    setting_response.hardware_timestamp_us = frame.timestamp_us;
+                    setting_response.hardware_timestamp_us = frame.timestamp_us();
                     setting_response.host_rx_mono_us = host_rx_mono_us;
                     setting_response.response_index = feedback.response_index;
                     setting_response.zero_point_success = feedback.zero_point_success;
@@ -3134,7 +3173,7 @@ fn parse_and_update_state(
                 }
             }
         },
-        ID_MOTOR_LIMIT_FEEDBACK => match decode_motor_limit_feedback(*frame) {
+        Some(ID_MOTOR_LIMIT_FEEDBACK) => match decode_motor_limit_feedback(*frame) {
             DecodeResult::Data(typed) => {
                 let feedback = typed.payload;
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
@@ -3201,7 +3240,7 @@ fn parse_and_update_state(
             },
             DecodeResult::Ignore => {},
         },
-        ID_MOTOR_MAX_ACCEL_FEEDBACK => match MotorMaxAccelFeedback::try_from(*frame) {
+        Some(ID_MOTOR_MAX_ACCEL_FEEDBACK) => match MotorMaxAccelFeedback::try_from(*frame) {
             Ok(feedback) => {
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 if joint_idx < 6 {
@@ -3209,7 +3248,7 @@ fn parse_and_update_state(
                     ctx.observation_metrics.record_joint_accel_config_raw_frame();
                     let host_rx_mono_us = host_rx_mono_us();
                     let hardware_timestamp_us =
-                        (frame.timestamp_us != 0).then_some(frame.timestamp_us);
+                        (frame.timestamp_us() != 0).then_some(frame.timestamp_us());
 
                     if let Ok(mut joint_accel) = ctx.joint_accel_config.write() {
                         joint_accel.max_acc_limits[joint_idx] = feedback.max_accel();
@@ -3250,7 +3289,7 @@ fn parse_and_update_state(
                             ctx.diagnostics.push(DiagnosticEvent::Query(
                                 QueryDiagnostic::UnexpectedFrameForActiveQuery {
                                     query: active_query.kind,
-                                    can_id: frame.id,
+                                    can_id: frame.raw_id(),
                                 },
                             ));
                         }
@@ -3276,7 +3315,7 @@ fn parse_and_update_state(
                 ctx.observation_metrics.record_joint_accel_config_diagnostic();
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(
                     ProtocolDiagnostic::InvalidLength {
-                        can_id: frame.id,
+                        can_id: frame.raw_id(),
                         expected,
                         actual,
                     },
@@ -3288,17 +3327,18 @@ fn parse_and_update_state(
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(
                     ProtocolDiagnostic::UnsupportedValue {
                         field: "motor_max_accel_feedback",
-                        raw: frame.id,
+                        raw: frame.raw_id(),
                     },
                 ));
             },
         },
-        ID_END_VELOCITY_ACCEL_FEEDBACK => match EndVelocityAccelFeedback::try_from(*frame) {
+        Some(ID_END_VELOCITY_ACCEL_FEEDBACK) => match EndVelocityAccelFeedback::try_from(*frame) {
             Ok(feedback) => {
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_end_limit_config_raw_frame();
                 let host_rx_mono_us = host_rx_mono_us();
-                let hardware_timestamp_us = (frame.timestamp_us != 0).then_some(frame.timestamp_us);
+                let hardware_timestamp_us =
+                    (frame.timestamp_us() != 0).then_some(frame.timestamp_us());
 
                 if let Ok(mut end_limit) = ctx.end_limit_config.write() {
                     end_limit.max_end_linear_velocity = feedback.max_linear_velocity();
@@ -3339,7 +3379,7 @@ fn parse_and_update_state(
                         ctx.diagnostics.push(DiagnosticEvent::Query(
                             QueryDiagnostic::UnexpectedFrameForActiveQuery {
                                 query: active_query.kind,
-                                can_id: frame.id,
+                                can_id: frame.raw_id(),
                             },
                         ));
                     }
@@ -3354,7 +3394,7 @@ fn parse_and_update_state(
                 ctx.observation_metrics.record_end_limit_config_diagnostic();
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(
                     ProtocolDiagnostic::InvalidLength {
-                        can_id: frame.id,
+                        can_id: frame.raw_id(),
                         expected,
                         actual,
                     },
@@ -3366,12 +3406,12 @@ fn parse_and_update_state(
                 ctx.diagnostics.push(DiagnosticEvent::Protocol(
                     ProtocolDiagnostic::UnsupportedValue {
                         field: "end_velocity_accel_feedback",
-                        raw: frame.id,
+                        raw: frame.raw_id(),
                     },
                 ));
             },
         },
-        ID_FIRMWARE_READ => {
+        Some(ID_FIRMWARE_READ) => {
             if let Ok(feedback) = FirmwareReadFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
@@ -3379,8 +3419,8 @@ fn parse_and_update_state(
                 if let Ok(mut firmware_state) = ctx.firmware_version.write() {
                     firmware_state
                         .firmware_data
-                        .extend_from_slice(&feedback.firmware_data()[..frame.len as usize]);
-                    firmware_state.hardware_timestamp_us = frame.timestamp_us;
+                        .extend_from_slice(&feedback.firmware_data()[..frame.dlc() as usize]);
+                    firmware_state.hardware_timestamp_us = frame.timestamp_us();
                     firmware_state.host_rx_mono_us = host_rx_mono_us;
                     firmware_state.parse_version();
                 }
@@ -3391,13 +3431,13 @@ fn parse_and_update_state(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         },
-        ID_CONTROL_MODE => {
+        Some(ID_CONTROL_MODE) => {
             if let Ok(feedback) = ControlModeCommandFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 let new_state = MasterSlaveControlModeState {
-                    hardware_timestamp_us: frame.timestamp_us,
+                    hardware_timestamp_us: frame.timestamp_us(),
                     host_rx_mono_us,
                     control_mode: feedback.control_mode as u8,
                     move_mode: feedback.move_mode as u8,
@@ -3415,7 +3455,7 @@ fn parse_and_update_state(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         },
-        ID_JOINT_CONTROL_12 => {
+        Some(ID_JOINT_CONTROL_12) => {
             if let Ok(feedback) = JointControl12Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
@@ -3432,7 +3472,7 @@ fn parse_and_update_state(
                 state.joint_control_group.write_slot(0, alignment_timestamp_us, host_rx_mono_us);
             }
         },
-        ID_JOINT_CONTROL_34 => {
+        Some(ID_JOINT_CONTROL_34) => {
             if let Ok(feedback) = JointControl34Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
@@ -3449,7 +3489,7 @@ fn parse_and_update_state(
                 state.joint_control_group.write_slot(1, alignment_timestamp_us, host_rx_mono_us);
             }
         },
-        ID_JOINT_CONTROL_56 => {
+        Some(ID_JOINT_CONTROL_56) => {
             if let Ok(feedback) = JointControl56Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
@@ -3484,13 +3524,13 @@ fn parse_and_update_state(
                 }
             }
         },
-        ID_GRIPPER_CONTROL => {
+        Some(ID_GRIPPER_CONTROL) => {
             if let Ok(feedback) = GripperControlFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 let host_rx_mono_us = host_rx_mono_us();
 
                 let new_state = MasterSlaveGripperControlState {
-                    hardware_timestamp_us: frame.timestamp_us,
+                    hardware_timestamp_us: frame.timestamp_us(),
                     host_rx_mono_us,
                     gripper_target_travel_mm: feedback.travel_mm,
                     gripper_target_torque_nm: feedback.torque_nm,
@@ -3507,7 +3547,10 @@ fn parse_and_update_state(
             }
         },
         _ => {
-            debug!("RX thread: Received unhandled frame ID=0x{:X}", frame.id);
+            debug!(
+                "RX thread: Received unhandled frame ID=0x{:X}",
+                frame.raw_id()
+            );
         },
     }
 
@@ -3518,6 +3561,7 @@ fn parse_and_update_state(
 mod tests {
     use super::*;
     use crate::piper::NormalSendGateState;
+    use piper_protocol::StandardCanId;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::thread;
@@ -3561,6 +3605,61 @@ mod tests {
                 })
                 .ok_or(CanError::Timeout)
         }
+    }
+
+    #[derive(Default)]
+    struct CapturingRealtimeTx {
+        sent_control: Vec<PiperFrame>,
+        sent_shutdown: Vec<PiperFrame>,
+    }
+
+    impl RealtimeTxAdapter for CapturingRealtimeTx {
+        fn send_control(&mut self, frame: PiperFrame, _budget: Duration) -> Result<(), CanError> {
+            self.sent_control.push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            _deadline: Instant,
+        ) -> Result<(), CanError> {
+            self.sent_shutdown.push(frame);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tx_send_records_userspace_copy_without_stamping_backend_frame() {
+        let ctx = Arc::new(PiperContext::new());
+        let (hook, rx) = crate::recording::AsyncRecordingHook::new();
+        ctx.hooks.write().unwrap().add_callback(Arc::new(hook));
+        std::thread::sleep(Duration::from_millis(1));
+
+        let mut tx = CapturingRealtimeTx::default();
+        let command_frame =
+            PiperFrame::new_standard(0x1A1, [1, 2, 3, 4]).unwrap().with_timestamp_us(88_000);
+
+        send_control_and_record(&mut tx, &ctx, command_frame, Duration::from_millis(1)).unwrap();
+
+        assert_eq!(tx.sent_control.len(), 1);
+        assert_eq!(
+            tx.sent_control[0].timestamp_us(),
+            0,
+            "backend-observed TX frame must not carry replay timestamps"
+        );
+
+        let recorded = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(
+            recorded.direction,
+            crate::recording::RecordedFrameDirection::Tx
+        );
+        assert_eq!(
+            recorded.timestamp_provenance,
+            crate::recording::TimestampProvenance::Userspace
+        );
+        assert!(recorded.frame.timestamp_us() > 0);
+        assert_eq!(recorded.frame.raw_id(), 0x1A1);
     }
 
     #[test]
@@ -3693,17 +3792,27 @@ mod tests {
         data
     }
 
-    fn joint_feedback_frame(id: u16, jx_deg: f64, jy_deg: f64, timestamp_us: u64) -> PiperFrame {
-        let mut frame =
-            PiperFrame::new_standard(id, &create_joint_feedback_frame_data(jx_deg, jy_deg));
-        frame.timestamp_us = timestamp_us;
-        frame
+    fn joint_feedback_frame(
+        id: StandardCanId,
+        jx_deg: f64,
+        jy_deg: f64,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        PiperFrame::new_standard(
+            u32::from(id.raw()),
+            create_joint_feedback_frame_data(jx_deg, jy_deg),
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
-    fn end_pose_frame(id: u16, first: f64, second: f64, timestamp_us: u64) -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(id, &create_end_pose_frame_data(first, second));
-        frame.timestamp_us = timestamp_us;
-        frame
+    fn end_pose_frame(id: StandardCanId, first: f64, second: f64, timestamp_us: u64) -> PiperFrame {
+        PiperFrame::new_standard(
+            u32::from(id.raw()),
+            create_end_pose_frame_data(first, second),
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn joint_driver_low_speed_frame(
@@ -3711,16 +3820,14 @@ mod tests {
         enabled: bool,
         timestamp_us: u64,
     ) -> PiperFrame {
-        let id = ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index.saturating_sub(1));
+        let id = ID_JOINT_DRIVER_LOW_SPEED_BASE_RAW + u32::from(joint_index.saturating_sub(1));
         let mut data = [0u8; 8];
         data[0..2].copy_from_slice(&240u16.to_be_bytes());
         data[2..4].copy_from_slice(&45i16.to_be_bytes());
         data[4] = 50;
         data[5] = if enabled { 0x40 } else { 0x00 };
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(id as u16, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn robot_status_frame_with_status(
@@ -3729,9 +3836,9 @@ mod tests {
         move_mode: MoveMode,
         timestamp_us: u64,
     ) -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(
-            ID_ROBOT_STATUS as u16,
-            &[
+        PiperFrame::new_standard(
+            u32::from(ID_ROBOT_STATUS.raw()),
+            [
                 control_mode as u8,
                 robot_status as u8,
                 move_mode as u8,
@@ -3741,9 +3848,9 @@ mod tests {
                 0,
                 0,
             ],
-        );
-        frame.timestamp_us = timestamp_us;
-        frame
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn parse_frame_for_test(
@@ -3879,21 +3986,24 @@ mod tests {
 
         // 创建完整的关节位置帧组（0x2A5, 0x2A6, 0x2A7）
         // J1=10°, J2=20°, J3=30°, J4=40°, J5=50°, J6=60°
-        let mut frame_2a5 = PiperFrame::new_standard(
-            ID_JOINT_FEEDBACK_12 as u16,
-            &create_joint_feedback_frame_data(10.0, 20.0),
-        );
-        frame_2a5.timestamp_us = 1000;
-        let mut frame_2a6 = PiperFrame::new_standard(
-            ID_JOINT_FEEDBACK_34 as u16,
-            &create_joint_feedback_frame_data(30.0, 40.0),
-        );
-        frame_2a6.timestamp_us = 1001;
-        let mut frame_2a7 = PiperFrame::new_standard(
-            ID_JOINT_FEEDBACK_56 as u16,
-            &create_joint_feedback_frame_data(50.0, 60.0),
-        );
-        frame_2a7.timestamp_us = 1002;
+        let frame_2a5 = PiperFrame::new_standard(
+            u32::from(ID_JOINT_FEEDBACK_12.raw()),
+            create_joint_feedback_frame_data(10.0, 20.0),
+        )
+        .unwrap()
+        .with_timestamp_us(1000);
+        let frame_2a6 = PiperFrame::new_standard(
+            u32::from(ID_JOINT_FEEDBACK_34.raw()),
+            create_joint_feedback_frame_data(30.0, 40.0),
+        )
+        .unwrap()
+        .with_timestamp_us(1001);
+        let frame_2a7 = PiperFrame::new_standard(
+            u32::from(ID_JOINT_FEEDBACK_56.raw()),
+            create_joint_feedback_frame_data(50.0, 60.0),
+        )
+        .unwrap()
+        .with_timestamp_us(1002);
 
         // 队列所有帧
         mock_can.queue_frame(frame_2a5);
@@ -3956,7 +4066,7 @@ mod tests {
         });
 
         // 发送命令帧
-        let cmd_frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03]);
+        let cmd_frame = PiperFrame::new_standard(0x123, [0x01, 0x02, 0x03]).unwrap();
         cmd_tx.send(cmd_frame).unwrap();
 
         // 等待处理
@@ -3991,21 +4101,21 @@ mod tests {
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 10.0, 20.0, 1_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12, 10.0, 20.0, 1_000),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 30.0, 40.0, 3_600),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34, 30.0, 40.0, 3_600),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 50.0, 60.0, 3_700),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56, 50.0, 60.0, 3_700),
         );
 
         let snapshot = ctx.capture_joint_position_monitor_snapshot();
@@ -4032,21 +4142,21 @@ mod tests {
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 1.0, 2.0, 1_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12, 1.0, 2.0, 1_000),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 3.0, 4.0, 1_100),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34, 3.0, 4.0, 1_100),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 11.0, 12.0, 1_200),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12, 11.0, 12.0, 1_200),
         );
 
         let snapshot = ctx.capture_joint_position_monitor_snapshot();
@@ -4073,21 +4183,21 @@ mod tests {
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 30.0, 40.0, 1_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34, 30.0, 40.0, 1_000),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 10.0, 20.0, 1_500),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12, 10.0, 20.0, 1_500),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 50.0, 60.0, 1_600),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56, 50.0, 60.0, 1_600),
         );
 
         let complete = ctx
@@ -4635,21 +4745,21 @@ mod tests {
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 10.0, 20.0, 1_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12, 10.0, 20.0, 1_000),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 30.0, 40.0, 3_050),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34, 30.0, 40.0, 3_050),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 50.0, 60.0, 3_100),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56, 50.0, 60.0, 3_100),
         );
 
         assert!(
@@ -4678,21 +4788,21 @@ mod tests {
             &mut state,
             &metrics,
             &config,
-            end_pose_frame(ID_END_POSE_2 as u16, 300.0, 40.0, 1_000),
+            end_pose_frame(ID_END_POSE_2, 300.0, 40.0, 1_000),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            end_pose_frame(ID_END_POSE_1 as u16, 100.0, 200.0, 1_100),
+            end_pose_frame(ID_END_POSE_1, 100.0, 200.0, 1_100),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            end_pose_frame(ID_END_POSE_3 as u16, 50.0, 60.0, 1_150),
+            end_pose_frame(ID_END_POSE_3, 50.0, 60.0, 1_150),
         );
 
         let complete = ctx
@@ -4716,21 +4826,21 @@ mod tests {
             &mut state,
             &metrics,
             &config,
-            end_pose_frame(ID_END_POSE_1 as u16, 100.0, 200.0, 1_000),
+            end_pose_frame(ID_END_POSE_1, 100.0, 200.0, 1_000),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            end_pose_frame(ID_END_POSE_2 as u16, 300.0, 40.0, 3_600),
+            end_pose_frame(ID_END_POSE_2, 300.0, 40.0, 3_600),
         );
         parse_frame_for_test(
             &ctx,
             &mut state,
             &metrics,
             &config,
-            end_pose_frame(ID_END_POSE_3 as u16, 50.0, 60.0, 3_700),
+            end_pose_frame(ID_END_POSE_3, 50.0, 60.0, 3_700),
         );
 
         let snapshot = ctx.capture_end_pose_monitor_snapshot();

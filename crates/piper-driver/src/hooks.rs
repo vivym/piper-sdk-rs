@@ -13,7 +13,6 @@
 //! ```rust
 //! use piper_driver::hooks::{HookManager, FrameCallback};
 //! use piper_driver::recording::AsyncRecordingHook;
-//! use piper_protocol::PiperFrame;
 //! use std::sync::Arc;
 //!
 //! // 创建钩子管理器
@@ -25,16 +24,20 @@
 //! hooks.add_callback(callback);
 //!
 //! // 触发所有回调（在 rx_loop 中）
-//! let frame = PiperFrame::new_standard(0x251, &[1, 2, 3, 4]);
-//! hooks.trigger_all(&frame);
+//! let frame = piper_can::ReceivedFrame::new(
+//!     piper_protocol::PiperFrame::new_standard(0x251, &[1, 2, 3, 4]).unwrap(),
+//!     piper_can::TimestampProvenance::None,
+//! );
+//! hooks.trigger_all(frame);
 //! ```
 
-use piper_protocol::PiperFrame;
+use crate::recording::{RecordedFrameDirection, RecordedFrameEvent, TimestampProvenance};
+use piper_can::{PiperFrame, ReceivedFrame};
 use std::sync::Arc;
 
 /// 帧回调 Trait
 ///
-/// 定义 CAN 帧回调接口，用于在接收到帧时执行自定义逻辑。
+/// 定义 CAN 帧回调接口，用于在接收或发送 CAN 帧时执行自定义逻辑。
 ///
 /// # 性能要求
 ///
@@ -46,22 +49,22 @@ use std::sync::Arc;
 ///
 /// ```rust
 /// use piper_driver::hooks::FrameCallback;
-/// use piper_protocol::PiperFrame;
+/// use piper_driver::recording::RecordedFrameEvent;
 /// use crossbeam_channel::{Sender, bounded};
 ///
 /// struct MyCallback {
-///     sender: Sender<PiperFrame>,
+///     sender: Sender<RecordedFrameEvent>,
 /// }
 ///
 /// impl FrameCallback for MyCallback {
-///     fn on_frame_received(&self, frame: &PiperFrame) {
+///     fn on_frame(&self, event: RecordedFrameEvent) {
 ///         // ✅ 使用 try_send，非阻塞
-///         let _ = self.sender.try_send(*frame);
+///         let _ = self.sender.try_send(event);
 ///     }
 /// }
 /// ```
 pub trait FrameCallback: Send + Sync {
-    /// 当接收到 CAN 帧时调用
+    /// 当接收到或发送 CAN 帧时调用
     ///
     /// # 性能要求
     ///
@@ -71,23 +74,8 @@ pub trait FrameCallback: Send + Sync {
     ///
     /// # 参数
     ///
-    /// - `frame`: 接收到的 CAN 帧
-    fn on_frame_received(&self, frame: &PiperFrame);
-
-    /// 当发送 CAN 帧成功后调用（可选）
-    ///
-    /// # 时机
-    ///
-    /// 仅在 `tx.send()` 成功后触发，确保记录的是实际到达总线的帧。
-    /// 避免记录"幽灵帧"（发送失败的帧）。
-    ///
-    /// # 默认实现
-    ///
-    /// 默认为空操作，仅需在需要录制 TX 帧时实现。
-    fn on_frame_sent(&self, frame: &PiperFrame) {
-        let _ = frame;
-        // 默认：不处理 TX 帧
-    }
+    /// - `event`: 帧、方向和时间戳来源
+    fn on_frame(&self, event: RecordedFrameEvent);
 }
 
 /// Runtime hook registration handle.
@@ -211,7 +199,7 @@ impl HookManager {
     ///
     /// # 参数
     ///
-    /// - `frame`: 接收到的 CAN 帧
+    /// - `received`: 接收到的 CAN 帧及其时间戳来源
     ///
     /// # 示例
     ///
@@ -226,12 +214,20 @@ impl HookManager {
     /// hooks.add_callback(Arc::new(hook));
     ///
     /// // 在 rx_loop 中触发
-    /// let frame = PiperFrame::new_standard(0x251, &[1, 2, 3, 4]);
-    /// hooks.trigger_all(&frame);
+    /// let frame = piper_can::ReceivedFrame::new(
+    ///     PiperFrame::new_standard(0x251, &[1, 2, 3, 4]).unwrap(),
+    ///     piper_can::TimestampProvenance::None,
+    /// );
+    /// hooks.trigger_all(frame);
     /// ```
-    pub fn trigger_all(&self, frame: &PiperFrame) {
+    pub fn trigger_all(&self, received: ReceivedFrame) {
+        let event = RecordedFrameEvent {
+            frame: received.frame,
+            direction: RecordedFrameDirection::Rx,
+            timestamp_provenance: received.timestamp_provenance,
+        };
         for entry in self.callbacks.iter() {
-            entry.callback.on_frame_received(frame);
+            entry.callback.on_frame(event);
             // ^^^^ 使用 try_send，<1μs，非阻塞
         }
     }
@@ -260,8 +256,13 @@ impl HookManager {
     /// hooks.trigger_all_sent(&frame);
     /// ```
     pub fn trigger_all_sent(&self, frame: &PiperFrame) {
+        let event = RecordedFrameEvent {
+            frame: *frame,
+            direction: RecordedFrameDirection::Tx,
+            timestamp_provenance: TimestampProvenance::Userspace,
+        };
         for entry in self.callbacks.iter() {
-            entry.callback.on_frame_sent(frame);
+            entry.callback.on_frame(event);
         }
     }
 
@@ -290,18 +291,13 @@ mod tests {
 
     #[derive(Debug)]
     struct TestCallback {
-        tx: Sender<PiperFrame>,
+        tx: Sender<RecordedFrameEvent>,
         count: Arc<AtomicU64>,
     }
 
     impl FrameCallback for TestCallback {
-        fn on_frame_received(&self, frame: &PiperFrame) {
-            let _ = self.tx.try_send(*frame);
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
-
-        fn on_frame_sent(&self, frame: &PiperFrame) {
-            let _ = self.tx.try_send(*frame);
+        fn on_frame(&self, event: RecordedFrameEvent) {
+            let _ = self.tx.try_send(event);
             self.count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -323,7 +319,7 @@ mod tests {
     fn test_hook_manager_trigger_all() {
         let mut hooks = HookManager::new();
 
-        let (tx, rx) = bounded::<PiperFrame>(10);
+        let (tx, rx) = bounded::<RecordedFrameEvent>(10);
         let count = Arc::new(AtomicU64::new(0));
         let callback = Arc::new(TestCallback {
             tx,
@@ -333,27 +329,25 @@ mod tests {
         hooks.add_callback(callback);
 
         // 创建测试帧
-        let frame = PiperFrame {
-            id: 0x2A5,
-            data: [0, 1, 2, 3, 4, 5, 6, 7],
-            len: 8,
-            is_extended: false,
-            timestamp_us: 12345,
-        };
+        let frame = PiperFrame::new_standard(0x2A5, [0, 1, 2, 3, 4, 5, 6, 7])
+            .unwrap()
+            .with_timestamp_us(12345);
 
         // 触发回调
-        hooks.trigger_all(&frame);
+        hooks.trigger_all(ReceivedFrame::new(frame, TimestampProvenance::Kernel));
 
         // 验证
         assert_eq!(count.load(Ordering::Relaxed), 1);
-        assert!(rx.try_recv().is_ok());
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.direction, RecordedFrameDirection::Rx);
+        assert_eq!(event.timestamp_provenance, TimestampProvenance::Kernel);
     }
 
     #[test]
     fn test_hook_manager_trigger_sent() {
         let mut hooks = HookManager::new();
 
-        let (tx, rx) = bounded::<PiperFrame>(10);
+        let (tx, rx) = bounded::<RecordedFrameEvent>(10);
         let count = Arc::new(AtomicU64::new(0));
         let callback = Arc::new(TestCallback {
             tx,
@@ -363,20 +357,18 @@ mod tests {
         hooks.add_callback(callback);
 
         // 创建测试帧
-        let frame = PiperFrame {
-            id: 0x1A1,
-            data: [0, 1, 2, 3, 4, 5, 6, 7],
-            len: 8,
-            is_extended: false,
-            timestamp_us: 12345,
-        };
+        let frame = PiperFrame::new_standard(0x1A1, [0, 1, 2, 3, 4, 5, 6, 7])
+            .unwrap()
+            .with_timestamp_us(12345);
 
         // 触发 TX 回调
         hooks.trigger_all_sent(&frame);
 
         // 验证
         assert_eq!(count.load(Ordering::Relaxed), 1);
-        assert!(rx.try_recv().is_ok());
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.direction, RecordedFrameDirection::Tx);
+        assert_eq!(event.timestamp_provenance, TimestampProvenance::Userspace);
     }
 
     #[test]
