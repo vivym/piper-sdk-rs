@@ -151,6 +151,14 @@ impl CanIdDistributionKey {
         }
     }
 
+    pub fn from_raw_id(can_id: u32) -> Self {
+        if can_id <= piper_protocol::frame::STANDARD_CAN_ID_MAX {
+            Self::Standard(can_id)
+        } else {
+            Self::Extended(can_id)
+        }
+    }
+
     pub fn raw_id(self) -> u32 {
         match self {
             Self::Standard(id) | Self::Extended(id) => id,
@@ -177,9 +185,9 @@ impl CanIdDistribution {
         }
     }
 
-    /// 添加 standard CAN ID 帧（兼容旧调用点）
+    /// 添加 raw CAN ID 帧（兼容旧调用点）
     pub fn add_frame(&mut self, can_id: u32) {
-        self.add_key(CanIdDistributionKey::Standard(can_id));
+        self.add_key(CanIdDistributionKey::from_raw_id(can_id));
     }
 
     /// 添加 typed PiperFrame.
@@ -195,7 +203,7 @@ impl CanIdDistribution {
 
     /// 获取某个 standard CAN ID 的频率（%）
     pub fn frequency(&self, can_id: u32) -> f64 {
-        self.frequency_for_key(CanIdDistributionKey::Standard(can_id))
+        self.frequency_for_key(CanIdDistributionKey::from_raw_id(can_id))
     }
 
     /// 获取某个格式感知 CAN ID key 的频率（%）
@@ -324,5 +332,24 @@ mod tests {
             dist.frequency_for_key(CanIdDistributionKey::Extended(0x123)),
             (2.0 / 3.0 * 100.0)
         );
+    }
+
+    #[test]
+    fn test_can_id_distribution_raw_add_frame_does_not_create_impossible_standard_ids() {
+        let mut dist = CanIdDistribution::new();
+
+        dist.add_frame(0x7FF);
+        dist.add_frame(0x800);
+
+        assert_eq!(
+            dist.counts.get(&CanIdDistributionKey::Standard(0x7FF)).copied(),
+            Some(1)
+        );
+        assert_eq!(
+            dist.counts.get(&CanIdDistributionKey::Extended(0x800)).copied(),
+            Some(1)
+        );
+        assert_eq!(dist.frequency(0x800), 50.0);
+        assert!(!dist.counts.contains_key(&CanIdDistributionKey::Standard(0x800)));
     }
 }

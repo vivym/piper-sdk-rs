@@ -1,8 +1,10 @@
 //! Strict recording v3 wire format.
 
-use super::{MAGIC, PiperRecording, RecordingMetadata, TimestampedFrame};
+use super::{MAGIC, PiperRecording, RecordedFrameDirection, RecordingMetadata, TimestampedFrame};
+use crate::timestamp::TimestampSource;
 use anyhow::{Context, Result, bail};
 use bincode::Options;
+use piper_protocol::frame::PiperFrame;
 use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -36,7 +38,7 @@ impl Default for RecordingLimits {
 pub(crate) struct BincodePiperRecordingV3<'a> {
     version: u8,
     metadata: BincodeRecordingMetadata<'a>,
-    frames: &'a [TimestampedFrame],
+    frames: Vec<BincodeRecordedFrameV3>,
 }
 
 impl<'a> From<&'a PiperRecording> for BincodePiperRecordingV3<'a> {
@@ -51,7 +53,7 @@ impl<'a> From<&'a PiperRecording> for BincodePiperRecordingV3<'a> {
                 operator: &recording.metadata.operator,
                 notes: &recording.metadata.notes,
             },
-            frames: &recording.frames,
+            frames: recording.frames.iter().map(BincodeRecordedFrameV3::from).collect(),
         }
     }
 }
@@ -64,6 +66,69 @@ struct BincodeRecordingMetadata<'a> {
     platform: &'a str,
     operator: &'a str,
     notes: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct BincodeRecordedFrameV3 {
+    frame: PiperFrame,
+    direction: u8,
+    timestamp_source: u8,
+}
+
+impl From<&TimestampedFrame> for BincodeRecordedFrameV3 {
+    fn from(frame: &TimestampedFrame) -> Self {
+        Self {
+            frame: frame.frame,
+            direction: encode_direction(frame.direction),
+            timestamp_source: encode_timestamp_source(frame.timestamp_source),
+        }
+    }
+}
+
+impl TryFrom<BincodeRecordedFrameV3> for TimestampedFrame {
+    type Error = anyhow::Error;
+
+    fn try_from(frame: BincodeRecordedFrameV3) -> Result<Self> {
+        Ok(Self {
+            frame: frame.frame,
+            direction: decode_direction(frame.direction)?,
+            timestamp_source: decode_timestamp_source(frame.timestamp_source)?,
+        })
+    }
+}
+
+fn encode_direction(direction: RecordedFrameDirection) -> u8 {
+    match direction {
+        RecordedFrameDirection::Rx => 0,
+        RecordedFrameDirection::Tx => 1,
+    }
+}
+
+fn decode_direction(direction: u8) -> Result<RecordedFrameDirection> {
+    match direction {
+        0 => Ok(RecordedFrameDirection::Rx),
+        1 => Ok(RecordedFrameDirection::Tx),
+        other => bail!("invalid recorded frame direction: {other}"),
+    }
+}
+
+fn encode_timestamp_source(source: Option<TimestampSource>) -> u8 {
+    match source {
+        None => 0,
+        Some(TimestampSource::Hardware) => 1,
+        Some(TimestampSource::Kernel) => 2,
+        Some(TimestampSource::Userspace) => 3,
+    }
+}
+
+fn decode_timestamp_source(source: u8) -> Result<Option<TimestampSource>> {
+    match source {
+        0 => Ok(None),
+        1 => Ok(Some(TimestampSource::Hardware)),
+        2 => Ok(Some(TimestampSource::Kernel)),
+        3 => Ok(Some(TimestampSource::Userspace)),
+        other => bail!("invalid recorded frame timestamp source: {other}"),
+    }
 }
 
 fn v3_options() -> impl Options {
@@ -460,8 +525,8 @@ impl<'de> Visitor<'de> for FrameVecVisitor {
         }
 
         let mut frames = Vec::with_capacity(len);
-        while let Some(frame) = seq.next_element::<TimestampedFrame>()? {
-            frames.push(frame);
+        while let Some(frame) = seq.next_element::<BincodeRecordedFrameV3>()? {
+            frames.push(TimestampedFrame::try_from(frame).map_err(serde::de::Error::custom)?);
         }
 
         Ok(frames)
@@ -492,9 +557,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording::RecordedFrameDirection;
-    use crate::timestamp::TimestampSource;
-    use piper_protocol::frame::PiperFrame;
     use std::fs::OpenOptions;
 
     fn metadata() -> RecordingMetadata {
@@ -535,9 +597,9 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, b'o', b'p', 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             b'n', b'o', b't', b'e', 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x01,
             0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x03,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xBC, 0x1A,
-            0x00, 0x01, 0x02, 0x09, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD0, 0x07, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xBC, 0x1A, 0x00, 0x01, 0x02,
+            0x09, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD0, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x02,
         ]
     }
 
@@ -609,6 +671,11 @@ mod tests {
     fn locked_body_bytes_are_little_endian_fixint_in_field_order() {
         let body = serialize_body(&recording_with_locked_frames()).unwrap();
         assert_eq!(body, expected_locked_body_bytes());
+        assert_eq!(body.len(), 116);
+        assert_eq!(body[90], 0); // Rx
+        assert_eq!(body[91], 0); // timestamp source None
+        assert_eq!(body[114], 1); // Tx
+        assert_eq!(body[115], 2); // Kernel
 
         let decoded = deserialize_body(&expected_locked_body_bytes()).unwrap();
         assert_eq!(decoded.frames, recording_with_locked_frames().frames);
@@ -684,19 +751,15 @@ mod tests {
         let body = expected_locked_body_bytes();
 
         let mut invalid_direction = body.clone();
-        invalid_direction[90..94].copy_from_slice(&9u32.to_le_bytes());
+        invalid_direction[90] = 9;
         assert!(deserialize_body(&invalid_direction).is_err());
 
-        let mut invalid_source_option = body.clone();
-        invalid_source_option[94] = 9;
-        assert!(deserialize_body(&invalid_source_option).is_err());
-
-        let mut invalid_source_variant = body.clone();
-        invalid_source_variant[122..126].copy_from_slice(&9u32.to_le_bytes());
-        assert!(deserialize_body(&invalid_source_variant).is_err());
+        let mut invalid_source = body.clone();
+        invalid_source[91] = 9;
+        assert!(deserialize_body(&invalid_source).is_err());
 
         let mut invalid_format = body;
-        invalid_format[99] = 9;
+        invalid_format[96] = 9;
         assert!(deserialize_body(&invalid_format).is_err());
     }
 
