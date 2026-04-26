@@ -208,6 +208,8 @@ The serialized `data` field should contain only the active payload bytes, not th
 
 The serde implementation should not accept the old field shape. Historical recording compatibility is intentionally out of scope.
 
+The same strict serde model applies to every serializer used by the workspace. JSON examples document the logical shape, but recording files use `bincode`; implementation must verify that bincode serialization and deserialization enforce the same invariants.
+
 ## Recording Format
 
 Both recording boundary types must migrate:
@@ -246,7 +248,9 @@ TimestampedFrame::raw_id(&self) -> u32
 TimestampedFrame::data(&self) -> &[u8]
 ```
 
-If dependency direction makes direct reuse of `PiperFrame` impractical, `TimestampedFrame` must still store explicit `format`, `id`, and `data` fields and validate them on construction and deserialization. It must not infer frame format from numeric ID.
+Both recording types must store `PiperFrame` directly. They must not keep a local duplicate frame representation with `format`, `id`, and `data` fields, because that would create a second frame validation model outside the canonical `PiperFrame` type.
+
+Historical recording compatibility is intentionally removed. Existing legacy recording conversion paths, including `LegacyPiperRecording`-style readers that deserialize old `can_id + Vec<u8>` frames, should be deleted. The recording file format version should be bumped, and tests should prove old-shape serialized data is rejected rather than silently converted.
 
 ## Bridge Protocol Format
 
@@ -360,6 +364,14 @@ just clippy-physics
 
 Hardware ignored tests are not required for this refactor unless hardware is explicitly available.
 
+Required targeted tests:
+
+- `piper-protocol` serde tests for valid/invalid `PiperFrame` JSON shapes.
+- `piper-tools` bincode roundtrip tests for recordings containing standard and extended frames.
+- `piper-tools` rejection tests for old recording frame shapes that lack explicit frame format.
+- `piper-can` bridge protocol tests for invalid frame format booleans, invalid IDs, invalid DLC, request timestamp zeroing, and event timestamp preservation.
+- Backend decode tests for RTR/error frame rejection where such frames can be constructed without hardware.
+
 ## Acceptance Criteria
 
 No public API can construct a `PiperFrame` with invalid standard ID, invalid extended ID, or DLC above 8.
@@ -373,6 +385,8 @@ No code in the repository directly reads or writes `PiperFrame` fields.
 Serde deserialization rejects malformed frames.
 
 Recording and bridge boundaries preserve explicit standard versus extended frame format.
+
+Recording code has no remaining legacy conversion path from ambiguous `can_id + Vec<u8>` frames.
 
 SocketCAN and GS-USB TX paths do not have unchecked indexing or slicing based on untrusted frame length.
 
