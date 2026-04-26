@@ -47,6 +47,8 @@ This work should not add CAN FD support.
 
 This work should not split timestamp metadata out of `PiperFrame`. Keeping `timestamp_us` inside the frame is less semantically pure than a separate `TimestampedFrame`, but it keeps the change focused on eliminating invalid frame states.
 
+Because timestamp stays inside `PiperFrame`, every recording and bridge-facing model that carries a `PiperFrame` must treat `frame.timestamp_us()` as the authoritative timestamp. It must not duplicate timestamp state beside the frame.
+
 This work should not refactor unrelated protocol parsing or motion-control behavior except where direct `PiperFrame` API usage must change.
 
 ## Chosen Approach
@@ -89,6 +91,8 @@ All fields are private. The only way to construct a frame is through constructor
 `PiperFrame::data_padded()` must always return the fixed 8-byte padded storage for backend encoders.
 
 `PiperFrame::dlc()` must always return a value in `0..=8`.
+
+Unused padded bytes must always be zeroed. This makes `data_padded()` deterministic and prevents stale bytes from leaking into backends, bridge payloads, recording files, or tests that compare padded storage.
 
 Frame format must be explicit. Code must not infer standard versus extended from the numeric ID.
 
@@ -194,19 +198,39 @@ The serde implementation should not accept the old field shape. Historical recor
 
 ## Recording Format
 
-`piper-tools::TimestampedFrame` should no longer store an ambiguous `can_id + Vec<u8>` model that infers extended frames from `can_id > 0x7FF`.
+Both recording boundary types must migrate:
+
+- `piper-tools::TimestampedFrame`
+- `piper_driver::recording::TimestampedFrame`
+
+Neither type should store an ambiguous `can_id + Vec<u8>` model that infers extended frames from `can_id > 0x7FF`.
 
 Preferred shape:
 
 ```rust
 pub struct TimestampedFrame {
-    pub timestamp_us: u64,
     pub frame: PiperFrame,
     pub source: TimestampSource,
 }
 ```
 
-This makes recording files use the same explicit serde format as live frames.
+This makes recording files use the same explicit serde format as live frames. The recorded timestamp is `frame.timestamp_us()`. There must not be a second top-level `timestamp_us` field when the type already stores a `PiperFrame`.
+
+For `piper_driver::recording::TimestampedFrame`, the preferred shape is:
+
+```rust
+pub struct TimestampedFrame {
+    pub frame: PiperFrame,
+}
+```
+
+If the driver recording hook needs convenience accessors, they should delegate to the inner frame:
+
+```rust
+TimestampedFrame::timestamp_us(&self) -> u64
+TimestampedFrame::raw_id(&self) -> u32
+TimestampedFrame::data(&self) -> &[u8]
+```
 
 If dependency direction makes direct reuse of `PiperFrame` impractical, `TimestampedFrame` must still store explicit `format`, `id`, and `data` fields and validate them on construction and deserialization. It must not infer frame format from numeric ID.
 
@@ -215,6 +239,8 @@ If dependency direction makes direct reuse of `PiperFrame` impractical, `Timesta
 The bridge protocol must encode explicit frame format.
 
 The binary bridge protocol already carries `id`, `is_extended`, `len`, and 8 data bytes. The decoder should construct a `PiperFrame` through the checked constructors instead of a struct literal.
+
+The bridge decoder must treat `is_extended` as a canonical boolean field. Accept only `0` and `1`; reject any other value as malformed protocol data.
 
 The encoder should read from frame methods:
 
