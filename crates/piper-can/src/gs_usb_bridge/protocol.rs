@@ -1,8 +1,10 @@
 //! Stream-oriented GS-USB bridge protocol.
 //!
-//! Bridge v2 uses length-prefixed binary frames over UnixStream/TCP. Requests
+//! The bridge uses length-prefixed binary frames over UnixStream/TCP. Requests
 //! and responses are correlated by full-width `u32` request ids. Events are
-//! asynchronous and do not carry request ids.
+//! asynchronous and do not carry request ids. Filter-bearing client requests use
+//! the v3 tags and schema: `Hello` is tag `0x09`, `SetFilters` is tag `0x0A`,
+//! and each filter carries an explicit CAN ID format plus typed bounds.
 
 use crate::{CanData, CanId, ExtendedCanId, FrameError, PiperFrame, StandardCanId};
 use rand::random;
@@ -138,7 +140,9 @@ enum CanIdFilterKind {
 impl CanIdFilter {
     pub fn standard(min: StandardCanId, max: StandardCanId) -> Result<Self, ProtocolError> {
         if min > max {
-            return Err(ProtocolError::InvalidData("invalid bridge filter range"));
+            return Err(ProtocolError::InvalidData(
+                "invalid local bridge filter range",
+            ));
         }
         Ok(Self {
             kind: CanIdFilterKind::Standard { min, max },
@@ -147,7 +151,9 @@ impl CanIdFilter {
 
     pub fn extended(min: ExtendedCanId, max: ExtendedCanId) -> Result<Self, ProtocolError> {
         if min > max {
-            return Err(ProtocolError::InvalidData("invalid bridge filter range"));
+            return Err(ProtocolError::InvalidData(
+                "invalid local bridge filter range",
+            ));
         }
         Ok(Self {
             kind: CanIdFilterKind::Extended { min, max },
@@ -434,23 +440,34 @@ impl<'a> Cursor<'a> {
             let min = self.u32()?;
             let max = self.u32()?;
             let filter = match format {
-                0 => CanIdFilter::standard(
+                0 => Self::wire_filter(CanIdFilter::standard(
                     StandardCanId::new(min)
                         .map_err(|err| map_frame_error("invalid bridge standard filter id", err))?,
                     StandardCanId::new(max)
                         .map_err(|err| map_frame_error("invalid bridge standard filter id", err))?,
-                )?,
-                1 => CanIdFilter::extended(
+                ))?,
+                1 => Self::wire_filter(CanIdFilter::extended(
                     ExtendedCanId::new(min)
                         .map_err(|err| map_frame_error("invalid bridge extended filter id", err))?,
                     ExtendedCanId::new(max)
                         .map_err(|err| map_frame_error("invalid bridge extended filter id", err))?,
-                )?,
+                ))?,
                 _ => return Err(ProtocolError::InvalidData("invalid bridge filter format")),
             };
             filters.push(filter);
         }
         Ok(filters)
+    }
+
+    fn wire_filter(
+        result: Result<CanIdFilter, ProtocolError>,
+    ) -> Result<CanIdFilter, ProtocolError> {
+        result.map_err(|error| match error {
+            ProtocolError::InvalidData("invalid local bridge filter range") => {
+                ProtocolError::InvalidData("invalid bridge wire filter range")
+            },
+            other => other,
+        })
     }
 
     fn string(&mut self) -> Result<String, ProtocolError> {
@@ -1129,7 +1146,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProtocolError::InvalidData("invalid bridge filter range")
+            ProtocolError::InvalidData("invalid bridge wire filter range")
         ));
     }
 
@@ -1143,7 +1160,7 @@ mod tests {
 
         assert_eq!(
             error,
-            ProtocolError::InvalidData("invalid bridge filter range")
+            ProtocolError::InvalidData("invalid local bridge filter range")
         );
     }
 
