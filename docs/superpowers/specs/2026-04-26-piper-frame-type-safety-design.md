@@ -86,6 +86,8 @@ All fields are private. The only way to construct a frame is through constructor
 
 `CanData` must only contain payloads with length `0..=8`.
 
+`PiperFrame` represents classic CAN data frames only. Remote/RTR frames, error frames, CAN FD frames, and backend-specific control/status frames must not be decoded into `PiperFrame`.
+
 `PiperFrame::data()` must always return exactly the valid payload slice.
 
 `PiperFrame::data_padded()` must always return the fixed 8-byte padded storage for backend encoders.
@@ -93,6 +95,8 @@ All fields are private. The only way to construct a frame is through constructor
 `PiperFrame::dlc()` must always return a value in `0..=8`.
 
 Unused padded bytes must always be zeroed. This makes `data_padded()` deterministic and prevents stale bytes from leaking into backends, bridge payloads, recording files, or tests that compare padded storage.
+
+`CanData::from_padded(bytes, len)` should normalize padded storage: validate `len <= 8`, copy only the active `0..len` bytes, and zero unused bytes. It should not reject a backend buffer only because bytes beyond DLC are nonzero.
 
 Frame format must be explicit. Code must not infer standard versus extended from the numeric ID.
 
@@ -114,8 +118,13 @@ ID construction:
 ```rust
 StandardCanId::new(raw: u16) -> Result<Self, FrameError>
 ExtendedCanId::new(raw: u32) -> Result<Self, FrameError>
+StandardCanId::raw(&self) -> u16
+ExtendedCanId::raw(&self) -> u32
 CanId::standard(raw: u16) -> Result<Self, FrameError>
 CanId::extended(raw: u32) -> Result<Self, FrameError>
+CanId::raw(&self) -> u32
+CanId::is_standard(&self) -> bool
+CanId::is_extended(&self) -> bool
 ```
 
 Payload construction:
@@ -272,6 +281,8 @@ Backend encoding should use:
 - `frame.data_padded()` where the backend protocol requires fixed storage
 
 RX conversion should validate backend-provided IDs and DLC values through `PiperFrame` constructors. Invalid frames received from a device or raw socket should become backend errors instead of invalid SDK values.
+
+RX conversion must also reject non-data frames before constructing `PiperFrame`. SocketCAN remote frames and error frames should return backend errors. GS-USB frames carrying RTR/error flags or backend control/status semantics should be handled as backend events/errors, not exposed as `PiperFrame`.
 
 ## Protocol Layer Impact
 
