@@ -28,6 +28,7 @@ run_check() {
   local matches
   local filtered
   local rg_status
+  local grep_status
 
   matches="$(mktemp)"
   filtered="$(mktemp)"
@@ -51,7 +52,16 @@ run_check() {
   fi
 
   if [[ -n "$exclude_pattern" ]]; then
-    grep -Ev "$exclude_pattern" "$matches" >"$filtered" || true
+    if grep -Ev "$exclude_pattern" "$matches" >"$filtered"; then
+      grep_status=0
+    else
+      grep_status=$?
+    fi
+
+    if ((grep_status > 1)); then
+      echo "ERROR: $name exclude filter failed" >&2
+      exit "$grep_status"
+    fi
   else
     cp "$matches" "$filtered"
   fi
