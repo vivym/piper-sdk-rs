@@ -338,3 +338,135 @@ impl PiperFrame {
         self
     }
 }
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::{FrameError, PiperFrame};
+
+    const FORMAT_STANDARD: &str = "standard";
+    const FORMAT_EXTENDED: &str = "extended";
+    const BINCODE_FORMAT_STANDARD: u8 = 0;
+    const BINCODE_FORMAT_EXTENDED: u8 = 1;
+
+    #[derive(serde::Serialize)]
+    struct HumanFrame<'a> {
+        id: u32,
+        format: &'a str,
+        data: &'a [u8],
+        timestamp_us: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HumanFrameOwned {
+        id: u32,
+        format: String,
+        data: Vec<u8>,
+        timestamp_us: u64,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct BincodePiperFrame {
+        id: u32,
+        format: u8,
+        data_len: u8,
+        data: [u8; 8],
+        timestamp_us: u64,
+    }
+
+    // Serde is intentionally exposed only at the PiperFrame boundary for this task.
+    // Constrained subtypes continue to be validated through their public constructors.
+    impl serde::Serialize for PiperFrame {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            if serializer.is_human_readable() {
+                let format = if self.is_standard() {
+                    FORMAT_STANDARD
+                } else {
+                    FORMAT_EXTENDED
+                };
+                HumanFrame {
+                    id: self.raw_id(),
+                    format,
+                    data: self.data(),
+                    timestamp_us: self.timestamp_us(),
+                }
+                .serialize(serializer)
+            } else {
+                let format = if self.is_standard() {
+                    BINCODE_FORMAT_STANDARD
+                } else {
+                    BINCODE_FORMAT_EXTENDED
+                };
+                BincodePiperFrame {
+                    id: self.raw_id(),
+                    format,
+                    data_len: self.dlc(),
+                    data: *self.data_padded(),
+                    timestamp_us: self.timestamp_us(),
+                }
+                .serialize(serializer)
+            }
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for PiperFrame {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            if deserializer.is_human_readable() {
+                let frame = HumanFrameOwned::deserialize(deserializer)?;
+                let HumanFrameOwned {
+                    id,
+                    format,
+                    data,
+                    timestamp_us,
+                } = frame;
+
+                let parsed = match format.as_str() {
+                    FORMAT_STANDARD => PiperFrame::new_standard(id, data),
+                    FORMAT_EXTENDED => PiperFrame::new_extended(id, data),
+                    format => {
+                        return Err(serde::de::Error::custom(format!(
+                            "invalid frame format {format:?}, expected \"standard\" or \"extended\""
+                        )));
+                    },
+                };
+
+                parsed
+                    .map(|frame| frame.with_timestamp_us(timestamp_us))
+                    .map_err(serde::de::Error::custom)
+            } else {
+                let frame = BincodePiperFrame::deserialize(deserializer)?;
+
+                if !matches!(
+                    frame.format,
+                    BINCODE_FORMAT_STANDARD | BINCODE_FORMAT_EXTENDED
+                ) {
+                    return Err(serde::de::Error::custom(
+                        FrameError::InvalidSerializedFrameFormat {
+                            format: frame.format,
+                        },
+                    ));
+                }
+
+                super::CanData::validate_canonical_padding(frame.data, frame.data_len)
+                    .map_err(serde::de::Error::custom)?;
+
+                let data = &frame.data[..frame.data_len as usize];
+                let parsed = match frame.format {
+                    BINCODE_FORMAT_STANDARD => PiperFrame::new_standard(frame.id, data),
+                    BINCODE_FORMAT_EXTENDED => PiperFrame::new_extended(frame.id, data),
+                    _ => unreachable!("frame format was validated above"),
+                };
+
+                parsed
+                    .map(|parsed| parsed.with_timestamp_us(frame.timestamp_us))
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    }
+}
