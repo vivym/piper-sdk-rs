@@ -864,6 +864,13 @@ impl GsUsbDevice {
             GS_USB_FRAME_SIZE
         };
 
+        if len % frame_size != 0 {
+            return Err(GsUsbError::InvalidFrame(format!(
+                "USB packet contains incomplete frame: {} bytes (expected multiple of {})",
+                len, frame_size
+            )));
+        }
+
         let complete_frames = len / frame_size;
         if frames.capacity() < complete_frames {
             frames.reserve(complete_frames - frames.capacity());
@@ -876,14 +883,6 @@ impl GsUsbDevice {
             frame.unpack_from_bytes(frame_bytes, self.hw_timestamp)?;
             frames.push(frame);
             offset += frame_size;
-        }
-
-        if offset < len {
-            use tracing::warn;
-            warn!(
-                "USB packet contains incomplete frame: {} bytes (expected multiple of {})",
-                len, frame_size
-            );
         }
 
         Ok(())
@@ -1111,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn test_receive_batch_into_ignores_trailing_incomplete_frame_bytes() {
+    fn test_receive_batch_into_rejects_trailing_incomplete_frame_bytes() {
         let (device, harness) = GsUsbDevice::new_test_device(false, false);
         let frame = GsUsbFrame {
             echo_id: GS_USB_RX_ECHO_ID,
@@ -1129,13 +1128,12 @@ mod tests {
 
         let mut buf = [0u8; GS_USB_READ_BUFFER_SIZE];
         let mut frames_out = Vec::new();
-        device
+        let err = device
             .receive_batch_into(Duration::from_millis(1), &mut buf, &mut frames_out)
-            .unwrap();
+            .expect_err("trailing transport bytes must reject the whole packet");
 
-        assert_eq!(frames_out.len(), 1);
-        assert_eq!(frames_out[0].can_id, 0x2A5);
-        assert_eq!(frames_out[0].data, [8, 7, 6, 5, 4, 3, 2, 1]);
+        assert!(matches!(err, GsUsbError::InvalidFrame(_)));
+        assert!(frames_out.is_empty());
     }
 
     // 注意：scan() 和实际 USB 操作的测试需要硬件，放在集成测试中

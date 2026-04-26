@@ -256,11 +256,11 @@ impl GsUsbCanAdapter {
         ))
     }
 
-    /// 批量接收：一次从 USB 读取一个包，解析并返回其中所有有效 CAN 帧
+    /// 批量接收：一次从 USB 读取一个包，解析并返回其中所有有效 CAN 帧及时间戳来源
     ///
     /// - 会应用与 `receive()` 相同的 Echo 过滤与 overflow 检测逻辑
     /// - 返回的 Vec 可能为空（例如读到的都是 Echo 且被过滤，或读到空包）
-    pub fn receive_batch_frames(&mut self) -> Result<Vec<PiperFrame>, CanError> {
+    pub fn receive_batch_frames(&mut self) -> Result<Vec<ReceivedFrame>, CanError> {
         if !self.started {
             return Err(CanError::NotStarted);
         }
@@ -269,7 +269,7 @@ impl GsUsbCanAdapter {
         if !self.rx_queue.is_empty() {
             let mut out = Vec::with_capacity(self.rx_queue.len());
             while let Some(received) = self.rx_queue.pop_front() {
-                out.push(received.frame);
+                out.push(received);
             }
             return Ok(out);
         }
@@ -315,7 +315,10 @@ impl GsUsbCanAdapter {
 
         let out = parse_gs_usb_batch(&self.rx_batch_frames);
         self.rx_batch_frames.clear();
-        out
+        let provenance = self.timestamp_provenance();
+        out.map(|frames| {
+            frames.into_iter().map(|frame| ReceivedFrame::new(frame, provenance)).collect()
+        })
     }
 
     /// 获取当前打开设备的基础信息（用于日志/诊断）
@@ -704,6 +707,12 @@ mod tests {
         packet
     }
 
+    fn packet_with_trailing_incomplete_bytes(frames: &[GsUsbFrame]) -> Vec<u8> {
+        let mut packet = pack_packet(frames, false);
+        packet.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        packet
+    }
+
     fn rx_frame(can_id: u32, flags: u8, data0: u8) -> GsUsbFrame {
         GsUsbFrame {
             echo_id: GS_USB_RX_ECHO_ID,
@@ -839,8 +848,13 @@ mod tests {
         let frames = adapter.receive_batch_frames().unwrap();
 
         assert_eq!(
-            frames.iter().map(|frame| frame.raw_id()).collect::<Vec<_>>(),
+            frames.iter().map(|received| received.frame.raw_id()).collect::<Vec<_>>(),
             vec![0x100, 0x101]
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|received| received.timestamp_provenance == TimestampProvenance::None)
         );
     }
 
@@ -879,6 +893,36 @@ mod tests {
             Err(CanError::BufferOverflow)
         ));
         assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn unsplit_batch_fatal_transport_discards_whole_batch() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(packet_with_trailing_incomplete_bytes(&[
+            rx_frame(0x100, 0, 0x10),
+            rx_frame(0x101, 0, 0x11),
+        ]));
+        let mut adapter = started_adapter(device);
+
+        assert!(adapter.receive_batch_frames().is_err());
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn unsplit_batch_preserves_queued_received_frame_provenance() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(pack_packet(
+            &[rx_frame(0x100, 0, 0x10), rx_frame(0x101, 0, 0x11)],
+            false,
+        ));
+        let mut adapter = started_adapter(device);
+
+        assert_eq!(adapter.receive().unwrap().frame.raw_id(), 0x100);
+        let queued = adapter.receive_batch_frames().unwrap();
+
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].frame.raw_id(), 0x101);
+        assert_eq!(queued[0].timestamp_provenance, TimestampProvenance::None);
     }
 
     #[test]
@@ -930,6 +974,19 @@ mod tests {
         let mut adapter = started_adapter(device);
 
         assert!(matches!(adapter.receive(), Err(CanError::BufferOverflow)));
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn unsplit_receive_fatal_transport_discards_whole_batch() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(packet_with_trailing_incomplete_bytes(&[
+            rx_frame(0x100, 0, 0x10),
+            rx_frame(0x101, 0, 0x11),
+        ]));
+        let mut adapter = started_adapter(device);
+
+        assert!(adapter.receive().is_err());
         assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
     }
 

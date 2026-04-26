@@ -394,6 +394,12 @@ mod tests {
         packet
     }
 
+    fn packet_with_trailing_incomplete_bytes(frames: &[GsUsbFrame]) -> Vec<u8> {
+        let mut packet = pack_packet(frames, false);
+        packet.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        packet
+    }
+
     fn rx_frame(can_id: u32, flags: u8, data0: u8) -> GsUsbFrame {
         GsUsbFrame {
             echo_id: GS_USB_RX_ECHO_ID,
@@ -491,6 +497,19 @@ mod tests {
         let mut adapter = GsUsbRxAdapter::new(Arc::new(device), Duration::from_millis(2), 0, false);
 
         assert!(matches!(adapter.receive(), Err(CanError::BufferOverflow)));
+        assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
+    }
+
+    #[test]
+    fn split_receive_fatal_transport_discards_whole_batch() {
+        let (device, harness) = GsUsbDevice::new_test_device(false, false);
+        harness.enqueue_read_packet(packet_with_trailing_incomplete_bytes(&[
+            rx_frame(0x100, 0, 0x10),
+            rx_frame(0x101, 0, 0x11),
+        ]));
+        let mut adapter = GsUsbRxAdapter::new(Arc::new(device), Duration::from_millis(2), 0, false);
+
+        assert!(adapter.receive().is_err());
         assert!(matches!(adapter.receive(), Err(CanError::Timeout)));
     }
 
