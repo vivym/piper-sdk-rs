@@ -164,9 +164,9 @@ PiperFrame::timestamp_us(&self) -> u64
 PiperFrame::with_timestamp_us(self, timestamp_us: u64) -> Self
 ```
 
-`CanId` should be `Copy`. `CanData` and `PiperFrame` should remain `Copy` if practical, preserving the current zero-allocation hot-path behavior.
+`CanId`, `CanData`, and `PiperFrame` must remain `Copy`, preserving the current zero-allocation hot-path behavior.
 
-The new frame types should preserve the existing ergonomics traits where practical: `Debug`, `Clone`, `Copy`, `PartialEq`, and `Eq`. Losing these traits would expand the breaking change beyond the frame-construction problem and would make tests and diagnostics worse.
+The new frame types must preserve the existing ergonomics traits: `Debug`, `Clone`, `Copy`, `PartialEq`, and `Eq`. Losing these traits would expand the breaking change beyond the frame-construction problem and would make tests and diagnostics worse. If implementation discovers a trait is genuinely impossible, that should be treated as a design issue and surfaced before continuing.
 
 Protocol-layer command builders that use compile-time CAN ID constants should remain infallible where the IDs and payload sizes are statically known to be valid. Implementations should avoid spreading `unwrap()` or `expect()` through every `to_frame()` method. Acceptable patterns include pre-validated ID constants, private infallible helpers for protocol-owned constants, or a clearly documented conversion layer that proves the constants are valid once. Public constructors for user-provided IDs and payloads must remain fallible.
 
@@ -213,6 +213,8 @@ The serialized `data` field should contain only the active payload bytes, not th
 The serde implementation should not accept the old field shape. Historical recording compatibility is intentionally out of scope.
 
 The same strict serde model applies to every serializer used by the workspace. JSON examples document the logical shape, but recording files use `bincode`; implementation must verify that bincode serialization and deserialization enforce the same invariants.
+
+The constrained subtypes also need safe serde behavior. `StandardCanId`, `ExtendedCanId`, `CanId`, and `CanData` must not derive unchecked `Deserialize` implementations that can bypass their constructors. Either they do not expose serde implementations directly, or their deserializers must enforce the same invariants as their constructors.
 
 ## Recording Format
 
@@ -352,6 +354,8 @@ Required checks:
 ```bash
 cargo fmt --all -- --check
 cargo check --all-targets
+cargo test -p piper-protocol --features serde
+cargo test -p piper-tools
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --document-private-items
@@ -371,6 +375,8 @@ Hardware ignored tests are not required for this refactor unless hardware is exp
 Required targeted tests:
 
 - `piper-protocol` serde tests for valid/invalid `PiperFrame` JSON shapes.
+- `piper-protocol` tests proving constrained subtypes cannot be deserialized into invalid values when serde is enabled.
+- `piper-protocol` tests for `CanData::from_padded`: reject `len > 8`, preserve active bytes, and zero nonzero bytes beyond DLC.
 - `piper-tools` bincode roundtrip tests for recordings containing standard and extended frames.
 - `piper-tools` rejection tests for old recording frame shapes that lack explicit frame format.
 - `piper-can` bridge protocol tests for invalid frame format booleans, invalid IDs, invalid DLC, request timestamp zeroing, and event timestamp preservation.
