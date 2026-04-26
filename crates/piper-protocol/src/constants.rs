@@ -15,7 +15,7 @@ pub const GRIPPER_FORCE_SCALE: f64 = 5.0;
 // 重新导出 CAN ID 常量（从 ids.rs）
 pub use crate::ids::{
     ID_CONTROL_MODE, ID_EMERGENCY_STOP, ID_GRIPPER_CONTROL, ID_JOINT_CONTROL_12,
-    ID_JOINT_CONTROL_34, ID_JOINT_CONTROL_56, ID_MIT_CONTROL_BASE, ID_MOTOR_ENABLE,
+    ID_JOINT_CONTROL_34, ID_JOINT_CONTROL_56, ID_MOTOR_ENABLE, JointIndex, mit_control_id,
 };
 
 #[cfg(test)]
@@ -39,15 +39,14 @@ mod tests {
     }
 
     #[test]
-    fn test_can_id_constants() {
-        // 验证 CAN ID 常量的正确性
-        assert_eq!(ID_MOTOR_ENABLE, 0x471);
-        assert_eq!(ID_MIT_CONTROL_BASE, 0x15A);
-        assert_eq!(ID_JOINT_CONTROL_12, 0x155);
-        assert_eq!(ID_JOINT_CONTROL_34, 0x156);
-        assert_eq!(ID_JOINT_CONTROL_56, 0x157);
-        assert_eq!(ID_CONTROL_MODE, 0x151);
-        assert_eq!(ID_EMERGENCY_STOP, 0x150);
-        assert_eq!(ID_GRIPPER_CONTROL, 0x159);
+    fn reexported_protocol_ids_are_typed() {
+        assert_eq!(ID_MOTOR_ENABLE.raw(), 0x471);
+        assert_eq!(mit_control_id(JointIndex::new(1).unwrap()).raw(), 0x15A);
+        assert_eq!(ID_JOINT_CONTROL_12.raw(), 0x155);
+        assert_eq!(ID_JOINT_CONTROL_34.raw(), 0x156);
+        assert_eq!(ID_JOINT_CONTROL_56.raw(), 0x157);
+        assert_eq!(ID_CONTROL_MODE.raw(), 0x151);
+        assert_eq!(ID_EMERGENCY_STOP.raw(), 0x150);
+        assert_eq!(ID_GRIPPER_CONTROL.raw(), 0x159);
     }
 }

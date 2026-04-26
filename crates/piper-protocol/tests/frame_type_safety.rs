@@ -1,6 +1,7 @@
 use piper_protocol::frame::{
     CanData, CanId, ExtendedCanId, FrameError, JointIndex, PiperFrame, StandardCanId,
 };
+use piper_protocol::ids::{self, FrameType};
 use std::collections::{BTreeSet, HashSet};
 
 #[test]
@@ -116,4 +117,21 @@ fn joint_index_is_one_based_and_bounded() {
     assert_eq!(JointIndex::new(1).unwrap().zero_based(), 0);
     assert_eq!(JointIndex::new(6).unwrap().zero_based(), 5);
     assert!(JointIndex::new(7).is_err());
+}
+
+#[test]
+fn protocol_classification_is_format_aware() {
+    let standard = CanId::standard(0x251).unwrap();
+    let extended = CanId::extended(0x251).unwrap();
+
+    assert_eq!(FrameType::from_id(standard), FrameType::Feedback);
+    assert_eq!(FrameType::from_id(extended), FrameType::Unknown);
+    assert!(ids::is_robot_feedback_id(standard));
+    assert!(!ids::is_robot_feedback_id(extended));
+}
+
+#[test]
+fn dynamic_protocol_ids_require_valid_joint_index() {
+    let joint = JointIndex::new(6).unwrap();
+    assert_eq!(ids::mit_control_id(joint).raw(), 0x15F);
 }

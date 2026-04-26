@@ -4,7 +4,7 @@
 
 use crate::can::PiperFrame;
 use crate::diagnostics::{DecodeResult, ProtocolDiagnostic, TypedFrame};
-use crate::{ProtocolError, bytes_to_i16_be, i16_to_bytes_be, ids::*};
+use crate::{ProtocolError, bytes_to_i16_be, i16_to_bytes_be, ids::raw::*};
 
 // ============================================================================
 // 随动主从模式设置指令

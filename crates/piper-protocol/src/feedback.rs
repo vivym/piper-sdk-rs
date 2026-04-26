@@ -7,7 +7,7 @@ use crate::can::PiperFrame;
 use crate::control::{ControlModeCommand, InstallPosition, MitMode};
 use crate::{
     ProtocolError, bytes_to_i16_be, bytes_to_i32_be,
-    ids::{
+    ids::raw::{
         ID_CONTROL_MODE, ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_FIRMWARE_READ,
         ID_GRIPPER_CONTROL, ID_GRIPPER_FEEDBACK, ID_JOINT_CONTROL_12, ID_JOINT_CONTROL_34,
         ID_JOINT_CONTROL_56, ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE,
