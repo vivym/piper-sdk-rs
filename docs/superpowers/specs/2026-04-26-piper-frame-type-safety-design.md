@@ -380,6 +380,8 @@ struct BincodeRecordedFrameV3 {
 }
 ```
 
+`BincodeRecordingMetadataV3::start_time` is wall-clock metadata encoded as Unix seconds. It is not the scheduling timebase; frame timestamps provide recording-local elapsed microseconds.
+
 `direction` wire values are fixed:
 
 - `0` means RX.
@@ -394,11 +396,23 @@ struct BincodeRecordedFrameV3 {
 - `3` means userspace.
 - every other value is invalid.
 
+`Option<TimestampSource>` maps through this wire field as `None -> 0`, `Some(Hardware) -> 1`, `Some(Kernel) -> 2`, and `Some(Userspace) -> 3`. Deserialization must preserve `None` as source-less metadata rather than coercing it to a concrete source.
+
 The implementation may use public enums such as `RecordedFrameDirection` and `TimestampSource`, but it must convert through the fixed helper schema above before bincode serialization. Tests must lock representative bytes for the full v3 body, not only for individual `PiperFrame` values.
 
-Version `3` recordings must use the current workspace `bincode = "1.3"` fixed-int little-endian wire encoding for this helper schema, with fields encoded in the declaration order shown above. `bincode::serialize` is acceptable for writing because it uses that encoding. Recording reads must not use top-level `bincode::deserialize` directly, because bincode 1.3's top-level helper allows trailing bytes. Use explicit bincode 1.3 options equivalent to `DefaultOptions::new().with_fixint_encoding().with_limit(MAX_RECORDING_BODY_BYTES).reject_trailing_bytes()` for recording bodies so appended bytes and oversized bodies are rejected. Do not switch to bincode 2.x, varint encoding, or a hand-written binary layout without bumping the recording version again. Tests should lock representative v3 byte payloads so the wire contract is explicit.
+Version `3` recordings must use the current workspace `bincode = "1.3"` fixed-int little-endian wire encoding for this helper schema, with fields encoded in the declaration order shown above. Do not use top-level `bincode::serialize` or `bincode::deserialize` for v3 recording bodies. Top-level `serialize` does not enforce the v3 body limit, and top-level `deserialize` allows trailing bytes. Use one shared bincode 1.3 options helper equivalent to `DefaultOptions::new().with_fixint_encoding().with_limit(MAX_RECORDING_BODY_BYTES).reject_trailing_bytes()` for both writing and reading recording bodies so appended bytes and oversized bodies are rejected. Do not switch to bincode 2.x, varint encoding, or a hand-written binary layout without bumping the recording version again. Tests should lock representative v3 byte payloads so the wire contract is explicit.
 
-The v3 body reader must not allow unbounded allocation through `String` or `Vec` length prefixes. Define explicit limits such as `MAX_RECORDING_BODY_BYTES`, `MAX_RECORDING_FRAMES`, and `MAX_METADATA_STRING_BYTES`; apply the bincode byte limit during decode and validate `frames.len()` plus every metadata string byte length after decode. If future recordings need to exceed the default limits, expose that as an explicit reader option rather than using unlimited bincode deserialization. Tests must include oversized body limits, oversized frame-count prefixes, and oversized metadata string lengths.
+The v3 file container is:
+
+```text
+magic: [u8; 8] = PIPERV1\0
+version: u8 = 3
+body: bincode(BincodePiperRecordingV3)
+```
+
+Do not keep the historical segmented body shape with metadata JSON length, metadata JSON, frame count, and separately serialized frames. After the magic and version byte, the rest of the file is exactly one bounded bincode v3 body. The reader must enforce `MAX_RECORDING_BODY_BYTES` before or while reading the body, for example by checking file metadata when available and by reading through a bounded reader that detects one byte over the limit. It must not call `read_to_end` into an unbounded `Vec` and only then apply the bincode limit.
+
+The v3 body reader must not allow unbounded allocation through `String` or `Vec` length prefixes. Define explicit limits such as `MAX_RECORDING_BODY_BYTES`, `MAX_RECORDING_FRAMES`, and `MAX_METADATA_STRING_BYTES`; apply the bincode byte limit during decode and validate `frames.len()` plus every metadata string byte length after decode. The writer must validate the same frame-count, metadata string, and serialized body-size limits before producing a v3 file, so the SDK cannot write recordings that its reader rejects. If future recordings need to exceed the default limits, expose that as an explicit reader/writer option rather than using unlimited bincode serialization or deserialization. Tests must include oversized body limits, oversized frame-count prefixes, and oversized metadata string lengths.
 
 `format` values are fixed:
 
@@ -467,19 +481,23 @@ piper-protocol = { workspace = true, features = ["serde"] }
 
 Recording serialization should not rely on a local duplicate frame representation just to avoid enabling serde on `piper-protocol`, because `piper-tools` always serializes recordings.
 
+`TimestampProvenance` must be defined in `piper-can`, then re-exported by `piper-driver` recording APIs. Do not define a second driver-local provenance enum with the same variants, because that would force lossy conversion at the receive/hook boundary.
+
+```rust
+pub enum TimestampProvenance {
+    Hardware,
+    Kernel,
+    Userspace,
+    None,
+}
+```
+
 For `piper_driver::recording::TimestampedFrame`, the preferred shape is:
 
 ```rust
 pub enum RecordedFrameDirection {
     Rx,
     Tx,
-}
-
-pub enum TimestampProvenance {
-    Hardware,
-    Kernel,
-    Userspace,
-    None,
 }
 
 pub struct TimestampedFrame {
@@ -489,7 +507,7 @@ pub struct TimestampedFrame {
 }
 ```
 
-Driver/CAN receive APIs and hook APIs must carry provenance explicitly. `TimestampProvenance` and `ReceivedFrame` should be owned by `piper-can` so every backend reports the same metadata shape; driver recording can reuse that provenance without depending on `piper-tools`. Required shapes:
+Driver/CAN receive APIs and hook APIs must carry provenance explicitly. `TimestampProvenance` and `ReceivedFrame` are owned by `piper-can` so every backend reports the same metadata shape; driver recording re-exports or imports that provenance type without depending on `piper-tools`. Required shapes:
 
 ```rust
 pub struct ReceivedFrame {
@@ -531,7 +549,7 @@ TimestampedFrame::data(&self) -> &[u8]
 
 Both recording types must store `PiperFrame` directly. They must not keep a local duplicate frame representation with `format`, `id`, and `data` fields, because that would create a second frame validation model outside the canonical `PiperFrame` type. Direction and timestamp-provenance metadata may sit beside the frame because they are not frame validity state.
 
-`piper-driver` should not depend on `piper-tools` just to reuse `TimestampSource`. Use driver-local metadata and have `piper-client` map it into the tools recording metadata when saving.
+`piper-driver` must not depend on `piper-tools` just to reuse `TimestampSource`. Use `piper-can::TimestampProvenance` plus driver-owned recording event types, and have `piper-client` map that provenance into the tools `TimestampSource` metadata when saving.
 
 `piper-client` is part of the recording boundary migration, not just a downstream compile fix. The `stop_recording` paths that currently convert driver frames into tools frames must pass through the canonical `PiperFrame` shape without splitting it into `can_id`, padded data, and a separate timestamp. Replay paths that currently construct a TX frame from `can_id + Vec<u8>` and infer extended format from `can_id > 0x7FF` must instead deserialize recorded `Tx` frames and send the recorded `PiperFrame` with explicit frame format.
 
@@ -659,12 +677,12 @@ SocketCAN error-frame mapping must be explicit and shared by split and unsplit p
 | Raw error condition | Parser result |
 | --- | --- |
 | `CAN_ERR_FLAG` with malformed MTU or DLC not equal to Linux `CAN_ERR_DLC` | `Fatal(CanError::Frame(...))` or `Fatal(CanError::Device(InvalidFrame))` with raw context |
-| `CAN_ERR_BUSOFF` error class, or controller payload with `CAN_ERR_CRTL_TX_BUS_OFF` / `CAN_ERR_CRTL_RX_BUS_OFF` | `Fatal(CanError::BusOff)` |
+| `CAN_ERR_BUSOFF` error class | `Fatal(CanError::BusOff)` |
 | controller payload with `CAN_ERR_CRTL_RX_OVERFLOW` / `CAN_ERR_CRTL_TX_OVERFLOW` | `Fatal(CanError::BufferOverflow)` |
-| warning/passive/restarted/ACK/protocol/bus-error classes without bus-off or overflow | `RecoverableNonData` with log/counter |
+| controller payload with `CAN_ERR_CRTL_ACTIVE`, warning, or passive bits; restarted, ACK, protocol, or bus-error classes without bus-off or overflow | `RecoverableNonData` with log/counter |
 | unknown but well-formed error-frame class | `RecoverableNonData` with raw error class logged |
 
-This table replaces split/unsplit divergence and avoids string-matching parsed SocketCAN error descriptions.
+This table replaces split/unsplit divergence and avoids string-matching parsed SocketCAN error descriptions. Do not invent SocketCAN controller-payload bus-off bits: in Linux `can/error.h`, `CAN_ERR_CRTL_ACTIVE` is `0x40` in `data[1]` and means recovery to error-active, not bus-off. If a non-SocketCAN backend exposes vendor-specific bus-off status bits, classify them in that backend's status mapping, not in the Linux SocketCAN table.
 
 All RX conversion surfaces must reject non-data and malformed frames before constructing `PiperFrame`, including split and unsplit SocketCAN paths, split and unsplit GS-USB paths, GS-USB batch receive paths, and bridge protocol decode paths. SocketCAN MTU and `libc::can_frame` parsing requirements apply only to SocketCAN.
 
@@ -693,7 +711,7 @@ The shared `classify_gs_usb_frame` contract must be defined in terms of `echo_id
 - `echo_id != GS_USB_RX_ECHO_ID` is `RecoverableNonData` unless the frame also carries a fatal device-status flag.
 - `flags & GS_CAN_FLAG_OVERFLOW != 0` is `FatalDeviceStatus`, even if the rest of the frame looks like valid data.
 - Unsupported nonzero `reserved` bits or unsupported frame flags are not silently ignored; classify them as `FatalMalformedData` for data-looking frames or `RecoverableNonData` for explicit non-data/control/status frames.
-- `CAN_ERR_FLAG` uses the same bus-off/overflow/recoverable mapping as SocketCAN error frames where the payload exposes Linux-compatible error bytes.
+- `CAN_ERR_FLAG` uses the same bus-off/overflow/recoverable mapping as SocketCAN error frames where the payload exposes Linux-compatible error bytes. If GS-USB firmware exposes non-Linux-compatible controller status bits, document and test that mapping separately so Linux `CAN_ERR_CRTL_ACTIVE` is not misread as bus-off.
 - `CAN_RTR_FLAG` and CAN FD/control/status frames are `RecoverableNonData` unless they also carry fatal device-status information.
 - For standard data frames, any ID bits outside `CAN_SFF_MASK` are `FatalMalformedData`; for extended data frames, validate the `CAN_EFF_FLAG` format and `CAN_EFF_MASK` ID through `ExtendedCanId`.
 - `can_dlc > 8` is always `FatalMalformedData` for data-looking frames; do not clamp with `.min(8)`.
@@ -751,9 +769,15 @@ Tests should use small helper builders instead of struct literals. This keeps te
 
 ## Public Re-Exports
 
-`piper-can` and `piper-sdk` should re-export the new frame types alongside `PiperFrame`:
+`piper-can` and `piper-sdk` should re-export the new frame types alongside `PiperFrame`. `piper-sdk` should also re-export robot-protocol ergonomics such as `JointIndex`; `piper-can` should not, because it is the generic CAN adapter crate.
 
 ```rust
+// piper-can
+pub use piper_protocol::{
+    CanData, CanId, ExtendedCanId, FrameError, PiperFrame, StandardCanId,
+};
+
+// piper-sdk
 pub use piper_protocol::{
     CanData, CanId, ExtendedCanId, FrameError, JointIndex, PiperFrame, StandardCanId,
 };
@@ -864,8 +888,8 @@ Required targeted tests:
 - tests for recording stop conditions, statistics, diagnostics, and ID aggregation proving `standard 0x123` and `extended 0x123` are distinct.
 - `piper-protocol` tests proving constrained subtypes cannot be deserialized into invalid values when serde is enabled.
 - `piper-protocol` tests for `CanData::from_padded`: reject `len > 8`, preserve active bytes, and zero nonzero bytes beyond DLC.
-- `piper-tools` bincode roundtrip tests for version `3` recordings containing standard and extended frames using direct `PiperFrame` storage, plus locked representative byte payloads for the full recording-body bincode 1.3 fixed-int wire contract.
-- `piper-tools` rejection tests for version `1` and `2` recordings, header/body version mismatch, appended top-level bincode trailing bytes, oversized body/frame-count/metadata string limits, nonzero trailing bytes inside frame payload storage, invalid direction values, invalid timestamp source values, and old recording frame shapes that lack explicit frame format.
+- `piper-tools` bincode roundtrip tests for version `3` recordings containing standard and extended frames using direct `PiperFrame` storage, plus locked representative byte payloads for the `magic + version + bincode(BincodePiperRecordingV3)` file contract and full recording-body bincode 1.3 fixed-int wire contract.
+- `piper-tools` rejection tests for version `1` and `2` recordings, historical segmented metadata/frame-count body shapes, header/body version mismatch, appended top-level bincode trailing bytes, oversized body/frame-count/metadata string limits including one-byte-over body reads and writer-side oversized-recording rejection, nonzero trailing bytes inside frame payload storage, invalid direction values, invalid timestamp source values, and old recording frame shapes that lack explicit frame format.
 - `piper-tools` and `piper-driver` structure tests or static checks proving recording types do not duplicate timestamp, ID, or data beside `PiperFrame`.
 - `piper-driver` recording tests proving `TimestampedFrame` stores `PiperFrame` directly, records normalized recording-local monotonic timestamps, records only active payload semantics, and preserves RX/TX direction plus `Hardware` / `Kernel` / `Userspace` / `None` timestamp provenance through receive metadata and hook APIs.
 - `piper-driver` TX recording tests proving a replayable TX recording stamps a copy with a post-send userspace timestamp normalized into the recording-local timebase while the frame observed by backend send remains `timestamp_us() == 0`.
@@ -925,13 +949,13 @@ Recording code has no remaining legacy conversion path from ambiguous `can_id + 
 
 Recording files use version `3`; version `1` and `2` files are rejected before old frame bodies are deserialized.
 
-Recording bincode uses the declared full-body bincode 1.3 fixed-int wire contract, rejects appended top-level body bytes, enforces explicit body/frame-count/metadata string limits, rejects nonzero unused frame payload bytes, rejects invalid direction/source values, and rejects header/body version mismatches.
+Recording bincode uses the declared `magic + version + bincode(BincodePiperRecordingV3)` file contract and bincode 1.3 fixed-int body contract, rejects historical segmented bodies, rejects appended top-level body bytes, enforces explicit body/frame-count/metadata string limits before unbounded allocation, rejects nonzero unused frame payload bytes, rejects invalid direction/source values, and rejects header/body version mismatches.
 
 Recording types store `PiperFrame` directly and do not duplicate timestamp, ID, format, or data state.
 
 Persisted recording frame timestamps use one recording-local monotonic microsecond timebase. Timestamp source/provenance describes that persisted timestamp value and is never inferred from `timestamp_us() != 0`.
 
-Driver receive and hook APIs carry timestamp provenance explicitly. Driver recording metadata preserves RX/TX direction and `Hardware` / `Kernel` / `Userspace` / `None` timestamp provenance without making `piper-driver` depend on `piper-tools`.
+Driver receive and hook APIs carry timestamp provenance explicitly. `TimestampProvenance` is defined once in `piper-can`, and driver recording metadata preserves RX/TX direction plus `Hardware` / `Kernel` / `Userspace` / `None` timestamp provenance without making `piper-driver` depend on `piper-tools`.
 
 Client recording conversion maps timestamp provenance explicitly and does not infer `TimestampSource` from `frame.timestamp_us() != 0`.
 
