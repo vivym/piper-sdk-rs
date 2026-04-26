@@ -1151,10 +1151,42 @@ mod tests {
     }
 
     #[test]
+    fn decode_extended_filters_reject_invalid_ranges() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, 0x0A);
+        put_u32(&mut payload, 8);
+        put_u16(&mut payload, 1);
+        put_u8(&mut payload, 1);
+        put_u32(&mut payload, 0x200);
+        put_u32(&mut payload, 0x100);
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("invalid bridge wire filter range")
+        ));
+    }
+
+    #[test]
     fn local_filter_construction_rejects_invalid_ranges() {
         let error = CanIdFilter::standard(
             StandardCanId::new(0x200).unwrap(),
             StandardCanId::new(0x100).unwrap(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ProtocolError::InvalidData("invalid local bridge filter range")
+        );
+    }
+
+    #[test]
+    fn local_extended_filter_construction_rejects_invalid_ranges() {
+        let error = CanIdFilter::extended(
+            ExtendedCanId::new(0x200).unwrap(),
+            ExtendedCanId::new(0x100).unwrap(),
         )
         .unwrap_err();
 

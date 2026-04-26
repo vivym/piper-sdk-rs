@@ -1,7 +1,8 @@
-//! GS-USB bridge v2 client.
+//! GS-USB bridge client.
 //!
 //! The bridge is a non-realtime debug/record/replay transport over UnixStream
-//! or TCP. It is intentionally separate from the realtime CAN control path.
+//! or TCP. It is intentionally separate from the realtime CAN control path, and
+//! uses v3 filter-bearing requests for typed CAN ID filter setup.
 
 pub mod protocol;
 
