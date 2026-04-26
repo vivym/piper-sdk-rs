@@ -44,7 +44,7 @@
 use crate::hooks::FrameCallback;
 use crossbeam_channel::{Receiver, Sender, bounded};
 pub use piper_can::TimestampProvenance;
-use piper_protocol::PiperFrame;
+use piper_protocol::{CanId, PiperFrame};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -65,6 +65,48 @@ pub struct TimestampedFrame {
     pub direction: RecordedFrameDirection,
     /// 归一化后时间戳来源。
     pub timestamp_provenance: TimestampProvenance,
+}
+
+impl TimestampedFrame {
+    /// Returns the typed CAN ID for the recorded frame.
+    pub fn id(&self) -> CanId {
+        self.frame.id()
+    }
+
+    /// Returns the raw CAN ID value without losing standard/extended typing on the frame.
+    pub fn raw_id(&self) -> u32 {
+        self.frame.raw_id()
+    }
+
+    /// Returns the recorded frame payload without canonical padding bytes.
+    pub fn data(&self) -> &[u8] {
+        self.frame.data()
+    }
+
+    /// Returns the fixed 8-byte padded CAN payload.
+    pub fn data_padded(&self) -> &[u8; 8] {
+        self.frame.data_padded()
+    }
+
+    /// Returns the CAN data length code.
+    pub fn dlc(&self) -> u8 {
+        self.frame.dlc()
+    }
+
+    /// Returns the normalized recording timestamp in microseconds.
+    pub fn timestamp_us(&self) -> u64 {
+        self.frame.timestamp_us()
+    }
+
+    /// Returns whether the frame was received or transmitted.
+    pub fn direction(&self) -> RecordedFrameDirection {
+        self.direction
+    }
+
+    /// Returns the provenance for the normalized timestamp.
+    pub fn timestamp_provenance(&self) -> TimestampProvenance {
+        self.timestamp_provenance
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -501,6 +543,29 @@ mod tests {
         assert_eq!(timestamped.direction, RecordedFrameDirection::Rx);
         assert_eq!(
             timestamped.timestamp_provenance,
+            TimestampProvenance::Hardware
+        );
+    }
+
+    #[test]
+    fn timestamped_frame_exposes_read_only_accessors() {
+        let frame = frame_with_timestamp(0x2A5, &[0, 1, 2, 3], 12345);
+
+        let timestamped = TimestampedFrame {
+            frame,
+            direction: RecordedFrameDirection::Rx,
+            timestamp_provenance: TimestampProvenance::Hardware,
+        };
+
+        assert_eq!(timestamped.id(), frame.id());
+        assert_eq!(timestamped.raw_id(), 0x2A5);
+        assert_eq!(timestamped.dlc(), 4);
+        assert_eq!(timestamped.data(), &[0, 1, 2, 3]);
+        assert_eq!(timestamped.data_padded(), frame.data_padded());
+        assert_eq!(timestamped.timestamp_us(), 12345);
+        assert_eq!(timestamped.direction(), RecordedFrameDirection::Rx);
+        assert_eq!(
+            timestamped.timestamp_provenance(),
             TimestampProvenance::Hardware
         );
     }

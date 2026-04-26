@@ -33,24 +33,16 @@
 /// - Copy trait：零成本复制，适合高频场景
 /// - 固定 8 字节数据：避免堆分配
 /// - 无生命周期：简化 API
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PiperFrame {
-    /// CAN ID（标准帧或扩展帧）
-    pub id: u32,
-
-    /// 帧数据（固定 8 字节，未使用部分为 0）
-    pub data: [u8; 8],
-
-    /// 有效数据长度 (0-8)
-    pub len: u8,
-
-    /// 是否为扩展帧（29-bit ID）
-    pub is_extended: bool,
-
-    /// 硬件时间戳（微秒），0 表示不可用
-    pub timestamp_us: u64,
+    // 字段不公开；通过类型化构造函数和访问器使用。
 }
+
+let frame = PiperFrame::new_standard(0x123, [1, 2, 3])?.with_timestamp_us(timestamp_us);
+let raw_id = frame.raw_id();
+let data = frame.data();
+let padded = frame.data_padded();
+let dlc = frame.dlc();
+let timestamp_us = frame.timestamp_us();
 ```
 
 ### 1.2 设计特点
@@ -198,13 +190,12 @@ GsUsbFrame          →  PiperFrame  →  Protocol Type
 
 **SocketCAN → PiperFrame** (`socketcan/mod.rs:756-768`):
 ```rust
-let piper_frame = PiperFrame {
-    id: can_frame.raw_id(),
-    data: { /* 转换逻辑 */ },
-    len: can_frame.dlc() as u8,
-    is_extended: can_frame.is_extended(),
-    timestamp_us, // 从 CMSG 提取
-};
+let piper_frame = if can_frame.is_extended() {
+    PiperFrame::new_extended(can_frame.raw_id(), can_frame.data())?
+} else {
+    PiperFrame::new_standard(can_frame.raw_id(), can_frame.data())?
+}
+.with_timestamp_us(timestamp_us);
 ```
 
 **PiperFrame → Protocol Type** (`feedback.rs:291`):
@@ -336,19 +327,15 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
 - 提供迁移指南
 - 保持向后兼容的别名
 
-#### 改进 3: 添加构建器模式
+#### 改进 3: 使用类型化构造函数
 当前创建帧需要：
 ```rust
 let frame = PiperFrame::new_standard(0x123, [1, 2, 3])?;
 ```
 
-可以考虑添加链式构建器：
+附加时间戳时使用不可变更新：
 ```rust
-let frame = PiperFrame::builder()
-    .id(0x123)
-    .data(&[1, 2, 3])
-    .timestamp_us(now)
-    .build();
+let frame = PiperFrame::new_standard(0x123, [1, 2, 3])?.with_timestamp_us(now);
 ```
 
 ---
