@@ -24,14 +24,14 @@
 
 use crate::{
     BackendCapability, CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame, RealtimeTxAdapter,
-    RxAdapter,
+    ReceivedFrame, RxAdapter, TimestampProvenance,
 };
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use piper_protocol::ids::{driver_rx_robot_feedback_ids, is_robot_feedback_id};
 use socketcan::{
-    BlockingCan, CanError as SocketCanError, CanErrorFrame, CanFilter, CanFrame, CanSocket,
-    EmbeddedFrame, ExtendedId, Frame, Socket, SocketOptions, StandardId,
+    BlockingCan, CanFilter, CanFrame, CanSocket, EmbeddedFrame, ExtendedId, Socket, SocketOptions,
+    StandardId,
 };
 use std::collections::VecDeque;
 use std::io::IoSliceMut;
@@ -40,7 +40,9 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::time::{Duration, Instant};
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
+
+use super::raw_frame::{ParsedSocketCanFrame, parse_libc_can_frame_bytes};
 
 /// 检查 socket 是否启用了 SO_TIMESTAMPING
 ///
@@ -105,16 +107,17 @@ struct TimestampInfo {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ReceivedFrame {
+struct SocketCanReceivedFrame {
     frame: PiperFrame,
     timestamp_source: TimestampSource,
+    timestamp_provenance: TimestampProvenance,
 }
 
 fn classify_startup_probe_frame(
     frame: &PiperFrame,
     timestamp_source: TimestampSource,
 ) -> Option<BackendCapability> {
-    if !is_robot_feedback_id(frame.id) {
+    if !is_robot_feedback_id(frame.id()) {
         return None;
     }
 
@@ -125,12 +128,12 @@ fn classify_startup_probe_frame(
     }
 }
 
-fn hardware_filter_ids() -> &'static [u32] {
+fn hardware_filter_ids() -> &'static [piper_protocol::StandardCanId] {
     driver_rx_robot_feedback_ids()
 }
 
 fn should_buffer_bootstrap_frame(frame: &PiperFrame) -> bool {
-    !frame.is_extended && is_robot_feedback_id(frame.id)
+    frame.is_standard() && is_robot_feedback_id(frame.id())
 }
 
 /// 只读适配器（用于 RX 线程）
@@ -151,7 +154,7 @@ pub struct SocketCanRxAdapter {
     /// 是否检测到硬件时间戳支持（运行时检测）
     hw_timestamp_available: bool,
     /// Startup probe drains frames before worker threads exist; replay them first once RX starts.
-    bootstrap_frames: VecDeque<PiperFrame>,
+    bootstrap_frames: VecDeque<ReceivedFrame>,
     /// Final capability resolved by startup probing. Defaults to the safe soft-realtime posture.
     backend_capability: BackendCapability,
     startup_probe_resolved: bool,
@@ -227,7 +230,7 @@ impl SocketCanRxAdapter {
             .map(|&id| {
                 // 使用 0x7FF 作为掩码，实现精确匹配（标准帧）
                 // 如果需要支持扩展帧，使用 0x1FFFFFFF
-                CanFilter::new(id, 0x7FF)
+                CanFilter::new(id.raw() as u32, 0x7FF)
             })
             .collect();
 
@@ -264,7 +267,7 @@ impl SocketCanRxAdapter {
         Ok(())
     }
 
-    fn receive_live(&mut self, timeout: Duration) -> Result<ReceivedFrame, CanError> {
+    fn receive_live(&mut self, timeout: Duration) -> Result<SocketCanReceivedFrame, CanError> {
         loop {
             let fd = self.socket.as_raw_fd();
 
@@ -283,11 +286,12 @@ impl SocketCanRxAdapter {
                 },
             }
 
-            const CAN_FRAME_LEN: usize = std::mem::size_of::<libc::can_frame>();
-            let mut frame_buf = [0u8; CAN_FRAME_LEN];
+            // Keep a CAN FD-sized receive buffer so the parser sees and rejects
+            // non-classic MTUs instead of recvmsg truncating them.
+            let mut frame_buf = [0u8; libc::CANFD_MTU as usize];
             let mut cmsg_buf = [0u8; 1024];
 
-            let (msg_bytes, timestamp_info) = {
+            let (msg_bytes, msg_flags, timestamp_info) = {
                 let mut iov = [IoSliceMut::new(&mut frame_buf)];
 
                 let msg = match recvmsg::<SockaddrStorage>(
@@ -309,67 +313,26 @@ impl SocketCanRxAdapter {
                 };
 
                 let timestamp_info = self.extract_timestamp_from_cmsg(&msg)?;
-                (msg.bytes, timestamp_info)
+                (msg.bytes, msg.flags.bits(), timestamp_info)
             };
 
-            if msg_bytes < CAN_FRAME_LEN {
-                return Err(CanError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Incomplete CAN frame: {} bytes (expected at least {})",
-                        msg_bytes, CAN_FRAME_LEN
-                    ),
-                )));
-            }
-
-            let can_frame = self.parse_raw_can_frame(&frame_buf[..msg_bytes])?;
-
-            if can_frame.is_error_frame() {
-                if let Ok(error_frame) = CanErrorFrame::try_from(can_frame) {
-                    let socketcan_error = SocketCanError::from(error_frame);
-                    match &socketcan_error {
-                        SocketCanError::BusOff => {
-                            error!("CAN Bus Off error detected");
-                            return Err(CanError::BusOff);
+            match parse_libc_can_frame_bytes(&frame_buf, msg_bytes, msg_flags) {
+                ParsedSocketCanFrame::Data(frame) => {
+                    let timestamp_provenance = match timestamp_info.source {
+                        TimestampSource::Hardware | TimestampSource::Software => {
+                            TimestampProvenance::Kernel
                         },
-                        SocketCanError::ControllerProblem(problem) => {
-                            let problem_str = format!("{}", problem);
-                            if problem_str.contains("overflow") || problem_str.contains("Overflow")
-                            {
-                                error!("CAN Buffer Overflow detected: {}", problem);
-                                return Err(CanError::BufferOverflow);
-                            }
-
-                            warn!("CAN Controller Problem: {}, ignoring", problem);
-                            continue;
-                        },
-                        _ => {
-                            warn!("CAN Error Frame received: {}, ignoring", socketcan_error);
-                            continue;
-                        },
-                    }
-                } else {
-                    warn!("Received CAN error frame but failed to parse, ignoring");
-                    continue;
-                }
-            }
-
-            return Ok(ReceivedFrame {
-                frame: PiperFrame {
-                    id: can_frame.raw_id(),
-                    data: {
-                        let mut data = [0u8; 8];
-                        let frame_data = can_frame.data();
-                        let len = frame_data.len().min(8);
-                        data[..len].copy_from_slice(&frame_data[..len]);
-                        data
-                    },
-                    len: can_frame.dlc() as u8,
-                    is_extended: can_frame.is_extended(),
-                    timestamp_us: timestamp_info.timestamp_us,
+                        TimestampSource::None => TimestampProvenance::None,
+                    };
+                    return Ok(SocketCanReceivedFrame {
+                        frame: frame.with_timestamp_us(timestamp_info.timestamp_us),
+                        timestamp_source: timestamp_info.source,
+                        timestamp_provenance,
+                    });
                 },
-                timestamp_source: timestamp_info.source,
-            });
+                ParsedSocketCanFrame::RecoverableNonData => continue,
+                ParsedSocketCanFrame::Fatal(error) => return Err(error),
+            }
         }
     }
 
@@ -385,12 +348,13 @@ impl SocketCanRxAdapter {
 }
 
 impl RxAdapter for SocketCanRxAdapter {
-    fn receive(&mut self) -> Result<PiperFrame, CanError> {
-        if let Some(frame) = self.bootstrap_frames.pop_front() {
-            return Ok(frame);
+    fn receive(&mut self) -> Result<ReceivedFrame, CanError> {
+        if let Some(received) = self.bootstrap_frames.pop_front() {
+            return Ok(received);
         }
 
-        self.receive_live(self.read_timeout).map(|received| received.frame)
+        self.receive_live(self.read_timeout)
+            .map(|received| ReceivedFrame::new(received.frame, received.timestamp_provenance))
     }
 
     fn backend_capability(&self) -> BackendCapability {
@@ -419,7 +383,8 @@ impl RxAdapter for SocketCanRxAdapter {
                 Ok(received) => {
                     let frame = received.frame;
                     if should_buffer_bootstrap_frame(&frame) {
-                        self.bootstrap_frames.push_back(frame);
+                        self.bootstrap_frames
+                            .push_back(ReceivedFrame::new(frame, received.timestamp_provenance));
                     }
                     let Some(capability) =
                         classify_startup_probe_frame(&frame, received.timestamp_source)
@@ -539,97 +504,6 @@ impl SocketCanRxAdapter {
     fn timespec_to_micros(tv_sec: i64, tv_nsec: i64) -> u64 {
         (tv_sec as u64) * 1_000_000 + ((tv_nsec as u64) / 1000)
     }
-
-    /// 解析原始 CAN 帧数据（与 SocketCanAdapter 一致）
-    ///
-    /// 从 `recvmsg` 接收的原始字节数组解析为 `CanFrame`。
-    ///
-    /// # 参数
-    /// - `data`: 原始 CAN 帧数据（`libc::can_frame` 的字节表示）
-    ///
-    /// # 返回值
-    /// - `Ok(CanFrame)`: 成功解析
-    /// - `Err(CanError::Io)`: 数据不完整或格式错误
-    fn parse_raw_can_frame(&self, data: &[u8]) -> Result<CanFrame, CanError> {
-        const CAN_FRAME_LEN: usize = std::mem::size_of::<libc::can_frame>();
-
-        // 验证数据长度
-        if data.len() < CAN_FRAME_LEN {
-            return Err(CanError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Incomplete CAN frame data: {} bytes (expected at least {})",
-                    data.len(),
-                    CAN_FRAME_LEN
-                ),
-            )));
-        }
-
-        // 使用安全的内存拷贝
-        let mut raw_frame: libc::can_frame = unsafe { std::mem::zeroed() };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                &mut raw_frame as *mut _ as *mut u8,
-                CAN_FRAME_LEN.min(data.len()),
-            );
-        }
-
-        // 解析 CAN ID（处理 EFF/RTR/ERR 标志位）
-        let can_id = raw_frame.can_id;
-        let is_extended = (can_id & libc::CAN_EFF_FLAG) != 0;
-        let is_rtr = (can_id & libc::CAN_RTR_FLAG) != 0;
-
-        // 提取实际的 ID（去除标志位）
-        let id_bits = if is_extended {
-            can_id & libc::CAN_EFF_MASK
-        } else {
-            can_id & libc::CAN_SFF_MASK
-        };
-
-        // 获取数据长度
-        let dlc = raw_frame.can_dlc as usize;
-        if dlc > 8 {
-            return Err(CanError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Invalid DLC: {} (max 8)", dlc),
-            )));
-        }
-
-        // 提取数据
-        let data_slice = &raw_frame.data[..dlc.min(8)];
-
-        // 构造 socketcan::CanFrame
-        if is_rtr {
-            // RTR 帧暂不支持
-            return Err(CanError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "RTR frames not yet supported",
-            )));
-        }
-
-        if is_extended {
-            // 扩展帧
-            let id = ExtendedId::new(id_bits).ok_or_else(|| {
-                CanError::Device(format!("Invalid extended ID: 0x{:X}", id_bits).into())
-            })?;
-            CanFrame::new(id, data_slice).ok_or_else(|| {
-                CanError::Device(
-                    format!("Failed to create extended frame with ID 0x{:X}", id_bits).into(),
-                )
-            })
-        } else {
-            // 标准帧
-            let id = StandardId::new(id_bits as u16).ok_or_else(|| {
-                CanError::Device(format!("Invalid standard ID: 0x{:X}", id_bits).into())
-            })?;
-            CanFrame::new(id, data_slice).ok_or_else(|| {
-                CanError::Device(
-                    format!("Failed to create standard frame with ID 0x{:X}", id_bits).into(),
-                )
-            })
-        }
-    }
 }
 
 impl Drop for SocketCanRxAdapter {
@@ -700,20 +574,29 @@ impl SocketCanTxAdapter {
     }
 
     fn build_can_frame(frame: PiperFrame) -> Result<CanFrame, CanError> {
-        if frame.is_extended {
-            ExtendedId::new(frame.id)
-                .and_then(|id| CanFrame::new(id, &frame.data[..frame.len as usize]))
+        let payload = &frame.data_padded()[..frame.dlc() as usize];
+        if frame.is_extended() {
+            ExtendedId::new(frame.raw_id())
+                .and_then(|id| CanFrame::new(id, payload))
                 .ok_or_else(|| {
                     CanError::Device(
-                        format!("Failed to create extended frame with ID 0x{:X}", frame.id).into(),
+                        format!(
+                            "Failed to create extended frame with ID 0x{:X}",
+                            frame.raw_id()
+                        )
+                        .into(),
                     )
                 })
         } else {
-            StandardId::new(frame.id as u16)
-                .and_then(|id| CanFrame::new(id, &frame.data[..frame.len as usize]))
+            StandardId::new(frame.raw_id() as u16)
+                .and_then(|id| CanFrame::new(id, payload))
                 .ok_or_else(|| {
                     CanError::Device(
-                        format!("Failed to create standard frame with ID 0x{:X}", frame.id).into(),
+                        format!(
+                            "Failed to create standard frame with ID 0x{:X}",
+                            frame.raw_id()
+                        )
+                        .into(),
                     )
                 })
         }
@@ -783,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_classify_startup_probe_frame_accepts_hardware_timestamped_robot_feedback() {
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8]).unwrap();
         assert_eq!(
             classify_startup_probe_frame(&frame, TimestampSource::Hardware),
             Some(BackendCapability::StrictRealtime)
@@ -792,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_classify_startup_probe_frame_accepts_software_timestamped_robot_feedback() {
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_34 as u16, &[0; 8]);
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_34.raw() as u32, [0; 8]).unwrap();
         assert_eq!(
             classify_startup_probe_frame(&frame, TimestampSource::Software),
             Some(BackendCapability::SoftRealtime)
@@ -801,8 +684,9 @@ mod tests {
 
     #[test]
     fn test_classify_startup_probe_frame_rejects_noise_and_missing_timestamps() {
-        let robot_frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-        let noise_frame = PiperFrame::new_standard(0x7FF, &[0; 8]);
+        let robot_frame =
+            PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8]).unwrap();
+        let noise_frame = PiperFrame::new_standard(0x7FF, [0; 8]).unwrap();
 
         assert_eq!(
             classify_startup_probe_frame(&robot_frame, TimestampSource::None),
@@ -821,8 +705,9 @@ mod tests {
 
     #[test]
     fn test_startup_probe_buffers_only_robot_feedback_frames() {
-        let robot_frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-        let noise_frame = PiperFrame::new_standard(0x7FF, &[0; 8]);
+        let robot_frame =
+            PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8]).unwrap();
+        let noise_frame = PiperFrame::new_standard(0x7FF, [0; 8]).unwrap();
 
         assert!(should_buffer_bootstrap_frame(&robot_frame));
         assert!(!should_buffer_bootstrap_frame(&noise_frame));
