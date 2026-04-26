@@ -389,10 +389,16 @@ impl<'a> Cursor<'a> {
 
     fn frame_request(&mut self) -> Result<PiperFrame, ProtocolError> {
         let id = self.u32()?;
-        let is_extended = self.u8()? != 0;
+        let is_extended = match self.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(ProtocolError::InvalidData("invalid bridge frame format")),
+        };
         let len = self.u8()?;
         let mut data = [0u8; 8];
         data.copy_from_slice(self.take(8)?);
+        CanData::validate_canonical_padding(data, len)
+            .map_err(|err| map_frame_error("invalid bridge frame data padding", err))?;
         let data = CanData::from_padded(data, len)
             .map_err(|err| map_frame_error("invalid bridge frame data", err))?;
         if is_extended {
@@ -769,6 +775,42 @@ mod tests {
         let encoded = encode_server_message(&message).unwrap();
         let decoded = decode_server_message(&encoded[4..]).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn decode_send_frame_rejects_noncanonical_padding() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, TAG_SEND_FRAME);
+        put_u32(&mut payload, 42);
+        put_u32(&mut payload, 0x123);
+        put_u8(&mut payload, 0);
+        put_u8(&mut payload, 1);
+        payload.extend_from_slice(&[0xAA, 0xBB, 0, 0, 0, 0, 0, 0]);
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("invalid bridge frame data padding")
+        ));
+    }
+
+    #[test]
+    fn decode_send_frame_rejects_invalid_format_byte() {
+        let mut payload = Vec::new();
+        put_u8(&mut payload, TAG_SEND_FRAME);
+        put_u32(&mut payload, 43);
+        put_u32(&mut payload, 0x123);
+        put_u8(&mut payload, 2);
+        put_u8(&mut payload, 1);
+        payload.extend_from_slice(&[0xAA, 0, 0, 0, 0, 0, 0, 0]);
+
+        let error = decode_client_request(&payload).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::InvalidData("invalid bridge frame format")
+        ));
     }
 
     #[test]
