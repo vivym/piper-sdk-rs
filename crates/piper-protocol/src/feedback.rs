@@ -3,19 +3,29 @@
 //! 包含所有机械臂反馈帧的结构体，提供从 `PiperFrame` 解析的方法
 //! 和物理量转换方法。
 
-use crate::can::PiperFrame;
 use crate::control::{ControlModeCommand, InstallPosition, MitMode};
 use crate::{
-    ProtocolError, bytes_to_i16_be, bytes_to_i32_be,
-    ids::raw::{
-        ID_CONTROL_MODE, ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_FIRMWARE_READ,
-        ID_GRIPPER_CONTROL, ID_GRIPPER_FEEDBACK, ID_JOINT_CONTROL_12, ID_JOINT_CONTROL_34,
-        ID_JOINT_CONTROL_56, ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE,
-        ID_JOINT_END_VELOCITY_ACCEL_BASE, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
-        ID_JOINT_FEEDBACK_56, ID_ROBOT_STATUS,
-    },
+    JointIndex, PiperFrame, ProtocolError, StandardCanId, bytes_to_i16_be, bytes_to_i32_be, ids::*,
 };
 use bilge::prelude::*;
+
+fn joint_index_from_id(
+    frame: &PiperFrame,
+    id_for_joint: fn(JointIndex) -> StandardCanId,
+) -> Result<u8, ProtocolError> {
+    let Some(standard_id) = frame.id().as_standard() else {
+        return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
+    };
+
+    for joint_index in 1..=6 {
+        let joint = JointIndex::new(joint_index)?;
+        if id_for_joint(joint) == standard_id {
+            return Ok(joint_index);
+        }
+    }
+
+    Err(ProtocolError::InvalidCanId { id: frame.raw_id() })
+}
 
 // ============================================================================
 // 枚举类型定义
@@ -216,28 +226,28 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_ROBOT_STATUS {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_ROBOT_STATUS) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 解析所有字段
         Ok(Self {
-            control_mode: ControlMode::from(frame.data[0]),
-            robot_status: RobotStatus::from(frame.data[1]),
-            move_mode: MoveMode::from(frame.data[2]),
-            teach_status: TeachStatus::from(frame.data[3]),
-            motion_status: MotionStatus::from(frame.data[4]),
-            trajectory_point_index: frame.data[5],
-            fault_code_angle_limit: FaultCodeAngleLimit::from(u8::new(frame.data[6])),
-            fault_code_comm_error: FaultCodeCommError::from(u8::new(frame.data[7])),
+            control_mode: ControlMode::from(frame.data()[0]),
+            robot_status: RobotStatus::from(frame.data()[1]),
+            move_mode: MoveMode::from(frame.data()[2]),
+            teach_status: TeachStatus::from(frame.data()[3]),
+            motion_status: MotionStatus::from(frame.data()[4]),
+            trajectory_point_index: frame.data()[5],
+            fault_code_angle_limit: FaultCodeAngleLimit::from(u8::new(frame.data()[6])),
+            fault_code_comm_error: FaultCodeCommError::from(u8::new(frame.data()[7])),
         })
     }
 }
@@ -293,24 +303,34 @@ impl TryFrom<PiperFrame> for JointFeedback12 {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_JOINT_FEEDBACK_12 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_JOINT_FEEDBACK_12) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 解析 J1 角度（Byte 0-3，大端字节序）
-        let j1_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j1_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let j1_deg = bytes_to_i32_be(j1_bytes);
 
         // 解析 J2 角度（Byte 4-7，大端字节序）
-        let j2_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j2_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let j2_deg = bytes_to_i32_be(j2_bytes);
 
         Ok(Self { j1_deg, j2_deg })
@@ -364,24 +384,34 @@ impl TryFrom<PiperFrame> for JointFeedback34 {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_JOINT_FEEDBACK_34 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_JOINT_FEEDBACK_34) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 解析 J3 角度（Byte 0-3，大端字节序）
-        let j3_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j3_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let j3_deg = bytes_to_i32_be(j3_bytes);
 
         // 解析 J4 角度（Byte 4-7，大端字节序）
-        let j4_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j4_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let j4_deg = bytes_to_i32_be(j4_bytes);
 
         Ok(Self { j3_deg, j4_deg })
@@ -435,24 +465,34 @@ impl TryFrom<PiperFrame> for JointFeedback56 {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_JOINT_FEEDBACK_56 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_JOINT_FEEDBACK_56) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 解析 J5 角度（Byte 0-3，大端字节序）
-        let j5_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j5_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let j5_deg = bytes_to_i32_be(j5_bytes);
 
         // 解析 J6 角度（Byte 4-7，大端字节序）
-        let j6_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j6_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let j6_deg = bytes_to_i32_be(j6_bytes);
 
         Ok(Self { j5_deg, j6_deg })
@@ -500,24 +540,34 @@ impl TryFrom<PiperFrame> for EndPoseFeedback1 {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_END_POSE_1 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_END_POSE_1) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 解析 X 坐标（Byte 0-3，大端字节序）
-        let x_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let x_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let x_mm = bytes_to_i32_be(x_bytes);
 
         // 解析 Y 坐标（Byte 4-7，大端字节序）
-        let y_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let y_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let y_mm = bytes_to_i32_be(y_bytes);
 
         Ok(Self { x_mm, y_mm })
@@ -566,24 +616,34 @@ impl TryFrom<PiperFrame> for EndPoseFeedback2 {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_END_POSE_2 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_END_POSE_2) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 解析 Z 坐标（Byte 0-3，大端字节序）
-        let z_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let z_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let z_mm = bytes_to_i32_be(z_bytes);
 
         // 解析 RX 角度（Byte 4-7，大端字节序）
-        let rx_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let rx_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let rx_deg = bytes_to_i32_be(rx_bytes);
 
         Ok(Self { z_mm, rx_deg })
@@ -637,24 +697,34 @@ impl TryFrom<PiperFrame> for EndPoseFeedback3 {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_END_POSE_3 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_END_POSE_3) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 解析 RY 角度（Byte 0-3，大端字节序）
-        let ry_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let ry_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let ry_deg = bytes_to_i32_be(ry_bytes);
 
         // 解析 RZ 角度（Byte 4-7，大端字节序）
-        let rz_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let rz_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let rz_deg = bytes_to_i32_be(rz_bytes);
 
         Ok(Self { ry_deg, rz_deg })
@@ -768,8 +838,8 @@ impl JointDriverHighSpeedFeedback {
     /// # 示例
     /// ```rust
     /// # use piper_protocol::feedback::JointDriverHighSpeedFeedback;
-    /// # use piper_protocol::can::PiperFrame;
-    /// # let frame = PiperFrame::new_standard(0x251, &[0; 8]);
+    /// # use piper_protocol::PiperFrame;
+    /// # let frame = PiperFrame::new_standard(0x251, [0; 8]).unwrap();
     /// # let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
     /// // 使用反馈中的电流值计算力矩
     /// let torque = feedback.torque(None);
@@ -798,8 +868,8 @@ impl JointDriverHighSpeedFeedback {
     /// # 示例
     /// ```rust
     /// # use piper_protocol::feedback::JointDriverHighSpeedFeedback;
-    /// # use piper_protocol::can::PiperFrame;
-    /// # let frame = PiperFrame::new_standard(0x251, &[0; 8]);
+    /// # use piper_protocol::PiperFrame;
+    /// # let frame = PiperFrame::new_standard(0x251, [0; 8]).unwrap();
     /// # let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
     /// let torque_raw = feedback.torque_raw(); // 例如：1181 (表示 1.181 N·m)
     /// ```
@@ -812,34 +882,32 @@ impl TryFrom<PiperFrame> for JointDriverHighSpeedFeedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        // 验证 CAN ID 范围（0x251~0x256）
-        if frame.id < ID_JOINT_DRIVER_HIGH_SPEED_BASE
-            || frame.id > ID_JOINT_DRIVER_HIGH_SPEED_BASE + 5
-        {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
-        }
-
         // 从 CAN ID 推导关节索引（0x251 -> 1, 0x252 -> 2, ..., 0x256 -> 6）
-        let joint_index = (frame.id - ID_JOINT_DRIVER_HIGH_SPEED_BASE + 1) as u8;
+        let joint_index = joint_index_from_id(&frame, joint_driver_high_speed_id)?;
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 解析速度（Byte 0-1，大端字节序，i16）
-        let speed_bytes = [frame.data[0], frame.data[1]];
+        let speed_bytes = [frame.data()[0], frame.data()[1]];
         let speed_rad_s = bytes_to_i16_be(speed_bytes);
 
         // 解析电流（Byte 2-3，大端字节序，i16，支持负值表示反向电流）
-        let current_bytes = [frame.data[2], frame.data[3]];
+        let current_bytes = [frame.data()[2], frame.data()[3]];
         let current_a = bytes_to_i16_be(current_bytes);
 
         // 解析位置（Byte 4-7，大端字节序，i32）
-        let position_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let position_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let position_rad = bytes_to_i32_be(position_bytes);
 
         Ok(Self {
@@ -942,32 +1010,29 @@ impl TryFrom<PiperFrame> for JointDriverLowSpeedFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 从 CAN ID 推导关节序号
-        let joint_index = (frame.id - ID_JOINT_DRIVER_LOW_SPEED_BASE + 1) as u8;
-        if !(1..=6).contains(&joint_index) {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
-        }
+        let joint_index = joint_index_from_id(&frame, joint_driver_low_speed_id)?;
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 处理大端字节序
-        let voltage_bytes = [frame.data[0], frame.data[1]];
+        let voltage_bytes = [frame.data()[0], frame.data()[1]];
         let voltage = u16::from_be_bytes(voltage_bytes);
 
-        let driver_temp_bytes = [frame.data[2], frame.data[3]];
+        let driver_temp_bytes = [frame.data()[2], frame.data()[3]];
         let driver_temp = bytes_to_i16_be(driver_temp_bytes);
 
-        let motor_temp = frame.data[4] as i8;
+        let motor_temp = frame.data()[4] as i8;
 
         // 使用 bilge 解析位域（Byte 5）
-        let status = DriverStatus::from(u8::new(frame.data[5]));
+        let status = DriverStatus::from(u8::new(frame.data()[5]));
 
-        let bus_current_bytes = [frame.data[6], frame.data[7]];
+        let bus_current_bytes = [frame.data()[6], frame.data()[7]];
         let bus_current = u16::from_be_bytes(bus_current_bytes);
 
         Ok(Self {
@@ -1049,35 +1114,28 @@ impl TryFrom<PiperFrame> for JointEndVelocityAccelFeedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        // 验证 CAN ID 范围（0x481~0x486）
-        if frame.id < ID_JOINT_END_VELOCITY_ACCEL_BASE
-            || frame.id > ID_JOINT_END_VELOCITY_ACCEL_BASE + 5
-        {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
-        }
-
         // 从 CAN ID 推导关节序号（0x481 -> 1, 0x482 -> 2, ..., 0x486 -> 6）
-        let joint_index = (frame.id - ID_JOINT_END_VELOCITY_ACCEL_BASE + 1) as u8;
+        let joint_index = joint_index_from_id(&frame, joint_end_velocity_accel_id)?;
 
         // 验证数据长度（需要 8 字节：线速度 2 + 角速度 2 + 线加速度 2 + 角加速度 2）
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 处理大端字节序（所有字段都是 uint16）
-        let linear_velocity_bytes = [frame.data[0], frame.data[1]];
+        let linear_velocity_bytes = [frame.data()[0], frame.data()[1]];
         let linear_velocity_m_s_raw = u16::from_be_bytes(linear_velocity_bytes);
 
-        let angular_velocity_bytes = [frame.data[2], frame.data[3]];
+        let angular_velocity_bytes = [frame.data()[2], frame.data()[3]];
         let angular_velocity_rad_s_raw = u16::from_be_bytes(angular_velocity_bytes);
 
-        let linear_accel_bytes = [frame.data[4], frame.data[5]];
+        let linear_accel_bytes = [frame.data()[4], frame.data()[5]];
         let linear_accel_m_s2_raw = u16::from_be_bytes(linear_accel_bytes);
 
-        let angular_accel_bytes = [frame.data[6], frame.data[7]];
+        let angular_accel_bytes = [frame.data()[6], frame.data()[7]];
         let angular_accel_rad_s2_raw = u16::from_be_bytes(angular_accel_bytes);
 
         Ok(Self {
@@ -1158,27 +1216,32 @@ impl TryFrom<PiperFrame> for GripperFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_GRIPPER_FEEDBACK {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_GRIPPER_FEEDBACK) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 7 {
+        if frame.dlc() < 7 {
             return Err(ProtocolError::InvalidLength {
                 expected: 7,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 处理大端字节序
-        let travel_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let travel_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let travel_mm = bytes_to_i32_be(travel_bytes);
 
-        let torque_bytes = [frame.data[4], frame.data[5]];
+        let torque_bytes = [frame.data()[4], frame.data()[5]];
         let torque_nm = bytes_to_i16_be(torque_bytes);
 
         // 使用 bilge 解析位域
-        let status = GripperStatus::from(u8::new(frame.data[6]));
+        let status = GripperStatus::from(u8::new(frame.data()[6]));
 
         Ok(Self {
             travel_mm,
@@ -1191,6 +1254,10 @@ impl TryFrom<PiperFrame> for GripperFeedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ID_JOINT_DRIVER_HIGH_SPEED_BASE: u32 = ID_JOINT_DRIVER_HIGH_SPEED_1.raw() as u32;
+    const ID_JOINT_DRIVER_LOW_SPEED_BASE: u32 = ID_JOINT_DRIVER_LOW_SPEED_1.raw() as u32;
+    const ID_JOINT_END_VELOCITY_ACCEL_BASE: u32 = ID_JOINT_END_VELOCITY_ACCEL_1.raw() as u32;
 
     #[test]
     fn test_control_mode_from_u8() {
@@ -1450,8 +1517,8 @@ mod tests {
     #[test]
     fn test_robot_status_feedback_parse() {
         let frame = PiperFrame::new_standard(
-            ID_ROBOT_STATUS as u16,
-            &[
+            ID_ROBOT_STATUS.raw() as u32,
+            [
                 0x01,        // Byte 0: CAN指令控制模式
                 0x00,        // Byte 1: 正常
                 0x01,        // Byte 2: MOVE J
@@ -1461,7 +1528,8 @@ mod tests {
                 0b0011_1111, // Byte 6: 所有关节角度超限位（Bit 0-5 = 1）
                 0b0000_0000, // Byte 7: 无通信异常
             ],
-        );
+        )
+        .unwrap();
 
         let status = RobotStatusFeedback::try_from(frame).unwrap();
 
@@ -1478,18 +1546,18 @@ mod tests {
 
     #[test]
     fn test_robot_status_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = RobotStatusFeedback::try_from(frame);
         assert!(result.is_err());
         match result.unwrap_err() {
-            ProtocolError::InvalidCanId { id } => assert_eq!(id, 0x999),
+            ProtocolError::InvalidCanId { id } => assert_eq!(id, 0x700),
             _ => panic!("Expected InvalidCanId error"),
         }
     }
 
     #[test]
     fn test_robot_status_feedback_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_ROBOT_STATUS as u16, &[0; 4]);
+        let frame = PiperFrame::new_standard(ID_ROBOT_STATUS.raw() as u32, [0; 4]).unwrap();
         let result = RobotStatusFeedback::try_from(frame);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1505,8 +1573,8 @@ mod tests {
     fn test_robot_status_feedback_all_fields() {
         // 测试所有字段的各种值
         let frame = PiperFrame::new_standard(
-            ID_ROBOT_STATUS as u16,
-            &[
+            ID_ROBOT_STATUS.raw() as u32,
+            [
                 0x07,        // Byte 0: 离线轨迹模式
                 0x0F,        // Byte 1: 释放电阻NTC过温
                 0x04,        // Byte 2: MOVE M
@@ -1516,7 +1584,8 @@ mod tests {
                 0b0011_1111, // Byte 6: 所有关节超限位（Bit 0-5 = 1）
                 0b0011_1111, // Byte 7: 所有关节通信异常（Bit 0-5 = 1）
             ],
-        );
+        )
+        .unwrap();
 
         let status = RobotStatusFeedback::try_from(frame).unwrap();
 
@@ -1556,7 +1625,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&j1_val.to_be_bytes());
         data[4..8].copy_from_slice(&j2_val.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, data).unwrap();
 
         let feedback = JointFeedback12::try_from(frame).unwrap();
         assert_eq!(feedback.j1_raw(), 90000);
@@ -1569,12 +1638,13 @@ mod tests {
     fn test_joint_feedback12_physical_conversion() {
         // 测试物理量转换精度
         let frame = PiperFrame::new_standard(
-            ID_JOINT_FEEDBACK_12 as u16,
-            &[
+            ID_JOINT_FEEDBACK_12.raw() as u32,
+            [
                 0x00, 0x00, 0x00, 0x00, // J1: 0°
                 0x00, 0x00, 0x01, 0xF4, // J2: 500 (0.001° 单位) = 0.5°
             ],
-        );
+        )
+        .unwrap();
 
         let feedback = JointFeedback12::try_from(frame).unwrap();
         assert_eq!(feedback.j1(), 0.0);
@@ -1592,7 +1662,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&max_positive.to_be_bytes());
         data[4..8].copy_from_slice(&max_positive.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, data).unwrap();
 
         let feedback = JointFeedback12::try_from(frame).unwrap();
         assert_eq!(feedback.j1_raw(), max_positive);
@@ -1603,7 +1673,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&min_negative.to_be_bytes());
         data[4..8].copy_from_slice(&min_negative.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, data).unwrap();
 
         let feedback = JointFeedback12::try_from(frame).unwrap();
         assert_eq!(feedback.j1_raw(), min_negative);
@@ -1612,18 +1682,18 @@ mod tests {
 
     #[test]
     fn test_joint_feedback12_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = JointFeedback12::try_from(frame);
         assert!(result.is_err());
         match result.unwrap_err() {
-            ProtocolError::InvalidCanId { id } => assert_eq!(id, 0x999),
+            ProtocolError::InvalidCanId { id } => assert_eq!(id, 0x700),
             _ => panic!("Expected InvalidCanId error"),
         }
     }
 
     #[test]
     fn test_joint_feedback12_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12 as u16, &[0; 4]);
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 4]).unwrap();
         let result = JointFeedback12::try_from(frame);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1643,7 +1713,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&j3_val.to_be_bytes());
         data[4..8].copy_from_slice(&j4_val.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_34 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_34.raw() as u32, data).unwrap();
 
         let feedback = JointFeedback34::try_from(frame).unwrap();
         assert_eq!(feedback.j3_raw(), 30000);
@@ -1660,7 +1730,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&j5_val.to_be_bytes());
         data[4..8].copy_from_slice(&j6_val.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_56 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_56.raw() as u32, data).unwrap();
 
         let feedback = JointFeedback56::try_from(frame).unwrap();
         assert_eq!(feedback.j5_raw(), 180000);
@@ -1681,8 +1751,8 @@ mod tests {
 
         for (j1_val, j2_val) in test_cases {
             let frame = PiperFrame::new_standard(
-                ID_JOINT_FEEDBACK_12 as u16,
-                &[
+                ID_JOINT_FEEDBACK_12.raw() as u32,
+                [
                     j1_val.to_be_bytes()[0],
                     j1_val.to_be_bytes()[1],
                     j1_val.to_be_bytes()[2],
@@ -1692,7 +1762,8 @@ mod tests {
                     j2_val.to_be_bytes()[2],
                     j2_val.to_be_bytes()[3],
                 ],
-            );
+            )
+            .unwrap();
 
             let feedback = JointFeedback12::try_from(frame).unwrap();
             assert_eq!(feedback.j1_raw(), j1_val);
@@ -1712,7 +1783,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&x_val.to_be_bytes());
         data[4..8].copy_from_slice(&y_val.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_END_POSE_1 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_END_POSE_1.raw() as u32, data).unwrap();
 
         let feedback = EndPoseFeedback1::try_from(frame).unwrap();
         assert_eq!(feedback.x_raw(), 100000);
@@ -1729,7 +1800,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&x_val.to_be_bytes());
         data[4..8].copy_from_slice(&y_val.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_END_POSE_1 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_END_POSE_1.raw() as u32, data).unwrap();
 
         let feedback = EndPoseFeedback1::try_from(frame).unwrap();
         assert!((feedback.x() - 1.234).abs() < 0.0001);
@@ -1738,7 +1809,7 @@ mod tests {
 
     #[test]
     fn test_end_pose_feedback1_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = EndPoseFeedback1::try_from(frame);
         assert!(result.is_err());
     }
@@ -1751,7 +1822,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&z_val.to_be_bytes());
         data[4..8].copy_from_slice(&rx_val.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_END_POSE_2 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_END_POSE_2.raw() as u32, data).unwrap();
 
         let feedback = EndPoseFeedback2::try_from(frame).unwrap();
         assert_eq!(feedback.z_raw(), 200000);
@@ -1769,7 +1840,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&ry_val.to_be_bytes());
         data[4..8].copy_from_slice(&rz_val.to_be_bytes());
-        let frame = PiperFrame::new_standard(ID_END_POSE_3 as u16, &data);
+        let frame = PiperFrame::new_standard(ID_END_POSE_3.raw() as u32, data).unwrap();
 
         let feedback = EndPoseFeedback3::try_from(frame).unwrap();
         assert_eq!(feedback.ry_raw(), 90000);
@@ -1798,7 +1869,7 @@ mod tests {
         data[2..4].copy_from_slice(&current_val.to_be_bytes());
         data[4..8].copy_from_slice(&position_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.joint_index, 1);
@@ -1816,7 +1887,7 @@ mod tests {
         // 测试所有 6 个关节的 ID 识别
         for joint_id in 1..=6 {
             let can_id = ID_JOINT_DRIVER_HIGH_SPEED_BASE + (joint_id - 1);
-            let frame = PiperFrame::new_standard(can_id as u16, &[0; 8]);
+            let frame = PiperFrame::new_standard(can_id, [0; 8]).unwrap();
             let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
             assert_eq!(feedback.joint_index, joint_id as u8);
         }
@@ -1834,7 +1905,7 @@ mod tests {
         data[2..4].copy_from_slice(&current_val.to_be_bytes());
         data[4..8].copy_from_slice(&position_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
         assert!((feedback.speed() - std::f64::consts::PI).abs() < 0.001);
@@ -1857,7 +1928,7 @@ mod tests {
         data[2..4].copy_from_slice(&current_val.to_be_bytes());
         data[4..8].copy_from_slice(&position_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.speed_raw(), i16::MAX);
@@ -1868,18 +1939,18 @@ mod tests {
     #[test]
     fn test_joint_driver_high_speed_feedback_invalid_id() {
         // 测试无效的 CAN ID
-        let frame = PiperFrame::new_standard(0x250, &[0; 8]); // 小于 0x251
+        let frame = PiperFrame::new_standard(0x250, [0; 8]).unwrap(); // 小于 0x251
         let result = JointDriverHighSpeedFeedback::try_from(frame);
         assert!(result.is_err());
 
-        let frame = PiperFrame::new_standard(0x257, &[0; 8]); // 大于 0x256
+        let frame = PiperFrame::new_standard(0x257, [0; 8]).unwrap(); // 大于 0x256
         let result = JointDriverHighSpeedFeedback::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_joint_driver_high_speed_feedback_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &[0; 4]);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE, [0; 4]).unwrap();
         let result = JointDriverHighSpeedFeedback::try_from(frame);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1903,7 +1974,7 @@ mod tests {
         data[2..4].copy_from_slice(&current_val.to_be_bytes());
         data[4..8].copy_from_slice(&position_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.speed_raw(), -1000);
@@ -1918,7 +1989,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[2..4].copy_from_slice(&current_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.joint_index, 1);
@@ -1930,13 +2001,13 @@ mod tests {
         );
 
         // 关节 2 (CAN ID: 0x252)
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 1, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE + 1, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
         assert_eq!(feedback.joint_index, 2);
         assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
 
         // 关节 3 (CAN ID: 0x253)
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 2, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE + 2, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
         assert_eq!(feedback.joint_index, 3);
         assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
@@ -1950,7 +2021,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[2..4].copy_from_slice(&current_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 3, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE + 3, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.joint_index, 4);
@@ -1962,13 +2033,13 @@ mod tests {
         );
 
         // 关节 5 (CAN ID: 0x255)
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 4, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE + 4, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
         assert_eq!(feedback.joint_index, 5);
         assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
 
         // 关节 6 (CAN ID: 0x256)
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 5, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE + 5, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
         assert_eq!(feedback.joint_index, 6);
         assert!((feedback.torque(None) - expected_torque).abs() < 0.0001);
@@ -1984,7 +2055,7 @@ mod tests {
         data[2..4].copy_from_slice(&current_val.to_be_bytes());
 
         // 关节 1：使用反馈中的电流值
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
         let torque_from_feedback = feedback.torque(None);
         let expected_from_feedback = 2.0 * JointDriverHighSpeedFeedback::COEFFICIENT_1_3;
@@ -1996,7 +2067,7 @@ mod tests {
         assert!((torque_from_custom - expected_from_custom).abs() < 0.0001);
 
         // 关节 4：使用自定义电流值
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16 + 3, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE + 3, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
         let torque_from_custom = feedback.torque(Some(custom_current));
         let expected_from_custom = custom_current * JointDriverHighSpeedFeedback::COEFFICIENT_4_6;
@@ -2016,7 +2087,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[2..4].copy_from_slice(&current_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_HIGH_SPEED_BASE, data).unwrap();
         let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
         let torque = feedback.torque(None);
         assert!((torque - 1.18125).abs() < 0.0001);
@@ -2069,7 +2140,7 @@ mod tests {
         data[4..6].copy_from_slice(&torque_val.to_be_bytes());
         data[6] = status_byte;
 
-        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
+        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw() as u32, data).unwrap();
         let feedback = GripperFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.travel_raw(), 50000);
@@ -2082,14 +2153,14 @@ mod tests {
 
     #[test]
     fn test_gripper_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = GripperFeedback::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_gripper_feedback_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &[0; 4]);
+        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw() as u32, [0; 4]).unwrap();
         let result = GripperFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -2167,7 +2238,7 @@ mod tests {
         data[5] = status_byte;
         data[6..8].copy_from_slice(&bus_current_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_LOW_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_LOW_SPEED_BASE, data).unwrap();
         let feedback = JointDriverLowSpeedFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.joint_index, 1);
@@ -2190,7 +2261,7 @@ mod tests {
             data[4] = 50; // 50℃
             data[5] = 0x40; // Bit 6=使能
 
-            let frame = PiperFrame::new_standard(id as u16, &data);
+            let frame = PiperFrame::new_standard(id, data).unwrap();
             let feedback = JointDriverLowSpeedFeedback::try_from(frame).unwrap();
             assert_eq!(feedback.joint_index, i);
         }
@@ -2205,7 +2276,7 @@ mod tests {
         data[5] = 0x40; // Bit 6=使能
         data[6..8].copy_from_slice(&5000u16.to_be_bytes()); // 5.0A
 
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_LOW_SPEED_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_LOW_SPEED_BASE, data).unwrap();
         let feedback = JointDriverLowSpeedFeedback::try_from(frame).unwrap();
 
         assert!((feedback.voltage() - 24.0).abs() < 0.01);
@@ -2216,14 +2287,14 @@ mod tests {
 
     #[test]
     fn test_joint_driver_low_speed_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = JointDriverLowSpeedFeedback::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_joint_driver_low_speed_feedback_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_LOW_SPEED_BASE as u16, &[0; 4]);
+        let frame = PiperFrame::new_standard(ID_JOINT_DRIVER_LOW_SPEED_BASE, [0; 4]).unwrap();
         let result = JointDriverLowSpeedFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -2246,7 +2317,7 @@ mod tests {
         data[4..6].copy_from_slice(&linear_accel.to_be_bytes());
         data[6..8].copy_from_slice(&angular_accel.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE, data).unwrap();
         let feedback = JointEndVelocityAccelFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.joint_index, 1);
@@ -2267,7 +2338,7 @@ mod tests {
             data[4..6].copy_from_slice(&3000u16.to_be_bytes());
             data[6..8].copy_from_slice(&4000u16.to_be_bytes());
 
-            let frame = PiperFrame::new_standard(id as u16, &data);
+            let frame = PiperFrame::new_standard(id, data).unwrap();
             let feedback = JointEndVelocityAccelFeedback::try_from(frame).unwrap();
             assert_eq!(feedback.joint_index, i);
         }
@@ -2281,7 +2352,7 @@ mod tests {
         data[4..6].copy_from_slice(&3000u16.to_be_bytes()); // 3.0 m/s²
         data[6..8].copy_from_slice(&4000u16.to_be_bytes()); // 4.0 rad/s²
 
-        let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE, data).unwrap();
         let feedback = JointEndVelocityAccelFeedback::try_from(frame).unwrap();
 
         assert!((feedback.linear_velocity() - 1.0).abs() < 0.0001);
@@ -2294,7 +2365,7 @@ mod tests {
     fn test_joint_end_velocity_accel_feedback_zero() {
         // 测试零值
         let data = [0u8; 8];
-        let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE as u16, &data);
+        let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE, data).unwrap();
         let feedback = JointEndVelocityAccelFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.linear_velocity_m_s_raw, 0);
@@ -2307,7 +2378,7 @@ mod tests {
 
     #[test]
     fn test_joint_end_velocity_accel_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = JointEndVelocityAccelFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -2315,7 +2386,7 @@ mod tests {
     #[test]
     fn test_joint_end_velocity_accel_feedback_invalid_length() {
         // 测试长度不足（需要 8 字节）
-        let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE as u16, &[0; 7]);
+        let frame = PiperFrame::new_standard(ID_JOINT_END_VELOCITY_ACCEL_BASE, [0; 7]).unwrap();
         let result = JointEndVelocityAccelFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -2377,12 +2448,12 @@ impl TryFrom<PiperFrame> for FirmwareReadFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_FIRMWARE_READ {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_FIRMWARE_READ) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度（至少需要 1 字节，最多 8 字节）
-        if frame.len == 0 {
+        if frame.dlc() == 0 {
             return Err(ProtocolError::InvalidLength {
                 expected: 1,
                 actual: 0,
@@ -2390,8 +2461,8 @@ impl TryFrom<PiperFrame> for FirmwareReadFeedback {
         }
 
         let mut firmware_data = [0u8; 8];
-        let copy_len = (frame.len as usize).min(8);
-        firmware_data[..copy_len].copy_from_slice(&frame.data[..copy_len]);
+        let copy_len = (frame.dlc() as usize).min(8);
+        firmware_data[..copy_len].copy_from_slice(&frame.data()[..copy_len]);
 
         Ok(Self { firmware_data })
     }
@@ -2405,7 +2476,7 @@ mod firmware_read_tests {
     fn test_firmware_read_feedback_parse() {
         // 测试数据：包含 "S-V1.6-3" 版本字符串
         let data = b"S-V1.6-3";
-        let frame = PiperFrame::new_standard(ID_FIRMWARE_READ as u16, data);
+        let frame = PiperFrame::new_standard(ID_FIRMWARE_READ.raw() as u32, data).unwrap();
         let feedback = FirmwareReadFeedback::try_from(frame).unwrap();
 
         assert_eq!(&feedback.firmware_data[..8], data);
@@ -2460,14 +2531,14 @@ mod firmware_read_tests {
 
     #[test]
     fn test_firmware_read_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = FirmwareReadFeedback::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_firmware_read_feedback_empty_data() {
-        let frame = PiperFrame::new_standard(ID_FIRMWARE_READ as u16, &[]);
+        let frame = PiperFrame::new_standard(ID_FIRMWARE_READ.raw() as u32, []).unwrap();
         let result = FirmwareReadFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -2498,25 +2569,25 @@ impl TryFrom<PiperFrame> for ControlModeCommandFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_CONTROL_MODE {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_CONTROL_MODE) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 6 {
+        if frame.dlc() < 6 {
             return Err(ProtocolError::InvalidLength {
                 expected: 6,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         Ok(Self {
-            control_mode: ControlModeCommand::try_from(frame.data[0])?,
-            move_mode: MoveMode::from(frame.data[1]),
-            speed_percent: frame.data[2],
-            mit_mode: MitMode::try_from(frame.data[3])?,
-            trajectory_stay_time: frame.data[4],
-            install_position: InstallPosition::try_from(frame.data[5])?,
+            control_mode: ControlModeCommand::try_from(frame.data()[0])?,
+            move_mode: MoveMode::from(frame.data()[1]),
+            speed_percent: frame.data()[2],
+            mit_mode: MitMode::try_from(frame.data()[3])?,
+            trajectory_stay_time: frame.data()[4],
+            install_position: InstallPosition::try_from(frame.data()[5])?,
         })
     }
 }
@@ -2566,21 +2637,31 @@ impl TryFrom<PiperFrame> for JointControl12Feedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        if frame.id != ID_JOINT_CONTROL_12 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_JOINT_CONTROL_12) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
-        let j1_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j1_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let j1_deg = bytes_to_i32_be(j1_bytes);
 
-        let j2_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j2_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let j2_deg = bytes_to_i32_be(j2_bytes);
 
         Ok(Self { j1_deg, j2_deg })
@@ -2598,21 +2679,31 @@ impl TryFrom<PiperFrame> for JointControl34Feedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        if frame.id != ID_JOINT_CONTROL_34 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_JOINT_CONTROL_34) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
-        let j3_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j3_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let j3_deg = bytes_to_i32_be(j3_bytes);
 
-        let j4_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j4_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let j4_deg = bytes_to_i32_be(j4_bytes);
 
         Ok(Self { j3_deg, j4_deg })
@@ -2630,21 +2721,31 @@ impl TryFrom<PiperFrame> for JointControl56Feedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        if frame.id != ID_JOINT_CONTROL_56 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_JOINT_CONTROL_56) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
-        let j5_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let j5_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let j5_deg = bytes_to_i32_be(j5_bytes);
 
-        let j6_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+        let j6_bytes = [
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ];
         let j6_deg = bytes_to_i32_be(j6_bytes);
 
         Ok(Self { j5_deg, j6_deg })
@@ -2666,28 +2767,33 @@ impl TryFrom<PiperFrame> for GripperControlFeedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        if frame.id != ID_GRIPPER_CONTROL {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_GRIPPER_CONTROL) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
-        let travel_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let travel_bytes = [
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ];
         let travel_mm = bytes_to_i32_be(travel_bytes);
 
-        let torque_bytes = [frame.data[4], frame.data[5]];
+        let torque_bytes = [frame.data()[4], frame.data()[5]];
         let torque_nm = bytes_to_i16_be(torque_bytes);
 
         Ok(Self {
             travel_mm,
             torque_nm,
-            status_code: frame.data[6],
-            set_zero: frame.data[7],
+            status_code: frame.data()[6],
+            set_zero: frame.data()[7],
         })
     }
 }

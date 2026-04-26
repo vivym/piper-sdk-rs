@@ -2,9 +2,8 @@
 //!
 //! 包含配置查询和设置指令的结构体，以及配置反馈帧。
 
-use crate::can::PiperFrame;
 use crate::diagnostics::{DecodeResult, ProtocolDiagnostic, TypedFrame};
-use crate::{ProtocolError, bytes_to_i16_be, i16_to_bytes_be, ids::raw::*};
+use crate::{CanData, PiperFrame, ProtocolError, bytes_to_i16_be, i16_to_bytes_be, ids::*};
 
 // ============================================================================
 // 随动主从模式设置指令
@@ -138,19 +137,18 @@ impl MasterSlaveModeCommand {
         data[3] = self.target_id_offset as u8;
         // Byte 4-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_MASTER_SLAVE_MODE as u16, &data)
+        PiperFrame::standard(ID_MASTER_SLAVE_MODE, CanData::from_array(data))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::can::PiperFrame;
     use crate::diagnostics::{DecodeResult, ProtocolDiagnostic};
 
     #[test]
     fn decode_collision_protection_out_of_range_returns_diagnostic() {
-        let frame = PiperFrame::new_standard(0x47B, &[255, 0, 0, 0, 0, 0, 0, 0]);
+        let frame = PiperFrame::new_standard(0x47B, [255, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         match decode_collision_protection_feedback(frame) {
             DecodeResult::Diagnostic(ProtocolDiagnostic::OutOfRange { field, .. }) => {
                 assert_eq!(field, "collision_protection_level");
@@ -161,7 +159,8 @@ mod tests {
 
     #[test]
     fn decode_motor_limit_valid_frame_returns_data() {
-        let frame = PiperFrame::new_standard(0x473, &[1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]);
+        let frame =
+            PiperFrame::new_standard(0x473, [1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]).unwrap();
         assert!(matches!(
             decode_motor_limit_feedback(frame),
             DecodeResult::Data(_)
@@ -170,7 +169,7 @@ mod tests {
 
     #[test]
     fn decode_motor_limit_malformed_joint_index_returns_diagnostic() {
-        let frame = PiperFrame::new_standard(0x473, &[7, 0, 0, 0, 0, 0, 0, 0]);
+        let frame = PiperFrame::new_standard(0x473, [7, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         match decode_motor_limit_feedback(frame) {
             DecodeResult::Diagnostic(ProtocolDiagnostic::OutOfRange {
                 field,
@@ -189,7 +188,7 @@ mod tests {
 
     #[test]
     fn decode_motor_limit_invalid_length_returns_diagnostic() {
-        let frame = PiperFrame::new_standard(0x473, &[1, 2, 3, 4]);
+        let frame = PiperFrame::new_standard(0x473, [1, 2, 3, 4]).unwrap();
         match decode_motor_limit_feedback(frame) {
             DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
                 can_id,
@@ -206,7 +205,8 @@ mod tests {
 
     #[test]
     fn decode_motor_limit_mismatched_can_id_returns_ignore() {
-        let frame = PiperFrame::new_standard(0x999, &[1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]);
+        let frame =
+            PiperFrame::new_standard(0x700, [1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]).unwrap();
         assert!(matches!(
             decode_motor_limit_feedback(frame),
             DecodeResult::Ignore
@@ -215,9 +215,9 @@ mod tests {
 
     #[test]
     fn decode_motor_limit_propagates_hardware_timestamp() {
-        let mut frame =
-            PiperFrame::new_standard(0x473, &[1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]);
-        frame.timestamp_us = 123_456;
+        let frame =
+            PiperFrame::new_standard(0x473, [1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]).unwrap();
+        let frame = frame.with_timestamp_us(123_456);
 
         match decode_motor_limit_feedback(frame) {
             DecodeResult::Data(typed) => {
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn decode_collision_protection_invalid_length_returns_diagnostic() {
-        let frame = PiperFrame::new_standard(0x47B, &[1, 2, 3, 4, 5]);
+        let frame = PiperFrame::new_standard(0x47B, [1, 2, 3, 4, 5]).unwrap();
         match decode_collision_protection_feedback(frame) {
             DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
                 can_id,
@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn decode_collision_protection_propagates_hardware_timestamp() {
-        let mut frame = PiperFrame::new_standard(0x47B, &[1, 2, 3, 4, 5, 6, 0, 0]);
-        frame.timestamp_us = 654_321;
+        let frame = PiperFrame::new_standard(0x47B, [1, 2, 3, 4, 5, 6, 0, 0]).unwrap();
+        let frame = frame.with_timestamp_us(654_321);
 
         match decode_collision_protection_feedback(frame) {
             DecodeResult::Data(typed) => {
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn decode_collision_protection_mismatched_can_id_returns_ignore() {
-        let frame = PiperFrame::new_standard(0x999, &[1, 2, 3, 4, 5, 6, 0, 0]);
+        let frame = PiperFrame::new_standard(0x700, [1, 2, 3, 4, 5, 6, 0, 0]).unwrap();
         assert!(matches!(
             decode_collision_protection_feedback(frame),
             DecodeResult::Ignore
@@ -320,12 +320,12 @@ mod tests {
         );
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_MASTER_SLAVE_MODE);
-        assert_eq!(frame.data[0], 0xFA); // TeachInputArm
-        assert_eq!(frame.data[1], 0x10); // Offset2Bx
-        assert_eq!(frame.data[2], 0x10); // Offset16x
-        assert_eq!(frame.data[3], 0x10); // Offset16x
-        assert_eq!(frame.data[4], 0x00); // 保留
+        assert_eq!(frame.id().as_standard(), Some(ID_MASTER_SLAVE_MODE));
+        assert_eq!(frame.data()[0], 0xFA); // TeachInputArm
+        assert_eq!(frame.data()[1], 0x10); // Offset2Bx
+        assert_eq!(frame.data()[2], 0x10); // Offset16x
+        assert_eq!(frame.data()[3], 0x10); // Offset16x
+        assert_eq!(frame.data()[4], 0x00); // 保留
     }
 
     #[test]
@@ -333,12 +333,12 @@ mod tests {
         let cmd = MasterSlaveModeCommand::set_motion_output_arm();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_MASTER_SLAVE_MODE);
-        assert_eq!(frame.data[0], 0xFC); // MotionOutputArm
-        assert_eq!(frame.data[1], 0x00); // None
-        assert_eq!(frame.data[2], 0x00); // None
-        assert_eq!(frame.data[3], 0x00); // None
-        assert_eq!(frame.data[4..], [0, 0, 0, 0]); // 8-byte zero padding
+        assert_eq!(frame.id().as_standard(), Some(ID_MASTER_SLAVE_MODE));
+        assert_eq!(frame.data()[0], 0xFC); // MotionOutputArm
+        assert_eq!(frame.data()[1], 0x00); // None
+        assert_eq!(frame.data()[2], 0x00); // None
+        assert_eq!(frame.data()[3], 0x00); // None
+        assert_eq!(frame.data()[4..], [0, 0, 0, 0]); // 8-byte zero padding
     }
 }
 
@@ -401,7 +401,7 @@ impl QueryMotorLimitCommand {
         data[1] = self.query_type as u8;
         // Byte 2-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_QUERY_MOTOR_LIMIT as u16, &data)
+        PiperFrame::standard(ID_QUERY_MOTOR_LIMIT, CanData::from_array(data))
     }
 }
 
@@ -441,31 +441,31 @@ impl TryFrom<PiperFrame> for MotorLimitFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_MOTOR_LIMIT_FEEDBACK {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_MOTOR_LIMIT_FEEDBACK) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 7 {
+        if frame.dlc() < 7 {
             return Err(ProtocolError::InvalidLength {
                 expected: 7,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
-        let joint_index = frame.data[0];
+        let joint_index = frame.data()[0];
         if !(1..=6).contains(&joint_index) {
             return Err(ProtocolError::InvalidJointIndex { joint_index });
         }
 
         // 大端字节序
-        let max_angle_bytes = [frame.data[1], frame.data[2]];
+        let max_angle_bytes = [frame.data()[1], frame.data()[2]];
         let max_angle_deg = bytes_to_i16_be(max_angle_bytes);
 
-        let min_angle_bytes = [frame.data[3], frame.data[4]];
+        let min_angle_bytes = [frame.data()[3], frame.data()[4]];
         let min_angle_deg = bytes_to_i16_be(min_angle_bytes);
 
-        let max_velocity_bytes = [frame.data[5], frame.data[6]];
+        let max_velocity_bytes = [frame.data()[5], frame.data()[6]];
         let max_velocity_rad_s = u16::from_be_bytes(max_velocity_bytes);
 
         Ok(Self {
@@ -479,13 +479,13 @@ impl TryFrom<PiperFrame> for MotorLimitFeedback {
 
 /// 解码电机限制反馈帧，返回结构化数据或协议诊断。
 pub fn decode_motor_limit_feedback(frame: PiperFrame) -> DecodeResult<MotorLimitFeedback> {
-    if frame.id != ID_MOTOR_LIMIT_FEEDBACK {
+    if frame.id().as_standard() != Some(ID_MOTOR_LIMIT_FEEDBACK) {
         return DecodeResult::Ignore;
     }
 
-    let can_id = frame.id;
-    let timestamp_us = frame.timestamp_us;
-    let actual = frame.len as usize;
+    let can_id = frame.raw_id();
+    let timestamp_us = frame.timestamp_us();
+    let actual = frame.dlc() as usize;
 
     if actual < 7 {
         return DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
@@ -545,9 +545,9 @@ mod motor_limit_tests {
         let cmd = QueryMotorLimitCommand::query_angle_and_max_velocity(1);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_QUERY_MOTOR_LIMIT);
-        assert_eq!(frame.data[0], 1);
-        assert_eq!(frame.data[1], 0x01); // AngleAndMaxVelocity
+        assert_eq!(frame.id().as_standard(), Some(ID_QUERY_MOTOR_LIMIT));
+        assert_eq!(frame.data()[0], 1);
+        assert_eq!(frame.data()[1], 0x01); // AngleAndMaxVelocity
     }
 
     #[test]
@@ -555,9 +555,9 @@ mod motor_limit_tests {
         let cmd = QueryMotorLimitCommand::query_max_acceleration(2);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_QUERY_MOTOR_LIMIT);
-        assert_eq!(frame.data[0], 2);
-        assert_eq!(frame.data[1], 0x02); // MaxAcceleration
+        assert_eq!(frame.id().as_standard(), Some(ID_QUERY_MOTOR_LIMIT));
+        assert_eq!(frame.data()[0], 2);
+        assert_eq!(frame.data()[1], 0x02); // MaxAcceleration
     }
 
     #[test]
@@ -576,7 +576,7 @@ mod motor_limit_tests {
         data[3..5].copy_from_slice(&min_angle_val.to_be_bytes());
         data[5..7].copy_from_slice(&max_velocity_val.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_MOTOR_LIMIT_FEEDBACK as u16, &data);
+        let frame = PiperFrame::standard(ID_MOTOR_LIMIT_FEEDBACK, CanData::from_array(data));
         let feedback = MotorLimitFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.joint_index, 1);
@@ -590,14 +590,14 @@ mod motor_limit_tests {
 
     #[test]
     fn test_motor_limit_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = MotorLimitFeedback::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_motor_limit_feedback_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_MOTOR_LIMIT_FEEDBACK as u16, &[0; 4]);
+        let frame = PiperFrame::new_standard(ID_MOTOR_LIMIT_FEEDBACK.raw() as u32, [0; 4]).unwrap();
         let result = MotorLimitFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -664,7 +664,7 @@ impl SetMotorLimitCommand {
         };
         data[5..7].copy_from_slice(&max_velocity_bytes);
 
-        PiperFrame::new_standard(ID_SET_MOTOR_LIMIT as u16, &data)
+        PiperFrame::standard(ID_SET_MOTOR_LIMIT, CanData::from_array(data))
     }
 }
 
@@ -691,13 +691,13 @@ mod set_motor_limit_tests {
         let cmd = SetMotorLimitCommand::new(1, Some(180.0), Some(-180.0), Some(0.5));
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_SET_MOTOR_LIMIT);
-        assert_eq!(frame.data[0], 1);
+        assert_eq!(frame.id().as_standard(), Some(ID_SET_MOTOR_LIMIT));
+        assert_eq!(frame.data()[0], 1);
 
         // 验证大端字节序
-        let max_angle = i16::from_be_bytes([frame.data[1], frame.data[2]]);
-        let min_angle = i16::from_be_bytes([frame.data[3], frame.data[4]]);
-        let max_velocity = u16::from_be_bytes([frame.data[5], frame.data[6]]);
+        let max_angle = i16::from_be_bytes([frame.data()[1], frame.data()[2]]);
+        let min_angle = i16::from_be_bytes([frame.data()[3], frame.data()[4]]);
+        let max_velocity = u16::from_be_bytes([frame.data()[5], frame.data()[6]]);
         assert_eq!(max_angle, 1800);
         assert_eq!(min_angle, -1800);
         assert_eq!(max_velocity, 500);
@@ -710,12 +710,12 @@ mod set_motor_limit_tests {
         let frame = cmd.to_frame();
 
         // 验证无效值编码为 0x7FFF
-        assert_eq!(frame.data[1], 0x7F);
-        assert_eq!(frame.data[2], 0xFF);
-        assert_eq!(frame.data[3], 0x7F);
-        assert_eq!(frame.data[4], 0xFF);
-        assert_eq!(frame.data[5], 0x7F);
-        assert_eq!(frame.data[6], 0xFF);
+        assert_eq!(frame.data()[1], 0x7F);
+        assert_eq!(frame.data()[2], 0xFF);
+        assert_eq!(frame.data()[3], 0x7F);
+        assert_eq!(frame.data()[4], 0xFF);
+        assert_eq!(frame.data()[5], 0x7F);
+        assert_eq!(frame.data()[6], 0xFF);
     }
 
     #[test]
@@ -729,9 +729,9 @@ mod set_motor_limit_tests {
         );
         let frame = cmd.to_frame();
 
-        let max_angle = i16::from_be_bytes([frame.data[1], frame.data[2]]);
-        let min_angle = i16::from_be_bytes([frame.data[3], frame.data[4]]);
-        let max_velocity = u16::from_be_bytes([frame.data[5], frame.data[6]]);
+        let max_angle = i16::from_be_bytes([frame.data()[1], frame.data()[2]]);
+        let min_angle = i16::from_be_bytes([frame.data()[3], frame.data()[4]]);
+        let max_velocity = u16::from_be_bytes([frame.data()[5], frame.data()[6]]);
 
         assert_eq!(max_angle, 900);
         assert_eq!(min_angle, 0x7FFF); // 无效值
@@ -811,7 +811,7 @@ impl JointSettingCommand {
         data[5] = if self.clear_error { 0xAE } else { 0x00 };
         // Byte 6-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_JOINT_SETTING as u16, &data)
+        PiperFrame::standard(ID_JOINT_SETTING, CanData::from_array(data))
     }
 }
 
@@ -824,11 +824,11 @@ mod joint_setting_tests {
         let cmd = JointSettingCommand::set_zero_point(1);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_JOINT_SETTING);
-        assert_eq!(frame.data[0], 1);
-        assert_eq!(frame.data[1], 0xAE); // 设置零点
-        assert_eq!(frame.data[2], 0x00);
-        assert_eq!(frame.data[5], 0x00);
+        assert_eq!(frame.id().as_standard(), Some(ID_JOINT_SETTING));
+        assert_eq!(frame.data()[0], 1);
+        assert_eq!(frame.data()[1], 0xAE); // 设置零点
+        assert_eq!(frame.data()[2], 0x00);
+        assert_eq!(frame.data()[5], 0x00);
     }
 
     #[test]
@@ -836,12 +836,12 @@ mod joint_setting_tests {
         let cmd = JointSettingCommand::set_acceleration(2, 10.0); // 10.0 rad/s²
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_JOINT_SETTING);
-        assert_eq!(frame.data[0], 2);
-        assert_eq!(frame.data[1], 0x00);
-        assert_eq!(frame.data[2], 0xAE); // 加速度参数生效
+        assert_eq!(frame.id().as_standard(), Some(ID_JOINT_SETTING));
+        assert_eq!(frame.data()[0], 2);
+        assert_eq!(frame.data()[1], 0x00);
+        assert_eq!(frame.data()[2], 0xAE); // 加速度参数生效
 
-        let max_accel = u16::from_be_bytes([frame.data[3], frame.data[4]]);
+        let max_accel = u16::from_be_bytes([frame.data()[3], frame.data()[4]]);
         assert_eq!(max_accel, 1000); // 10.0 * 100 = 1000
     }
 
@@ -850,11 +850,11 @@ mod joint_setting_tests {
         let cmd = JointSettingCommand::clear_error(3);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_JOINT_SETTING);
-        assert_eq!(frame.data[0], 3);
-        assert_eq!(frame.data[1], 0x00);
-        assert_eq!(frame.data[2], 0x00);
-        assert_eq!(frame.data[5], 0xAE); // 清除错误
+        assert_eq!(frame.id().as_standard(), Some(ID_JOINT_SETTING));
+        assert_eq!(frame.data()[0], 3);
+        assert_eq!(frame.data()[1], 0x00);
+        assert_eq!(frame.data()[2], 0x00);
+        assert_eq!(frame.data()[5], 0xAE); // 清除错误
     }
 
     #[test]
@@ -862,7 +862,7 @@ mod joint_setting_tests {
         // 测试全部关节（joint_index = 7）
         let cmd = JointSettingCommand::set_zero_point(7);
         let frame = cmd.to_frame();
-        assert_eq!(frame.data[0], 7);
+        assert_eq!(frame.data()[0], 7);
     }
 
     #[test]
@@ -873,8 +873,8 @@ mod joint_setting_tests {
         let frame = cmd.to_frame();
 
         // 验证无效值编码为 0x7FFF
-        assert_eq!(frame.data[3], 0x7F);
-        assert_eq!(frame.data[4], 0xFF);
+        assert_eq!(frame.data()[3], 0x7F);
+        assert_eq!(frame.data()[4], 0xFF);
     }
 }
 
@@ -978,34 +978,34 @@ impl TryFrom<PiperFrame> for SettingResponse {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_SETTING_RESPONSE {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_SETTING_RESPONSE) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度（至少需要 8 字节）
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
-        let response_index = frame.data[0];
-        let zero_point_success = frame.data[1] == 0x01;
-        let trajectory_index = frame.data[2];
+        let response_index = frame.data()[0];
+        let zero_point_success = frame.data()[1] == 0x01;
+        let trajectory_index = frame.data()[2];
 
         // Byte 3: 轨迹包传输完成应答（仅在轨迹传输应答时有效）
         let pack_complete_status = if response_index == 0x50 {
-            Some(TrajectoryPackCompleteStatus::from(frame.data[3]))
+            Some(TrajectoryPackCompleteStatus::from(frame.data()[3]))
         } else {
             None
         };
 
         // Byte 4-5: NameIndex（大端字节序）
-        let name_index = u16::from_be_bytes([frame.data[4], frame.data[5]]);
+        let name_index = u16::from_be_bytes([frame.data()[4], frame.data()[5]]);
 
         // Byte 6-7: CRC16（大端字节序）
-        let crc16 = u16::from_be_bytes([frame.data[6], frame.data[7]]);
+        let crc16 = u16::from_be_bytes([frame.data()[6], frame.data()[7]]);
 
         Ok(Self {
             response_index,
@@ -1029,7 +1029,7 @@ mod setting_response_tests {
         data[0] = 0x71; // 0x471 的最后一个字节
         data[1] = 0x00; // 不是零点设置
 
-        let frame = PiperFrame::new_standard(ID_SETTING_RESPONSE as u16, &data);
+        let frame = PiperFrame::standard(ID_SETTING_RESPONSE, CanData::from_array(data));
         let response = SettingResponse::try_from(frame).unwrap();
 
         assert_eq!(response.response_index, 0x71);
@@ -1045,7 +1045,7 @@ mod setting_response_tests {
         data[0] = 0x75; // 0x475 关节设置指令的最后一个字节
         data[1] = 0x01; // 零点设置成功
 
-        let frame = PiperFrame::new_standard(ID_SETTING_RESPONSE as u16, &data);
+        let frame = PiperFrame::standard(ID_SETTING_RESPONSE, CanData::from_array(data));
         let response = SettingResponse::try_from(frame).unwrap();
 
         assert_eq!(response.response_index, 0x75);
@@ -1065,7 +1065,7 @@ mod setting_response_tests {
         data[6] = 0x56; // CRC16_H
         data[7] = 0x78; // CRC16_L
 
-        let frame = PiperFrame::new_standard(ID_SETTING_RESPONSE as u16, &data);
+        let frame = PiperFrame::standard(ID_SETTING_RESPONSE, CanData::from_array(data));
         let response = SettingResponse::try_from(frame).unwrap();
 
         assert_eq!(response.response_index, 0x50);
@@ -1089,7 +1089,7 @@ mod setting_response_tests {
         data[2] = 10; // 轨迹点索引
         data[3] = 0xEE; // 校验失败
 
-        let frame = PiperFrame::new_standard(ID_SETTING_RESPONSE as u16, &data);
+        let frame = PiperFrame::standard(ID_SETTING_RESPONSE, CanData::from_array(data));
         let response = SettingResponse::try_from(frame).unwrap();
 
         assert_eq!(
@@ -1100,14 +1100,14 @@ mod setting_response_tests {
 
     #[test]
     fn test_setting_response_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = SettingResponse::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_setting_response_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_SETTING_RESPONSE as u16, &[0; 2]);
+        let frame = PiperFrame::new_standard(ID_SETTING_RESPONSE.raw() as u32, [0; 2]).unwrap();
         let result = SettingResponse::try_from(frame);
         assert!(result.is_err());
     }
@@ -1305,9 +1305,9 @@ impl ParameterQuerySetCommand {
         data[4] = self.end_load as u8;
         // Byte 5-7: 保留，已初始化为 0
 
-        Ok(PiperFrame::new_standard(
-            ID_PARAMETER_QUERY_SET as u16,
-            &data,
+        Ok(PiperFrame::standard(
+            ID_PARAMETER_QUERY_SET,
+            CanData::from_array(data),
         ))
     }
 }
@@ -1353,9 +1353,9 @@ mod parameter_query_set_tests {
         let cmd = ParameterQuerySetCommand::query(ParameterQueryType::EndVelocityAccel);
         let frame = cmd.to_frame().unwrap();
 
-        assert_eq!(frame.id, ID_PARAMETER_QUERY_SET);
-        assert_eq!(frame.data[0], 0x01); // EndVelocityAccel
-        assert_eq!(frame.data[1], 0x00); // 不设置
+        assert_eq!(frame.id().as_standard(), Some(ID_PARAMETER_QUERY_SET));
+        assert_eq!(frame.data()[0], 0x01); // EndVelocityAccel
+        assert_eq!(frame.data()[1], 0x00); // 不设置
     }
 
     #[test]
@@ -1363,9 +1363,9 @@ mod parameter_query_set_tests {
         let cmd = ParameterQuerySetCommand::set(ParameterSetType::AllJointLimitsToDefault);
         let frame = cmd.to_frame().unwrap();
 
-        assert_eq!(frame.id, ID_PARAMETER_QUERY_SET);
-        assert_eq!(frame.data[0], 0x00); // 不查询
-        assert_eq!(frame.data[1], 0x02); // AllJointLimitsToDefault
+        assert_eq!(frame.id().as_standard(), Some(ID_PARAMETER_QUERY_SET));
+        assert_eq!(frame.data()[0], 0x00); // 不查询
+        assert_eq!(frame.data()[1], 0x02); // AllJointLimitsToDefault
     }
 
     #[test]
@@ -1431,10 +1431,10 @@ mod parameter_query_set_tests {
             .with_feedback_48x(Feedback48XSetting::Enable);
         let frame = cmd.to_frame().unwrap();
 
-        assert_eq!(frame.id, ID_PARAMETER_QUERY_SET);
-        assert_eq!(frame.data[0], 0x01); // EndVelocityAccel
-        assert_eq!(frame.data[1], 0x00); // 不设置
-        assert_eq!(frame.data[2], 0x01); // Enable
+        assert_eq!(frame.id().as_standard(), Some(ID_PARAMETER_QUERY_SET));
+        assert_eq!(frame.data()[0], 0x01); // EndVelocityAccel
+        assert_eq!(frame.data()[1], 0x00); // 不设置
+        assert_eq!(frame.data()[2], 0x01); // Enable
     }
 
     #[test]
@@ -1443,11 +1443,11 @@ mod parameter_query_set_tests {
             .with_end_load(EndLoadSetting::FullLoad);
         let frame = cmd.to_frame().unwrap();
 
-        assert_eq!(frame.id, ID_PARAMETER_QUERY_SET);
-        assert_eq!(frame.data[0], 0x00); // 不查询
-        assert_eq!(frame.data[1], 0x01); // EndVelocityAccelToDefault
-        assert_eq!(frame.data[3], 0xAE); // 负载参数生效
-        assert_eq!(frame.data[4], 0x02); // FullLoad
+        assert_eq!(frame.id().as_standard(), Some(ID_PARAMETER_QUERY_SET));
+        assert_eq!(frame.data()[0], 0x00); // 不查询
+        assert_eq!(frame.data()[1], 0x01); // EndVelocityAccelToDefault
+        assert_eq!(frame.data()[3], 0xAE); // 负载参数生效
+        assert_eq!(frame.data()[4], 0x02); // FullLoad
     }
 }
 
@@ -1497,23 +1497,23 @@ impl TryFrom<PiperFrame> for EndVelocityAccelFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_END_VELOCITY_ACCEL_FEEDBACK {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_END_VELOCITY_ACCEL_FEEDBACK) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         // 大端字节序
-        let max_linear_velocity = u16::from_be_bytes([frame.data[0], frame.data[1]]);
-        let max_angular_velocity = u16::from_be_bytes([frame.data[2], frame.data[3]]);
-        let max_linear_accel = u16::from_be_bytes([frame.data[4], frame.data[5]]);
-        let max_angular_accel = u16::from_be_bytes([frame.data[6], frame.data[7]]);
+        let max_linear_velocity = u16::from_be_bytes([frame.data()[0], frame.data()[1]]);
+        let max_angular_velocity = u16::from_be_bytes([frame.data()[2], frame.data()[3]]);
+        let max_linear_accel = u16::from_be_bytes([frame.data()[4], frame.data()[5]]);
+        let max_angular_accel = u16::from_be_bytes([frame.data()[6], frame.data()[7]]);
 
         Ok(Self {
             max_linear_velocity,
@@ -1541,7 +1541,7 @@ mod end_velocity_accel_feedback_tests {
         data[4..6].copy_from_slice(&500u16.to_be_bytes());
         data[6..8].copy_from_slice(&1500u16.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_END_VELOCITY_ACCEL_FEEDBACK as u16, &data);
+        let frame = PiperFrame::standard(ID_END_VELOCITY_ACCEL_FEEDBACK, CanData::from_array(data));
         let feedback = EndVelocityAccelFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.max_linear_velocity, 1000);
@@ -1556,14 +1556,15 @@ mod end_velocity_accel_feedback_tests {
 
     #[test]
     fn test_end_velocity_accel_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = EndVelocityAccelFeedback::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_end_velocity_accel_feedback_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_END_VELOCITY_ACCEL_FEEDBACK as u16, &[0; 4]);
+        let frame =
+            PiperFrame::new_standard(ID_END_VELOCITY_ACCEL_FEEDBACK.raw() as u32, [0; 4]).unwrap();
         let result = EndVelocityAccelFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -1638,7 +1639,7 @@ impl SetEndVelocityAccelCommand {
         };
         data[6..8].copy_from_slice(&angular_accel_bytes);
 
-        PiperFrame::new_standard(ID_SET_END_VELOCITY_ACCEL as u16, &data)
+        PiperFrame::standard(ID_SET_END_VELOCITY_ACCEL, CanData::from_array(data))
     }
 }
 
@@ -1665,13 +1666,13 @@ mod set_end_velocity_accel_tests {
         let cmd = SetEndVelocityAccelCommand::new(Some(1.0), Some(2.0), Some(0.5), Some(1.5));
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_SET_END_VELOCITY_ACCEL);
+        assert_eq!(frame.id().as_standard(), Some(ID_SET_END_VELOCITY_ACCEL));
 
         // 验证大端字节序
-        let linear_vel = u16::from_be_bytes([frame.data[0], frame.data[1]]);
-        let angular_vel = u16::from_be_bytes([frame.data[2], frame.data[3]]);
-        let linear_accel = u16::from_be_bytes([frame.data[4], frame.data[5]]);
-        let angular_accel = u16::from_be_bytes([frame.data[6], frame.data[7]]);
+        let linear_vel = u16::from_be_bytes([frame.data()[0], frame.data()[1]]);
+        let angular_vel = u16::from_be_bytes([frame.data()[2], frame.data()[3]]);
+        let linear_accel = u16::from_be_bytes([frame.data()[4], frame.data()[5]]);
+        let angular_accel = u16::from_be_bytes([frame.data()[6], frame.data()[7]]);
 
         assert_eq!(linear_vel, 1000);
         assert_eq!(angular_vel, 2000);
@@ -1686,14 +1687,14 @@ mod set_end_velocity_accel_tests {
         let frame = cmd.to_frame();
 
         // 验证无效值编码为 0x7FFF
-        assert_eq!(frame.data[0], 0x7F);
-        assert_eq!(frame.data[1], 0xFF);
-        assert_eq!(frame.data[2], 0x7F);
-        assert_eq!(frame.data[3], 0xFF);
-        assert_eq!(frame.data[4], 0x7F);
-        assert_eq!(frame.data[5], 0xFF);
-        assert_eq!(frame.data[6], 0x7F);
-        assert_eq!(frame.data[7], 0xFF);
+        assert_eq!(frame.data()[0], 0x7F);
+        assert_eq!(frame.data()[1], 0xFF);
+        assert_eq!(frame.data()[2], 0x7F);
+        assert_eq!(frame.data()[3], 0xFF);
+        assert_eq!(frame.data()[4], 0x7F);
+        assert_eq!(frame.data()[5], 0xFF);
+        assert_eq!(frame.data()[6], 0x7F);
+        assert_eq!(frame.data()[7], 0xFF);
     }
 
     #[test]
@@ -1707,10 +1708,10 @@ mod set_end_velocity_accel_tests {
         );
         let frame = cmd.to_frame();
 
-        let linear_vel = u16::from_be_bytes([frame.data[0], frame.data[1]]);
-        let angular_vel = u16::from_be_bytes([frame.data[2], frame.data[3]]);
-        let linear_accel = u16::from_be_bytes([frame.data[4], frame.data[5]]);
-        let angular_accel = u16::from_be_bytes([frame.data[6], frame.data[7]]);
+        let linear_vel = u16::from_be_bytes([frame.data()[0], frame.data()[1]]);
+        let angular_vel = u16::from_be_bytes([frame.data()[2], frame.data()[3]]);
+        let linear_accel = u16::from_be_bytes([frame.data()[4], frame.data()[5]]);
+        let angular_accel = u16::from_be_bytes([frame.data()[6], frame.data()[7]]);
 
         assert_eq!(linear_vel, 1000);
         assert_eq!(angular_vel, 0x7FFF); // 无效值
@@ -1757,7 +1758,7 @@ impl CollisionProtectionLevelCommand {
         data[0..6].copy_from_slice(&self.levels);
         // Byte 6-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_COLLISION_PROTECTION_LEVEL as u16, &data)
+        PiperFrame::standard(ID_COLLISION_PROTECTION_LEVEL, CanData::from_array(data))
     }
 }
 
@@ -1774,20 +1775,20 @@ impl TryFrom<PiperFrame> for CollisionProtectionLevelFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_COLLISION_PROTECTION_LEVEL_FEEDBACK {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_COLLISION_PROTECTION_LEVEL_FEEDBACK) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 6 {
+        if frame.dlc() < 6 {
             return Err(ProtocolError::InvalidLength {
                 expected: 6,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         let mut levels = [0u8; 6];
-        levels.copy_from_slice(&frame.data[0..6]);
+        levels.copy_from_slice(&frame.data()[0..6]);
 
         Ok(Self { levels })
     }
@@ -1797,13 +1798,13 @@ impl TryFrom<PiperFrame> for CollisionProtectionLevelFeedback {
 pub fn decode_collision_protection_feedback(
     frame: PiperFrame,
 ) -> DecodeResult<CollisionProtectionLevelFeedback> {
-    if frame.id != ID_COLLISION_PROTECTION_LEVEL_FEEDBACK {
+    if frame.id().as_standard() != Some(ID_COLLISION_PROTECTION_LEVEL_FEEDBACK) {
         return DecodeResult::Ignore;
     }
 
-    let can_id = frame.id;
-    let timestamp_us = frame.timestamp_us;
-    let actual = frame.len as usize;
+    let can_id = frame.raw_id();
+    let timestamp_us = frame.timestamp_us();
+    let actual = frame.dlc() as usize;
 
     if actual < 6 {
         return DecodeResult::Diagnostic(ProtocolDiagnostic::InvalidLength {
@@ -1813,7 +1814,7 @@ pub fn decode_collision_protection_feedback(
         });
     }
 
-    for &raw in &frame.data[0..6] {
+    for &raw in &frame.data()[0..6] {
         if raw > 8 {
             return DecodeResult::Diagnostic(ProtocolDiagnostic::OutOfRange {
                 field: "collision_protection_level",
@@ -1872,10 +1873,13 @@ mod collision_protection_tests {
         let cmd = CollisionProtectionLevelCommand::new([1, 2, 3, 4, 5, 6]);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_COLLISION_PROTECTION_LEVEL);
-        assert_eq!(frame.data[0..6], [1, 2, 3, 4, 5, 6]);
-        assert_eq!(frame.data[6], 0x00); // 保留
-        assert_eq!(frame.data[7], 0x00); // 保留
+        assert_eq!(
+            frame.id().as_standard(),
+            Some(ID_COLLISION_PROTECTION_LEVEL)
+        );
+        assert_eq!(frame.data()[0..6], [1, 2, 3, 4, 5, 6]);
+        assert_eq!(frame.data()[6], 0x00); // 保留
+        assert_eq!(frame.data()[7], 0x00); // 保留
     }
 
     #[test]
@@ -1883,7 +1887,10 @@ mod collision_protection_tests {
         let mut data = [0u8; 8];
         data[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
 
-        let frame = PiperFrame::new_standard(ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16, &data);
+        let frame = PiperFrame::standard(
+            ID_COLLISION_PROTECTION_LEVEL_FEEDBACK,
+            CanData::from_array(data),
+        );
         let feedback = CollisionProtectionLevelFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.levels, [1, 2, 3, 4, 5, 6]);
@@ -1891,7 +1898,7 @@ mod collision_protection_tests {
 
     #[test]
     fn test_collision_protection_level_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = CollisionProtectionLevelFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -1899,7 +1906,8 @@ mod collision_protection_tests {
     #[test]
     fn test_collision_protection_level_feedback_invalid_length() {
         let frame =
-            PiperFrame::new_standard(ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16, &[0; 4]);
+            PiperFrame::new_standard(ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw() as u32, [0; 4])
+                .unwrap();
         let result = CollisionProtectionLevelFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -1909,7 +1917,7 @@ mod collision_protection_tests {
         // 测试等级0（不检测碰撞）
         let cmd = CollisionProtectionLevelCommand::all_joints(0);
         let frame = cmd.to_frame();
-        assert_eq!(frame.data[0..6], [0; 6]);
+        assert_eq!(frame.data()[0..6], [0; 6]);
     }
 
     #[test]
@@ -1917,7 +1925,7 @@ mod collision_protection_tests {
         // 测试最大等级8
         let cmd = CollisionProtectionLevelCommand::all_joints(8);
         let frame = cmd.to_frame();
-        assert_eq!(frame.data[0..6], [8; 6]);
+        assert_eq!(frame.data()[0..6], [8; 6]);
     }
 }
 
@@ -1946,20 +1954,20 @@ impl TryFrom<PiperFrame> for MotorMaxAccelFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_MOTOR_MAX_ACCEL_FEEDBACK {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_MOTOR_MAX_ACCEL_FEEDBACK) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 3 {
+        if frame.dlc() < 3 {
             return Err(ProtocolError::InvalidLength {
                 expected: 3,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
-        let joint_index = frame.data[0];
-        let max_accel_bytes = [frame.data[1], frame.data[2]];
+        let joint_index = frame.data()[0];
+        let max_accel_bytes = [frame.data()[1], frame.data()[2]];
         let max_accel_rad_s2 = u16::from_be_bytes(max_accel_bytes);
 
         Ok(Self {
@@ -1982,7 +1990,7 @@ mod motor_max_accel_feedback_tests {
         data[0] = 1;
         data[1..3].copy_from_slice(&10000u16.to_be_bytes());
 
-        let frame = PiperFrame::new_standard(ID_MOTOR_MAX_ACCEL_FEEDBACK as u16, &data);
+        let frame = PiperFrame::standard(ID_MOTOR_MAX_ACCEL_FEEDBACK, CanData::from_array(data));
         let feedback = MotorMaxAccelFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.joint_index, 1);
@@ -1998,7 +2006,8 @@ mod motor_max_accel_feedback_tests {
             data[0] = i;
             data[1..3].copy_from_slice(&5000u16.to_be_bytes());
 
-            let frame = PiperFrame::new_standard(ID_MOTOR_MAX_ACCEL_FEEDBACK as u16, &data);
+            let frame =
+                PiperFrame::standard(ID_MOTOR_MAX_ACCEL_FEEDBACK, CanData::from_array(data));
             let feedback = MotorMaxAccelFeedback::try_from(frame).unwrap();
             assert_eq!(feedback.joint_index, i);
         }
@@ -2006,14 +2015,15 @@ mod motor_max_accel_feedback_tests {
 
     #[test]
     fn test_motor_max_accel_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = MotorMaxAccelFeedback::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_motor_max_accel_feedback_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_MOTOR_MAX_ACCEL_FEEDBACK as u16, &[0; 2]);
+        let frame =
+            PiperFrame::new_standard(ID_MOTOR_MAX_ACCEL_FEEDBACK.raw() as u32, [0; 2]).unwrap();
         let result = MotorMaxAccelFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -2057,7 +2067,7 @@ impl GripperTeachParamsCommand {
         data[2] = self.friction_coeff;
         // Byte 3-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_GRIPPER_TEACH_PARAMS as u16, &data)
+        PiperFrame::standard(ID_GRIPPER_TEACH_PARAMS, CanData::from_array(data))
     }
 }
 
@@ -2077,22 +2087,22 @@ impl TryFrom<PiperFrame> for GripperTeachParamsFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 验证 CAN ID
-        if frame.id != ID_GRIPPER_TEACH_PARAMS_FEEDBACK {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.id().as_standard() != Some(ID_GRIPPER_TEACH_PARAMS_FEEDBACK) {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // 验证数据长度
-        if frame.len < 3 {
+        if frame.dlc() < 3 {
             return Err(ProtocolError::InvalidLength {
                 expected: 3,
-                actual: frame.len as usize,
+                actual: frame.dlc() as usize,
             });
         }
 
         Ok(Self {
-            teach_travel_coeff: frame.data[0],
-            max_travel_limit: frame.data[1],
-            friction_coeff: frame.data[2],
+            teach_travel_coeff: frame.data()[0],
+            max_travel_limit: frame.data()[1],
+            friction_coeff: frame.data()[2],
         })
     }
 }
@@ -2114,11 +2124,11 @@ mod gripper_teach_params_tests {
         let cmd = GripperTeachParamsCommand::new(150, 70, 5);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_GRIPPER_TEACH_PARAMS);
-        assert_eq!(frame.data[0], 150);
-        assert_eq!(frame.data[1], 70);
-        assert_eq!(frame.data[2], 5);
-        assert_eq!(frame.data[3], 0x00); // 保留
+        assert_eq!(frame.id().as_standard(), Some(ID_GRIPPER_TEACH_PARAMS));
+        assert_eq!(frame.data()[0], 150);
+        assert_eq!(frame.data()[1], 70);
+        assert_eq!(frame.data()[2], 5);
+        assert_eq!(frame.data()[3], 0x00); // 保留
     }
 
     #[test]
@@ -2128,7 +2138,8 @@ mod gripper_teach_params_tests {
         data[1] = 70; // 最大控制行程限制值
         data[2] = 5; // 摩擦系数
 
-        let frame = PiperFrame::new_standard(ID_GRIPPER_TEACH_PARAMS_FEEDBACK as u16, &data);
+        let frame =
+            PiperFrame::standard(ID_GRIPPER_TEACH_PARAMS_FEEDBACK, CanData::from_array(data));
         let feedback = GripperTeachParamsFeedback::try_from(frame).unwrap();
 
         assert_eq!(feedback.teach_travel_coeff, 150);
@@ -2138,14 +2149,15 @@ mod gripper_teach_params_tests {
 
     #[test]
     fn test_gripper_teach_params_feedback_invalid_id() {
-        let frame = PiperFrame::new_standard(0x999, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x700, [0; 8]).unwrap();
         let result = GripperTeachParamsFeedback::try_from(frame);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_gripper_teach_params_feedback_invalid_length() {
-        let frame = PiperFrame::new_standard(ID_GRIPPER_TEACH_PARAMS_FEEDBACK as u16, &[0; 2]);
+        let frame = PiperFrame::new_standard(ID_GRIPPER_TEACH_PARAMS_FEEDBACK.raw() as u32, [0; 2])
+            .unwrap();
         let result = GripperTeachParamsFeedback::try_from(frame);
         assert!(result.is_err());
     }
@@ -2207,7 +2219,7 @@ impl FirmwareUpgradeCommand {
     /// 转换为 CAN 帧
     pub fn to_frame(self) -> PiperFrame {
         let data = [self.mode as u8];
-        PiperFrame::new_standard(ID_FIRMWARE_UPGRADE as u16, &data)
+        PiperFrame::standard(ID_FIRMWARE_UPGRADE, CanData::from_exact(data))
     }
 }
 
@@ -2258,9 +2270,9 @@ mod firmware_upgrade_tests {
         let cmd = FirmwareUpgradeCommand::new(FirmwareUpgradeMode::CanUpgradeSilent);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_FIRMWARE_UPGRADE);
-        assert_eq!(frame.len, 1);
-        assert_eq!(frame.data[0], 0x01);
+        assert_eq!(frame.id().as_standard(), Some(ID_FIRMWARE_UPGRADE));
+        assert_eq!(frame.dlc(), 1);
+        assert_eq!(frame.data()[0], 0x01);
     }
 
     #[test]
@@ -2275,8 +2287,8 @@ mod firmware_upgrade_tests {
         for mode in modes.iter() {
             let cmd = FirmwareUpgradeCommand::new(*mode);
             let frame = cmd.to_frame();
-            assert_eq!(frame.id, ID_FIRMWARE_UPGRADE);
-            assert_eq!(frame.data[0], *mode as u8);
+            assert_eq!(frame.id().as_standard(), Some(ID_FIRMWARE_UPGRADE));
+            assert_eq!(frame.data()[0], *mode as u8);
         }
     }
 }
@@ -2310,7 +2322,7 @@ impl FirmwareVersionQueryCommand {
     pub fn to_frame(self) -> PiperFrame {
         // 与 Python SDK 对齐：data = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         let data = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        PiperFrame::new_standard(ID_FIRMWARE_READ as u16, &data)
+        PiperFrame::standard(ID_FIRMWARE_READ, CanData::from_array(data))
     }
 }
 
@@ -2329,10 +2341,10 @@ mod firmware_version_query_tests {
         let cmd = FirmwareVersionQueryCommand::new();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_FIRMWARE_READ);
-        assert_eq!(frame.len, 8);
-        assert_eq!(frame.data[0], 0x01);
-        assert_eq!(frame.data[1..8], [0x00; 7]);
+        assert_eq!(frame.id().as_standard(), Some(ID_FIRMWARE_READ));
+        assert_eq!(frame.dlc(), 8);
+        assert_eq!(frame.data()[0], 0x01);
+        assert_eq!(frame.data()[1..8], [0x00; 7]);
     }
 
     #[test]
@@ -2340,8 +2352,11 @@ mod firmware_version_query_tests {
         let cmd = FirmwareVersionQueryCommand;
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_FIRMWARE_READ);
-        assert_eq!(frame.data, [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(frame.id().as_standard(), Some(ID_FIRMWARE_READ));
+        assert_eq!(
+            frame.data(),
+            [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -2352,6 +2367,6 @@ mod firmware_version_query_tests {
 
         // Python SDK: [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         let expected_data = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert_eq!(frame.data, expected_data);
+        assert_eq!(frame.data(), expected_data);
     }
 }

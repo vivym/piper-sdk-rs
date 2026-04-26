@@ -1,4 +1,4 @@
-error[E0616]: field `id` of struct `piper_protocol::frame::PiperFrame` is private
+error[E0616]: field `id` of struct `PiperFrame` is private
  --> tests/ui/direct_field_access.rs:3:19
   |
 3 |     let _ = frame.id;

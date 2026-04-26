@@ -1,7 +1,6 @@
 //! CAN ID constants and classifiers.
 //!
-//! Public protocol IDs are typed `StandardCanId` values. Raw `u32` aliases are
-//! kept crate-private only while older protocol builders/parsers are migrated.
+//! Public protocol IDs are typed `StandardCanId` values.
 
 pub use crate::frame::JointIndex;
 pub use crate::frame::protocol_ids::*;
@@ -18,63 +17,6 @@ impl FrameType {
     pub fn from_id(id: crate::frame::CanId) -> Self {
         crate::frame::protocol_ids::frame_type_from_id(id)
     }
-}
-
-pub(crate) mod raw {
-    use crate::frame::protocol_ids as typed;
-
-    pub(crate) const ID_ROBOT_STATUS: u32 = typed::ID_ROBOT_STATUS.raw() as u32;
-    pub(crate) const ID_END_POSE_1: u32 = typed::ID_END_POSE_1.raw() as u32;
-    pub(crate) const ID_END_POSE_2: u32 = typed::ID_END_POSE_2.raw() as u32;
-    pub(crate) const ID_END_POSE_3: u32 = typed::ID_END_POSE_3.raw() as u32;
-    pub(crate) const ID_JOINT_FEEDBACK_12: u32 = typed::ID_JOINT_FEEDBACK_12.raw() as u32;
-    pub(crate) const ID_JOINT_FEEDBACK_34: u32 = typed::ID_JOINT_FEEDBACK_34.raw() as u32;
-    pub(crate) const ID_JOINT_FEEDBACK_56: u32 = typed::ID_JOINT_FEEDBACK_56.raw() as u32;
-    pub(crate) const ID_GRIPPER_FEEDBACK: u32 = typed::ID_GRIPPER_FEEDBACK.raw() as u32;
-
-    pub(crate) const ID_JOINT_DRIVER_HIGH_SPEED_BASE: u32 =
-        typed::ID_JOINT_DRIVER_HIGH_SPEED_1.raw() as u32;
-    pub(crate) const ID_JOINT_DRIVER_LOW_SPEED_BASE: u32 =
-        typed::ID_JOINT_DRIVER_LOW_SPEED_1.raw() as u32;
-    pub(crate) const ID_JOINT_END_VELOCITY_ACCEL_BASE: u32 =
-        typed::ID_JOINT_END_VELOCITY_ACCEL_1.raw() as u32;
-
-    pub(crate) const ID_FIRMWARE_READ: u32 = typed::ID_FIRMWARE_READ.raw() as u32;
-
-    pub(crate) const ID_EMERGENCY_STOP: u32 = typed::ID_EMERGENCY_STOP.raw() as u32;
-    pub(crate) const ID_CONTROL_MODE: u32 = typed::ID_CONTROL_MODE.raw() as u32;
-    pub(crate) const ID_END_POSE_CONTROL_1: u32 = typed::ID_END_POSE_CONTROL_1.raw() as u32;
-    pub(crate) const ID_END_POSE_CONTROL_2: u32 = typed::ID_END_POSE_CONTROL_2.raw() as u32;
-    pub(crate) const ID_END_POSE_CONTROL_3: u32 = typed::ID_END_POSE_CONTROL_3.raw() as u32;
-    pub(crate) const ID_JOINT_CONTROL_12: u32 = typed::ID_JOINT_CONTROL_12.raw() as u32;
-    pub(crate) const ID_JOINT_CONTROL_34: u32 = typed::ID_JOINT_CONTROL_34.raw() as u32;
-    pub(crate) const ID_JOINT_CONTROL_56: u32 = typed::ID_JOINT_CONTROL_56.raw() as u32;
-    pub(crate) const ID_ARC_POINT: u32 = typed::ID_ARC_POINT.raw() as u32;
-    pub(crate) const ID_GRIPPER_CONTROL: u32 = typed::ID_GRIPPER_CONTROL.raw() as u32;
-    pub(crate) const ID_MIT_CONTROL_BASE: u32 = typed::ID_MIT_CONTROL_1.raw() as u32;
-    pub(crate) const ID_LIGHT_CONTROL: u32 = typed::ID_LIGHT_CONTROL.raw() as u32;
-    pub(crate) const ID_FIRMWARE_UPGRADE: u32 = typed::ID_FIRMWARE_UPGRADE.raw() as u32;
-
-    pub(crate) const ID_MASTER_SLAVE_MODE: u32 = typed::ID_MASTER_SLAVE_MODE.raw() as u32;
-    pub(crate) const ID_MOTOR_ENABLE: u32 = typed::ID_MOTOR_ENABLE.raw() as u32;
-    pub(crate) const ID_QUERY_MOTOR_LIMIT: u32 = typed::ID_QUERY_MOTOR_LIMIT.raw() as u32;
-    pub(crate) const ID_MOTOR_LIMIT_FEEDBACK: u32 = typed::ID_MOTOR_LIMIT_FEEDBACK.raw() as u32;
-    pub(crate) const ID_SET_MOTOR_LIMIT: u32 = typed::ID_SET_MOTOR_LIMIT.raw() as u32;
-    pub(crate) const ID_JOINT_SETTING: u32 = typed::ID_JOINT_SETTING.raw() as u32;
-    pub(crate) const ID_SETTING_RESPONSE: u32 = typed::ID_SETTING_RESPONSE.raw() as u32;
-    pub(crate) const ID_PARAMETER_QUERY_SET: u32 = typed::ID_PARAMETER_QUERY_SET.raw() as u32;
-    pub(crate) const ID_END_VELOCITY_ACCEL_FEEDBACK: u32 =
-        typed::ID_END_VELOCITY_ACCEL_FEEDBACK.raw() as u32;
-    pub(crate) const ID_SET_END_VELOCITY_ACCEL: u32 = typed::ID_SET_END_VELOCITY_ACCEL.raw() as u32;
-    pub(crate) const ID_COLLISION_PROTECTION_LEVEL: u32 =
-        typed::ID_COLLISION_PROTECTION_LEVEL.raw() as u32;
-    pub(crate) const ID_COLLISION_PROTECTION_LEVEL_FEEDBACK: u32 =
-        typed::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw() as u32;
-    pub(crate) const ID_MOTOR_MAX_ACCEL_FEEDBACK: u32 =
-        typed::ID_MOTOR_MAX_ACCEL_FEEDBACK.raw() as u32;
-    pub(crate) const ID_GRIPPER_TEACH_PARAMS: u32 = typed::ID_GRIPPER_TEACH_PARAMS.raw() as u32;
-    pub(crate) const ID_GRIPPER_TEACH_PARAMS_FEEDBACK: u32 =
-        typed::ID_GRIPPER_TEACH_PARAMS_FEEDBACK.raw() as u32;
 }
 
 #[cfg(test)]

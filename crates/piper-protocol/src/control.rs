@@ -3,10 +3,21 @@
 //! 包含所有控制指令帧的结构体，提供构建控制帧的方法
 //! 和转换为 `PiperFrame` 的方法。
 
-use crate::can::PiperFrame;
-use crate::{ProtocolError, i16_to_bytes_be, i32_to_bytes_be, ids::raw::*};
+use crate::{CanData, PiperFrame, ProtocolError, i16_to_bytes_be, i32_to_bytes_be, ids::*};
 use bilge::prelude::*;
 use std::fmt;
+
+fn mit_control_standard_id(joint_index: u8) -> crate::StandardCanId {
+    match joint_index {
+        1 => ID_MIT_CONTROL_1,
+        2 => ID_MIT_CONTROL_2,
+        3 => ID_MIT_CONTROL_3,
+        4 => ID_MIT_CONTROL_4,
+        5 => ID_MIT_CONTROL_5,
+        6 => ID_MIT_CONTROL_6,
+        _ => unreachable!("MIT control joint index is validated by constructors"),
+    }
+}
 
 // ============================================================================
 // 控制模式指令相关枚举
@@ -175,7 +186,7 @@ impl ControlModeCommandFrame {
         data[5] = self.install_position as u8;
         // Byte 6-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_CONTROL_MODE as u16, &data)
+        PiperFrame::standard(ID_CONTROL_MODE, CanData::from_array(data))
     }
 }
 
@@ -278,15 +289,15 @@ mod tests {
         let cmd = ControlModeCommandFrame::mode_switch(ControlModeCommand::CanControl);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_CONTROL_MODE);
-        assert_eq!(frame.data[0], 0x01); // CanControl
-        assert_eq!(frame.data[1], 0x00); // MoveP (默认)
-        assert_eq!(frame.data[2], 0x00); // speed_percent = 0
-        assert_eq!(frame.data[3], 0x00); // PositionVelocity (默认)
-        assert_eq!(frame.data[4], 0x00); // trajectory_stay_time = 0
-        assert_eq!(frame.data[5], 0x00); // Invalid (默认)
-        assert_eq!(frame.data[6], 0x00); // 保留
-        assert_eq!(frame.data[7], 0x00); // 保留
+        assert_eq!(frame.id().as_standard(), Some(ID_CONTROL_MODE));
+        assert_eq!(frame.data()[0], 0x01); // CanControl
+        assert_eq!(frame.data()[1], 0x00); // MoveP (默认)
+        assert_eq!(frame.data()[2], 0x00); // speed_percent = 0
+        assert_eq!(frame.data()[3], 0x00); // PositionVelocity (默认)
+        assert_eq!(frame.data()[4], 0x00); // trajectory_stay_time = 0
+        assert_eq!(frame.data()[5], 0x00); // Invalid (默认)
+        assert_eq!(frame.data()[6], 0x00); // 保留
+        assert_eq!(frame.data()[7], 0x00); // 保留
     }
 
     #[test]
@@ -301,13 +312,13 @@ mod tests {
         );
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_CONTROL_MODE);
-        assert_eq!(frame.data[0], 0x01); // CanControl
-        assert_eq!(frame.data[1], 0x01); // MoveJ
-        assert_eq!(frame.data[2], 50); // speed_percent
-        assert_eq!(frame.data[3], 0xAD); // Mit
-        assert_eq!(frame.data[4], 10); // trajectory_stay_time
-        assert_eq!(frame.data[5], 0x01); // Horizontal
+        assert_eq!(frame.id().as_standard(), Some(ID_CONTROL_MODE));
+        assert_eq!(frame.data()[0], 0x01); // CanControl
+        assert_eq!(frame.data()[1], 0x01); // MoveJ
+        assert_eq!(frame.data()[2], 50); // speed_percent
+        assert_eq!(frame.data()[3], 0xAD); // Mit
+        assert_eq!(frame.data()[4], 10); // trajectory_stay_time
+        assert_eq!(frame.data()[5], 0x01); // Horizontal
     }
 
     #[test]
@@ -323,7 +334,7 @@ mod tests {
         );
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.data[4], 255); // 轨迹终止标志
+        assert_eq!(frame.data()[4], 255); // 轨迹终止标志
     }
 }
 
@@ -361,7 +372,7 @@ impl JointControl12 {
         data[0..4].copy_from_slice(&j1_bytes);
         data[4..8].copy_from_slice(&j2_bytes);
 
-        PiperFrame::new_standard(ID_JOINT_CONTROL_12 as u16, &data)
+        PiperFrame::standard(ID_JOINT_CONTROL_12, CanData::from_array(data))
     }
 }
 
@@ -394,7 +405,7 @@ impl JointControl34 {
         data[0..4].copy_from_slice(&j3_bytes);
         data[4..8].copy_from_slice(&j4_bytes);
 
-        PiperFrame::new_standard(ID_JOINT_CONTROL_34 as u16, &data)
+        PiperFrame::standard(ID_JOINT_CONTROL_34, CanData::from_array(data))
     }
 }
 
@@ -427,7 +438,7 @@ impl JointControl56 {
         data[0..4].copy_from_slice(&j5_bytes);
         data[4..8].copy_from_slice(&j6_bytes);
 
-        PiperFrame::new_standard(ID_JOINT_CONTROL_56 as u16, &data)
+        PiperFrame::standard(ID_JOINT_CONTROL_56, CanData::from_array(data))
     }
 }
 
@@ -447,12 +458,20 @@ mod joint_control_tests {
         let cmd = JointControl12::new(90.0, -45.0);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_JOINT_CONTROL_12);
+        assert_eq!(frame.id().as_standard(), Some(ID_JOINT_CONTROL_12));
         // 验证大端字节序编码
-        let j1_decoded =
-            i32::from_be_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
-        let j2_decoded =
-            i32::from_be_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
+        let j1_decoded = i32::from_be_bytes([
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ]);
+        let j2_decoded = i32::from_be_bytes([
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ]);
         assert_eq!(j1_decoded, 90000);
         assert_eq!(j2_decoded, -45000);
     }
@@ -464,13 +483,21 @@ mod joint_control_tests {
         let frame = cmd.to_frame();
 
         // 验证 CAN ID
-        assert_eq!(frame.id, ID_JOINT_CONTROL_12);
+        assert_eq!(frame.id().as_standard(), Some(ID_JOINT_CONTROL_12));
 
         // 验证编码后的字节值（大端字节序）
-        let j1_decoded =
-            i32::from_be_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
-        let j2_decoded =
-            i32::from_be_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
+        let j1_decoded = i32::from_be_bytes([
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ]);
+        let j2_decoded = i32::from_be_bytes([
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ]);
         assert_eq!(j1_decoded, 90000);
         assert_eq!(j2_decoded, -45000);
 
@@ -491,11 +518,19 @@ mod joint_control_tests {
         let cmd = JointControl34::new(30.0, -60.0);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_JOINT_CONTROL_34);
-        let j3_decoded =
-            i32::from_be_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
-        let j4_decoded =
-            i32::from_be_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
+        assert_eq!(frame.id().as_standard(), Some(ID_JOINT_CONTROL_34));
+        let j3_decoded = i32::from_be_bytes([
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ]);
+        let j4_decoded = i32::from_be_bytes([
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ]);
         assert_eq!(j3_decoded, 30000);
         assert_eq!(j4_decoded, -60000);
     }
@@ -512,11 +547,19 @@ mod joint_control_tests {
         let cmd = JointControl56::new(180.0, -90.0);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_JOINT_CONTROL_56);
-        let j5_decoded =
-            i32::from_be_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
-        let j6_decoded =
-            i32::from_be_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
+        assert_eq!(frame.id().as_standard(), Some(ID_JOINT_CONTROL_56));
+        let j5_decoded = i32::from_be_bytes([
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ]);
+        let j6_decoded = i32::from_be_bytes([
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ]);
         assert_eq!(j5_decoded, 180000);
         assert_eq!(j6_decoded, -90000);
     }
@@ -721,7 +764,7 @@ impl EmergencyStopCommand {
         data[6] = crc_bytes[0];
         data[7] = crc_bytes[1];
 
-        PiperFrame::new_standard(ID_EMERGENCY_STOP as u16, &data)
+        PiperFrame::standard(ID_EMERGENCY_STOP, CanData::from_array(data))
     }
 }
 
@@ -779,11 +822,11 @@ mod emergency_stop_tests {
         let cmd = EmergencyStopCommand::emergency_stop();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_EMERGENCY_STOP);
-        assert_eq!(frame.data[0], 0x01); // EmergencyStop
-        assert_eq!(frame.data[1], 0x00); // Closed
-        assert_eq!(frame.data[2], 0x00); // Closed
-        assert_eq!(frame.data[3], 0x00); // trajectory_index = 0
+        assert_eq!(frame.id().as_standard(), Some(ID_EMERGENCY_STOP));
+        assert_eq!(frame.data()[0], 0x01); // EmergencyStop
+        assert_eq!(frame.data()[1], 0x00); // Closed
+        assert_eq!(frame.data()[2], 0x00); // Closed
+        assert_eq!(frame.data()[3], 0x00); // trajectory_index = 0
     }
 
     #[test]
@@ -791,8 +834,8 @@ mod emergency_stop_tests {
         let cmd = EmergencyStopCommand::resume();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_EMERGENCY_STOP);
-        assert_eq!(frame.data[0], 0x02); // Resume
+        assert_eq!(frame.id().as_standard(), Some(ID_EMERGENCY_STOP));
+        assert_eq!(frame.data()[0], 0x02); // Resume
     }
 
     #[test]
@@ -800,14 +843,14 @@ mod emergency_stop_tests {
         let cmd = EmergencyStopCommand::trajectory_transmit(5, 0x1234, 0x5678);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_EMERGENCY_STOP);
-        assert_eq!(frame.data[0], 0x00); // Invalid
-        assert_eq!(frame.data[1], 0x07); // Transmit
-        assert_eq!(frame.data[3], 5); // trajectory_index
+        assert_eq!(frame.id().as_standard(), Some(ID_EMERGENCY_STOP));
+        assert_eq!(frame.data()[0], 0x00); // Invalid
+        assert_eq!(frame.data()[1], 0x07); // Transmit
+        assert_eq!(frame.data()[3], 5); // trajectory_index
 
         // 验证大端字节序
-        let name_index = u16::from_be_bytes([frame.data[4], frame.data[5]]);
-        let crc16 = u16::from_be_bytes([frame.data[6], frame.data[7]]);
+        let name_index = u16::from_be_bytes([frame.data()[4], frame.data()[5]]);
+        let crc16 = u16::from_be_bytes([frame.data()[6], frame.data()[7]]);
         assert_eq!(name_index, 0x1234);
         assert_eq!(crc16, 0x5678);
     }
@@ -866,7 +909,7 @@ impl MotorEnableCommand {
         data[1] = if self.enable { 0x02 } else { 0x01 };
         // Byte 2-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_MOTOR_ENABLE as u16, &data)
+        PiperFrame::standard(ID_MOTOR_ENABLE, CanData::from_array(data))
     }
 }
 
@@ -879,9 +922,9 @@ mod motor_enable_tests {
         let cmd = MotorEnableCommand::enable(1);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_MOTOR_ENABLE);
-        assert_eq!(frame.data[0], 1);
-        assert_eq!(frame.data[1], 0x02); // 使能
+        assert_eq!(frame.id().as_standard(), Some(ID_MOTOR_ENABLE));
+        assert_eq!(frame.data()[0], 1);
+        assert_eq!(frame.data()[1], 0x02); // 使能
     }
 
     #[test]
@@ -889,9 +932,9 @@ mod motor_enable_tests {
         let cmd = MotorEnableCommand::disable(2);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_MOTOR_ENABLE);
-        assert_eq!(frame.data[0], 2);
-        assert_eq!(frame.data[1], 0x01); // 失能
+        assert_eq!(frame.id().as_standard(), Some(ID_MOTOR_ENABLE));
+        assert_eq!(frame.data()[0], 2);
+        assert_eq!(frame.data()[1], 0x01); // 失能
     }
 
     #[test]
@@ -899,9 +942,9 @@ mod motor_enable_tests {
         let cmd = MotorEnableCommand::enable_all();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_MOTOR_ENABLE);
-        assert_eq!(frame.data[0], 7); // 全部关节
-        assert_eq!(frame.data[1], 0x02); // 使能
+        assert_eq!(frame.id().as_standard(), Some(ID_MOTOR_ENABLE));
+        assert_eq!(frame.data()[0], 7); // 全部关节
+        assert_eq!(frame.data()[1], 0x02); // 使能
     }
 
     #[test]
@@ -910,8 +953,8 @@ mod motor_enable_tests {
         for i in 1..=6 {
             let cmd = MotorEnableCommand::enable(i);
             let frame = cmd.to_frame();
-            assert_eq!(frame.data[0], i);
-            assert_eq!(frame.data[1], 0x02);
+            assert_eq!(frame.data()[0], i);
+            assert_eq!(frame.data()[1], 0x02);
         }
     }
 }
@@ -994,7 +1037,7 @@ impl GripperControlCommand {
         data[6] = u8::from(self.control_flags).value();
         data[7] = self.zero_setting;
 
-        PiperFrame::new_standard(ID_GRIPPER_CONTROL as u16, &data)
+        PiperFrame::standard(ID_GRIPPER_CONTROL, CanData::from_array(data))
     }
 }
 
@@ -1036,16 +1079,20 @@ mod gripper_control_tests {
         let cmd = GripperControlCommand::new(50.0, 2.5, true);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_GRIPPER_CONTROL);
+        assert_eq!(frame.id().as_standard(), Some(ID_GRIPPER_CONTROL));
 
         // 验证大端字节序
-        let travel_decoded =
-            i32::from_be_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
-        let torque_decoded = i16::from_be_bytes([frame.data[4], frame.data[5]]);
+        let travel_decoded = i32::from_be_bytes([
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ]);
+        let torque_decoded = i16::from_be_bytes([frame.data()[4], frame.data()[5]]);
         assert_eq!(travel_decoded, 50000);
         assert_eq!(torque_decoded, 2500);
-        assert_eq!(frame.data[6] & 0x01, 0x01); // Bit 0 = 1（使能）
-        assert_eq!(frame.data[7], 0x00); // 零点设置无效
+        assert_eq!(frame.data()[6] & 0x01, 0x01); // Bit 0 = 1（使能）
+        assert_eq!(frame.data()[7], 0x00); // 零点设置无效
     }
 
     #[test]
@@ -1053,8 +1100,8 @@ mod gripper_control_tests {
         let cmd = GripperControlCommand::new(0.0, 0.0, false).set_zero_point();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.data[6], 0x00); // 失能（设置零点时）
-        assert_eq!(frame.data[7], 0xAE); // 设置零点标志
+        assert_eq!(frame.data()[6], 0x00); // 失能（设置零点时）
+        assert_eq!(frame.data()[7], 0xAE); // 设置零点标志
     }
 
     #[test]
@@ -1062,7 +1109,7 @@ mod gripper_control_tests {
         let cmd = GripperControlCommand::new(50.0, 2.5, true).clear_error();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.data[6] & 0x03, 0x03); // Bit 0 和 Bit 1 都是 1
+        assert_eq!(frame.data()[6] & 0x03, 0x03); // Bit 0 和 Bit 1 都是 1
     }
 
     #[test]
@@ -1104,7 +1151,7 @@ impl EndPoseControl1 {
         data[0..4].copy_from_slice(&x_bytes);
         data[4..8].copy_from_slice(&y_bytes);
 
-        PiperFrame::new_standard(ID_END_POSE_CONTROL_1 as u16, &data)
+        PiperFrame::standard(ID_END_POSE_CONTROL_1, CanData::from_array(data))
     }
 }
 
@@ -1136,7 +1183,7 @@ impl EndPoseControl2 {
         data[0..4].copy_from_slice(&z_bytes);
         data[4..8].copy_from_slice(&rx_bytes);
 
-        PiperFrame::new_standard(ID_END_POSE_CONTROL_2 as u16, &data)
+        PiperFrame::standard(ID_END_POSE_CONTROL_2, CanData::from_array(data))
     }
 }
 
@@ -1167,7 +1214,7 @@ impl EndPoseControl3 {
         data[0..4].copy_from_slice(&ry_bytes);
         data[4..8].copy_from_slice(&rz_bytes);
 
-        PiperFrame::new_standard(ID_END_POSE_CONTROL_3 as u16, &data)
+        PiperFrame::standard(ID_END_POSE_CONTROL_3, CanData::from_array(data))
     }
 }
 
@@ -1187,11 +1234,19 @@ mod end_pose_control_tests {
         let cmd = EndPoseControl1::new(100.0, -50.0);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_END_POSE_CONTROL_1);
-        let x_decoded =
-            i32::from_be_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
-        let y_decoded =
-            i32::from_be_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
+        assert_eq!(frame.id().as_standard(), Some(ID_END_POSE_CONTROL_1));
+        let x_decoded = i32::from_be_bytes([
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ]);
+        let y_decoded = i32::from_be_bytes([
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ]);
         assert_eq!(x_decoded, 100000);
         assert_eq!(y_decoded, -50000);
     }
@@ -1208,11 +1263,19 @@ mod end_pose_control_tests {
         let cmd = EndPoseControl2::new(200.0, 90.0);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_END_POSE_CONTROL_2);
-        let z_decoded =
-            i32::from_be_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
-        let rx_decoded =
-            i32::from_be_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
+        assert_eq!(frame.id().as_standard(), Some(ID_END_POSE_CONTROL_2));
+        let z_decoded = i32::from_be_bytes([
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ]);
+        let rx_decoded = i32::from_be_bytes([
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ]);
         assert_eq!(z_decoded, 200000);
         assert_eq!(rx_decoded, 90000);
     }
@@ -1229,11 +1292,19 @@ mod end_pose_control_tests {
         let cmd = EndPoseControl3::new(-45.0, 180.0);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_END_POSE_CONTROL_3);
-        let ry_decoded =
-            i32::from_be_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
-        let rz_decoded =
-            i32::from_be_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
+        assert_eq!(frame.id().as_standard(), Some(ID_END_POSE_CONTROL_3));
+        let ry_decoded = i32::from_be_bytes([
+            frame.data()[0],
+            frame.data()[1],
+            frame.data()[2],
+            frame.data()[3],
+        ]);
+        let rz_decoded = i32::from_be_bytes([
+            frame.data()[4],
+            frame.data()[5],
+            frame.data()[6],
+            frame.data()[7],
+        ]);
         assert_eq!(ry_decoded, -45000);
         assert_eq!(rz_decoded, 180000);
     }
@@ -1323,7 +1394,7 @@ impl ArcPointCommand {
         data[0] = self.point_index as u8;
         // Byte 1-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_ARC_POINT as u16, &data)
+        PiperFrame::standard(ID_ARC_POINT, CanData::from_array(data))
     }
 }
 
@@ -1356,9 +1427,9 @@ mod arc_point_tests {
         let cmd = ArcPointCommand::start();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_ARC_POINT);
-        assert_eq!(frame.data[0], 0x01);
-        assert_eq!(frame.data[1], 0x00); // 保留字段
+        assert_eq!(frame.id().as_standard(), Some(ID_ARC_POINT));
+        assert_eq!(frame.data()[0], 0x01);
+        assert_eq!(frame.data()[1], 0x00); // 保留字段
     }
 
     #[test]
@@ -1366,8 +1437,8 @@ mod arc_point_tests {
         let cmd = ArcPointCommand::middle();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_ARC_POINT);
-        assert_eq!(frame.data[0], 0x02);
+        assert_eq!(frame.id().as_standard(), Some(ID_ARC_POINT));
+        assert_eq!(frame.data()[0], 0x02);
     }
 
     #[test]
@@ -1375,8 +1446,8 @@ mod arc_point_tests {
         let cmd = ArcPointCommand::end();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_ARC_POINT);
-        assert_eq!(frame.data[0], 0x03);
+        assert_eq!(frame.id().as_standard(), Some(ID_ARC_POINT));
+        assert_eq!(frame.data()[0], 0x03);
     }
 }
 
@@ -1707,8 +1778,10 @@ impl MitControlCommand {
         // 使用 | 操作符，因为 encode_to_bytes 已经把低 4 位清零了
         data[7] |= crc & 0x0F;
 
-        let can_id = ID_MIT_CONTROL_BASE + (self.joint_index - 1) as u32;
-        PiperFrame::new_standard(can_id as u16, &data)
+        PiperFrame::standard(
+            mit_control_standard_id(self.joint_index),
+            CanData::from_array(data),
+        )
     }
 
     /// 测试专用：允许注入自定义 CRC
@@ -1730,14 +1803,18 @@ impl MitControlCommand {
         // 强制使用指定 CRC（替换低 4 位）
         data[7] = (data[7] & 0xF0) | (custom_crc & 0x0F);
 
-        let can_id = ID_MIT_CONTROL_BASE + (self.joint_index - 1) as u32;
-        PiperFrame::new_standard(can_id as u16, &data)
+        PiperFrame::standard(
+            mit_control_standard_id(self.joint_index),
+            CanData::from_array(data),
+        )
     }
 }
 
 #[cfg(test)]
 mod mit_control_tests {
     use super::*;
+
+    const ID_MIT_CONTROL_BASE: u32 = ID_MIT_CONTROL_1.raw() as u32;
 
     #[test]
     fn test_float_to_uint() {
@@ -1870,13 +1947,13 @@ mod mit_control_tests {
         let cmd = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.0).unwrap();
         let frame = cmd.to_frame();
         // 只验证 CRC 在有效范围内（0-15）
-        let crc = frame.data[7] & 0x0F;
+        let crc = frame.data()[7] & 0x0F;
         assert!(crc <= 0x0F, "CRC 应该在 0-15 范围内");
 
         // 测试用例 2：有输入值（kp=10.0, kd=0.8）
         let cmd2 = MitControlCommand::try_new(1, 0.0, 0.0, 10.0, 0.8, 0.0).unwrap();
         let frame2 = cmd2.to_frame();
-        let crc2 = frame2.data[7] & 0x0F;
+        let crc2 = frame2.data()[7] & 0x0F;
         assert!(crc2 <= 0x0F, "CRC 应该在 0-15 范围内");
     }
 
@@ -1901,7 +1978,10 @@ mod mit_control_tests {
             let frame = MitControlCommand::try_new(joint_index, 0.0, 0.0, 0.0, 0.0, 0.0)
                 .unwrap()
                 .to_frame();
-            assert_eq!(frame.id, ID_MIT_CONTROL_BASE + (joint_index - 1) as u32);
+            assert_eq!(
+                frame.raw_id(),
+                ID_MIT_CONTROL_BASE + (joint_index - 1) as u32
+            );
         }
     }
 
@@ -1996,7 +2076,7 @@ impl LightControlCommand {
         // Byte 6: 保留，已初始化为 0
         data[7] = self.counter;
 
-        PiperFrame::new_standard(ID_LIGHT_CONTROL as u16, &data)
+        PiperFrame::standard(ID_LIGHT_CONTROL, CanData::from_array(data))
     }
 }
 
@@ -2029,15 +2109,15 @@ mod light_control_tests {
         let cmd = LightControlCommand::new(LightControlEnable::Enabled, 2, 5, 100, 200, 50, 42);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_LIGHT_CONTROL);
-        assert_eq!(frame.data[0], 0x01); // Enabled
-        assert_eq!(frame.data[1], 2); // joint_index
-        assert_eq!(frame.data[2], 5); // led_index
-        assert_eq!(frame.data[3], 100); // R
-        assert_eq!(frame.data[4], 200); // G
-        assert_eq!(frame.data[5], 50); // B
-        assert_eq!(frame.data[6], 0x00); // 保留
-        assert_eq!(frame.data[7], 42); // counter
+        assert_eq!(frame.id().as_standard(), Some(ID_LIGHT_CONTROL));
+        assert_eq!(frame.data()[0], 0x01); // Enabled
+        assert_eq!(frame.data()[1], 2); // joint_index
+        assert_eq!(frame.data()[2], 5); // led_index
+        assert_eq!(frame.data()[3], 100); // R
+        assert_eq!(frame.data()[4], 200); // G
+        assert_eq!(frame.data()[5], 50); // B
+        assert_eq!(frame.data()[6], 0x00); // 保留
+        assert_eq!(frame.data()[7], 42); // counter
     }
 
     #[test]
@@ -2045,13 +2125,13 @@ mod light_control_tests {
         // 测试 0xFF 表示同时操作全部灯珠
         let cmd = LightControlCommand::new(LightControlEnable::Enabled, 3, 0xFF, 255, 255, 255, 0);
         let frame = cmd.to_frame();
-        assert_eq!(frame.data[2], 0xFF);
+        assert_eq!(frame.data()[2], 0xFF);
     }
 
     #[test]
     fn test_light_control_command_disabled() {
         let cmd = LightControlCommand::new(LightControlEnable::Disabled, 1, 0, 0, 0, 0, 0);
         let frame = cmd.to_frame();
-        assert_eq!(frame.data[0], 0x00);
+        assert_eq!(frame.data()[0], 0x00);
     }
 }
