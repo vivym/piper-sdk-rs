@@ -107,6 +107,7 @@ struct HookEntry {
 /// ```rust
 /// use piper_driver::hooks::{HookManager, FrameCallback};
 /// use piper_driver::recording::AsyncRecordingHook;
+/// use piper_can::{ReceivedFrame, TimestampProvenance};
 /// use piper_protocol::PiperFrame;
 /// use std::sync::Arc;
 ///
@@ -117,8 +118,11 @@ struct HookEntry {
 /// hooks.add_callback(callback);
 ///
 /// // 触发回调
-/// let frame = PiperFrame::new_standard(0x251, &[1, 2, 3, 4]);
-/// hooks.trigger_all(&frame);
+/// let received = ReceivedFrame::new(
+///     PiperFrame::new_standard(0x251, &[1, 2, 3, 4]).unwrap(),
+///     TimestampProvenance::Kernel,
+/// );
+/// hooks.trigger_all(received);
 /// ```
 pub struct HookManager {
     next_handle: u64,
@@ -251,7 +255,7 @@ impl HookManager {
     /// let hooks = HookManager::new();
     ///
     /// // 在 tx_loop 中，发送成功后触发回调
-    /// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+    /// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap();
     /// // 假设 tx.send(&frame) 返回 Ok(())
     /// hooks.trigger_all_sent(&frame);
     /// ```

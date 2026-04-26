@@ -20,7 +20,6 @@
 //! ```rust
 //! use piper_driver::recording::AsyncRecordingHook;
 //! use piper_driver::hooks::FrameCallback;
-//! use piper_protocol::PiperFrame;
 //! use std::sync::Arc;
 //!
 //! // 创建录制钩子
@@ -32,8 +31,9 @@
 //!
 //! // 在后台线程处理录制数据
 //! std::thread::spawn(move || {
-//!     while let Ok(frame) = rx.recv() {
-//!         // 处理帧...
+//!     while let Ok(recorded) = rx.recv() {
+//!         // recorded.frame.timestamp_us() 是会话内 elapsed 微秒
+//!         let _elapsed_us = recorded.frame.timestamp_us();
 //!     }
 //! });
 //!
@@ -45,8 +45,8 @@ use crate::hooks::FrameCallback;
 use crossbeam_channel::{Receiver, Sender, bounded};
 pub use piper_can::TimestampProvenance;
 use piper_protocol::PiperFrame;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// 录制帧方向。
@@ -146,10 +146,10 @@ pub struct AsyncRecordingHook {
     /// 录制会话开始时间，用于将 TX/Userspace 时间戳归一化为 elapsed 微秒。
     session_start: Instant,
 
-    hardware_origin_raw_us: AtomicU64,
-    hardware_origin_elapsed_us: AtomicU64,
-    kernel_origin_raw_us: AtomicU64,
-    kernel_origin_elapsed_us: AtomicU64,
+    /// Raw source timestamp and session elapsed timestamp observed for the first mappable frame.
+    hardware_origin: OnceLock<(u64, u64)>,
+    /// Raw source timestamp and session elapsed timestamp observed for the first mappable frame.
+    kernel_origin: OnceLock<(u64, u64)>,
 }
 
 impl AsyncRecordingHook {
@@ -204,10 +204,8 @@ impl AsyncRecordingHook {
             stop_after_frame_count,
             stop_requested: Arc::new(AtomicBool::new(false)),
             session_start: Instant::now(),
-            hardware_origin_raw_us: AtomicU64::new(0),
-            hardware_origin_elapsed_us: AtomicU64::new(0),
-            kernel_origin_raw_us: AtomicU64::new(0),
-            kernel_origin_elapsed_us: AtomicU64::new(0),
+            hardware_origin: OnceLock::new(),
+            kernel_origin: OnceLock::new(),
         };
 
         (hook, rx)
@@ -345,30 +343,16 @@ impl AsyncRecordingHook {
             return None;
         }
 
-        let (origin_raw, origin_elapsed) = match provenance {
-            TimestampProvenance::Hardware => (
-                &self.hardware_origin_raw_us,
-                &self.hardware_origin_elapsed_us,
-            ),
-            TimestampProvenance::Kernel => {
-                (&self.kernel_origin_raw_us, &self.kernel_origin_elapsed_us)
-            },
+        let origin = match provenance {
+            TimestampProvenance::Hardware => &self.hardware_origin,
+            TimestampProvenance::Kernel => &self.kernel_origin,
             _ => return None,
         };
 
         let elapsed_now = self.elapsed_us_since_start().max(1);
-        let observed_origin = origin_raw.load(Ordering::Acquire);
-        if observed_origin == 0
-            && origin_raw
-                .compare_exchange(0, raw_timestamp_us, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            origin_elapsed.store(elapsed_now, Ordering::Release);
-        }
+        let &(raw_origin, elapsed_origin) = origin.get_or_init(|| (raw_timestamp_us, elapsed_now));
 
-        let raw_origin = origin_raw.load(Ordering::Acquire);
-        let elapsed_origin = origin_elapsed.load(Ordering::Acquire);
-        if raw_origin == 0 || elapsed_origin == 0 || raw_timestamp_us < raw_origin {
+        if raw_timestamp_us < raw_origin {
             None
         } else {
             Some(elapsed_origin.saturating_add(raw_timestamp_us - raw_origin))
@@ -419,24 +403,32 @@ impl FrameCallback for AsyncRecordingHook {
     /// - <1μs 开销（非阻塞）
     /// - 队列满时丢帧，而非阻塞或无限增长
     ///
-    /// # 时间戳精度（v1.2.1）
+    /// # 时间戳精度
     ///
-    /// ⏱️ **必须使用硬件时间戳**:
+    /// 回调事件携带帧方向和来源，录制钩子会把源时间戳归一化为会话内 elapsed 微秒。
     ///
     /// ```rust
-    /// use piper_driver::recording::TimestampedFrame;
+    /// use piper_driver::hooks::FrameCallback;
+    /// use piper_driver::recording::{AsyncRecordingHook, RecordedFrameDirection, RecordedFrameEvent};
+    /// use piper_can::TimestampProvenance;
     /// use piper_protocol::PiperFrame;
+    /// use std::sync::Arc;
     ///
-    /// let frame = PiperFrame::new_standard(0x251, &[1, 2, 3, 4]);
-    /// let ts_frame = TimestampedFrame::from(&frame);
-    /// assert_eq!(ts_frame.timestamp_us, frame.timestamp_us);  // ✅ 硬件时间戳
+    /// let (hook, rx) = AsyncRecordingHook::new();
+    /// let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+    /// let frame = PiperFrame::new_standard(0x251, &[1, 2, 3, 4])
+    ///     .unwrap()
+    ///     .with_timestamp_us(99_000);
+    ///
+    /// callback.on_frame(RecordedFrameEvent {
+    ///     frame,
+    ///     direction: RecordedFrameDirection::Rx,
+    ///     timestamp_provenance: TimestampProvenance::Kernel,
+    /// });
+    ///
+    /// let recorded = rx.recv().unwrap();
+    /// assert!(recorded.frame.timestamp_us() < 99_000);
     /// ```
-    ///
-    /// ❌ **禁止软件生成时间戳**:
-    ///
-    /// // ❌ 错误：回调执行时间已晚于帧到达时间（仅说明概念）
-    /// // let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
-    ///
     #[inline]
     #[allow(clippy::collapsible_if)] // 嵌套 if 结构更清晰：先检查 Option，再比较 ID
     fn on_frame(&self, event: RecordedFrameEvent) {
@@ -572,6 +564,66 @@ mod tests {
             0,
             "backend-observed frame must remain unstamped"
         );
+    }
+
+    fn assert_source_timestamps_are_normalized(timestamp_provenance: TimestampProvenance) {
+        let (hook, rx) = AsyncRecordingHook::new();
+        let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+
+        callback.on_frame(event(
+            frame_with_timestamp(0x2A5, &[1, 2, 3, 4], 99_000),
+            RecordedFrameDirection::Rx,
+            timestamp_provenance,
+        ));
+        callback.on_frame(event(
+            frame_with_timestamp(0x2A5, &[1, 2, 3, 4], 100_250),
+            RecordedFrameDirection::Rx,
+            timestamp_provenance,
+        ));
+
+        let first = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        let second = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+
+        assert_eq!(first.timestamp_provenance, timestamp_provenance);
+        assert_eq!(second.timestamp_provenance, timestamp_provenance);
+        assert_ne!(
+            first.frame.timestamp_us(),
+            99_000,
+            "recording timestamp must be session-relative, not raw absolute source time"
+        );
+        assert_eq!(
+            second.frame.timestamp_us() - first.frame.timestamp_us(),
+            1_250
+        );
+    }
+
+    #[test]
+    fn kernel_timestamps_are_normalized_to_recording_elapsed_time() {
+        assert_source_timestamps_are_normalized(TimestampProvenance::Kernel);
+    }
+
+    #[test]
+    fn hardware_timestamps_are_normalized_to_recording_elapsed_time() {
+        assert_source_timestamps_are_normalized(TimestampProvenance::Hardware);
+    }
+
+    #[test]
+    fn hardware_timestamp_without_source_time_falls_back_to_userspace() {
+        let (hook, rx) = AsyncRecordingHook::new();
+        let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+
+        callback.on_frame(event(
+            frame_with_timestamp(0x2A5, &[1, 2, 3, 4], 0),
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
+
+        let recorded = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(
+            recorded.timestamp_provenance,
+            TimestampProvenance::Userspace
+        );
+        assert!(recorded.frame.timestamp_us() > 0);
     }
 
     #[test]
