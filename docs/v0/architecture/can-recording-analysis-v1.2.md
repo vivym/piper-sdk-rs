@@ -361,10 +361,9 @@ impl FrameCallback for AsyncRecordingHook {
         // ⏱️ **时间戳精度**: 必须直接使用硬件时间戳
         // 禁止调用 SystemTime::now()，因为回调执行时间已晚于帧到达时间
         let ts_frame = TimestampedFrame {
-            timestamp_us: frame.timestamp_us,  // ✅ 直接透传硬件时间戳
-            id: frame.id,
-            data: frame.data.clone(),
-            // ... 其他字段
+            frame: (*frame).with_timestamp_us(frame.timestamp_us()),  // ✅ 直接透传硬件时间戳
+            direction: RecordedFrameDirection::Rx,
+            timestamp_provenance: TimestampProvenance::Hardware,
         };
 
         // 🛡️ 丢帧保护：队列满时丢弃帧，而不是阻塞或无限增长

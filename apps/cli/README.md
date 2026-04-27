@@ -197,8 +197,8 @@ piper-cli monitor --frequency 20
 # 录制
 piper-cli record --output recording.bin --duration 10
 
-# 接收到指定 CAN ID 后停止（优先级高于 --duration）
-piper-cli record --output recording.bin --duration 30 --stop-on-id 0x2A4
+# 接收到指定标准 CAN ID 后停止（优先级高于 --duration）
+piper-cli record --output recording.bin --duration 30 --stop-on-id standard:0x2A4
 
 # 回放
 piper-cli replay --input recording.bin --speed 2.0

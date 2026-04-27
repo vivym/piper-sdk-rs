@@ -724,7 +724,7 @@ $ piper-cli record --output test.bin --duration 5
 # 验证录制约 5 秒
 
 # 测试 3: OnCanId（Phase 2）
-$ piper-cli record --output test.bin --stop-on-id 0x2A5
+$ piper-cli record --output test.bin --stop-on-id standard:0x2A5
 # 应该在 Phase 1 报错提示未实现
 ```
 

@@ -47,9 +47,9 @@ let (tx, rx) = crossbeam::channel::bounded(10_000);
 impl FrameCallback for AsyncRecordingHook {
     fn on_frame_received(&self, frame: &PiperFrame) {
         let ts_frame = TimestampedFrame {
-            timestamp_us: frame.timestamp_us,  // ⏱️ 硬件时间戳
-            id: frame.id,
-            data: frame.data.clone(),
+            frame: (*frame).with_timestamp_us(frame.timestamp_us()),  // ⏱️ 硬件时间戳
+            direction: RecordedFrameDirection::Rx,
+            timestamp_provenance: TimestampProvenance::Hardware,
         };
 
         // 🛡️ 队列满时丢帧，而不是无限增长
@@ -114,9 +114,9 @@ let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
 
 // ✅ v1.2 正确：直接透传硬件时间戳
 let ts_frame = TimestampedFrame {
-    timestamp_us: frame.timestamp_us,  // 内核/Driver 在中断时刻打的戳
-    id: frame.id,
-    data: frame.data.clone(),
+    frame: (*frame).with_timestamp_us(frame.timestamp_us()),  // 内核/Driver 在中断时刻打的戳
+    direction: RecordedFrameDirection::Rx,
+    timestamp_provenance: TimestampProvenance::Kernel,
 };
 ```
 

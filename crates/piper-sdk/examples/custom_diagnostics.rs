@@ -62,7 +62,7 @@ fn drain_recorded_frames(
                 "   后台线程：已接收 {} 帧，平均 FPS: {:.1}",
                 frame_count, fps
             );
-            println!("   帧ID: 0x{:03X}", frame.frame.raw_id());
+            println!("   帧ID: 0x{:03X}", frame.raw_id());
         }
     }
 
@@ -198,7 +198,8 @@ where
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
-    use piper_sdk::driver::TimestampedFrame;
+    use piper_sdk::PiperFrame;
+    use piper_sdk::driver::{RecordedFrameDirection, TimestampProvenance, TimestampedFrame};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
@@ -220,15 +221,15 @@ mod tests {
         let dropped_counter = Arc::new(AtomicU64::new(3));
 
         tx.send(TimestampedFrame {
-            timestamp_us: 42,
-            id: 0x251,
-            data: vec![1, 2, 3, 4],
+            frame: PiperFrame::new_standard(0x251, [1, 2, 3, 4]).unwrap().with_timestamp_us(42),
+            direction: RecordedFrameDirection::Rx,
+            timestamp_provenance: TimestampProvenance::Userspace,
         })
         .unwrap();
         tx.send(TimestampedFrame {
-            timestamp_us: 43,
-            id: 0x252,
-            data: vec![5, 6, 7, 8],
+            frame: PiperFrame::new_standard(0x252, [5, 6, 7, 8]).unwrap().with_timestamp_us(43),
+            direction: RecordedFrameDirection::Rx,
+            timestamp_provenance: TimestampProvenance::Userspace,
         })
         .unwrap();
         drop(tx);

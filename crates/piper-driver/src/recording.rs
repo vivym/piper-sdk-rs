@@ -32,8 +32,8 @@
 //! // 在后台线程处理录制数据
 //! std::thread::spawn(move || {
 //!     while let Ok(recorded) = rx.recv() {
-//!         // recorded.frame.timestamp_us() 是会话内 elapsed 微秒
-//!         let _elapsed_us = recorded.frame.timestamp_us();
+//!         // recorded.timestamp_us() 是会话内 elapsed 微秒
+//!         let _elapsed_us = recorded.timestamp_us();
 //!     }
 //! });
 //!
@@ -469,7 +469,7 @@ impl FrameCallback for AsyncRecordingHook {
     /// });
     ///
     /// let recorded = rx.recv().unwrap();
-    /// assert!(recorded.frame.timestamp_us() < 99_000);
+    /// assert!(recorded.timestamp_us() < 99_000);
     /// ```
     #[inline]
     #[allow(clippy::collapsible_if)] // 嵌套 if 结构更清晰：先检查 Option，再比较 ID
@@ -583,7 +583,7 @@ mod tests {
         hooks.trigger_all(received_frame);
 
         let recorded = rx.recv_timeout(Duration::from_millis(100)).unwrap();
-        assert_eq!(recorded.frame.raw_id(), 0x2A5);
+        assert_eq!(recorded.raw_id(), 0x2A5);
         assert_eq!(recorded.direction, RecordedFrameDirection::Rx);
         assert_eq!(recorded.timestamp_provenance, TimestampProvenance::Kernel);
     }
@@ -621,7 +621,7 @@ mod tests {
             TimestampProvenance::Userspace
         );
         assert!(
-            recorded.frame.timestamp_us() > 0,
+            recorded.timestamp_us() > 0,
             "recording copy must be replayable with elapsed userspace timestamp"
         );
         assert_eq!(
@@ -688,7 +688,7 @@ mod tests {
             recorded.timestamp_provenance,
             TimestampProvenance::Userspace
         );
-        assert!(recorded.frame.timestamp_us() > 0);
+        assert!(recorded.timestamp_us() > 0);
     }
 
     #[test]
@@ -823,9 +823,9 @@ mod tests {
             TimestampProvenance::Hardware,
         ));
 
-        assert_eq!(ts_frame.frame.timestamp_us(), 99999);
-        assert_eq!(ts_frame.frame.raw_id(), 0x2A5);
-        assert_eq!(ts_frame.frame.data(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(ts_frame.timestamp_us(), 99999);
+        assert_eq!(ts_frame.raw_id(), 0x2A5);
+        assert_eq!(ts_frame.data(), &[0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(ts_frame.direction, RecordedFrameDirection::Rx);
     }
 

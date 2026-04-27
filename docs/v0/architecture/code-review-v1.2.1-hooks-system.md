@@ -156,51 +156,42 @@ trait FrameCallback {
 
 ---
 
-### 1.5 TimestampedFrame 使用 `Vec<u8>` 而非 `[u8; 8]`
+### 1.5 TimestampedFrame 直接携带类型化 `PiperFrame`
 
 **位置**: `recording.rs:54-66`
 
 **当前实现**:
 ```rust
 pub struct TimestampedFrame {
-    pub timestamp_us: u64,
-    pub id: u32,
-    pub data: Vec<u8>,  // ✅ 使用 Vec
+    pub frame: PiperFrame,
+    pub direction: RecordedFrameDirection,
+    pub timestamp_provenance: TimestampProvenance,
 }
 ```
 
 **简化说明**:
-- ✅ **与序列化兼容**: Vec<u8> 更容易序列化到文件/网络
-- ✅ **灵活性**: 未来可支持 CAN FD (最多 64 字节)
-- ✅ **零拷贝**: 接收端可以获取子切片
+- ✅ **类型安全**: CAN ID 格式和 DLC 由 `PiperFrame` 保证
+- ✅ **单一时间戳来源**: 通过 `frame.timestamp_us()` 读取归一化时间戳
+- ✅ **元数据明确**: RX/TX 方向和时间戳来源单独记录
 
-**对比固定大小数组**:
+**访问方式**:
 ```rust
-// ⚠️ 固定数组的缺点
-pub data: [u8; 8],
-// 问题1：浪费空间（大多数帧只有 4-6 字节）
-// 问题2：无法扩展到 CAN FD
+let raw_id = recorded.raw_id();
+let data = recorded.data();
+let timestamp_us = recorded.timestamp_us();
 ```
 
 **性能分析**:
 ```rust
 // 当前实现的内存布局
 TimestampedFrame {
-    timestamp_us: u64,        // 8 bytes
-    id: u32,                  // 4 bytes + 4 padding
-    data: Vec<u8> {           // 24 bytes (ptr+cap+len)
-        ptr: *mut u8,
-        cap: usize,
-        len: usize,
-    }
+    frame: PiperFrame,                              // typed CAN frame
+    direction: RecordedFrameDirection,              // RX/TX
+    timestamp_provenance: TimestampProvenance,      // timestamp source
 }
-// 总计: 40 bytes + 实际数据（8 bytes）= 48 bytes
-
-// 如果使用 [u8; 8]:
-// 总计: 24 bytes（节省 24 bytes，但失去灵活性）
 ```
 
-**结论**: 对于录制场景（通常录制到文件或网络），灵活性优于微小的内存优化。
+**结论**: 对于录制场景，类型化帧和显式来源元数据优于重复拆分 ID、数据和时间戳字段。
 
 ---
 
