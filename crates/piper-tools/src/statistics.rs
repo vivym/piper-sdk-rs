@@ -7,7 +7,7 @@
 //! piper-tools = { workspace = true, features = ["statistics"] }
 //! ```
 
-use piper_protocol::frame::PiperFrame;
+use piper_protocol::frame::{CanId, PiperFrame};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -144,18 +144,13 @@ pub enum CanIdDistributionKey {
 
 impl CanIdDistributionKey {
     pub fn from_frame(frame: &PiperFrame) -> Self {
-        if frame.is_standard() {
-            Self::Standard(frame.raw_id())
-        } else {
-            Self::Extended(frame.raw_id())
-        }
+        Self::from_id(frame.id())
     }
 
-    pub fn from_raw_id(can_id: u32) -> Self {
-        if can_id <= piper_protocol::frame::STANDARD_CAN_ID_MAX {
-            Self::Standard(can_id)
-        } else {
-            Self::Extended(can_id)
+    pub fn from_id(can_id: CanId) -> Self {
+        match can_id {
+            CanId::Standard(id) => Self::Standard(id.raw() as u32),
+            CanId::Extended(id) => Self::Extended(id.raw()),
         }
     }
 
@@ -185,9 +180,9 @@ impl CanIdDistribution {
         }
     }
 
-    /// 添加 raw CAN ID 帧（兼容旧调用点）
-    pub fn add_frame(&mut self, can_id: u32) {
-        self.add_key(CanIdDistributionKey::from_raw_id(can_id));
+    /// 添加 typed CAN ID.
+    pub fn add_id(&mut self, can_id: CanId) {
+        self.add_key(CanIdDistributionKey::from_id(can_id));
     }
 
     /// 添加 typed PiperFrame.
@@ -201,9 +196,9 @@ impl CanIdDistribution {
         self.total_frames += 1;
     }
 
-    /// 获取某个 standard CAN ID 的频率（%）
-    pub fn frequency(&self, can_id: u32) -> f64 {
-        self.frequency_for_key(CanIdDistributionKey::from_raw_id(can_id))
+    /// 获取某个 typed CAN ID 的频率（%）
+    pub fn frequency_for_id(&self, can_id: CanId) -> f64 {
+        self.frequency_for_key(CanIdDistributionKey::from_id(can_id))
     }
 
     /// 获取某个格式感知 CAN ID key 的频率（%）
@@ -283,15 +278,19 @@ mod tests {
 
     #[test]
     fn test_can_id_distribution() {
-        let mut dist = CanIdDistribution::new();
+        use piper_protocol::frame::CanId;
 
-        dist.add_frame(0x100);
-        dist.add_frame(0x100);
-        dist.add_frame(0x200);
+        let mut dist = CanIdDistribution::new();
+        let standard_100 = CanId::standard(0x100).unwrap();
+        let standard_200 = CanId::standard(0x200).unwrap();
+
+        dist.add_id(standard_100);
+        dist.add_id(standard_100);
+        dist.add_id(standard_200);
 
         assert_eq!(dist.total_frames, 3);
-        assert_eq!(dist.frequency(0x100), (2.0 / 3.0 * 100.0));
-        assert_eq!(dist.frequency(0x200), (1.0 / 3.0 * 100.0));
+        assert_eq!(dist.frequency_for_id(standard_100), (2.0 / 3.0 * 100.0));
+        assert_eq!(dist.frequency_for_id(standard_200), (1.0 / 3.0 * 100.0));
 
         let common = dist.most_common(2);
         assert_eq!(common[0], (CanIdDistributionKey::Standard(0x100), 2));
@@ -302,11 +301,14 @@ mod tests {
     fn test_can_id_distribution_default() {
         let dist = CanIdDistribution::default();
         assert_eq!(dist.total_frames, 0);
-        assert_eq!(dist.frequency(0x100), 0.0);
+        assert_eq!(
+            dist.frequency_for_key(CanIdDistributionKey::Standard(0x100)),
+            0.0
+        );
     }
 
     #[test]
-    fn test_can_id_distribution_distinguishes_standard_and_extended_raw_equal_ids() {
+    fn test_can_id_distribution_distinguishes_standard_and_extended_piper_frame_ids() {
         let mut dist = CanIdDistribution::new();
         let standard = PiperFrame::new_standard(0x123, [1]).unwrap();
         let extended = PiperFrame::new_extended(0x123, [2]).unwrap();
@@ -335,21 +337,33 @@ mod tests {
     }
 
     #[test]
-    fn test_can_id_distribution_raw_add_frame_does_not_create_impossible_standard_ids() {
+    fn test_can_id_distribution_add_id_distinguishes_standard_and_extended_raw_equal_ids() {
+        use piper_protocol::frame::CanId;
+
         let mut dist = CanIdDistribution::new();
+        let standard = CanId::standard(0x123).unwrap();
+        let extended = CanId::extended(0x123).unwrap();
 
-        dist.add_frame(0x7FF);
-        dist.add_frame(0x800);
+        dist.add_id(standard);
+        dist.add_id(extended);
+        dist.add_id(extended);
 
+        assert_eq!(dist.total_frames, 3);
         assert_eq!(
-            dist.counts.get(&CanIdDistributionKey::Standard(0x7FF)).copied(),
+            dist.counts.get(&CanIdDistributionKey::Standard(0x123)).copied(),
             Some(1)
         );
         assert_eq!(
-            dist.counts.get(&CanIdDistributionKey::Extended(0x800)).copied(),
-            Some(1)
+            dist.counts.get(&CanIdDistributionKey::Extended(0x123)).copied(),
+            Some(2)
         );
-        assert_eq!(dist.frequency(0x800), 50.0);
-        assert!(!dist.counts.contains_key(&CanIdDistributionKey::Standard(0x800)));
+        assert_eq!(
+            dist.frequency_for_id(standard),
+            dist.frequency_for_key(CanIdDistributionKey::Standard(0x123))
+        );
+        assert_eq!(
+            dist.frequency_for_id(extended),
+            dist.frequency_for_key(CanIdDistributionKey::Extended(0x123))
+        );
     }
 }

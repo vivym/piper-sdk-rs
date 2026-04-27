@@ -96,7 +96,14 @@ run_check \
   '\bPiperFrame\s*\{' \
   '^crates/piper-protocol/tests/ui/struct_literal.rs:|(pub[[:space:]]+)?struct[[:space:]]+PiperFrame[[:space:]]*\{|impl([[:space:]]*<[^>]+>)?[[:space:]]+PiperFrame[[:space:]]*\{|impl.*for[[:space:]]+PiperFrame[[:space:]]*\{|->[[:space:]]*PiperFrame[[:space:]]*\{'
 run_check 'legacy recording readers' 'LegacyPiperRecording'
-run_check 'extended-format inference from raw id' 'can_id\s*>\s*0x7[Ff]{2}'
+run_check \
+  'raw standard-threshold format inference' \
+  'STANDARD_CAN_ID_MAX|\bcan_id\s*(<=|<|>|>=)\s*(0x7[Ff]{2}|STANDARD_CAN_ID_MAX)\b|\b(0x7[Ff]{2}|STANDARD_CAN_ID_MAX)\s*(<|<=|>|>=)\s*can_id\b' \
+  '^docs/|^crates/piper-protocol/src/frame.rs:'
+run_check \
+  'piper-tools statistics raw CAN ID APIs' \
+  'from_raw_id|pub[[:space:]]+fn[[:space:]]+(add_frame|frequency)[[:space:]]*\([^)]*can_id[[:space:]]*:[[:space:]]*u32' \
+  '^docs/'
 run_check \
   'replay construction from ambiguous can_id' \
   'new_standard\([^\n]*can_id' \
