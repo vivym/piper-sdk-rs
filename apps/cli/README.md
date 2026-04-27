@@ -34,6 +34,11 @@ piper-cli config set-target socketcan:can0
 piper-cli config check
 ```
 
+### Dual-Arm Teleoperation
+
+生产双臂 `piper-cli teleop dual-arm` 上手、校准和验收流程见
+[TELEOP_DUAL_ARM.md](TELEOP_DUAL_ARM.md)。
+
 ### One-shot 模式
 
 ```bash
