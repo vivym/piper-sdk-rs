@@ -105,6 +105,10 @@ run_check \
   'from_raw_id|pub[[:space:]]+fn[[:space:]]+(add_frame|frequency)[[:space:]]*\([^)]*can_id[[:space:]]*:[[:space:]]*u32' \
   '^docs/'
 run_check \
+  'raw recording stop condition APIs' \
+  'stop_on_id[[:space:]]*:[[:space:]]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|with_(auto_)?stop(_condition)?[[:space:]]*\([^)]*stop_on_id[[:space:]]*:[[:space:]]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|raw_id\(\)[[:space:]]*==[[:space:]]*stop_id|stop_id[[:space:]]*==[^\n]*raw_id\(\)' \
+  '^docs/'
+run_check \
   'replay construction from ambiguous can_id' \
   'new_standard\([^\n]*can_id' \
   '^docs/|^crates/piper-protocol/src/feedback.rs:[0-9]+:[[:space:]]*let frame = PiperFrame::new_standard\(can_id, \[0; 8\]\)\.unwrap\(\);|^crates/piper-client/src/(observer|dual_arm|control/mit_controller)\.rs:[0-9]+:[[:space:]]*let mut frame = PiperFrame::new_standard\(can_id, &data\);|^crates/piper-client/src/state/machine\.rs:[0-9]+:[[:space:]]*(let mut frame = PiperFrame::new_standard\(can_id, &data\);|PiperFrame::new_standard\(\*can_id, \*data\))'
