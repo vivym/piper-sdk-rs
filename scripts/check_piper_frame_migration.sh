@@ -9,6 +9,10 @@ TARGETS=()
 for path in crates apps addons tests docs README*.md QUICKSTART*.md; do
   [[ -e "$path" ]] && TARGETS+=("$path")
 done
+ACTIVE_CODE_TARGETS=()
+for path in crates apps addons tests; do
+  [[ -e "$path" ]] && ACTIVE_CODE_TARGETS+=("$path")
+done
 EXCLUDES=(
   -g '!docs/superpowers/specs/2026-04-26-piper-frame-type-safety-design.md'
   -g '!docs/superpowers/plans/*.md'
@@ -91,6 +95,37 @@ run_candidate_search() {
   fi
 }
 
+run_active_multiline_check() {
+  local name="$1"
+  local pattern="$2"
+  local matches
+  local rg_status
+
+  matches="$(mktemp)"
+  TMPFILES+=("$matches")
+
+  echo "== $name =="
+  if rg -n -U "$pattern" "${ACTIVE_CODE_TARGETS[@]}" -g '*.rs' >"$matches"; then
+    rg_status=0
+  else
+    rg_status=$?
+  fi
+
+  if ((rg_status > 1)); then
+    cat "$matches" >&2
+    echo "ERROR: $name search failed" >&2
+    exit "$rg_status"
+  fi
+
+  if ((rg_status == 1)); then
+    return
+  fi
+
+  cat "$matches"
+  echo "FAILED: $name matched forbidden migration pattern" >&2
+  FAILURES+=("$name")
+}
+
 run_check \
   'PiperFrame struct literals' \
   '\bPiperFrame\s*\{' \
@@ -108,6 +143,9 @@ run_check \
   'raw recording stop condition APIs' \
   'stop_on_id[[:space:]]*:[[:space:]]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|with_(auto_)?stop(_condition)?[[:space:]]*\([^)]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|raw_id\(\)[[:space:]]*==[[:space:]]*stop_id|stop_id[[:space:]]*==[^\n]*raw_id\(\)' \
   '^docs/'
+run_active_multiline_check \
+  'raw recording stop condition multiline APIs' \
+  'with_(auto_)?stop(_condition)?[[:space:]]*\([^)]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>'
 run_check \
   'replay construction from ambiguous can_id' \
   'new_standard\([^\n]*can_id' \
