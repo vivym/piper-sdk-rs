@@ -830,12 +830,15 @@ mod tests {
     use piper_driver::{BackendCapability, PipelineConfig};
     use piper_protocol::ids::{
         ID_END_POSE_1, ID_END_POSE_2, ID_END_POSE_3, ID_GRIPPER_FEEDBACK,
-        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE, ID_JOINT_FEEDBACK_12,
+        ID_JOINT_DRIVER_HIGH_SPEED_1, ID_JOINT_DRIVER_LOW_SPEED_1, ID_JOINT_FEEDBACK_12,
         ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56, ID_ROBOT_STATUS,
     };
     use std::collections::VecDeque;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    const ID_JOINT_DRIVER_HIGH_SPEED_BASE: u32 = ID_JOINT_DRIVER_HIGH_SPEED_1.raw() as u32;
+    const ID_JOINT_DRIVER_LOW_SPEED_BASE: u32 = ID_JOINT_DRIVER_LOW_SPEED_1.raw() as u32;
 
     fn received(frame: PiperFrame) -> piper_can::ReceivedFrame {
         piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
@@ -990,7 +993,7 @@ mod tests {
     }
 
     fn joint_feedback_frame(
-        can_id: u16,
+        can_id: u32,
         first_deg_milli: i32,
         second_deg_milli: i32,
         timestamp_us: u64,
@@ -998,9 +1001,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
         data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(can_id, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(can_id, &data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn joint_dynamic_frame(
@@ -1013,12 +1014,12 @@ mod tests {
         data[0..2].copy_from_slice(&speed_millirad_per_sec.to_be_bytes());
         data[2..4].copy_from_slice(&current_milliamp.to_be_bytes());
         data[4..8].copy_from_slice(&0i32.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(
-            (ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1)) as u16,
+        PiperFrame::new_standard(
+            ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1),
             &data,
-        );
-        frame.timestamp_us = timestamp_us;
-        frame
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn gripper_feedback_frame(timestamp_us: u64) -> PiperFrame {
@@ -1029,9 +1030,9 @@ mod tests {
         data[4..6].copy_from_slice(&torque_raw);
         data[6] = 0b0100_0000;
 
-        let mut frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw().into(), &data)
+            .unwrap()
+            .with_timestamp_us(timestamp_us)
     }
 
     fn joint_driver_low_speed_frame(
@@ -1046,19 +1047,15 @@ mod tests {
         data[4] = 50;
         data[5] = if enabled { 0x40 } else { 0x00 };
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(id as u16, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(id, &data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn bootstrap_timestamp_frame() -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-        frame.timestamp_us = 1;
-        frame
+        PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1)
     }
 
     fn end_pose_frame(
-        can_id: u16,
+        can_id: u32,
         first_raw: i32,
         second_raw: i32,
         timestamp_us: u64,
@@ -1066,9 +1063,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_raw.to_be_bytes());
         data[4..8].copy_from_slice(&second_raw.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(can_id, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(can_id, &data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn robot_status_frame(
@@ -1077,12 +1072,12 @@ mod tests {
         move_mode: u8,
         timestamp_us: u64,
     ) -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(
-            ID_ROBOT_STATUS as u16,
+        PiperFrame::new_standard(
+            ID_ROBOT_STATUS.raw().into(),
             &[control_mode, robot_status, move_mode, 0, 0, 0, 0, 0],
-        );
-        frame.timestamp_us = timestamp_us;
-        frame
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn start_observer_with_frames(
@@ -1189,7 +1184,7 @@ mod tests {
         data[4..6].copy_from_slice(&torque_raw);
         data[6] = 0b0100_0000; // enabled = true
 
-        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK as u16, &data);
+        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw().into(), &data).unwrap();
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 ScriptedRxAdapter::new(vec![frame]),
@@ -1298,9 +1293,24 @@ mod tests {
         let position_timestamp_us = 1_000;
         let dynamic_timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, position_timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, position_timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_12.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_34.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_56.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
             joint_dynamic_frame(1, 1000, 1000, dynamic_timestamp_us),
             joint_dynamic_frame(2, 1000, 1000, dynamic_timestamp_us),
             joint_dynamic_frame(3, 1000, 1000, dynamic_timestamp_us),
@@ -1333,15 +1343,15 @@ mod tests {
         let frames = vec![
             TimedFrame {
                 delay: Duration::ZERO,
-                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, 1_000),
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, 1_000),
             },
             TimedFrame {
                 delay: Duration::ZERO,
-                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, 1_000),
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, 1_000),
             },
             TimedFrame {
                 delay: Duration::ZERO,
-                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, 1_000),
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, 1_000),
             },
             TimedFrame {
                 delay: Duration::ZERO,
@@ -1416,9 +1426,24 @@ mod tests {
         let position_timestamp_us = 1_000;
         let dynamic_timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, position_timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, position_timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_12.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_34.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_56.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
             joint_dynamic_frame(1, 1000, 1000, dynamic_timestamp_us),
             joint_dynamic_frame(2, 1000, 1000, dynamic_timestamp_us),
             joint_dynamic_frame(3, 1000, 1000, dynamic_timestamp_us),
@@ -1451,9 +1476,9 @@ mod tests {
     fn test_control_snapshot_rejects_stale_feedback() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 0, 1000, timestamp_us),
             joint_dynamic_frame(2, 0, 1000, timestamp_us),
             joint_dynamic_frame(3, 0, 1000, timestamp_us),
@@ -1482,9 +1507,9 @@ mod tests {
     fn test_control_snapshot_reports_feedback_stale_when_driver_marks_pair_stale_due_to_age() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 0, 1000, timestamp_us),
             joint_dynamic_frame(2, 0, 1000, timestamp_us),
             joint_dynamic_frame(3, 0, 1000, timestamp_us),
@@ -1513,9 +1538,9 @@ mod tests {
     fn test_monitor_only_observer_reports_capability_without_control_snapshot_api() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 1000, 1000, timestamp_us),
             joint_dynamic_frame(2, 1000, 1000, timestamp_us),
             joint_dynamic_frame(3, 1000, 1000, timestamp_us),
@@ -1537,8 +1562,8 @@ mod tests {
     fn test_control_snapshot_rejects_incomplete_position_group() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 0, 1000, timestamp_us),
             joint_dynamic_frame(2, 0, 1000, timestamp_us),
             joint_dynamic_frame(3, 0, 1000, timestamp_us),
@@ -1573,9 +1598,9 @@ mod tests {
     fn test_control_snapshot_rejects_incomplete_dynamic_group() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 0, 1000, timestamp_us),
             joint_dynamic_frame(2, 0, 1000, timestamp_us),
             joint_dynamic_frame(3, 0, 1000, timestamp_us),
@@ -1607,9 +1632,9 @@ mod tests {
     #[test]
     fn test_control_snapshot_reports_control_candidate_masks_when_control_grade_rejected() {
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, 1_000),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, 4_000),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, 7_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, 1_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, 4_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, 7_000),
             joint_dynamic_frame(1, 0, 1000, 7_000),
             joint_dynamic_frame(2, 0, 1000, 7_000),
             joint_dynamic_frame(3, 0, 1000, 7_000),
@@ -1663,8 +1688,8 @@ mod tests {
     fn test_joint_positions_report_monitor_state_incomplete() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
         ];
         let (driver, observer) = start_observer_with_frames(frames);
 
@@ -1689,9 +1714,9 @@ mod tests {
     fn test_joint_positions_report_monitor_state_stale() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
         ];
         let (driver, observer) = start_observer_with_frames(frames);
 
@@ -1720,9 +1745,9 @@ mod tests {
     fn test_last_complete_joint_positions_tolerates_stale_feedback() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
         ];
         let (driver, observer) = start_observer_with_frames(frames);
 
@@ -1742,9 +1767,9 @@ mod tests {
     fn test_joint_velocities_report_monitor_state_incomplete() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 0, 1000, timestamp_us),
             joint_dynamic_frame(2, 0, 1000, timestamp_us),
             joint_dynamic_frame(3, 0, 1000, timestamp_us),
@@ -1807,9 +1832,9 @@ mod tests {
     fn test_joint_torques_report_monitor_state_incomplete() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 0, 1000, timestamp_us),
             joint_dynamic_frame(2, 0, 1000, timestamp_us),
             joint_dynamic_frame(3, 0, 1000, timestamp_us),
@@ -1870,11 +1895,11 @@ mod tests {
     fn test_end_pose_reports_monitor_state_incomplete() {
         let timestamp_us = 1_000;
         let frames = vec![
-            end_pose_frame(ID_END_POSE_1 as u16, 0, 0, timestamp_us),
-            end_pose_frame(ID_END_POSE_3 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_1.raw().into(), 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_3.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 0, 1000, timestamp_us),
             joint_dynamic_frame(2, 0, 1000, timestamp_us),
             joint_dynamic_frame(3, 0, 1000, timestamp_us),
@@ -1905,9 +1930,9 @@ mod tests {
     fn test_end_pose_reports_monitor_state_stale() {
         let timestamp_us = 1_000;
         let frames = vec![
-            end_pose_frame(ID_END_POSE_1 as u16, 0, 0, timestamp_us),
-            end_pose_frame(ID_END_POSE_2 as u16, 0, 0, timestamp_us),
-            end_pose_frame(ID_END_POSE_3 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_1.raw().into(), 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_2.raw().into(), 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_3.raw().into(), 0, 0, timestamp_us),
         ];
         let (driver, observer) = start_observer_with_frames(frames);
 
@@ -1936,9 +1961,9 @@ mod tests {
     fn test_last_complete_end_pose_tolerates_stale_feedback() {
         let timestamp_us = 1_000;
         let frames = vec![
-            end_pose_frame(ID_END_POSE_1 as u16, 0, 0, timestamp_us),
-            end_pose_frame(ID_END_POSE_2 as u16, 0, 0, timestamp_us),
-            end_pose_frame(ID_END_POSE_3 as u16, 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_1.raw().into(), 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_2.raw().into(), 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_3.raw().into(), 0, 0, timestamp_us),
         ];
         let (driver, observer) = start_observer_with_frames(frames);
 
@@ -1974,10 +1999,15 @@ mod tests {
     fn test_joint_positions_keep_latest_complete_when_new_raw_is_partial() {
         let timestamp_us = 1_000;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 1_000, 2_000, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_12.raw().into(),
+                1_000,
+                2_000,
+                timestamp_us + 1,
+            ),
         ];
         let (driver, observer) = start_observer_with_frames(frames);
 
@@ -2029,10 +2059,10 @@ mod tests {
     fn test_end_pose_keeps_latest_complete_when_new_raw_is_partial() {
         let timestamp_us = 1_000;
         let frames = vec![
-            end_pose_frame(ID_END_POSE_1 as u16, 0, 0, timestamp_us),
-            end_pose_frame(ID_END_POSE_2 as u16, 0, 0, timestamp_us),
-            end_pose_frame(ID_END_POSE_3 as u16, 0, 0, timestamp_us),
-            end_pose_frame(ID_END_POSE_1 as u16, 1_000, 0, timestamp_us + 1),
+            end_pose_frame(ID_END_POSE_1.raw().into(), 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_2.raw().into(), 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_3.raw().into(), 0, 0, timestamp_us),
+            end_pose_frame(ID_END_POSE_1.raw().into(), 1_000, 0, timestamp_us + 1),
         ];
         let (driver, observer) = start_observer_with_frames(frames);
 
@@ -2057,7 +2087,7 @@ mod tests {
             TimedFrame {
                 delay: Duration::ZERO,
                 frame: joint_feedback_frame(
-                    ID_JOINT_FEEDBACK_12 as u16,
+                    ID_JOINT_FEEDBACK_12.raw().into(),
                     0,
                     0,
                     position_timestamp_us,
@@ -2066,7 +2096,7 @@ mod tests {
             TimedFrame {
                 delay: Duration::ZERO,
                 frame: joint_feedback_frame(
-                    ID_JOINT_FEEDBACK_34 as u16,
+                    ID_JOINT_FEEDBACK_34.raw().into(),
                     0,
                     0,
                     position_timestamp_us,
@@ -2075,7 +2105,7 @@ mod tests {
             TimedFrame {
                 delay: Duration::ZERO,
                 frame: joint_feedback_frame(
-                    ID_JOINT_FEEDBACK_56 as u16,
+                    ID_JOINT_FEEDBACK_56.raw().into(),
                     0,
                     0,
                     position_timestamp_us,
@@ -2132,9 +2162,24 @@ mod tests {
         let position_timestamp_us = 1_000;
         let dynamic_timestamp_us = 9_500;
         let frames = vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, position_timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, position_timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, position_timestamp_us),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_12.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_34.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
+            joint_feedback_frame(
+                ID_JOINT_FEEDBACK_56.raw().into(),
+                0,
+                0,
+                position_timestamp_us,
+            ),
             joint_dynamic_frame(1, 0, 1000, dynamic_timestamp_us),
             joint_dynamic_frame(2, 0, 1000, dynamic_timestamp_us),
             joint_dynamic_frame(3, 0, 1000, dynamic_timestamp_us),

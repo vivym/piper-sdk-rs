@@ -3790,9 +3790,7 @@ mod tests {
     }
 
     fn bootstrap_timestamp_frame() -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-        frame.timestamp_us = 1;
-        frame
+        PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1)
     }
 
     fn write_test_recording(frames: &[(u64, u32, &[u8])]) -> PathBuf {
@@ -4017,7 +4015,7 @@ mod tests {
     }
 
     fn joint_feedback_frame(
-        can_id: u16,
+        can_id: u32,
         first_deg_milli: i32,
         second_deg_milli: i32,
         timestamp_us: u64,
@@ -4025,22 +4023,20 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
         data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(can_id, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(can_id, &data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn joint_driver_state_frame(joint_index: u8, enabled: bool, timestamp_us: u64) -> PiperFrame {
-        let id = piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_BASE + (joint_index as u32) - 1;
+        let id = u32::from(piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_1.raw())
+            + u32::from(joint_index)
+            - 1;
         let mut data = [0u8; 8];
         data[0..2].copy_from_slice(&240u16.to_be_bytes());
         data[2..4].copy_from_slice(&45i16.to_be_bytes());
         data[4] = 50;
         data[5] = if enabled { 0x40 } else { 0x00 };
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(id as u16, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(id, &data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn joint_driver_enabled_frame(joint_index: u8, timestamp_us: u64) -> PiperFrame {
@@ -4061,13 +4057,13 @@ mod tests {
         data[0..2].copy_from_slice(&speed_millirad_per_sec.to_be_bytes());
         data[2..4].copy_from_slice(&current_milliamp.to_be_bytes());
         data[4..8].copy_from_slice(&0i32.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(
-            (piper_protocol::ids::ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1))
-                as u16,
+        PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_JOINT_DRIVER_HIGH_SPEED_1.raw())
+                + u32::from(joint_index - 1),
             &data,
-        );
-        frame.timestamp_us = timestamp_us;
-        frame
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn robot_status_frame_with_status(
@@ -4076,8 +4072,8 @@ mod tests {
         move_mode: MoveMode,
         timestamp_us: u64,
     ) -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(
-            piper_protocol::ids::ID_ROBOT_STATUS as u16,
+        PiperFrame::new_standard(
+            piper_protocol::ids::ID_ROBOT_STATUS.raw().into(),
             &[
                 control_mode as u8,
                 robot_status as u8,
@@ -4088,9 +4084,9 @@ mod tests {
                 0,
                 0,
             ],
-        );
-        frame.timestamp_us = timestamp_us;
-        frame
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn robot_status_frame(
@@ -4106,8 +4102,8 @@ mod tests {
         zero_point_success: bool,
         timestamp_us: u64,
     ) -> PiperFrame {
-        let mut frame = PiperFrame::new_standard(
-            piper_protocol::ids::ID_SETTING_RESPONSE as u16,
+        PiperFrame::new_standard(
+            piper_protocol::ids::ID_SETTING_RESPONSE.raw().into(),
             &[
                 response_index,
                 if zero_point_success { 0x01 } else { 0x00 },
@@ -4118,9 +4114,9 @@ mod tests {
                 0,
                 0,
             ],
-        );
-        frame.timestamp_us = timestamp_us;
-        frame
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn control_mode_echo_frame(
@@ -4131,7 +4127,7 @@ mod tests {
         install_position: InstallPosition,
         timestamp_us: u64,
     ) -> PiperFrame {
-        let mut frame = piper_protocol::control::ControlModeCommandFrame::new(
+        piper_protocol::control::ControlModeCommandFrame::new(
             control_mode,
             move_mode,
             speed_percent,
@@ -4139,9 +4135,8 @@ mod tests {
             0,
             install_position,
         )
-        .to_frame();
-        frame.timestamp_us = timestamp_us;
-        frame
+        .to_frame()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn enabled_joint_frames() -> Vec<TimedFrame> {
@@ -4187,15 +4182,15 @@ mod tests {
         vec![
             TimedFrame {
                 delay: Duration::ZERO,
-                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
             },
             TimedFrame {
                 delay: Duration::ZERO,
-                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
             },
             TimedFrame {
                 delay: Duration::ZERO,
-                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+                frame: joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             },
             TimedFrame {
                 delay: Duration::ZERO,
@@ -4307,7 +4302,7 @@ mod tests {
                 .lock()
                 .expect("sent frames lock")
                 .iter()
-                .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
+                .any(|frame| frame.id() == piper_protocol::ids::ID_CONTROL_MODE.into()),
             "mode switch command should still be sent before confirmation succeeds"
         );
     }
@@ -4343,7 +4338,7 @@ mod tests {
                 .lock()
                 .expect("sent frames lock")
                 .iter()
-                .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
+                .any(|frame| frame.id() == piper_protocol::ids::ID_CONTROL_MODE.into()),
             "mode switch command should still be sent before confirmation succeeds"
         );
     }
@@ -4435,7 +4430,7 @@ mod tests {
             .lock()
             .expect("sent frames lock")
             .iter()
-            .filter(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE)
+            .filter(|frame| frame.id() == piper_protocol::ids::ID_CONTROL_MODE.into())
             .copied()
             .collect();
 
@@ -4509,7 +4504,7 @@ mod tests {
             .lock()
             .expect("sent frames lock")
             .iter()
-            .filter(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE)
+            .filter(|frame| frame.id() == piper_protocol::ids::ID_CONTROL_MODE.into())
             .copied()
             .collect();
 
@@ -4562,7 +4557,7 @@ mod tests {
             .lock()
             .expect("sent frames lock")
             .iter()
-            .filter(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE)
+            .filter(|frame| frame.id() == piper_protocol::ids::ID_CONTROL_MODE.into())
             .count();
         assert_eq!(
             control_mode_frames, 1,
@@ -4604,7 +4599,7 @@ mod tests {
                 .lock()
                 .expect("sent frames lock")
                 .iter()
-                .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
+                .any(|frame| frame.id() == piper_protocol::ids::ID_CONTROL_MODE.into()),
             "mode switch command should be sent before confirmation succeeds"
         );
     }
@@ -4886,7 +4881,7 @@ mod tests {
         );
         let driver = Arc::clone(&standby.driver);
         driver
-            .send_reliable(PiperFrame::new_standard(0x221, &[0x01]))
+            .send_reliable(PiperFrame::new_standard(0x221, &[0x01]).unwrap())
             .expect("blocking reliable frame should enqueue before mode switch");
 
         let standby_handle = thread::spawn(move || {
@@ -4928,7 +4923,7 @@ mod tests {
         );
         let driver = Arc::clone(&standby.driver);
         driver
-            .send_reliable(PiperFrame::new_standard(0x221, &[0x02]))
+            .send_reliable(PiperFrame::new_standard(0x221, &[0x02]).unwrap())
             .expect("blocking reliable frame should enqueue before enable_all");
 
         let standby_handle = thread::spawn(move || {
@@ -4961,7 +4956,7 @@ mod tests {
                 .lock()
                 .expect("sent frames lock")
                 .iter()
-                .any(|frame| frame.id == piper_protocol::ids::ID_CONTROL_MODE),
+                .any(|frame| frame.id() == piper_protocol::ids::ID_CONTROL_MODE.into()),
             "mode switch must not start when enable confirmation only existed before commit",
         );
     }
@@ -5140,7 +5135,9 @@ mod tests {
             active.request_disable_all().expect("disable request should enter maintenance");
 
         assert!(matches!(
-            maintenance.driver.send_reliable(PiperFrame::new_standard(0x151, &[0x09])),
+            maintenance
+                .driver
+                .send_reliable(PiperFrame::new_standard(0x151, &[0x09]).unwrap()),
             Err(piper_driver::DriverError::ControlPathClosed)
         ));
 
@@ -5153,7 +5150,7 @@ mod tests {
             .expect("fresh disabled feedback should eventually reopen the control path");
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x0A]))
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x0A]).unwrap())
             .expect("shared driver should reopen once disabled feedback is confirmed");
     }
 
@@ -5209,7 +5206,7 @@ mod tests {
 
         assert!(matches!(standby._state, Standby));
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x0B]))
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x0B]).unwrap())
             .expect(
                 "driver should not remain stuck in StateTransitionClosed after request_disable_all returns against already-confirmed disabled feedback",
             );
@@ -5374,7 +5371,7 @@ mod tests {
             "shutdown timeout must latch a transport fault before returning control",
         );
         assert!(matches!(
-            driver.send_reliable(PiperFrame::new_standard(0x151, &[0x08])),
+            driver.send_reliable(PiperFrame::new_standard(0x151, &[0x08]).unwrap()),
             Err(piper_driver::DriverError::ControlPathClosed)
         ));
         assert_eq!(
@@ -5416,7 +5413,7 @@ mod tests {
             "disable request timeout must latch a transport fault before returning control",
         );
         assert!(matches!(
-            driver.send_reliable(PiperFrame::new_standard(0x151, &[0x09])),
+            driver.send_reliable(PiperFrame::new_standard(0x151, &[0x09]).unwrap()),
             Err(piper_driver::DriverError::ControlPathClosed)
         ));
         assert_eq!(
@@ -5571,7 +5568,7 @@ mod tests {
             piper_driver::MaintenanceGateState::DeniedFaulted
         );
         assert!(matches!(
-            driver.send_reliable(PiperFrame::new_standard(0x472, &[0x02])),
+            driver.send_reliable(PiperFrame::new_standard(0x472, &[0x02]).unwrap()),
             Err(piper_driver::DriverError::ControlPathClosed)
         ));
 
@@ -6179,7 +6176,7 @@ mod tests {
 
         handle.stop();
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x44]))
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x44]).unwrap())
             .expect("driver should send a frame after manual stop");
         thread::sleep(Duration::from_millis(20));
 
@@ -6260,7 +6257,7 @@ mod tests {
             .expect("recording should start");
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x66]))
+            .send_reliable(PiperFrame::new_standard(0x151, &[0x66]).unwrap())
             .expect("driver should emit a frame for recording metadata test");
         wait_until(
             Duration::from_millis(200),
@@ -6417,9 +6414,9 @@ mod tests {
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 ScriptedRxAdapter::new(vec![
-                    joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, 1_000),
-                    joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, 1_000),
-                    joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, 1_000),
+                    joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, 1_000),
+                    joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, 1_000),
+                    joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, 1_000),
                 ]),
                 RecordingTxAdapter::new(sent_frames.clone()),
                 None,
@@ -7251,14 +7248,14 @@ mod tests {
             .lock()
             .expect("joint sent frames lock")
             .iter()
-            .map(|frame| frame.id)
+            .map(|frame| frame.raw_id())
             .collect();
         assert_eq!(
             joint_ids,
             vec![
-                ID_JOINT_CONTROL_12,
-                ID_JOINT_CONTROL_34,
-                ID_JOINT_CONTROL_56
+                ID_JOINT_CONTROL_12.raw().into(),
+                ID_JOINT_CONTROL_34.raw().into(),
+                ID_JOINT_CONTROL_56.raw().into()
             ]
         );
 
@@ -7286,7 +7283,7 @@ mod tests {
             .lock()
             .expect("cartesian sent frames lock")
             .iter()
-            .map(|frame| frame.id)
+            .map(|frame| frame.raw_id())
             .collect();
         assert_eq!(cartesian_ids, vec![0x152, 0x153, 0x154]);
 
@@ -7314,7 +7311,7 @@ mod tests {
             .lock()
             .expect("linear sent frames lock")
             .iter()
-            .map(|frame| frame.id)
+            .map(|frame| frame.raw_id())
             .collect();
         assert_eq!(linear_ids, vec![0x152, 0x153, 0x154]);
 
@@ -7344,7 +7341,7 @@ mod tests {
             .lock()
             .expect("circular sent frames lock")
             .iter()
-            .map(|frame| frame.id)
+            .map(|frame| frame.raw_id())
             .collect();
         assert_eq!(
             circular_ids,
@@ -7386,8 +7383,8 @@ mod tests {
         let expected = MitControlCommand::try_new(1, -1.0, 0.0, 0.0, 0.0, -1.0)
             .expect("expected command should be valid")
             .to_frame();
-        assert_eq!(frames[0].id, expected.id);
-        assert_eq!(frames[0].data, expected.data);
+        assert_eq!(frames[0].id(), expected.id());
+        assert_eq!(frames[0].data(), expected.data());
     }
 
     #[test]
@@ -7469,8 +7466,8 @@ mod tests {
         let expected = MitControlCommand::try_new(1, -1.0, 0.0, 0.0, 0.0, -1.0)
             .expect("expected command should be valid")
             .to_frame();
-        assert_eq!(frames[0].id, expected.id);
-        assert_eq!(frames[0].data, expected.data);
+        assert_eq!(frames[0].id(), expected.id());
+        assert_eq!(frames[0].data(), expected.data());
     }
 
     #[test]

@@ -2807,10 +2807,12 @@ mod tests {
     use piper_can::{
         BackendCapability, CanError, ExtendedCanId, RealtimeTxAdapter, RxAdapter, StandardCanId,
     };
-    use piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_BASE;
+    use piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_1;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const ID_JOINT_DRIVER_LOW_SPEED_BASE: u32 = ID_JOINT_DRIVER_LOW_SPEED_1.raw() as u32;
 
     struct NoopWake;
 

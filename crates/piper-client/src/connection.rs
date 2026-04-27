@@ -219,23 +219,25 @@ mod tests {
     }
 
     fn bootstrap_timestamp_frame() -> PiperFrame {
-        let mut frame =
-            PiperFrame::new_standard(piper_protocol::ids::ID_JOINT_FEEDBACK_12 as u16, &[0; 8]);
-        frame.timestamp_us = 1;
-        frame
+        PiperFrame::new_standard(
+            piper_protocol::ids::ID_JOINT_FEEDBACK_12.raw().into(),
+            &[0; 8],
+        )
+        .unwrap()
+        .with_timestamp_us(1)
     }
 
     fn joint_driver_disabled_frame(joint_index: u8, timestamp_us: u64) -> PiperFrame {
-        let id = piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index) - 1;
+        let id = u32::from(piper_protocol::ids::ID_JOINT_DRIVER_LOW_SPEED_1.raw())
+            + u32::from(joint_index)
+            - 1;
         let mut data = [0u8; 8];
         data[0..2].copy_from_slice(&240u16.to_be_bytes());
         data[2..4].copy_from_slice(&45i16.to_be_bytes());
         data[4] = 50;
         data[5] = 0x00;
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(id as u16, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(id, &data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     #[test]

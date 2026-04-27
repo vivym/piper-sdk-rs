@@ -966,7 +966,7 @@ mod tests {
     use piper_driver::Piper as RobotPiper;
     use piper_protocol::control::{EmergencyStopCommand, MitControlCommand, MotorEnableCommand};
     use piper_protocol::ids::{
-        ID_JOINT_DRIVER_HIGH_SPEED_BASE, ID_JOINT_DRIVER_LOW_SPEED_BASE, ID_JOINT_FEEDBACK_12,
+        ID_JOINT_DRIVER_HIGH_SPEED_1, ID_JOINT_DRIVER_LOW_SPEED_1, ID_JOINT_FEEDBACK_12,
         ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
     };
     use semver::Version;
@@ -974,6 +974,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    const ID_JOINT_DRIVER_HIGH_SPEED_BASE: u32 = ID_JOINT_DRIVER_HIGH_SPEED_1.raw() as u32;
+    const ID_JOINT_DRIVER_LOW_SPEED_BASE: u32 = ID_JOINT_DRIVER_LOW_SPEED_1.raw() as u32;
 
     #[derive(Default)]
     struct DisableFeedbackHarness {
@@ -1067,7 +1070,7 @@ mod tests {
 
         fn is_disable_all_frame(&self, frame: PiperFrame) -> bool {
             let disable_all = MotorEnableCommand::disable_all().to_frame();
-            frame.id == disable_all.id && frame.data == disable_all.data
+            frame.id() == disable_all.id() && frame.data() == disable_all.data()
         }
     }
 
@@ -1187,7 +1190,7 @@ mod tests {
     }
 
     fn joint_feedback_frame(
-        can_id: u16,
+        can_id: u32,
         first_deg_milli: i32,
         second_deg_milli: i32,
         timestamp_us: u64,
@@ -1195,9 +1198,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
         data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(can_id, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(can_id, &data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn joint_dynamic_frame(
@@ -1210,12 +1211,12 @@ mod tests {
         data[0..2].copy_from_slice(&speed_millirad_per_sec.to_be_bytes());
         data[2..4].copy_from_slice(&current_milliamp.to_be_bytes());
         data[4..8].copy_from_slice(&0i32.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(
-            (ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1)) as u16,
+        PiperFrame::new_standard(
+            ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1),
             &data,
-        );
-        frame.timestamp_us = timestamp_us;
-        frame
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn joint_driver_low_speed_frame(
@@ -1229,28 +1230,28 @@ mod tests {
         data[4] = 50;
         data[5] = if enabled { 0x40 } else { 0x00 };
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(
-            (ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index - 1)) as u16,
+        PiperFrame::new_standard(
+            ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index - 1),
             &data,
-        );
-        frame.timestamp_us = timestamp_us;
-        frame
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn scripted_frames(timestamp_us: u64) -> Vec<PiperFrame> {
         vec![
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             joint_dynamic_frame(1, 0, 0, timestamp_us),
             joint_dynamic_frame(2, 0, 0, timestamp_us),
             joint_dynamic_frame(3, 0, 0, timestamp_us),
             joint_dynamic_frame(4, 0, 0, timestamp_us),
             joint_dynamic_frame(5, 0, 0, timestamp_us),
             joint_dynamic_frame(6, 0, 0, timestamp_us),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us + 1),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us + 1),
-            joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us + 1),
             joint_dynamic_frame(1, 0, 0, timestamp_us + 1),
             joint_dynamic_frame(2, 0, 0, timestamp_us + 1),
             joint_dynamic_frame(3, 0, 0, timestamp_us + 1),
@@ -1267,15 +1268,15 @@ mod tests {
         vec![
             (
                 Duration::ZERO,
-                joint_feedback_frame(ID_JOINT_FEEDBACK_12 as u16, 0, 0, timestamp_us),
+                joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
             ),
             (
                 Duration::ZERO,
-                joint_feedback_frame(ID_JOINT_FEEDBACK_34 as u16, 0, 0, timestamp_us),
+                joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
             ),
             (
                 Duration::ZERO,
-                joint_feedback_frame(ID_JOINT_FEEDBACK_56 as u16, 0, 0, timestamp_us),
+                joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
             ),
             (dynamic_delay, joint_dynamic_frame(1, 0, 0, timestamp_us)),
             (Duration::ZERO, joint_dynamic_frame(2, 0, 0, timestamp_us)),
@@ -1877,7 +1878,7 @@ mod tests {
         assert!(
             frames
                 .iter()
-                .any(|frame| frame.id == safe_hold.id && frame.data == safe_hold.data),
+                .any(|frame| frame.id() == safe_hold.id() && frame.data() == safe_hold.data()),
             "safe-hold package must reach the TX path before returning SafedOut"
         );
         assert!(
