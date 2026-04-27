@@ -143,6 +143,10 @@ run_check \
   'raw recording stop condition APIs' \
   'stop_on_id[[:space:]]*:[[:space:]]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|with_(auto_)?stop(_condition)?[[:space:]]*\([^)]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|raw_id\(\)[[:space:]]*==[[:space:]]*stop_id|stop_id[[:space:]]*==[^\n]*raw_id\(\)' \
   '^docs/'
+run_check \
+  'crate-visible unchecked constructors' \
+  'pub\((crate|super|in[[:space:]]+[^)]*)\)[^\n]*(new_const|new_unchecked)' \
+  '^docs/'
 run_active_multiline_check \
   'raw recording stop condition multiline APIs' \
   'with_(auto_)?stop(_condition)?[[:space:]]*\([^)]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>'

@@ -79,7 +79,7 @@ impl StandardCanId {
         }
     }
 
-    pub(crate) const fn new_const(raw: u16) -> Self {
+    const fn new_const(raw: u16) -> Self {
         assert!((raw as u32) <= STANDARD_CAN_ID_MAX);
         Self(raw)
     }
