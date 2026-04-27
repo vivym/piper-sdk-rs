@@ -746,12 +746,12 @@ driver.send_realtime_package(frames)?;
            let piper = Piper::new_dual_thread(adapter, None)?;
 
            // 2. 在 Reliable 队列中放入一个关键帧
-           let critical_frame = PiperFrame::new_standard(0x100, &[0x01]);
+           let critical_frame = PiperFrame::new_standard(0x100, &[0x01])?;
            piper.send_reliable(critical_frame)?;
 
            // 3. 连续发送 200 个 Realtime 包
            for i in 0..200 {
-               let frame = PiperFrame::new_standard(0x200 + i, &[i as u8]);
+               let frame = PiperFrame::new_standard(0x200 + i, &[i as u8])?;
                piper.send_realtime(frame)?;
            }
 

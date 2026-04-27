@@ -86,7 +86,7 @@ cd ../piper-sdk-rs-state-observation
 ```rust
 #[test]
 fn decode_collision_protection_out_of_range_returns_diagnostic() {
-    let frame = PiperFrame::new_standard(0x47B, &[255, 0, 0, 0, 0, 0, 0, 0]);
+    let frame = PiperFrame::new_standard(0x47B, &[255, 0, 0, 0, 0, 0, 0, 0]).unwrap();
     match decode_collision_protection_feedback(frame) {
         DecodeResult::Diagnostic(ProtocolDiagnostic::OutOfRange { field, .. }) => {
             assert_eq!(field, "collision_protection_level");
@@ -97,7 +97,7 @@ fn decode_collision_protection_out_of_range_returns_diagnostic() {
 
 #[test]
 fn decode_motor_limit_valid_frame_returns_data() {
-    let frame = PiperFrame::new_standard(0x473, &[1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]);
+    let frame = PiperFrame::new_standard(0x473, &[1, 0x07, 0x08, 0xF8, 0xF8, 0x01, 0x2C, 0x00]).unwrap();
     assert!(matches!(
         decode_motor_limit_feedback(frame),
         DecodeResult::Data(_)
@@ -404,7 +404,10 @@ git commit -m "feat: add observation diagnostics buffer and query coordinator"
 #[test]
 fn collision_protection_invalid_frame_goes_to_diagnostics_not_state() {
     let (piper, diagnostics) = build_test_piper_with_diagnostics();
-    queue_frame(&piper, PiperFrame::new_standard(0x47B, &[255, 0, 0, 0, 0, 0, 0, 0]));
+    queue_frame(
+        &piper,
+        PiperFrame::new_standard(0x47B, &[255, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+    );
 
     assert!(matches!(piper.get_collision_protection(), Observation::Unavailable));
     assert!(diagnostics.snapshot().iter().any(|event| matches!(

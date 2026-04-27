@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_realtime_command_single() {
-        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
         let cmd = RealtimeCommand::single(frame);
         assert_eq!(cmd.len(), 1);
         assert!(!cmd.is_empty());
@@ -223,9 +223,9 @@ mod tests {
     #[test]
     fn test_realtime_command_package() {
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
-            PiperFrame::new_standard(0x157, &[0x03]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x157, &[0x03]).unwrap(),
         ];
         let cmd = RealtimeCommand::package(frames);
         assert_eq!(cmd.len(), 3);
@@ -243,8 +243,8 @@ mod tests {
     #[test]
     fn test_realtime_command_iter() {
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
         ];
         let cmd = RealtimeCommand::package(frames);
         let collected: Vec<_> = cmd.iter().collect();
@@ -254,8 +254,8 @@ mod tests {
     #[test]
     fn test_realtime_command_into_frames() {
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
         ];
         let cmd = RealtimeCommand::package(frames);
         let buffer = cmd.into_frames();
@@ -868,7 +868,7 @@ mod tests {
         // 测试超大包错误
         let piper = Piper::new_dual_thread(/* ... */)?;
         let frames: Vec<PiperFrame> = (0..=Piper::MAX_REALTIME_PACKAGE_SIZE)
-            .map(|i| PiperFrame::new_standard(i as u32, &[0x01]))
+            .map(|i| PiperFrame::new_standard(i as u32, &[0x01]).unwrap())
             .collect();
         let result = piper.send_realtime_package(frames);
         assert!(result.is_err());
@@ -880,9 +880,9 @@ mod tests {
         // 测试数组输入（栈分配）
         let piper = Piper::new_dual_thread(/* ... */)?;
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
-            PiperFrame::new_standard(0x157, &[0x03]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x157, &[0x03]).unwrap(),
         ];
         let result = piper.send_realtime_package(frames);
         assert!(result.is_ok());
@@ -893,8 +893,8 @@ mod tests {
         // 测试 Vec 输入（堆分配，但 SmallVec 会处理）
         let piper = Piper::new_dual_thread(/* ... */)?;
         let frames = vec![
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
         ];
         let result = piper.send_realtime_package(frames);
         assert!(result.is_ok());
@@ -904,7 +904,7 @@ mod tests {
     fn test_send_realtime_backward_compatible() {
         // 测试向后兼容性
         let piper = Piper::new_dual_thread(/* ... */)?;
-        let frame = PiperFrame::new_standard(0x123, &[0x01]);
+        let frame = PiperFrame::new_standard(0x123, &[0x01]).unwrap();
         let result = piper.send_realtime(frame);
         assert!(result.is_ok());
     }
@@ -941,12 +941,12 @@ fn test_starvation_protection() {
     let realtime_slot = Arc::new(Mutex::new(None));
 
     // 2. 在 Reliable 队列中放入一个关键帧
-    let critical_frame = PiperFrame::new_standard(0x100, &[0x01]);
+    let critical_frame = PiperFrame::new_standard(0x100, &[0x01]).unwrap();
     reliable_sender.send(critical_frame).unwrap();
 
     // 3. 连续发送 200 个 Realtime 包
     for i in 0..200 {
-        let frame = PiperFrame::new_standard(0x200 + i, &[i as u8]);
+        let frame = PiperFrame::new_standard(0x200 + i, &[i as u8]).unwrap();
         let cmd = RealtimeCommand::single(frame);
         *realtime_slot.lock().unwrap() = Some(cmd);
     }
@@ -1232,4 +1232,3 @@ eprintln!("FrameBuffer ptr: {:p}, capacity: {}", buffer.as_ptr(), buffer.capacit
 ---
 
 **文档结束**
-

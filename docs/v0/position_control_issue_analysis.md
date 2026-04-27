@@ -142,7 +142,7 @@ impl JointControl12 {
         data[0..4].copy_from_slice(&j1_bytes);
         data[4..8].copy_from_slice(&j2_bytes);
 
-        PiperFrame::new_standard(ID_JOINT_CONTROL_12 as u16, &data)
+        PiperFrame::new_standard(ID_JOINT_CONTROL_12 as u16, &data).unwrap()
     }
 ```
 
@@ -238,4 +238,3 @@ pub struct PositionModeConfig {
 2. **速度百分比为 0**：导致即使模式正确也不会运动
 
 这两个问题都出现在 `enable_position_mode` 函数中，需要同时修复才能让位置控制正常工作。
-

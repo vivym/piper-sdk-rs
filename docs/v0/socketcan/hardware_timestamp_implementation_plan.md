@@ -528,7 +528,7 @@ fn test_socketcan_timestamp_extraction() {
     let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
 
     // 发送帧
-    adapter.send(PiperFrame::new_standard(0x123, &[1, 2, 3])).unwrap();
+    adapter.send(PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap()).unwrap();
 
     // 接收帧，检查时间戳
     let frame = adapter.receive().unwrap();
@@ -542,7 +542,7 @@ fn test_socketcan_timestamp_monotonic() {
 
     // 发送多个帧
     for i in 0..10 {
-        adapter.send(PiperFrame::new_standard(0x100 + i, &[i as u8])).unwrap();
+        adapter.send(PiperFrame::new_standard(0x100 + i, &[i as u8]).unwrap()).unwrap();
         std::thread::sleep(Duration::from_micros(100));
     }
 

@@ -513,7 +513,7 @@ mod tests {
         let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
 
         // 发送测试帧
-        let tx_frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+        let tx_frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap();
         adapter.send(tx_frame).unwrap();
 
         // 接收（可能需要另一个线程或工具发送）

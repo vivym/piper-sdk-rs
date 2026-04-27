@@ -218,11 +218,11 @@
       let mut mock_can = MockCanAdapter::new();
 
       // 模拟 0x2A5 帧
-      mock_can.queue_frame(PiperFrame::new_standard(0x2A5, &[...]));
+      mock_can.queue_frame(PiperFrame::new_standard(0x2A5, &[...]).unwrap());
       // 模拟 0x2A6 帧
-      mock_can.queue_frame(PiperFrame::new_standard(0x2A6, &[...]));
+      mock_can.queue_frame(PiperFrame::new_standard(0x2A6, &[...]).unwrap());
       // 模拟 0x2A7 帧（最后一帧，应触发提交）
-      mock_can.queue_frame(PiperFrame::new_standard(0x2A7, &[...]));
+      mock_can.queue_frame(PiperFrame::new_standard(0x2A7, &[...]).unwrap());
 
       // 运行 io_loop（需要能够控制循环次数或使用超时）
       // 验证 core_motion 已更新，且包含完整的 6 个关节位置
@@ -673,4 +673,3 @@ impl CanAdapter for MockCanAdapter {
 **文档版本**: v1.0
 **最后更新**: 2024-12
 **参考文档**: `implementation_plan.md`
-

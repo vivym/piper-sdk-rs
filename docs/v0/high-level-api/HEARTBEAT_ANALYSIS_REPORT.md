@@ -81,7 +81,7 @@ fn send_heartbeat(robot: &Arc<RobotPiper>) -> Result<()> {
     // 注意：实际的心跳帧应该根据协议定义
     // 这里暂时使用一个简单的实现，实际应该根据协议定义心跳帧
     use crate::can::PiperFrame;
-    let frame = PiperFrame::new_standard(0x00, &[0xAA]);
+    let frame = PiperFrame::new_standard(0x00, &[0xAA])?;
     robot.send_reliable(frame)?;
     Ok(())
 }
@@ -295,4 +295,3 @@ fn send_heartbeat(robot: &Arc<RobotPiper>) -> Result<()> {
 **报告生成时间**：2024年
 **分析人员**：AI Assistant
 **审查状态**：✅ **已确认** - 机械臂没有看门狗机制，不需要心跳包
-

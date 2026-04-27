@@ -140,7 +140,7 @@
   ```rust
   #[test]
   fn test_send_frame_zero_copy() {
-      let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
+      let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]).unwrap();
       let seq = 12345;
       let mut buf = [0u8; 64]; // 栈上缓冲区
       let encoded = encode_send_frame_with_seq(&frame, seq, &mut buf);
@@ -1040,4 +1040,3 @@ impl MockDaemonClient {
 **文档版本**：v1.0
 **创建日期**：2024-12
 **参考文档**：`daemon_implementation_plan.md`
-

@@ -1096,7 +1096,8 @@ fn test_rx_loop_resilience_bad_frames() {
         let bad_frame = PiperFrame::new_standard(
             0x2A1,  // Robot Status ID
             &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]  // Invalid robot_status
-        );
+        )
+        .unwrap();
         // Send bad_frame to robot...
     }
 
@@ -1111,7 +1112,8 @@ fn test_rx_loop_resilience_bad_frames() {
     let good_frame = PiperFrame::new_standard(
         0x2A1,
         &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-    );
+    )
+    .unwrap();
     // Send good_frame to robot...
 
     // 4. Wait for good frame to be processed
@@ -1146,7 +1148,7 @@ fn test_rx_loop_resilience_mock() {
 
     // Simulate 100 bad frames
     for _ in 0..100 {
-        let bad_frame = PiperFrame::new_standard(0x2A1, &[0xFF; 8]);
+        let bad_frame = PiperFrame::new_standard(0x2A1, &[0xFF; 8]).unwrap();
         let result = RobotStatusFeedback::try_from(bad_frame);
 
         match result {
@@ -1198,7 +1200,7 @@ use piper_sdk::protocol::feedback::*;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() >= 8 {
-        let frame = PiperFrame::new_standard(0x2A1, &data[..8]);
+        let frame = PiperFrame::new_standard(0x2A1, &data[..8]).unwrap();
         let _ = RobotStatusFeedback::try_from(frame);
     }
 });

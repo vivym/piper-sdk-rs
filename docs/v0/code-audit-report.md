@@ -276,7 +276,10 @@ impl TryFrom<ProtocolFrame> for PiperFrame {
     type Error = FrameError;
 
     fn try_from(pf: ProtocolFrame) -> Result<Self, Self::Error> {
-        PiperFrame::new_standard(pf.id, &pf.data[..pf.len as usize])
+        Ok(PiperFrame::new_standard(
+            pf.id,
+            &pf.data[..pf.len as usize],
+        )?)
     }
 }
 ```

@@ -232,7 +232,7 @@ impl MitControlCommand {
         data[7] |= crc & 0x0F;
 
         let can_id = ID_MIT_CONTROL_BASE + (self.joint_index - 1) as u32;
-        PiperFrame::new_standard(can_id as u16, &data)
+        PiperFrame::new_standard(can_id as u16, &data).unwrap()
     }
 
     /// 测试专用：允许注入自定义 CRC
@@ -247,7 +247,7 @@ impl MitControlCommand {
         data[7] = (data[7] & 0xF0) | (custom_crc & 0x0F);
 
         let can_id = ID_MIT_CONTROL_BASE + (self.joint_index - 1) as u32;
-        PiperFrame::new_standard(can_id as u16, &data)
+        PiperFrame::new_standard(can_id as u16, &data).unwrap()
     }
 
     /// 计算 CRC 校验值（4位）
@@ -465,12 +465,12 @@ pub(crate) fn send_mit_command_batch(
     use crate::protocol::control::MitControlCommand;
 
     let mut frames_array: [PiperFrame; 6] = [
-        PiperFrame::new_standard(0, &[0; 8]),
-        PiperFrame::new_standard(0, &[0; 8]),
-        PiperFrame::new_standard(0, &[0; 8]),
-        PiperFrame::new_standard(0, &[0; 8]),
-        PiperFrame::new_standard(0, &[0; 8]),
-        PiperFrame::new_standard(0, &[0; 8]),
+        PiperFrame::new_standard(0, &[0; 8]).unwrap(),
+        PiperFrame::new_standard(0, &[0; 8]).unwrap(),
+        PiperFrame::new_standard(0, &[0; 8]).unwrap(),
+        PiperFrame::new_standard(0, &[0; 8]).unwrap(),
+        PiperFrame::new_standard(0, &[0; 8]).unwrap(),
+        PiperFrame::new_standard(0, &[0; 8]).unwrap(),
     ];
     let mut index = 0;
 
@@ -632,4 +632,3 @@ test result: ok. 583 passed; 0 failed; 0 ignored; 0 measured; filtered out; fini
 **创建日期**：2024
 **最后更新**：2024
 **状态**：✅ 已实施完成，所有测试通过
-

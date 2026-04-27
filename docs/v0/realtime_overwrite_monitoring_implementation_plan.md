@@ -338,7 +338,7 @@ fn test_overwrite_monitoring_integration() {
 
     // 快速发送命令（超过 TX 处理速度，触发覆盖）
     for i in 0..2000 {
-        let frame = crate::can::PiperFrame::new_standard(0x155, &[i as u8; 8]);
+        let frame = crate::can::PiperFrame::new_standard(0x155, &[i as u8; 8]).unwrap();
         // ... 发送命令 ...
         thread::sleep(Duration::from_micros(100)); // 100μs 间隔（10kHz）
     }
@@ -653,4 +653,3 @@ pub fn overwrite_rate_trend(&self) -> Trend {
 ---
 
 **文档结束**
-

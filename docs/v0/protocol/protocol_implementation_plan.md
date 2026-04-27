@@ -567,7 +567,7 @@ impl EmergencyStopCommand {
         data[6] = crc_bytes[0];
         data[7] = crc_bytes[1];
 
-        PiperFrame::new_standard(ID_EMERGENCY_STOP as u16, &data)
+        PiperFrame::new_standard(ID_EMERGENCY_STOP as u16, &data).unwrap()
     }
 }
 
@@ -665,7 +665,7 @@ impl ControlModeCommand {
         data[5] = self.install_position as u8;
         // Byte 6-7: 保留，已初始化为 0
 
-        PiperFrame::new_standard(ID_CONTROL_MODE as u16, &data)
+        PiperFrame::new_standard(ID_CONTROL_MODE as u16, &data).unwrap()
     }
 }
 ```
@@ -694,7 +694,7 @@ impl JointControl12 {
         data[0..4].copy_from_slice(&j1_bytes);
         data[4..8].copy_from_slice(&j2_bytes);
 
-        PiperFrame::new_standard(ID_JOINT_CONTROL_12 as u16, &data)
+        PiperFrame::new_standard(ID_JOINT_CONTROL_12 as u16, &data).unwrap()
     }
 }
 ```
@@ -745,7 +745,7 @@ pub struct ArcPointCommand {
 impl ArcPointCommand {
     pub fn to_frame(&self) -> PiperFrame {
         let data = [self.point_index as u8, 0, 0, 0, 0, 0, 0, 0];
-        PiperFrame::new_standard(ID_ARC_POINT as u16, &data)
+        PiperFrame::new_standard(ID_ARC_POINT as u16, &data).unwrap()
     }
 }
 ```
@@ -797,7 +797,7 @@ impl GripperControlCommand {
         data[6] = u8::from(self.control_flags).value();
         data[7] = self.zero_setting;
 
-        PiperFrame::new_standard(ID_GRIPPER_CONTROL as u16, &data)
+        PiperFrame::new_standard(ID_GRIPPER_CONTROL as u16, &data).unwrap()
     }
 }
 ```
@@ -839,7 +839,7 @@ impl MitControlCommand {
         let mut data = [0u8; 8];
         // ... 位域打包代码 ...
 
-        PiperFrame::new_standard(ID_MIT_CONTROL_BASE + self.joint_index as u16, &data)
+        PiperFrame::new_standard(ID_MIT_CONTROL_BASE + self.joint_index as u16, &data).unwrap()
     }
 
     /// 辅助函数：将浮点数转换为无符号整数（根据协议公式）
@@ -885,7 +885,7 @@ impl MotorEnableCommand {
         let mut data = [0u8; 8];
         data[0] = self.joint_index;
         data[1] = if self.enable { 0x02 } else { 0x01 };
-        PiperFrame::new_standard(ID_MOTOR_ENABLE as u16, &data)
+        PiperFrame::new_standard(ID_MOTOR_ENABLE as u16, &data).unwrap()
     }
 }
 ```
@@ -917,7 +917,7 @@ impl MasterSlaveModeCommand {
             self.target_id_offset,
             0, 0, 0, 0,  // Byte 4-7: 保留（协议中 Len: 4，但 CAN 帧固定 8 字节）
         ];
-        PiperFrame::new_standard(ID_MASTER_SLAVE_MODE as u16, &data)
+        PiperFrame::new_standard(ID_MASTER_SLAVE_MODE as u16, &data).unwrap()
     }
 }
 ```
@@ -1076,7 +1076,7 @@ impl ParameterQuerySetCommand {
         data[4] = self.end_effector_load as u8;
         // Byte 5-7: 保留，已初始化为 0
 
-        Ok(PiperFrame::new_standard(ID_PARAMETER_QUERY_SET as u16, &data))
+        Ok(PiperFrame::new_standard(ID_PARAMETER_QUERY_SET as u16, &data)?)
     }
 }
 
@@ -1457,7 +1457,8 @@ mod tests {
         let frame = PiperFrame::new_standard(
             ID_ROBOT_STATUS as u16,
             &[0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
-        );
+        )
+        .unwrap();
 
         let status = RobotStatusFeedback::try_from(frame).unwrap();
         assert_eq!(status.control_mode, ControlMode::CanControl);

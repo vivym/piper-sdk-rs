@@ -167,7 +167,7 @@ use piper_can::{MockCanAdapter, CanAdapter, PiperFrame};
 let mut adapter = MockCanAdapter::new();
 
 // 注入测试帧
-let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap();
 adapter.inject(frame);
 
 // 接收帧

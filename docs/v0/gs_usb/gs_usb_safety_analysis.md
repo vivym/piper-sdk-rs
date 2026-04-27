@@ -227,7 +227,7 @@ fn test_loopback_mode_safe() {
     // adapter.configure_loopback(250_000)?;
 
     // 发送帧
-    let tx_frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+    let tx_frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
     adapter.send(tx_frame).unwrap();
 
     // 接收 Echo（Loopback 模式下会收到）
@@ -364,4 +364,3 @@ impl GsUsbCanAdapter {
 
 **报告版本**：v1.0
 **最后更新**：2024-12-XX
-

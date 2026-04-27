@@ -382,7 +382,7 @@ impl CanAdapter for MockCanAdapter {
 ///
 ///     fn receive(&mut self) -> Result<PiperFrame, CanError> {
 ///         // 自定义实现
-///         Ok(PiperFrame::new_standard(0x123, &[0]))
+///         Ok(PiperFrame::new_standard(0x123, &[0])?)
 ///     }
 /// }
 /// ```

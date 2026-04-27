@@ -342,7 +342,7 @@ fn test_position_physical_meaning() {
     let mut data = [0u8; 8];
     data[4..8].copy_from_slice(&position_val.to_be_bytes());
 
-    let frame = PiperFrame::new_standard(0x251, &data);
+    let frame = PiperFrame::new_standard(0x251, &data).unwrap();
     let feedback = JointDriverHighSpeedFeedback::try_from(frame).unwrap();
 
     // ✅ 验证物理意义
