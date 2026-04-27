@@ -400,7 +400,11 @@ impl DualArmActiveMit {
             if iteration < cfg.warmup_cycles {
                 let anchor = DualArmHoldAnchor::from_snapshot(&snapshot);
                 hold_anchor = Some(anchor);
-                active.safe_hold(&anchor, &cfg.safety).map_err(DualArmError::from)?;
+                // If the run budget ends in warmup, skip a normal hold that would
+                // immediately race the state-transition disable path.
+                if !is_last_allowed_iteration(iteration, cfg.max_iterations) {
+                    active.safe_hold(&anchor, &cfg.safety).map_err(DualArmError::from)?;
+                }
                 report.iterations += 1;
                 iteration += 1;
                 continue;
@@ -1541,6 +1545,10 @@ fn sleep_strategy_from_loop_timing(mode: LoopTimingMode) -> SleepStrategy {
         LoopTimingMode::Sleep => SleepStrategy::Sleep,
         LoopTimingMode::Spin => SleepStrategy::Spin,
     }
+}
+
+fn is_last_allowed_iteration(iteration: usize, max_iterations: Option<usize>) -> bool {
+    max_iterations.is_some_and(|max_iterations| iteration.saturating_add(1) >= max_iterations)
 }
 
 fn command_hold(
