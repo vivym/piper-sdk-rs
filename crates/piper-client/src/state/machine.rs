@@ -610,6 +610,29 @@ where
     }
 }
 
+struct EnableCleanupGuard<'a> {
+    piper: &'a piper_driver::Piper,
+    armed: bool,
+}
+
+impl<'a> EnableCleanupGuard<'a> {
+    fn armed(piper: &'a piper_driver::Piper) -> Self {
+        Self { piper, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EnableCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.piper.best_effort_disable_or_shutdown_on_drop(EMERGENCY_STOP_LANE_TIMEOUT);
+        }
+    }
+}
+
 fn split_piper_for_transition<State, Capability>(
     this: Piper<State, Capability>,
 ) -> (PiperTransitionParts<Capability>, State)
@@ -949,6 +972,7 @@ where
         let enable_commit_host_mono_us = self
             .driver
             .send_reliable_frame_confirmed_commit_marker(enable_cmd.to_frame(), config.timeout)?;
+        let mut enable_cleanup = EnableCleanupGuard::armed(self.driver.as_ref());
         debug!("Motor enable command sent");
 
         // 2. 等待使能完成（带 Debounce）
@@ -986,6 +1010,9 @@ where
             },
         )?;
         info!("Robot enabled - Active<MitMode>");
+
+        enable_cleanup.disarm();
+        drop(enable_cleanup);
 
         Ok(transition_piper_state(
             self,
@@ -3855,6 +3882,27 @@ mod tests {
         panic!("{message}");
     }
 
+    fn wait_for_sent_frames(
+        sent_frames: &Arc<Mutex<Vec<PiperFrame>>>,
+        expected: usize,
+    ) -> Vec<PiperFrame> {
+        let start = std::time::Instant::now();
+        loop {
+            let frames = sent_frames.lock().expect("sent frames lock").clone();
+            if frames.len() >= expected {
+                return frames;
+            }
+
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "timed out waiting for {} sent frames, got {}",
+                expected,
+                frames.len()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn latest_joint_6_low_speed_hardware_timestamp(driver: &RobotPiper) -> Option<u64> {
         match driver.get_joint_driver_low_speed() {
             Observation::Available(available) => match available.payload {
@@ -4756,6 +4804,33 @@ mod tests {
 
         assert!(active.observer().is_all_enabled());
         assert!(active.observer().is_all_enabled_confirmed());
+    }
+
+    #[test]
+    fn enable_mit_mode_timeout_after_enable_dispatch_sends_disable_all() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_standby_piper(IdleRxAdapter::new(), sent.clone());
+        let config = MitModeConfig {
+            timeout: Duration::from_millis(1),
+            poll_interval: Duration::from_millis(1),
+            ..MitModeConfig::default()
+        };
+
+        let err = match standby.enable_mit_mode(config) {
+            Ok(_) => panic!("enable confirmation timeout must fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, RobotError::Timeout { .. }));
+        let frames = wait_for_sent_frames(&sent, 2);
+        assert!(
+            frames
+                .iter()
+                .any(|frame| *frame == MotorEnableCommand::disable_all().to_frame()),
+            "failed MIT enable after dispatch must send disable_all"
+        );
     }
 
     #[test]

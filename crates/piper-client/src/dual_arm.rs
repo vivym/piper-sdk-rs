@@ -1601,10 +1601,14 @@ mod tests {
     use crate::types::RadPerSecond;
     use piper_can::{CanError, PiperFrame, RealtimeTxAdapter, RxAdapter};
     use piper_driver::Piper as RobotPiper;
-    use piper_protocol::control::{MitControlCommand, MotorEnableCommand};
+    use piper_protocol::control::{
+        ControlModeCommand, ControlModeCommandFrame, InstallPosition, MitControlCommand,
+        MitMode as ProtocolMitMode, MotorEnableCommand,
+    };
+    use piper_protocol::feedback::{ControlMode, MotionStatus, MoveMode, RobotStatus, TeachStatus};
     use piper_protocol::ids::{
-        ID_JOINT_DRIVER_HIGH_SPEED_1, ID_JOINT_DRIVER_LOW_SPEED_1, ID_JOINT_FEEDBACK_12,
-        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
+        ID_CONTROL_MODE, ID_JOINT_DRIVER_HIGH_SPEED_1, ID_JOINT_DRIVER_LOW_SPEED_1,
+        ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56,
     };
     use semver::Version;
     use std::collections::VecDeque;
@@ -1933,6 +1937,26 @@ mod tests {
         sends: usize,
     }
 
+    struct FailingEnableConfirmTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    }
+
+    impl FailingEnableConfirmTxAdapter {
+        fn new(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> Self {
+            Self { sent_frames }
+        }
+    }
+
+    struct FailingModeConfirmTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+    }
+
+    impl FailingModeConfirmTxAdapter {
+        fn new(sent_frames: Arc<Mutex<Vec<PiperFrame>>>) -> Self {
+            Self { sent_frames }
+        }
+    }
+
     impl RealtimeTxAdapter for FailOnNthFatalTxAdapter {
         fn send_control(
             &mut self,
@@ -1961,6 +1985,61 @@ mod tests {
             if self.sends == self.fail_on {
                 return Err(CanError::BufferOverflow);
             }
+            Ok(())
+        }
+    }
+
+    impl RealtimeTxAdapter for FailingEnableConfirmTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
+    impl RealtimeTxAdapter for FailingModeConfirmTxAdapter {
+        fn send_control(
+            &mut self,
+            frame: PiperFrame,
+            budget: Duration,
+        ) -> std::result::Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            if frame.id() == ID_CONTROL_MODE.into() {
+                return Err(CanError::Timeout);
+            }
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> std::result::Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
             Ok(())
         }
     }
@@ -2016,6 +2095,47 @@ mod tests {
         .with_timestamp_us(timestamp_us)
     }
 
+    fn robot_status_frame(
+        control_mode: ControlMode,
+        move_mode: MoveMode,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        PiperFrame::new_standard(
+            piper_protocol::ids::ID_ROBOT_STATUS.raw().into(),
+            [
+                control_mode as u8,
+                RobotStatus::Normal as u8,
+                move_mode as u8,
+                TeachStatus::Closed as u8,
+                MotionStatus::Arrived as u8,
+                0,
+                0,
+                0,
+            ],
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
+    }
+
+    fn control_mode_echo_frame(
+        control_mode: ControlModeCommand,
+        move_mode: MoveMode,
+        speed_percent: u8,
+        mit_mode: ProtocolMitMode,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        ControlModeCommandFrame::new(
+            control_mode,
+            move_mode,
+            speed_percent,
+            mit_mode,
+            0,
+            InstallPosition::Invalid,
+        )
+        .to_frame()
+        .with_timestamp_us(timestamp_us)
+    }
+
     fn scripted_frames(timestamp_us: u64) -> Vec<PiperFrame> {
         vec![
             joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
@@ -2039,6 +2159,42 @@ mod tests {
             joint_dynamic_frame(5, 0, 0, timestamp_us + 1),
             joint_dynamic_frame(6, 0, 0, timestamp_us + 1),
         ]
+    }
+
+    fn mit_enable_success_frames(timestamp_us: u64) -> Vec<(Duration, PiperFrame)> {
+        let mut frames: Vec<_> = scripted_frames(timestamp_us)
+            .into_iter()
+            .map(|frame| (Duration::ZERO, frame))
+            .collect();
+        frames.extend((1..=6).map(|joint_index| {
+            (
+                if joint_index == 1 {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::ZERO
+                },
+                joint_driver_low_speed_frame(
+                    joint_index,
+                    true,
+                    timestamp_us + 100 + joint_index as u64,
+                ),
+            )
+        }));
+        frames.push((
+            Duration::ZERO,
+            robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, timestamp_us + 200),
+        ));
+        frames.push((
+            Duration::ZERO,
+            control_mode_echo_frame(
+                ControlModeCommand::CanControl,
+                MoveMode::MoveM,
+                100,
+                ProtocolMitMode::Mit,
+                timestamp_us + 201,
+            ),
+        ));
+        frames
     }
 
     fn delayed_control_snapshot_frames(
@@ -2257,6 +2413,48 @@ mod tests {
         );
         wait_for_complete_control_snapshot(&piper.observer().clone());
         piper
+    }
+
+    fn build_standby_piper_with_tx_adapter<T>(
+        timestamp_us: u64,
+        tx_adapter: T,
+        post_feedback_delay: Duration,
+    ) -> Piper<Standby, StrictRealtime>
+    where
+        T: RealtimeTxAdapter + Send + 'static,
+    {
+        let piper =
+            build_piper_with_tx_adapter(timestamp_us, tx_adapter, post_feedback_delay, Standby);
+        wait_for_complete_control_snapshot(&piper.observer().clone());
+        piper
+    }
+
+    fn build_standby_piper_with_rx_and_tx_adapter<R, T>(
+        rx_adapter: R,
+        tx_adapter: T,
+        post_feedback_delay: Duration,
+    ) -> Piper<Standby, StrictRealtime>
+    where
+        R: RxAdapter + Send + 'static,
+        T: RealtimeTxAdapter + Send + 'static,
+    {
+        let piper = build_piper_with_adapters(rx_adapter, tx_adapter, post_feedback_delay, Standby);
+        wait_for_complete_control_snapshot(&piper.observer().clone());
+        piper
+    }
+
+    fn build_mit_enable_ready_standby_piper<T>(
+        timestamp_us: u64,
+        tx_adapter: T,
+    ) -> Piper<Standby, StrictRealtime>
+    where
+        T: RealtimeTxAdapter + Send + 'static,
+    {
+        build_standby_piper_with_rx_and_tx_adapter(
+            DelayedScriptedRxAdapter::new(mit_enable_success_frames(timestamp_us)),
+            tx_adapter,
+            Duration::ZERO,
+        )
     }
 
     fn build_active_mit_piper_with_frames(
@@ -3238,6 +3436,68 @@ mod tests {
         assert!(
             matches!(skew_error, RobotError::StateMisaligned { .. }),
             "expected state misalignment, got {skew_error:?}"
+        );
+    }
+
+    #[test]
+    fn dual_arm_enable_mit_right_failure_drops_left_active_and_sends_disable() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let left =
+            build_mit_enable_ready_standby_piper(1_000, RecordingTxAdapter::new(left_sent.clone()));
+        let right = build_mit_enable_ready_standby_piper(
+            10_000,
+            FailingModeConfirmTxAdapter::new(right_sent),
+        );
+        let arms = DualArmStandby { left, right };
+
+        let err = match arms.enable_mit(MitModeConfig::default(), MitModeConfig::default()) {
+            Ok(_) => panic!("right-arm enable failure should fail the dual-arm enable"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("timeout") || err.to_string().contains("confirm"));
+        let left_frames = wait_for_sent_frames(&left_sent, 3);
+        assert!(
+            left_frames
+                .iter()
+                .any(|frame| *frame == MotorEnableCommand::disable_all().to_frame()),
+            "dropping left active arm after right failure must disable left"
+        );
+    }
+
+    #[test]
+    fn dual_arm_enable_mit_left_confirmation_failure_sends_disable() {
+        let left_sent = Arc::new(Mutex::new(Vec::new()));
+        let right_sent = Arc::new(Mutex::new(Vec::new()));
+        let left = build_standby_piper_with_tx_adapter(
+            1_000,
+            FailingEnableConfirmTxAdapter::new(left_sent.clone()),
+            Duration::from_millis(20),
+        );
+        let right = build_standby_piper(1_000, right_sent.clone(), Duration::from_millis(20));
+        let arms = DualArmStandby { left, right };
+        let config = MitModeConfig {
+            timeout: Duration::from_millis(20),
+            poll_interval: Duration::from_millis(1),
+            ..MitModeConfig::default()
+        };
+
+        let _ = match arms.enable_mit(config, MitModeConfig::default()) {
+            Ok(_) => panic!("left enable confirmation failure should fail"),
+            Err(err) => err,
+        };
+
+        let left_frames = wait_for_sent_frames(&left_sent, 2);
+        assert!(
+            left_frames
+                .iter()
+                .any(|frame| *frame == MotorEnableCommand::disable_all().to_frame()),
+            "left confirmation failure after enable dispatch must disable left"
+        );
+        assert!(
+            right_sent.lock().expect("right sent frames lock").is_empty(),
+            "right arm must not be enabled after left enable failure"
         );
     }
 
