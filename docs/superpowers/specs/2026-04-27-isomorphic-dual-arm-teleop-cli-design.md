@@ -125,6 +125,7 @@ Core options:
 --reflection-gain <VALUE>
 --disable-gripper-mirror
 --calibration-file <PATH>
+--calibration-max-error-rad <RAD>
 --save-calibration <PATH>
 --report-json <PATH>
 --yes
@@ -182,12 +183,23 @@ gripper_mirror = true
 
 [calibration]
 file = "calibration.toml"
+max_error_rad = 0.05
 ```
 
 The teleop config should be separate from the existing single-arm default
 target config. The single-arm CLI config is optimized for one Piper; dual-arm
 teleoperation needs explicit per-role target resolution and should not infer a
 slave arm from the single-arm target.
+
+Teleop target values are strings using the same grammar as the CLI:
+
+- `socketcan:can0`
+- `gs-usb-serial:ABC123`
+- `gs-usb-bus-address:1:8`
+
+The implementation parses these strings with `TargetSpec::from_str` and then
+converts to `ConnectionTarget` / `PiperBuilder`. It must not deserialize these
+fields directly as the current `TargetSpec` tagged-enum TOML representation.
 
 ## Calibration
 
@@ -227,6 +239,21 @@ Validation rules:
 - zero arrays must contain six finite radians.
 - malformed files fail before MIT enable.
 
+Loaded calibration files require a pre-enable posture compatibility check. After
+connecting both arms and loading the file, the CLI reads a current standby
+snapshot with the configured dual-arm read policy, computes:
+
+```text
+expected_slave = calibration.master_to_slave_position(current_master)
+max_error = max(abs(expected_slave[j] - current_slave[j]))
+```
+
+If `max_error > calibration.max_error_rad`, the command fails before MIT enable
+and instructs the operator to recapture calibration or move both arms back to the
+saved isomorphic zero relationship. The default threshold is `0.05 rad`. The
+threshold may be configurable, but there is no first-version override that
+continues past a failed compatibility check.
+
 `--save-calibration` writes the captured calibration after successful capture.
 It must not overwrite an existing file unless a future explicit overwrite flag
 is added.
@@ -240,16 +267,18 @@ The command runs these phases:
 3. Connect both arms through `DualArmBuilder`.
 4. Read initial runtime health and fail if either arm is unhealthy.
 5. Load calibration file or prompt for manual capture.
-6. Optionally save captured calibration.
-7. Print an enable summary: targets, mode, profile, frequency, gains,
+6. If calibration was loaded from a file, verify current master/slave posture
+   compatibility before MIT enable.
+7. Optionally save captured calibration.
+8. Print an enable summary: targets, mode, profile, frequency, gains,
    calibration source, gripper mirroring, and report path.
-8. In production profile, ask for explicit operator confirmation unless
+9. In production profile, ask for explicit operator confirmation unless
    `--yes` is present.
-9. Enable MIT mode on both arms.
-10. Start runtime console input and Ctrl+C handling.
-11. Run the dual-arm loop until `quit`, Ctrl+C, max iterations, or a fault.
-12. Print and optionally save the final report.
-13. Exit with zero only for clean standby exits.
+10. Enable MIT mode on both arms.
+11. Start runtime console input and Ctrl+C handling.
+12. Run the dual-arm loop until `quit`, Ctrl+C, max iterations, or a fault.
+13. Print and optionally save the final report.
+14. Exit with zero only for clean standby exits.
 
 No step after connection should command motion before calibration and MIT enable
 confirmation complete.
@@ -296,9 +325,8 @@ quit
 
 Semantics:
 
-- `status` prints current mode, gains, elapsed time, last report counters that
-  are available without blocking the control loop, and whether cancellation has
-  been requested.
+- `status` prints current mode, gains, elapsed time, and whether cancellation
+  has been requested.
 - `mode` changes runtime controller behavior on the next tick.
 - `gain` validates finite non-negative values before applying.
 - `quit` sets the same cancellation flag used by Ctrl+C.
@@ -306,6 +334,11 @@ Semantics:
 
 The console must not send raw motor commands directly. It only changes runtime
 settings or requests cancellation.
+
+First-version `status` must not claim live `BilateralRunReport` counters. The
+current SDK returns `BilateralRunReport` only after `run_bilateral` exits. If
+live loop counters become required later, add an explicit telemetry/shared
+metrics mechanism rather than reading report state that does not exist.
 
 ## Safety Profiles
 
@@ -388,6 +421,8 @@ Fail before MIT enable when:
 - either arm cannot connect
 - runtime health is unhealthy
 - calibration cannot load or capture
+- loaded calibration does not match the current master/slave posture within the
+  configured max joint error
 - operator confirmation is declined
 
 During control:
@@ -399,9 +434,16 @@ During control:
 
 Exit code policy:
 
-- `0`: clean `Standby` exit caused by `Cancelled` or `MaxIterations`
+- `0`: `report.exit_reason` is exactly `Cancelled` or `MaxIterations`
 - non-zero: config failure, connection failure, calibration failure, controller
-  fault, submission fault, runtime transport fault, or faulted exit
+  fault, read fault, compensation fault, submission fault, runtime transport
+  fault, runtime manual fault, missing/unknown exit reason, or any `Faulted`
+  loop exit
+
+The CLI must classify process status by `report.exit_reason`, not only by
+`DualArmLoopExit::Standby` vs `DualArmLoopExit::Faulted`. The SDK can return
+`Standby` for `ReadFault`, `ControllerFault`, and `CompensationFault` after it
+has safely disabled both arms; these are still failed sessions.
 
 ## Testing Strategy
 
@@ -414,8 +456,11 @@ Unit tests:
 - production/debug profile mapping into `BilateralLoopConfig`
 - calibration TOML roundtrip
 - calibration validation failures
+- loaded-calibration posture compatibility success/failure
 - runtime console parser
 - report serialization
+- exit-code classification, including `Standby` reports with `ReadFault`,
+  `ControllerFault`, and `CompensationFault`
 
 Controller tests:
 
@@ -433,6 +478,7 @@ CLI tests:
 - invalid frequency/gain fails fast
 - missing non-Linux target fails fast
 - malformed calibration file fails fast without connecting when possible
+- loaded calibration that does not match current posture fails before MIT enable
 
 Manual hardware acceptance:
 
@@ -464,9 +510,8 @@ recommended topology for the first version.
 
 ## Open Implementation Notes
 
-- The CLI should reuse `piper_control::TargetSpec` if it can represent both
-  per-arm targets cleanly. If not, add a small teleop-specific target parser
-  that converts into `PiperBuilder`.
+- Teleop config target fields are string specs parsed through
+  `TargetSpec::from_str`; do not deserialize them as `TargetSpec` TOML tables.
 - `RuntimeTeleopController` should stay inside the CLI unless it proves useful
   as a reusable SDK abstraction.
 - If the runtime console needs richer live metrics later, add an explicit
@@ -482,6 +527,8 @@ recommended topology for the first version.
 - CLI rejects conflicting or duplicate arm targets before connecting.
 - CLI supports SocketCAN and GS-USB dual-arm target selection.
 - CLI can run with manual calibration and with calibration loaded from TOML.
+- Loaded calibration files are checked against current arm posture before MIT
+  enable, using a bounded max joint error.
 - CLI can save a captured calibration without overwriting existing files.
 - Default mode is `master-follower`.
 - `bilateral` mode requires explicit config or CLI selection.
@@ -489,7 +536,8 @@ recommended topology for the first version.
 - Runtime mode/gain updates affect the next controller tick without restarting
   the session.
 - Ctrl+C and `quit` converge through SDK cancellation and disable paths.
-- Fault exits produce non-zero process status.
+- All exit reasons except `Cancelled` and `MaxIterations` produce non-zero
+  process status, even if the SDK returned `DualArmLoopExit::Standby`.
 - Clean cancellation prints a final report and exits zero.
 - JSON report output is supported.
 - Default automated tests require no hardware.
