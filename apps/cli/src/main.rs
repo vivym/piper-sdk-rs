@@ -34,6 +34,7 @@ mod modes;
 mod parsing;
 mod safety;
 mod script;
+mod teleop;
 mod utils;
 mod validation;
 
@@ -41,6 +42,7 @@ use commands::config::CliConfig;
 use commands::{
     CollisionProtectionCommand, ConfigCommand, HomeCommand, MoveCommand, ParkCommand,
     PositionCommand, RecordCommand, ReplayCommand, RunCommand, SetZeroCommand, StopCommand,
+    TeleopAction, TeleopCommand,
 };
 use connection::TargetArgs;
 use modes::oneshot::OneShotMode;
@@ -134,6 +136,12 @@ enum Commands {
         #[command(flatten)]
         args: ReplayCommand,
     },
+
+    /// 双臂遥操作
+    Teleop {
+        #[command(subcommand)]
+        action: Box<TeleopAction>,
+    },
 }
 
 #[tokio::main]
@@ -213,6 +221,8 @@ async fn main() -> Result<()> {
             args.execute().await?;
             Ok(())
         },
+
+        Commands::Teleop { action } => TeleopCommand { action: *action }.execute().await,
 
         Commands::Shell => {
             // REPL 模式：交互式 Shell

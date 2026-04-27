@@ -11,6 +11,7 @@ pub mod replay;
 pub mod run;
 pub mod set_zero;
 pub mod stop;
+pub mod teleop;
 
 pub use collision_protection::CollisionProtectionCommand;
 pub use config::ConfigCommand;
@@ -23,3 +24,4 @@ pub use replay::ReplayCommand;
 pub use run::RunCommand;
 pub use set_zero::SetZeroCommand;
 pub use stop::StopCommand;
+pub use teleop::{TeleopAction, TeleopCommand};
