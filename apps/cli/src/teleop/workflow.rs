@@ -447,35 +447,45 @@ pub struct RealTeleopIo {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+enum CtrlcInstallState {
+    Installed(Arc<AtomicBool>),
+    Failed(String),
+}
+
 impl RealTeleopIo {
     pub fn install_ctrlc() -> Result<Self> {
-        static CTRL_C_CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+        static CTRL_C_INSTALL: OnceLock<CtrlcInstallState> = OnceLock::new();
 
-        if let Some(cancel) = CTRL_C_CANCEL.get() {
-            cancel.store(false, Ordering::SeqCst);
-            return Ok(Self {
-                cancel: cancel.clone(),
-            });
-        }
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        let handler_cancel = cancel.clone();
-        ctrlc::set_handler(move || {
-            handler_cancel.store(true, Ordering::SeqCst);
-        })
-        .context("failed to install Ctrl+C handler")?;
-
-        if CTRL_C_CANCEL.set(cancel.clone()).is_err() {
-            let existing = CTRL_C_CANCEL
-                .get()
-                .context("Ctrl+C cancel signal initialized concurrently but unavailable")?;
-            existing.store(false, Ordering::SeqCst);
-            return Ok(Self {
-                cancel: existing.clone(),
-            });
-        }
+        let cancel = ctrlc_cancel_signal(&CTRL_C_INSTALL, || {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let handler_cancel = cancel.clone();
+            ctrlc::set_handler(move || {
+                handler_cancel.store(true, Ordering::SeqCst);
+            })
+            .map_err(|error| error.to_string())?;
+            Ok(cancel)
+        })?;
 
         Ok(Self { cancel })
+    }
+}
+
+fn ctrlc_cancel_signal(
+    install: &'static OnceLock<CtrlcInstallState>,
+    installer: impl FnOnce() -> std::result::Result<Arc<AtomicBool>, String>,
+) -> Result<Arc<AtomicBool>> {
+    match install.get_or_init(|| match installer() {
+        Ok(cancel) => CtrlcInstallState::Installed(cancel),
+        Err(error) => CtrlcInstallState::Failed(error),
+    }) {
+        CtrlcInstallState::Installed(cancel) => {
+            cancel.store(false, Ordering::SeqCst);
+            Ok(cancel.clone())
+        },
+        CtrlcInstallState::Failed(error) => {
+            bail!("failed to install Ctrl+C handler: {error}");
+        },
     }
 }
 
@@ -991,6 +1001,25 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn ctrlc_initializer_reuses_same_arc_and_resets_flag() {
+        static TEST_CTRL_C_INSTALL: OnceLock<CtrlcInstallState> = OnceLock::new();
+
+        let first =
+            ctrlc_cancel_signal(&TEST_CTRL_C_INSTALL, || Ok(Arc::new(AtomicBool::new(true))))
+                .expect("test ctrlc installer should initialize");
+        assert!(!first.load(Ordering::SeqCst));
+
+        first.store(true, Ordering::SeqCst);
+        let second = ctrlc_cancel_signal(&TEST_CTRL_C_INSTALL, || {
+            panic!("installer must not run after OnceLock is initialized")
+        })
+        .expect("initialized ctrlc signal should be reused");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!second.load(Ordering::SeqCst));
     }
 
     #[test]
