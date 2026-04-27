@@ -77,6 +77,39 @@ impl TeleopCommand {
 }
 
 #[cfg(test)]
+impl TeleopDualArmArgs {
+    pub fn default_for_tests() -> Self {
+        Self {
+            config: None,
+            master_target: None,
+            slave_target: None,
+            master_interface: None,
+            slave_interface: None,
+            master_serial: None,
+            slave_serial: None,
+            master_gs_usb_bus_address: None,
+            slave_gs_usb_bus_address: None,
+            baud_rate: 1_000_000,
+            mode: None,
+            profile: None,
+            frequency_hz: None,
+            track_kp: None,
+            track_kd: None,
+            master_damping: None,
+            reflection_gain: None,
+            disable_gripper_mirror: false,
+            calibration_file: None,
+            calibration_max_error_rad: None,
+            save_calibration: None,
+            report_json: None,
+            yes: false,
+            max_iterations: None,
+            timing_mode: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;

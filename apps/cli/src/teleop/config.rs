@@ -1,19 +1,335 @@
-use clap::ValueEnum;
+#![allow(dead_code)]
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
+use piper_client::dual_arm::{BilateralLoopConfig, LoopTimingMode};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::AtomicBool};
+
+use crate::commands::teleop::TeleopDualArmArgs;
+
+pub const DEFAULT_FREQUENCY_HZ: f64 = 200.0;
+pub const MAX_CALIBRATION_ERROR_RAD: f64 = 0.05;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TeleopMode {
     MasterFollower,
     Bilateral,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TeleopProfile {
     Production,
     Debug,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TeleopTimingMode {
     Sleep,
     Spin,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TeleopConfigFile {
+    pub arms: Option<TeleopArmsConfig>,
+    pub control: Option<TeleopControlConfig>,
+    pub safety: Option<TeleopSafetyConfig>,
+    pub calibration: Option<TeleopCalibrationConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TeleopArmsConfig {
+    pub master: Option<TeleopRoleTargetConfig>,
+    pub slave: Option<TeleopRoleTargetConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TeleopRoleTargetConfig {
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TeleopControlConfig {
+    pub mode: Option<TeleopMode>,
+    pub frequency_hz: Option<f64>,
+    pub track_kp: Option<f64>,
+    pub track_kd: Option<f64>,
+    pub master_damping: Option<f64>,
+    pub reflection_gain: Option<f64>,
+    pub max_iterations: Option<usize>,
+    pub timing_mode: Option<TeleopTimingMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TeleopSafetyConfig {
+    pub profile: Option<TeleopProfile>,
+    pub gripper_mirror: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TeleopCalibrationConfig {
+    pub file: Option<PathBuf>,
+    pub max_error_rad: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeleopControlSettings {
+    pub mode: TeleopMode,
+    pub frequency_hz: f64,
+    pub track_kp: f64,
+    pub track_kd: f64,
+    pub master_damping: f64,
+    pub reflection_gain: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeleopSafetySettings {
+    pub profile: TeleopProfile,
+    pub gripper_mirror: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeleopCalibrationSettings {
+    pub file: Option<PathBuf>,
+    pub max_error_rad: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedTeleopConfig {
+    pub control: TeleopControlSettings,
+    pub safety: TeleopSafetySettings,
+    pub calibration: TeleopCalibrationSettings,
+    pub max_iterations: Option<usize>,
+    pub timing_mode: Option<TeleopTimingMode>,
+}
+
+impl TeleopConfigFile {
+    pub fn load(path: &Path) -> Result<Self> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read teleop config {}", path.display()))?;
+        toml::from_str(&contents)
+            .with_context(|| format!("failed to parse teleop config {}", path.display()))
+    }
+}
+
+impl Default for TeleopControlSettings {
+    fn default() -> Self {
+        Self {
+            mode: TeleopMode::MasterFollower,
+            frequency_hz: DEFAULT_FREQUENCY_HZ,
+            track_kp: 8.0,
+            track_kd: 1.0,
+            master_damping: 0.4,
+            reflection_gain: 0.25,
+        }
+    }
+}
+
+impl TeleopControlSettings {
+    pub fn validate(&self) -> Result<()> {
+        validate_range("frequency_hz", self.frequency_hz, 10.0, 500.0)?;
+        validate_range("track_kp", self.track_kp, 0.0, 20.0)?;
+        validate_range("track_kd", self.track_kd, 0.0, 5.0)?;
+        validate_range("master_damping", self.master_damping, 0.0, 2.0)?;
+        validate_range("reflection_gain", self.reflection_gain, 0.0, 0.5)?;
+        Ok(())
+    }
+}
+
+impl ResolvedTeleopConfig {
+    pub fn resolve(args: TeleopDualArmArgs, file: Option<TeleopConfigFile>) -> Result<Self> {
+        let file_control = file.as_ref().and_then(|file| file.control.as_ref());
+        let file_safety = file.as_ref().and_then(|file| file.safety.as_ref());
+        let file_calibration = file.as_ref().and_then(|file| file.calibration.as_ref());
+
+        let control = TeleopControlSettings {
+            mode: args
+                .mode
+                .or_else(|| file_control.and_then(|control| control.mode))
+                .unwrap_or(TeleopMode::MasterFollower),
+            frequency_hz: args
+                .frequency_hz
+                .or_else(|| file_control.and_then(|control| control.frequency_hz))
+                .unwrap_or(DEFAULT_FREQUENCY_HZ),
+            track_kp: args
+                .track_kp
+                .or_else(|| file_control.and_then(|control| control.track_kp))
+                .unwrap_or(8.0),
+            track_kd: args
+                .track_kd
+                .or_else(|| file_control.and_then(|control| control.track_kd))
+                .unwrap_or(1.0),
+            master_damping: args
+                .master_damping
+                .or_else(|| file_control.and_then(|control| control.master_damping))
+                .unwrap_or(0.4),
+            reflection_gain: args
+                .reflection_gain
+                .or_else(|| file_control.and_then(|control| control.reflection_gain))
+                .unwrap_or(0.25),
+        };
+        control.validate()?;
+
+        let calibration_max_error_rad = args
+            .calibration_max_error_rad
+            .or_else(|| file_calibration.and_then(|calibration| calibration.max_error_rad))
+            .unwrap_or(MAX_CALIBRATION_ERROR_RAD);
+        validate_calibration_max_error_rad(calibration_max_error_rad)?;
+
+        Ok(Self {
+            control,
+            safety: TeleopSafetySettings {
+                profile: args
+                    .profile
+                    .or_else(|| file_safety.and_then(|safety| safety.profile))
+                    .unwrap_or(TeleopProfile::Production),
+                gripper_mirror: if args.disable_gripper_mirror {
+                    false
+                } else {
+                    file_safety.and_then(|safety| safety.gripper_mirror).unwrap_or(true)
+                },
+            },
+            calibration: TeleopCalibrationSettings {
+                file: args
+                    .calibration_file
+                    .or_else(|| file_calibration.and_then(|calibration| calibration.file.clone())),
+                max_error_rad: calibration_max_error_rad,
+            },
+            max_iterations: args
+                .max_iterations
+                .or_else(|| file_control.and_then(|control| control.max_iterations)),
+            timing_mode: args
+                .timing_mode
+                .or_else(|| file_control.and_then(|control| control.timing_mode)),
+        })
+    }
+
+    pub fn loop_config(&self, cancel_signal: Arc<AtomicBool>) -> BilateralLoopConfig {
+        let mut config = BilateralLoopConfig {
+            frequency_hz: self.control.frequency_hz,
+            max_iterations: self.max_iterations,
+            cancel_signal: Some(cancel_signal),
+            ..BilateralLoopConfig::default()
+        };
+        if let Some(timing_mode) = self.timing_mode {
+            config.timing_mode = match timing_mode {
+                TeleopTimingMode::Sleep => LoopTimingMode::Sleep,
+                TeleopTimingMode::Spin => LoopTimingMode::Spin,
+            };
+        }
+        config.gripper.enabled = self.safety.gripper_mirror;
+        config
+    }
+}
+
+fn validate_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
+    if !value.is_finite() || value < min || value > max {
+        bail!("{name} must be finite and between {min} and {max}; got {value}");
+    }
+    Ok(())
+}
+
+fn validate_calibration_max_error_rad(value: f64) -> Result<()> {
+    if !value.is_finite() || value <= 0.0 || value > MAX_CALIBRATION_ERROR_RAD {
+        bail!(
+            "calibration_max_error_rad must be finite and greater than 0.0 up to {MAX_CALIBRATION_ERROR_RAD}; got {value}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::teleop::TeleopDualArmArgs;
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn cli_values_override_file_values() {
+        let file = TeleopConfigFile {
+            control: Some(TeleopControlConfig {
+                mode: Some(TeleopMode::Bilateral),
+                frequency_hz: Some(100.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let args = TeleopDualArmArgs {
+            mode: Some(TeleopMode::MasterFollower),
+            frequency_hz: Some(200.0),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
+
+        assert_eq!(resolved.control.mode, TeleopMode::MasterFollower);
+        assert_eq!(resolved.control.frequency_hz, 200.0);
+    }
+
+    #[test]
+    fn hard_limits_reject_unsafe_gains() {
+        let err = TeleopControlSettings {
+            track_kp: 21.0,
+            ..TeleopControlSettings::default()
+        }
+        .validate()
+        .expect_err("track_kp above hard cap must fail");
+
+        assert!(err.to_string().contains("track_kp"));
+    }
+
+    #[test]
+    fn default_mode_is_master_follower() {
+        let resolved =
+            ResolvedTeleopConfig::resolve(TeleopDualArmArgs::default_for_tests(), None).unwrap();
+
+        assert_eq!(resolved.control.mode, TeleopMode::MasterFollower);
+    }
+
+    #[test]
+    fn loads_toml_config_from_path() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+            [control]
+            frequency_hz = 250.0
+            "#
+        )
+        .unwrap();
+
+        let loaded = TeleopConfigFile::load(file.path()).unwrap();
+
+        assert_eq!(
+            loaded.control.as_ref().and_then(|control| control.frequency_hz),
+            Some(250.0)
+        );
+    }
+
+    #[test]
+    fn loop_config_applies_resolved_fields() {
+        let args = TeleopDualArmArgs {
+            frequency_hz: Some(150.0),
+            max_iterations: Some(3),
+            timing_mode: Some(TeleopTimingMode::Sleep),
+            disable_gripper_mirror: true,
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+        let resolved = ResolvedTeleopConfig::resolve(args, None).unwrap();
+        let cancel_signal = Arc::new(AtomicBool::new(false));
+
+        let loop_config = resolved.loop_config(cancel_signal.clone());
+
+        assert_eq!(loop_config.frequency_hz, 150.0);
+        assert_eq!(loop_config.max_iterations, Some(3));
+        assert_eq!(loop_config.timing_mode, LoopTimingMode::Sleep);
+        assert!(!loop_config.gripper.enabled);
+        assert!(!cancel_signal.load(Ordering::Relaxed));
+        assert!(loop_config.cancel_signal.is_some());
+    }
 }
