@@ -155,7 +155,7 @@ pub(crate) fn enable_arm(&self) -> Result<()> {
     let frame = cmd.to_frame();
 
     let _guard = self.send_lock.lock();
-    self.can_sender.send_frame(frame.id as u32, &frame.data)?;
+    self.can_sender.send_frame(frame.raw_id() as u32, &frame.data)?;
 
     self.state_tracker.set_expected_controller(ArmController::Enabled);
     Ok(())
@@ -398,7 +398,7 @@ pub(crate) fn enable_arm(&self) -> Result<()> {
     let frame = cmd.to_frame();
 
     let _guard = self.send_lock.lock();
-    self.can_sender.send_frame(frame.id as u32, &frame.data)?;
+    self.can_sender.send_frame(frame.raw_id() as u32, &frame.data)?;
 
     self.state_tracker.set_expected_controller(ArmController::Enabled);
     Ok(())
@@ -412,7 +412,7 @@ pub(crate) fn enable_joint(&self, joint_index: u8) -> Result<()> {
     let frame = cmd.to_frame();
 
     let _guard = self.send_lock.lock();
-    self.can_sender.send_frame(frame.id as u32, &frame.data)?;
+    self.can_sender.send_frame(frame.raw_id() as u32, &frame.data)?;
 
     // ✅ 更新对应关节的期望状态
     self.state_tracker.set_joint_enabled(joint_index, true);

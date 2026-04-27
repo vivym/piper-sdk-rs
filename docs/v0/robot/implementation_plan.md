@@ -478,7 +478,7 @@ pub fn io_loop(
         // ============================================================
         // 2. 根据 CAN ID 解析帧并更新状态
         // ============================================================
-        match frame.id {
+        match frame.raw_id() {
             // === 核心运动状态（帧组同步） ===
 
             // 关节反馈 12 (0x2A5)
@@ -488,7 +488,7 @@ pub fn io_loop(
                     pending_joint_pos[1] = feedback.j2_rad();
                     joint_pos_ready = false;  // 重置，等待完整帧组
                 } else {
-                    warn!("Failed to parse JointFeedback12: CAN ID 0x{:X}", frame.id);
+                    warn!("Failed to parse JointFeedback12: CAN ID 0x{:X}", frame.raw_id());
                 }
             }
 
@@ -499,7 +499,7 @@ pub fn io_loop(
                     pending_joint_pos[3] = feedback.j4_rad();
                     joint_pos_ready = false;  // 重置，等待完整帧组
                 } else {
-                    warn!("Failed to parse JointFeedback34: CAN ID 0x{:X}", frame.id);
+                    warn!("Failed to parse JointFeedback34: CAN ID 0x{:X}", frame.raw_id());
                 }
             }
 
@@ -537,7 +537,7 @@ pub fn io_loop(
                         trace!("Core motion committed: joint_pos updated (end_pose not ready)");
                     }
                 } else {
-                    warn!("Failed to parse JointFeedback56: CAN ID 0x{:X}", frame.id);
+                    warn!("Failed to parse JointFeedback56: CAN ID 0x{:X}", frame.raw_id());
                 }
             }
 
@@ -816,7 +816,7 @@ pub fn io_loop(
 
             // 其他反馈帧...
             _ => {
-                trace!("Unhandled CAN ID: 0x{:X}", frame.id);
+                trace!("Unhandled CAN ID: 0x{:X}", frame.raw_id());
             }
         }
 

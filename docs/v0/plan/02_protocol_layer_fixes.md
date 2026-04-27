@@ -187,7 +187,7 @@ match ControlMode::try_from(feedback.control_mode as u8) {
     Ok(mode) => state.control_mode = mode,
     Err(e) => {
         warn!("Invalid control mode in frame 0x{:X}: {}, skipping",
-              frame.id, e);
+              frame.raw_id(), e);
         continue; // Skip THIS frame, keep processing
     }
 }
@@ -313,7 +313,7 @@ ID_ROBOT_STATUS => {
                 // So we log the raw value for debugging instead
                 warn!(
                     "Invalid robot_status {} in frame 0x{:X}, skipping",
-                    feedback.robot_status, frame.id
+                    feedback.robot_status, frame.raw_id()
                 );
                 continue;
             }
@@ -911,8 +911,8 @@ pub fn validate_frame(
     expected_id: u32,
     expected_len: u8,
 ) -> Result<(), ProtocolError> {
-    if frame.id != expected_id {
-        return Err(ProtocolError::InvalidCanId { id: frame.id });
+    if frame.raw_id() != expected_id {
+        return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
     }
 
     // Strict: must be exactly expected length

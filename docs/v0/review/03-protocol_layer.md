@@ -122,8 +122,8 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        if frame.id != ID_ROBOT_STATUS {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.raw_id() != ID_ROBOT_STATUS {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         if frame.len < 8 {
@@ -146,8 +146,8 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
 
 ```rust
 fn validate_frame(frame: &PiperFrame, expected_id: u32, expected_len: u8) -> Result<(), ProtocolError> {
-    if frame.id != expected_id {
-        return Err(ProtocolError::InvalidCanId { id: frame.id });
+    if frame.raw_id() != expected_id {
+        return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
     }
     if frame.len < expected_len {
         return Err(ProtocolError::InvalidLength {

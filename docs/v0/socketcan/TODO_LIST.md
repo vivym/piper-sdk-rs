@@ -276,7 +276,7 @@ fn test_socketcan_adapter_receive_standard_frame() {
 
     // 接收帧
     let rx_frame = adapter.receive().unwrap();
-    assert_eq!(rx_frame.id, 0x123);
+    assert_eq!(rx_frame.raw_id(), 0x123);
     assert_eq!(rx_frame.data[..4], [1, 2, 3, 4]);
     assert_eq!(rx_frame.len, 4);
     assert!(!rx_frame.is_extended);
@@ -290,7 +290,7 @@ fn test_socketcan_adapter_receive_extended_frame() {
     adapter.send(tx_frame).unwrap();
 
     let rx_frame = adapter.receive().unwrap();
-    assert_eq!(rx_frame.id, 0x12345678);
+    assert_eq!(rx_frame.raw_id(), 0x12345678);
     assert!(rx_frame.is_extended);
 }
 

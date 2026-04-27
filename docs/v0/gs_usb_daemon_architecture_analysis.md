@@ -1354,7 +1354,7 @@ thread::spawn(move || {
         // ✅ 无需锁，直接遍历
         let clients_snapshot = clients.load(Ordering::Acquire);  // ArcSwap
         for client in clients_snapshot.iter() {
-            if client.matches_filter(frame.id) {
+            if client.matches_filter(frame.raw_id()) {
                 // ✅ 非阻塞入队
                 client.rx_queue.push(frame.clone());
             }

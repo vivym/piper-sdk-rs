@@ -232,7 +232,7 @@ fn test_loopback_mode_safe() {
 
     // 接收 Echo（Loopback 模式下会收到）
     let rx_frame = adapter.receive().unwrap();
-    assert_eq!(rx_frame.id, 0x123);
+    assert_eq!(rx_frame.raw_id(), 0x123);
 
     // ✅ 不会向 CAN 总线发送帧
 }

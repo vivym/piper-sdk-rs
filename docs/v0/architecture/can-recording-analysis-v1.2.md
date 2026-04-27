@@ -360,11 +360,11 @@ impl FrameCallback for AsyncRecordingHook {
     fn on_frame_received(&self, frame: &PiperFrame) {
         // ⏱️ **时间戳精度**: 必须直接使用硬件时间戳
         // 禁止调用 SystemTime::now()，因为回调执行时间已晚于帧到达时间
-        let ts_frame = TimestampedFrame {
+        let ts_frame = TimestampedFrame::from(RecordedFrameEvent {
             frame: (*frame).with_timestamp_us(frame.timestamp_us()),  // ✅ 直接透传硬件时间戳
             direction: RecordedFrameDirection::Rx,
             timestamp_provenance: TimestampProvenance::Hardware,
-        };
+        });
 
         // 🛡️ 丢帧保护：队列满时丢弃帧，而不是阻塞或无限增长
         if let Err(_) = self.tx.try_send(ts_frame) {
@@ -1168,7 +1168,7 @@ use crate::pipeline::PiperFrame;
 /// impl FrameCallback for MyCallback {
 ///     fn on_frame_received(&self, frame: &PiperFrame) {
 ///         // 快速操作：<1μs
-///         println!("Frame: 0x{:03X}", frame.id);
+///         println!("Frame: 0x{:03X}", frame.raw_id());
 ///     }
 /// }
 /// ```
@@ -1560,7 +1560,7 @@ impl FrameCallback for AsyncRecordingHook {
     fn on_frame_received(&self, frame: &PiperFrame) {
         // 🔄 过滤回环帧
         if let Ok(ids) = self.sent_ids.lock() {
-            if ids.contains(&frame.id) {
+            if ids.contains(&frame.raw_id()) {
                 // 这是自己发送的帧的回环，跳过录制
                 return;
             }
@@ -1573,7 +1573,7 @@ impl FrameCallback for AsyncRecordingHook {
 
 // 在 tx_loop 发送成功后记录 ID
 // tx_loop 发送成功后:
-// sent_ids.lock().unwrap().insert(frame.id);
+// sent_ids.lock().unwrap().insert(frame.raw_id());
 ```
 
 **劣势**:

@@ -195,10 +195,9 @@ pub struct PiperRecording {
 }
 
 pub struct TimestampedFrame {
-    pub timestamp_us: u64,
-    pub can_id: u32,
-    pub data: Vec<u8>,
-    pub source: TimestampSource,  // ⭐ 明确来源
+    pub frame: PiperFrame,
+    pub direction: RecordedFrameDirection,
+    pub timestamp_source: Option<TimestampSource>,  // ⭐ 明确来源
 }
 ```
 

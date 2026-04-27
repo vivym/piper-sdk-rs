@@ -59,7 +59,7 @@ loop {
     };
 
     // 2. 解析帧，更新状态
-    // ... 根据 frame.id 解析并更新各种状态 ...
+    // ... 根据 frame.raw_id() 解析并更新各种状态 ...
 
     // 3. 命令 drain（关键：在 receive 之后）
     while let Ok(cmd_frame) = cmd_rx.try_recv() {
@@ -506,7 +506,7 @@ impl GsUsbRxAdapter {
                 let piper_frame = self.convert_to_piper_frame(gs_frame)?;
 
                 // 检查是否为 Overflow
-                if piper_frame.id == 0x7FF && piper_frame.len == 0 {
+                if piper_frame.raw_id() == 0x7FF && piper_frame.len == 0 {
                     warn!("CAN RX overflow detected");
                     continue;
                 }
@@ -566,7 +566,7 @@ impl GsUsbTxAdapter {
         // 转换 PiperFrame -> GsUsbFrame
         let gs_frame = GsUsbFrame {
             echo_id: GS_USB_ECHO_ID,
-            can_id: if frame.is_extended { frame.id | CAN_EFF_FLAG } else { frame.id },
+            can_id: if frame.is_extended { frame.raw_id() | CAN_EFF_FLAG } else { frame.raw_id() },
             can_dlc: frame.len,
             channel: 0,
             flags: 0,
@@ -1373,7 +1373,7 @@ impl Piper {
                     // 尝试取出旧数据（腾位置）
                     if let Ok(old_frame) = self.realtime_tx.try_recv() {
                         trace!("Realtime queue full, dropped old frame (ID=0x{:X}), attempt {}",
-                               old_frame.id, attempt + 1);
+                               old_frame.raw_id(), attempt + 1);
                     }
 
                     // 继续下一轮尝试

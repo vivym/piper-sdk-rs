@@ -258,7 +258,7 @@ impl CanAdapter for LinuxCanDriver {
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
         // 1. 转换 PiperFrame -> socketcan::CANFrame
         let sys_frame = socketcan::CANFrame::new(
-            frame.id,
+            frame.raw_id(),
             &frame.data[0..frame.len as usize],
             false,
             false
@@ -310,7 +310,7 @@ impl CanAdapter for UsbCanDriver {
         // 1. 转换 PiperFrame -> GsUsbFrame
         // 2. 调用底层的 USB Bulk Write
         // 3. 不等待 Echo，直接返回
-        self.driver.transmit_raw(frame.id, &frame.data, frame.len)
+        self.driver.transmit_raw(frame.raw_id(), &frame.data, frame.len)
             .map_err(|e| CanError::Device(e.to_string()))?;
         Ok(())
     }

@@ -451,7 +451,7 @@ impl CanAdapter for SocketCanAdapter {
 
             trace!(
                 "Received CAN frame: ID=0x{:X}, len={}, timestamp_us={}",
-                piper_frame.id, piper_frame.len, piper_frame.timestamp_us
+                piper_frame.raw_id(), piper_frame.len, piper_frame.timestamp_us
             );
 
             return Ok(piper_frame);

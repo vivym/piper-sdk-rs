@@ -585,7 +585,7 @@ impl RawCommander {
         let frame = cmd.to_frame();
 
         // 验证 frame ID 是否正确（可选，用于调试）
-        debug_assert_eq!(frame.id, ID_MOTOR_ENABLE as u16);
+        debug_assert_eq!(frame.raw_id(), ID_MOTOR_ENABLE as u16);
 
         self.robot.send_reliable(frame)?;
 

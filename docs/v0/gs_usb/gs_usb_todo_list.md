@@ -62,7 +62,7 @@ mod tests {
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         let frame = PiperFrame::new_standard(0x123, &data[..4]);
 
-        assert_eq!(frame.id, 0x123);
+        assert_eq!(frame.raw_id(), 0x123);
         assert_eq!(frame.len, 4);
         assert_eq!(frame.data[..4], data[..4]);
         assert!(!frame.is_extended);
@@ -73,7 +73,7 @@ mod tests {
         let data = [0xFF; 8];
         let frame = PiperFrame::new_extended(0x12345678, &data);
 
-        assert_eq!(frame.id, 0x12345678);
+        assert_eq!(frame.raw_id(), 0x12345678);
         assert_eq!(frame.len, 8);
         assert!(frame.is_extended);
     }

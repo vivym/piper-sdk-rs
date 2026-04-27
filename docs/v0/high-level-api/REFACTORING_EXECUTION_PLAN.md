@@ -1013,7 +1013,7 @@ impl<'a> RawCommander<'a> {
         let frame = cmd.to_frame();
 
         // 验证 frame ID 是否正确（可选，用于调试）
-        debug_assert_eq!(frame.id, (ID_MIT_CONTROL_BASE + joint_index as u32) as u16);
+        debug_assert_eq!(frame.raw_id(), (ID_MIT_CONTROL_BASE + joint_index as u32) as u16);
 
         // ✅ 直接调用，无锁（实时命令，使用邮箱模式）
         self.robot.send_realtime(frame)?;

@@ -389,8 +389,8 @@ impl TryFrom<PiperFrame> for GripperFeedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        if frame.id != ID_GRIPPER_FEEDBACK {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.raw_id() != ID_GRIPPER_FEEDBACK {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
         if frame.len < 7 {
             return Err(ProtocolError::InvalidLength { expected: 7, actual: frame.len as usize });
@@ -511,8 +511,8 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        if frame.id != ID_ROBOT_STATUS {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.raw_id() != ID_ROBOT_STATUS {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
         if frame.len < 8 {
             return Err(ProtocolError::InvalidLength { expected: 8, actual: frame.len as usize });
@@ -1400,8 +1400,8 @@ impl TryFrom<PiperFrame> for GripperFeedback {
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
         // 1. 验证 CAN ID 和长度
-        if frame.id != ID_GRIPPER_FEEDBACK {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.raw_id() != ID_GRIPPER_FEEDBACK {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
         if frame.len < 7 {
             return Err(ProtocolError::InvalidLength { expected: 7, actual: frame.len as usize });
@@ -1469,7 +1469,7 @@ mod tests {
         let cmd = JointControl12::new(90.0, -45.0);
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, ID_JOINT_CONTROL_12);
+        assert_eq!(frame.raw_id(), ID_JOINT_CONTROL_12);
         // 验证编码后的字节
     }
 }

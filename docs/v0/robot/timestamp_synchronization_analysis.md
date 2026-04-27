@@ -592,7 +592,7 @@ fn io_loop(
             Err(e) => { /* ... */ }
         };
 
-        match frame.id {
+        match frame.raw_id() {
             // === 核心运动状态（帧组同步） ===
             ID_JOINT_FEEDBACK_12 => {
                 if let Ok(feedback) = JointFeedback12::try_from(frame) {

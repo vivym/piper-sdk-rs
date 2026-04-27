@@ -171,7 +171,7 @@ fn parse_and_update_state(
     config: &PipelineConfig,
     state: &mut ParserState,
 ) {
-    match frame.id {
+    match frame.raw_id() {
         ID_JOINT_FEEDBACK_12 => { /* 处理关节反馈 */ },
         ID_JOINT_FEEDBACK_34 => { /* 处理关节反馈 */ },
         ID_JOINT_FEEDBACK_56 => { /* 处理关节反馈 */ },
@@ -289,7 +289,7 @@ impl FrameCallback for RecordingCallback {
         // 转换为 TimestampedFrame 并添加
         let timestamped = TimestampedFrame::new(
             frame.timestamp_us,
-            frame.id,
+            frame.raw_id(),
             frame.data().to_vec(),
             TimestampSource::Hardware,
         );
@@ -418,7 +418,7 @@ pub fn rx_loop(
                 if let Ok(mut recording) = recording.try_lock() {
                     let timestamped = TimestampedFrame::new(
                         frame.timestamp_us,
-                        frame.id,
+                        frame.raw_id(),
                         frame.data().to_vec(),
                         TimestampSource::Hardware,
                     );
@@ -509,7 +509,7 @@ impl<A: CanAdapter> CanAdapter for RecordingAdapter<A> {
         if let Ok(mut recording) = self.recording.try_lock() {
             let timestamped = TimestampedFrame::new(
                 frame.timestamp_us,
-                frame.id,
+                frame.raw_id(),
                 frame.data().to_vec(),
                 TimestampSource::Hardware,
             );
@@ -1028,7 +1028,7 @@ use std::sync::Arc;
 ///
 /// impl FrameCallback for MyCallback {
 ///     fn on_frame_received(&self, frame: &PiperFrame) {
-///         println!("Received frame: ID=0x{:03X}", frame.id);
+///         println!("Received frame: ID=0x{:03X}", frame.raw_id());
 ///     }
 /// }
 /// ```
@@ -1060,7 +1060,7 @@ impl FrameCallback for RecordingCallback {
             // 转换为 TimestampedFrame
             let timestamped = piper_tools::TimestampedFrame::new(
                 frame.timestamp_us,
-                frame.id,
+                frame.raw_id(),
                 frame.data().to_vec(),
                 piper_tools::TimestampSource::Hardware,
             );

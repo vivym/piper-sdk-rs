@@ -53,7 +53,7 @@ ID_JOINT_FEEDBACK_12 => {
         pending_joint_pos[0] = feedback.j1_rad();
         // ... use feedback data without validation
     } else {
-        warn!("Failed to parse JointFeedback12: CAN ID 0x{:X}", frame.id);
+        warn!("Failed to parse JointFeedback12: CAN ID 0x{:X}", frame.raw_id());
     }
 }
 ```
@@ -71,8 +71,8 @@ impl TryFrom<PiperFrame> for JointFeedback12 {
     type Error = ProtocolError;
 
     fn try_from(frame: PiperFrame) -> Result<Self, Self::Error> {
-        if frame.id != ID_JOINT_FEEDBACK_12 {
-            return Err(ProtocolError::InvalidCanId { id: frame.id });
+        if frame.raw_id() != ID_JOINT_FEEDBACK_12 {
+            return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
         // Strict: must be exactly 8 bytes

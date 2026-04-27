@@ -126,7 +126,7 @@ fn joint_position_command_emits_joint_position_frame_batch() {
     let raw = build_raw_commander_with_recording_tx(sent.clone());
     raw.send_position_command_batch(&JointArray::from([Rad(0.0); 6]), Duration::from_millis(20))
         .expect("joint position command should encode");
-    let ids: Vec<u32> = sent.lock().unwrap().iter().map(|frame| frame.id).collect();
+    let ids: Vec<u32> = sent.lock().unwrap().iter().map(|frame| frame.raw_id()).collect();
     assert_eq!(ids, vec![ID_JOINT_CONTROL_12, ID_JOINT_CONTROL_34, ID_JOINT_CONTROL_56]);
 }
 ```

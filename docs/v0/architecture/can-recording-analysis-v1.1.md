@@ -1038,7 +1038,7 @@ use crate::pipeline::PiperFrame;
 /// impl FrameCallback for MyCallback {
 ///     fn on_frame_received(&self, frame: &PiperFrame) {
 ///         // 快速操作：<1μs
-///         println!("Frame: 0x{:03X}", frame.id);
+///         println!("Frame: 0x{:03X}", frame.raw_id());
 ///     }
 /// }
 /// ```

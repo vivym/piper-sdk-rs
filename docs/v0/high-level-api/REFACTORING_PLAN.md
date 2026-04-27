@@ -1152,7 +1152,7 @@ mod protocol_tests {
         let cmd = MotorEnableCommand::enable_all();
         let frame = cmd.to_frame();
 
-        assert_eq!(frame.id, 0x471); // ✅ 正确的 CAN ID
+        assert_eq!(frame.raw_id(), 0x471); // ✅ 正确的 CAN ID
         assert_eq!(frame.data[0], 7); // 全部关节
         assert_eq!(frame.data[1], 0x02); // 使能
     }

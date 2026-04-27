@@ -212,7 +212,7 @@ fn io_loop(mut driver: PiperCanBackend, tx: Sender<Error>, cmd_rx: Receiver<CanF
         match driver.receive() {
             Ok(frame) => {
                 let mut current_state = **state.load();
-                //根据 frame.id 更新 current_state
+                //根据 frame.raw_id() 更新 current_state
                 state.store(Arc::new(current_state));
             },
             Err(e) => { /* handle errors, maybe send to main thread */ }

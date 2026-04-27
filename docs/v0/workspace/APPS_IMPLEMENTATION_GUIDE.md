@@ -552,11 +552,9 @@ use serde::{Serialize, Deserialize}; // ✅ 允许
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimestampedFrame {
-    pub timestamp_us: u64,
-    pub can_id: u32,
-    pub data: Vec<u8>,
-    pub dlc: u8,
-    pub source: TimestampSource,
+    pub frame: PiperFrame,
+    pub direction: RecordedFrameDirection,
+    pub timestamp_source: Option<TimestampSource>,
 }
 
 // ⚠️ 不引用任何控制逻辑

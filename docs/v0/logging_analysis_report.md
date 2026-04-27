@@ -371,7 +371,7 @@ apps/daemon/src/client_manager.rs:3:        debug!("Client {} heartbeat failed: 
 **建议**：
 ```rust
 // ✅ 添加有用的 debug 日志
-debug!("Parsing frame ID=0x{:X}, len={}", frame.id, frame.data.len());
+debug!("Parsing frame ID=0x{:X}, len={}", frame.raw_id(), frame.data.len());
 debug!("State transition: {:?} -> {:?}", old_state, new_state);
 debug!("Position error: [{:.3}, {:.3}, {:.3}, {:.3}, {:.3}, {:.3}]",
        e[0], e[1], e[2], e[3], e[4], e[5]);
@@ -472,7 +472,7 @@ use tracing::{info, warn, instrument};
 
 #[instrument]  // 自动追踪函数调用
 fn process_frame(frame: &PiperFrame) -> Result<(), CanError> {
-    info!(frame_id = frame.id, len = frame.data.len(), "Processing frame");
+    info!(frame_id = frame.raw_id(), len = frame.data.len(), "Processing frame");
     // 输出：{"frame_id": 673, "len": 8, "message": "Processing frame"}
 
     match parse(frame) {
@@ -481,7 +481,7 @@ fn process_frame(frame: &PiperFrame) -> Result<(), CanError> {
             Ok(())
         },
         Err(e) => {
-            warn!(error = %e, frame_id = frame.id, "Failed to parse frame");
+            warn!(error = %e, frame_id = frame.raw_id(), "Failed to parse frame");
             Err(e)
         },
     }
@@ -683,7 +683,7 @@ fn run_rx_thread(&self, rx: Receiver<CanCommand>, ...) {
     }
 }
 
-#[instrument(skip(self), fields(frame_id = %frame.id))]
+#[instrument(skip(self), fields(frame_id = %frame.raw_id()))]
 fn process_single_frame(&self, frame: PiperFrame) {
     // 快速操作，span 会快速结束
     parse_and_commit(frame);
@@ -698,7 +698,7 @@ fn run_rx_thread(&self, rx: Receiver<CanCommand>, ...) {
         let frame = rx.recv_timeout(Duration::from_millis(5))?;
 
         // 手动创建短生命周期的 span
-        let _span = span!(Level::TRACE, "frame_processing", frame_id = %frame.id).entered();
+        let _span = span!(Level::TRACE, "frame_processing", frame_id = %frame.raw_id()).entered();
         process_frame(&frame);
         // span 在这里结束
     }
@@ -1146,7 +1146,7 @@ fn parse_frame(data: &[u8]) -> Result<Frame, ParseError> {
 - [ ] 将 30-40 条日志改为结构化格式：
   - 错误日志：`error!(error = %e, ...)`
   - 超时日志：`warn!(timeout_ms = elapsed.as_millis(), ...)`
-  - 帧日志：`info!(frame_id = frame.id, len = frame.data.len(), ...)`
+  - 帧日志：`info!(frame_id = frame.raw_id(), len = frame.data.len(), ...)`
 - [ ] 估计工作量：**3-4 小时**
 
 **P2 - 添加 Span 追踪**

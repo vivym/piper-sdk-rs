@@ -258,7 +258,7 @@ enum MessageType {
 +--------+--------+--------+--------+
 ```
 
-- 只有 `CAN ID Min <= frame.id <= CAN ID Max` 的帧才会被转发给该客户端
+- 只有 `CAN ID Min <= frame.raw_id() <= CAN ID Max` 的帧才会被转发给该客户端
 - 如果 `Filter Count = 0`，表示接收所有帧（默认行为）
 
 **ConnectAck 消息**（守护进程 → 客户端）：
@@ -769,7 +769,7 @@ impl Daemon {
             let clients_guard = clients.read().unwrap();
             for client in clients_guard.iter() {
                 // 检查过滤规则
-                if !client.matches_filter(frame.id) {
+                if !client.matches_filter(frame.raw_id()) {
                     continue;
                 }
 
@@ -1554,7 +1554,7 @@ pub fn encode_receive_frame_zero_copy(
     cursor.write_all(&[0x00, 0x00, 0x00, 0x00]).unwrap(); // Reserved + Seq (4 bytes)
 
     // CAN 帧数据
-    cursor.write_all(&frame.id.to_le_bytes()).unwrap();
+    cursor.write_all(&frame.raw_id().to_le_bytes()).unwrap();
     cursor.write_all(&[if frame.is_extended { 0x01 } else { 0x00 }]).unwrap();
     cursor.write_all(&[frame.len]).unwrap();
     cursor.write_all(&frame.timestamp_us.to_le_bytes()).unwrap();
@@ -1579,7 +1579,7 @@ pub fn encode_send_frame_with_seq(
     cursor.write_all(&seq.to_le_bytes()).unwrap(); // Sequence Number
 
     // CAN 帧数据
-    cursor.write_all(&frame.id.to_le_bytes()).unwrap();
+    cursor.write_all(&frame.raw_id().to_le_bytes()).unwrap();
     cursor.write_all(&[if frame.is_extended { 0x01 } else { 0x00 }]).unwrap();
     cursor.write_all(&[frame.len]).unwrap();
     cursor.write_all(&frame.data[..frame.len as usize]).unwrap();
@@ -1990,10 +1990,10 @@ use tracing::{trace, debug, info, warn, error};
 impl Daemon {
     fn handle_send_frame(&self, frame: PiperFrame, seq: u32) -> Result<(), DaemonError> {
         // ❌ 错误：高频日志使用 Info 级别
-        // info!("Sent CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
+        // info!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.len);
 
         // ✅ 正确：高频日志使用 Trace 或 Debug 级别
-        trace!("Sent CAN frame: ID=0x{:X}, len={}, seq={}", frame.id, frame.len, seq);
+        trace!("Sent CAN frame: ID=0x{:X}, len={}, seq={}", frame.raw_id(), frame.len, seq);
 
         // ✅ 正确：重要事件使用 Info 级别
         info!("Device connected successfully");

@@ -34,7 +34,7 @@ This is an intentional breaking API change.
 The redesign may break:
 
 - `PiperFrame { ... }` struct literals
-- direct field access such as `frame.id`, `frame.data`, `frame.len`, `frame.is_extended`, and `frame.timestamp_us`
+- direct field access to the old raw ID, payload, length, frame-format, and timestamp fields
 - existing `new_standard` / `new_extended` call sites if they assume infallible construction
 - existing recording files and bridge protocol payloads
 - serde JSON shape for `PiperFrame`
@@ -748,7 +748,7 @@ Protocol parsing should replace direct field access with methods.
 
 Examples:
 
-- `frame.id` becomes `frame.raw_id()`
+- old raw ID field access becomes `frame.raw_id()`
 - `frame.len` becomes `frame.dlc()`
 - `frame.data[0]` becomes `frame.data()[0]` after length checks
 - `frame.data[..copy_len]` becomes `frame.data()[..copy_len]`

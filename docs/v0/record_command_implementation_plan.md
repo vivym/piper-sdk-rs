@@ -91,7 +91,7 @@ pub fn start_recording(
 RecordCommand {
     output: String           // -> output_path
     duration: u64            // -> stop_condition::Duration()
-    stop_on_id: Option<u32>  // -> stop_condition::OnCanId()
+    stop_on_id: Option<CanId> // -> stop_condition::OnCanId()
     interface: Option<String>
     serial: Option<String>
 }
@@ -115,7 +115,7 @@ RecordCommand {
 |----------|----------------------|-------------|
 | `duration: 0` | `StopCondition::Manual` | CLI 等待 Ctrl-C |
 | `duration: N` | `StopCondition::Duration(N)` | ⚠️ CLI 负责超时检查 |
-| `stop_on_id: Some(id)` | `StopCondition::OnCanId(id)` | 🔴 **CLI 无法实现**（见 Section 5.3） |
+| `stop_on_id: Some(CanId::standard(id)?)` | `StopCondition::OnCanId(id)` | 🔴 **CLI 无法实现**（见 Section 5.3） |
 | 默认（无参数） | `StopCondition::Manual` | CLI 等待 Ctrl-C |
 
 **关键问题**：`StopCondition::OnCanId` 在当前 API 设计下无法实现，因为：
@@ -615,7 +615,7 @@ std::thread::spawn(move || {
 
         // 检查停止条件
         if stop_condition == StopCondition::OnCanId(target_id) {
-            if frame.id == target_id {
+            if frame.id() == target_id {
                 stop_signal_clone.store(true, Ordering::SeqCst);
                 break;
             }
@@ -705,7 +705,7 @@ fn test_record_command_creation() {
     let cmd = RecordCommand {
         output: "test.bin".to_string(),
         duration: 10,
-        stop_on_id: Some(0x2A5),
+        stop_on_id: Some(CanId::standard(0x2A5).unwrap()),
         ...
     };
     assert_eq!(cmd.duration, 10);

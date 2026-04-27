@@ -252,11 +252,11 @@ impl CanAdapter for SocketCanAdapter {
         // 1. 转换 PiperFrame -> CanFrame
         let can_frame = if frame.is_extended {
             // 扩展帧
-            CanFrame::new(ExtendedId::new(frame.id)?, &frame.data[..frame.len as usize])
+            CanFrame::new(ExtendedId::new(frame.raw_id())?, &frame.data[..frame.len as usize])
                 .ok_or_else(|| CanError::Device("Failed to create extended frame".to_string()))?
         } else {
             // 标准帧
-            CanFrame::new(StandardId::new(frame.id as u16)?, &frame.data[..frame.len as usize])
+            CanFrame::new(StandardId::new(frame.raw_id() as u16)?, &frame.data[..frame.len as usize])
                 .ok_or_else(|| CanError::Device("Failed to create standard frame".to_string()))?
         };
 
@@ -264,7 +264,7 @@ impl CanAdapter for SocketCanAdapter {
         self.socket.transmit(&can_frame)
             .map_err(|e| CanError::Io(e))?;
 
-        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
+        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.len);
         Ok(())
     }
 
@@ -314,7 +314,7 @@ impl CanAdapter for SocketCanAdapter {
                 timestamp_us: 0,  // TODO: 提取时间戳
             };
 
-            trace!("Received CAN frame: ID=0x{:X}, len={}", piper_frame.id, piper_frame.len);
+            trace!("Received CAN frame: ID=0x{:X}, len={}", piper_frame.raw_id(), piper_frame.len);
             return Ok(piper_frame);
         }
     }

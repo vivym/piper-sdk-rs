@@ -552,9 +552,9 @@ impl CanAdapter for GsUsbCanAdapter {
             let mut gs = GsUsbFrame {
                 echo_id: GS_USB_ECHO_ID,
                 can_id: if frame.is_extended {
-                    frame.id | CAN_EFF_FLAG
+                    frame.raw_id() | CAN_EFF_FLAG
                 } else {
-                    frame.id
+                    frame.raw_id()
                 },
                 can_dlc: frame.len,
                 channel: 0,
@@ -569,7 +569,7 @@ impl CanAdapter for GsUsbCanAdapter {
         self.device.send_raw(&gs_frame)
             .map_err(|e| CanError::Device(format!("USB send failed: {}", e)))?;
 
-        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
+        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.len);
         Ok(())
     }
 
@@ -617,7 +617,7 @@ impl CanAdapter for GsUsbCanAdapter {
                 is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
             };
 
-            trace!("Received CAN frame: ID=0x{:X}, len={}", frame.id, frame.len);
+            trace!("Received CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.len);
             return Ok(frame);
         }
     }
@@ -658,7 +658,7 @@ impl SocketCanAdapter {
 impl CanAdapter for SocketCanAdapter {
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
         let can_frame = CANFrame::new(
-            frame.id,
+            frame.raw_id(),
             frame.data_slice(),
             frame.is_extended,
             false, // RTR

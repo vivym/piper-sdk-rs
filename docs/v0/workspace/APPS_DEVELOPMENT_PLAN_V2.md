@@ -379,11 +379,11 @@ pub struct TimestampedFrame {
     /// CAN 帧数据
     pub frame: PiperFrame,
 
-    /// 时间戳（微秒）
-    pub timestamp_us: u64,
+    /// RX/TX 方向
+    pub direction: RecordedFrameDirection,
 
     /// 时间戳来源
-    pub source: TimestampSource,
+    pub timestamp_source: Option<TimestampSource>,
 }
 ```
 
@@ -427,12 +427,9 @@ pub struct RecordingMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimestampedFrame {
-    pub timestamp_us: u64,
-    pub can_id: u32,
-    pub data: Vec<u8>,
-    pub dlc: u8,
-    pub is_extended: bool,
-    pub is_error: bool,
+    pub frame: PiperFrame,
+    pub direction: RecordedFrameDirection,
+    pub timestamp_source: Option<TimestampSource>,
 }
 ```
 
