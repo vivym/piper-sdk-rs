@@ -1,5 +1,6 @@
 /tmp
 /.mujoco
+.superpowers/
 .worktrees/
 .DS_Store
 *.dll
