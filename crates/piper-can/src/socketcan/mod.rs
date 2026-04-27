@@ -36,6 +36,9 @@ use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 use tracing::{trace, warn};
 
+const CLASSIC_CAN_MTU: usize = mem::size_of::<libc::can_frame>();
+const CANFD_MTU: usize = mem::size_of::<libc::canfd_frame>();
+
 mod interface_check;
 mod raw_frame;
 pub mod split;
@@ -336,7 +339,7 @@ impl SocketCanAdapter {
 
             // Read into CANFD_MTU so recvmsg can report CAN FD/non-classic frames without
             // truncating them before the shared parser rejects them.
-            let mut frame_buf = [0u8; libc::CANFD_MTU as usize];
+            let mut frame_buf = [0u8; CANFD_MTU];
             let mut cmsg_buf = [0u8; 1024]; // CMSG 缓冲区
 
             // 构建 IO 向量

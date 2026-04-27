@@ -42,6 +42,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::time::{Duration, Instant};
 use tracing::{trace, warn};
 
+use super::CANFD_MTU;
 use super::raw_frame::{ParsedSocketCanFrame, parse_libc_can_frame_bytes};
 
 /// 检查 socket 是否启用了 SO_TIMESTAMPING
@@ -288,7 +289,7 @@ impl SocketCanRxAdapter {
 
             // Keep a CAN FD-sized receive buffer so the parser sees and rejects
             // non-classic MTUs instead of recvmsg truncating them.
-            let mut frame_buf = [0u8; libc::CANFD_MTU as usize];
+            let mut frame_buf = [0u8; CANFD_MTU];
             let mut cmsg_buf = [0u8; 1024];
 
             let (msg_bytes, msg_flags, timestamp_info) = {

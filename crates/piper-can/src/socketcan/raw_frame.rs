@@ -1,6 +1,8 @@
 use crate::{CanDeviceError, CanDeviceErrorKind, CanError, PiperFrame};
 use piper_protocol::{CanData, ExtendedCanId, StandardCanId};
 
+use super::CLASSIC_CAN_MTU;
+
 #[derive(Debug)]
 pub enum ParsedSocketCanFrame {
     Data(PiperFrame),
@@ -54,11 +56,11 @@ pub fn parse_libc_can_frame_bytes(
         return fatal_invalid_frame("truncated SocketCAN frame");
     }
 
-    if msg_len != libc::CAN_MTU as usize {
+    if msg_len != CLASSIC_CAN_MTU {
         return fatal_invalid_frame("non-classic CAN MTU");
     }
 
-    if bytes.len() < libc::CAN_MTU as usize {
+    if bytes.len() < CLASSIC_CAN_MTU {
         return fatal_invalid_frame(format!(
             "short SocketCAN frame buffer: {} bytes",
             bytes.len()
@@ -130,12 +132,13 @@ pub fn parse_libc_can_frame_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedSocketCanFrame, parse_libc_can_frame_bytes};
+    use super::{CLASSIC_CAN_MTU, ParsedSocketCanFrame, parse_libc_can_frame_bytes};
+    use crate::socketcan::CANFD_MTU;
     use crate::{CanDeviceErrorKind, CanError};
     use piper_protocol::FrameError;
 
-    fn raw_frame_bytes(can_id: u32, dlc: u8, data: [u8; 8]) -> [u8; libc::CAN_MTU as usize] {
-        let mut bytes = [0u8; libc::CAN_MTU as usize];
+    fn raw_frame_bytes(can_id: u32, dlc: u8, data: [u8; 8]) -> [u8; CLASSIC_CAN_MTU] {
+        let mut bytes = [0u8; CLASSIC_CAN_MTU];
         bytes[..4].copy_from_slice(&can_id.to_ne_bytes());
         bytes[4] = dlc;
         bytes[8..16].copy_from_slice(&data);
@@ -157,7 +160,7 @@ mod tests {
     fn parses_classic_standard_data_frame() {
         let bytes = raw_frame_bytes(0x123, 4, [1, 2, 3, 4, 0xAA, 0xBB, 0xCC, 0xDD]);
 
-        let ParsedSocketCanFrame::Data(frame) = parse(&bytes, libc::CAN_MTU as usize, 0) else {
+        let ParsedSocketCanFrame::Data(frame) = parse(&bytes, CLASSIC_CAN_MTU, 0) else {
             panic!("expected data frame");
         };
 
@@ -177,7 +180,7 @@ mod tests {
             [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80],
         );
 
-        let ParsedSocketCanFrame::Data(frame) = parse(&bytes, libc::CAN_MTU as usize, 0) else {
+        let ParsedSocketCanFrame::Data(frame) = parse(&bytes, CLASSIC_CAN_MTU, 0) else {
             panic!("expected data frame");
         };
 
@@ -192,9 +195,9 @@ mod tests {
 
     #[test]
     fn rejects_canfd_mtu() {
-        let bytes = [0u8; libc::CANFD_MTU as usize];
+        let bytes = [0u8; CANFD_MTU];
 
-        let message = fatal_message(parse(&bytes, libc::CANFD_MTU as usize, 0));
+        let message = fatal_message(parse(&bytes, CANFD_MTU, 0));
 
         assert!(message.contains("non-classic CAN MTU"));
     }
@@ -212,7 +215,7 @@ mod tests {
     fn rejects_truncated_message_flag() {
         let bytes = raw_frame_bytes(0x123, 1, [0; 8]);
 
-        let message = fatal_message(parse(&bytes, libc::CAN_MTU as usize, libc::MSG_TRUNC));
+        let message = fatal_message(parse(&bytes, CLASSIC_CAN_MTU, libc::MSG_TRUNC));
 
         assert!(message.contains("truncated SocketCAN frame"));
     }
@@ -222,7 +225,7 @@ mod tests {
         let bytes = raw_frame_bytes(libc::CAN_RTR_FLAG | 0x123, 0, [0; 8]);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::RecoverableNonData
         ));
     }
@@ -232,7 +235,7 @@ mod tests {
         let bytes = raw_frame_bytes(libc::CAN_ERR_FLAG | libc::CAN_ERR_BUSOFF, 8, [0; 8]);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::Fatal(CanError::BusOff)
         ));
     }
@@ -244,7 +247,7 @@ mod tests {
         let bytes = raw_frame_bytes(libc::CAN_ERR_FLAG | libc::CAN_ERR_CRTL, 8, data);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::Fatal(CanError::BufferOverflow)
         ));
     }
@@ -256,7 +259,7 @@ mod tests {
         let bytes = raw_frame_bytes(libc::CAN_ERR_FLAG | libc::CAN_ERR_CRTL, 8, data);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::Fatal(CanError::BufferOverflow)
         ));
     }
@@ -268,7 +271,7 @@ mod tests {
         let bytes = raw_frame_bytes(libc::CAN_ERR_FLAG | libc::CAN_ERR_CRTL, 8, data);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::RecoverableNonData
         ));
     }
@@ -278,7 +281,7 @@ mod tests {
         let bytes = raw_frame_bytes(0x123, 9, [0; 8]);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::Fatal(CanError::Frame(FrameError::InvalidDlc { dlc: 9 }))
         ));
     }
@@ -288,7 +291,7 @@ mod tests {
         let bytes = raw_frame_bytes(0x0800, 0, [0; 8]);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::Fatal(CanError::Frame(FrameError::InvalidStandardId {
                 id: 0x0800
             }))
@@ -300,7 +303,7 @@ mod tests {
         let bytes = raw_frame_bytes(libc::CAN_EFF_FLAG | 0x2000_0000, 0, [0; 8]);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::Fatal(CanError::Frame(FrameError::InvalidExtendedId {
                 id: 0x2000_0000
             }))
@@ -312,7 +315,7 @@ mod tests {
         let bytes = raw_frame_bytes(libc::CAN_ERR_FLAG | libc::CAN_ERR_PROT, 8, [0; 8]);
 
         assert!(matches!(
-            parse(&bytes, libc::CAN_MTU as usize, 0),
+            parse(&bytes, CLASSIC_CAN_MTU, 0),
             ParsedSocketCanFrame::RecoverableNonData
         ));
     }
@@ -322,7 +325,7 @@ mod tests {
         let bytes = [0u8; 8];
 
         let ParsedSocketCanFrame::Fatal(CanError::Device(error)) =
-            parse(&bytes, libc::CAN_MTU as usize, 0)
+            parse(&bytes, CLASSIC_CAN_MTU, 0)
         else {
             panic!("expected invalid frame fatal error");
         };
