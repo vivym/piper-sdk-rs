@@ -117,7 +117,10 @@ fn test_command_latency_quiet_bus() {
 }
 
 /// 测试 SocketCAN 超时配置（仅 Linux）
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "socketcan", feature = "auto-backend")
+))]
 #[test]
 #[ignore]
 fn test_socketcan_timeout_config() {
@@ -164,6 +167,7 @@ fn test_socketcan_timeout_config() {
 }
 
 /// 测试 GS-USB 超时配置（所有平台）
+#[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
 #[test]
 #[ignore]
 fn test_gs_usb_timeout_config() {

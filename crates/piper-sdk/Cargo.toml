@@ -12,9 +12,28 @@ readme = "../../README.md"
 default = ["auto-backend"]
 serde = ["piper-client/serde", "piper-can/serde", "piper-protocol/serde"]
 mock = ["piper-client/mock", "piper-driver/mock", "piper-can/mock"]
-auto-backend = ["piper-client/auto-backend", "piper-driver/auto-backend", "piper-can/auto-backend"]
-socketcan = ["piper-client/socketcan", "piper-driver/socketcan", "piper-can/socketcan"]
-gs_usb = ["piper-client/gs_usb", "piper-driver/gs_usb", "piper-can/gs_usb"]
+auto-backend = [
+    "piper-client/auto-backend",
+    "piper-driver/auto-backend",
+    "piper-can/auto-backend",
+    "target-socketcan",
+    "target-gs-usb",
+]
+socketcan = [
+    "piper-client/socketcan",
+    "piper-driver/socketcan",
+    "piper-can/socketcan",
+    "target-socketcan",
+]
+gs_usb = [
+    "piper-client/gs_usb",
+    "piper-driver/gs_usb",
+    "piper-can/gs_usb",
+    "target-gs-usb",
+]
+# Internal markers used only by Cargo target `required-features`.
+target-socketcan = []
+target-gs-usb = []
 
 [dependencies]
 piper-client = { workspace = true, default-features = false }
@@ -47,3 +66,28 @@ rusb = { workspace = true }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 nix = { version = "0.30", features = ["poll", "socket", "uio"] }
 socketcan = "3.5"
+
+[[example]]
+name = "gs_usb_direct_test"
+path = "examples/gs_usb_direct_test.rs"
+required-features = ["target-gs-usb"]
+
+[[example]]
+name = "iface_check"
+path = "examples/iface_check.rs"
+required-features = ["target-socketcan"]
+
+[[test]]
+name = "gs_usb_integration_tests"
+path = "tests/gs_usb_integration_tests.rs"
+required-features = ["target-gs-usb"]
+
+[[test]]
+name = "gs_usb_performance_tests"
+path = "tests/gs_usb_performance_tests.rs"
+required-features = ["target-gs-usb"]
+
+[[test]]
+name = "gs_usb_stage1_loopback_tests"
+path = "tests/gs_usb_stage1_loopback_tests.rs"
+required-features = ["target-gs-usb"]
