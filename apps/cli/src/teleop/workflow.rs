@@ -29,9 +29,20 @@ pub trait TeleopBackend {
     fn runtime_health_ok(&self) -> Result<()>;
     fn standby_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot>;
     fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration>;
+
+    /// Enables both arms in MIT mode and transfers backend ownership into active state.
+    ///
+    /// If this returns `Err`, the workflow must not call `disable_active`: backend implementations
+    /// are responsible for cleaning up any partially-dispatched enable attempt before returning.
     fn enable_mit(&mut self, master: MitModeConfig, slave: MitModeConfig) -> Result<EnableOutcome>;
+
     fn disable_active(&mut self) -> Result<()>;
     fn active_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot>;
+
+    /// Runs the bilateral loop until it reaches a disabled standby or faulted/no-active state.
+    ///
+    /// Report and console I/O happen after this method returns, so implementations must not return
+    /// while torque-producing active control is still enabled.
     fn run_loop(
         &mut self,
         controller: RuntimeTeleopController,
@@ -131,6 +142,7 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
             let calibration = backend.capture_calibration(JointMirrorMap::left_right_mirror())?;
             let created_at_unix_ms = current_unix_ms();
             if let Some(path) = &args.save_calibration {
+                // The Task 8 startup order saves captured calibration before operator confirmation.
                 CalibrationFile::from_calibration(&calibration, None, created_at_unix_ms)
                     .save_new(path)?;
             }
@@ -178,7 +190,7 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
     .context("pre-enable posture compatibility check failed")?;
 
     if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
-        bail!("teleop cancelled before enable");
+        return Ok(TeleopExitStatus::Success);
     }
 
     match backend.enable_mit(MitModeConfig::default(), MitModeConfig::default())? {
@@ -189,7 +201,7 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
         backend
             .disable_active()
             .context("failed to disable active teleop after cancellation")?;
-        bail!("teleop cancelled during enable");
+        return Ok(TeleopExitStatus::Success);
     }
 
     let active_snapshot = backend.active_snapshot(DualArmReadPolicy::default())?;
@@ -212,7 +224,7 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
     let settings_handle = RuntimeTeleopSettingsHandle::new(settings)?;
     let initial_mode = settings_handle.snapshot().mode;
     let started_at = Instant::now();
-    let _console = io.start_console(settings_handle.clone(), started_at)?;
+    let console_handle = io.start_console(settings_handle.clone(), started_at)?;
 
     let loop_exit = backend.run_loop(
         RuntimeTeleopController::new(settings_handle.clone()),
@@ -237,6 +249,7 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
     if let Some(path) = &args.report_json {
         io.write_json_report(path, &report)?;
     }
+    inspect_finished_console(console_handle)?;
 
     Ok(classify_exit(loop_exit.faulted, &loop_exit.report))
 }
@@ -267,6 +280,20 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(Duration::ZERO)
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+fn inspect_finished_console(handle: Option<JoinHandle<Result<()>>>) -> Result<()> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    if !handle.is_finished() {
+        return Ok(());
+    }
+
+    match handle.join() {
+        Ok(result) => result.context("teleop console thread failed"),
+        Err(_) => bail!("teleop console thread panicked"),
+    }
 }
 
 pub async fn run_dual_arm(_args: TeleopDualArmArgs) -> Result<()> {
@@ -480,6 +507,7 @@ mod tests {
         cancel_during_enable: bool,
         cancel_checks: Arc<Mutex<usize>>,
         report_write_error: bool,
+        console_finished_error: bool,
     }
 
     impl Default for FakeTeleopIo {
@@ -492,6 +520,7 @@ mod tests {
                 cancel_during_enable: false,
                 cancel_checks: Arc::new(Mutex::new(0)),
                 report_write_error: false,
+                console_finished_error: false,
             }
         }
     }
@@ -504,7 +533,7 @@ mod tests {
             }
         }
 
-        fn cancel_before_confirmation() -> Self {
+        fn cancel_after_confirmation_before_enable() -> Self {
             Self {
                 cancel_on_confirm: true,
                 ..Self::default()
@@ -522,6 +551,23 @@ mod tests {
             Self {
                 trace,
                 report_write_error: true,
+                ..Self::default()
+            }
+        }
+
+        fn finished_console_error_with_trace(trace: WorkflowTrace) -> Self {
+            Self {
+                trace,
+                console_finished_error: true,
+                ..Self::default()
+            }
+        }
+
+        fn report_and_console_error_with_trace(trace: WorkflowTrace) -> Self {
+            Self {
+                trace,
+                report_write_error: true,
+                console_finished_error: true,
                 ..Self::default()
             }
         }
@@ -556,6 +602,13 @@ mod tests {
             _started_at: Instant,
         ) -> Result<Option<JoinHandle<Result<()>>>> {
             self.trace.push(WorkflowCall::StartConsole);
+            if self.console_finished_error {
+                let handle = std::thread::spawn(|| bail!("console finished with error"));
+                while !handle.is_finished() {
+                    std::thread::yield_now();
+                }
+                return Ok(Some(handle));
+            }
             Ok(None)
         }
 
@@ -615,16 +668,17 @@ mod tests {
     }
 
     #[test]
-    fn cancel_before_enable_exits_without_enable() {
+    fn cancel_after_confirmation_before_enable_returns_success_without_enable() {
         let backend = FakeTeleopBackend::default();
-        let io = FakeTeleopIo::cancel_before_confirmation();
+        let io = FakeTeleopIo::cancel_after_confirmation_before_enable();
 
-        let err = run_workflow_for_test_with_io(valid_args(), backend.clone(), io)
-            .expect_err("Ctrl+C before enable must stop before enable");
+        let status = run_workflow_for_test_with_io(valid_args(), backend.clone(), io)
+            .expect("Ctrl+C before enable must stop cleanly");
 
-        assert!(err.to_string().contains("cancel"));
+        assert_eq!(status, TeleopExitStatus::Success);
         assert!(backend.calls().contains(&WorkflowCall::Connect));
         assert!(!backend.calls().contains(&WorkflowCall::Enable));
+        assert!(!backend.calls().contains(&WorkflowCall::DisableActive));
         assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
     }
 
@@ -684,14 +738,14 @@ mod tests {
     }
 
     #[test]
-    fn cancel_during_enable_disables_active_before_exit() {
+    fn cancel_during_enable_disables_active_and_returns_success() {
         let backend = FakeTeleopBackend::cancel_during_enable_after_active();
         let io = FakeTeleopIo::cancel_during_enable();
 
-        let err = run_workflow_for_test_with_io(valid_args(), backend.clone(), io)
-            .expect_err("Ctrl+C during enable must exit safely");
+        let status = run_workflow_for_test_with_io(valid_args(), backend.clone(), io)
+            .expect("Ctrl+C during enable must exit safely");
 
-        assert!(err.to_string().contains("cancel"));
+        assert_eq!(status, TeleopExitStatus::Success);
         assert_call_order(
             backend.calls(),
             &[WorkflowCall::Enable, WorkflowCall::DisableActive],
@@ -714,6 +768,39 @@ mod tests {
             &[WorkflowCall::RunLoop, WorkflowCall::WriteReport],
         );
         assert!(backend.was_disabled_or_faulted_before_report());
+    }
+
+    #[test]
+    fn finished_console_error_surfaces_after_run_loop_and_report_write() {
+        let trace = WorkflowTrace::default();
+        let backend = FakeTeleopBackend::loop_exits_cancelled_with_trace(trace.clone());
+        let io = FakeTeleopIo::finished_console_error_with_trace(trace.clone());
+
+        let err = run_workflow_for_test_with_io(args_with_report_json(), backend.clone(), io)
+            .expect_err("finished console error should be surfaced");
+
+        assert!(err.to_string().contains("console"));
+        assert_call_order(
+            trace.calls(),
+            &[WorkflowCall::RunLoop, WorkflowCall::WriteReport],
+        );
+    }
+
+    #[test]
+    fn report_write_failure_takes_precedence_over_finished_console_error() {
+        let trace = WorkflowTrace::default();
+        let backend = FakeTeleopBackend::loop_exits_cancelled_with_trace(trace.clone());
+        let io = FakeTeleopIo::report_and_console_error_with_trace(trace.clone());
+
+        let err = run_workflow_for_test_with_io(args_with_report_json(), backend.clone(), io)
+            .expect_err("report write failure should be surfaced before console error");
+
+        assert!(err.to_string().contains("report"));
+        assert!(!err.to_string().contains("console"));
+        assert_call_order(
+            trace.calls(),
+            &[WorkflowCall::RunLoop, WorkflowCall::WriteReport],
+        );
     }
 
     fn run_workflow_for_test(
