@@ -7,8 +7,8 @@
 //! piper-tools = { workspace = true, features = ["statistics"] }
 //! ```
 
-use piper_protocol::frame::{CanId, PiperFrame};
-use serde::{Deserialize, Serialize};
+use piper_protocol::frame::{CanId, FrameError, PiperFrame};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
 
 /// CAN 总线统计
@@ -136,10 +136,9 @@ impl LatencyStatistics {
 }
 
 /// Format-aware CAN ID distribution key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum CanIdDistributionKey {
-    Standard(u32),
-    Extended(u32),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CanIdDistributionKey {
+    id: CanId,
 }
 
 impl CanIdDistributionKey {
@@ -148,16 +147,92 @@ impl CanIdDistributionKey {
     }
 
     pub fn from_id(can_id: CanId) -> Self {
-        match can_id {
-            CanId::Standard(id) => Self::Standard(id.raw() as u32),
-            CanId::Extended(id) => Self::Extended(id.raw()),
-        }
+        Self { id: can_id }
+    }
+
+    pub fn standard(raw: u32) -> Result<Self, FrameError> {
+        Ok(Self::from_id(CanId::standard(raw)?))
+    }
+
+    pub fn extended(raw: u32) -> Result<Self, FrameError> {
+        Ok(Self::from_id(CanId::extended(raw)?))
+    }
+
+    pub fn id(self) -> CanId {
+        self.id
     }
 
     pub fn raw_id(self) -> u32 {
-        match self {
-            Self::Standard(id) | Self::Extended(id) => id,
+        self.id.raw()
+    }
+
+    pub fn is_standard(self) -> bool {
+        self.id.is_standard()
+    }
+
+    pub fn is_extended(self) -> bool {
+        self.id.is_extended()
+    }
+
+    fn serde_key(self) -> String {
+        let format = if self.is_standard() {
+            "standard"
+        } else {
+            "extended"
+        };
+        format!("{format}:0x{:X}", self.raw_id())
+    }
+
+    fn from_serde_key(value: &str) -> Result<Self, String> {
+        let (format, raw) = value.split_once(':').ok_or_else(|| {
+            "expected can id key format '<standard|extended>:<raw_id>'".to_string()
+        })?;
+        let raw = parse_can_id_raw(raw)?;
+        match format {
+            "standard" => Self::standard(raw).map_err(|err| err.to_string()),
+            "extended" => Self::extended(raw).map_err(|err| err.to_string()),
+            _ => Err(format!("unknown CAN ID format '{format}'")),
         }
+    }
+}
+
+impl Ord for CanIdDistributionKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (u8::from(self.is_extended()), self.raw_id())
+            .cmp(&(u8::from(other.is_extended()), other.raw_id()))
+    }
+}
+
+impl PartialOrd for CanIdDistributionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Serialize for CanIdDistributionKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.serde_key())
+    }
+}
+
+impl<'de> Deserialize<'de> for CanIdDistributionKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_serde_key(&value).map_err(de::Error::custom)
+    }
+}
+
+fn parse_can_id_raw(value: &str) -> Result<u32, String> {
+    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).map_err(|err| err.to_string())
+    } else {
+        value.parse::<u32>().map_err(|err| err.to_string())
     }
 }
 
@@ -293,8 +368,14 @@ mod tests {
         assert_eq!(dist.frequency_for_id(standard_200), (1.0 / 3.0 * 100.0));
 
         let common = dist.most_common(2);
-        assert_eq!(common[0], (CanIdDistributionKey::Standard(0x100), 2));
-        assert_eq!(common[1], (CanIdDistributionKey::Standard(0x200), 1));
+        assert_eq!(
+            common[0],
+            (CanIdDistributionKey::standard(0x100).unwrap(), 2)
+        );
+        assert_eq!(
+            common[1],
+            (CanIdDistributionKey::standard(0x200).unwrap(), 1)
+        );
     }
 
     #[test]
@@ -302,7 +383,7 @@ mod tests {
         let dist = CanIdDistribution::default();
         assert_eq!(dist.total_frames, 0);
         assert_eq!(
-            dist.frequency_for_key(CanIdDistributionKey::Standard(0x100)),
+            dist.frequency_for_key(CanIdDistributionKey::standard(0x100).unwrap()),
             0.0
         );
     }
@@ -319,19 +400,19 @@ mod tests {
 
         assert_eq!(dist.total_frames, 3);
         assert_eq!(
-            dist.counts.get(&CanIdDistributionKey::Standard(0x123)).copied(),
+            dist.counts.get(&CanIdDistributionKey::standard(0x123).unwrap()).copied(),
             Some(1)
         );
         assert_eq!(
-            dist.counts.get(&CanIdDistributionKey::Extended(0x123)).copied(),
+            dist.counts.get(&CanIdDistributionKey::extended(0x123).unwrap()).copied(),
             Some(2)
         );
         assert_eq!(
-            dist.frequency_for_key(CanIdDistributionKey::Standard(0x123)),
+            dist.frequency_for_key(CanIdDistributionKey::standard(0x123).unwrap()),
             (1.0 / 3.0 * 100.0)
         );
         assert_eq!(
-            dist.frequency_for_key(CanIdDistributionKey::Extended(0x123)),
+            dist.frequency_for_key(CanIdDistributionKey::extended(0x123).unwrap()),
             (2.0 / 3.0 * 100.0)
         );
     }
@@ -350,20 +431,44 @@ mod tests {
 
         assert_eq!(dist.total_frames, 3);
         assert_eq!(
-            dist.counts.get(&CanIdDistributionKey::Standard(0x123)).copied(),
+            dist.counts.get(&CanIdDistributionKey::standard(0x123).unwrap()).copied(),
             Some(1)
         );
         assert_eq!(
-            dist.counts.get(&CanIdDistributionKey::Extended(0x123)).copied(),
+            dist.counts.get(&CanIdDistributionKey::extended(0x123).unwrap()).copied(),
             Some(2)
         );
         assert_eq!(
             dist.frequency_for_id(standard),
-            dist.frequency_for_key(CanIdDistributionKey::Standard(0x123))
+            dist.frequency_for_key(CanIdDistributionKey::standard(0x123).unwrap())
         );
         assert_eq!(
             dist.frequency_for_id(extended),
-            dist.frequency_for_key(CanIdDistributionKey::Extended(0x123))
+            dist.frequency_for_key(CanIdDistributionKey::extended(0x123).unwrap())
         );
+    }
+
+    #[test]
+    fn can_id_distribution_json_roundtrip_uses_string_keys() {
+        use piper_protocol::frame::CanId;
+
+        let mut dist = CanIdDistribution::new();
+        dist.add_id(CanId::standard(0x123).unwrap());
+        dist.add_id(CanId::extended(0x123).unwrap());
+        dist.add_id(CanId::extended(0x123).unwrap());
+
+        let encoded = serde_json::to_string(&dist).unwrap();
+        assert!(encoded.contains("\"standard:0x123\""));
+        assert!(encoded.contains("\"extended:0x123\""));
+
+        let decoded: CanIdDistribution = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.total_frames, dist.total_frames);
+        assert_eq!(decoded.counts, dist.counts);
+    }
+
+    #[test]
+    fn can_id_distribution_key_rejects_invalid_standard_json_key() {
+        let err = serde_json::from_str::<CanIdDistributionKey>("\"standard:0x800\"").unwrap_err();
+        assert!(err.to_string().contains("invalid standard CAN ID"));
     }
 }
