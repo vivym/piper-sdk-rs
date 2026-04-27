@@ -24,7 +24,7 @@ As of 2026-04-27:
 - [x] Task 8: Implement Fakeable Workflow Orchestration.
 - [x] Task 9: Add Real Dual-Arm Backend and Command Execution.
 - [x] Task 10: Add Operator Documentation.
-- [ ] Task 11: Final Verification.
+- [x] Task 11: Final Verification.
 
 Task 9 review loop is complete. The final targeted Ctrl+C idempotency fix is commit
 `edac468` (`fix: preserve first teleop ctrlc signal`), approved by reviewer with
@@ -33,6 +33,13 @@ Task 9 review loop is complete. The final targeted Ctrl+C idempotency fix is com
 Task 10 review loop is complete. Documentation commits through `02bcdd6`
 (`docs: clarify teleop stop attempt semantics`) are approved by reviewers with
 `gpt-5.5` and `xhigh` reasoning.
+
+Task 11 final verification is complete. The final verification pass ran
+`cargo fmt --all -- --check`, `cargo test -p piper-cli --all-targets`,
+`cargo test -p piper-client enable_mit_mode_timeout_after_enable_dispatch_sends_disable_all -- --nocapture`,
+`cargo test --workspace --all-targets --all-features`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`, and
+`cargo run -p piper-cli -- teleop dual-arm --help`.
 
 ---
 
