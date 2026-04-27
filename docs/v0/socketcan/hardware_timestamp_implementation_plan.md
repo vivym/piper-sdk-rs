@@ -13,7 +13,7 @@
 - ✅ `PiperFrame` 已包含 `timestamp_us: u64` 字段（微秒精度）
 - ✅ GS-USB 适配器已支持硬件时间戳
 - ❌ SocketCAN 适配器的 `timestamp_us` 目前硬编码为 `0`
-- ✅ Pipeline 已正确使用 `frame.timestamp_us`（`src/robot/pipeline.rs:199`）
+- ✅ Pipeline 已正确使用 `frame.timestamp_us()`（`src/robot/pipeline.rs:199`）
 
 ### 1.2 需求分析
 
@@ -451,7 +451,7 @@ impl CanAdapter for SocketCanAdapter {
 
             trace!(
                 "Received CAN frame: ID=0x{:X}, len={}, timestamp_us={}",
-                piper_frame.raw_id(), piper_frame.len, piper_frame.timestamp_us
+                piper_frame.raw_id(), piper_frame.len, piper_frame.timestamp_us()
             );
 
             return Ok(piper_frame);
@@ -538,7 +538,7 @@ fn test_socketcan_timestamp_extraction() {
 
     // 接收帧，检查时间戳
     let frame = adapter.receive().unwrap();
-    assert!(frame.timestamp_us > 0, "Timestamp should be set (software timestamp)");
+    assert!(frame.timestamp_us() > 0, "Timestamp should be set (software timestamp)");
 }
 
 #[test]
@@ -556,8 +556,8 @@ fn test_socketcan_timestamp_monotonic() {
     let mut prev_ts: u64 = 0;
     for _ in 0..10 {
         let frame = adapter.receive().unwrap();
-        assert!(frame.timestamp_us >= prev_ts, "Timestamp should be monotonic");
-        prev_ts = frame.timestamp_us;
+        assert!(frame.timestamp_us() >= prev_ts, "Timestamp should be monotonic");
+        prev_ts = frame.timestamp_us();
     }
 }
 ```

@@ -895,17 +895,17 @@
 
 **实现清单**：
 - [x] 验证 `receive()` 方法返回时间戳（Task 4.1 已完成）
-- [x] 验证 Pipeline 使用 `frame.timestamp_us` 更新状态（现有集成测试已验证）
-- [x] 验证 `CoreMotionState.timestamp_us` 来自 `frame.timestamp_us`（Pipeline 代码验证）
-- [x] 验证 `JointDynamicState.group_timestamp_us` 来自 `frame.timestamp_us`（Pipeline 代码验证）
+- [x] 验证 Pipeline 使用 `frame.timestamp_us()` 更新状态（现有集成测试已验证）
+- [x] 验证 `CoreMotionState.timestamp_us` 来自 `frame.timestamp_us()`（Pipeline 代码验证）
+- [x] 验证 `JointDynamicState.group_timestamp_us` 来自 `frame.timestamp_us()`（Pipeline 代码验证）
 
 **测试清单**：
-- [x] 集成测试：现有集成测试已验证 Pipeline 使用 `frame.timestamp_us`（`test_piper_end_to_end_joint_pos_update`）
-- [x] 代码审查：验证 Pipeline 正确使用 `frame.timestamp_us` 更新状态（代码审查通过）
+- [x] 集成测试：现有集成测试已验证 Pipeline 使用 `frame.timestamp_us()`（`test_piper_end_to_end_joint_pos_update`）
+- [x] 代码审查：验证 Pipeline 正确使用 `frame.timestamp_us()` 更新状态（代码审查通过）
 
 **验证标准**：
 - ✅ Pipeline 接收到的时间戳非零（由 SocketCAN 适配器保证，Task 4.1）
-- ✅ 时间戳正确传递到状态（Pipeline 代码使用 `frame.timestamp_us`，已验证）
+- ✅ 时间戳正确传递到状态（Pipeline 代码使用 `frame.timestamp_us()`，已验证）
 
 **验收标准**：
 - ✅ Pipeline 集成测试通过（现有集成测试使用 MockCanAdapter，已验证逻辑）
@@ -915,21 +915,21 @@
 
 **实现详情**：
 - ✅ SocketCAN 适配器的 `receive()` 方法在 Task 4.1 中已改为使用 `receive_with_timestamp()`，返回 `PiperFrame.timestamp_us`（u64）
-- ✅ Pipeline 的 `io_loop` 使用 `frame.timestamp_us` 更新状态：
-  - `CoreMotionState.timestamp_us` = `frame.timestamp_us`（第 199, 212, 255, 268 行）
-  - `JointDynamicState.group_timestamp_us` = `frame.timestamp_us`（第 311 行）
-  - `JointDynamicState.timestamps[joint_index]` = `frame.timestamp_us`（第 289 行）
-- ✅ 现有集成测试 `test_piper_end_to_end_joint_pos_update` 使用 `MockCanAdapter` 验证了 Pipeline 使用 `frame.timestamp_us` 的逻辑
+- ✅ Pipeline 的 `io_loop` 使用 `frame.timestamp_us()` 更新状态：
+  - `CoreMotionState.timestamp_us` = `frame.timestamp_us()`（第 199, 212, 255, 268 行）
+  - `JointDynamicState.group_timestamp_us` = `frame.timestamp_us()`（第 311 行）
+  - `JointDynamicState.timestamps[joint_index]` = `frame.timestamp_us()`（第 289 行）
+- ✅ 现有集成测试 `test_piper_end_to_end_joint_pos_update` 使用 `MockCanAdapter` 验证了 Pipeline 使用 `frame.timestamp_us()` 的逻辑
 
 **验证结果**：
-- ✅ Pipeline 代码正确使用 `frame.timestamp_us`（代码审查通过）
+- ✅ Pipeline 代码正确使用 `frame.timestamp_us()`（代码审查通过）
 - ✅ 现有集成测试验证了时间戳传递逻辑（使用 MockCanAdapter）
 - ✅ SocketCAN 适配器在 Task 4.1 中已集成时间戳支持，Pipeline 应能正确获取时间戳
 
 **注意**：
 - Pipeline 使用 SocketCAN 适配器时的实际验证需要在真实硬件环境中进行（需要实际的 CAN 帧发送）
 - 在 vcan0 上进行完整验证需要发送实际的协议帧（关节反馈帧等），这超出了 SocketCAN 适配器测试的范围
-- 核心逻辑（Pipeline 使用 `frame.timestamp_us`）已在现有集成测试中验证
+- 核心逻辑（Pipeline 使用 `frame.timestamp_us()`）已在现有集成测试中验证
 
 ---
 

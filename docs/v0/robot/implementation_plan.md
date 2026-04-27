@@ -516,7 +516,7 @@ pub fn io_loop(
                     if end_pose_ready {
                         // 两个帧组都完整，提交完整状态
                         let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us as u64,
+                            timestamp_us: frame.timestamp_us() as u64,
                             joint_pos: pending_joint_pos,
                             end_pose: pending_end_pose,
                         };
@@ -529,7 +529,7 @@ pub fn io_loop(
                         // 只有关节位置完整，从当前状态读取 end_pose 并更新
                         let current = ctx.core_motion.load();
                         let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us as u64,
+                            timestamp_us: frame.timestamp_us() as u64,
                             joint_pos: pending_joint_pos,
                             end_pose: current.end_pose,  // 保留当前值
                         };
@@ -572,7 +572,7 @@ pub fn io_loop(
                     if joint_pos_ready {
                         // 两个帧组都完整，提交完整状态
                         let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us as u64,
+                            timestamp_us: frame.timestamp_us() as u64,
                             joint_pos: pending_joint_pos,
                             end_pose: pending_end_pose,
                         };
@@ -585,7 +585,7 @@ pub fn io_loop(
                         // 只有末端位姿完整，从当前状态读取 joint_pos 并更新
                         let current = ctx.core_motion.load();
                         let new_state = CoreMotionState {
-                            timestamp_us: frame.timestamp_us as u64,
+                            timestamp_us: frame.timestamp_us() as u64,
                             joint_pos: current.joint_pos,  // 保留当前值
                             end_pose: pending_end_pose,
                         };
@@ -604,19 +604,19 @@ pub fn io_loop(
                     pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                     pending_joint_dynamic.joint_current[joint_index] = feedback.current();
                     // 注意：硬件时间戳是 u32，但状态中使用 u64（用于与其他时间戳比较）
-                    pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us as u64;
+                    pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us() as u64;
 
                     // 2. 标记该关节已更新
                     vel_update_mask |= 1 << joint_index;
                     // 更新硬件时间戳和系统时间戳（用于不同场景的检查）
-                    last_vel_packet_time_us = frame.timestamp_us;  // 硬件时间戳（u32）
+                    last_vel_packet_time_us = frame.timestamp_us();  // 硬件时间戳（u32）
                     last_vel_packet_instant = Some(std::time::Instant::now());  // 系统时间（用于超时检查）
 
                     // 3. 判断是否提交（混合策略：集齐或超时）
                     let all_received = vel_update_mask == 0b111111;  // 0x3F，6 个关节全部收到
                     // 注意：硬件时间戳之间可以比较（来自同一个设备），但不能与系统时间戳比较
-                    let time_since_last_commit = if frame.timestamp_us >= last_vel_commit_time_us {
-                        frame.timestamp_us - last_vel_commit_time_us
+                    let time_since_last_commit = if frame.timestamp_us() >= last_vel_commit_time_us {
+                        frame.timestamp_us() - last_vel_commit_time_us
                     } else {
                         // 硬件时间戳可能回绕（u32 微秒，约 71 分钟回绕一次）
                         // 当回绕发生时，认为时间差为 0（立即提交）
@@ -630,14 +630,14 @@ pub fn io_loop(
                     if all_received || time_since_last_commit > timeout_threshold_us {
                         // 原子性地一次性提交所有关节的速度
                         // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
-                        pending_joint_dynamic.group_timestamp_us = frame.timestamp_us as u64;
+                        pending_joint_dynamic.group_timestamp_us = frame.timestamp_us() as u64;
                         pending_joint_dynamic.valid_mask = vel_update_mask;
 
                         ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
 
                         // 重置状态（准备下一轮）
                         vel_update_mask = 0;
-                        last_vel_commit_time_us = frame.timestamp_us;  // 硬件时间戳（u32）
+                        last_vel_commit_time_us = frame.timestamp_us();  // 硬件时间戳（u32）
                         last_vel_packet_instant = None;  // 重置系统时间戳
 
                         // 如果超时提交，记录警告（可能丢帧）
@@ -684,7 +684,7 @@ pub fn io_loop(
                         ];
                         new.is_enabled = feedback.robot_status == RobotStatus::Normal;
                         // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
-                        new.timestamp_us = frame.timestamp_us as u64;
+                        new.timestamp_us = frame.timestamp_us() as u64;
                         new
                     });
                 }
@@ -699,7 +699,7 @@ pub fn io_loop(
                         new.gripper_travel = feedback.travel();  // mm
                         new.gripper_torque = feedback.torque();  // N·m
                         // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
-                        new.timestamp_us = frame.timestamp_us as u64;
+                        new.timestamp_us = frame.timestamp_us() as u64;
                         new
                     });
 
@@ -716,7 +716,7 @@ pub fn io_loop(
                         diag.gripper_enabled = status.enabled();  // 注意：反向逻辑已在 GripperStatus 中处理
                         diag.gripper_homed = status.homed();
                         // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
-                        diag.timestamp_us = frame.timestamp_us as u64;
+                        diag.timestamp_us = frame.timestamp_us() as u64;
                     } else {
                         // 锁被占用，跳过本次更新
                         trace!("Skipped gripper status update due to lock contention");
@@ -749,7 +749,7 @@ pub fn io_loop(
                         diag.driver_stall_protection[joint_index] = status.stall_protection();
 
                         // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
-                        diag.timestamp_us = frame.timestamp_us as u64;
+                        diag.timestamp_us = frame.timestamp_us() as u64;
                     } else {
                         // 锁被占用，跳过本次更新（诊断数据不可靠没关系，IO 线程流畅最重要）
                         trace!("Skipped diagnostic update due to lock contention (joint {})", joint_index + 1);
@@ -764,7 +764,7 @@ pub fn io_loop(
                     if let Ok(mut diag) = ctx.diagnostics.try_write() {
                         diag.protection_levels = feedback.levels;
                         // 注意：硬件时间戳是 u32，但状态中使用 u64（与其他时间戳统一）
-                        diag.timestamp_us = frame.timestamp_us as u64;
+                        diag.timestamp_us = frame.timestamp_us() as u64;
                     } else {
                         // 锁被占用，跳过本次更新
                         trace!("Skipped collision protection level update due to lock contention");

@@ -579,14 +579,14 @@ self.ctx.low_speed_store.record_slot(
     joint_index,
     typed_slot,
     host_rx_mono_us,
-    nonzero_hw_timestamp(frame.timestamp_us),
+    nonzero_hw_timestamp(frame.timestamp_us()),
 );
 
 self.ctx.end_pose_store.record_slot(
     member_index,
     typed_member,
     host_rx_mono_us,
-    nonzero_hw_timestamp(frame.timestamp_us),
+    nonzero_hw_timestamp(frame.timestamp_us()),
 );
 ```
 

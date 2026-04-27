@@ -468,7 +468,7 @@ impl Driver {
         };
 
         // 发送给 Client 的时间戳
-        frame.timestamp_us = system_time;  // For Info Only
+        let frame_for_client = (*frame).with_timestamp_us(system_time);  // For Info Only
     }
 
     fn control_loop(&mut self) {
@@ -491,7 +491,7 @@ impl Driver {
 **Client 端处理**:
 ```rust
 // Client 接收帧时
-let wall_time = frame.timestamp_us;  // UNIX 时间戳
+let wall_time = frame.timestamp_us();  // UNIX 时间戳
 // 注意：这是"墙时间"，可能不连续（时钟回跳时填充0）
 // Client 应该基于自己的时钟计算轨迹，不依赖 frame.timestamp
 ```

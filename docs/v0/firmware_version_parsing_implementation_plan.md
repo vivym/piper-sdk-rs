@@ -112,7 +112,7 @@ if let Ok(mut firmware_state) = ctx.firmware_version.write() {
     firmware_state.firmware_data.extend_from_slice(feedback.firmware_data());
 
     // 更新时间戳
-    firmware_state.hardware_timestamp_us = frame.timestamp_us;
+    firmware_state.hardware_timestamp_us = frame.timestamp_us();
     firmware_state.system_timestamp_us = system_timestamp_us;
 
     // 尝试解析版本字符串
@@ -288,7 +288,7 @@ ID_FIRMWARE_READ => {
             firmware_state.firmware_data.extend_from_slice(feedback.firmware_data());
 
             // 更新时间戳
-            firmware_state.hardware_timestamp_us = frame.timestamp_us;
+            firmware_state.hardware_timestamp_us = frame.timestamp_us();
             firmware_state.system_timestamp_us = system_timestamp_us;
 
             // 尝试解析版本字符串（会自动更新 is_complete）

@@ -18,7 +18,7 @@
 **v1.2.1 核心工程修正**:
 - 🛡️ **内存安全**: 使用 `bounded(10000)` 代替 `unbounded()`，防止 OOM
 - 🏗️ **架构优化**: 将回调从 `PipelineConfig` 移至 `PiperContext::hooks`
-- ⏱️ **时间戳精度**: 强制使用硬件时间戳 `frame.timestamp_us`，禁止重新生成
+- ⏱️ **时间戳精度**: 强制使用硬件时间戳 `frame.timestamp_us()`，禁止重新生成
 - 🔒 **TX 安全**: TX 回调仅在 `send()` 成功后触发，避免记录未发送的帧
 - 🌐 **平台依赖**: 明确方案 D 依赖 SocketCAN Loopback 特性
 - 📊 **监控获取模式**: 直接持有 `Arc<AtomicU64>` 引用，避免 `downcast` 复杂性（v1.2.1）
@@ -1660,7 +1660,7 @@ impl PiperBuilder {
 | 队列满导致丢帧 | 低 | 中 | 🛡️ v1.2: Bounded Queue（10,000 帧）+ 丢帧计数器 |
 | **OOM 崩溃** | **高** | **中** | 🛡️ **v1.2 已修正**: 使用 `bounded(10000)` 代替 `unbounded()` |
 | **TX 死锁/时序混乱** | **中** | **低** | 🔒 **v1.2 已修正**: 仅在 `send()` 成功后触发回调 |
-| **时间戳精度误差** | **中** | **低** | ⏱️ **v1.2 已修正**: 强制使用 `frame.timestamp_us` |
+| **时间戳精度误差** | **中** | **低** | ⏱️ **v1.2 已修正**: 强制使用 `frame.timestamp_us()` |
 | **架构耦合（Config vs Context）** | **低** | **低** | 🏗️ **v1.2 已修正**: Hooks 移至 `PiperContext` |
 | **监控获取复杂性（downcast）** | **中** | **中** | 📊 **v1.2.1 已修正**: 直接持有 `Arc<AtomicU64>` 引用 |
 | **Loopback 双重录制** | **高** | **高** | 🔄 **v1.2.1 已修正**: Driver 关闭 Loopback |
@@ -1672,7 +1672,7 @@ impl PiperBuilder {
 **7 个关键工程修正**:
 1. 🛡️ **内存安全**: `bounded(10000)` 防止 OOM，而非 `unbounded()`
 2. 🏗️ **架构优化**: Hooks 在 `PiperContext` 而非 `PipelineConfig`
-3. ⏱️ **时间戳精度**: 直接使用 `frame.timestamp_us`（硬件时间戳）
+3. ⏱️ **时间戳精度**: 直接使用 `frame.timestamp_us()`（硬件时间戳）
 4. 🔒 **TX 安全**: 仅在 `send()` 成功后记录 TX 帧
 5. 🌐 **平台依赖**: 方案 D 依赖 SocketCAN Loopback 特性
 6. 📊 **监控获取模式**: 直接持有 `Arc<AtomicU64>` 引用，避免 downcast（v1.2.1）⭐
@@ -1749,7 +1749,7 @@ impl PiperBuilder {
 **v1.2 工程安全修正**:
 1. 🛡️ **内存安全**: `bounded(10000)` 防止 OOM，添加丢帧计数器
 2. 🏗️ **架构优化**: Hooks 从 `PipelineConfig` 移至 `PiperContext::hooks`
-3. ⏱️ **时间戳精度**: 强制使用 `frame.timestamp_us`，禁止 `SystemTime::now()`
+3. ⏱️ **时间戳精度**: 强制使用 `frame.timestamp_us()`，禁止 `SystemTime::now()`
 4. 🔒 **TX 安全**: 仅在 `send()` 成功后触发 TX 回调
 5. 🌐 **平台依赖**: 明确方案 D 依赖 SocketCAN Loopback 特性
 
@@ -1776,7 +1776,7 @@ impl PiperBuilder {
 2. 严格使用 `bounded(10000)`，不要使用 `unbounded()`
 3. 在 `PiperContext` 中添加 `hooks: RwLock<HookManager>`
 4. 在 `tx_loop` 中先发送，成功后才触发回调
-5. 使用 `frame.timestamp_us`，不要重新生成时间戳
+5. 使用 `frame.timestamp_us()`，不要重新生成时间戳
 6. **直接持有 `dropped_frames` 的 `Arc` 引用**，不要 downcast（v1.2.1）
 7. **在 `SocketCanAdapter::new()` 中调用 `set_loopback(false)`**（v1.2.1）⭐
 

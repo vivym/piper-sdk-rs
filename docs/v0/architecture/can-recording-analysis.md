@@ -28,7 +28,7 @@
 > **v1.2 工程安全修正**:
 > - 🛡️ 使用 `bounded(10000)` 代替 `unbounded()` 防止 OOM
 > - 🏗️ Hooks 从 `PipelineConfig` 移至 `PiperContext`
-> - ⏱️ 强制使用硬件时间戳 `frame.timestamp_us`
+> - ⏱️ 强制使用硬件时间戳 `frame.timestamp_us()`
 > - 🔒 仅在 `send()` 成功后记录 TX 帧
 > - 🌐 明确方案 D 依赖 SocketCAN Loopback
 >
@@ -288,7 +288,7 @@ impl FrameCallback for RecordingCallback {
         let mut recording = self.recording.lock().unwrap();
         // 转换为 TimestampedFrame 并添加
         let timestamped = TimestampedFrame::new(
-            frame.timestamp_us,
+            frame.timestamp_us(),
             frame.raw_id(),
             frame.data().to_vec(),
             TimestampSource::Hardware,
@@ -417,7 +417,7 @@ pub fn rx_loop(
                 // 录制模式：记录帧
                 if let Ok(mut recording) = recording.try_lock() {
                     let timestamped = TimestampedFrame::new(
-                        frame.timestamp_us,
+                        frame.timestamp_us(),
                         frame.raw_id(),
                         frame.data().to_vec(),
                         TimestampSource::Hardware,
@@ -508,7 +508,7 @@ impl<A: CanAdapter> CanAdapter for RecordingAdapter<A> {
         // 录制接收的帧
         if let Ok(mut recording) = self.recording.try_lock() {
             let timestamped = TimestampedFrame::new(
-                frame.timestamp_us,
+                frame.timestamp_us(),
                 frame.raw_id(),
                 frame.data().to_vec(),
                 TimestampSource::Hardware,
@@ -1059,7 +1059,7 @@ impl FrameCallback for RecordingCallback {
         if let Ok(mut recording) = self.recording.try_lock() {
             // 转换为 TimestampedFrame
             let timestamped = piper_tools::TimestampedFrame::new(
-                frame.timestamp_us,
+                frame.timestamp_us(),
                 frame.raw_id(),
                 frame.data().to_vec(),
                 piper_tools::TimestampSource::Hardware,

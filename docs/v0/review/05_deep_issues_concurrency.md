@@ -98,7 +98,7 @@ ctx.gripper.store(Arc::new(new));
 ```rust
 // 更新 CollisionProtectionState
 if let Ok(mut collision) = ctx.collision_protection.write() {
-    collision.hardware_timestamp_us = frame.timestamp_us;
+    collision.hardware_timestamp_us = frame.timestamp_us();
     collision.system_timestamp_us = system_timestamp_us;
     collision.protection_levels = feedback.levels;
 }
@@ -122,7 +122,7 @@ if let Ok(mut collision) = ctx.collision_protection.write() {
 ```rust
 // Safer approach
 if let Ok(mut collision) = ctx.collision_protection.try_write() {
-    collision.hardware_timestamp_us = frame.timestamp_us;
+    collision.hardware_timestamp_us = frame.timestamp_us();
     collision.system_timestamp_us = system_timestamp_us;
     collision.protection_levels = feedback.levels;
 } else {
@@ -193,7 +193,7 @@ struct PendingBuffer {
 
 ```rust
 let time_since_last_commit =
-    frame.timestamp_us.saturating_sub(last_vel_commit_time_us);
+    frame.timestamp_us().saturating_sub(last_vel_commit_time_us);
 // ...
 let timeout_threshold_us = 6000; // 6ms 超时
 if all_received || time_since_last_commit > timeout_threshold_us {
@@ -201,7 +201,7 @@ if all_received || time_since_last_commit > timeout_threshold_us {
 
 **Issue**: Using `saturating_sub` masks the real problem:
 
-1. `frame.timestamp_us` is `u64` (hardware timestamp)
+1. `frame.timestamp_us()` is `u64` (hardware timestamp)
 2. `last_vel_commit_time_us` is `u64`
 3. If hardware counter wraps around (unlikely with u64, but possible), `saturating_sub` returns 0
 4. After wrap-around, `time_since_last_commit` becomes small, timeout never triggers
@@ -217,13 +217,13 @@ if all_received || time_since_last_commit > timeout_threshold_us {
 // Handle initial state explicitly
 if last_vel_commit_time_us == 0 {
     // First frame ever received, accept unconditionally
-    pending_joint_dynamic.group_timestamp_us = frame.timestamp_us;
+    pending_joint_dynamic.group_timestamp_us = frame.timestamp_us();
     pending_joint_dynamic.valid_mask = vel_update_mask;
     ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
     // ... reset state ...
 } else {
     // Normal timeout handling with wrap-around detection
-    let time_since_last_commit = frame.timestamp_us.wrapping_sub(last_vel_commit_time_us);
+    let time_since_last_commit = frame.timestamp_us().wrapping_sub(last_vel_commit_time_us);
     if all_received || time_since_last_commit > timeout_threshold_us {
         // ... commit logic ...
     }

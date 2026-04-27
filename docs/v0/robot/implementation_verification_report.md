@@ -511,7 +511,7 @@ let max_angle_rad = max_angle_deg.to_radians();  // 转换为弧度
 - ✅ 正确使用 `pending_core_motion` 缓存
 - ✅ 正确更新 `joint_pos[0-1]`, `joint_pos[2-3]`, `joint_pos[4-5]`
 - ✅ 最后一帧（0x2A7）触发 Frame Commit
-- ✅ 使用硬件时间戳 `frame.timestamp_us`
+- ✅ 使用硬件时间戳 `frame.timestamp_us()`
 
 **末端位姿（0x2A2-0x2A4）**：
 - ✅ 正确更新 `end_pose[0-1]`, `end_pose[2-3]`, `end_pose[4-5]`
@@ -657,7 +657,7 @@ ID_GRIPPER_FEEDBACK => {
             let mut new = state.clone();
             new.gripper_travel = feedback.travel();  // mm
             new.gripper_torque = feedback.torque();  // N·m
-            new.timestamp_us = frame.timestamp_us;
+            new.timestamp_us = frame.timestamp_us();
             new
         });
 
@@ -672,7 +672,7 @@ ID_GRIPPER_FEEDBACK => {
             diag.gripper_driver_error = status.driver_error();
             diag.gripper_enabled = status.enabled();  // 注意：反向逻辑已在 GripperStatus 中处理
             diag.gripper_homed = status.homed();
-            diag.timestamp_us = frame.timestamp_us;
+            diag.timestamp_us = frame.timestamp_us();
         }
     }
 }
@@ -722,7 +722,7 @@ ID_JOINT_FEEDBACK_56 => {
     // 如果两个帧组都准备好，才提交
     if joint_pos_ready && end_pose_ready {
         let mut new_state = CoreMotionState {
-            timestamp_us: frame.timestamp_us,
+            timestamp_us: frame.timestamp_us(),
             joint_pos: pending_joint_pos,
             end_pose: pending_end_pose,
         };

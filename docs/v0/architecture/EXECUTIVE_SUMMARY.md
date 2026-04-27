@@ -16,7 +16,7 @@
 **v1.2 工程安全修正**:
 - 🛡️ **内存安全**: 使用 `bounded(10000)` 防止 OOM
 - 🏗️ **架构优化**: Hooks 从 `PipelineConfig` 移至 `PiperContext`
-- ⏱️ **时间戳精度**: 强制使用硬件时间戳 `frame.timestamp_us`
+- ⏱️ **时间戳精度**: 强制使用硬件时间戳 `frame.timestamp_us()`
 - 🔒 **TX 安全**: 仅在 `send()` 成功后记录 TX 帧
 - 🌐 **平台依赖**: 明确方案 D 依赖 SocketCAN Loopback
 
@@ -536,7 +536,7 @@ spawn(move || {
 **v1.2 关键改进**:
 1. **🛡️ 内存安全**: `bounded(10000)` 防止 OOM，丢帧计数器监控
 2. **🏗️ 架构优化**: Hooks 从 `PipelineConfig` 移至 `PiperContext`
-3. **⏱️ 时间戳精确**: 强制使用 `frame.timestamp_us`，禁止软件生成
+3. **⏱️ 时间戳精确**: 强制使用 `frame.timestamp_us()`，禁止软件生成
 4. **🔒 TX 安全**: 仅在 `send()` 成功后记录 TX 帧
 5. **🌐 平台依赖**: 明确方案 D 依赖 SocketCAN Loopback
 
@@ -563,7 +563,7 @@ spawn(move || {
    - ✅ 使用 `bounded(10000)` **不要用 `unbounded()`**
    - ✅ 在 `PiperContext` 中添加 `hooks: RwLock<HookManager>`
    - ✅ RX + TX 双向录制（TX 仅成功后触发）
-   - ✅ 使用 `frame.timestamp_us`（硬件时间戳）
+   - ✅ 使用 `frame.timestamp_us()`（硬件时间戳）
    - ✅ 添加 `dropped_frames` 计数器
 2. 完整测试（6 项验证清单）
 3. 性能基准测试

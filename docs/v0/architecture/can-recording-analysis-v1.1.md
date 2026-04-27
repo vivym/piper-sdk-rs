@@ -7,7 +7,7 @@
 > **v1.2 新增关键工程安全修正**:
 > - 🛡️ **内存安全**: 使用 `bounded(10000)` 代替 `unbounded()` 防止 OOM
 > - 🏗️ **架构优化**: Hooks 从 `PipelineConfig` 移至 `PiperContext`
-> - ⏱️ **时间戳精度**: 强制使用硬件时间戳 `frame.timestamp_us`
+> - ⏱️ **时间戳精度**: 强制使用硬件时间戳 `frame.timestamp_us()`
 > - 🔒 **TX 安全**: 仅在 `send()` 成功后记录 TX 帧
 > - 🌐 **平台依赖**: 明确方案 D 依赖 SocketCAN Loopback
 >

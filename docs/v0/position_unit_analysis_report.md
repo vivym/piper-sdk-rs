@@ -539,7 +539,7 @@ if let Ok(feedback) = JointDriverHighSpeedFeedback::try_from(*frame) {
     // 1. 更新缓冲区（而不是立即提交）
     state.pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
     state.pending_joint_dynamic.joint_current[joint_index] = feedback.current();
-    state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us;
+    state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us();
 
     // 2. 标记该关节已更新
     state.vel_update_mask |= 1 << joint_index;

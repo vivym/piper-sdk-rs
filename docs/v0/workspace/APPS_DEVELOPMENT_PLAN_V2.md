@@ -453,9 +453,9 @@ pub struct Statistics {
 
 impl Statistics {
     pub fn update(&mut self, frame: &TimestampedFrame) {
-        self.fps.update(frame.timestamp_us);
+        self.fps.update(frame.timestamp_us());
         self.bandwidth.update(frame.data.len());
-        self.latency.update(frame.timestamp_us);
+        self.latency.update(frame.timestamp_us());
     }
 }
 ```

@@ -568,7 +568,7 @@ fn test_socketcan_adapter_receive_includes_timestamp() {
 
     // 接收帧，检查时间戳
     let rx_frame = adapter.receive().unwrap();
-    assert!(rx_frame.timestamp_us > 0, "Timestamp should be set");
+    assert!(rx_frame.timestamp_us() > 0, "Timestamp should be set");
 }
 
 #[test]

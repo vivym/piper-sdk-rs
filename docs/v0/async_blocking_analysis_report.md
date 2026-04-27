@@ -120,7 +120,7 @@ impl Piper<ReplayMode> {
             let delay_us = if first_frame {
                 0
             } else {
-                let elapsed_us = frame.timestamp_us.saturating_sub(last_timestamp_us);
+                let elapsed_us = frame.timestamp_us().saturating_sub(last_timestamp_us);
                 (elapsed_us as f64 / speed_factor) as u64
             };
 

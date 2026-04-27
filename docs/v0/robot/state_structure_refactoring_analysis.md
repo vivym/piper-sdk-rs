@@ -51,14 +51,14 @@ pub struct CoreMotionState {
 if end_pose_ready {
     // 两个帧组都完整，提交完整状态
     let new_state = CoreMotionState {
-        timestamp_us: frame.timestamp_us,  // 使用 joint_pos 帧组的时间戳
+        timestamp_us: frame.timestamp_us(),  // 使用 joint_pos 帧组的时间戳
         joint_pos: pending_joint_pos,
         end_pose: pending_end_pose,
     };
 } else {
     // 只有关节位置完整，从当前状态读取 end_pose 并更新
     let new_state = CoreMotionState {
-        timestamp_us: frame.timestamp_us,  // 使用 joint_pos 帧组的时间戳
+        timestamp_us: frame.timestamp_us(),  // 使用 joint_pos 帧组的时间戳
         joint_pos: pending_joint_pos,
         end_pose: current.end_pose,  // 保留旧的 end_pose
     };
@@ -95,7 +95,7 @@ pub struct ControlStatusState {
 ID_ROBOT_STATUS => {
     ctx.control_status.rcu(|old| {
         let mut new = (**old).clone();
-        new.timestamp_us = frame.timestamp_us;  // 来自 0x2A1
+        new.timestamp_us = frame.timestamp_us();  // 来自 0x2A1
         new.control_mode = feedback.control_mode as u8;
         // ... 更新控制状态字段
         Arc::new(new)
@@ -465,7 +465,7 @@ ID_GRIPPER_FEEDBACK => {
         // 只更新一个状态
         ctx.gripper.rcu(|old| {
             let mut new = (**old).clone();
-            new.timestamp_us = frame.timestamp_us;
+            new.timestamp_us = frame.timestamp_us();
             new.travel = feedback.travel();
             new.torque = feedback.torque();
             new.voltage_low = feedback.status.voltage_low();
@@ -917,7 +917,7 @@ ID_MOTOR_LIMIT_FEEDBACK => {
     {
         let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
         if joint_idx < 6 {
-            config.joint_update_hardware_timestamps[joint_idx] = frame.timestamp_us;
+            config.joint_update_hardware_timestamps[joint_idx] = frame.timestamp_us();
             config.joint_update_system_timestamps[joint_idx] = std::time::Instant::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -926,7 +926,7 @@ ID_MOTOR_LIMIT_FEEDBACK => {
             config.joint_limits_min[joint_idx] = feedback.min_angle().to_radians();
             config.joint_max_velocity[joint_idx] = feedback.max_velocity();
             config.valid_mask |= 1 << joint_idx;  // 标记该关节已更新
-            config.last_update_hardware_timestamp_us = frame.timestamp_us;
+            config.last_update_hardware_timestamp_us = frame.timestamp_us();
             config.last_update_system_timestamp_us = config.joint_update_system_timestamps[joint_idx];
             ctx.fps_stats.joint_limit_config_updates.fetch_add(1, Ordering::Relaxed);
         }

@@ -613,7 +613,7 @@ fn io_loop(
                     pending_core_motion.joint_pos[5] = feedback.j6_rad();
 
                     // 【Frame Commit】关节位置完整帧组已收到
-                    pending_core_motion.timestamp_us = frame.timestamp_us;
+                    pending_core_motion.timestamp_us = frame.timestamp_us();
                     ctx.core_motion.store(Arc::new(pending_core_motion.clone()));
                 }
             }
@@ -636,7 +636,7 @@ fn io_loop(
                     pending_core_motion.end_pose[5] = feedback.rz_rad();
 
                     // 【Frame Commit】末端位姿完整帧组已收到
-                    pending_core_motion.timestamp_us = frame.timestamp_us;
+                    pending_core_motion.timestamp_us = frame.timestamp_us();
                     ctx.core_motion.store(Arc::new(pending_core_motion.clone()));
                 }
             }
@@ -649,28 +649,28 @@ fn io_loop(
                     // 1. 更新缓冲区（而不是立即提交）
                     pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                     pending_joint_dynamic.joint_current[joint_index] = feedback.current();
-                    pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us;
+                    pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us();
 
                     // 2. 标记该关节已更新
                     vel_update_mask |= 1 << joint_index;
 
                     // 3. 判断是否提交（混合策略：集齐或超时）
                     let all_received = vel_update_mask == 0b111111;  // 0x3F，6 个关节全部收到
-                    let time_since_last_commit = frame.timestamp_us.saturating_sub(last_vel_commit_time_us);
+                    let time_since_last_commit = frame.timestamp_us().saturating_sub(last_vel_commit_time_us);
                     let timeout_threshold_us = 1200;  // 1.2ms 超时（防止丢帧导致死锁）
 
                     // 策略 A：集齐 6 个关节（严格同步）
                     // 策略 B：超时提交（容错）
                     if all_received || time_since_last_commit > timeout_threshold_us {
                         // 原子性地一次性提交所有关节的速度
-                        pending_joint_dynamic.group_timestamp_us = frame.timestamp_us;
+                        pending_joint_dynamic.group_timestamp_us = frame.timestamp_us();
                         pending_joint_dynamic.valid_mask = vel_update_mask;
 
                         ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
 
                         // 重置状态（准备下一轮）
                         vel_update_mask = 0;
-                        last_vel_commit_time_us = frame.timestamp_us;
+                        last_vel_commit_time_us = frame.timestamp_us();
 
                         // 如果超时提交，记录警告（可能丢帧）
                         if !all_received {
@@ -695,7 +695,7 @@ fn io_loop(
                         new.motion_status = feedback.motion_status as u8;
                         new.trajectory_point_index = feedback.trajectory_point_index;
                         // ... 更新其他字段
-                        new.timestamp_us = frame.timestamp_us;
+                        new.timestamp_us = frame.timestamp_us();
                         new
                     });
                 }

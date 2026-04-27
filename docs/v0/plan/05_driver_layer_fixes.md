@@ -94,7 +94,7 @@ The first velocity frame may be incorrectly rejected due to timestamp comparison
 **Current Code** (`pipeline.rs:321-326`):
 ```rust
 let time_since_last_commit =
-    frame.timestamp_us.saturating_sub(last_vel_commit_time_us);
+    frame.timestamp_us().saturating_sub(last_vel_commit_time_us);
 
 let timeout_threshold_us = 6000; // 6ms timeout
 if all_received || time_since_last_commit > timeout_threshold_us {
@@ -113,13 +113,13 @@ The previous fix used `continue` after handling the first frame:
 ```rust
 if last_vel_commit_time_us == 0 {
     // First frame ever received, accept unconditionally
-    pending_joint_dynamic.group_timestamp_us = frame.timestamp_us;
+    pending_joint_dynamic.group_timestamp_us = frame.timestamp_us();
     pending_joint_dynamic.valid_mask = vel_update_mask;
     ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
 
     // Reset for next cycle
     vel_update_mask = 0;
-    last_vel_commit_time_us = frame.timestamp_us;
+    last_vel_commit_time_us = frame.timestamp_us();
     last_vel_packet_instant = None;
     continue; // ❌ BUG: Skips commit logic even if all_received == true!
 }
@@ -139,13 +139,13 @@ let time_since_last_commit = if last_vel_commit_time_us == 0 {
     0
 } else {
     // Normal wrap-around subtraction for subsequent frames
-    frame.timestamp_us.wrapping_sub(last_vel_commit_time_us)
+    frame.timestamp_us().wrapping_sub(last_vel_commit_time_us)
 };
 
 // Normal commit logic: either all received OR timeout
 if all_received || time_since_last_commit > timeout_threshold_us {
     // Commit the frame group
-    pending_joint_dynamic.group_timestamp_us = frame.timestamp_us;
+    pending_joint_dynamic.group_timestamp_us = frame.timestamp_us();
     pending_joint_dynamic.valid_mask = vel_update_mask;
     ctx.joint_dynamic.store(Arc::new(pending_joint_dynamic.clone()));
 
@@ -156,7 +156,7 @@ if all_received || time_since_last_commit > timeout_threshold_us {
 
     // Reset for next cycle
     vel_update_mask = 0;
-    last_vel_commit_time_us = frame.timestamp_us;
+    last_vel_commit_time_us = frame.timestamp_us();
     last_vel_packet_instant = None;
 }
 ```
@@ -241,7 +241,7 @@ let timeout_threshold_us = config.velocity_buffer_timeout_us;
 let time_since_last_commit = if last_vel_commit_time_us == 0 {
     0 // First frame - no time elapsed
 } else {
-    frame.timestamp_us.wrapping_sub(last_vel_commit_time_us)
+    frame.timestamp_us().wrapping_sub(last_vel_commit_time_us)
 };
 
 if all_received || time_since_last_commit > timeout_threshold_us {

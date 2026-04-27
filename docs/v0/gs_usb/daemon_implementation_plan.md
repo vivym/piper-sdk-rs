@@ -1557,7 +1557,7 @@ pub fn encode_receive_frame_zero_copy(
     cursor.write_all(&frame.raw_id().to_le_bytes()).unwrap();
     cursor.write_all(&[if frame.is_extended { 0x01 } else { 0x00 }]).unwrap();
     cursor.write_all(&[frame.len]).unwrap();
-    cursor.write_all(&frame.timestamp_us.to_le_bytes()).unwrap();
+    cursor.write_all(&frame.timestamp_us().to_le_bytes()).unwrap();
     cursor.write_all(&frame.data).unwrap();
 
     &buf[..length]

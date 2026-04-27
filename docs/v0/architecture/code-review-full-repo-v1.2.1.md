@@ -167,7 +167,7 @@ let mut piper = Piper::new(/* ... */)?;
 let start_time = frames[0].timestamp_us;
 for frame in &frames {
     // 计算延迟
-    let delay_us = frame.timestamp_us - start_time;
+    let delay_us = frame.timestamp_us() - start_time;
     std::thread::sleep(Duration::from_micros(delay_us));
 
     // 发送帧（使用 driver 层 API）

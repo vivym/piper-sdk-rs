@@ -86,7 +86,7 @@ pub struct PiperFrame {
 
 **修复位置**：
 - `src/can/mod.rs`: 添加 `timestamp_us` 字段到 `PiperFrame`
-- `src/can/gs_usb/mod.rs:254`: 转换时保留 `gs_frame.timestamp_us`
+- `src/can/gs_usb/mod.rs:254`: 转换时保留 `gs_frame.timestamp_us()`
 
 ---
 

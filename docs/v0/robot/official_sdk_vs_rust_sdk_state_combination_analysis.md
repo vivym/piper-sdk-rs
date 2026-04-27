@@ -121,7 +121,7 @@ ID_END_POSE_3 => {
         // 【Frame Commit】只有在完整时才提交
         if joint_pos_ready {
             let new_state = CoreMotionState {
-                timestamp_us: frame.timestamp_us,
+                timestamp_us: frame.timestamp_us(),
                 joint_pos: pending_joint_pos,
                 end_pose: pending_end_pose,
             };
@@ -252,7 +252,7 @@ pending_end_pose[3] = feedback.rx_rad();
 // 收到0x2A4消息时：更新为完整帧组的时间戳
 if joint_pos_ready {
     let new_state = CoreMotionState {
-        timestamp_us: frame.timestamp_us,  // 使用0x2A4的时间戳
+        timestamp_us: frame.timestamp_us(),  // 使用0x2A4的时间戳
         joint_pos: pending_joint_pos,
         end_pose: pending_end_pose,
     };

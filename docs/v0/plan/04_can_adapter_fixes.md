@@ -218,7 +218,7 @@ pub fn receive_batch_frames(&mut self) -> Result<Vec<PiperFrame>, CanError> {
             data: gs_frame.data,
             len: gs_frame.can_dlc.min(8),
             is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-            timestamp_us: gs_frame.timestamp_us as u64,
+            timestamp_us: gs_frame.timestamp_us() as u64,
         });
     }
 

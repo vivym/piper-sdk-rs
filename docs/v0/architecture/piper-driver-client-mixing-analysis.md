@@ -1262,7 +1262,7 @@ impl Piper<Active<ReplayMode>> {
 
         for frame in &recording.frames {
             // 计算相对时间（微秒）
-            let elapsed_us = frame.timestamp_us.saturating_sub(base_timestamp);
+            let elapsed_us = frame.timestamp_us().saturating_sub(base_timestamp);
             let elapsed_ms = elapsed_us / 1000;
 
             // 应用速度控制
@@ -1288,7 +1288,7 @@ impl Piper<Active<ReplayMode>> {
                 },
                 len: frame.data.len() as u8,
                 is_extended: frame.can_id > 0x7FF,
-                timestamp_us: frame.timestamp_us,
+                timestamp_us: frame.timestamp_us(),
             };
 
             diag.send_frame(&piper_frame)?;
