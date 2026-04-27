@@ -6,7 +6,10 @@ use piper_client::types::{Joint, JointArray, Rad};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationFile {
@@ -45,15 +48,37 @@ impl CalibrationFile {
     pub fn save_new(&self, path: &Path) -> Result<()> {
         self.validate().context("invalid calibration file")?;
         let toml = toml::to_string_pretty(self).context("failed to serialize calibration file")?;
-        let mut file =
-            OpenOptions::new().write(true).create_new(true).open(path).with_context(|| {
-                format!(
-                    "failed to create calibration file '{}'; refusing to overwrite existing files",
-                    path.display()
-                )
-            })?;
-        file.write_all(toml.as_bytes())
-            .with_context(|| format!("failed to write calibration file '{}'", path.display()))?;
+        let (temp_path, mut file) = create_temp_sibling(path)?;
+
+        if let Err(error) = file
+            .write_all(toml.as_bytes())
+            .with_context(|| format!("failed to write temporary file '{}'", temp_path.display()))
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        if let Err(error) = file
+            .sync_all()
+            .with_context(|| format!("failed to sync temporary file '{}'", temp_path.display()))
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        drop(file);
+
+        if let Err(error) = std::fs::hard_link(&temp_path, path).with_context(|| {
+            format!(
+                "failed to create calibration file '{}'; refusing to overwrite existing files",
+                path.display()
+            )
+        }) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+
+        let _ = std::fs::remove_file(&temp_path);
         Ok(())
     }
 
@@ -235,6 +260,43 @@ fn joint_from_name(name: &str) -> Option<Joint> {
     }
 }
 
+fn create_temp_sibling(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("calibration path '{}' has no file name", path.display()))?
+        .to_string_lossy();
+
+    for _ in 0..100 {
+        let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            suffix
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create temporary calibration file '{}'",
+                        temp_path.display()
+                    )
+                });
+            },
+        }
+    }
+
+    bail!(
+        "failed to create a unique temporary calibration file for '{}'",
+        path.display()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +380,31 @@ mod tests {
 
         assert!(file.save_new(&path).is_err());
         assert_eq!(CalibrationFile::load(&path).unwrap(), file);
+    }
+
+    #[test]
+    fn save_new_preserves_existing_file_content_after_failed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calibration.toml");
+        let file = CalibrationFile::from_calibration(&sample_calibration(), None, 1);
+        let original = "not a calibration file\n";
+        std::fs::write(&path, original).unwrap();
+
+        assert!(file.save_new(&path).is_err());
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_new_missing_parent_does_not_create_final_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("calibration.toml");
+        let file = CalibrationFile::from_calibration(&sample_calibration(), None, 1);
+
+        assert!(file.save_new(&path).is_err());
+
+        assert!(!path.exists());
     }
 
     #[test]
