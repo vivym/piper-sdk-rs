@@ -15,6 +15,10 @@ pub enum TeleopAction {
 }
 
 #[derive(Debug, Args, Clone)]
+#[command(
+    about = "Run dual-arm isomorphic teleoperation",
+    long_about = "Run dual-arm isomorphic teleoperation.\n\nv1 runtime support is StrictRealtime SocketCAN on Linux. GS-USB concrete target syntax is parsed for configuration compatibility, but command execution requires future SDK SoftRealtime dual-arm support and is rejected before hardware connect."
+)]
 pub struct TeleopDualArmArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -158,5 +162,21 @@ mod tests {
                 assert_eq!(args.slave_target.as_deref(), Some("socketcan:can1"));
             },
         }
+    }
+
+    #[test]
+    fn dual_arm_help_mentions_realtime_runtime_and_key_options() {
+        let err = TeleopCommand::try_parse_from(["teleop", "dual-arm", "--help"])
+            .expect_err("--help should return clap help");
+        let help = err.to_string();
+
+        assert!(help.contains("StrictRealtime"));
+        assert!(help.contains("GS-USB"));
+        assert!(help.contains("--master-target"));
+        assert!(help.contains("--slave-target"));
+        assert!(help.contains("--mode"));
+        assert!(help.contains("--profile"));
+        assert!(help.contains("--calibration-file"));
+        assert!(help.contains("--report-json"));
     }
 }

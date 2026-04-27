@@ -1,15 +1,18 @@
 use anyhow::{Context, Result, bail};
+use piper_client::PiperBuilder;
 use piper_client::dual_arm::{
-    BilateralLoopConfig, BilateralRunReport, DualArmCalibration, DualArmReadPolicy,
-    DualArmSnapshot, JointMirrorMap,
+    BilateralLoopConfig, BilateralRunReport, DualArmActiveMit, DualArmBuilder, DualArmCalibration,
+    DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby, JointMirrorMap,
 };
-use piper_client::state::MitModeConfig;
+use piper_client::state::{DisableConfig, MitModeConfig};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::commands::teleop::TeleopDualArmArgs;
@@ -178,6 +181,9 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
         yes: args.yes,
     };
     if !io.confirm_start(&summary)? {
+        if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
+            return Ok(TeleopExitStatus::Success);
+        }
         bail!("operator confirmation declined");
     }
 
@@ -296,8 +302,217 @@ fn inspect_finished_console(handle: Option<JoinHandle<Result<()>>>) -> Result<()
     }
 }
 
-pub async fn run_dual_arm(_args: TeleopDualArmArgs) -> Result<()> {
-    bail!("teleop dual-arm is not implemented yet")
+#[derive(Default)]
+pub struct RealTeleopBackend {
+    standby: Option<DualArmStandby>,
+    active: Option<DualArmActiveMit>,
+    disabled_or_faulted: bool,
+}
+
+impl TeleopBackend for RealTeleopBackend {
+    fn connect(&mut self, targets: &RoleTargets, baud_rate: u32) -> Result<()> {
+        let master_builder = PiperBuilder::new()
+            .target(targets.master.to_connection_target())
+            .baud_rate(baud_rate);
+        let slave_builder = PiperBuilder::new()
+            .target(targets.slave.to_connection_target())
+            .baud_rate(baud_rate);
+
+        self.standby = Some(DualArmBuilder::new(master_builder, slave_builder).build()?);
+        self.active = None;
+        self.disabled_or_faulted = false;
+        Ok(())
+    }
+
+    fn runtime_health_ok(&self) -> Result<()> {
+        let standby = self.standby.as_ref().context("dual-arm backend is not connected")?;
+        let health = standby.observer().runtime_health();
+        if health.any_unhealthy() {
+            bail!("dual-arm runtime is unhealthy before teleop start: {health:?}");
+        }
+        Ok(())
+    }
+
+    fn standby_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+        let standby = self.standby.as_ref().context("dual-arm backend is not in standby")?;
+        Ok(standby.observer().snapshot(policy)?)
+    }
+
+    fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration> {
+        let standby = self.standby.as_ref().context("dual-arm backend is not in standby")?;
+        Ok(standby.capture_calibration(map)?)
+    }
+
+    fn enable_mit(&mut self, master: MitModeConfig, slave: MitModeConfig) -> Result<EnableOutcome> {
+        let standby = self.standby.take().context("dual-arm backend is not in standby")?;
+        let active = standby.enable_mit(master, slave)?;
+        self.active = Some(active);
+        self.disabled_or_faulted = false;
+        Ok(EnableOutcome::Active)
+    }
+
+    fn disable_active(&mut self) -> Result<()> {
+        let active = self.active.take().context("dual-arm backend is not active")?;
+        let standby = active.disable_both(DisableConfig::default())?;
+        self.standby = Some(standby);
+        self.disabled_or_faulted = true;
+        Ok(())
+    }
+
+    fn active_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+        let active = self.active.as_ref().context("dual-arm backend is not active")?;
+        Ok(active.observer().snapshot(policy)?)
+    }
+
+    fn run_loop(
+        &mut self,
+        controller: RuntimeTeleopController,
+        cfg: BilateralLoopConfig,
+    ) -> Result<TeleopLoopExit> {
+        let active = self.active.take().context("dual-arm backend is not active")?;
+
+        match active.run_bilateral(controller, cfg)? {
+            DualArmLoopExit::Standby { arms, report } => {
+                self.standby = Some(arms);
+                self.disabled_or_faulted = true;
+                Ok(TeleopLoopExit {
+                    faulted: false,
+                    report,
+                })
+            },
+            DualArmLoopExit::Faulted { arms: _, report } => {
+                self.disabled_or_faulted = true;
+                Ok(TeleopLoopExit {
+                    faulted: true,
+                    report,
+                })
+            },
+        }
+    }
+}
+
+pub struct RealTeleopIo {
+    cancel: Arc<AtomicBool>,
+}
+
+impl RealTeleopIo {
+    pub fn install_ctrlc() -> Result<Self> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handler_cancel = cancel.clone();
+        ctrlc::set_handler(move || {
+            handler_cancel.store(true, Ordering::SeqCst);
+        })
+        .context("failed to install Ctrl+C handler")?;
+        Ok(Self { cancel })
+    }
+}
+
+impl TeleopIo for RealTeleopIo {
+    fn cancel_signal(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    fn confirm_start(&mut self, summary: &StartupSummary) -> Result<bool> {
+        print_startup_summary(summary)?;
+        if summary.yes {
+            return Ok(true);
+        }
+        read_yes_from_stdin_unless_cancelled(&self.cancel)
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    fn start_console(
+        &mut self,
+        settings: RuntimeTeleopSettingsHandle,
+        started_at: Instant,
+    ) -> Result<Option<JoinHandle<Result<()>>>> {
+        Ok(Some(crate::teleop::console::spawn_console_thread(
+            settings,
+            started_at,
+            self.cancel.clone(),
+        )))
+    }
+
+    fn write_json_report(&mut self, path: &Path, report: &TeleopJsonReport) -> Result<()> {
+        crate::teleop::report::write_json_report(path, report)
+    }
+}
+
+fn print_startup_summary(summary: &StartupSummary) -> Result<()> {
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "teleop dual-arm startup summary")?;
+    writeln!(stderr, "  master target: {:?}", summary.targets.master)?;
+    writeln!(stderr, "  slave target: {:?}", summary.targets.slave)?;
+    writeln!(stderr, "  mode: {:?}", summary.mode)?;
+    writeln!(stderr, "  profile: {:?}", summary.profile)?;
+    writeln!(stderr, "  frequency: {:.1} Hz", summary.frequency_hz)?;
+    writeln!(
+        stderr,
+        "  gains: track_kp={:.3}, track_kd={:.3}, master_damping={:.3}, reflection_gain={:.3}",
+        summary.track_kp, summary.track_kd, summary.master_damping, summary.reflection_gain
+    )?;
+    writeln!(stderr, "  calibration: {}", summary.calibration_source)?;
+    if let Some(path) = &summary.calibration_path {
+        writeln!(stderr, "  calibration path: {}", path.display())?;
+    }
+    writeln!(stderr, "  gripper mirror: {}", summary.gripper_mirror)?;
+    if let Some(path) = &summary.report_path {
+        writeln!(stderr, "  report json: {}", path.display())?;
+    }
+    if !summary.yes {
+        write!(stderr, "Type 'yes' or 'y' to enable MIT teleop: ")?;
+        stderr.flush()?;
+    }
+    Ok(())
+}
+
+fn read_yes_from_stdin_unless_cancelled(cancel: &Arc<AtomicBool>) -> Result<bool> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let result = io::stdin().read_line(&mut line).map(|_| line);
+        let _ = tx.send(result);
+    });
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Ok(line)) => {
+                let value = line.trim();
+                return Ok(value.eq_ignore_ascii_case("y") || value.eq_ignore_ascii_case("yes"));
+            },
+            Ok(Err(error)) => return Err(error).context("failed to read operator confirmation"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {},
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("operator confirmation reader stopped unexpectedly");
+            },
+        }
+    }
+}
+
+pub fn run_dual_arm_blocking(
+    args: TeleopDualArmArgs,
+    backend: &mut RealTeleopBackend,
+) -> Result<()> {
+    let mut io = RealTeleopIo::install_ctrlc()?;
+    match run_workflow(args, backend, &mut io)? {
+        TeleopExitStatus::Success => Ok(()),
+        TeleopExitStatus::Failure => bail!("teleop dual-arm failed"),
+    }
+}
+
+pub async fn run_dual_arm(args: TeleopDualArmArgs) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut backend = RealTeleopBackend::default();
+        run_dual_arm_blocking(args, &mut backend)
+    })
+    .await?
 }
 
 #[cfg(test)]
@@ -540,6 +755,14 @@ mod tests {
             }
         }
 
+        fn cancel_during_confirmation_input() -> Self {
+            Self {
+                confirm: false,
+                cancel_on_confirm: true,
+                ..Self::default()
+            }
+        }
+
         fn cancel_during_enable() -> Self {
             Self {
                 cancel_during_enable: true,
@@ -683,6 +906,21 @@ mod tests {
     }
 
     #[test]
+    fn cancel_during_confirmation_input_returns_success_without_enable() {
+        let backend = FakeTeleopBackend::default();
+        let io = FakeTeleopIo::cancel_during_confirmation_input();
+
+        let status = run_workflow_for_test_with_io(valid_args(), backend.clone(), io)
+            .expect("Ctrl+C during confirmation input must stop cleanly");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        assert!(backend.calls().contains(&WorkflowCall::Connect));
+        assert!(!backend.calls().contains(&WorkflowCall::Enable));
+        assert!(!backend.calls().contains(&WorkflowCall::DisableActive));
+        assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
     fn pre_enable_mismatch_fails_before_enable() {
         let backend = FakeTeleopBackend::with_standby_snapshot_mismatch();
 
@@ -803,6 +1041,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gs_usb_runtime_target_is_rejected_before_backend_connect() {
+        let args = TeleopDualArmArgs {
+            master_target: Some("gs-usb-serial:A".to_string()),
+            slave_target: Some("gs-usb-serial:B".to_string()),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+        let backend = FakeTeleopBackend::default();
+
+        let err = run_workflow_for_test(args, backend.clone())
+            .expect_err("gs-usb runtime should be rejected in v1");
+
+        assert!(err.to_string().contains("SoftRealtime dual-arm"));
+        assert_eq!(backend.calls(), Vec::<WorkflowCall>::new());
+    }
+
+    #[test]
+    fn socketcan_runtime_target_is_rejected_on_non_linux_before_backend_connect() {
+        let args = TeleopDualArmArgs {
+            master_target: Some("socketcan:can0".to_string()),
+            slave_target: Some("socketcan:can1".to_string()),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+        let backend = FakeTeleopBackend::default();
+
+        let err = run_workflow_for_test_on_platform(args, backend.clone(), TeleopPlatform::Other)
+            .expect_err("SocketCAN runtime is Linux-only in v1");
+
+        assert!(err.to_string().contains("Linux"));
+        assert_eq!(backend.calls(), Vec::<WorkflowCall>::new());
+    }
+
     fn run_workflow_for_test(
         args: TeleopDualArmArgs,
         backend: FakeTeleopBackend,
@@ -816,6 +1086,15 @@ mod tests {
         mut io: FakeTeleopIo,
     ) -> Result<TeleopExitStatus> {
         run_workflow_on_platform(args, &mut backend, &mut io, TeleopPlatform::Linux)
+    }
+
+    fn run_workflow_for_test_on_platform(
+        args: TeleopDualArmArgs,
+        mut backend: FakeTeleopBackend,
+        platform: TeleopPlatform,
+    ) -> Result<TeleopExitStatus> {
+        let mut io = FakeTeleopIo::default();
+        run_workflow_on_platform(args, &mut backend, &mut io, platform)
     }
 
     fn valid_args() -> TeleopDualArmArgs {
