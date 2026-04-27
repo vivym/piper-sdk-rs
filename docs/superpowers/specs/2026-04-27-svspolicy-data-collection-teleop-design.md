@@ -257,6 +257,24 @@ existing dual-arm loop as the owner of timing, command submission, and safety.
 If implementation requires a new SDK hook, that hook must be generic and
 MuJoCo-free; it must not mention SVSPolicy, MuJoCo, or dataset writing.
 
+MuJoCo pose and Jacobian access belongs in `addons/piper-physics-mujoco`, not
+as duplicated MuJoCo FFI in `addons/piper-svs-collect`. The implementation
+should add a narrow addon-local public API such as:
+
+```rust
+pub struct EndEffectorKinematics {
+    pub position_base_m: [f64; 3],
+    pub rotation_base_from_ee: [[f64; 3]; 3],
+    pub translational_jacobian_base: [[f64; 6]; 3],
+    pub jacobian_condition: f64,
+}
+```
+
+This API remains outside the default workspace dependency graph because
+`addons/piper-physics-mujoco` is still excluded. `piper-svs-collect` consumes
+that API to build `SvsMujocoBridge`; it should not duplicate model loading or
+raw `mj_jac` FFI logic.
+
 `tau_model_mujoco` must be reproducible from the episode manifest and task
 profile. V1 uses per-arm MuJoCo mode fields:
 
@@ -562,6 +580,18 @@ Each run creates one directory:
 
 `raw_can/` exists only when `--raw-can` is passed.
 
+`episode-id` is generated before the episode directory is created. V1 format:
+
+```text
+<utc-yyyymmddThhmmssZ>-<task-slug>-<12-hex-random>
+```
+
+`task-slug` is lowercase ASCII `[a-z0-9-]`, derived from the task name by
+replacing non-alphanumeric runs with `-` and trimming leading/trailing `-`. The
+random suffix comes from the OS RNG. If the generated directory already exists,
+the collector retries with a new random suffix; after a bounded retry count it
+fails before connecting hardware.
+
 ### `manifest.toml`
 
 Contains:
@@ -598,9 +628,23 @@ task profile path.
 
 `steps.bin` is a strict bincode 1.3 stream using fixed-int encoding and little
 endian byte order, matching the repository's existing strict recording v3
-style. It contains a small header and repeated fixed-schema `SvsStepV1` records.
-Historical incompatible formats are rejected unless a new schema version is
-declared.
+style. Historical incompatible formats are rejected unless a new schema version
+is declared.
+
+V1 header fields:
+
+```text
+magic = "PIPERSVS"
+schema_version = 1
+encoding = "bincode-1.3-fixint-little-endian"
+episode_id = <episode-id>
+created_unix_ms = <u64>
+step_record_type = "SvsStepV1"
+```
+
+After the header, the file stores repeated fixed-schema `SvsStepV1` records
+until EOF. The record count is not trusted from the header; readers count records
+while decoding and compare against `report.json`/`manifest.toml` metadata.
 
 Each step contains:
 
