@@ -106,7 +106,7 @@ run_check \
   '^docs/'
 run_check \
   'raw recording stop condition APIs' \
-  'stop_on_id[[:space:]]*:[[:space:]]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|with_(auto_)?stop(_condition)?[[:space:]]*\([^)]*stop_on_id[[:space:]]*:[[:space:]]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|raw_id\(\)[[:space:]]*==[[:space:]]*stop_id|stop_id[[:space:]]*==[^\n]*raw_id\(\)' \
+  'stop_on_id[[:space:]]*:[[:space:]]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|with_(auto_)?stop(_condition)?[[:space:]]*\([^)]*Option[[:space:]]*<[[:space:]]*u32[[:space:]]*>|raw_id\(\)[[:space:]]*==[[:space:]]*stop_id|stop_id[[:space:]]*==[^\n]*raw_id\(\)' \
   '^docs/'
 run_check \
   'replay construction from ambiguous can_id' \
