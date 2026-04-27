@@ -4015,7 +4015,7 @@ mod tests {
     }
 
     fn joint_feedback_frame(
-        can_id: u32,
+        standard_id: u32,
         first_deg_milli: i32,
         second_deg_milli: i32,
         timestamp_us: u64,
@@ -4023,7 +4023,9 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
         data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
-        PiperFrame::new_standard(can_id, &data).unwrap().with_timestamp_us(timestamp_us)
+        PiperFrame::new_standard(standard_id, &data)
+            .unwrap()
+            .with_timestamp_us(timestamp_us)
     }
 
     fn joint_driver_state_frame(joint_index: u8, enabled: bool, timestamp_us: u64) -> PiperFrame {
