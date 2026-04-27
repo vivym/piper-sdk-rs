@@ -234,10 +234,17 @@ The bridge provides per-arm:
 - translational Jacobian in base frame
 - condition metrics for Jacobian DLS mapping
 
-The bridge also exposes the slave end-effector rotation `R_slave_base_to_ee`
-and uses a collector/profile-provided base-frame transform
-`R_master_base_to_slave_base` for master cue normalization. That transform is a
-3x3 proper rotation matrix mapping vectors from the master arm base frame into
+All rotation matrices in this spec use the notation `R_target_from_source`,
+meaning they left-multiply a vector expressed in `source` coordinates and return
+the same vector expressed in `target` coordinates. The bridge exposes
+`R_slave_base_from_ee`, whose columns are the slave end-effector axes expressed
+in the slave base frame. The collector therefore uses
+`R_slave_ee_from_base = R_slave_base_from_ee^T` to express base-frame cues in
+the slave end-effector frame.
+
+The collector also requires a profile-provided
+`R_slave_base_from_master_base` for master cue normalization. That transform is
+a 3x3 proper rotation matrix mapping vectors from the master arm base frame into
 the slave arm base frame. It is required in the collector config or task
 profile; v1 must not infer it from the joint mirror map because joint signs are
 not a complete Cartesian frame transform.
@@ -286,15 +293,16 @@ f_proxy_base = (Jp * Jp^T + lambda * I)^-1 * Jp * tau_residual
 For the slave arm, the cue is expressed in the slave end-effector frame:
 
 ```text
-r_ee = R_slave_base_to_ee^T * f_slave_proxy_base
+R_slave_ee_from_base = R_slave_base_from_ee^T
+r_ee = R_slave_ee_from_base * f_slave_proxy_base
 ```
 
 For the master arm, the cue is first rotated into the slave base frame, then
 expressed in the slave end-effector frame:
 
 ```text
-u_slave_base = R_master_base_to_slave_base * f_master_proxy_base
-u_ee = R_slave_base_to_ee^T * u_slave_base
+u_slave_base = R_slave_base_from_master_base * f_master_proxy_base
+u_ee = R_slave_ee_from_base * u_slave_base
 ```
 
 The master-side cue is named `u_ee`. The slave-side cue is named `r_ee`.
@@ -350,6 +358,10 @@ need to soften an axis to avoid jamming.
 Manual discrete stiffness modes are not part of v1. Runtime controls may tune
 profile parameters, pause, stop, or print status, but they must not create
 operator-selected `soft` or `hard` labels.
+
+`max_jacobian_condition` applies to the singular-value condition number of the
+undamped translational Jacobian `Jp`. The DLS damping term improves numerical
+stability, but it must not hide a rejected near-singular kinematic state.
 
 ## Task Profiles
 
@@ -491,6 +503,10 @@ the task profile. Rows are clamped after projection, so profiles can express
 task-specific coupling while the runtime keeps every joint gain within the
 configured bounds. V1 does not modulate slave feedforward torque from `K_tele`;
 model compensation remains owned by the MuJoCo compensation path.
+
+Each stiffness axis must satisfy `K_min[i] < K_max[i]`. Equal bounds are
+rejected rather than treated as a constant axis because the normalized control
+mapping above depends on a non-zero denominator.
 
 The reflected master interaction torque reuses the existing joint-space
 bilateral sign semantics, but uses the slave residual torque rather than raw
@@ -666,7 +682,7 @@ All numeric profile values must be finite. Validation rejects:
 - negative frequencies or filter cutoffs
 - non-positive DLS lambda
 - non-positive Jacobian condition threshold
-- `K_min > K_max`
+- `K_min >= K_max` on any axis
 - base stiffness outside `[K_min, K_max]`
 - negative rate limits
 - contact enter threshold less than or equal to exit threshold
