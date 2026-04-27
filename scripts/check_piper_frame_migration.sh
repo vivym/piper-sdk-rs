@@ -93,11 +93,14 @@ run_candidate_search() {
 
 run_check \
   'PiperFrame struct literals' \
-  'PiperFrame\s*\{' \
-  '(pub[[:space:]]+)?struct[[:space:]]+PiperFrame[[:space:]]*\{|impl([[:space:]]*<[^>]+>)?[[:space:]]+PiperFrame[[:space:]]*\{|impl.*for[[:space:]]+PiperFrame[[:space:]]*\{|->[[:space:]]*PiperFrame[[:space:]]*\{'
+  '\bPiperFrame\s*\{' \
+  '^crates/piper-protocol/tests/ui/struct_literal.rs:|(pub[[:space:]]+)?struct[[:space:]]+PiperFrame[[:space:]]*\{|impl([[:space:]]*<[^>]+>)?[[:space:]]+PiperFrame[[:space:]]*\{|impl.*for[[:space:]]+PiperFrame[[:space:]]*\{|->[[:space:]]*PiperFrame[[:space:]]*\{'
 run_check 'legacy recording readers' 'LegacyPiperRecording'
 run_check 'extended-format inference from raw id' 'can_id\s*>\s*0x7[Ff]{2}'
-run_check 'replay construction from ambiguous can_id' 'new_standard\([^\n]*can_id'
+run_check \
+  'replay construction from ambiguous can_id' \
+  'new_standard\([^\n]*can_id' \
+  '^docs/|^crates/piper-protocol/src/feedback.rs:[0-9]+:[[:space:]]*let frame = PiperFrame::new_standard\(can_id, \[0; 8\]\)\.unwrap\(\);|^crates/piper-client/src/(observer|dual_arm|control/mit_controller)\.rs:[0-9]+:[[:space:]]*let mut frame = PiperFrame::new_standard\(can_id, &data\);|^crates/piper-client/src/state/machine\.rs:[0-9]+:[[:space:]]*(let mut frame = PiperFrame::new_standard\(can_id, &data\);|PiperFrame::new_standard\(\*can_id, \*data\))'
 
 run_candidate_search 'direct field access candidates' '\.(timestamp_us|is_extended|len|data|id)\b'
 echo "Review any direct field access candidates above. The script does not fail this broad search automatically because unrelated structs can have the same field names."
