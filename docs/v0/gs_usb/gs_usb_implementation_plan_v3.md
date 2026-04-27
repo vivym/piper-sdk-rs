@@ -61,49 +61,26 @@ src/can/
 /// - 固定 8 字节数据：避免堆分配
 /// - 无生命周期：简化 API
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PiperFrame {
-    /// CAN ID（标准帧或扩展帧）
-    pub id: u32,
-
-    /// 帧数据（固定 8 字节，未使用部分为 0）
-    pub data: [u8; 8],
-
-    /// 有效数据长度 (0-8)
-    pub len: u8,
-
-    /// 是否为扩展帧（29-bit ID）
-    pub is_extended: bool,
-}
+pub struct PiperFrame; // 字段私有；通过类型化构造函数和访问器使用
 
 impl PiperFrame {
     /// 创建标准帧
-    pub fn new_standard(id: u16, data: &[u8]) -> Self {
-        Self::new(id as u32, data, false)
-    }
+    pub fn new_standard(id: u32, data: impl AsRef<[u8]>) -> Result<Self, FrameError>;
 
     /// 创建扩展帧
-    pub fn new_extended(id: u32, data: &[u8]) -> Self {
-        Self::new(id, data, true)
-    }
-
-    /// 通用构造器
-    fn new(id: u32, data: &[u8], is_extended: bool) -> Self {
-        let mut fixed_data = [0u8; 8];
-        let len = data.len().min(8);
-        fixed_data[..len].copy_from_slice(&data[..len]);
-
-        Self {
-            id,
-            data: fixed_data,
-            len: len as u8,
-            is_extended,
-        }
-    }
+    pub fn new_extended(id: u32, data: impl AsRef<[u8]>) -> Result<Self, FrameError>;
 
     /// 获取数据切片（只包含有效数据）
-    pub fn data_slice(&self) -> &[u8] {
-        &self.data[..self.len as usize]
-    }
+    pub fn data(&self) -> &[u8];
+
+    /// 获取固定 8 字节填充数据
+    pub fn data_padded(&self) -> &[u8; 8];
+
+    pub fn raw_id(&self) -> u32;
+    pub fn is_extended(&self) -> bool;
+    pub fn dlc(&self) -> u8;
+    pub fn timestamp_us(&self) -> u64;
+    pub fn with_timestamp_us(self, timestamp_us: u64) -> Self;
 }
 ```
 
@@ -551,16 +528,16 @@ impl CanAdapter for GsUsbCanAdapter {
         let gs_frame = {
             let mut gs = GsUsbFrame {
                 echo_id: GS_USB_ECHO_ID,
-                can_id: if frame.is_extended {
+                can_id: if frame.is_extended() {
                     frame.raw_id() | CAN_EFF_FLAG
                 } else {
                     frame.raw_id()
                 },
-                can_dlc: frame.len,
+                can_dlc: frame.dlc(),
                 channel: 0,
                 flags: 0,
                 reserved: 0,
-                data: frame.data,
+                data: *frame.data_padded(),
             };
             gs
         };
@@ -569,7 +546,7 @@ impl CanAdapter for GsUsbCanAdapter {
         self.device.send_raw(&gs_frame)
             .map_err(|e| CanError::Device(format!("USB send failed: {}", e)))?;
 
-        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.len);
+        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.dlc());
         Ok(())
     }
 
@@ -610,14 +587,16 @@ impl CanAdapter for GsUsbCanAdapter {
             // 如果设备支持 GET_STATE，可以查询状态
 
             // 5. 返回有效数据帧
-            let frame = PiperFrame {
-                id: gs_frame.can_id & CAN_EFF_MASK, // 移除标志位
-                data: gs_frame.data,
-                len: gs_frame.can_dlc.min(8),
-                is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-            };
+            let raw_id = gs_frame.can_id & CAN_EFF_MASK; // 移除标志位
+            let payload = &gs_frame.data[..gs_frame.can_dlc.min(8) as usize];
+            let frame = if (gs_frame.can_id & CAN_EFF_FLAG) != 0 {
+                PiperFrame::new_extended(raw_id, payload)
+            } else {
+                PiperFrame::new_standard(raw_id, payload)
+            }
+            .map_err(|e| CanError::Device(e.to_string()))?;
 
-            trace!("Received CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.len);
+            trace!("Received CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.dlc());
             return Ok(frame);
         }
     }
@@ -659,8 +638,8 @@ impl CanAdapter for SocketCanAdapter {
     fn send(&mut self, frame: PiperFrame) -> Result<(), CanError> {
         let can_frame = CANFrame::new(
             frame.raw_id(),
-            frame.data_slice(),
-            frame.is_extended,
+            frame.data(),
+            frame.is_extended(),
             false, // RTR
         ).map_err(|_| CanError::Device("Invalid frame".to_string()))?;
 
@@ -680,16 +659,14 @@ impl CanAdapter for SocketCanAdapter {
                 format!("Socket read failed: {}", e)
             )))?;
 
-        let mut data = [0u8; 8];
         let frame_data = can_frame.data();
-        data[..frame_data.len()].copy_from_slice(frame_data);
 
-        Ok(PiperFrame {
-            id: can_frame.id(),
-            data,
-            len: frame_data.len() as u8,
-            is_extended: can_frame.is_extended(),
-        })
+        if can_frame.is_extended() {
+            PiperFrame::new_extended(can_frame.id(), frame_data)
+        } else {
+            PiperFrame::new_standard(can_frame.id(), frame_data)
+        }
+        .map_err(|e| CanError::Device(e.to_string()))
     }
 }
 ```
@@ -805,4 +782,3 @@ pub fn create_can_adapter(interface: Option<&str>) -> Result<Box<dyn CanAdapter>
 5. ✅ **可扩展**：未来可以轻松添加其他后端（如虚拟设备、模拟器）
 
 **预计实现时间**：7-10 个工作日（基于参考实现的代码复用）。
-

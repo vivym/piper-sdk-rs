@@ -272,14 +272,11 @@ pub struct ProtocolFrame {
 }
 
 // piper-can 层转换
-impl From<ProtocolFrame> for PiperFrame {
-    fn from(pf: ProtocolFrame) -> Self {
-        PiperFrame {
-            id: pf.id,
-            data: pf.data,
-            len: pf.len,
-            // ... 其他 CAN 特定字段
-        }
+impl TryFrom<ProtocolFrame> for PiperFrame {
+    type Error = FrameError;
+
+    fn try_from(pf: ProtocolFrame) -> Result<Self, Self::Error> {
+        PiperFrame::new_standard(pf.id, &pf.data[..pf.len as usize])
     }
 }
 ```

@@ -392,19 +392,19 @@ impl TryFrom<PiperFrame> for GripperFeedback {
         if frame.raw_id() != ID_GRIPPER_FEEDBACK {
             return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
-        if frame.len < 7 {
-            return Err(ProtocolError::InvalidLength { expected: 7, actual: frame.len as usize });
+        if frame.dlc() < 7 {
+            return Err(ProtocolError::InvalidLength { expected: 7, actual: frame.dlc() as usize });
         }
 
         // 处理大端字节序
-        let travel_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+        let travel_bytes = [frame.data()[0], frame.data()[1], frame.data()[2], frame.data()[3]];
         let travel_mm = i32::from_be_bytes(travel_bytes);
 
-        let torque_bytes = [frame.data[4], frame.data[5]];
+        let torque_bytes = [frame.data()[4], frame.data()[5]];
         let torque_nm = i16::from_be_bytes(torque_bytes);
 
         // 使用 bilge 解析位域
-        let status = GripperStatus::from(u8::new(frame.data[6]));
+        let status = GripperStatus::from(u8::new(frame.data()[6]));
 
         Ok(Self {
             travel_mm,
@@ -514,13 +514,13 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
         if frame.raw_id() != ID_ROBOT_STATUS {
             return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
-        if frame.len < 8 {
-            return Err(ProtocolError::InvalidLength { expected: 8, actual: frame.len as usize });
+        if frame.dlc() < 8 {
+            return Err(ProtocolError::InvalidLength { expected: 8, actual: frame.dlc() as usize });
         }
 
         Ok(Self {
-            control_mode: ControlMode::from(frame.data[0]),
-            robot_status: RobotStatus::from(frame.data[1]),
+            control_mode: ControlMode::from(frame.data()[0]),
+            robot_status: RobotStatus::from(frame.data()[1]),
             // ... 解析其他字段
         })
     }
@@ -1228,7 +1228,7 @@ pub struct GripperStatus {
 }
 
 // 使用方式：
-let status_byte = frame.data[6];
+let status_byte = frame.data()[6];
 let status = GripperStatus::from(u8::new(status_byte));
 
 // 访问字段
@@ -1403,19 +1403,19 @@ impl TryFrom<PiperFrame> for GripperFeedback {
         if frame.raw_id() != ID_GRIPPER_FEEDBACK {
             return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
-        if frame.len < 7 {
-            return Err(ProtocolError::InvalidLength { expected: 7, actual: frame.len as usize });
+        if frame.dlc() < 7 {
+            return Err(ProtocolError::InvalidLength { expected: 7, actual: frame.dlc() as usize });
         }
 
         // 2. 处理多字节整数（大端序）
         let travel_mm = i32::from_be_bytes([
-            frame.data[0], frame.data[1], frame.data[2], frame.data[3]
+            frame.data()[0], frame.data()[1], frame.data()[2], frame.data()[3]
         ]);
 
-        let torque_nm = i16::from_be_bytes([frame.data[4], frame.data[5]]);
+        let torque_nm = i16::from_be_bytes([frame.data()[4], frame.data()[5]]);
 
         // 3. 使用 bilge 解析位域
-        let status = GripperStatus::from(u8::new(frame.data[6]));
+        let status = GripperStatus::from(u8::new(frame.data()[6]));
 
         Ok(Self {
             travel_mm,
@@ -1622,4 +1622,3 @@ pub enum Mode {
 - **完整的协议覆盖**：分阶段实现，优先核心功能
 
 实现将分阶段进行，优先实现高频使用的反馈帧和控制帧，确保核心功能可用后再完善其他协议。对于位域结构，使用 bilge 可以显著提高代码的可读性和类型安全性。
-

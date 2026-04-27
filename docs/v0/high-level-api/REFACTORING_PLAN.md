@@ -1153,8 +1153,8 @@ mod protocol_tests {
         let frame = cmd.to_frame();
 
         assert_eq!(frame.raw_id(), 0x471); // ✅ 正确的 CAN ID
-        assert_eq!(frame.data[0], 7); // 全部关节
-        assert_eq!(frame.data[1], 0x02); // 使能
+        assert_eq!(frame.data()[0], 7); // 全部关节
+        assert_eq!(frame.data()[1], 0x02); // 使能
     }
 }
 
@@ -1334,4 +1334,3 @@ pub fn enable_arm(&self) -> Result<Piper<Active<MitMode>>> { ... }
 **文档版本：** v1.0
 **创建时间：** 2025-01-23
 **最后更新：** 2025-01-23
-

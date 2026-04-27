@@ -170,26 +170,18 @@ impl embedded_can::Frame for MyCanFrame {
 /// SDK 通用的 CAN 帧定义（只针对 CAN 2.0）
 /// 这种结构体没有任何生命周期，Copy trait，极其轻量
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PiperFrame {
-    pub id: u32,          // 标准帧或扩展帧 ID
-    pub data: [u8; 8],    // 固定 8 字节，避免堆分配
-    pub len: u8,          // 有效数据长度 (0-8)
-    pub is_extended: bool,// 是否为扩展帧
-}
+pub struct PiperFrame; // 字段私有；通过类型化构造函数和访问器使用
 
 impl PiperFrame {
-    pub fn new(id: u32, data: &[u8]) -> Self {
-        let mut fixed_data = [0u8; 8];
-        let len = data.len().min(8);
-        fixed_data[..len].copy_from_slice(&data[..len]);
-
-        Self {
-            id,
-            data: fixed_data,
-            len: len as u8,
-            is_extended: false, // 默认标准帧，按需修改
-        }
-    }
+    pub fn new_standard(id: u32, data: impl AsRef<[u8]>) -> Result<Self, FrameError>;
+    pub fn new_extended(id: u32, data: impl AsRef<[u8]>) -> Result<Self, FrameError>;
+    pub fn raw_id(&self) -> u32;
+    pub fn is_extended(&self) -> bool;
+    pub fn dlc(&self) -> u8;
+    pub fn data(&self) -> &[u8];
+    pub fn data_padded(&self) -> &[u8; 8];
+    pub fn timestamp_us(&self) -> u64;
+    pub fn with_timestamp_us(self, timestamp_us: u64) -> Self;
 }
 
 /// SDK 统一错误类型
@@ -259,7 +251,7 @@ impl CanAdapter for LinuxCanDriver {
         // 1. 转换 PiperFrame -> socketcan::CANFrame
         let sys_frame = socketcan::CANFrame::new(
             frame.raw_id(),
-            &frame.data[0..frame.len as usize],
+            frame.data(),
             false,
             false
         ).map_err(|_| CanError::Device("Invalid frame creation".into()))?;
@@ -274,17 +266,12 @@ impl CanAdapter for LinuxCanDriver {
         let sys_frame = self.socket.read_frame()?;
 
         // 2. 转换 socketcan::CANFrame -> PiperFrame
-        Ok(PiperFrame {
-            id: sys_frame.id(),
-            data: {
-                let mut d = [0u8; 8];
-                let src = sys_frame.data();
-                d[..src.len()].copy_from_slice(src);
-                d
-            },
-            len: sys_frame.data().len() as u8,
-            is_extended: sys_frame.is_extended(),
-        })
+        if sys_frame.is_extended() {
+            PiperFrame::new_extended(sys_frame.id(), sys_frame.data())
+        } else {
+            PiperFrame::new_standard(sys_frame.id(), sys_frame.data())
+        }
+        .map_err(|e| CanError::Device(e.to_string()))
     }
 }
 
@@ -310,7 +297,7 @@ impl CanAdapter for UsbCanDriver {
         // 1. 转换 PiperFrame -> GsUsbFrame
         // 2. 调用底层的 USB Bulk Write
         // 3. 不等待 Echo，直接返回
-        self.driver.transmit_raw(frame.raw_id(), &frame.data, frame.len)
+        self.driver.transmit_raw(frame.raw_id(), frame.data(), frame.dlc())
             .map_err(|e| CanError::Device(e.to_string()))?;
         Ok(())
     }
@@ -327,12 +314,13 @@ impl CanAdapter for UsbCanDriver {
             // 2. 过滤错误帧（可选）
 
             // 3. 返回有效帧
-            return Ok(PiperFrame {
-                id: gs_frame.can_id,
-                data: gs_frame.data,
-                len: gs_frame.can_dlc,
-                is_extended: gs_frame.flags & 1 != 0, // 伪代码
-            });
+            let payload = &gs_frame.data[..gs_frame.can_dlc.min(8) as usize];
+            return if gs_frame.flags & 1 != 0 {
+                PiperFrame::new_extended(gs_frame.can_id, payload)
+            } else {
+                PiperFrame::new_standard(gs_frame.can_id, payload)
+            }
+            .map_err(|e| CanError::Device(e.to_string()));
         }
     }
 }

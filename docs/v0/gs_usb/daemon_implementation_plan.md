@@ -1555,10 +1555,10 @@ pub fn encode_receive_frame_zero_copy(
 
     // CAN 帧数据
     cursor.write_all(&frame.raw_id().to_le_bytes()).unwrap();
-    cursor.write_all(&[if frame.is_extended { 0x01 } else { 0x00 }]).unwrap();
-    cursor.write_all(&[frame.len]).unwrap();
+    cursor.write_all(&[if frame.is_extended() { 0x01 } else { 0x00 }]).unwrap();
+    cursor.write_all(&[frame.dlc()]).unwrap();
     cursor.write_all(&frame.timestamp_us().to_le_bytes()).unwrap();
-    cursor.write_all(&frame.data).unwrap();
+    cursor.write_all(frame.data_padded()).unwrap();
 
     &buf[..length]
 }
@@ -1573,16 +1573,16 @@ pub fn encode_send_frame_with_seq(
 
     // 消息头（8 字节）
     cursor.write_all(&[0x03, 0x00]).unwrap(); // Type, Flags
-    let length = 8 + 4 + 1 + 1 + frame.len as usize; // Header + ID + Flags + DLC + Data
+    let length = 8 + 4 + 1 + 1 + frame.data().len(); // Header + ID + Flags + DLC + Data
     cursor.write_all(&(length as u16).to_le_bytes()).unwrap(); // Length
     cursor.write_all(&[0x00]).unwrap(); // Reserved
     cursor.write_all(&seq.to_le_bytes()).unwrap(); // Sequence Number
 
     // CAN 帧数据
     cursor.write_all(&frame.raw_id().to_le_bytes()).unwrap();
-    cursor.write_all(&[if frame.is_extended { 0x01 } else { 0x00 }]).unwrap();
-    cursor.write_all(&[frame.len]).unwrap();
-    cursor.write_all(&frame.data[..frame.len as usize]).unwrap();
+    cursor.write_all(&[if frame.is_extended() { 0x01 } else { 0x00 }]).unwrap();
+    cursor.write_all(&[frame.dlc()]).unwrap();
+    cursor.write_all(frame.data()).unwrap();
 
     &buf[..length]
 }
@@ -1628,13 +1628,14 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
             let mut frame_data = [0u8; 8];
             frame_data[..len as usize].copy_from_slice(&data[10..10 + len as usize]);
 
-            Ok(Message::SendFrame(PiperFrame {
-                id,
-                data: frame_data,
-                len,
-                is_extended,
-                timestamp_us: 0,
-            }))
+            let payload = &frame_data[..len as usize];
+            let frame = if is_extended {
+                PiperFrame::new_extended(id, payload)
+            } else {
+                PiperFrame::new_standard(id, payload)
+            }?;
+
+            Ok(Message::SendFrame(frame))
         },
         0x83 => {
             // ReceiveFrame
@@ -1650,13 +1651,15 @@ pub fn decode_message(data: &[u8]) -> Result<Message, ProtocolError> {
             let mut frame_data = [0u8; 8];
             frame_data[..len as usize].copy_from_slice(&data[18..18 + len as usize]);
 
-            Ok(Message::ReceiveFrame(PiperFrame {
-                id,
-                data: frame_data,
-                len,
-                is_extended,
-                timestamp_us: timestamp,
-            }))
+            let payload = &frame_data[..len as usize];
+            let frame = if is_extended {
+                PiperFrame::new_extended(id, payload)
+            } else {
+                PiperFrame::new_standard(id, payload)
+            }?
+            .with_timestamp_us(timestamp);
+
+            Ok(Message::ReceiveFrame(frame))
         },
         _ => Err(ProtocolError::UnknownType),
     }
@@ -1990,10 +1993,10 @@ use tracing::{trace, debug, info, warn, error};
 impl Daemon {
     fn handle_send_frame(&self, frame: PiperFrame, seq: u32) -> Result<(), DaemonError> {
         // ❌ 错误：高频日志使用 Info 级别
-        // info!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.len);
+        // info!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.dlc());
 
         // ✅ 正确：高频日志使用 Trace 或 Debug 级别
-        trace!("Sent CAN frame: ID=0x{:X}, len={}, seq={}", frame.raw_id(), frame.len, seq);
+        trace!("Sent CAN frame: ID=0x{:X}, len={}, seq={}", frame.raw_id(), frame.dlc(), seq);
 
         // ✅ 正确：重要事件使用 Info 级别
         info!("Device connected successfully");
@@ -2229,4 +2232,3 @@ pub struct DaemonConfig {
 - 往返延迟：< 200us（USB <-> Daemon <-> Client）
 - 延迟抖动：< 100us（P99）
 - 控制频率：1kHz (1ms 周期) 或更高
-

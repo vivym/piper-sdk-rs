@@ -891,9 +891,7 @@ driver.send_realtime_package(frames)?;
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PiperFrame {
-    // ...
-}
+pub struct PiperFrame; // 字段私有；通过类型化构造函数和访问器使用
 ```
 
 这确保了 `SmallVec` 在收集和迭代时会编译为高效的内存拷贝指令（`memcpy`），而不是调用 `Clone::clone`。
@@ -978,4 +976,3 @@ pub struct PiperFrame {
 - **问题**：在锁内更新指标，略微增加锁持有时间
 - **解决**：先释放锁，再更新指标（原子操作在锁外）
 - **效果**：减少锁持有时间，降低 TX 线程获取锁失败的风险
-

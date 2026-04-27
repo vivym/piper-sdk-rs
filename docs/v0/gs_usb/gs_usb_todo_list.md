@@ -63,9 +63,9 @@ mod tests {
         let frame = PiperFrame::new_standard(0x123, &data[..4]);
 
         assert_eq!(frame.raw_id(), 0x123);
-        assert_eq!(frame.len, 4);
-        assert_eq!(frame.data[..4], data[..4]);
-        assert!(!frame.is_extended);
+        assert_eq!(frame.dlc(), 4);
+        assert_eq!(frame.data(), &data[..4]);
+        assert!(!frame.is_extended());
     }
 
     #[test]
@@ -74,8 +74,8 @@ mod tests {
         let frame = PiperFrame::new_extended(0x12345678, &data);
 
         assert_eq!(frame.raw_id(), 0x12345678);
-        assert_eq!(frame.len, 8);
-        assert!(frame.is_extended);
+        assert_eq!(frame.dlc(), 8);
+        assert!(frame.is_extended());
     }
 
     #[test]
@@ -84,8 +84,8 @@ mod tests {
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A];
         let frame = PiperFrame::new_standard(0x123, &data);
 
-        assert_eq!(frame.len, 8); // 应该截断到 8
-        assert_eq!(frame.data[7], 0x08);
+        assert_eq!(frame.dlc(), 8); // 应该截断到 8
+        assert_eq!(frame.data()[7], 0x08);
     }
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(frame.echo_id, GS_USB_RX_ECHO_ID);
         assert_eq!(frame.can_id, 0x123);
         assert_eq!(frame.can_dlc, 4);
-        assert_eq!(frame.data[..4], [0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(frame.data(), &[0x01, 0x02, 0x03, 0x04]);
         assert!(frame.is_rx_frame());
     }
 
@@ -859,4 +859,3 @@ fn test_receive_latency() {
 - **集成测试**：需要实际硬件，使用 `#[ignore]` 标记，手动运行
 - **性能测试**：在真实硬件上运行，记录基准数据
 - **代码审查**：每个 Phase 完成后进行代码审查，确保符合方案要求
-

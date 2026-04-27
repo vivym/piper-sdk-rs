@@ -277,9 +277,9 @@ fn test_socketcan_adapter_receive_standard_frame() {
     // 接收帧
     let rx_frame = adapter.receive().unwrap();
     assert_eq!(rx_frame.raw_id(), 0x123);
-    assert_eq!(rx_frame.data[..4], [1, 2, 3, 4]);
-    assert_eq!(rx_frame.len, 4);
-    assert!(!rx_frame.is_extended);
+    assert_eq!(rx_frame.data(), &[1, 2, 3, 4]);
+    assert_eq!(rx_frame.dlc(), 4);
+    assert!(!rx_frame.is_extended());
 }
 
 #[test]
@@ -291,7 +291,7 @@ fn test_socketcan_adapter_receive_extended_frame() {
 
     let rx_frame = adapter.receive().unwrap();
     assert_eq!(rx_frame.raw_id(), 0x12345678);
-    assert!(rx_frame.is_extended);
+    assert!(rx_frame.is_extended());
 }
 
 #[test]
@@ -945,4 +945,3 @@ fn test_socketcan_gs_usb_frame_equivalence() {
 **文档版本**：v1.0
 **创建日期**：2024-12
 **最后更新**：2024-12
-

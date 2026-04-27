@@ -155,7 +155,7 @@ pub(crate) fn enable_arm(&self) -> Result<()> {
     let frame = cmd.to_frame();
 
     let _guard = self.send_lock.lock();
-    self.can_sender.send_frame(frame.raw_id() as u32, &frame.data)?;
+    self.can_sender.send_frame(frame.raw_id() as u32, frame.data())?;
 
     self.state_tracker.set_expected_controller(ArmController::Enabled);
     Ok(())
@@ -398,7 +398,7 @@ pub(crate) fn enable_arm(&self) -> Result<()> {
     let frame = cmd.to_frame();
 
     let _guard = self.send_lock.lock();
-    self.can_sender.send_frame(frame.raw_id() as u32, &frame.data)?;
+    self.can_sender.send_frame(frame.raw_id() as u32, frame.data())?;
 
     self.state_tracker.set_expected_controller(ArmController::Enabled);
     Ok(())
@@ -412,7 +412,7 @@ pub(crate) fn enable_joint(&self, joint_index: u8) -> Result<()> {
     let frame = cmd.to_frame();
 
     let _guard = self.send_lock.lock();
-    self.can_sender.send_frame(frame.raw_id() as u32, &frame.data)?;
+    self.can_sender.send_frame(frame.raw_id() as u32, frame.data())?;
 
     // ✅ 更新对应关节的期望状态
     self.state_tracker.set_joint_enabled(joint_index, true);
@@ -695,4 +695,3 @@ impl Observer {
 **报告生成时间**: 2024-12-19
 **分析范围**: `high_level` 模块与 `can`、`protocol`、`robot` 模块的交互
 **主要关注点**: 状态管理设计问题（逐个电机控制 vs 整体状态表示）
-

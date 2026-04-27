@@ -506,7 +506,7 @@ impl GsUsbRxAdapter {
                 let piper_frame = self.convert_to_piper_frame(gs_frame)?;
 
                 // 检查是否为 Overflow
-                if piper_frame.raw_id() == 0x7FF && piper_frame.len == 0 {
+                if piper_frame.raw_id() == 0x7FF && piper_frame.dlc() == 0 {
                     warn!("CAN RX overflow detected");
                     continue;
                 }
@@ -546,13 +546,15 @@ impl GsUsbRxAdapter {
     }
 
     fn convert_to_piper_frame(&self, gs_frame: GsUsbFrame) -> Result<PiperFrame, CanError> {
-        // 转换逻辑（与现有实现相同）
-        Ok(PiperFrame {
-            id: gs_frame.can_id & CAN_EFF_MASK,
-            is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-            len: gs_frame.can_dlc,
-            data: gs_frame.data,
-        })
+        let raw_id = gs_frame.can_id & CAN_EFF_MASK;
+        let payload = &gs_frame.data[..gs_frame.can_dlc.min(8) as usize];
+
+        if (gs_frame.can_id & CAN_EFF_FLAG) != 0 {
+            PiperFrame::new_extended(raw_id, payload)
+        } else {
+            PiperFrame::new_standard(raw_id, payload)
+        }
+        .map_err(|e| CanError::Device(e.to_string()))
     }
 }
 
@@ -566,13 +568,13 @@ impl GsUsbTxAdapter {
         // 转换 PiperFrame -> GsUsbFrame
         let gs_frame = GsUsbFrame {
             echo_id: GS_USB_ECHO_ID,
-            can_id: if frame.is_extended { frame.raw_id() | CAN_EFF_FLAG } else { frame.raw_id() },
-            can_dlc: frame.len,
+            can_id: if frame.is_extended() { frame.raw_id() | CAN_EFF_FLAG } else { frame.raw_id() },
+            can_dlc: frame.dlc(),
             channel: 0,
             flags: 0,
             reserved: 0,
-            data: frame.data,
-            timestamp_us: 0,
+            data: *frame.data_padded(),
+            timestamp_us: frame.timestamp_us(),
         };
 
         // 发送到 USB Endpoint OUT
@@ -1987,4 +1989,3 @@ getcap target/release/your_app
 ---
 
 **最终评价**：本方案已达到**生产级详细设计规格说明书（Production-Ready Detailed Design Spec）**水准，逻辑严密，工程细节完备，技术风险已充分识别和缓解。**文档状态：Approved（通过）**，建议立即冻结需求，进入开发阶段。
-

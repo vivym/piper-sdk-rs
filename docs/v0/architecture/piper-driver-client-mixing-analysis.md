@@ -1252,7 +1252,7 @@ impl Piper<Active<ReplayMode>> {
         let diag = self.diagnostics();
 
         // 获取基准时间戳
-        let base_timestamp = recording.frames[0].timestamp_us;
+        let base_timestamp = recording.frames[0].timestamp_us();
         let speed = self._state.speed;
 
         println!("📝 开始回放...");
@@ -1279,17 +1279,7 @@ impl Piper<Active<ReplayMode>> {
 
             // 发送 CAN 帧
             // ✅ 这里安全，因为在 ReplayMode 下 tx_loop 已暂停
-            let piper_frame = piper_driver::PiperFrame {
-                id: frame.can_id,
-                data: {
-                    let mut data = [0u8; 8];
-                    data.copy_from_slice(&frame.data);
-                    data
-                },
-                len: frame.data.len() as u8,
-                is_extended: frame.can_id > 0x7FF,
-                timestamp_us: frame.timestamp_us(),
-            };
+            let piper_frame = frame.frame;
 
             diag.send_frame(&piper_frame)?;
 

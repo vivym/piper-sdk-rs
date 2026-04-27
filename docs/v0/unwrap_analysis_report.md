@@ -433,10 +433,11 @@ if dt == 0 {
 **问题**: `Instant` 是进程内不透明类型，无法通过网络传输
 
 ```rust
-pub struct PiperFrame {
-    pub id: u32,
-    pub data: [u8; 8],
-    pub timestamp_us: u64,  // 协议层时间戳
+pub struct PiperFrame; // 字段私有；timestamp_us 通过访问器暴露
+
+impl PiperFrame {
+    pub fn timestamp_us(&self) -> u64;
+    pub fn with_timestamp_us(self, timestamp_us: u64) -> Self;
 }
 ```
 

@@ -154,7 +154,15 @@ pub fn receive_batch_frames(&mut self) -> Result<Vec<PiperFrame>, CanError> {
     // ... process frames ...
     for gs_frame in gs_frames {
         // ❌ Missing overflow check!
-        out.push(PiperFrame { ... });
+        let raw_id = gs_frame.can_id & CAN_EFF_MASK;
+        let payload = &gs_frame.data[..gs_frame.can_dlc.min(8) as usize];
+        let frame = if (gs_frame.can_id & CAN_EFF_FLAG) != 0 {
+            PiperFrame::new_extended(raw_id, payload)
+        } else {
+            PiperFrame::new_standard(raw_id, payload)
+        }?;
+
+        out.push(frame);
     }
 }
 ```
@@ -213,13 +221,16 @@ pub fn receive_batch_frames(&mut self) -> Result<Vec<PiperFrame>, CanError> {
             // The overflow flag indicates PAST data loss, not a problem with current frames
         }
 
-        out.push(PiperFrame {
-            id: gs_frame.can_id & CAN_EFF_MASK,
-            data: gs_frame.data,
-            len: gs_frame.can_dlc.min(8),
-            is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-            timestamp_us: gs_frame.timestamp_us() as u64,
-        });
+        let raw_id = gs_frame.can_id & CAN_EFF_MASK;
+        let payload = &gs_frame.data[..gs_frame.can_dlc.min(8) as usize];
+        let frame = if (gs_frame.can_id & CAN_EFF_FLAG) != 0 {
+            PiperFrame::new_extended(raw_id, payload)
+        } else {
+            PiperFrame::new_standard(raw_id, payload)
+        }?
+        .with_timestamp_us(gs_frame.timestamp_us() as u64);
+
+        out.push(frame);
     }
 
     // Optionally: Return a special error if overflow was detected

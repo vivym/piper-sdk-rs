@@ -435,23 +435,17 @@ impl CanAdapter for SocketCanAdapter {
             }
 
             // 2. 转换 CanFrame -> PiperFrame（使用提取的时间戳）
-            let piper_frame = PiperFrame {
-                id: can_frame.raw_id(),
-                data: {
-                    let mut data = [0u8; 8];
-                    let frame_data = can_frame.data();
-                    let len = frame_data.len().min(8);
-                    data[..len].copy_from_slice(&frame_data[..len]);
-                    data
-                },
-                len: can_frame.dlc() as u8,
-                is_extended: can_frame.is_extended(),
-                timestamp_us,  // ✅ 使用提取的时间戳
-            };
+            let piper_frame = if can_frame.is_extended() {
+                PiperFrame::new_extended(can_frame.raw_id(), can_frame.data())
+            } else {
+                PiperFrame::new_standard(can_frame.raw_id(), can_frame.data())
+            }
+            .map_err(|e| CanError::Device(e.to_string()))?
+            .with_timestamp_us(timestamp_us);
 
             trace!(
                 "Received CAN frame: ID=0x{:X}, len={}, timestamp_us={}",
-                piper_frame.raw_id(), piper_frame.len, piper_frame.timestamp_us()
+                piper_frame.raw_id(), piper_frame.dlc(), piper_frame.timestamp_us()
             );
 
             return Ok(piper_frame);
@@ -694,4 +688,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [ ] 缓冲区大小：使用 `size_of` 计算
 - [ ] 错误处理：所有错误路径都有适当的降级策略
 - [ ] 测试覆盖：vcan0 测试 + 回环测试 + 集成测试
-

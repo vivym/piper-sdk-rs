@@ -93,14 +93,14 @@ msg.arm_status_msgs.err_code = self.ConvertToNegative_16bit(self.ConvertBytesToI
 
 **Rust 实现**：
 ```rust
-control_mode: ControlMode::from(frame.data[0]),
-robot_status: RobotStatus::from(frame.data[1]),
-move_mode: MoveMode::from(frame.data[2]),
-teach_status: TeachStatus::from(frame.data[3]),
-motion_status: MotionStatus::from(frame.data[4]),
-trajectory_point_index: frame.data[5],
-fault_code_angle_limit: FaultCodeAngleLimit::from(u8::new(frame.data[6])),
-fault_code_comm_error: FaultCodeCommError::from(u8::new(frame.data[7])),
+control_mode: ControlMode::from(frame.data()[0]),
+robot_status: RobotStatus::from(frame.data()[1]),
+move_mode: MoveMode::from(frame.data()[2]),
+teach_status: TeachStatus::from(frame.data()[3]),
+motion_status: MotionStatus::from(frame.data()[4]),
+trajectory_point_index: frame.data()[5],
+fault_code_angle_limit: FaultCodeAngleLimit::from(u8::new(frame.data()[6])),
+fault_code_comm_error: FaultCodeCommError::from(u8::new(frame.data()[7])),
 ```
 
 **对比分析**：
@@ -125,7 +125,7 @@ msg.arm_end_pose.RZ_axis = self.ConvertToNegative_32bit(self.ConvertBytesToInt(c
 
 **Rust 实现**：
 ```rust
-let x_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+let x_bytes = [frame.data()[0], frame.data()[1], frame.data()[2], frame.data()[3]];
 let x_mm = bytes_to_i32_be(x_bytes);
 ```
 
@@ -152,11 +152,11 @@ msg.gripper_feedback.status_code = self.ConvertToNegative_8bit(self.ConvertBytes
 
 **Rust 实现**：
 ```rust
-let travel_bytes = [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
+let travel_bytes = [frame.data()[0], frame.data()[1], frame.data()[2], frame.data()[3]];
 let travel_mm = bytes_to_i32_be(travel_bytes);
-let torque_bytes = [frame.data[4], frame.data[5]];
+let torque_bytes = [frame.data()[4], frame.data()[5]];
 let torque_nm = bytes_to_i16_be(torque_bytes);
-let status = GripperStatus::from(u8::new(frame.data[6]));
+let status = GripperStatus::from(u8::new(frame.data()[6]));
 ```
 
 **对比分析**：
@@ -178,11 +178,11 @@ msg.arm_high_spd_feedback_1.pos = self.ConvertToNegative_32bit(self.ConvertBytes
 
 **Rust 实现**：
 ```rust
-let speed_bytes = [frame.data[0], frame.data[1]];
+let speed_bytes = [frame.data()[0], frame.data()[1]];
 let speed_rad_s = bytes_to_i16_be(speed_bytes);
-let current_bytes = [frame.data[2], frame.data[3]];
+let current_bytes = [frame.data()[2], frame.data()[3]];
 let current_a = u16::from_be_bytes(current_bytes);
-let position_bytes = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+let position_bytes = [frame.data()[4], frame.data()[5], frame.data()[6], frame.data()[7]];
 let position_rad = bytes_to_i32_be(position_bytes);
 ```
 
@@ -207,13 +207,13 @@ msg.arm_low_spd_feedback_1.bus_current = self.ConvertToNegative_16bit(self.Conve
 
 **Rust 实现**：
 ```rust
-let voltage_bytes = [frame.data[0], frame.data[1]];
+let voltage_bytes = [frame.data()[0], frame.data()[1]];
 let voltage = u16::from_be_bytes(voltage_bytes);
-let driver_temp_bytes = [frame.data[2], frame.data[3]];
+let driver_temp_bytes = [frame.data()[2], frame.data()[3]];
 let driver_temp = bytes_to_i16_be(driver_temp_bytes);
-let motor_temp = frame.data[4] as i8;
-let status = DriverStatus::from(u8::new(frame.data[5]));
-let bus_current_bytes = [frame.data[6], frame.data[7]];
+let motor_temp = frame.data()[4] as i8;
+let status = DriverStatus::from(u8::new(frame.data()[5]));
+let bus_current_bytes = [frame.data()[6], frame.data()[7]];
 let bus_current = u16::from_be_bytes(bus_current_bytes);
 ```
 
@@ -239,12 +239,12 @@ msg.arm_feedback_current_motor_angle_limit_max_spd.max_joint_spd = self.ConvertT
 
 **Rust 实现**：
 ```rust
-let joint_index = frame.data[0];
-let max_angle_bytes = [frame.data[1], frame.data[2]];
+let joint_index = frame.data()[0];
+let max_angle_bytes = [frame.data()[1], frame.data()[2]];
 let max_angle_deg = bytes_to_i16_be(max_angle_bytes);
-let min_angle_bytes = [frame.data[3], frame.data[4]];
+let min_angle_bytes = [frame.data()[3], frame.data()[4]];
 let min_angle_deg = bytes_to_i16_be(min_angle_bytes);
-let max_velocity_bytes = [frame.data[5], frame.data[6]];
+let max_velocity_bytes = [frame.data()[5], frame.data()[6]];
 let max_velocity_rad_s = u16::from_be_bytes(max_velocity_bytes);
 ```
 
@@ -267,8 +267,8 @@ msg.arm_feedback_resp_set_instruction.is_set_zero_successfully = self.ConvertToN
 
 **Rust 实现**：
 ```rust
-let response_index = frame.data[0];
-let zero_point_success = frame.data[1] == 0x01;
+let response_index = frame.data()[0];
+let zero_point_success = frame.data()[1] == 0x01;
 // ... 还处理了轨迹传输应答的其他字段
 ```
 
@@ -289,10 +289,10 @@ msg.arm_feedback_current_end_vel_acc_param.end_max_angular_acc = self.ConvertToN
 
 **Rust 实现**：
 ```rust
-let max_linear_velocity = u16::from_be_bytes([frame.data[0], frame.data[1]]);
-let max_angular_velocity = u16::from_be_bytes([frame.data[2], frame.data[3]]);
-let max_linear_accel = u16::from_be_bytes([frame.data[4], frame.data[5]]);
-let max_angular_accel = u16::from_be_bytes([frame.data[6], frame.data[7]]);
+let max_linear_velocity = u16::from_be_bytes([frame.data()[0], frame.data()[1]]);
+let max_angular_velocity = u16::from_be_bytes([frame.data()[2], frame.data()[3]]);
+let max_linear_accel = u16::from_be_bytes([frame.data()[4], frame.data()[5]]);
+let max_angular_accel = u16::from_be_bytes([frame.data()[6], frame.data()[7]]);
 ```
 
 **对比分析**：
@@ -311,7 +311,7 @@ msg.arm_crash_protection_rating_feedback.joint_1_protection_level = self.Convert
 **Rust 实现**：
 ```rust
 let mut levels = [0u8; 6];
-levels.copy_from_slice(&frame.data[0..6]);
+levels.copy_from_slice(&frame.data()[0..6]);
 ```
 
 **对比分析**：
@@ -329,8 +329,8 @@ msg.arm_feedback_current_motor_max_acc_limit.max_joint_acc = self.ConvertToNegat
 
 **Rust 实现**：
 ```rust
-let joint_index = frame.data[0];
-let max_accel_bytes = [frame.data[1], frame.data[2]];
+let joint_index = frame.data()[0];
+let max_accel_bytes = [frame.data()[1], frame.data()[2]];
 let max_accel_rad_s2 = u16::from_be_bytes(max_accel_bytes);
 ```
 
@@ -351,9 +351,9 @@ msg.arm_gripper_teaching_param_feedback.teaching_friction = self.ConvertToNegati
 **Rust 实现**：
 ```rust
 Ok(Self {
-    teach_travel_coeff: frame.data[0],
-    max_travel_limit: frame.data[1],
-    friction_coeff: frame.data[2],
+    teach_travel_coeff: frame.data()[0],
+    max_travel_limit: frame.data()[1],
+    friction_coeff: frame.data()[2],
 })
 ```
 
@@ -654,4 +654,3 @@ Rust 实现的协议解析**整体正确性很高**，在符号处理和字节�
 - 官方参考实现：协议 V2 对照实现
 - Rust SDK: `src/protocol/` 模块
 - 协议文档: `docs/v0/protocol.md`
-

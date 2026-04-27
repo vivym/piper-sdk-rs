@@ -126,10 +126,10 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
             return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
         }
 
-        if frame.len < 8 {
+        if frame.dlc() < 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len,
+                actual: frame.dlc(),
             });
         }
         // ...
@@ -138,8 +138,8 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
 ```
 
 **Issue**: The error handling is good, but different protocol types have inconsistent validation:
-- Some check `frame.len < 8`
-- Some check `frame.len != 8`
+- Some check `frame.dlc() < 8`
+- Some check `frame.dlc() != 8`
 - Some don't check length at all
 
 **Recommendation**: Standardize validation logic through a helper function:
@@ -149,10 +149,10 @@ fn validate_frame(frame: &PiperFrame, expected_id: u32, expected_len: u8) -> Res
     if frame.raw_id() != expected_id {
         return Err(ProtocolError::InvalidCanId { id: frame.raw_id() });
     }
-    if frame.len < expected_len {
+    if frame.dlc() < expected_len {
         return Err(ProtocolError::InvalidLength {
             expected: expected_len,
-            actual: frame.len
+            actual: frame.dlc()
         });
     }
     Ok(())
@@ -208,7 +208,7 @@ pub mod units {
 ### 5. Missing Bounds Checking in Protocol Parsing (Low Severity)
 **Location**: `src/protocol/feedback.rs` (inferred)
 
-**Issue**: When parsing protocol frames, array indexing like `frame.data[0]` is used. While `frame.len` is validated, the bilge-generated `try_from_bytes` might not do bounds checking.
+**Issue**: When parsing protocol frames, array indexing like `frame.data()[0]` is used. While `frame.dlc()` is validated, the bilge-generated `try_from_bytes` might not do bounds checking.
 
 **Recommendation**: Verify that bilge generates bounds-safe code, or add explicit checks:
 

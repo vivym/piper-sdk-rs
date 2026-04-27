@@ -893,8 +893,8 @@ fn test_validate_end_pose_meters() {
 ### Problem
 
 Protocol parsing uses inconsistent length validation:
-- Some check `frame.len < 8`
-- Some check `frame.len != 8`
+- Some check `frame.dlc() < 8`
+- Some check `frame.dlc() != 8`
 - Some don't check length at all
 
 ### Solution
@@ -916,10 +916,10 @@ pub fn validate_frame(
     }
 
     // Strict: must be exactly expected length
-    if frame.len != expected_len {
+    if frame.dlc() != expected_len {
         return Err(ProtocolError::InvalidLength {
             expected: expected_len,
-            actual: frame.len,
+            actual: frame.dlc(),
         });
     }
 
@@ -937,7 +937,7 @@ impl TryFrom<PiperFrame> for RobotStatusFeedback {
         validate_frame(&frame, ID_ROBOT_STATUS, 8)?;
 
         // Parse bilge structures...
-        let control_mode = ControlMode::try_from(frame.data[0])?;
+        let control_mode = ControlMode::try_from(frame.data()[0])?;
         // ...
 
         Ok(Self { /* ... */ })

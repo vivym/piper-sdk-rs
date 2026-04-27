@@ -45,12 +45,18 @@ pub trait CanAdapter {
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PiperFrame {
-    pub id: u32,              // CAN ID（标准帧或扩展帧）
-    pub data: [u8; 8],        // 固定 8 字节数据
-    pub len: u8,              // 有效数据长度 (0-8)
-    pub is_extended: bool,    // 是否为扩展帧（29-bit ID）
-    pub timestamp_us: u32,    // 硬件时间戳（微秒）
+pub struct PiperFrame; // 字段私有；通过类型化构造函数和访问器使用
+
+impl PiperFrame {
+    pub fn new_standard(id: u32, data: impl AsRef<[u8]>) -> Result<Self, FrameError>;
+    pub fn new_extended(id: u32, data: impl AsRef<[u8]>) -> Result<Self, FrameError>;
+    pub fn raw_id(&self) -> u32;
+    pub fn is_extended(&self) -> bool;
+    pub fn dlc(&self) -> u8;
+    pub fn data(&self) -> &[u8];
+    pub fn data_padded(&self) -> &[u8; 8];
+    pub fn timestamp_us(&self) -> u64;
+    pub fn with_timestamp_us(self, timestamp_us: u64) -> Self;
 }
 ```
 
@@ -250,13 +256,13 @@ impl CanAdapter for SocketCanAdapter {
         }
 
         // 1. 转换 PiperFrame -> CanFrame
-        let can_frame = if frame.is_extended {
+        let can_frame = if frame.is_extended() {
             // 扩展帧
-            CanFrame::new(ExtendedId::new(frame.raw_id())?, &frame.data[..frame.len as usize])
+            CanFrame::new(ExtendedId::new(frame.raw_id())?, frame.data())
                 .ok_or_else(|| CanError::Device("Failed to create extended frame".to_string()))?
         } else {
             // 标准帧
-            CanFrame::new(StandardId::new(frame.raw_id() as u16)?, &frame.data[..frame.len as usize])
+            CanFrame::new(StandardId::new(frame.raw_id() as u16)?, frame.data())
                 .ok_or_else(|| CanError::Device("Failed to create standard frame".to_string()))?
         };
 
@@ -264,7 +270,7 @@ impl CanAdapter for SocketCanAdapter {
         self.socket.transmit(&can_frame)
             .map_err(|e| CanError::Io(e))?;
 
-        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.len);
+        trace!("Sent CAN frame: ID=0x{:X}, len={}", frame.raw_id(), frame.dlc());
         Ok(())
     }
 
@@ -300,21 +306,14 @@ impl CanAdapter for SocketCanAdapter {
             }
 
             // 2. 转换 CanFrame -> PiperFrame
-            let piper_frame = PiperFrame {
-                id: can_frame.raw_id(),
-                data: {
-                    let mut data = [0u8; 8];
-                    let frame_data = can_frame.data();
-                    let len = frame_data.len().min(8);
-                    data[..len].copy_from_slice(&frame_data[..len]);
-                    data
-                },
-                len: can_frame.dlc() as u8,
-                is_extended: can_frame.is_extended(),
-                timestamp_us: 0,  // TODO: 提取时间戳
-            };
+            let piper_frame = if can_frame.is_extended() {
+                PiperFrame::new_extended(can_frame.raw_id(), can_frame.data())
+            } else {
+                PiperFrame::new_standard(can_frame.raw_id(), can_frame.data())
+            }
+            .map_err(|e| CanError::Device(e.to_string()))?;
 
-            trace!("Received CAN frame: ID=0x{:X}, len={}", piper_frame.raw_id(), piper_frame.len);
+            trace!("Received CAN frame: ID=0x{:X}, len={}", piper_frame.raw_id(), piper_frame.dlc());
             return Ok(piper_frame);
         }
     }
@@ -634,4 +633,3 @@ sudo ip link set up vcan0
 **文档版本**：v1.0
 **创建日期**：2024-12
 **作者**：基于现有代码分析和 socketcan-rs 研究
-

@@ -58,9 +58,9 @@ ID_JOINT_FEEDBACK_12 => {
 }
 ```
 
-**Issue**: The `try_from()` implementations in protocol layer validate `frame.len`, but:
-1. `frame.len < 8` is checked, but what about `frame.len > 8`?
-2. If `frame.len == 20` (malformed frame), extra bytes are silently ignored
+**Issue**: The `try_from()` implementations in protocol layer validate `frame.dlc()`, but:
+1. `frame.dlc() < 8` is checked, but what about `frame.dlc() > 8`?
+2. If `frame.dlc() == 20` (malformed frame), extra bytes are silently ignored
 3. No validation that frame data is actually initialized (all-zero might be invalid)
 
 **Impact**: Silently accepts malformed CAN frames that pass validation.
@@ -76,15 +76,15 @@ impl TryFrom<PiperFrame> for JointFeedback12 {
         }
 
         // Strict: must be exactly 8 bytes
-        if frame.len != 8 {
+        if frame.dlc() != 8 {
             return Err(ProtocolError::InvalidLength {
                 expected: 8,
-                actual: frame.len,
+                actual: frame.dlc(),
             });
         }
 
         // Check for all-zero data (possible bus error)
-        if frame.data.iter().all(|&b| b == 0) {
+        if frame.data().iter().all(|&b| b == 0) {
             return Err(ProtocolError::AllZeroData);
         }
 

@@ -45,13 +45,13 @@
 **问题**：
 ```rust
 // 3.4 转换格式并放入队列
-let frame = PiperFrame {
-    id: gs_frame.can_id & CAN_EFF_MASK,
-    data: gs_frame.data,
-    len: gs_frame.can_dlc.min(8),
-    is_extended: (gs_frame.can_id & CAN_EFF_FLAG) != 0,
-    // ❌ 缺少 timestamp_us 字段！
-};
+let raw_id = gs_frame.can_id & CAN_EFF_MASK;
+let payload = &gs_frame.data[..gs_frame.can_dlc.min(8) as usize];
+let frame = if (gs_frame.can_id & CAN_EFF_FLAG) != 0 {
+    PiperFrame::new_extended(raw_id, payload)
+} else {
+    PiperFrame::new_standard(raw_id, payload)
+}?; // ❌ 缺少 .with_timestamp_us(...)
 ```
 
 **影响**：
@@ -64,13 +64,11 @@ let frame = PiperFrame {
 **方案 A**：在 `PiperFrame` 中添加 `timestamp_us` 字段（推荐）
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PiperFrame {
-    pub id: u32,
-    pub data: [u8; 8],
-    pub len: u8,
-    pub is_extended: bool,
-    /// Hardware timestamp in microseconds (0 if not available)
-    pub timestamp_us: u32,  // 新增
+pub struct PiperFrame; // 字段私有；timestamp 通过访问器维护
+
+impl PiperFrame {
+    pub fn timestamp_us(&self) -> u64;
+    pub fn with_timestamp_us(self, timestamp_us: u64) -> Self;
 }
 ```
 
@@ -343,4 +341,3 @@ if hw_timestamp {
 - ✅ 性能优化到位（单帧优化路径）
 
 代码已准备好用于生产环境，特别是在力控机械臂等实时控制场景中。
-
