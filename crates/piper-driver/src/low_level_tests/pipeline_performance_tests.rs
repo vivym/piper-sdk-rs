@@ -207,7 +207,8 @@ fn start_tx_loop(
 
 #[test]
 fn test_rx_loop_processes_burst_without_transport_fault() {
-    let frames = (0..12).map(|i| PiperFrame::new_standard((0x251 + (i % 6)) as u16, &[i as u8; 8]));
+    let frames =
+        (0..12).map(|i| PiperFrame::new_standard((0x251 + (i % 6)) as u32, &[i as u8; 8]).unwrap());
     let ctx = Arc::new(PiperContext::new());
     let metrics = Arc::new(PiperMetrics::new());
     let is_running = Arc::new(AtomicBool::new(true));
@@ -262,7 +263,7 @@ fn test_tx_loop_drains_reliable_queue_with_slow_sender() {
     );
 
     let expected: Vec<PiperFrame> = (0..10)
-        .map(|i| PiperFrame::new_standard((0x180 + i) as u16, &[i as u8; 8]))
+        .map(|i| PiperFrame::new_standard((0x180 + i) as u32, &[i as u8; 8]).unwrap())
         .collect();
     for frame in &expected {
         reliable_tx.send(ReliableCommand::single(*frame)).unwrap();
@@ -312,7 +313,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
     );
 
     let reliable_frames: Vec<PiperFrame> = (0..3)
-        .map(|i| PiperFrame::new_standard((0x300 + i) as u16, &[0xAA, i as u8]))
+        .map(|i| PiperFrame::new_standard((0x300 + i) as u32, &[0xAA, i as u8]).unwrap())
         .collect();
     for frame in &reliable_frames {
         reliable_tx.send(ReliableCommand::single(*frame)).unwrap();
@@ -320,7 +321,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
 
     let realtime_writer = thread::spawn(move || {
         for i in 0..30 {
-            let frame = PiperFrame::new_standard((0x400 + i) as u16, &[i as u8; 8]);
+            let frame = PiperFrame::new_standard((0x400 + i) as u32, &[i as u8; 8]).unwrap();
             *realtime_slot_writer.lock().unwrap() = Some(RealtimeCommand::single(frame));
             thread::sleep(Duration::from_micros(50));
         }
@@ -330,7 +331,7 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
         let sent = sent_frames.lock().unwrap();
         reliable_frames
             .iter()
-            .all(|frame| sent.iter().any(|sent_frame| sent_frame.id == frame.id))
+            .all(|frame| sent.iter().any(|sent_frame| sent_frame.raw_id() == frame.raw_id()))
     });
 
     realtime_writer.join().unwrap();
@@ -340,9 +341,9 @@ fn test_tx_loop_realtime_bursts_do_not_starve_reliable_queue() {
     let sent = sent_frames.lock().unwrap();
     for frame in &reliable_frames {
         assert!(
-            sent.iter().any(|sent_frame| sent_frame.id == frame.id),
+            sent.iter().any(|sent_frame| sent_frame.raw_id() == frame.raw_id()),
             "reliable frame 0x{:X} should not starve",
-            frame.id
+            frame.raw_id()
         );
     }
     assert_eq!(fault.load(Ordering::Relaxed), 0);
@@ -357,7 +358,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
     let fault = Arc::new(AtomicU8::new(0));
 
     let rx_frames: Vec<PiperFrame> = (0..6)
-        .map(|i| PiperFrame::new_standard((0x251 + (i % 6)) as u16, &[i as u8; 8]))
+        .map(|i| PiperFrame::new_standard((0x251 + (i % 6)) as u32, &[i as u8; 8]).unwrap())
         .collect();
     let rx_handle = start_rx_loop(
         QueueRxAdapter::new(rx_frames.clone()),
@@ -385,7 +386,7 @@ fn test_metrics_snapshot_matches_processed_frames() {
     );
 
     let tx_frames: Vec<PiperFrame> = (0..4)
-        .map(|i| PiperFrame::new_standard((0x500 + i) as u16, &[i as u8; 8]))
+        .map(|i| PiperFrame::new_standard((0x500 + i) as u32, &[i as u8; 8]).unwrap())
         .collect();
     for frame in &tx_frames {
         reliable_tx.send(ReliableCommand::single(*frame)).unwrap();
@@ -436,17 +437,17 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
         reliable_rx,
     );
 
-    let first = PiperFrame::new_standard(0x610, &[1; 8]);
+    let first = PiperFrame::new_standard(0x610, &[1; 8]).unwrap();
     *realtime_slot_writer.lock().unwrap() = Some(RealtimeCommand::single(first));
 
     let blocked_frame = first_frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(blocked_frame.id, first.id);
+    assert_eq!(blocked_frame.raw_id(), first.raw_id());
 
-    let latest = PiperFrame::new_standard(0x614, &[4; 8]);
+    let latest = PiperFrame::new_standard(0x614, &[4; 8]).unwrap();
     for frame in [
-        PiperFrame::new_standard(0x611, &[2; 8]),
-        PiperFrame::new_standard(0x612, &[3; 8]),
-        PiperFrame::new_standard(0x613, &[4; 8]),
+        PiperFrame::new_standard(0x611, &[2; 8]).unwrap(),
+        PiperFrame::new_standard(0x612, &[3; 8]).unwrap(),
+        PiperFrame::new_standard(0x613, &[4; 8]).unwrap(),
         latest,
     ] {
         *realtime_slot_writer.lock().unwrap() = Some(RealtimeCommand::single(frame));
@@ -462,8 +463,8 @@ fn test_realtime_overwrite_keeps_latest_pending_command() {
     handle.join().unwrap();
 
     let sent = sent_frames.lock().unwrap().clone();
-    assert_eq!(sent[0].id, first.id);
-    assert_eq!(sent[1].id, latest.id);
+    assert_eq!(sent[0].raw_id(), first.raw_id());
+    assert_eq!(sent[1].raw_id(), latest.raw_id());
     assert_eq!(metrics.snapshot().tx_frames_sent_total, 2);
     assert_eq!(fault.load(Ordering::Relaxed), 0);
 }

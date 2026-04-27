@@ -249,10 +249,9 @@ impl ConfigurableRxAdapter {
         let mut frames = VecDeque::new();
         let total_frames = frames_per_second * test_duration.as_secs() as u32;
         for i in 0..total_frames {
-            frames.push_back(PiperFrame::new_standard(
-                (0x251 + (i % 6)) as u16,
-                &[i as u8; 8],
-            ));
+            frames.push_back(
+                PiperFrame::new_standard((0x251 + (i % 6)) as u32, &[i as u8; 8]).unwrap(),
+            );
         }
 
         Self {
@@ -685,9 +684,10 @@ fn test_tx_latency_benchmark() {
     while start.elapsed() < test_duration {
         let api_call_time = Instant::now();
         let frame = PiperFrame::new_standard(
-            0x200 + (command_count % 10) as u16,
+            0x200 + (command_count % 10) as u32,
             &[command_count as u8; 8],
-        );
+        )
+        .unwrap();
 
         let queued = {
             let mut slot = realtime_slot.lock().unwrap();
@@ -805,9 +805,10 @@ fn test_send_duration_benchmark() {
 
     while start.elapsed() < test_duration {
         let frame = PiperFrame::new_standard(
-            0x200 + (command_count % 10) as u16,
+            0x200 + (command_count % 10) as u32,
             &[command_count as u8; 8],
-        );
+        )
+        .unwrap();
 
         let queued = {
             let mut slot = realtime_slot.lock().unwrap();

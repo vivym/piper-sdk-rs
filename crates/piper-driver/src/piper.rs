@@ -5071,8 +5071,7 @@ mod tests {
 
     impl BootstrappedMockRxAdapter {
         fn new() -> Self {
-            let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-            frame.timestamp_us = 1;
+            let frame = PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1);
             Self {
                 bootstrap: Some(frame),
             }
@@ -5153,8 +5152,7 @@ mod tests {
         fn receive(&mut self) -> Result<piper_can::ReceivedFrame, CanError> {
             if !self.emitted {
                 self.emitted = true;
-                let mut frame = PiperFrame::new_standard(0x7FF, &[0]);
-                frame.timestamp_us = 123;
+                let frame = PiperFrame::new_standard(0x7FF, &[0]).unwrap().with_timestamp_us(123);
                 return Ok(received(frame));
             }
             Err(CanError::Timeout)
@@ -5182,8 +5180,7 @@ mod tests {
                 if !self.delay.is_zero() {
                     std::thread::sleep(self.delay);
                 }
-                let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-                frame.timestamp_us = 1;
+                let frame = PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1);
                 return Ok(received(frame));
             }
             Err(CanError::Timeout)
@@ -5713,8 +5710,8 @@ mod tests {
         fn new(frames: Vec<PiperFrame>, first_delay: Duration) -> Self {
             Self {
                 bootstrap: Some({
-                    let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-                    frame.timestamp_us = 1;
+                    let frame =
+                        PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1);
                     frame
                 }),
                 frames: frames.into(),
@@ -5746,8 +5743,8 @@ mod tests {
         fn new(frames_rx: mpsc::Receiver<PiperFrame>) -> Self {
             Self {
                 bootstrap: Some({
-                    let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-                    frame.timestamp_us = 1;
+                    let frame =
+                        PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1);
                     frame
                 }),
                 frames_rx,
@@ -5771,11 +5768,12 @@ mod tests {
     fn collision_protection_feedback_frame(levels: [u8; 6], timestamp_us: u64) -> PiperFrame {
         let mut data = [0u8; 8];
         data[..6].copy_from_slice(&levels);
-        let mut frame = PiperFrame::new_standard(
-            piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
+        let frame = PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw()),
             &data,
-        );
-        frame.timestamp_us = timestamp_us;
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us);
         frame
     }
 
@@ -5791,11 +5789,12 @@ mod tests {
         data[2..4].copy_from_slice(&angular_velocity_millirad_s.to_be_bytes());
         data[4..6].copy_from_slice(&linear_accel_mm_s2.to_be_bytes());
         data[6..8].copy_from_slice(&angular_accel_millirad_s2.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(
-            piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK as u16,
+        let frame = PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK.raw()),
             &data,
-        );
-        frame.timestamp_us = timestamp_us;
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us);
         frame
     }
 
@@ -5811,10 +5810,12 @@ mod tests {
         data[1..3].copy_from_slice(&max_angle_deci_deg.to_be_bytes());
         data[3..5].copy_from_slice(&min_angle_deci_deg.to_be_bytes());
         data[5..7].copy_from_slice(&max_velocity_millirad_s.to_be_bytes());
-        let mut frame =
-            PiperFrame::new_standard(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK as u16, &data);
-        frame.timestamp_us = timestamp_us;
-        frame
+        PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK.raw()),
+            &data,
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
     }
 
     fn joint_accel_feedback_frame(
@@ -5825,11 +5826,12 @@ mod tests {
         let mut data = [0u8; 8];
         data[0] = joint_index;
         data[1..3].copy_from_slice(&max_accel_millirad_s2.to_be_bytes());
-        let mut frame = PiperFrame::new_standard(
-            piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK as u16,
+        let frame = PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK.raw()),
             &data,
-        );
-        frame.timestamp_us = timestamp_us;
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us);
         frame
     }
 
@@ -5843,7 +5845,7 @@ mod tests {
         assert_eq!(joint_pos.hardware_timestamp_us, 0);
 
         // 验证通道正常工作
-        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
         assert!(piper.send_frame(frame).is_ok());
     }
 
@@ -5868,7 +5870,7 @@ mod tests {
     fn test_piper_send_frame_channel_full() {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
-        let frame = PiperFrame::new_standard(0x123, &[0x01]);
+        let frame = PiperFrame::new_standard(0x123, &[0x01]).unwrap();
 
         // 填满命令通道（容量 10）
         // 注意：IO 线程会持续消费帧，所以需要快速填充
@@ -5909,16 +5911,16 @@ mod tests {
             None,
         )
         .unwrap();
-        let replay_frame = PiperFrame::new_standard(0x155, &[0xAA]);
+        let replay_frame = PiperFrame::new_standard(0x155, &[0xAA]).unwrap();
 
         piper.set_mode(crate::mode::DriverMode::Replay);
 
         assert!(matches!(
-            piper.send_frame(PiperFrame::new_standard(0x123, &[0x01])),
+            piper.send_frame(PiperFrame::new_standard(0x123, &[0x01]).unwrap()),
             Err(DriverError::ReplayModeActive)
         ));
         assert!(matches!(
-            piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01])),
+            piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01]).unwrap()),
             Err(DriverError::ReplayModeActive)
         ));
         assert!(matches!(
@@ -5947,7 +5949,7 @@ mod tests {
 
         let error = piper
             .send_soft_realtime_package_confirmed(
-                [PiperFrame::new_standard(0x155, &[0x01])],
+                [PiperFrame::new_standard(0x155, &[0x01]).unwrap()],
                 Duration::from_millis(50),
             )
             .expect_err("soft realtime batch should be blocked while Replay mode is active");
@@ -5966,7 +5968,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let replay_frame = PiperFrame::new_standard(0x155, &[0xA5]);
+        let replay_frame = PiperFrame::new_standard(0x155, &[0xA5]).unwrap();
         let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
 
         reached_rx
@@ -6004,7 +6006,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let replay_frame = PiperFrame::new_standard(0x159, &[0xE1]);
+        let replay_frame = PiperFrame::new_standard(0x159, &[0xE1]).unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
 
         let piper_switch = Arc::clone(&piper);
@@ -6046,7 +6048,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let realtime_frame = PiperFrame::new_standard(0x156, &[0xB6]);
+        let realtime_frame = PiperFrame::new_standard(0x156, &[0xB6]).unwrap();
         let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
 
         piper
@@ -6085,7 +6087,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let reliable_frame = PiperFrame::new_standard(0x157, &[0xC7]);
+        let reliable_frame = PiperFrame::new_standard(0x157, &[0xC7]).unwrap();
         let (reached_rx, release_tx) = install_tx_loop_barrier(&piper);
 
         piper
@@ -6126,8 +6128,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let reliable_frame = PiperFrame::new_standard(0x15A, &[0xE2]);
-        let realtime_frame = PiperFrame::new_standard(0x15B, &[0xE3]);
+        let reliable_frame = PiperFrame::new_standard(0x15A, &[0xE2]).unwrap();
+        let realtime_frame = PiperFrame::new_standard(0x15B, &[0xE3]).unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
 
         piper
@@ -6181,7 +6183,7 @@ mod tests {
             .unwrap(),
         );
         let session_key = 99;
-        let maintenance_frame = PiperFrame::new_standard(0x158, &[0xD8]);
+        let maintenance_frame = PiperFrame::new_standard(0x158, &[0xD8]).unwrap();
 
         mark_maintenance_standby_confirmed(&piper);
         let lease_epoch = match piper
@@ -6274,8 +6276,8 @@ mod tests {
             .unwrap(),
         );
 
-        let first = PiperFrame::new_standard(0x101, &[0x01]);
-        let second = [PiperFrame::new_standard(0x102, &[0x02])];
+        let first = PiperFrame::new_standard(0x101, &[0x01]).unwrap();
+        let second = [PiperFrame::new_standard(0x102, &[0x02]).unwrap()];
         piper.send_frame(first).expect("first reliable frame should queue");
         started_rx
             .recv_timeout(Duration::from_millis(200))
@@ -6328,8 +6330,8 @@ mod tests {
             .unwrap(),
         );
 
-        let first = [PiperFrame::new_standard(0x155, &[0x01])];
-        let second = [PiperFrame::new_standard(0x156, &[0x02])];
+        let first = [PiperFrame::new_standard(0x155, &[0x01]).unwrap()];
+        let second = [PiperFrame::new_standard(0x156, &[0x02]).unwrap()];
         piper.send_realtime_package(first).expect("first realtime frame should queue");
         started_rx
             .recv_timeout(Duration::from_millis(200))
@@ -6394,8 +6396,8 @@ mod tests {
             .unwrap(),
         );
         let frames = [
-            PiperFrame::new_standard(0x201, &[0x01]),
-            PiperFrame::new_standard(0x202, &[0x02]),
+            PiperFrame::new_standard(0x201, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x202, &[0x02]).unwrap(),
         ];
 
         let piper_send = Arc::clone(&piper);
@@ -6448,7 +6450,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let first = PiperFrame::new_standard(0x301, &[0x01]);
+        let first = PiperFrame::new_standard(0x301, &[0x01]).unwrap();
 
         piper.send_frame(first).expect("first reliable frame should queue");
         started_rx
@@ -6468,7 +6470,7 @@ mod tests {
         assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
         assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
         assert!(matches!(
-            piper.send_frame(PiperFrame::new_standard(0x302, &[0x02])),
+            piper.send_frame(PiperFrame::new_standard(0x302, &[0x02]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
 
@@ -6536,7 +6538,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let first = PiperFrame::new_standard(0x311, &[0x01]);
+        let first = PiperFrame::new_standard(0x311, &[0x01]).unwrap();
 
         piper.send_frame(first).expect("first reliable frame should queue");
         started_rx
@@ -6562,7 +6564,7 @@ mod tests {
         assert_eq!(piper.mode(), crate::mode::DriverMode::Normal);
         assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
         assert!(matches!(
-            piper.send_frame(PiperFrame::new_standard(0x312, &[0x02])),
+            piper.send_frame(PiperFrame::new_standard(0x312, &[0x02]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
 
@@ -6635,8 +6637,8 @@ mod tests {
             "serialized mode switches must not leave the replay barrier engaged"
         );
 
-        let reliable_frame = PiperFrame::new_standard(0x320, &[0x01]);
-        let realtime_frame = PiperFrame::new_standard(0x321, &[0x02]);
+        let reliable_frame = PiperFrame::new_standard(0x320, &[0x01]).unwrap();
+        let realtime_frame = PiperFrame::new_standard(0x321, &[0x02]).unwrap();
         piper
             .send_frame(reliable_frame)
             .expect("normal reliable send should work after returning to Normal");
@@ -6644,7 +6646,7 @@ mod tests {
             .send_realtime(realtime_frame)
             .expect("normal realtime send should work after returning to Normal");
         assert!(matches!(
-            piper.send_replay_frame(PiperFrame::new_standard(0x322, &[0x03])),
+            piper.send_replay_frame(PiperFrame::new_standard(0x322, &[0x03]).unwrap()),
             Err(DriverError::InvalidInput(_))
         ));
 
@@ -6708,8 +6710,8 @@ mod tests {
             "wrapper restore must not leave the replay barrier engaged"
         );
 
-        let reliable_frame = PiperFrame::new_standard(0x330, &[0x01]);
-        let realtime_frame = PiperFrame::new_standard(0x331, &[0x02]);
+        let reliable_frame = PiperFrame::new_standard(0x330, &[0x01]).unwrap();
+        let realtime_frame = PiperFrame::new_standard(0x331, &[0x02]).unwrap();
         piper
             .send_frame(reliable_frame)
             .expect("normal reliable send should work after wrapper restore");
@@ -6717,7 +6719,7 @@ mod tests {
             .send_realtime(realtime_frame)
             .expect("normal realtime send should work after wrapper restore");
         assert!(matches!(
-            piper.send_replay_frame(PiperFrame::new_standard(0x332, &[0x03])),
+            piper.send_replay_frame(PiperFrame::new_standard(0x332, &[0x03]).unwrap()),
             Err(DriverError::InvalidInput(_))
         ));
 
@@ -6746,7 +6748,7 @@ mod tests {
         );
 
         piper
-            .send_frame(PiperFrame::new_standard(0x340, &[0x01]))
+            .send_frame(PiperFrame::new_standard(0x340, &[0x01]).unwrap())
             .expect("first reliable frame should queue");
         started_rx
             .recv_timeout(Duration::from_millis(200))
@@ -7192,7 +7194,7 @@ mod tests {
 
     #[test]
     fn test_wait_for_feedback_uses_connection_monitor() {
-        let frame = PiperFrame::new_standard(0x251, &[0; 8]);
+        let frame = PiperFrame::new_standard(0x251, &[0; 8]).unwrap();
         let piper = Piper::new_dual_thread_parts(
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
             MockTxAdapter,
@@ -7245,8 +7247,7 @@ mod tests {
     #[test]
     fn test_public_new_dual_thread_parts_accepts_soft_probed_backend_and_replays_bootstrap_feedback()
      {
-        let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-        frame.timestamp_us = 123;
+        let frame = PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(123);
 
         let piper = Piper::new_dual_thread_parts(
             ProbedBootstrapRxAdapter::new(BackendCapability::SoftRealtime, frame),
@@ -7291,8 +7292,7 @@ mod tests {
 
     #[test]
     fn test_wait_for_timestamped_feedback_succeeds_after_timestamped_frame() {
-        let mut frame = PiperFrame::new_standard(0x251, &[0; 8]);
-        frame.timestamp_us = 123;
+        let frame = PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(123);
         let piper = Piper::new_dual_thread_parts(
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(10)),
             MockTxAdapter,
@@ -7488,10 +7488,11 @@ mod tests {
     fn test_soft_realtime_rejects_strict_mailbox_apis() {
         let piper = Piper::new_dual_thread_parts(SoftRxAdapter, MockTxAdapter, None).unwrap();
 
-        let single = piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01]));
+        let single = piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01]).unwrap());
         assert!(matches!(single, Err(DriverError::InvalidInput(_))));
 
-        let package = piper.send_realtime_package([PiperFrame::new_standard(0x155, &[0x01])]);
+        let package =
+            piper.send_realtime_package([PiperFrame::new_standard(0x155, &[0x01]).unwrap()]);
         assert!(matches!(package, Err(DriverError::InvalidInput(_))));
     }
 
@@ -7500,8 +7501,8 @@ mod tests {
         let piper =
             Piper::new_dual_thread_parts(SoftRxAdapter, AlwaysTimeoutTxAdapter, None).unwrap();
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
         ];
 
         for _ in 0..3 {
@@ -7538,8 +7539,8 @@ mod tests {
             Piper::new_dual_thread_parts(SoftRxAdapter, PartialTimeoutTxAdapter { sends: 0 }, None)
                 .unwrap();
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
         ];
 
         let error = piper
@@ -7586,7 +7587,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let frames = [PiperFrame::new_standard(0x155, &[0x01])];
+        let frames = [PiperFrame::new_standard(0x155, &[0x01]).unwrap()];
 
         let error = piper
             .send_soft_realtime_package_confirmed(frames, Duration::ZERO)
@@ -7621,7 +7622,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .expect("TX loop should hit dispatch barrier");
 
-        let expired_frame = PiperFrame::new_standard(0x155, &[0x01]);
+        let expired_frame = PiperFrame::new_standard(0x155, &[0x01]).unwrap();
         for _ in 0..4 {
             let error = piper
                 .send_soft_realtime_package_confirmed([expired_frame], Duration::ZERO)
@@ -7630,7 +7631,7 @@ mod tests {
         }
 
         let piper_for_send = Arc::clone(&piper);
-        let valid_frame = PiperFrame::new_standard(0x156, &[0x02]);
+        let valid_frame = PiperFrame::new_standard(0x156, &[0x02]).unwrap();
         let send_handle = std::thread::spawn(move || {
             piper_for_send
                 .send_soft_realtime_package_confirmed([valid_frame], Duration::from_millis(200))
@@ -7677,7 +7678,7 @@ mod tests {
             let piper_for_send = Arc::clone(&piper);
             expired_handles.push(thread::spawn(move || {
                 piper_for_send.send_soft_realtime_package_confirmed(
-                    [PiperFrame::new_standard(0x155 + u16::from(index), &[index])],
+                    [PiperFrame::new_standard(0x155 + u32::from(index), &[index]).unwrap()],
                     Duration::from_millis(20),
                 )
             }));
@@ -7691,7 +7692,7 @@ mod tests {
         let piper_for_valid_send = Arc::clone(&piper);
         let valid_handle = thread::spawn(move || {
             piper_for_valid_send.send_soft_realtime_package_confirmed(
-                [PiperFrame::new_standard(0x159, &[0xFF])],
+                [PiperFrame::new_standard(0x159, &[0xFF]).unwrap()],
                 Duration::from_millis(200),
             )
         });
@@ -7745,7 +7746,7 @@ mod tests {
             let piper_for_send = Arc::clone(&piper);
             expired_handles.push(thread::spawn(move || {
                 piper_for_send.send_soft_realtime_package_confirmed(
-                    [PiperFrame::new_standard(0x160 + u16::from(index), &[index])],
+                    [PiperFrame::new_standard(0x160 + u32::from(index), &[index]).unwrap()],
                     Duration::from_millis(20),
                 )
             }));
@@ -7761,7 +7762,7 @@ mod tests {
         let piper_for_valid_send = Arc::clone(&piper);
         let valid_handle = thread::spawn(move || {
             piper_for_valid_send.send_soft_realtime_package_confirmed(
-                [PiperFrame::new_standard(0x169, &[0xFF])],
+                [PiperFrame::new_standard(0x169, &[0xFF]).unwrap()],
                 Duration::from_millis(200),
             )
         });
@@ -7800,8 +7801,8 @@ mod tests {
         )
         .unwrap();
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
         ];
 
         let error = piper
@@ -7841,8 +7842,11 @@ mod tests {
 
     #[test]
     fn test_read_firmware_version_success() {
-        let frame =
-            PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"S-V1.8-1");
+        let frame = PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_FIRMWARE_READ.raw()),
+            b"S-V1.8-1",
+        )
+        .unwrap();
         let piper = Piper::new_dual_thread_parts(
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
             MockTxAdapter,
@@ -7859,9 +7863,16 @@ mod tests {
 
     #[test]
     fn test_read_firmware_version_waits_for_complete_split_payload() {
-        let frame_1 =
-            PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"S-V1.6");
-        let frame_2 = PiperFrame::new_standard(piper_protocol::ids::ID_FIRMWARE_READ as u16, b"-3");
+        let frame_1 = PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_FIRMWARE_READ.raw()),
+            b"S-V1.6",
+        )
+        .unwrap();
+        let frame_2 = PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_FIRMWARE_READ.raw()),
+            b"-3",
+        )
+        .unwrap();
         let piper = Piper::new_dual_thread_parts(
             ScriptedRxAdapter::new(vec![frame_1, frame_2], Duration::from_millis(20)),
             MockTxAdapter,
@@ -7880,11 +7891,12 @@ mod tests {
     fn test_query_collision_protection_returns_fresh_feedback_and_sends_query_frame() {
         let mut data = [0u8; 8];
         data[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
-        let mut feedback = PiperFrame::new_standard(
-            piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
+        let feedback = PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw()),
             &data,
-        );
-        feedback.timestamp_us = 321;
+        )
+        .unwrap()
+        .with_timestamp_us(321);
 
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
@@ -7914,12 +7926,15 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].id, piper_protocol::ids::ID_PARAMETER_QUERY_SET);
         assert_eq!(
-            sent[0].data[0],
+            sent[0].raw_id(),
+            u32::from(piper_protocol::ids::ID_PARAMETER_QUERY_SET.raw())
+        );
+        assert_eq!(
+            sent[0].data()[0],
             piper_protocol::config::ParameterQueryType::CollisionProtectionLevel as u8
         );
-        assert_eq!(sent[0].data[1], 0);
+        assert_eq!(sent[0].data()[1], 0);
     }
 
     #[test]
@@ -7978,11 +7993,12 @@ mod tests {
         data[2..4].copy_from_slice(&2000u16.to_be_bytes());
         data[4..6].copy_from_slice(&3000u16.to_be_bytes());
         data[6..8].copy_from_slice(&4000u16.to_be_bytes());
-        let mut feedback = PiperFrame::new_standard(
-            piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK as u16,
+        let feedback = PiperFrame::new_standard(
+            u32::from(piper_protocol::ids::ID_END_VELOCITY_ACCEL_FEEDBACK.raw()),
             &data,
-        );
-        feedback.timestamp_us = 654;
+        )
+        .unwrap()
+        .with_timestamp_us(654);
 
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let piper = Piper::new_dual_thread_parts(
@@ -8017,9 +8033,12 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].id, piper_protocol::ids::ID_PARAMETER_QUERY_SET);
         assert_eq!(
-            sent[0].data[0],
+            sent[0].raw_id(),
+            u32::from(piper_protocol::ids::ID_PARAMETER_QUERY_SET.raw())
+        );
+        assert_eq!(
+            sent[0].data()[0],
             piper_protocol::config::ParameterQueryType::EndVelocityAccel as u8
         );
     }
@@ -8082,11 +8101,12 @@ mod tests {
                 data[1..3].copy_from_slice(&(1800i16 + i16::from(joint_index)).to_be_bytes());
                 data[3..5].copy_from_slice(&(-1800i16 - i16::from(joint_index)).to_be_bytes());
                 data[5..7].copy_from_slice(&(500u16 + u16::from(joint_index)).to_be_bytes());
-                let mut frame = PiperFrame::new_standard(
-                    piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK as u16,
+                let frame = PiperFrame::new_standard(
+                    u32::from(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK.raw()),
                     &data,
-                );
-                frame.timestamp_us = 1000 + u64::from(joint_index);
+                )
+                .unwrap()
+                .with_timestamp_us(1000 + u64::from(joint_index));
                 frame
             })
             .collect();
@@ -8116,10 +8136,13 @@ mod tests {
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 6);
         for (idx, frame) in sent.iter().enumerate() {
-            assert_eq!(frame.id, piper_protocol::ids::ID_QUERY_MOTOR_LIMIT);
-            assert_eq!(frame.data[0], (idx + 1) as u8);
             assert_eq!(
-                frame.data[1],
+                frame.raw_id(),
+                u32::from(piper_protocol::ids::ID_QUERY_MOTOR_LIMIT.raw())
+            );
+            assert_eq!(frame.data()[0], (idx + 1) as u8);
+            assert_eq!(
+                frame.data()[1],
                 piper_protocol::config::QueryType::AngleAndMaxVelocity as u8
             );
         }
@@ -8209,11 +8232,12 @@ mod tests {
                 let mut data = [0u8; 8];
                 data[0] = joint_index;
                 data[1..3].copy_from_slice(&(1000u16 + 10 * u16::from(joint_index)).to_be_bytes());
-                let mut frame = PiperFrame::new_standard(
-                    piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK as u16,
+                let frame = PiperFrame::new_standard(
+                    u32::from(piper_protocol::ids::ID_MOTOR_MAX_ACCEL_FEEDBACK.raw()),
                     &data,
-                );
-                frame.timestamp_us = 2000 + u64::from(joint_index);
+                )
+                .unwrap()
+                .with_timestamp_us(2000 + u64::from(joint_index));
                 frame
             })
             .collect();
@@ -8242,10 +8266,13 @@ mod tests {
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 6);
         for (idx, frame) in sent.iter().enumerate() {
-            assert_eq!(frame.id, piper_protocol::ids::ID_QUERY_MOTOR_LIMIT);
-            assert_eq!(frame.data[0], (idx + 1) as u8);
             assert_eq!(
-                frame.data[1],
+                frame.raw_id(),
+                u32::from(piper_protocol::ids::ID_QUERY_MOTOR_LIMIT.raw())
+            );
+            assert_eq!(frame.data()[0], (idx + 1) as u8);
+            assert_eq!(
+                frame.data()[1],
                 piper_protocol::config::QueryType::MaxAcceleration as u8
             );
         }
@@ -8329,9 +8356,10 @@ mod tests {
     #[test]
     fn collision_protection_invalid_frame_goes_to_diagnostics_not_state() {
         let frame = PiperFrame::new_standard(
-            piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
+            u32::from(piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw()),
             &[255, 0, 0, 0, 0, 0, 0, 0],
-        );
+        )
+        .unwrap();
         let piper = Piper::new_dual_thread_parts(
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
             MockTxAdapter,
@@ -8370,7 +8398,11 @@ mod tests {
                 data[1..3].copy_from_slice(&(1800i16 + i16::from(joint_index)).to_be_bytes());
                 data[3..5].copy_from_slice(&(-1800i16 - i16::from(joint_index)).to_be_bytes());
                 data[5..7].copy_from_slice(&(500u16 + u16::from(joint_index)).to_be_bytes());
-                PiperFrame::new_standard(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK as u16, &data)
+                PiperFrame::new_standard(
+                    u32::from(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK.raw()),
+                    &data,
+                )
+                .unwrap()
             })
             .collect();
         let piper = Piper::new_dual_thread_parts(
@@ -8398,9 +8430,10 @@ mod tests {
     #[test]
     fn query_collision_protection_invalid_feedback_returns_diagnostics_only_timeout() {
         let frame = PiperFrame::new_standard(
-            piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK as u16,
+            u32::from(piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw()),
             &[255, 0, 0, 0, 0, 0, 0, 0],
-        );
+        )
+        .unwrap();
         let piper = Piper::new_dual_thread_parts(
             ScriptedRxAdapter::new(vec![frame], Duration::from_millis(20)),
             MockTxAdapter,
@@ -8438,7 +8471,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
             diagnostics.push(DiagnosticEvent::Protocol(
                 ProtocolDiagnostic::InvalidLength {
-                    can_id: piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK,
+                    can_id: u32::from(piper_protocol::ids::ID_MOTOR_LIMIT_FEEDBACK.raw()),
                     expected: 8,
                     actual: 3,
                 },
@@ -8461,7 +8494,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
             diagnostics.push(DiagnosticEvent::Protocol(
                 ProtocolDiagnostic::InvalidLength {
-                    can_id: piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK,
+                    can_id: u32::from(
+                        piper_protocol::ids::ID_COLLISION_PROTECTION_LEVEL_FEEDBACK.raw(),
+                    ),
                     expected: 8,
                     actual: 3,
                 },
@@ -8481,7 +8516,7 @@ mod tests {
     fn test_send_frame_blocking_timeout() {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
-        let frame = PiperFrame::new_standard(0x123, &[0x01]);
+        let frame = PiperFrame::new_standard(0x123, &[0x01]).unwrap();
 
         // 快速填充通道（如果 IO 线程来不及消费）
         // 然后测试阻塞发送
@@ -8793,8 +8828,8 @@ mod tests {
         )
         .unwrap();
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
         ];
 
         piper
@@ -8817,9 +8852,9 @@ mod tests {
         )
         .unwrap();
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
-            PiperFrame::new_standard(0x157, &[0x03]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x157, &[0x03]).unwrap(),
         ];
 
         piper
@@ -8848,9 +8883,9 @@ mod tests {
         )
         .unwrap();
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
-            PiperFrame::new_standard(0x157, &[0x03]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x157, &[0x03]).unwrap(),
         ];
 
         let error = piper
@@ -8874,8 +8909,8 @@ mod tests {
             Piper::new_dual_thread_parts(SoftRxAdapter, PartialTimeoutTxAdapter { sends: 0 }, None)
                 .unwrap();
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
         ];
 
         let error = piper
@@ -8922,7 +8957,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let frame = PiperFrame::new_standard(0x471, &[0x01]);
+        let frame = PiperFrame::new_standard(0x471, &[0x01]).unwrap();
 
         wait_shutdown(&piper, frame, Duration::from_millis(200))
             .expect("confirmed shutdown send should succeed");
@@ -8944,7 +8979,7 @@ mod tests {
 
         let error = piper
             .enqueue_shutdown(
-                PiperFrame::new_standard(0x471, &[0x01]),
+                PiperFrame::new_standard(0x471, &[0x01]).unwrap(),
                 Instant::now() + Duration::from_millis(50),
             )
             .expect_err("stopped tx thread should reject confirmed shutdown send");
@@ -8966,7 +9001,7 @@ mod tests {
 
         let error = wait_shutdown(
             &piper,
-            PiperFrame::new_standard(0x471, &[0x01]),
+            PiperFrame::new_standard(0x471, &[0x01]).unwrap(),
             Duration::from_millis(200),
         )
         .expect_err("transport error should fail confirmed shutdown send");
@@ -8987,7 +9022,7 @@ mod tests {
 
         let error = wait_shutdown(
             &piper,
-            PiperFrame::new_standard(0x471, &[0x01]),
+            PiperFrame::new_standard(0x471, &[0x01]).unwrap(),
             Duration::from_millis(5),
         )
         .expect_err("slow tx should time out confirmed shutdown send");
@@ -8996,7 +9031,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
         assert!(matches!(
-            piper.send_frame(PiperFrame::new_standard(0x123, &[0x01])),
+            piper.send_frame(PiperFrame::new_standard(0x123, &[0x01]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
     }
@@ -9013,11 +9048,11 @@ mod tests {
             None,
         )
         .unwrap();
-        let retry_frame = PiperFrame::new_standard(0x472, &[0x02]);
+        let retry_frame = PiperFrame::new_standard(0x472, &[0x02]).unwrap();
 
         let error = wait_shutdown(
             &piper,
-            PiperFrame::new_standard(0x471, &[0x01]),
+            PiperFrame::new_standard(0x471, &[0x01]).unwrap(),
             Duration::from_millis(50),
         )
         .expect_err("first shutdown attempt should time out");
@@ -9026,7 +9061,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(piper.health().fault, Some(RuntimeFaultKind::TransportError));
         assert!(matches!(
-            piper.send_reliable(PiperFrame::new_standard(0x123, &[0x01])),
+            piper.send_reliable(PiperFrame::new_standard(0x123, &[0x01]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
 
@@ -9048,7 +9083,10 @@ mod tests {
         )
         .unwrap();
         let receipt = piper
-            .enqueue_shutdown(PiperFrame::new_standard(0x471, &[0x01]), Instant::now())
+            .enqueue_shutdown(
+                PiperFrame::new_standard(0x471, &[0x01]).unwrap(),
+                Instant::now(),
+            )
             .expect("enqueue should succeed");
         let error = receipt
             .wait()
@@ -9064,7 +9102,7 @@ mod tests {
         let timeout = Duration::from_millis(200);
         let receipt = piper
             .enqueue_shutdown(
-                PiperFrame::new_standard(0x471, &[0x01]),
+                PiperFrame::new_standard(0x471, &[0x01]).unwrap(),
                 Instant::now() + timeout,
             )
             .expect("enqueue should succeed");
@@ -9091,7 +9129,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let stop_frame = PiperFrame::new_standard(0x471, &[0x09]);
+        let stop_frame = PiperFrame::new_standard(0x471, &[0x09]).unwrap();
 
         piper.latch_fault();
         let health = piper.health();
@@ -9106,11 +9144,11 @@ mod tests {
             MaintenanceGateState::DeniedFaulted
         );
         assert!(matches!(
-            piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01])),
+            piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
         assert!(matches!(
-            piper.send_reliable(PiperFrame::new_standard(0x472, &[0x02])),
+            piper.send_reliable(PiperFrame::new_standard(0x472, &[0x02]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
 
@@ -9139,7 +9177,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let reliable_frame = PiperFrame::new_standard(0x472, &[0x0C]);
+        let reliable_frame = PiperFrame::new_standard(0x472, &[0x0C]).unwrap();
 
         mark_maintenance_standby_confirmed(&piper);
         piper.latch_fault();
@@ -9365,8 +9403,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let reliable_frame = PiperFrame::new_standard(0x472, &[0x0A]);
-        let realtime_frame = PiperFrame::new_standard(0x155, &[0x0B]);
+        let reliable_frame = PiperFrame::new_standard(0x472, &[0x0A]).unwrap();
+        let realtime_frame = PiperFrame::new_standard(0x155, &[0x0B]).unwrap();
         let (reached_rx, release_tx) = install_fault_latch_barrier(piper.as_ref());
 
         let piper_fault = Arc::clone(&piper);
@@ -9438,7 +9476,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let stop_frame = PiperFrame::new_standard(0x471, &[0x04]);
+        let stop_frame = PiperFrame::new_standard(0x471, &[0x04]).unwrap();
 
         std::thread::sleep(Duration::from_millis(20));
         let health = piper.health();
@@ -9454,7 +9492,7 @@ mod tests {
             MaintenanceGateState::DeniedFaulted
         );
         assert!(matches!(
-            piper.send_reliable(PiperFrame::new_standard(0x472, &[0x02])),
+            piper.send_reliable(PiperFrame::new_standard(0x472, &[0x02]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
 
@@ -9482,11 +9520,11 @@ mod tests {
         assert_eq!(health.fault, Some(RuntimeFaultKind::RxExited));
         piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
         assert!(matches!(
-            piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01])),
+            piper.send_realtime(PiperFrame::new_standard(0x155, &[0x01]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
         assert!(matches!(
-            piper.send_reliable(PiperFrame::new_standard(0x472, &[0x02])),
+            piper.send_reliable(PiperFrame::new_standard(0x472, &[0x02]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
         assert!(!piper.maintenance_runtime_open());
@@ -9511,7 +9549,7 @@ mod tests {
                 .unwrap();
         piper.set_maintenance_gate_state(MaintenanceGateState::AllowedStandby);
         piper
-            .send_reliable(PiperFrame::new_standard(0x472, &[0x09]))
+            .send_reliable(PiperFrame::new_standard(0x472, &[0x09]).unwrap())
             .expect("reliable send should enqueue before the tx worker panics");
 
         wait_until(
@@ -9623,9 +9661,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let stale_realtime = PiperFrame::new_standard(0x155, &[0x01]);
-        let stale_reliable = PiperFrame::new_standard(0x472, &[0x02]);
-        let stop_frame = PiperFrame::new_standard(0x471, &[0x03]);
+        let stale_realtime = PiperFrame::new_standard(0x155, &[0x01]).unwrap();
+        let stale_reliable = PiperFrame::new_standard(0x472, &[0x02]).unwrap();
+        let stop_frame = PiperFrame::new_standard(0x471, &[0x03]).unwrap();
 
         piper.latch_fault();
         {
@@ -9670,9 +9708,9 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .expect("tx loop should reach the installed dispatch barrier");
 
-        let stale_realtime = PiperFrame::new_standard(0x155, &[0x01]);
-        let stale_soft = PiperFrame::new_standard(0x156, &[0x02]);
-        let stale_reliable = PiperFrame::new_standard(0x151, &[0x03]);
+        let stale_realtime = PiperFrame::new_standard(0x155, &[0x01]).unwrap();
+        let stale_soft = PiperFrame::new_standard(0x156, &[0x02]).unwrap();
+        let stale_reliable = PiperFrame::new_standard(0x151, &[0x03]).unwrap();
         let disable_frame = MotorEnableCommand::disable_all().to_frame();
         let deadline = Instant::now() + Duration::from_secs(1);
         let (state_reached_rx, state_release_tx) = install_state_transition_barrier(piper.as_ref());
@@ -9796,8 +9834,8 @@ mod tests {
         );
 
         let disable_frame = MotorEnableCommand::disable_all().to_frame();
-        let reliable_frame = PiperFrame::new_standard(0x151, &[0x05]);
-        let realtime_frame = PiperFrame::new_standard(0x155, &[0x06]);
+        let reliable_frame = PiperFrame::new_standard(0x151, &[0x05]).unwrap();
+        let realtime_frame = PiperFrame::new_standard(0x155, &[0x06]).unwrap();
         let (reached_rx, release_tx) = install_state_transition_barrier(piper.as_ref());
 
         let piper_for_disable = Arc::clone(&piper);
@@ -9917,7 +9955,7 @@ mod tests {
             .expect("driver should start"),
         );
 
-        let inflight_frame = PiperFrame::new_standard(0x303, &[0x01]);
+        let inflight_frame = PiperFrame::new_standard(0x303, &[0x01]).unwrap();
         piper
             .send_frame(inflight_frame)
             .expect("reliable frame should enter the blocked in-flight send");
@@ -10078,7 +10116,7 @@ mod tests {
         );
 
         let disable_frame = MotorEnableCommand::disable_all().to_frame();
-        let reliable_frame = PiperFrame::new_standard(0x151, &[0x07]);
+        let reliable_frame = PiperFrame::new_standard(0x151, &[0x07]).unwrap();
         let (reached_rx, release_tx) = install_state_transition_barrier(piper.as_ref());
 
         let piper_for_disable = Arc::clone(&piper);
@@ -10144,7 +10182,7 @@ mod tests {
             MaintenanceGateState::DeniedFaulted
         );
         assert!(matches!(
-            piper.send_reliable(PiperFrame::new_standard(0x151, &[0x01])),
+            piper.send_reliable(PiperFrame::new_standard(0x151, &[0x01]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
     }
@@ -10170,7 +10208,7 @@ mod tests {
             .expect("driver should start"),
         );
 
-        let inflight_frame = PiperFrame::new_standard(0x301, &[0x01]);
+        let inflight_frame = PiperFrame::new_standard(0x301, &[0x01]).unwrap();
         piper
             .send_frame(inflight_frame)
             .expect("reliable frame should enter the blocked in-flight send");
@@ -10220,7 +10258,7 @@ mod tests {
             MaintenanceGateState::DeniedFaulted
         );
         assert!(matches!(
-            piper.send_frame(PiperFrame::new_standard(0x302, &[0x02])),
+            piper.send_frame(PiperFrame::new_standard(0x302, &[0x02]).unwrap()),
             Err(DriverError::ControlPathClosed)
         ));
 
@@ -10290,9 +10328,9 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .expect("tx loop should reach the installed dispatch barrier");
 
-        let stale_realtime = PiperFrame::new_standard(0x155, &[0x01]);
-        let stale_soft = PiperFrame::new_standard(0x156, &[0x02]);
-        let stale_reliable = PiperFrame::new_standard(0x151, &[0x03]);
+        let stale_realtime = PiperFrame::new_standard(0x155, &[0x01]).unwrap();
+        let stale_soft = PiperFrame::new_standard(0x156, &[0x02]).unwrap();
+        let stale_reliable = PiperFrame::new_standard(0x151, &[0x03]).unwrap();
         let disable_frame = MotorEnableCommand::disable_all().to_frame();
         let deadline = Instant::now() + Duration::from_secs(1);
         let (state_reached_rx, state_release_tx) = install_state_transition_barrier(piper.as_ref());
@@ -10418,9 +10456,9 @@ mod tests {
             .unwrap(),
         );
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
-            PiperFrame::new_standard(0x157, &[0x03]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x157, &[0x03]).unwrap(),
         ];
         let piper_clone = piper.clone();
         let result_handle = std::thread::spawn(move || {
@@ -10475,9 +10513,9 @@ mod tests {
             .unwrap(),
         );
         let frames = [
-            PiperFrame::new_standard(0x165, &[0x01]),
-            PiperFrame::new_standard(0x166, &[0x02]),
-            PiperFrame::new_standard(0x167, &[0x03]),
+            PiperFrame::new_standard(0x165, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x166, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x167, &[0x03]).unwrap(),
         ];
         let piper_clone = Arc::clone(&piper);
         let result_handle = std::thread::spawn(move || {
@@ -10549,7 +10587,7 @@ mod tests {
             other => panic!("unexpected maintenance acquire result: {other:?}"),
         };
 
-        let blocking_frame = PiperFrame::new_standard(0x201, &[0x01]);
+        let blocking_frame = PiperFrame::new_standard(0x201, &[0x01]).unwrap();
         let piper_blocking = Arc::clone(&piper);
         let blocking_handle = std::thread::spawn(move || {
             piper_blocking.send_maintenance_frame_confirmed(
@@ -10565,7 +10603,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .expect("first maintenance frame should begin sending");
 
-        let stale_frame = PiperFrame::new_standard(0x202, &[0x02]);
+        let stale_frame = PiperFrame::new_standard(0x202, &[0x02]).unwrap();
         let piper_stale = Arc::clone(&piper);
         let stale_handle = std::thread::spawn(move || {
             piper_stale.send_maintenance_frame_confirmed(
@@ -10637,7 +10675,7 @@ mod tests {
             other => panic!("unexpected maintenance acquire result: {other:?}"),
         };
 
-        let blocking_frame = PiperFrame::new_standard(0x211, &[0x01]);
+        let blocking_frame = PiperFrame::new_standard(0x211, &[0x01]).unwrap();
         let piper_blocking = Arc::clone(&piper);
         let blocking_handle = std::thread::spawn(move || {
             piper_blocking.send_maintenance_frame_confirmed(
@@ -10653,7 +10691,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .expect("first maintenance frame should begin sending");
 
-        let expired_frame = PiperFrame::new_standard(0x212, &[0x02]);
+        let expired_frame = PiperFrame::new_standard(0x212, &[0x02]).unwrap();
         let piper_expired = Arc::clone(&piper);
         let expired_handle = std::thread::spawn(move || {
             piper_expired.send_maintenance_frame_confirmed(
@@ -10712,7 +10750,7 @@ mod tests {
             other => panic!("unexpected maintenance acquire result: {other:?}"),
         };
 
-        let frame = PiperFrame::new_standard(0x213, &[0x03]);
+        let frame = PiperFrame::new_standard(0x213, &[0x03]).unwrap();
         let piper_send = Arc::clone(&piper);
         let send_handle = std::thread::spawn(move || {
             piper_send.send_maintenance_frame_confirmed(
@@ -10769,7 +10807,7 @@ mod tests {
             other => panic!("unexpected initial acquire result: {other:?}"),
         };
 
-        let blocking_frame = PiperFrame::new_standard(0x221, &[0x01]);
+        let blocking_frame = PiperFrame::new_standard(0x221, &[0x01]).unwrap();
         let piper_blocking = Arc::clone(&piper);
         let blocking_handle = std::thread::spawn(move || {
             piper_blocking.send_maintenance_frame_confirmed(
@@ -11030,9 +11068,9 @@ mod tests {
         )
         .unwrap();
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]),
-            PiperFrame::new_standard(0x156, &[0x02]),
-            PiperFrame::new_standard(0x157, &[0x03]),
+            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x157, &[0x03]).unwrap(),
         ];
 
         let error = piper
@@ -11068,7 +11106,7 @@ mod tests {
 
         let error = piper
             .send_realtime_package_confirmed(
-                [PiperFrame::new_standard(0x155, &[0x01])],
+                [PiperFrame::new_standard(0x155, &[0x01]).unwrap()],
                 Duration::from_millis(200),
             )
             .expect_err("fatal transport error should fail confirmed send");
@@ -11099,8 +11137,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let first = [PiperFrame::new_standard(0x155, &[0x01])];
-        let second = [PiperFrame::new_standard(0x156, &[0x02])];
+        let first = [PiperFrame::new_standard(0x155, &[0x01]).unwrap()];
+        let second = [PiperFrame::new_standard(0x156, &[0x02]).unwrap()];
 
         piper.send_realtime_package(first).expect("first realtime package should queue");
         started_rx
@@ -11157,8 +11195,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let first = [PiperFrame::new_standard(0x155, &[0x01])];
-        let expired = [PiperFrame::new_standard(0x156, &[0x02])];
+        let first = [PiperFrame::new_standard(0x155, &[0x01]).unwrap()];
+        let expired = [PiperFrame::new_standard(0x156, &[0x02]).unwrap()];
 
         piper.send_realtime_package(first).expect("first realtime package should queue");
         started_rx
@@ -11213,8 +11251,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let first = PiperFrame::new_standard(0x201, &[0x01]);
-        let expired = [PiperFrame::new_standard(0x202, &[0x02])];
+        let first = PiperFrame::new_standard(0x201, &[0x01]).unwrap();
+        let expired = [PiperFrame::new_standard(0x202, &[0x02]).unwrap()];
 
         piper.send_frame(first).expect("first reliable frame should queue");
         started_rx
@@ -11257,7 +11295,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let frames = [PiperFrame::new_standard(0x155, &[0x01])];
+        let frames = [PiperFrame::new_standard(0x155, &[0x01]).unwrap()];
         let result = Arc::new(Mutex::new(None));
         let result_clone = Arc::clone(&result);
         let piper_clone = Arc::clone(&piper);
@@ -11309,7 +11347,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let frames = [PiperFrame::new_standard(0x201, &[0x01])];
+        let frames = [PiperFrame::new_standard(0x201, &[0x01]).unwrap()];
         let result = Arc::new(Mutex::new(None));
         let result_clone = Arc::clone(&result);
         let piper_clone = Arc::clone(&piper);
@@ -11361,7 +11399,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let frames = [PiperFrame::new_standard(0x202, &[0x02])];
+        let frames = [PiperFrame::new_standard(0x202, &[0x02]).unwrap()];
         let result = Arc::new(Mutex::new(None));
         let result_clone = Arc::clone(&result);
         let piper_clone = Arc::clone(&piper);
@@ -11412,7 +11450,7 @@ mod tests {
     fn test_send_frame_non_blocking() {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
-        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
 
         // 非阻塞发送应该总是成功（除非通道满或关闭）
         let result = piper.send_frame(frame);

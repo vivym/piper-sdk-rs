@@ -553,8 +553,9 @@ mod tests {
 
     impl StrictBootstrapRxAdapter {
         fn new() -> Self {
-            let mut frame = piper_can::PiperFrame::new_standard(0x251, &[0; 8]);
-            frame.timestamp_us = 1;
+            let frame = piper_can::PiperFrame::new_standard(0x251, &[0; 8])
+                .unwrap()
+                .with_timestamp_us(1);
             Self {
                 bootstrap: Some(frame),
             }
@@ -589,8 +590,9 @@ mod tests {
 
     impl SoftBootstrapRxAdapter {
         fn new() -> Self {
-            let mut frame = piper_can::PiperFrame::new_standard(0x251, &[0; 8]);
-            frame.timestamp_us = 1;
+            let frame = piper_can::PiperFrame::new_standard(0x251, &[0; 8])
+                .unwrap()
+                .with_timestamp_us(1);
             Self {
                 bootstrap: Some(frame),
             }

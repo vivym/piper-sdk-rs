@@ -103,7 +103,7 @@ impl RealtimeTxAdapter for MockTxAdapter {
 /// 生成测试帧
 fn generate_test_frames(count: usize, base_id: u32) -> Vec<PiperFrame> {
     (0..count)
-        .map(|i| PiperFrame::new_standard((base_id + i as u32) as u16, &[i as u8; 8]))
+        .map(|i| PiperFrame::new_standard((base_id + i as u32) as u32, &[i as u8; 8]).unwrap())
         .collect()
 }
 
@@ -187,9 +187,9 @@ fn test_priority_scheduling() {
 
     // 同时发送实时命令和可靠命令（测试优先级）
     // 为了确保两者都在队列中，我们快速连续发送
-    let reliable_frame1 = PiperFrame::new_standard(0x100, &[1, 1, 1]);
-    let reliable_frame2 = PiperFrame::new_standard(0x101, &[2, 2, 2]);
-    let realtime_frame = PiperFrame::new_standard(0x200, &[3, 3, 3]);
+    let reliable_frame1 = PiperFrame::new_standard(0x100, &[1, 1, 1]).unwrap();
+    let reliable_frame2 = PiperFrame::new_standard(0x101, &[2, 2, 2]).unwrap();
+    let realtime_frame = PiperFrame::new_standard(0x200, &[3, 3, 3]).unwrap();
 
     // 先发送可靠命令到队列
     reliable_tx.send(ReliableCommand::single(reliable_frame1)).unwrap();
@@ -215,15 +215,15 @@ fn test_priority_scheduling() {
         println!(
             "  {}: ID=0x{:X}, data={:?}",
             i,
-            frame.id,
-            &frame.data[..frame.len as usize]
+            frame.raw_id(),
+            frame.data()
         );
     }
 
     // 查找实时命令和可靠命令的位置
-    let realtime_pos = sent.iter().position(|f| f.id == 0x200);
-    let reliable_pos1 = sent.iter().position(|f| f.id == 0x100);
-    let _reliable_pos2 = sent.iter().position(|f| f.id == 0x101);
+    let realtime_pos = sent.iter().position(|f| f.raw_id() == 0x200);
+    let reliable_pos1 = sent.iter().position(|f| f.raw_id() == 0x100);
+    let _reliable_pos2 = sent.iter().position(|f| f.raw_id() == 0x101);
 
     // 注意：由于 TX 线程的 select! 机制是"尽力优先"而非"严格优先"
     // 以及测试环境的并发特性，实时命令可能在可靠命令之后到达 TX 线程
@@ -336,7 +336,7 @@ fn test_reliable_command_not_dropped() {
 
     // 发送多个可靠命令（填满队列）
     let reliable_commands: Vec<PiperFrame> = (0..15)
-        .map(|i| PiperFrame::new_standard(0x100 + i as u16, &[i as u8; 8]))
+        .map(|i| PiperFrame::new_standard(0x100 + i as u32, &[i as u8; 8]).unwrap())
         .collect();
 
     let mut sent_successfully: u32 = 0;
@@ -490,7 +490,7 @@ fn test_realtime_overwrite_strategy() {
 
     // 快速发送多个实时命令（触发覆盖）
     let realtime_commands: Vec<PiperFrame> = (0..5)
-        .map(|i| PiperFrame::new_standard(0x200 + i as u16, &[i as u8; 8]))
+        .map(|i| PiperFrame::new_standard(0x200 + i as u32, &[i as u8; 8]).unwrap())
         .collect();
 
     for frame in realtime_commands.iter() {
@@ -517,15 +517,15 @@ fn test_realtime_overwrite_strategy() {
 
     println!(
         "Realtime frames sent: {:?}",
-        sent.iter().map(|frame| frame.id).collect::<Vec<_>>()
+        sent.iter().map(|frame| frame.raw_id()).collect::<Vec<_>>()
     );
     assert!(
         sent.len() < realtime_commands.len(),
         "mailbox overwrite should collapse some realtime commands under producer pressure",
     );
     assert_eq!(
-        sent.last().map(|frame| frame.id),
-        realtime_commands.last().map(|frame| frame.id),
+        sent.last().map(|frame| frame.raw_id()),
+        realtime_commands.last().map(|frame| frame.raw_id()),
         "last-write-wins mailbox should preserve the newest realtime command",
     );
 }
@@ -534,17 +534,17 @@ fn test_realtime_overwrite_strategy() {
 fn test_command_type_conversion() {
     // 测试场景：验证 PiperCommand 的类型转换
 
-    let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]);
+    let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap();
 
     // 测试创建实时命令
     let realtime_cmd = PiperCommand::realtime(frame);
     assert_eq!(realtime_cmd.priority(), CommandPriority::RealtimeControl);
-    assert_eq!(realtime_cmd.frame().id, 0x123);
+    assert_eq!(realtime_cmd.frame().raw_id(), 0x123);
 
     // 测试创建可靠命令
     let reliable_cmd = PiperCommand::reliable(frame);
     assert_eq!(reliable_cmd.priority(), CommandPriority::ReliableCommand);
-    assert_eq!(reliable_cmd.frame().id, 0x123);
+    assert_eq!(reliable_cmd.frame().raw_id(), 0x123);
 
     // 测试从 PiperFrame 转换（默认可靠）
     let cmd: PiperCommand = frame.into();
@@ -552,5 +552,5 @@ fn test_command_type_conversion() {
 
     // 测试转换为 PiperFrame
     let converted_frame: PiperFrame = realtime_cmd.into();
-    assert_eq!(converted_frame.id, 0x123);
+    assert_eq!(converted_frame.raw_id(), 0x123);
 }

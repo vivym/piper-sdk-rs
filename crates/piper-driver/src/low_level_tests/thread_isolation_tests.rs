@@ -169,7 +169,7 @@ impl RealtimeTxAdapter for MockTxAdapter {
 /// 生成测试帧
 fn generate_test_frames(count: usize) -> Vec<PiperFrame> {
     (0..count)
-        .map(|i| PiperFrame::new_standard((0x251 + (i % 6)) as u16, &[i as u8; 8]))
+        .map(|i| PiperFrame::new_standard((0x251 + (i % 6)) as u32, &[i as u8; 8]).unwrap())
         .collect()
 }
 
@@ -261,10 +261,9 @@ fn test_rx_unaffected_by_tx_timeout() {
     // 注意：由于 MockTxAdapter 是移动的，我们需要通过其他方式模拟
     // 这里我们发送一个会导致超时的命令（在实际场景中，这可能是总线错误）
     reliable_tx
-        .send(ReliableCommand::single(PiperFrame::new_standard(
-            0x123,
-            &[1, 2, 3],
-        )))
+        .send(ReliableCommand::single(
+            PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap(),
+        ))
         .unwrap();
 
     // 等待 100ms，观察 RX 是否受影响
