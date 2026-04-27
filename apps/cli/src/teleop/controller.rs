@@ -80,18 +80,15 @@ pub struct RuntimeTeleopSettingsHandle {
 }
 
 impl RuntimeTeleopSettingsHandle {
-    pub fn new(settings: RuntimeTeleopSettings) -> Self {
-        settings.validate().expect("runtime teleop settings must satisfy hard caps");
-        Self {
+    pub fn new(settings: RuntimeTeleopSettings) -> Result<Self> {
+        settings.validate()?;
+        Ok(Self {
             inner: Arc::new(RwLock::new(settings)),
-        }
+        })
     }
 
     pub fn snapshot(&self) -> RuntimeTeleopSettings {
-        match self.inner.read() {
-            Ok(settings) => settings.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        self.inner.read().expect("runtime teleop settings lock poisoned").clone()
     }
 
     pub fn update_mode(&self, mode: TeleopMode) -> Result<()> {
@@ -114,10 +111,7 @@ impl RuntimeTeleopSettingsHandle {
     }
 
     fn update(&self, mutate: impl FnOnce(&mut RuntimeTeleopSettings)) -> Result<()> {
-        let mut guard = match self.inner.write() {
-            Ok(settings) => settings,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.inner.write().expect("runtime teleop settings lock poisoned");
         let mut next = guard.clone();
         mutate(&mut next);
         next.validate()?;
@@ -226,7 +220,7 @@ mod tests {
             .unwrap()
             .with_master_damping(0.4)
             .unwrap();
-        let handle = RuntimeTeleopSettingsHandle::new(settings);
+        let handle = RuntimeTeleopSettingsHandle::new(settings).unwrap();
         let mut runtime = RuntimeTeleopController::new(handle);
         let mut reference = MasterFollowerController::new(calibration)
             .with_track_gains(JointArray::splat(8.0), JointArray::splat(1.0))
@@ -243,7 +237,8 @@ mod tests {
     fn mode_update_affects_next_tick() {
         let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
             sample_calibration(),
-        ));
+        ))
+        .unwrap();
         let mut controller = RuntimeTeleopController::new(handle.clone());
 
         handle.update_mode(TeleopMode::Bilateral).unwrap();
@@ -264,7 +259,7 @@ mod tests {
             .unwrap()
             .with_reflection_gain(0.25)
             .unwrap();
-        let handle = RuntimeTeleopSettingsHandle::new(settings);
+        let handle = RuntimeTeleopSettingsHandle::new(settings).unwrap();
         let mut runtime = RuntimeTeleopController::new(handle);
         let mut reference = JointSpaceBilateralController::new(calibration)
             .with_track_gains(JointArray::splat(8.0), JointArray::splat(1.0))
@@ -282,7 +277,8 @@ mod tests {
     fn tick_with_compensation_uses_external_slave_torque_in_bilateral_mode() {
         let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
             sample_calibration(),
-        ));
+        ))
+        .unwrap();
         handle.update_mode(TeleopMode::Bilateral).unwrap();
         let mut controller = RuntimeTeleopController::new(handle);
         let snapshot = sample_snapshot();
@@ -322,7 +318,8 @@ mod tests {
     fn invalid_update_returns_error_and_preserves_settings() {
         let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
             sample_calibration(),
-        ));
+        ))
+        .unwrap();
         let before = handle.snapshot();
 
         assert!(handle.update_track_gains(21.0, 1.0).is_err());
@@ -330,6 +327,104 @@ mod tests {
         assert!(handle.update_reflection_gain(0.6).is_err());
 
         assert_eq!(handle.snapshot(), before);
+    }
+
+    #[test]
+    fn invalid_constructor_input_returns_error() {
+        let invalid = RuntimeTeleopSettings::production(sample_calibration())
+            .with_track_gains(8.0, 1.0)
+            .unwrap()
+            .with_master_damping(0.4)
+            .unwrap();
+        let invalid = RuntimeTeleopSettings {
+            track_kp: 21.0,
+            ..invalid
+        };
+
+        assert!(RuntimeTeleopSettingsHandle::new(invalid).is_err());
+    }
+
+    #[test]
+    fn non_finite_updates_return_error_and_preserve_settings() {
+        let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
+            sample_calibration(),
+        ))
+        .unwrap();
+        let before = handle.snapshot();
+
+        assert!(handle.update_track_gains(f64::NAN, 1.0).is_err());
+        assert!(handle.update_master_damping(f64::INFINITY).is_err());
+        assert!(handle.update_reflection_gain(f64::NEG_INFINITY).is_err());
+
+        assert_eq!(handle.snapshot(), before);
+    }
+
+    #[test]
+    fn master_follower_tick_with_compensation_ignores_compensation() {
+        let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
+            sample_calibration(),
+        ))
+        .unwrap();
+        let mut controller = RuntimeTeleopController::new(handle);
+        let snapshot = sample_snapshot();
+        let compensation = BilateralDynamicsCompensation {
+            slave_external_torque_est: JointArray::splat(NewtonMeter(10.0)),
+            ..BilateralDynamicsCompensation::default()
+        };
+
+        let tick = controller.tick(&snapshot, Duration::from_millis(5)).unwrap();
+        let with_compensation = controller
+            .tick_with_compensation(
+                &BilateralControlFrame {
+                    snapshot,
+                    compensation: Some(compensation),
+                },
+                Duration::from_millis(5),
+            )
+            .unwrap();
+
+        assert_eq!(with_compensation, tick);
+    }
+
+    #[test]
+    fn bilateral_tick_with_compensation_without_compensation_uses_snapshot_torque() {
+        let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
+            sample_calibration(),
+        ))
+        .unwrap();
+        handle.update_mode(TeleopMode::Bilateral).unwrap();
+        let mut controller = RuntimeTeleopController::new(handle);
+        let snapshot = sample_snapshot();
+
+        let tick = controller.tick(&snapshot, Duration::from_millis(5)).unwrap();
+        let with_compensation = controller
+            .tick_with_compensation(
+                &BilateralControlFrame {
+                    snapshot,
+                    compensation: None,
+                },
+                Duration::from_millis(5),
+            )
+            .unwrap();
+
+        assert_eq!(with_compensation, tick);
+    }
+
+    #[test]
+    #[should_panic(expected = "runtime teleop settings lock poisoned")]
+    fn poisoned_settings_lock_panics_on_snapshot() {
+        let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
+            sample_calibration(),
+        ))
+        .unwrap();
+        let poison_target = handle.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target.inner.write().unwrap();
+            panic!("poison runtime teleop settings lock");
+        })
+        .join();
+
+        handle.snapshot();
     }
 
     fn sample_calibration() -> DualArmCalibration {
