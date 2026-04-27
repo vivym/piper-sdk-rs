@@ -195,15 +195,28 @@ override profile/default metadata for the episode manifest.
 
 Startup:
 
-1. Parse collector config, target specs, task profile, and output directory.
-2. Validate that master and slave targets are distinct StrictRealtime SocketCAN
-   interfaces.
-3. Load or capture dual-arm calibration.
-4. Load two MuJoCo calculators from the selected model source.
-5. Create an episode directory with an initial `manifest.toml` in `running`
-   status.
-6. Start the asynchronous episode writer.
-7. Connect both arms and enable MIT mode after operator confirmation.
+1. Parse collector config, target specs, task profile, model source, and output
+   directory.
+2. Validate static inputs before hardware connect: target syntax, distinct
+   SocketCAN interfaces, task profile schema, model source selection, output
+   parent directory, and task slug.
+3. Load two MuJoCo calculators from the selected model source and compute model
+   and profile hashes.
+4. Connect both arms and build `DualArmStandby`.
+5. Resolve calibration:
+   - with `--calibration-file`, load calibration and check current connected
+     posture against `calibration-max-error-rad`;
+   - without `--calibration-file`, capture calibration from the connected
+     `DualArmStandby`, optionally write `--save-calibration`, then hash the
+     captured calibration.
+6. Create the episode directory and write an initial `manifest.toml` in
+   `running` status. No episode directory is created before static validation,
+   successful hardware connect, and calibration resolution.
+7. Start the structured asynchronous episode writer.
+8. If `--raw-can` is enabled, start raw CAN side recording. Failure before MIT
+   enable is a startup error and finalizes the manifest as `faulted`.
+9. Ask for operator confirmation unless `--yes` is set.
+10. Enable MIT mode and enter the 200 Hz control loop.
 
 Per 200 Hz control tick:
 
