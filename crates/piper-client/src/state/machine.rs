@@ -3289,11 +3289,11 @@ where
             }
 
             // 等待适当的延迟
-            if !item.delay.is_zero() {
-                if !Self::wait_replay_delay_or_cancel(item.delay, cancel_signal) {
-                    tracing::warn!("Replay cancelled by user signal");
-                    return Ok(self.exit_replay_mode_to_standby());
-                }
+            if !item.delay.is_zero()
+                && !Self::wait_replay_delay_or_cancel(item.delay, cancel_signal)
+            {
+                tracing::warn!("Replay cancelled by user signal");
+                return Ok(self.exit_replay_mode_to_standby());
             }
 
             if Self::replay_cancel_requested(cancel_signal) {
@@ -3790,7 +3790,7 @@ mod tests {
     }
 
     fn bootstrap_timestamp_frame() -> PiperFrame {
-        PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1)
+        PiperFrame::new_standard(0x251, [0; 8]).unwrap().with_timestamp_us(1)
     }
 
     fn write_test_recording(frames: &[(u64, u32, &[u8])]) -> PathBuf {
@@ -4023,7 +4023,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
         data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
-        PiperFrame::new_standard(standard_id, &data)
+        PiperFrame::new_standard(standard_id, data)
             .unwrap()
             .with_timestamp_us(timestamp_us)
     }
@@ -4038,7 +4038,7 @@ mod tests {
         data[4] = 50;
         data[5] = if enabled { 0x40 } else { 0x00 };
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        PiperFrame::new_standard(id, &data).unwrap().with_timestamp_us(timestamp_us)
+        PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn joint_driver_enabled_frame(joint_index: u8, timestamp_us: u64) -> PiperFrame {
@@ -4062,7 +4062,7 @@ mod tests {
         PiperFrame::new_standard(
             u32::from(piper_protocol::ids::ID_JOINT_DRIVER_HIGH_SPEED_1.raw())
                 + u32::from(joint_index - 1),
-            &data,
+            data,
         )
         .unwrap()
         .with_timestamp_us(timestamp_us)
@@ -4076,7 +4076,7 @@ mod tests {
     ) -> PiperFrame {
         PiperFrame::new_standard(
             piper_protocol::ids::ID_ROBOT_STATUS.raw().into(),
-            &[
+            [
                 control_mode as u8,
                 robot_status as u8,
                 move_mode as u8,
@@ -4106,7 +4106,7 @@ mod tests {
     ) -> PiperFrame {
         PiperFrame::new_standard(
             piper_protocol::ids::ID_SETTING_RESPONSE.raw().into(),
-            &[
+            [
                 response_index,
                 if zero_point_success { 0x01 } else { 0x00 },
                 0,
@@ -4883,7 +4883,7 @@ mod tests {
         );
         let driver = Arc::clone(&standby.driver);
         driver
-            .send_reliable(PiperFrame::new_standard(0x221, &[0x01]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x221, [0x01]).unwrap())
             .expect("blocking reliable frame should enqueue before mode switch");
 
         let standby_handle = thread::spawn(move || {
@@ -4925,7 +4925,7 @@ mod tests {
         );
         let driver = Arc::clone(&standby.driver);
         driver
-            .send_reliable(PiperFrame::new_standard(0x221, &[0x02]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x221, [0x02]).unwrap())
             .expect("blocking reliable frame should enqueue before enable_all");
 
         let standby_handle = thread::spawn(move || {
@@ -5139,7 +5139,7 @@ mod tests {
         assert!(matches!(
             maintenance
                 .driver
-                .send_reliable(PiperFrame::new_standard(0x151, &[0x09]).unwrap()),
+                .send_reliable(PiperFrame::new_standard(0x151, [0x09]).unwrap()),
             Err(piper_driver::DriverError::ControlPathClosed)
         ));
 
@@ -5152,7 +5152,7 @@ mod tests {
             .expect("fresh disabled feedback should eventually reopen the control path");
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x0A]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x151, [0x0A]).unwrap())
             .expect("shared driver should reopen once disabled feedback is confirmed");
     }
 
@@ -5208,7 +5208,7 @@ mod tests {
 
         assert!(matches!(standby._state, Standby));
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x0B]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x151, [0x0B]).unwrap())
             .expect(
                 "driver should not remain stuck in StateTransitionClosed after request_disable_all returns against already-confirmed disabled feedback",
             );
@@ -5373,7 +5373,7 @@ mod tests {
             "shutdown timeout must latch a transport fault before returning control",
         );
         assert!(matches!(
-            driver.send_reliable(PiperFrame::new_standard(0x151, &[0x08]).unwrap()),
+            driver.send_reliable(PiperFrame::new_standard(0x151, [0x08]).unwrap()),
             Err(piper_driver::DriverError::ControlPathClosed)
         ));
         assert_eq!(
@@ -5415,7 +5415,7 @@ mod tests {
             "disable request timeout must latch a transport fault before returning control",
         );
         assert!(matches!(
-            driver.send_reliable(PiperFrame::new_standard(0x151, &[0x09]).unwrap()),
+            driver.send_reliable(PiperFrame::new_standard(0x151, [0x09]).unwrap()),
             Err(piper_driver::DriverError::ControlPathClosed)
         ));
         assert_eq!(
@@ -5570,7 +5570,7 @@ mod tests {
             piper_driver::MaintenanceGateState::DeniedFaulted
         );
         assert!(matches!(
-            driver.send_reliable(PiperFrame::new_standard(0x472, &[0x02]).unwrap()),
+            driver.send_reliable(PiperFrame::new_standard(0x472, [0x02]).unwrap()),
             Err(piper_driver::DriverError::ControlPathClosed)
         ));
 
@@ -6178,7 +6178,7 @@ mod tests {
 
         handle.stop();
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x44]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x151, [0x44]).unwrap())
             .expect("driver should send a frame after manual stop");
         thread::sleep(Duration::from_millis(20));
 
@@ -6212,7 +6212,7 @@ mod tests {
             .expect("recording should start");
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x11]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x151, [0x11]).unwrap())
             .expect("driver should send accepted frame");
         wait_until(
             Duration::from_millis(200),
@@ -6223,7 +6223,7 @@ mod tests {
         handle.stop();
         handle.detach_hook();
         driver
-            .send_reliable(PiperFrame::new_standard(0x152, &[0x22]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x152, [0x22]).unwrap())
             .expect("driver should send frame after detach");
         thread::sleep(Duration::from_millis(20));
 
@@ -6259,7 +6259,7 @@ mod tests {
             .expect("recording should start");
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x66]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x151, [0x66]).unwrap())
             .expect("driver should emit a frame for recording metadata test");
         wait_until(
             Duration::from_millis(200),
@@ -6341,7 +6341,7 @@ mod tests {
             .expect("recording should start");
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x77]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x151, [0x77]).unwrap())
             .expect("driver should send deadline frame");
         wait_until(
             Duration::from_millis(200),
@@ -6350,7 +6350,7 @@ mod tests {
         );
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x152, &[0x88]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x152, [0x88]).unwrap())
             .expect("driver should send post-deadline frame");
         thread::sleep(Duration::from_millis(20));
 
@@ -6383,10 +6383,10 @@ mod tests {
             .expect("recording should start");
 
         driver
-            .send_reliable(PiperFrame::new_standard(0x151, &[0x55]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x151, [0x55]).unwrap())
             .expect("driver should send a frame for frame-count stop");
         driver
-            .send_reliable(PiperFrame::new_standard(0x152, &[0x56]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x152, [0x56]).unwrap())
             .expect("driver should send the threshold frame for frame-count stop");
         wait_until(
             Duration::from_millis(200),
@@ -6394,7 +6394,7 @@ mod tests {
             "frame-count stop should request stop after the second recorded frame",
         );
         driver
-            .send_reliable(PiperFrame::new_standard(0x153, &[0x57]).unwrap())
+            .send_reliable(PiperFrame::new_standard(0x153, [0x57]).unwrap())
             .expect("driver should send a post-threshold frame");
         thread::sleep(Duration::from_millis(20));
 

@@ -221,7 +221,7 @@ mod tests {
     fn bootstrap_timestamp_frame() -> PiperFrame {
         PiperFrame::new_standard(
             piper_protocol::ids::ID_JOINT_FEEDBACK_12.raw().into(),
-            &[0; 8],
+            [0; 8],
         )
         .unwrap()
         .with_timestamp_us(1)
@@ -237,7 +237,7 @@ mod tests {
         data[4] = 50;
         data[5] = 0x00;
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        PiperFrame::new_standard(id, &data).unwrap().with_timestamp_us(timestamp_us)
+        PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     #[test]

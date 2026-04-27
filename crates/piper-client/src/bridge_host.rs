@@ -3300,7 +3300,7 @@ mod tests {
             }
         );
         assert_eq!(
-            manager.broadcast_frame(PiperFrame::new_extended(0x123, &[2]).unwrap()),
+            manager.broadcast_frame(PiperFrame::new_extended(0x123, [2]).unwrap()),
             BroadcastFrameStats {
                 dropped: 0,
                 inactive: 0

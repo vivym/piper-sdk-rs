@@ -1198,7 +1198,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
         data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
-        PiperFrame::new_standard(standard_id, &data)
+        PiperFrame::new_standard(standard_id, data)
             .unwrap()
             .with_timestamp_us(timestamp_us)
     }
@@ -1215,7 +1215,7 @@ mod tests {
         data[4..8].copy_from_slice(&0i32.to_be_bytes());
         PiperFrame::new_standard(
             ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1),
-            &data,
+            data,
         )
         .unwrap()
         .with_timestamp_us(timestamp_us)
@@ -1234,7 +1234,7 @@ mod tests {
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
         PiperFrame::new_standard(
             ID_JOINT_DRIVER_LOW_SPEED_BASE + u32::from(joint_index - 1),
-            &data,
+            data,
         )
         .unwrap()
         .with_timestamp_us(timestamp_us)

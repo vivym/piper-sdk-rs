@@ -1001,7 +1001,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
         data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
-        PiperFrame::new_standard(standard_id, &data)
+        PiperFrame::new_standard(standard_id, data)
             .unwrap()
             .with_timestamp_us(timestamp_us)
     }
@@ -1018,7 +1018,7 @@ mod tests {
         data[4..8].copy_from_slice(&0i32.to_be_bytes());
         PiperFrame::new_standard(
             ID_JOINT_DRIVER_HIGH_SPEED_BASE + u32::from(joint_index - 1),
-            &data,
+            data,
         )
         .unwrap()
         .with_timestamp_us(timestamp_us)
@@ -1032,7 +1032,7 @@ mod tests {
         data[4..6].copy_from_slice(&torque_raw);
         data[6] = 0b0100_0000;
 
-        PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw().into(), &data)
+        PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw().into(), data)
             .unwrap()
             .with_timestamp_us(timestamp_us)
     }
@@ -1049,11 +1049,11 @@ mod tests {
         data[4] = 50;
         data[5] = if enabled { 0x40 } else { 0x00 };
         data[6..8].copy_from_slice(&5000u16.to_be_bytes());
-        PiperFrame::new_standard(id, &data).unwrap().with_timestamp_us(timestamp_us)
+        PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn bootstrap_timestamp_frame() -> PiperFrame {
-        PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1)
+        PiperFrame::new_standard(0x251, [0; 8]).unwrap().with_timestamp_us(1)
     }
 
     fn end_pose_frame(
@@ -1065,7 +1065,7 @@ mod tests {
         let mut data = [0u8; 8];
         data[0..4].copy_from_slice(&first_raw.to_be_bytes());
         data[4..8].copy_from_slice(&second_raw.to_be_bytes());
-        PiperFrame::new_standard(standard_id, &data)
+        PiperFrame::new_standard(standard_id, data)
             .unwrap()
             .with_timestamp_us(timestamp_us)
     }
@@ -1078,7 +1078,7 @@ mod tests {
     ) -> PiperFrame {
         PiperFrame::new_standard(
             ID_ROBOT_STATUS.raw().into(),
-            &[control_mode, robot_status, move_mode, 0, 0, 0, 0, 0],
+            [control_mode, robot_status, move_mode, 0, 0, 0, 0, 0],
         )
         .unwrap()
         .with_timestamp_us(timestamp_us)
@@ -1188,7 +1188,7 @@ mod tests {
         data[4..6].copy_from_slice(&torque_raw);
         data[6] = 0b0100_0000; // enabled = true
 
-        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw().into(), &data).unwrap();
+        let frame = PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw().into(), data).unwrap();
         let driver = Arc::new(
             RobotPiper::new_dual_thread_parts(
                 ScriptedRxAdapter::new(vec![frame]),

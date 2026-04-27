@@ -428,7 +428,7 @@ mod tests {
         fn receive(&mut self) -> std::result::Result<piper_can::ReceivedFrame, CanError> {
             if !self.bootstrap_emitted {
                 self.bootstrap_emitted = true;
-                let frame = PiperFrame::new_standard(0x251, &[0; 8]).unwrap().with_timestamp_us(1);
+                let frame = PiperFrame::new_standard(0x251, [0; 8]).unwrap().with_timestamp_us(1);
                 return Ok(received(frame));
             }
             Err(CanError::Timeout)
