@@ -475,12 +475,23 @@ fn ctrlc_cancel_signal(
     install: &'static OnceLock<CtrlcInstallState>,
     installer: impl FnOnce() -> std::result::Result<Arc<AtomicBool>, String>,
 ) -> Result<Arc<AtomicBool>> {
-    match install.get_or_init(|| match installer() {
+    if let Some(state) = install.get() {
+        return ctrlc_signal_from_state(state, true);
+    }
+
+    let state = install.get_or_init(|| match installer() {
         Ok(cancel) => CtrlcInstallState::Installed(cancel),
         Err(error) => CtrlcInstallState::Failed(error),
-    }) {
+    });
+    ctrlc_signal_from_state(state, false)
+}
+
+fn ctrlc_signal_from_state(state: &CtrlcInstallState, reset: bool) -> Result<Arc<AtomicBool>> {
+    match state {
         CtrlcInstallState::Installed(cancel) => {
-            cancel.store(false, Ordering::SeqCst);
+            if reset {
+                cancel.store(false, Ordering::SeqCst);
+            }
             Ok(cancel.clone())
         },
         CtrlcInstallState::Failed(error) => {
@@ -1004,13 +1015,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrlc_initializer_reuses_same_arc_and_resets_flag() {
+    fn ctrlc_initializer_preserves_first_signal_and_resets_reused_flag() {
         static TEST_CTRL_C_INSTALL: OnceLock<CtrlcInstallState> = OnceLock::new();
 
         let first =
             ctrlc_cancel_signal(&TEST_CTRL_C_INSTALL, || Ok(Arc::new(AtomicBool::new(true))))
                 .expect("test ctrlc installer should initialize");
-        assert!(!first.load(Ordering::SeqCst));
+        assert!(first.load(Ordering::SeqCst));
 
         first.store(true, Ordering::SeqCst);
         let second = ctrlc_cancel_signal(&TEST_CTRL_C_INSTALL, || {
