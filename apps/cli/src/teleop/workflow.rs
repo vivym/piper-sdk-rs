@@ -1,14 +1,15 @@
 use anyhow::{Context, Result, bail};
 use piper_client::PiperBuilder;
 use piper_client::dual_arm::{
-    BilateralLoopConfig, BilateralRunReport, DualArmActiveMit, DualArmBuilder, DualArmCalibration,
-    DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby, JointMirrorMap,
+    BilateralExitReason, BilateralLoopConfig, BilateralRunReport, DualArmActiveMit, DualArmBuilder,
+    DualArmCalibration, DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby,
+    JointMirrorMap,
 };
 use piper_client::state::{DisableConfig, MitModeConfig};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -210,7 +211,12 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
         return Ok(TeleopExitStatus::Success);
     }
 
-    let active_snapshot = backend.active_snapshot(DualArmReadPolicy::default())?;
+    let active_snapshot = match backend.active_snapshot(DualArmReadPolicy::default()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return disable_active_after_error(backend, "active snapshot read failed", error);
+        },
+    };
     if let Err(error) = check_snapshot_posture(
         &calibration,
         &active_snapshot,
@@ -222,15 +228,40 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
         return Err(error).context("post-enable posture compatibility check failed");
     }
 
-    let settings = RuntimeTeleopSettings::production(calibration.clone())
-        .with_mode(resolved.control.mode)?
-        .with_track_gains(resolved.control.track_kp, resolved.control.track_kd)?
-        .with_master_damping(resolved.control.master_damping)?
-        .with_reflection_gain(resolved.control.reflection_gain)?;
-    let settings_handle = RuntimeTeleopSettingsHandle::new(settings)?;
+    let settings = match (|| {
+        RuntimeTeleopSettings::production(calibration.clone())
+            .with_mode(resolved.control.mode)?
+            .with_track_gains(resolved.control.track_kp, resolved.control.track_kd)?
+            .with_master_damping(resolved.control.master_damping)?
+            .with_reflection_gain(resolved.control.reflection_gain)
+    })() {
+        Ok(settings) => settings,
+        Err(error) => {
+            return disable_active_after_error(
+                backend,
+                "failed to build runtime teleop settings",
+                error,
+            );
+        },
+    };
+    let settings_handle = match RuntimeTeleopSettingsHandle::new(settings) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return disable_active_after_error(
+                backend,
+                "failed to initialize runtime teleop settings",
+                error,
+            );
+        },
+    };
     let initial_mode = settings_handle.snapshot().mode;
     let started_at = Instant::now();
-    let console_handle = io.start_console(settings_handle.clone(), started_at)?;
+    let console_handle = match io.start_console(settings_handle.clone(), started_at) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return disable_active_after_error(backend, "failed to start teleop console", error);
+        },
+    };
 
     let loop_exit = backend.run_loop(
         RuntimeTeleopController::new(settings_handle.clone()),
@@ -258,6 +289,22 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
     inspect_finished_console(console_handle)?;
 
     Ok(classify_exit(loop_exit.faulted, &loop_exit.report))
+}
+
+fn disable_active_after_error<B, T>(
+    backend: &mut B,
+    context: &'static str,
+    error: anyhow::Error,
+) -> Result<T>
+where
+    B: TeleopBackend,
+{
+    if let Err(disable_error) = backend.disable_active() {
+        return Err(error.context(format!(
+            "{context}; additionally failed to disable active teleop: {disable_error:#}"
+        )));
+    }
+    Err(error.context(context))
 }
 
 fn load_calibration(path: &Path) -> Result<(CalibrationFile, DualArmCalibration)> {
@@ -306,7 +353,6 @@ fn inspect_finished_console(handle: Option<JoinHandle<Result<()>>>) -> Result<()
 pub struct RealTeleopBackend {
     standby: Option<DualArmStandby>,
     active: Option<DualArmActiveMit>,
-    disabled_or_faulted: bool,
 }
 
 impl TeleopBackend for RealTeleopBackend {
@@ -320,7 +366,6 @@ impl TeleopBackend for RealTeleopBackend {
 
         self.standby = Some(DualArmBuilder::new(master_builder, slave_builder).build()?);
         self.active = None;
-        self.disabled_or_faulted = false;
         Ok(())
     }
 
@@ -347,7 +392,6 @@ impl TeleopBackend for RealTeleopBackend {
         let standby = self.standby.take().context("dual-arm backend is not in standby")?;
         let active = standby.enable_mit(master, slave)?;
         self.active = Some(active);
-        self.disabled_or_faulted = false;
         Ok(EnableOutcome::Active)
     }
 
@@ -355,7 +399,6 @@ impl TeleopBackend for RealTeleopBackend {
         let active = self.active.take().context("dual-arm backend is not active")?;
         let standby = active.disable_both(DisableConfig::default())?;
         self.standby = Some(standby);
-        self.disabled_or_faulted = true;
         Ok(())
     }
 
@@ -371,22 +414,31 @@ impl TeleopBackend for RealTeleopBackend {
     ) -> Result<TeleopLoopExit> {
         let active = self.active.take().context("dual-arm backend is not active")?;
 
-        match active.run_bilateral(controller, cfg)? {
-            DualArmLoopExit::Standby { arms, report } => {
+        match active.run_bilateral(controller, cfg) {
+            Err(error) => {
+                // The SDK consumed the active state before returning this error. Classify this as
+                // a runtime transport fault so the CLI still emits a non-success report instead of
+                // dropping report generation entirely.
+                Ok(TeleopLoopExit {
+                    faulted: true,
+                    report: BilateralRunReport {
+                        exit_reason: Some(BilateralExitReason::RuntimeTransportFault),
+                        last_error: Some(error.to_string()),
+                        ..BilateralRunReport::default()
+                    },
+                })
+            },
+            Ok(DualArmLoopExit::Standby { arms, report }) => {
                 self.standby = Some(arms);
-                self.disabled_or_faulted = true;
                 Ok(TeleopLoopExit {
                     faulted: false,
                     report,
                 })
             },
-            DualArmLoopExit::Faulted { arms: _, report } => {
-                self.disabled_or_faulted = true;
-                Ok(TeleopLoopExit {
-                    faulted: true,
-                    report,
-                })
-            },
+            Ok(DualArmLoopExit::Faulted { arms: _, report }) => Ok(TeleopLoopExit {
+                faulted: true,
+                report,
+            }),
         }
     }
 }
@@ -397,12 +449,32 @@ pub struct RealTeleopIo {
 
 impl RealTeleopIo {
     pub fn install_ctrlc() -> Result<Self> {
+        static CTRL_C_CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+        if let Some(cancel) = CTRL_C_CANCEL.get() {
+            cancel.store(false, Ordering::SeqCst);
+            return Ok(Self {
+                cancel: cancel.clone(),
+            });
+        }
+
         let cancel = Arc::new(AtomicBool::new(false));
         let handler_cancel = cancel.clone();
         ctrlc::set_handler(move || {
             handler_cancel.store(true, Ordering::SeqCst);
         })
         .context("failed to install Ctrl+C handler")?;
+
+        if CTRL_C_CANCEL.set(cancel.clone()).is_err() {
+            let existing = CTRL_C_CANCEL
+                .get()
+                .context("Ctrl+C cancel signal initialized concurrently but unavailable")?;
+            existing.store(false, Ordering::SeqCst);
+            return Ok(Self {
+                cancel: existing.clone(),
+            });
+        }
+
         Ok(Self { cancel })
     }
 }
@@ -444,10 +516,22 @@ impl TeleopIo for RealTeleopIo {
 fn print_startup_summary(summary: &StartupSummary) -> Result<()> {
     let mut stderr = io::stderr().lock();
     writeln!(stderr, "teleop dual-arm startup summary")?;
-    writeln!(stderr, "  master target: {:?}", summary.targets.master)?;
-    writeln!(stderr, "  slave target: {:?}", summary.targets.slave)?;
-    writeln!(stderr, "  mode: {:?}", summary.mode)?;
-    writeln!(stderr, "  profile: {:?}", summary.profile)?;
+    writeln!(
+        stderr,
+        "  master target: {}",
+        format_target_for_operator(&summary.targets.master)
+    )?;
+    writeln!(
+        stderr,
+        "  slave target: {}",
+        format_target_for_operator(&summary.targets.slave)
+    )?;
+    writeln!(stderr, "  mode: {}", format_mode_for_operator(summary.mode))?;
+    writeln!(
+        stderr,
+        "  profile: {}",
+        format_profile_for_operator(summary.profile)
+    )?;
     writeln!(stderr, "  frequency: {:.1} Hz", summary.frequency_hz)?;
     writeln!(
         stderr,
@@ -471,6 +555,8 @@ fn print_startup_summary(summary: &StartupSummary) -> Result<()> {
 
 fn read_yes_from_stdin_unless_cancelled(cancel: &Arc<AtomicBool>) -> Result<bool> {
     let (tx, rx) = mpsc::channel();
+    // If Ctrl+C wins this race, this one-shot CLI path may leave one stdin reader thread blocked
+    // until process exit or terminal input arrives. That is preferable to blocking orchestration.
     thread::spawn(move || {
         let mut line = String::new();
         let result = io::stdin().read_line(&mut line).map(|_| line);
@@ -493,6 +579,34 @@ fn read_yes_from_stdin_unless_cancelled(cancel: &Arc<AtomicBool>) -> Result<bool
                 bail!("operator confirmation reader stopped unexpectedly");
             },
         }
+    }
+}
+
+fn format_target_for_operator(target: &crate::teleop::target::ConcreteTeleopTarget) -> String {
+    match target {
+        crate::teleop::target::ConcreteTeleopTarget::SocketCan { iface } => {
+            format!("socketcan:{iface}")
+        },
+        crate::teleop::target::ConcreteTeleopTarget::GsUsbSerial { serial } => {
+            format!("gs-usb-serial:{serial}")
+        },
+        crate::teleop::target::ConcreteTeleopTarget::GsUsbBusAddress { bus, address } => {
+            format!("gs-usb-bus-address:{bus}:{address}")
+        },
+    }
+}
+
+fn format_mode_for_operator(mode: TeleopMode) -> &'static str {
+    match mode {
+        TeleopMode::MasterFollower => "master-follower",
+        TeleopMode::Bilateral => "bilateral",
+    }
+}
+
+fn format_profile_for_operator(profile: TeleopProfile) -> &'static str {
+    match profile {
+        TeleopProfile::Production => "production",
+        TeleopProfile::Debug => "debug",
     }
 }
 
@@ -571,6 +685,7 @@ mod tests {
         health_failure: bool,
         standby_mismatch: bool,
         active_mismatch: bool,
+        active_snapshot_error: bool,
         enable_error: bool,
         disabled_or_faulted: Arc<AtomicBool>,
         loop_exit: TeleopLoopExit,
@@ -583,6 +698,7 @@ mod tests {
                 health_failure: false,
                 standby_mismatch: false,
                 active_mismatch: false,
+                active_snapshot_error: false,
                 enable_error: false,
                 disabled_or_faulted: Arc::new(AtomicBool::new(false)),
                 loop_exit: TeleopLoopExit {
@@ -597,6 +713,13 @@ mod tests {
     }
 
     impl FakeTeleopBackend {
+        fn with_trace(trace: WorkflowTrace) -> Self {
+            Self {
+                trace,
+                ..Self::default()
+            }
+        }
+
         fn with_unhealthy_runtime() -> Self {
             Self {
                 health_failure: true,
@@ -614,6 +737,13 @@ mod tests {
         fn with_active_snapshot_mismatch() -> Self {
             Self {
                 active_mismatch: true,
+                ..Self::default()
+            }
+        }
+
+        fn with_active_snapshot_error() -> Self {
+            Self {
+                active_snapshot_error: true,
                 ..Self::default()
             }
         }
@@ -700,6 +830,9 @@ mod tests {
 
         fn active_snapshot(&self, _policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
             self.trace.push(WorkflowCall::ActiveSnapshot);
+            if self.active_snapshot_error {
+                bail!("active snapshot read failed");
+            }
             Ok(sample_snapshot(self.active_mismatch))
         }
 
@@ -722,6 +855,7 @@ mod tests {
         cancel_during_enable: bool,
         cancel_checks: Arc<Mutex<usize>>,
         report_write_error: bool,
+        console_start_error: bool,
         console_finished_error: bool,
     }
 
@@ -735,6 +869,7 @@ mod tests {
                 cancel_during_enable: false,
                 cancel_checks: Arc::new(Mutex::new(0)),
                 report_write_error: false,
+                console_start_error: false,
                 console_finished_error: false,
             }
         }
@@ -786,6 +921,13 @@ mod tests {
             }
         }
 
+        fn start_console_error() -> Self {
+            Self {
+                console_start_error: true,
+                ..Self::default()
+            }
+        }
+
         fn report_and_console_error_with_trace(trace: WorkflowTrace) -> Self {
             Self {
                 trace,
@@ -825,6 +967,9 @@ mod tests {
             _started_at: Instant,
         ) -> Result<Option<JoinHandle<Result<()>>>> {
             self.trace.push(WorkflowCall::StartConsole);
+            if self.console_start_error {
+                bail!("console failed to start");
+            }
             if self.console_finished_error {
                 let handle = std::thread::spawn(|| bail!("console finished with error"));
                 while !handle.is_finished() {
@@ -959,6 +1104,47 @@ mod tests {
 
         assert!(err.to_string().contains("posture"));
         assert!(backend.calls().contains(&WorkflowCall::DisableActive));
+        assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn active_snapshot_read_error_after_enable_disables_and_does_not_run_loop() {
+        let backend = FakeTeleopBackend::with_active_snapshot_error();
+
+        let err = run_workflow_for_test(valid_args(), backend.clone())
+            .expect_err("active snapshot read failure should fail");
+
+        assert!(err.to_string().contains("active snapshot"));
+        assert_call_order(
+            backend.calls(),
+            &[
+                WorkflowCall::Enable,
+                WorkflowCall::ActiveSnapshot,
+                WorkflowCall::DisableActive,
+            ],
+        );
+        assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn start_console_error_after_enable_disables_and_does_not_run_loop() {
+        let trace = WorkflowTrace::default();
+        let backend = FakeTeleopBackend::with_trace(trace.clone());
+        let mut io = FakeTeleopIo::start_console_error();
+        io.trace = trace.clone();
+
+        let err = run_workflow_for_test_with_io(valid_args(), backend.clone(), io)
+            .expect_err("console startup failure should fail");
+
+        assert!(err.to_string().contains("console"));
+        assert_call_order(
+            trace.calls(),
+            &[
+                WorkflowCall::Enable,
+                WorkflowCall::StartConsole,
+                WorkflowCall::DisableActive,
+            ],
+        );
         assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
     }
 
