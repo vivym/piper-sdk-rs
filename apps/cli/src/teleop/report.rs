@@ -571,6 +571,15 @@ mod tests {
         readonly.set_mode(0o555);
         fs::set_permissions(dir.path(), readonly).unwrap();
 
+        let probe_path = dir.path().join(".permission-probe.tmp");
+        if fs::File::options().write(true).create_new(true).open(&probe_path).is_ok() {
+            let _ = fs::remove_file(&probe_path);
+            let mut restored = fs::metadata(dir.path()).unwrap().permissions();
+            restored.set_mode(original_mode);
+            fs::set_permissions(dir.path(), restored).unwrap();
+            return;
+        }
+
         let result = write_json_report(&path, &sample_json_report());
 
         let mut restored = fs::metadata(dir.path()).unwrap().permissions();
