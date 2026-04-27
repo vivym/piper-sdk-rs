@@ -58,9 +58,10 @@ be written after the arms were already disabled or faulted.
 
 Unsupported runtime targets are rejected before hardware connect. Posture
 mismatch and Ctrl+C before MIT enable stop startup without entering active
-control. After enable, read faults, command submission faults, controller
-faults, and Ctrl+C trigger bounded shutdown behavior; the CLI attempts to stop
-both arms and records the per-arm stop attempt result.
+control. After enable, clean cancellation and `max_iterations` exit through
+normal disable. Read, controller, and compensation faults also attempt to return
+both arms to standby when possible. Submission faults and runtime transport
+faults use the SDK fault-shutdown path and record per-arm stop-attempt results.
 
 ## Stop Attempt Results
 
@@ -69,8 +70,14 @@ JSON reports store the same values at `metrics.master_stop_attempt` and
 `metrics.slave_stop_attempt`.
 
 Possible values are `not_attempted`, `confirmed_sent`, `timeout`,
-`channel_closed`, `queue_rejected`, and `transport_failed`. Treat anything other
-than `confirmed_sent` as requiring operator inspection before the next run.
+`channel_closed`, `queue_rejected`, and `transport_failed`. `not_attempted` is
+expected for clean normal-disable exits such as `cancelled` and
+`max_iterations`, and it can also appear when a non-clean path returned to
+standby without using fault shutdown. For submission or runtime transport
+faults, inspect these per-arm fields before the next run; `confirmed_sent` means
+the fault-shutdown stop command was accepted, while timeout, closed-channel,
+queue-rejected, or transport-failed values require hardware and CAN-link
+inspection.
 
 ## JSON Report Schema
 
