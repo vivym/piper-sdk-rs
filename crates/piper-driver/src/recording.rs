@@ -173,8 +173,8 @@ pub struct AsyncRecordingHook {
     /// 帧计数器（每次成功发送时递增）
     frame_counter: Arc<AtomicU64>,
 
-    /// 停止条件：当收到此 CAN ID 时停止录制（None 表示不启用）
-    stop_on_id: Option<u32>,
+    /// 停止条件：当收到此 typed CAN ID 时停止录制（None 表示不启用）
+    stop_on_id: Option<CanId>,
 
     /// 停止条件：达到指定录制时长后自动停止。
     stop_deadline: Option<Instant>,
@@ -228,7 +228,7 @@ impl AsyncRecordingHook {
     /// 创建新的录制钩子（带自动停止条件）
     #[must_use]
     pub fn with_auto_stop(
-        stop_on_id: Option<u32>,
+        stop_on_id: Option<CanId>,
         stop_duration: Option<Duration>,
         stop_after_frame_count: Option<u64>,
     ) -> (Self, Receiver<TimestampedFrame>) {
@@ -267,12 +267,14 @@ impl AsyncRecordingHook {
     ///
     /// ```rust
     /// use piper_driver::recording::AsyncRecordingHook;
+    /// use piper_protocol::CanId;
     ///
     /// // 当收到 0x2A4 时停止录制（末端位姿帧）
-    /// let (hook, rx) = AsyncRecordingHook::with_stop_condition(Some(0x2A4));
+    /// let stop_id = CanId::standard(0x2A4).unwrap();
+    /// let (hook, rx) = AsyncRecordingHook::with_stop_condition(Some(stop_id));
     /// ```
     #[must_use]
-    pub fn with_stop_condition(stop_on_id: Option<u32>) -> (Self, Receiver<TimestampedFrame>) {
+    pub fn with_stop_condition(stop_on_id: Option<CanId>) -> (Self, Receiver<TimestampedFrame>) {
         Self::with_auto_stop(stop_on_id, None, None)
     }
 
@@ -472,7 +474,6 @@ impl FrameCallback for AsyncRecordingHook {
     /// assert!(recorded.timestamp_us() < 99_000);
     /// ```
     #[inline]
-    #[allow(clippy::collapsible_if)] // 嵌套 if 结构更清晰：先检查 Option，再比较 ID
     fn on_frame(&self, event: RecordedFrameEvent) {
         if self.stop_requested.load(Ordering::Acquire) {
             return;
@@ -491,14 +492,13 @@ impl FrameCallback for AsyncRecordingHook {
         self.try_record_event(event);
 
         // 2. 再检查停止条件（原子操作，极快）
-        if event.direction == RecordedFrameDirection::Rx {
-            if let Some(stop_id) = self.stop_on_id
-                && event.frame.raw_id() == stop_id
-            {
-                // ✅ 原子存储，不会阻塞
-                self.stop_requested.store(true, Ordering::SeqCst);
-                // ✅ 注意：不使用 return，因为已经记录了触发帧
-            }
+        if event.direction == RecordedFrameDirection::Rx
+            && let Some(stop_id) = self.stop_on_id
+            && event.frame.id() == stop_id
+        {
+            // ✅ 原子存储，不会阻塞
+            self.stop_requested.store(true, Ordering::SeqCst);
+            // ✅ 注意：不使用 return，因为已经记录了触发帧
         }
     }
 }
@@ -513,6 +513,10 @@ mod tests {
 
     fn frame_with_timestamp(id: u32, data: &[u8], timestamp_us: u64) -> PiperFrame {
         PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
+    }
+
+    fn extended_frame_with_timestamp(id: u32, data: &[u8], timestamp_us: u64) -> PiperFrame {
+        PiperFrame::new_extended(id, data).unwrap().with_timestamp_us(timestamp_us)
     }
 
     fn event(
@@ -810,6 +814,61 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "expired duration stop must reject new frames"
+        );
+    }
+
+    #[test]
+    fn standard_stop_condition_does_not_match_extended_frame_with_same_raw_id() {
+        let stop_id = CanId::standard(0x123).unwrap();
+        let (hook, rx) = AsyncRecordingHook::with_stop_condition(Some(stop_id));
+        let stop_requested = hook.stop_requested().clone();
+        let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+
+        callback.on_frame(event(
+            extended_frame_with_timestamp(0x123, &[1], 100),
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
+        callback.on_frame(event(
+            frame_with_timestamp(0x124, &[2], 200),
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
+
+        let first = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        let second = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+
+        assert_eq!(first.id(), CanId::extended(0x123).unwrap());
+        assert_eq!(second.id(), CanId::standard(0x124).unwrap());
+        assert!(
+            !stop_requested.load(Ordering::Acquire),
+            "extended frame with the same raw value must not satisfy a standard stop condition"
+        );
+    }
+
+    #[test]
+    fn matching_can_id_stop_condition_records_triggering_frame_before_stopping() {
+        let stop_id = CanId::extended(0x123).unwrap();
+        let (hook, rx) = AsyncRecordingHook::with_stop_condition(Some(stop_id));
+        let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
+
+        callback.on_frame(event(
+            extended_frame_with_timestamp(0x123, &[1], 100),
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
+        callback.on_frame(event(
+            frame_with_timestamp(0x124, &[2], 200),
+            RecordedFrameDirection::Rx,
+            TimestampProvenance::Hardware,
+        ));
+
+        let trigger = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(trigger.id(), stop_id);
+        assert_eq!(trigger.data(), &[1]);
+        assert!(
+            rx.try_recv().is_err(),
+            "frames after the matching stop condition must be ignored"
         );
     }
 
