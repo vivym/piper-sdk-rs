@@ -4813,12 +4813,20 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let standby = build_standby_piper(IdleRxAdapter::new(), sent.clone());
         let config = MitModeConfig {
-            timeout: Duration::from_millis(1),
+            timeout: Duration::from_millis(20),
             poll_interval: Duration::from_millis(1),
             ..MitModeConfig::default()
         };
+        let enable_all = MotorEnableCommand::enable_all().to_frame();
 
-        let err = match standby.enable_mit_mode(config) {
+        let enable_handle = thread::spawn(move || standby.enable_mit_mode(config));
+        wait_until(
+            Duration::from_secs(1),
+            || sent.lock().expect("sent frames lock").contains(&enable_all),
+            "enable_all must be dispatched before forcing confirmation timeout",
+        );
+
+        let err = match enable_handle.join().expect("enable_mit_mode thread should finish") {
             Ok(_) => panic!("enable confirmation timeout must fail"),
             Err(err) => err,
         };
