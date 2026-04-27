@@ -203,7 +203,7 @@ mod tests {
 #[test]
 fn test_socketcan_adapter_send_standard_frame() {
     let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
-    let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+    let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap();
 
     let result = adapter.send(frame);
     assert!(result.is_ok());
@@ -212,7 +212,7 @@ fn test_socketcan_adapter_send_standard_frame() {
 #[test]
 fn test_socketcan_adapter_send_extended_frame() {
     let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
-    let frame = PiperFrame::new_extended(0x12345678, &[0xFF; 8]);
+    let frame = PiperFrame::new_extended(0x12345678, &[0xFF; 8]).unwrap();
 
     let result = adapter.send(frame);
     assert!(result.is_ok());
@@ -221,7 +221,7 @@ fn test_socketcan_adapter_send_extended_frame() {
 #[test]
 fn test_socketcan_adapter_send_empty_frame() {
     let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
-    let frame = PiperFrame::new_standard(0x123, &[]);
+    let frame = PiperFrame::new_standard(0x123, &[]).unwrap();
 
     let result = adapter.send(frame);
     assert!(result.is_ok());
@@ -271,7 +271,7 @@ fn test_socketcan_adapter_receive_standard_frame() {
     let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
 
     // 先发送一个帧（另一个线程或外部工具）
-    let tx_frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+    let tx_frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap();
     adapter.send(tx_frame).unwrap();
 
     // 接收帧
@@ -286,7 +286,7 @@ fn test_socketcan_adapter_receive_standard_frame() {
 fn test_socketcan_adapter_receive_extended_frame() {
     let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
 
-    let tx_frame = PiperFrame::new_extended(0x12345678, &[0xFF; 8]);
+    let tx_frame = PiperFrame::new_extended(0x12345678, &[0xFF; 8]).unwrap();
     adapter.send(tx_frame).unwrap();
 
     let rx_frame = adapter.receive().unwrap();
@@ -563,7 +563,7 @@ fn test_socketcan_adapter_receive_includes_timestamp() {
     let mut adapter = SocketCanAdapter::new("vcan0").unwrap();
 
     // 发送帧
-    let tx_frame = PiperFrame::new_standard(0x123, &[1, 2, 3]);
+    let tx_frame = PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap();
     adapter.send(tx_frame).unwrap();
 
     // 接收帧，检查时间戳

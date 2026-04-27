@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn test_piper_frame_new_standard() {
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        let frame = PiperFrame::new_standard(0x123, &data[..4]);
+        let frame = PiperFrame::new_standard(0x123, &data[..4]).unwrap();
 
         assert_eq!(frame.raw_id(), 0x123);
         assert_eq!(frame.dlc(), 4);
@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn test_piper_frame_new_extended() {
         let data = [0xFF; 8];
-        let frame = PiperFrame::new_extended(0x12345678, &data);
+        let frame = PiperFrame::new_extended(0x12345678, &data).unwrap();
 
         assert_eq!(frame.raw_id(), 0x12345678);
         assert_eq!(frame.dlc(), 8);
@@ -79,21 +79,19 @@ mod tests {
     }
 
     #[test]
-    fn test_piper_frame_data_truncation() {
-        // 超过 8 字节的数据应该被截断
+    fn test_piper_frame_rejects_long_payload() {
+        // 超过 8 字节的数据应该被拒绝
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A];
-        let frame = PiperFrame::new_standard(0x123, &data);
 
-        assert_eq!(frame.dlc(), 8); // 应该截断到 8
-        assert_eq!(frame.data()[7], 0x08);
+        assert!(PiperFrame::new_standard(0x123, &data).is_err());
     }
 
     #[test]
     fn test_piper_frame_data_slice() {
         let data = [0x01, 0x02, 0x03];
-        let frame = PiperFrame::new_standard(0x123, &data);
+        let frame = PiperFrame::new_standard(0x123, &data).unwrap();
 
-        let slice = frame.data_slice();
+        let slice = frame.data();
         assert_eq!(slice.len(), 3);
         assert_eq!(slice, &[0x01, 0x02, 0x03]);
     }
@@ -101,10 +99,10 @@ mod tests {
     #[test]
     fn test_piper_frame_copy_trait() {
         // 验证 Copy trait（零成本复制）
-        let frame1 = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+        let frame1 = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
         let frame2 = frame1; // 应该复制，不是移动
 
-        assert_eq!(frame1.id, frame2.id); // frame1 仍然可用
+        assert_eq!(frame1.id(), frame2.id()); // frame1 仍然可用
     }
 }
 ```
@@ -188,11 +186,11 @@ mod tests {
             receive_index: 0,
         };
 
-        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]);
+        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
         adapter.send(frame).unwrap();
 
         assert_eq!(adapter.sent_frames.len(), 1);
-        assert_eq!(adapter.sent_frames[0].id, 0x123);
+        assert_eq!(adapter.sent_frames[0].raw_id(), 0x123);
     }
 }
 ```
@@ -666,7 +664,7 @@ mod tests {
         let mut adapter = GsUsbCanAdapter::new(...);
         // adapter 未调用 configure()
 
-        let frame = PiperFrame::new_standard(0x123, &[0x01]);
+        let frame = PiperFrame::new_standard(0x123, &[0x01]).unwrap();
         let result = adapter.send(frame);
 
         assert!(matches!(result, Err(CanError::NotStarted)));
@@ -774,7 +772,7 @@ fn test_1khz_send_performance() {
     let mut adapter = GsUsbCanAdapter::new().unwrap();
     adapter.configure(500_000).unwrap();
 
-    let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]);
+    let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02, 0x03, 0x04]).unwrap();
 
     let start = std::time::Instant::now();
     let mut count = 0;
