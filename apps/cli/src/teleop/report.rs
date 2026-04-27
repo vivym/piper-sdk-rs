@@ -1,10 +1,13 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
+use piper_client::RuntimeFaultKind;
 use piper_client::dual_arm::{
     BilateralExitReason, BilateralRunReport, StopAttemptResult, SubmissionArm,
 };
 use serde::Serialize;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -178,69 +181,135 @@ impl TeleopJsonReport {
                 slave_stop_attempt: format_stop_attempt(report.right_stop_attempt).to_string(),
                 master_runtime_fault: report
                     .last_runtime_fault_left
-                    .map(|fault| debug_to_snake_case(&format!("{fault:?}"))),
+                    .map(format_runtime_fault)
+                    .map(str::to_string),
                 slave_runtime_fault: report
                     .last_runtime_fault_right
-                    .map(|fault| debug_to_snake_case(&format!("{fault:?}"))),
+                    .map(format_runtime_fault)
+                    .map(str::to_string),
             },
         }
     }
 }
 
 #[allow(dead_code)]
-pub fn print_human_report(report: &TeleopJsonReport) {
-    println!("teleop dual-arm report");
-    println!(
-        "exit: clean={} reason={} faulted={}",
+pub fn print_human_report(report: &TeleopJsonReport, elapsed: Duration) {
+    let _ = write_human_report(io::stdout().lock(), report, elapsed);
+}
+
+pub fn write_human_report<W: Write>(
+    mut writer: W,
+    report: &TeleopJsonReport,
+    elapsed: Duration,
+) -> io::Result<()> {
+    writeln!(writer, "teleop dual-arm report")?;
+    writeln!(
+        writer,
+        "exit: clean={} reason={} faulted={} elapsed_us={}",
         report.exit.clean,
         report.exit.reason.as_deref().unwrap_or("unknown"),
-        report.exit.faulted
-    );
-    println!(
+        report.exit.faulted,
+        duration_us(elapsed)
+    )?;
+    writeln!(
+        writer,
         "mode: {} -> {} profile={}",
         report.mode.initial, report.mode.final_, report.profile
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "targets: master={} slave={}",
         report.targets.master, report.targets.slave
-    );
-    println!(
-        "metrics: iterations={} read_faults={} submission_faults={} deadline_misses={}",
+    )?;
+    writeln!(
+        writer,
+        "metrics: iterations={} read_faults={} submission_faults={} last_submission_failed_role={} peer_command_may_have_applied={} deadline_misses={}",
         report.metrics.iterations,
         report.metrics.read_faults,
         report.metrics.submission_faults,
+        report.metrics.last_submission_failed_role.as_deref().unwrap_or("none"),
+        report.metrics.peer_command_may_have_applied,
         report.metrics.deadline_misses
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "timing: max_inter_arm_skew_us={} max_real_dt_us={} max_cycle_lag_us={}",
         report.metrics.max_inter_arm_skew_us,
         report.metrics.max_real_dt_us,
         report.metrics.max_cycle_lag_us
-    );
-    println!(
-        "master: tx_frames={} overwrites={} fault_aborts={} stop_attempt={}",
+    )?;
+    writeln!(
+        writer,
+        "master: tx_frames={} overwrites={} fault_aborts={} stop_attempt={} master_runtime_fault={}",
         report.metrics.master_tx_frames_sent_total,
         report.metrics.master_tx_realtime_overwrites_total,
         report.metrics.master_tx_fault_aborts_total,
-        report.metrics.master_stop_attempt
-    );
-    println!(
-        "slave: tx_frames={} overwrites={} fault_aborts={} stop_attempt={}",
+        report.metrics.master_stop_attempt,
+        report.metrics.master_runtime_fault.as_deref().unwrap_or("none")
+    )?;
+    writeln!(
+        writer,
+        "slave: tx_frames={} overwrites={} fault_aborts={} stop_attempt={} slave_runtime_fault={}",
         report.metrics.slave_tx_frames_sent_total,
         report.metrics.slave_tx_realtime_overwrites_total,
         report.metrics.slave_tx_fault_aborts_total,
-        report.metrics.slave_stop_attempt
-    );
+        report.metrics.slave_stop_attempt,
+        report.metrics.slave_runtime_fault.as_deref().unwrap_or("none")
+    )?;
     if let Some(last_error) = &report.exit.last_error {
-        println!("last_error: {last_error}");
+        writeln!(writer, "last_error: {last_error}")?;
     }
+    Ok(())
 }
 
 pub fn write_json_report(path: &Path, report: &TeleopJsonReport) -> Result<()> {
     let contents =
         serde_json::to_string_pretty(report).context("failed to serialize teleop report")?;
-    std::fs::write(path, contents)
+    publish_report_atomically(path, contents.as_bytes())
         .with_context(|| format!("failed to write teleop report {}", path.display()))
+}
+
+fn publish_report_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+    let dir = parent.unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "report path has no file name"))?
+        .to_string_lossy();
+    let temp_path = dir.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        unique_temp_suffix()
+    ));
+
+    let result = (|| {
+        let mut file = File::options().write(true).create_new(true).open(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        sync_directory(dir);
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    result
+}
+
+fn unique_temp_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn sync_directory(dir: &Path) {
+    if let Ok(file) = File::open(dir) {
+        let _ = file.sync_all();
+    }
 }
 
 fn duration_us(duration: Duration) -> u64 {
@@ -309,19 +378,13 @@ fn format_submission_arm(arm: SubmissionArm) -> &'static str {
     }
 }
 
-fn debug_to_snake_case(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for (index, ch) in value.chars().enumerate() {
-        if ch.is_ascii_uppercase() {
-            if index > 0 {
-                output.push('_');
-            }
-            output.push(ch.to_ascii_lowercase());
-        } else {
-            output.push(ch);
-        }
+fn format_runtime_fault(fault: RuntimeFaultKind) -> &'static str {
+    match fault {
+        RuntimeFaultKind::RxExited => "rx_exited",
+        RuntimeFaultKind::TxExited => "tx_exited",
+        RuntimeFaultKind::TransportError => "transport_error",
+        RuntimeFaultKind::ManualFault => "manual_fault",
     }
-    output
 }
 
 #[cfg(test)]
@@ -331,9 +394,13 @@ mod tests {
         TeleopControlSettings, TeleopMode, TeleopProfile, TeleopSafetySettings,
     };
     use crate::teleop::target::{ConcreteTeleopTarget, RoleTargets, TeleopPlatform};
+    use piper_client::RuntimeFaultKind;
     use piper_client::dual_arm::{
         BilateralExitReason, BilateralRunReport, StopAttemptResult, SubmissionArm,
     };
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     #[test]
@@ -392,6 +459,52 @@ mod tests {
     }
 
     #[test]
+    fn json_report_maps_all_left_right_sdk_metrics_to_master_slave() {
+        let json = serde_json::to_value(sample_json_report()).unwrap();
+
+        assert_eq!(json["metrics"]["master_tx_frames_sent_total"], 6);
+        assert_eq!(json["metrics"]["slave_tx_frames_sent_total"], 7);
+        assert_eq!(json["metrics"]["master_tx_realtime_overwrites_total"], 4);
+        assert_eq!(json["metrics"]["slave_tx_realtime_overwrites_total"], 5);
+        assert_eq!(json["metrics"]["master_tx_fault_aborts_total"], 8);
+        assert_eq!(json["metrics"]["slave_tx_fault_aborts_total"], 9);
+        assert_eq!(json["metrics"]["master_stop_attempt"], "confirmed_sent");
+        assert_eq!(json["metrics"]["slave_stop_attempt"], "queue_rejected");
+    }
+
+    #[test]
+    fn json_report_maps_right_submission_arm_to_slave() {
+        let sdk_report = BilateralRunReport {
+            last_submission_failed_arm: Some(SubmissionArm::Right),
+            exit_reason: Some(BilateralExitReason::SubmissionFault),
+            ..BilateralRunReport::default()
+        };
+
+        let json =
+            serde_json::to_value(TeleopJsonReport::from_run(sample_input(false, &sdk_report)))
+                .unwrap();
+
+        assert_eq!(json["metrics"]["last_submission_failed_role"], "slave");
+    }
+
+    #[test]
+    fn json_report_maps_runtime_faults_with_explicit_stable_names() {
+        let sdk_report = BilateralRunReport {
+            last_runtime_fault_left: Some(RuntimeFaultKind::RxExited),
+            last_runtime_fault_right: Some(RuntimeFaultKind::TransportError),
+            exit_reason: Some(BilateralExitReason::RuntimeTransportFault),
+            ..BilateralRunReport::default()
+        };
+
+        let json =
+            serde_json::to_value(TeleopJsonReport::from_run(sample_input(true, &sdk_report)))
+                .unwrap();
+
+        assert_eq!(json["metrics"]["master_runtime_fault"], "rx_exited");
+        assert_eq!(json["metrics"]["slave_runtime_fault"], "transport_error");
+    }
+
+    #[test]
     fn json_null_fields_are_present_as_null() {
         let json = serde_json::to_value(sample_json_report_without_optionals()).unwrap();
 
@@ -404,20 +517,68 @@ mod tests {
     }
 
     #[test]
-    fn write_json_report_writes_pretty_json_to_temp_file() {
+    fn human_report_includes_required_diagnostics() {
+        let mut output = Vec::new();
+        let report = sample_json_report();
+
+        write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("elapsed_us=9876"));
+        assert!(output.contains("last_submission_failed_role=master"));
+        assert!(output.contains("peer_command_may_have_applied=true"));
+        assert!(output.contains("master_runtime_fault=none"));
+        assert!(output.contains("slave_runtime_fault=none"));
+    }
+
+    #[test]
+    fn write_json_report_overwrites_existing_report_via_temp_publish() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("teleop-report.json");
+        fs::write(&path, "old report").unwrap();
         let report = sample_json_report();
 
         write_json_report(&path, &report).unwrap();
 
-        let contents = std::fs::read_to_string(path).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.starts_with("{\n"));
         assert!(contents.contains("  \"schema_version\": 1"));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&contents).unwrap(),
             serde_json::to_value(report).unwrap()
         );
+        let temp_entries = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".teleop-report.json.") && name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(
+            temp_entries.is_empty(),
+            "leftover temp files: {temp_entries:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_report_preserves_existing_report_if_temp_publish_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teleop-report.json");
+        let original = "existing valid report";
+        fs::write(&path, original).unwrap();
+
+        let original_mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+        let mut readonly = fs::metadata(dir.path()).unwrap().permissions();
+        readonly.set_mode(0o555);
+        fs::set_permissions(dir.path(), readonly).unwrap();
+
+        let result = write_json_report(&path, &sample_json_report());
+
+        let mut restored = fs::metadata(dir.path()).unwrap().permissions();
+        restored.set_mode(original_mode);
+        fs::set_permissions(dir.path(), restored).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     fn sample_json_report() -> TeleopJsonReport {
