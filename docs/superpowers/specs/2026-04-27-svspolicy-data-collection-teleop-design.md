@@ -119,7 +119,9 @@ It builds a binary named `piper-svs-collect` and may depend on:
 - serialization and CLI crates needed only by the collector
 
 It is intentionally not included in `[workspace].members` during this phase.
-The normal command:
+The repository root should add `addons/piper-svs-collect` to
+`[workspace].exclude` so default workspace commands cannot accidentally pull in
+MuJoCo through path discovery or future workspace edits. The normal command:
 
 ```bash
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -172,6 +174,10 @@ Core options:
 The initial runtime supports only concrete StrictRealtime SocketCAN targets.
 GS-USB selectors are not accepted by this collector until a separate
 SoftRealtime dual-arm SDK design exists.
+
+Exactly one MuJoCo model source may be selected. `--model-dir`,
+`--use-standard-model-path`, and `--use-embedded-model` are mutually exclusive.
+If none is supplied, the collector defaults to `--use-standard-model-path`.
 
 ## Runtime Data Flow
 
@@ -228,6 +234,14 @@ The bridge provides per-arm:
 - translational Jacobian in base frame
 - optional condition metrics for Jacobian DLS mapping
 
+The bridge also exposes the slave end-effector rotation `R_slave_base_to_ee`
+and uses a collector/profile-provided base-frame transform
+`R_master_base_to_slave_base` for master cue normalization. That transform is a
+3x3 proper rotation matrix mapping vectors from the master arm base frame into
+the slave arm base frame. It is required in the collector config or task
+profile; v1 must not infer it from the joint mirror map because joint signs are
+not a complete Cartesian frame transform.
+
 The bridge may be split into a standard
 `BilateralDynamicsCompensator` implementation plus a single-slot
 `SvsDynamicsFrame` side channel consumed by the SVS controller. This keeps the
@@ -252,13 +266,23 @@ maps residual joint torques into a task-space cue with damped least squares:
 f_proxy_base = (Jp * Jp^T + lambda * I)^-1 * Jp * tau_residual
 ```
 
-Then it expresses the cue in the slave end-effector frame:
+For the slave arm, the cue is expressed in the slave end-effector frame:
 
 ```text
-f_proxy_ee = R_slave^T * f_proxy_base
+r_ee = R_slave_base_to_ee^T * f_slave_proxy_base
+```
+
+For the master arm, the cue is first rotated into the slave base frame, then
+expressed in the slave end-effector frame:
+
+```text
+u_slave_base = R_master_base_to_slave_base * f_master_proxy_base
+u_ee = R_slave_base_to_ee^T * u_slave_base
 ```
 
 The master-side cue is named `u_ee`. The slave-side cue is named `r_ee`.
+Both have units of uncalibrated Newton-like proxy magnitude. The values are
+used only as normalized interaction cues.
 
 These values are not calibrated force estimates. They are robot-centric
 interaction cues used for contact gating and compliance-intent state updates.
@@ -278,6 +302,9 @@ The update rule is:
 ```text
 contact_gate = hysteresis(norm(r_ee), enter_threshold, exit_threshold, min_hold)
 
+phi_axis(v, mode, deadband, scale, limit) =
+  clip(scale * deadband_transform(v, mode, deadband), -limit, limit)
+
 K_raw =
   K_base(contact_state)
   + W_u * phi_u(u_ee)
@@ -289,11 +316,19 @@ K_tele = clip(rate_limit(lpf(K_raw)), K_min, K_max)
 All vectors are three-dimensional translational quantities expressed in the
 slave end-effector frame. `K_min`, `K_max`, `K_base`, thresholds, filter cutoff,
 rate limits, `W_u`, `W_r`, `phi_u`, and `phi_r` come from the task profile.
+`K_tele` has units of N/m.
+
+V1 supports only these deterministic `deadband_transform` modes:
+
+- `signed`: `sign(v) * max(abs(v) - deadband, 0)`
+- `absolute`: `max(abs(v) - deadband, 0)`
+- `positive`: `max(v - deadband, 0)`
+- `negative`: `max(-v - deadband, 0)`
 
 The mapping functions are task-axis mappings. They are not required to be
-monotone in every direction because high interaction intensity can indicate
-either a need for stronger support or a need to soften an axis to avoid
-jamming.
+monotone in every direction after multiplication by `W_u` and `W_r`, because
+high interaction intensity can indicate either a need for stronger support or a
+need to soften an axis to avoid jamming.
 
 Manual discrete stiffness modes are not part of v1. Runtime controls may tune
 profile parameters, pause, stop, or print status, but they must not create
@@ -323,6 +358,13 @@ residual_enter = 3.0
 residual_exit = 1.5
 min_hold_ms = 80
 
+[frames]
+master_to_slave_rotation = [
+  [1.0, 0.0, 0.0],
+  [0.0, 1.0, 0.0],
+  [0.0, 0.0, 1.0],
+]
+
 [cue]
 dls_lambda = 0.01
 master_lpf_cutoff_hz = 20.0
@@ -330,12 +372,49 @@ slave_lpf_cutoff_hz = 20.0
 w_u = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
 w_r = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
 
+[cue.master_phi]
+mode = ["signed", "signed", "signed"]
+deadband = [0.2, 0.2, 0.2]
+scale = [1.0, 1.0, 1.0]
+limit = [10.0, 10.0, 10.0]
+
+[cue.slave_phi]
+mode = ["signed", "signed", "signed"]
+deadband = [0.2, 0.2, 0.2]
+scale = [1.0, 1.0, 1.0]
+limit = [10.0, 10.0, 10.0]
+
 [control]
 track_kp_min = [2.0, 2.0, 2.0, 1.0, 1.0, 1.0]
 track_kp_max = [10.0, 10.0, 10.0, 4.0, 4.0, 4.0]
 track_kd = [1.0, 1.0, 1.0, 0.4, 0.4, 0.4]
 reflection_gain_min = [0.05, 0.05, 0.05, 0.02, 0.02, 0.02]
 reflection_gain_max = [0.30, 0.30, 0.30, 0.10, 0.10, 0.10]
+joint_stiffness_projection = [
+  [1.0, 0.0, 0.0],
+  [0.0, 1.0, 0.0],
+  [0.0, 0.0, 1.0],
+  [0.3, 0.3, 0.0],
+  [0.0, 0.3, 0.3],
+  [0.3, 0.0, 0.3],
+]
+reflection_projection = [
+  [1.0, 0.0, 0.0],
+  [0.0, 1.0, 0.0],
+  [0.0, 0.0, 1.0],
+  [0.3, 0.3, 0.0],
+  [0.0, 0.3, 0.3],
+  [0.3, 0.0, 0.3],
+]
+reflection_residual_deadband = 3.0
+reflection_residual_attenuation = 0.15
+reflection_residual_min_scale = 0.2
+
+[writer]
+queue_capacity = 8192
+queue_full_stop_events = 10
+queue_full_stop_duration_ms = 100
+flush_timeout_ms = 5000
 ```
 
 The numeric defaults are safe placeholders for validation and tests, not
@@ -350,11 +429,36 @@ deployment-time Cartesian impedance executor.
 In v1:
 
 - The slave command still follows the mirrored master joint reference.
-- `K_tele` schedules slave tracking/compliance through bounded joint-space
-  tracking gains or feedforward scaling.
+- `K_tele` schedules slave tracking/compliance only through bounded
+  joint-space tracking gains.
 - `K_tele` and slave residual cues schedule master force-reflection gain.
 - All resulting MIT commands remain subject to existing output shaping,
   per-joint torque limits, slew limits, and passivity damping.
+
+The v1 mapping from translational stiffness to joint-space command parameters
+is deterministic:
+
+```text
+alpha_xyz = clamp((K_tele - K_min) / (K_max - K_min), 0, 1)
+alpha_joint = clamp(joint_stiffness_projection * alpha_xyz, 0, 1)
+slave_kp = lerp(track_kp_min, track_kp_max, alpha_joint)
+slave_kd = track_kd
+
+reflection_alpha = clamp(reflection_projection * alpha_xyz, 0, 1)
+residual_excess = max(norm(r_ee) - reflection_residual_deadband, 0)
+residual_scale =
+  max(reflection_residual_min_scale,
+      1 / (1 + reflection_residual_attenuation * residual_excess))
+master_reflection_gain =
+  lerp(reflection_gain_min, reflection_gain_max, reflection_alpha)
+  * residual_scale
+```
+
+`joint_stiffness_projection` and `reflection_projection` are 6x3 matrices from
+the task profile. Rows are clamped after projection, so profiles can express
+task-specific coupling while the runtime keeps every joint gain within the
+configured bounds. V1 does not modulate slave feedforward torque from `K_tele`;
+model compensation remains owned by the MuJoCo compensation path.
 
 In v1, the collector does not implement:
 
@@ -402,9 +506,11 @@ Contains:
 
 ### `steps.bin`
 
-`steps.bin` is a strict bincode stream with a small header and repeated
-fixed-schema `SvsStepV1` records. Historical incompatible formats are rejected
-unless a new schema version is declared.
+`steps.bin` is a strict bincode 1.3 stream using fixed-int encoding and little
+endian byte order, matching the repository's existing strict recording v3
+style. It contains a small header and repeated fixed-schema `SvsStepV1` records.
+Historical incompatible formats are rejected unless a new schema version is
+declared.
 
 Each step contains:
 
@@ -503,6 +609,7 @@ normal cancellation and writer flush succeeds.
 
 All numeric profile values must be finite. Validation rejects:
 
+- model source flags that are not mutually exclusive
 - negative frequencies or filter cutoffs
 - non-positive DLS lambda
 - `K_min > K_max`
@@ -511,6 +618,12 @@ All numeric profile values must be finite. Validation rejects:
 - contact enter threshold less than or equal to exit threshold
 - negative min-hold duration
 - cue matrices with the wrong shape
+- unsupported phi modes
+- phi vectors with shapes other than three elements
+- base-frame rotation matrices that are not finite, approximately orthonormal,
+  and approximately determinant `+1`
+- control projection matrices with shapes other than 6x3
+- negative writer queue capacity, queue-full thresholds, or flush timeout
 - control gains outside conservative hard limits
 
 The `--yes` flag may skip confirmation prompts only. It must not skip target,
