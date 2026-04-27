@@ -146,7 +146,7 @@ cargo run --manifest-path addons/piper-svs-collect/Cargo.toml -- \
   --slave-target socketcan:can1 \
   --model-dir /path/to/piper/mujoco/model \
   --task-profile profiles/wiping.toml \
-  --output-dir data/svs/wiping
+  --output-dir data/svs
 ```
 
 Core options:
@@ -232,7 +232,7 @@ The bridge provides per-arm:
 - end-effector position in base frame
 - end-effector rotation matrix
 - translational Jacobian in base frame
-- optional condition metrics for Jacobian DLS mapping
+- condition metrics for Jacobian DLS mapping
 
 The bridge also exposes the slave end-effector rotation `R_slave_base_to_ee`
 and uses a collector/profile-provided base-frame transform
@@ -248,6 +248,23 @@ The bridge may be split into a standard
 existing dual-arm loop as the owner of timing, command submission, and safety.
 If implementation requires a new SDK hook, that hook must be generic and
 MuJoCo-free; it must not mention SVSPolicy, MuJoCo, or dataset writing.
+
+`tau_model_mujoco` must be reproducible from the episode manifest and task
+profile. V1 uses per-arm MuJoCo mode fields:
+
+- `gravity`: model torque from zero-velocity gravity compensation
+- `partial`: model torque from gravity plus velocity-dependent bias terms
+- `full`: model torque from full inverse dynamics with finite-difference
+  acceleration
+
+The default v1 profile uses `master_mode = "gravity"` and
+`slave_mode = "partial"`, matching the existing dual-arm MuJoCo example's
+conservative intent: keep operator-side reflection simple and compensate
+slave-side movement bias during contact. Payload and full-ID acceleration
+filtering are explicit profile fields and are recorded in the manifest. If
+`full` is selected for either arm, the collector must use the configured
+finite-difference acceleration low-pass cutoff and acceleration clamp; otherwise
+the run is rejected before MIT enable.
 
 ## Cue Definition
 
@@ -367,10 +384,25 @@ master_to_slave_rotation = [
 
 [cue]
 dls_lambda = 0.01
+max_jacobian_condition = 250.0
 master_lpf_cutoff_hz = 20.0
 slave_lpf_cutoff_hz = 20.0
 w_u = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
 w_r = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+
+[dynamics]
+master_mode = "gravity"
+slave_mode = "partial"
+qacc_lpf_cutoff_hz = 20.0
+max_abs_qacc = 50.0
+
+[dynamics.master_payload]
+mass_kg = 0.0
+com_m = [0.0, 0.0, 0.0]
+
+[dynamics.slave_payload]
+mass_kg = 0.0
+com_m = [0.0, 0.0, 0.0]
 
 [cue.master_phi]
 mode = ["signed", "signed", "signed"]
@@ -460,6 +492,26 @@ task-specific coupling while the runtime keeps every joint gain within the
 configured bounds. V1 does not modulate slave feedforward torque from `K_tele`;
 model compensation remains owned by the MuJoCo compensation path.
 
+The reflected master interaction torque reuses the existing joint-space
+bilateral sign semantics, but uses the slave residual torque rather than raw
+measured torque:
+
+```text
+slave_residual_for_reflection =
+  tau_slave_measured - tau_slave_model_mujoco
+
+mapped_slave_residual =
+  calibration.slave_to_master_torque(slave_residual_for_reflection)
+
+master_interaction_torque =
+  -mapped_slave_residual * master_reflection_gain
+```
+
+`master_reflection_gain` is the per-joint vector computed above. The negative
+sign matches the current `JointSpaceBilateralController` convention. The
+EE-frame cues affect reflection only through gain scheduling and dataset labels;
+v1 does not compute reflected master torque through `J^T f_ee`.
+
 In v1, the collector does not implement:
 
 ```text
@@ -499,6 +551,7 @@ Contains:
 - final status: `running`, `complete`, `cancelled`, or `faulted`
 - master/slave targets
 - MuJoCo model source and content hash
+- per-arm MuJoCo dynamics mode, payload, qacc filter, and qacc clamp
 - task profile path and content hash
 - calibration hash
 - collector binary version or git revision when available
@@ -612,6 +665,7 @@ All numeric profile values must be finite. Validation rejects:
 - model source flags that are not mutually exclusive
 - negative frequencies or filter cutoffs
 - non-positive DLS lambda
+- non-positive Jacobian condition threshold
 - `K_min > K_max`
 - base stiffness outside `[K_min, K_max]`
 - negative rate limits
@@ -619,11 +673,14 @@ All numeric profile values must be finite. Validation rejects:
 - negative min-hold duration
 - cue matrices with the wrong shape
 - unsupported phi modes
+- unsupported dynamics modes
+- negative payload mass or non-finite payload COM values
+- `full` dynamics mode with missing qacc filter or acceleration clamp
 - phi vectors with shapes other than three elements
 - base-frame rotation matrices that are not finite, approximately orthonormal,
   and approximately determinant `+1`
 - control projection matrices with shapes other than 6x3
-- negative writer queue capacity, queue-full thresholds, or flush timeout
+- non-positive writer queue capacity, queue-full thresholds, or flush timeout
 - control gains outside conservative hard limits
 
 The `--yes` flag may skip confirmation prompts only. It must not skip target,
