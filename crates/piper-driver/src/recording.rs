@@ -458,7 +458,7 @@ impl FrameCallback for AsyncRecordingHook {
     ///
     /// let (hook, rx) = AsyncRecordingHook::new();
     /// let callback = Arc::new(hook) as Arc<dyn FrameCallback>;
-    /// let frame = PiperFrame::new_standard(0x251, &[1, 2, 3, 4])
+    /// let frame = PiperFrame::new_standard(0x251, [1, 2, 3, 4])
     ///     .unwrap()
     ///     .with_timestamp_us(99_000);
     ///

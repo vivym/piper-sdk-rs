@@ -103,7 +103,7 @@ impl RealtimeTxAdapter for MockTxAdapter {
 /// 生成测试帧
 fn generate_test_frames(count: usize, base_id: u32) -> Vec<PiperFrame> {
     (0..count)
-        .map(|i| PiperFrame::new_standard((base_id + i as u32) as u32, &[i as u8; 8]).unwrap())
+        .map(|i| PiperFrame::new_standard(base_id + i as u32, [i as u8; 8]).unwrap())
         .collect()
 }
 
@@ -187,9 +187,9 @@ fn test_priority_scheduling() {
 
     // 同时发送实时命令和可靠命令（测试优先级）
     // 为了确保两者都在队列中，我们快速连续发送
-    let reliable_frame1 = PiperFrame::new_standard(0x100, &[1, 1, 1]).unwrap();
-    let reliable_frame2 = PiperFrame::new_standard(0x101, &[2, 2, 2]).unwrap();
-    let realtime_frame = PiperFrame::new_standard(0x200, &[3, 3, 3]).unwrap();
+    let reliable_frame1 = PiperFrame::new_standard(0x100, [1, 1, 1]).unwrap();
+    let reliable_frame2 = PiperFrame::new_standard(0x101, [2, 2, 2]).unwrap();
+    let realtime_frame = PiperFrame::new_standard(0x200, [3, 3, 3]).unwrap();
 
     // 先发送可靠命令到队列
     reliable_tx.send(ReliableCommand::single(reliable_frame1)).unwrap();
@@ -336,7 +336,7 @@ fn test_reliable_command_not_dropped() {
 
     // 发送多个可靠命令（填满队列）
     let reliable_commands: Vec<PiperFrame> = (0..15)
-        .map(|i| PiperFrame::new_standard(0x100 + i as u32, &[i as u8; 8]).unwrap())
+        .map(|i| PiperFrame::new_standard(0x100 + i as u32, [i as u8; 8]).unwrap())
         .collect();
 
     let mut sent_successfully: u32 = 0;
@@ -490,7 +490,7 @@ fn test_realtime_overwrite_strategy() {
 
     // 快速发送多个实时命令（触发覆盖）
     let realtime_commands: Vec<PiperFrame> = (0..5)
-        .map(|i| PiperFrame::new_standard(0x200 + i as u32, &[i as u8; 8]).unwrap())
+        .map(|i| PiperFrame::new_standard(0x200 + i as u32, [i as u8; 8]).unwrap())
         .collect();
 
     for frame in realtime_commands.iter() {
@@ -534,7 +534,7 @@ fn test_realtime_overwrite_strategy() {
 fn test_command_type_conversion() {
     // 测试场景：验证 PiperCommand 的类型转换
 
-    let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap();
+    let frame = PiperFrame::new_standard(0x123, [1, 2, 3]).unwrap();
 
     // 测试创建实时命令
     let realtime_cmd = PiperCommand::realtime(frame);

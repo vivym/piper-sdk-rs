@@ -25,7 +25,7 @@
 //!
 //! // 触发所有回调（在 rx_loop 中）
 //! let frame = piper_can::ReceivedFrame::new(
-//!     piper_protocol::PiperFrame::new_standard(0x251, &[1, 2, 3, 4]).unwrap(),
+//!     piper_protocol::PiperFrame::new_standard(0x251, [1, 2, 3, 4]).unwrap(),
 //!     piper_can::TimestampProvenance::None,
 //! );
 //! hooks.trigger_all(frame);
@@ -119,7 +119,7 @@ struct HookEntry {
 ///
 /// // 触发回调
 /// let received = ReceivedFrame::new(
-///     PiperFrame::new_standard(0x251, &[1, 2, 3, 4]).unwrap(),
+///     PiperFrame::new_standard(0x251, [1, 2, 3, 4]).unwrap(),
 ///     TimestampProvenance::Kernel,
 /// );
 /// hooks.trigger_all(received);
@@ -219,7 +219,7 @@ impl HookManager {
     ///
     /// // 在 rx_loop 中触发
     /// let frame = piper_can::ReceivedFrame::new(
-    ///     PiperFrame::new_standard(0x251, &[1, 2, 3, 4]).unwrap(),
+    ///     PiperFrame::new_standard(0x251, [1, 2, 3, 4]).unwrap(),
     ///     piper_can::TimestampProvenance::None,
     /// );
     /// hooks.trigger_all(frame);
@@ -255,7 +255,7 @@ impl HookManager {
     /// let hooks = HookManager::new();
     ///
     /// // 在 tx_loop 中，发送成功后触发回调
-    /// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap();
+    /// let frame = PiperFrame::new_standard(0x123, [1, 2, 3, 4]).unwrap();
     /// // 假设 tx.send(&frame) 返回 Ok(())
     /// hooks.trigger_all_sent(&frame);
     /// ```

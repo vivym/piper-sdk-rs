@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn test_command_priority() {
-        let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap();
+        let frame = PiperFrame::new_standard(0x123, [1, 2, 3]).unwrap();
 
         let realtime_cmd = PiperCommand::realtime(frame);
         assert_eq!(realtime_cmd.priority(), CommandPriority::RealtimeControl);
@@ -777,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_command_from_frame() {
-        let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap();
+        let frame = PiperFrame::new_standard(0x123, [1, 2, 3]).unwrap();
         let cmd: PiperCommand = frame.into();
 
         // 默认转换为可靠命令
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_command_to_frame() {
-        let frame = PiperFrame::new_standard(0x123, &[1, 2, 3]).unwrap();
+        let frame = PiperFrame::new_standard(0x123, [1, 2, 3]).unwrap();
         let cmd = PiperCommand::realtime(frame);
 
         let converted_frame: PiperFrame = cmd.into();
@@ -801,7 +801,7 @@ mod realtime_command_tests {
 
     #[test]
     fn test_realtime_command_single() {
-        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
+        let frame = PiperFrame::new_standard(0x123, [0x01, 0x02]).unwrap();
         let cmd = RealtimeCommand::single(frame);
         assert_eq!(cmd.len(), 1);
         assert!(!cmd.is_empty());
@@ -810,9 +810,9 @@ mod realtime_command_tests {
     #[test]
     fn test_realtime_command_package() {
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
-            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
-            PiperFrame::new_standard(0x157, &[0x03]).unwrap(),
+            PiperFrame::new_standard(0x155, [0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, [0x02]).unwrap(),
+            PiperFrame::new_standard(0x157, [0x03]).unwrap(),
         ];
         let cmd = RealtimeCommand::package(frames);
         assert_eq!(cmd.len(), 3);
@@ -830,8 +830,8 @@ mod realtime_command_tests {
     #[test]
     fn test_realtime_command_iter() {
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
-            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x155, [0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, [0x02]).unwrap(),
         ];
         let cmd = RealtimeCommand::package(frames);
         let collected: Vec<_> = cmd.iter().collect();
@@ -841,8 +841,8 @@ mod realtime_command_tests {
     #[test]
     fn test_realtime_command_into_frames() {
         let frames = [
-            PiperFrame::new_standard(0x155, &[0x01]).unwrap(),
-            PiperFrame::new_standard(0x156, &[0x02]).unwrap(),
+            PiperFrame::new_standard(0x155, [0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, [0x02]).unwrap(),
         ];
         let cmd = RealtimeCommand::package(frames);
         let buffer = cmd.into_frames();
@@ -851,14 +851,14 @@ mod realtime_command_tests {
 
     #[test]
     fn test_reliable_command_single() {
-        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
+        let frame = PiperFrame::new_standard(0x123, [0x01, 0x02]).unwrap();
         let cmd = ReliableCommand::single(frame);
         assert_eq!(cmd.frame(), frame);
     }
 
     #[test]
     fn test_reliable_command_confirmed() {
-        let frame = PiperFrame::new_standard(0x123, &[0x01, 0x02]).unwrap();
+        let frame = PiperFrame::new_standard(0x123, [0x01, 0x02]).unwrap();
         let (ack_tx, _ack_rx) = crossbeam_channel::bounded(2);
         let mut cmd = ReliableCommand::confirmed(frame, Instant::now(), ack_tx);
         assert_eq!(cmd.frame(), frame);

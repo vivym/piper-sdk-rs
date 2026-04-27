@@ -249,9 +249,7 @@ impl SimpleRxAdapter {
         let mut frames = VecDeque::new();
         let total_frames = frames_per_second * test_duration.as_secs() as u32;
         for i in 0..total_frames {
-            frames.push_back(
-                PiperFrame::new_standard((0x251 + (i % 6)) as u32, &[i as u8; 8]).unwrap(),
-            );
+            frames.push_back(PiperFrame::new_standard(0x251 + (i % 6), [i as u8; 8]).unwrap());
         }
 
         Self {
@@ -461,11 +459,9 @@ fn measure_performance(frequency_hz: u32, test_duration: Duration) -> Performanc
 
         // 发送命令并测量延迟
         let api_call_time = Instant::now();
-        let frame = PiperFrame::new_standard(
-            0x200 + (command_count % 10) as u32,
-            &[command_count as u8; 8],
-        )
-        .unwrap();
+        let frame =
+            PiperFrame::new_standard(0x200 + (command_count % 10), [command_count as u8; 8])
+                .unwrap();
 
         *realtime_slot_tx.lock().unwrap() = Some(RealtimeCommand::single(frame));
 
@@ -636,8 +632,8 @@ fn test_command_priority_performance() {
     let mut direct_send_count = 0u32;
     while start.elapsed() < test_duration {
         let frame = PiperFrame::new_standard(
-            0x200 + (direct_send_count % 10) as u32,
-            &[direct_send_count as u8; 8],
+            0x200 + (direct_send_count % 10),
+            [direct_send_count as u8; 8],
         )
         .unwrap();
         *realtime_slot_tx.lock().unwrap() = Some(RealtimeCommand::single(frame));
@@ -696,8 +692,8 @@ fn test_command_priority_performance() {
     let mut command_send_count = 0u32;
     while start2.elapsed() < test_duration {
         let frame = PiperFrame::new_standard(
-            0x200 + (command_send_count % 10) as u32,
-            &[command_send_count as u8; 8],
+            0x200 + (command_send_count % 10),
+            [command_send_count as u8; 8],
         )
         .unwrap();
         let cmd = PiperCommand::realtime(frame);
