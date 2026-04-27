@@ -42,24 +42,25 @@ baseline before confirmation if no calibration file is supplied.
 
 The human report and JSON report use master/slave naming even though the SDK
 internally stores the two arms as left/right. Durations are integer
-microseconds. In JSON, `exit.reason = cancelled` is a clean operator stop; the
-legacy/human-facing term `exit_reason` refers to that same reason value.
+microseconds. In JSON, `exit.reason = cancelled` is a clean operator stop, and
+the human report prints the same value as `reason=cancelled`.
 `metrics.read_faults` or `metrics.submission_faults` mean the run is unsafe to
 continue without inspecting the CAN link and arm status.
 
 ## Exit Codes
 
-Exit code `0` means the operator intentionally stopped the loop and post-disable
-reporting succeeded. Nonzero means startup validation failed, runtime faulted,
-or the JSON report could not be written after the arms were already disabled or
-faulted.
+Exit code `0` means the loop ended cleanly with `exit.reason = cancelled` or
+`exit.reason = max_iterations` and post-disable reporting succeeded. Nonzero
+means startup validation failed, runtime faulted, or the JSON report could not
+be written after the arms were already disabled or faulted.
 
 ## Fault Response
 
-Read faults, command submission faults, unsupported runtime targets, posture
-mismatch, and Ctrl+C during startup all trigger bounded shutdown behavior. If a
-fault occurs after enable, the CLI attempts to stop both arms and records the
-per-arm stop attempt result.
+Unsupported runtime targets are rejected before hardware connect. Posture
+mismatch and Ctrl+C before MIT enable stop startup without entering active
+control. After enable, read faults, command submission faults, controller
+faults, and Ctrl+C trigger bounded shutdown behavior; the CLI attempts to stop
+both arms and records the per-arm stop attempt result.
 
 ## Stop Attempt Results
 
