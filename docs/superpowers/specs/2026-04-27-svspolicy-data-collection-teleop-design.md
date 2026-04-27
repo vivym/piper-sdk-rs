@@ -604,7 +604,9 @@ the collector retries with a new random suffix; after a bounded retry count it
 fails before connecting hardware.
 
 The directory path uses the same `task-slug`, not the raw task name. The
-manifest records both the raw task name and the derived slug.
+manifest records both the raw task name and the derived slug. If slug generation
+would produce an empty slug, the task name is rejected during validation rather
+than replaced with a fallback.
 
 ### `manifest.toml`
 
@@ -707,8 +709,7 @@ An episode may be used as successful training data only when:
 - dual-arm report has no read, submission, compensation, controller, or runtime
   transport fault
 - writer flush succeeded
-- dropped step count is zero unless the downstream dataset filter explicitly
-  allows partial episodes
+- dropped step count is zero
 
 ## Writer and Backpressure
 
@@ -728,16 +729,30 @@ Backpressure policy:
 Final status mapping:
 
 - `complete`: normal finite run completion, including `--max-iterations`, with
-  no control fault, no writer backpressure stop, no dropped steps unless
-  explicitly allowed, and successful writer flush
+  no control fault, no writer queue-full event, no dropped step, and successful
+  writer flush
 - `cancelled`: operator-requested stop or Ctrl+C after a clean bounded shutdown
-  and successful writer flush
+  and successful writer flush, with no writer queue-full event and no dropped
+  step
 - `faulted`: startup failure after manifest creation, MuJoCo/controller/runtime
-  failure, writer backpressure threshold exceeded, writer flush failure, output
-  finalization failure, or any dual-arm fault report
+  failure, any writer queue-full event, any dropped step, writer backpressure
+  threshold exceeded, writer flush failure, output finalization failure, or any
+  dual-arm fault report
 
 If validation fails before the episode directory is created, no episode status
 is written and the command exits with an error.
+
+V1 has no partial-success final status. A run with any missing `SvsStepV1`
+record is `faulted`, even if the missing count is below the threshold that
+triggers early shutdown. Downstream training filters may inspect faulted
+episodes manually, but the collector must not label them complete.
+
+Optional raw CAN side recording is diagnostic only for training data quality:
+failure to start raw CAN recording before MIT enable is a startup error, but a
+raw CAN writer failure after the structured `steps.bin` writer has started does
+not by itself change `complete` or `cancelled` to `faulted`. Such failures are
+reported in `report.json` and `manifest.toml`; `steps.bin` remains the
+authoritative dataset stream.
 
 ## Safety and Fault Handling
 
