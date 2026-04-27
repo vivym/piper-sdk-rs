@@ -102,6 +102,14 @@ impl RuntimeTeleopSettingsHandle {
         })
     }
 
+    pub fn update_track_kp(&self, kp: f64) -> Result<()> {
+        self.update(|settings| settings.track_kp = kp)
+    }
+
+    pub fn update_track_kd(&self, kd: f64) -> Result<()> {
+        self.update(|settings| settings.track_kd = kd)
+    }
+
     pub fn update_master_damping(&self, damping: f64) -> Result<()> {
         self.update(|settings| settings.master_damping = damping)
     }
@@ -325,6 +333,36 @@ mod tests {
         assert!(handle.update_track_gains(21.0, 1.0).is_err());
         assert!(handle.update_master_damping(2.1).is_err());
         assert!(handle.update_reflection_gain(0.6).is_err());
+
+        assert_eq!(handle.snapshot(), before);
+    }
+
+    #[test]
+    fn single_track_gain_updates_preserve_the_other_track_gain() {
+        let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
+            sample_calibration(),
+        ))
+        .unwrap();
+
+        handle.update_track_kp(9.5).unwrap();
+        assert_eq!(handle.snapshot().track_kp, 9.5);
+        assert_eq!(handle.snapshot().track_kd, 1.0);
+
+        handle.update_track_kd(1.2).unwrap();
+        assert_eq!(handle.snapshot().track_kp, 9.5);
+        assert_eq!(handle.snapshot().track_kd, 1.2);
+    }
+
+    #[test]
+    fn invalid_single_track_gain_updates_preserve_settings() {
+        let handle = RuntimeTeleopSettingsHandle::new(RuntimeTeleopSettings::production(
+            sample_calibration(),
+        ))
+        .unwrap();
+        let before = handle.snapshot();
+
+        assert!(handle.update_track_kp(21.0).is_err());
+        assert!(handle.update_track_kd(f64::NAN).is_err());
 
         assert_eq!(handle.snapshot(), before);
     }

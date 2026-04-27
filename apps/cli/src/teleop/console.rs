@@ -79,12 +79,10 @@ pub fn apply_console_command(
         ConsoleCommand::SetGain { name, value } => {
             match name {
                 GainName::TrackKp => {
-                    let snapshot = settings_handle.snapshot();
-                    settings_handle.update_track_gains(value, snapshot.track_kd)?;
+                    settings_handle.update_track_kp(value)?;
                 },
                 GainName::TrackKd => {
-                    let snapshot = settings_handle.snapshot();
-                    settings_handle.update_track_gains(snapshot.track_kp, value)?;
+                    settings_handle.update_track_kd(value)?;
                 },
                 GainName::MasterDamping => settings_handle.update_master_damping(value)?,
                 GainName::ReflectionGain => settings_handle.update_reflection_gain(value)?,
@@ -100,14 +98,14 @@ pub fn spawn_console_thread(
     settings_handle: RuntimeTeleopSettingsHandle,
     started_at: Instant,
     cancel_signal: Arc<AtomicBool>,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<()>> {
     std::thread::spawn(move || {
         let stdin = io::stdin();
-        if let Err(error) =
-            run_console_reader(stdin.lock(), settings_handle, started_at, cancel_signal)
-        {
+        let result = run_console_reader(stdin.lock(), settings_handle, started_at, cancel_signal);
+        if let Err(error) = &result {
             eprintln!("teleop console stopped: {error:#}");
         }
+        result
     })
 }
 
@@ -128,7 +126,11 @@ pub(crate) fn run_console_reader<R: BufRead>(
 
         match ConsoleCommand::parse(&line) {
             Ok(command) => {
-                apply_console_command(command, &settings_handle, &cancel_signal, started_at)?
+                if let Err(error) =
+                    apply_console_command(command, &settings_handle, &cancel_signal, started_at)
+                {
+                    eprintln!("teleop console: {error:#}");
+                }
             },
             Err(error) => eprintln!("teleop console: {error:#}"),
         }
@@ -401,6 +403,34 @@ mod tests {
         assert_eq!(snapshot.track_kp, 9.5);
         assert_eq!(snapshot.track_kd, 1.0);
         assert!(cancel_signal.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn run_console_reader_continues_after_apply_error_until_quit() {
+        let handle = sample_settings_handle();
+        let cancel_signal = Arc::new(AtomicBool::new(false));
+        let input = b"gain track-kp 21\nquit\n";
+
+        run_console_reader(
+            &input[..],
+            handle.clone(),
+            Instant::now(),
+            cancel_signal.clone(),
+        )
+        .unwrap();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.track_kp, 8.0);
+        assert!(cancel_signal.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn spawn_console_thread_exposes_reader_result_in_join_handle() {
+        let _: fn(
+            RuntimeTeleopSettingsHandle,
+            Instant,
+            Arc<AtomicBool>,
+        ) -> std::thread::JoinHandle<anyhow::Result<()>> = spawn_console_thread;
     }
 
     fn sample_settings_handle() -> RuntimeTeleopSettingsHandle {
