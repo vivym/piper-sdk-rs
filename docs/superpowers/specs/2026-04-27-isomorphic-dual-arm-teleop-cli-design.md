@@ -8,16 +8,25 @@ teleoperation: one arm acts as the master, the other as the slave, with optional
 bilateral force reflection after a conservative master-follower bring-up path.
 
 The first implementation reuses the existing `piper-client::dual_arm` control
-loop and controllers. It does not reimplement MIT frame emission in the CLI.
-The CLI owns production concerns: target selection, configuration merging,
-calibration loading/capture, startup confirmation, runtime console commands,
-structured reports, and documented hardware bring-up.
+loop and controllers. That current SDK path requires `StrictRealtime`, so the
+first runnable version supports StrictRealtime dual-arm targets only. Today that
+means SocketCAN with trusted hardware timestamp capability. GS-USB dual-arm
+teleoperation remains a product goal, but it requires additional SDK design for
+SoftRealtime dual-arm control before the CLI may claim runtime support.
+
+The CLI does not reimplement MIT frame emission. It owns production concerns:
+target selection, configuration merging, calibration loading/capture, startup
+confirmation, runtime console commands, structured reports, and documented
+hardware bring-up.
 
 ## Goals
 
 - Add a production CLI entry point for two physical Piper arms.
 - Support master-follower and bilateral joint-space teleoperation.
-- Support both independent SocketCAN interfaces and two GS-USB devices.
+- Support production dual-arm teleoperation on StrictRealtime SocketCAN targets
+  in the first implementation.
+- Document concrete GS-USB target grammar, but reject GS-USB runtime execution
+  in v1 with an actionable error until SDK SoftRealtime dual-arm support exists.
 - Use master/slave terminology consistently in CLI, config, docs, and reports.
 - Keep SDK dual-arm realtime loop semantics as the single source of control
   behavior.
@@ -35,6 +44,8 @@ structured reports, and documented hardware bring-up.
 - Do not bypass or duplicate `piper-client::dual_arm` safety paths.
 - Do not make runtime console commands a full general-purpose REPL in the first
   version.
+- Do not add GS-USB / SoftRealtime dual-arm execution in this CLI v1. That needs
+  a separate SDK spec and plan.
 
 ## Existing Context
 
@@ -67,6 +78,12 @@ The MuJoCo addon has a richer bilateral example and bring-up guide:
 The new CLI command should productize the validated SDK path rather than move
 example-only code into production unchanged.
 
+Important current limitation: `DualArmBuilder::build()` calls
+`ConnectedPiper::require_strict()` for both arms. GS-USB backends currently
+expose `SoftRealtime` when hardware timestamps are available and `MonitorOnly`
+otherwise. Therefore GS-USB targets cannot create the existing
+`DualArmStandby` runtime session without additional SDK work.
+
 ## Command Shape
 
 Add a top-level `teleop` command group under `piper-cli`:
@@ -84,7 +101,7 @@ piper-cli teleop dual-arm \
   --mode master-follower
 ```
 
-GS-USB usage:
+Future GS-USB target syntax:
 
 ```bash
 piper-cli teleop dual-arm \
@@ -93,17 +110,49 @@ piper-cli teleop dual-arm \
   --mode bilateral
 ```
 
-Linux may default to `can0` and `can1` when neither interface nor serial is
-specified. Non-Linux platforms must specify GS-USB serials unless a future
-backend provides another explicit target type.
+The first runnable implementation must reject this at runtime with an explicit
+message that GS-USB dual-arm teleoperation requires future SDK SoftRealtime
+dual-arm support.
+
+Canonical target usage:
+
+```bash
+piper-cli teleop dual-arm \
+  --master-target socketcan:can0 \
+  --slave-target socketcan:can1
+```
+
+Linux may default to `can0` and `can1` when no per-arm target is specified.
+Non-Linux platforms have no supported runtime backend in v1 unless a future
+backend exposes `StrictRealtime`.
 
 Each arm target is exclusive:
 
-- master: exactly one of `--master-interface`, `--master-serial`, or inherited
-  config/default target
-- slave: exactly one of `--slave-interface`, `--slave-serial`, or inherited
-  config/default target
+- master: exactly one of `--master-target`, `--master-interface`,
+  `--master-serial`, `--master-gs-usb-bus-address`, or inherited config/default
+  target
+- slave: exactly one of `--slave-target`, `--slave-interface`,
+  `--slave-serial`, `--slave-gs-usb-bus-address`, or inherited config/default
+  target
 - master and slave must not resolve to the same target
+
+First-version teleop target parsing only accepts concrete target strings:
+
+- `socketcan:<iface>`
+- `gs-usb-serial:<serial>`
+- `gs-usb-bus-address:<bus>:<address>`
+
+The command rejects `auto-strict`, `auto-any`, and `gs-usb-auto`. If Linux
+defaults are used, `can0` and `can1` are materialized as concrete SocketCAN
+targets before validation. If both GS-USB arms are configured with different
+selector kinds, such as serial for master and bus/address for slave, v1 rejects
+the configuration unless an implementation adds a pre-connect enumeration step
+that normalizes both selectors to the same physical-device identity.
+
+After parsing, runtime target validation rejects any non-StrictRealtime target
+for v1. In practice, GS-USB targets are parsed for future-proof config and help
+text but are not accepted for actual teleop execution until the SDK provides a
+dual-arm SoftRealtime path.
 
 User-facing naming is always `master` and `slave`. The SDK currently exposes
 some lower-level left/right names; the CLI adapts master to SDK left and slave
@@ -134,10 +183,14 @@ Core options:
 Target options:
 
 ```text
+--master-target <SPEC>
+--slave-target <SPEC>
 --master-interface <IFACE>
 --slave-interface <IFACE>
 --master-serial <SERIAL>
 --slave-serial <SERIAL>
+--master-gs-usb-bus-address <BUS:ADDRESS>
+--slave-gs-usb-bus-address <BUS:ADDRESS>
 --baud-rate <BAUD>
 ```
 
@@ -191,7 +244,8 @@ target config. The single-arm CLI config is optimized for one Piper; dual-arm
 teleoperation needs explicit per-role target resolution and should not infer a
 slave arm from the single-arm target.
 
-Teleop target values are strings using the same grammar as the CLI:
+Teleop target values are strings using the same concrete-target grammar as the
+CLI:
 
 - `socketcan:can0`
 - `gs-usb-serial:ABC123`
@@ -200,6 +254,16 @@ Teleop target values are strings using the same grammar as the CLI:
 The implementation parses these strings with `TargetSpec::from_str` and then
 converts to `ConnectionTarget` / `PiperBuilder`. It must not deserialize these
 fields directly as the current `TargetSpec` tagged-enum TOML representation.
+
+Duplicate detection before connecting:
+
+- same SocketCAN interface is a duplicate
+- same GS-USB serial is a duplicate
+- same GS-USB bus/address pair is a duplicate
+- mixed GS-USB selector kinds are rejected in v1 unless normalized by explicit
+  enumeration before connection
+- SocketCAN and GS-USB targets are different backend families and cannot be the
+  same physical target
 
 ## Calibration
 
@@ -250,9 +314,18 @@ max_error = max(abs(expected_slave[j] - current_slave[j]))
 
 If `max_error > calibration.max_error_rad`, the command fails before MIT enable
 and instructs the operator to recapture calibration or move both arms back to the
-saved isomorphic zero relationship. The default threshold is `0.05 rad`. The
-threshold may be configurable, but there is no first-version override that
-continues past a failed compatibility check.
+saved isomorphic zero relationship. The default threshold is `0.05 rad`.
+First-version values must be finite and satisfy `0.0 < max_error_rad <= 0.05`.
+This option can only tighten the default tolerance; it cannot loosen the
+jump-prevention check.
+
+The compatibility check applies to loaded and captured calibration. The command
+must validate the current posture immediately before MIT enable, after the final
+operator confirmation, because either arm can be moved between initial
+calibration and confirmation. After MIT enable, before starting the normal
+bilateral loop, the command must take one active snapshot and run the same
+relationship check again. If that active check fails, the CLI must not enter
+`run_bilateral`; it disables both arms and exits non-zero.
 
 `--save-calibration` writes the captured calibration after successful capture.
 It must not overwrite an existing file unless a future explicit overwrite flag
@@ -263,25 +336,45 @@ is added.
 The command runs these phases:
 
 1. Parse CLI and optional TOML config.
-2. Resolve and validate master/slave targets.
-3. Connect both arms through `DualArmBuilder`.
-4. Read initial runtime health and fail if either arm is unhealthy.
-5. Load calibration file or prompt for manual capture.
-6. If calibration was loaded from a file, verify current master/slave posture
-   compatibility before MIT enable.
-7. Optionally save captured calibration.
-8. Print an enable summary: targets, mode, profile, frequency, gains,
+2. Load and schema-validate a calibration file if one was provided.
+3. Reject an existing `--save-calibration` destination before connecting.
+4. Resolve and validate concrete master/slave targets.
+5. Install Ctrl+C cancellation handling before any torque-enable operation.
+6. Connect both arms through `DualArmBuilder`.
+7. Read initial runtime health and fail if either arm is unhealthy.
+8. Capture calibration if no file was loaded.
+9. Optionally save captured calibration.
+10. Print an enable summary: targets, mode, profile, frequency, gains,
    calibration source, gripper mirroring, and report path.
-9. In production profile, ask for explicit operator confirmation unless
+11. In production profile, ask for explicit operator confirmation unless
    `--yes` is present.
-10. Enable MIT mode on both arms.
-11. Start runtime console input and Ctrl+C handling.
-12. Run the dual-arm loop until `quit`, Ctrl+C, max iterations, or a fault.
-13. Print and optionally save the final report.
-14. Exit with zero only for clean standby exits.
+12. Revalidate current master/slave posture against the loaded or captured
+    calibration.
+13. Check whether Ctrl+C cancellation was requested before enabling; if yes,
+    exit cleanly without enabling.
+14. Enable MIT mode on both arms.
+15. If enable fails, cleanup must cover any arm that may have received an enable
+    or MIT-mode command, even if confirmation failed before the SDK returned an
+    `Active` type-state value. The CLI reports non-zero and does not continue.
+16. Check whether Ctrl+C cancellation was requested during enable; if yes,
+    disable both arms and exit cleanly.
+17. Take an active snapshot and revalidate posture before the first normal
+    controller output; on mismatch, disable both arms and exit non-zero.
+18. Start runtime console input.
+19. Run the dual-arm loop until `quit`, Ctrl+C, max iterations, or a fault.
+20. Print and optionally save the final report.
+21. Exit with zero only for clean standby exits.
 
 No step after connection should command motion before calibration and MIT enable
 confirmation complete.
+
+The CLI must not implement custom partial-enable sequencing unless it also owns
+explicit cleanup for every arm that may have received an enable or mode command.
+When using `DualArmStandby::enable_mit`, the implementation must preserve the
+SDK's partial-active drop/disable safety behavior and must not bypass it. If the
+SDK cannot prove cleanup after an enable command was sent but confirmation
+failed, the implementation must add or use an SDK cleanup path before this CLI
+can be considered production-safe.
 
 ## Runtime Controller
 
@@ -328,7 +421,8 @@ Semantics:
 - `status` prints current mode, gains, elapsed time, and whether cancellation
   has been requested.
 - `mode` changes runtime controller behavior on the next tick.
-- `gain` validates finite non-negative values before applying.
+- `gain` validates finite values within the hard safety caps before applying.
+  Invalid runtime updates leave the prior setting unchanged.
 - `quit` sets the same cancellation flag used by Ctrl+C.
 - Unknown commands print help and do not affect control.
 
@@ -341,6 +435,24 @@ live loop counters become required later, add an explicit telemetry/shared
 metrics mechanism rather than reading report state that does not exist.
 
 ## Safety Profiles
+
+Hard limits apply to CLI arguments, config values, and runtime console updates.
+They are intentionally stricter than the low-level SDK can represent:
+
+| Parameter | v1 limit |
+|-----------|----------|
+| `frequency_hz` | `10.0 <= value <= 500.0` |
+| `track_kp` | `0.0 <= value <= 20.0` |
+| `track_kd` | `0.0 <= value <= 5.0` |
+| `master_damping` | `0.0 <= value <= 2.0` |
+| `reflection_gain` | `0.0 <= value <= 0.5` |
+| `calibration_max_error_rad` | `0.0 < value <= 0.05` |
+| `max_inter_arm_skew` | `<= 10 ms` on physical hardware |
+| `safe_hold_max_duration` | `<= 100 ms` on physical hardware |
+| `consecutive_read_failures_before_disable` | `<= 3` on physical hardware |
+
+All numeric values must be finite. Invalid values fail before connection, or for
+runtime console updates, are rejected without changing the active setting.
 
 Production profile defaults:
 
@@ -360,12 +472,16 @@ Debug profile:
 
 - may allow `--max-iterations`
 - may use more verbose logs
-- may tolerate a longer read-failure window
 - may use sleep timing for easier debugging
+- uses the same physical-hardware safety caps as production
 - must still converge to disable or fault shutdown
 
 Neither profile may leave both arms torque-enabled without a bounded shutdown
 path.
+
+Any future simulator-only profile that relaxes these physical-hardware caps must
+be explicitly named as simulator-only and must not be selectable for real
+hardware targets.
 
 ## Reports
 
@@ -402,6 +518,78 @@ Optional JSON report from `--report-json`:
 - calibration source and metadata
 - runtime metrics from `BilateralRunReport`
 - clean/faulted exit classification
+
+JSON report schema v1 uses stable CLI-owned field names rather than serializing
+SDK structs directly. Durations are integer microseconds with `_us` suffix.
+Enums use snake_case strings. SDK `left` metrics are reported as `master`; SDK
+`right` metrics are reported as `slave`.
+
+Example:
+
+```json
+{
+  "schema_version": 1,
+  "command": "teleop dual-arm",
+  "platform": "linux",
+  "targets": {
+    "master": "socketcan:can0",
+    "slave": "socketcan:can1"
+  },
+  "profile": "production",
+  "mode": {
+    "initial": "master_follower",
+    "final": "bilateral"
+  },
+  "control": {
+    "frequency_hz": 200.0,
+    "track_kp": 8.0,
+    "track_kd": 1.0,
+    "master_damping": 0.4,
+    "reflection_gain": 0.25,
+    "gripper_mirror": true
+  },
+  "calibration": {
+    "source": "file",
+    "path": "calibration.toml",
+    "created_at_unix_ms": 1770000000000,
+    "max_error_rad": 0.05
+  },
+  "exit": {
+    "clean": true,
+    "reason": "cancelled",
+    "faulted": false,
+    "last_error": null
+  },
+  "metrics": {
+    "iterations": 12000,
+    "read_faults": 0,
+    "submission_faults": 0,
+    "last_submission_failed_role": null,
+    "peer_command_may_have_applied": false,
+    "deadline_misses": 0,
+    "max_inter_arm_skew_us": 1200,
+    "max_real_dt_us": 5100,
+    "max_cycle_lag_us": 200,
+    "master_tx_frames_sent_total": 72000,
+    "slave_tx_frames_sent_total": 72000,
+    "master_tx_realtime_overwrites_total": 0,
+    "slave_tx_realtime_overwrites_total": 0,
+    "master_tx_fault_aborts_total": 0,
+    "slave_tx_fault_aborts_total": 0,
+    "master_stop_attempt": "not_attempted",
+    "slave_stop_attempt": "not_attempted",
+    "master_runtime_fault": null,
+    "slave_runtime_fault": null
+  }
+}
+```
+
+Required null rules:
+
+- absent optional data is encoded as `null`, not omitted
+- `last_submission_failed_role` is `master`, `slave`, or `null`
+- `last_error`, `master_runtime_fault`, and `slave_runtime_fault` are strings
+  or `null`
 
 JSON report writes should be best-effort only after both arms have already
 entered standby or faulted state. Report I/O failure must not keep arms enabled.
@@ -445,6 +633,34 @@ The CLI must classify process status by `report.exit_reason`, not only by
 `Standby` for `ReadFault`, `ControllerFault`, and `CompensationFault` after it
 has safely disabled both arms; these are still failed sessions.
 
+## Testability Architecture
+
+The production command should keep clap parsing and terminal I/O thin. The core
+teleop startup workflow must depend on a small injectable backend/factory trait
+instead of directly constructing real hardware sessions inside every branch.
+
+The production implementation wraps:
+
+- `DualArmBuilder`
+- `DualArmStandby`
+- `DualArmActiveMit`
+- `DualArmObserver`
+
+The test implementation can fake:
+
+- connect success/failure
+- standby snapshots
+- calibration capture
+- MIT enable success, confirmation failure after command dispatch, failure
+  before/after one arm may have received an enable command, and cleanup
+- active snapshots before entering the loop
+- loop exits with specific `BilateralRunReport` values
+- disable/fault-shutdown calls
+
+This seam is required so default tests can verify safety ordering without
+hardware. Pure functions are still preferred for parsing, config merging,
+calibration math, report serialization, and exit-code classification.
+
 ## Testing Strategy
 
 Default tests must not require hardware.
@@ -453,7 +669,12 @@ Unit tests:
 
 - CLI/config precedence
 - target exclusivity and duplicate-target detection
+- rejection of `auto-*`, `gs-usb-auto`, and mixed GS-USB selector forms without
+  pre-connect normalization
+- rejection of concrete GS-USB runtime targets until SDK SoftRealtime dual-arm
+  support exists
 - production/debug profile mapping into `BilateralLoopConfig`
+- rejection of out-of-range safety-critical numeric values
 - calibration TOML roundtrip
 - calibration validation failures
 - loaded-calibration posture compatibility success/failure
@@ -477,12 +698,24 @@ CLI tests:
 - illegal target combinations fail fast
 - invalid frequency/gain fails fast
 - missing non-Linux target fails fast
-- malformed calibration file fails fast without connecting when possible
+- malformed calibration file fails fast before connecting
+- existing `--save-calibration` destination fails fast before connecting
 - loaded calibration that does not match current posture fails before MIT enable
+- post-enable active-snapshot calibration mismatch disables both arms, does not
+  enter `run_bilateral`, and exits non-zero
+- Ctrl+C requested before MIT enable exits without enabling
+- Ctrl+C requested during enable disables any active arm before exit
+- enable command dispatch followed by confirmation failure disables or
+  fault-shuts down any arm that may have received the enable/mode command before
+  returning non-zero
+- report write failure occurs only after disabled/faulted state and cannot keep
+  either arm enabled
+- submission/runtime fault reports produce non-zero exit and include stop attempt
+  results
 
 Manual hardware acceptance:
 
-1. Connect two independent CAN links or two GS-USB devices.
+1. Connect two independent StrictRealtime CAN links.
 2. Run `master-follower` at default gains.
 3. Capture calibration manually.
 4. Verify every mirrored joint direction.
@@ -505,8 +738,8 @@ Add an operator guide under `apps/cli` or `docs/v0` covering:
 - fault response expectations
 - manual acceptance checklist
 
-The guide should explicitly state that two independent buses/devices are the
-recommended topology for the first version.
+The guide should explicitly state that two independent StrictRealtime SocketCAN
+links are the supported topology for the first version.
 
 ## Open Implementation Notes
 
@@ -514,6 +747,8 @@ recommended topology for the first version.
   `TargetSpec::from_str`; do not deserialize them as `TargetSpec` TOML tables.
 - `RuntimeTeleopController` should stay inside the CLI unless it proves useful
   as a reusable SDK abstraction.
+- The injectable workflow backend/factory is a CLI testing seam, not a new public
+  SDK abstraction unless implementation proves it should be shared.
 - If the runtime console needs richer live metrics later, add an explicit
   telemetry channel. Do not make the controller write to stdout from `tick`.
 - MuJoCo dynamics compensation remains out of scope for this CLI first version.
@@ -525,13 +760,26 @@ recommended topology for the first version.
 - `piper-cli teleop dual-arm --help` documents master/slave target options,
   modes, profiles, calibration, and reports.
 - CLI rejects conflicting or duplicate arm targets before connecting.
-- CLI supports SocketCAN and GS-USB dual-arm target selection.
+- CLI rejects non-concrete auto targets for dual-arm teleop v1.
+- CLI supports StrictRealtime SocketCAN dual-arm runtime targets in v1.
+- CLI parses concrete GS-USB target syntax but rejects GS-USB runtime execution
+  with an explicit SDK SoftRealtime dual-arm prerequisite error.
+- CLI validates malformed calibration files and existing save destinations before
+  connecting.
 - CLI can run with manual calibration and with calibration loaded from TOML.
 - Loaded calibration files are checked against current arm posture before MIT
   enable, using a bounded max joint error.
+- Loaded and captured calibration are rechecked immediately before MIT enable
+  and again after MIT enable before normal controller output.
 - CLI can save a captured calibration without overwriting existing files.
 - Default mode is `master-follower`.
 - `bilateral` mode requires explicit config or CLI selection.
+- Ctrl+C handling is installed before MIT enable, and cancellation during enable
+  cannot leave a partially enabled arm running.
+- Enable confirmation failure after command dispatch cannot leave an arm that
+  may have received enable/mode commands running.
+- Safety-critical numeric inputs and runtime updates are finite and within the
+  documented hard caps.
 - Runtime console supports `status`, `mode`, `gain`, and `quit`.
 - Runtime mode/gain updates affect the next controller tick without restarting
   the session.
@@ -539,6 +787,10 @@ recommended topology for the first version.
 - All exit reasons except `Cancelled` and `MaxIterations` produce non-zero
   process status, even if the SDK returned `DualArmLoopExit::Standby`.
 - Clean cancellation prints a final report and exits zero.
-- JSON report output is supported.
+- JSON report output follows schema version 1 with master/slave field names and
+  explicit duration units.
 - Default automated tests require no hardware.
+- Mock-backed workflow tests cover enable cancellation, enable-confirmation
+  failure after command dispatch, pre-enable calibration mismatch, post-enable
+  calibration mismatch, and post-disable report write failure.
 - Hardware bring-up and acceptance steps are documented.
