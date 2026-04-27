@@ -10,6 +10,28 @@
 
 ---
 
+## Execution Status
+
+As of 2026-04-27:
+
+- [x] Task 1: Harden SDK MIT Enable Failure Cleanup.
+- [x] Task 2: Add Teleop Command Skeleton.
+- [x] Task 3: Implement Teleop Target Parsing and Config Resolution.
+- [x] Task 4: Implement Calibration File and Posture Compatibility.
+- [x] Task 5: Implement Runtime Teleop Controller.
+- [x] Task 6: Implement Runtime Console Parser.
+- [x] Task 7: Implement Report and Exit Classification.
+- [x] Task 8: Implement Fakeable Workflow Orchestration.
+- [x] Task 9: Add Real Dual-Arm Backend and Command Execution.
+- [ ] Task 10: Add Operator Documentation.
+- [ ] Task 11: Final Verification.
+
+Task 9 review loop is complete. The final targeted Ctrl+C idempotency fix is commit
+`edac468` (`fix: preserve first teleop ctrlc signal`), approved by reviewer with
+`gpt-5.5` and `xhigh` reasoning.
+
+---
+
 ## Scope Check
 
 This plan implements the reviewed v1 spec:
