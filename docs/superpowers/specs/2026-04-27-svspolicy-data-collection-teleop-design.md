@@ -180,6 +180,17 @@ Exactly one MuJoCo model source may be selected. `--model-dir`,
 `--use-standard-model-path`, and `--use-embedded-model` are mutually exclusive.
 If none is supplied, the collector defaults to `--use-standard-model-path`.
 
+Configuration precedence is:
+
+1. CLI arguments
+2. task profile TOML
+3. built-in collector defaults
+
+For example, `[gripper].mirror_enabled = true` in the task profile enables
+gripper mirroring by default, while `--disable-gripper-mirror` forces it off for
+that run. CLI metadata flags such as `--task`, `--operator`, and `--notes`
+override profile/default metadata for the episode manifest.
+
 ## Runtime Data Flow
 
 Startup:
@@ -569,7 +580,7 @@ signal and uses it to keep the demonstration controller physically meaningful.
 Each run creates one directory:
 
 ```text
-<output-dir>/<task>/<episode-id>/
+<output-dir>/<task-slug>/<episode-id>/
   manifest.toml
   steps.bin
   report.json
@@ -591,6 +602,9 @@ replacing non-alphanumeric runs with `-` and trimming leading/trailing `-`. The
 random suffix comes from the OS RNG. If the generated directory already exists,
 the collector retries with a new random suffix; after a bounded retry count it
 fails before connecting hardware.
+
+The directory path uses the same `task-slug`, not the raw task name. The
+manifest records both the raw task name and the derived slug.
 
 ### `manifest.toml`
 
@@ -710,6 +724,20 @@ Backpressure policy:
   the configured duration, the collector stops the episode through the normal
   bounded shutdown path.
 - The final manifest cannot be `complete` if writer flush fails.
+
+Final status mapping:
+
+- `complete`: normal finite run completion, including `--max-iterations`, with
+  no control fault, no writer backpressure stop, no dropped steps unless
+  explicitly allowed, and successful writer flush
+- `cancelled`: operator-requested stop or Ctrl+C after a clean bounded shutdown
+  and successful writer flush
+- `faulted`: startup failure after manifest creation, MuJoCo/controller/runtime
+  failure, writer backpressure threshold exceeded, writer flush failure, output
+  finalization failure, or any dual-arm fault report
+
+If validation fails before the episode directory is created, no episode status
+is written and the command exits with an error.
 
 ## Safety and Fault Handling
 
