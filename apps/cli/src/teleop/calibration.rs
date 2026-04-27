@@ -157,14 +157,22 @@ pub fn check_posture_compatibility(
     let expected_slave = calibration.master_to_slave_position(master);
     let joint_errors_rad =
         std::array::from_fn(|index| (expected_slave[index].0 - slave[index].0).abs());
-    let (max_index, max_error_rad) = joint_errors_rad
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| {
-            left.partial_cmp(right).expect("posture errors are finite for finite inputs")
-        })
-        .expect("joint error array is non-empty");
+    let mut max_index = 0;
+    let mut max_error_rad = joint_errors_rad[0];
+    for (index, error_rad) in joint_errors_rad.iter().copied().enumerate() {
+        if !error_rad.is_finite() {
+            return Err(CompatibilityError {
+                max_error_rad: f64::INFINITY,
+                joint_errors_rad,
+                max_joint: Joint::from_index(index).expect("joint error index is in range"),
+                threshold_rad,
+            });
+        }
+        if error_rad > max_error_rad {
+            max_index = index;
+            max_error_rad = error_rad;
+        }
+    }
 
     if max_error_rad > threshold_rad {
         return Err(CompatibilityError {
@@ -272,6 +280,32 @@ mod tests {
             .expect_err("mismatch should fail");
 
         assert!(err.max_error_rad > 0.05);
+    }
+
+    #[test]
+    fn compatibility_check_rejects_non_finite_master_or_slave_posture_without_panic() {
+        let calibration = sample_calibration();
+        let mut master = JointArray::splat(Rad(0.0));
+        let slave = JointArray::splat(Rad(0.0));
+        master[Joint::J1] = Rad(f64::NAN);
+
+        let err = check_posture_compatibility(&calibration, master, slave, 0.05)
+            .expect_err("non-finite posture should fail");
+
+        assert!(err.max_error_rad.is_infinite() || !err.max_error_rad.is_finite());
+        assert_eq!(err.max_joint, Joint::J1);
+        assert_eq!(err.threshold_rad, 0.05);
+
+        let master = JointArray::splat(Rad(0.0));
+        let mut slave = JointArray::splat(Rad(0.0));
+        slave[Joint::J2] = Rad(f64::NAN);
+
+        let err = check_posture_compatibility(&calibration, master, slave, 0.05)
+            .expect_err("non-finite posture should fail");
+
+        assert!(err.max_error_rad.is_infinite() || !err.max_error_rad.is_finite());
+        assert_eq!(err.max_joint, Joint::J2);
+        assert_eq!(err.threshold_rad, 0.05);
     }
 
     #[test]
