@@ -8,6 +8,10 @@ but runtime execution is rejected until SDK SoftRealtime dual-arm support exists
 
 ## First Run
 
+If you do not pass `--calibration-file`, place both arms in the intended
+mirrored zero pose before running the command. Startup captures that posture
+automatically before the enable confirmation.
+
 ```bash
 piper-cli teleop dual-arm \
   --master-interface can0 \
@@ -17,8 +21,11 @@ piper-cli teleop dual-arm \
 
 ## Calibration
 
-Move both arms to the isomorphic zero pose before capture. Loaded calibration
-files are checked against the current posture before enabling.
+With `--calibration-file`, the CLI loads the baseline and checks the current
+posture before enabling. Without it, startup connects to both arms, checks
+runtime health, then captures the current posture as the baseline before asking
+for operator confirmation. `--save-calibration <path>` writes that captured
+baseline before confirmation if no calibration file is supplied.
 
 ## Runtime Console
 
@@ -35,9 +42,10 @@ files are checked against the current posture before enabling.
 
 The human report and JSON report use master/slave naming even though the SDK
 internally stores the two arms as left/right. Durations are integer
-microseconds. `exit_reason = cancelled` is a clean operator stop. `read_faults`
-or `submission_faults` mean the run is unsafe to continue without inspecting the
-CAN link and arm status.
+microseconds. In JSON, `exit.reason = cancelled` is a clean operator stop; the
+legacy/human-facing term `exit_reason` refers to that same reason value.
+`metrics.read_faults` or `metrics.submission_faults` mean the run is unsafe to
+continue without inspecting the CAN link and arm status.
 
 ## Exit Codes
 
@@ -51,21 +59,25 @@ faulted.
 Read faults, command submission faults, unsupported runtime targets, posture
 mismatch, and Ctrl+C during startup all trigger bounded shutdown behavior. If a
 fault occurs after enable, the CLI attempts to stop both arms and records the
-stop attempt result.
+per-arm stop attempt result.
 
 ## Stop Attempt Results
 
-`stop_attempt = disabled` means both arms were commanded back to standby.
-`stop_attempt = fault_shutdown` means normal disable did not complete and the
-backend used its fault shutdown path. `stop_attempt = unavailable` only applies
-before MIT enable succeeds.
+The human report prints separate master/slave lines with `stop_attempt=...`.
+JSON reports store the same values at `metrics.master_stop_attempt` and
+`metrics.slave_stop_attempt`.
+
+Possible values are `not_attempted`, `confirmed_sent`, `timeout`,
+`channel_closed`, `queue_rejected`, and `transport_failed`. Treat anything other
+than `confirmed_sent` as requiring operator inspection before the next run.
 
 ## JSON Report Schema
 
 `schema_version = 1` is intentionally incompatible with future schemas unless a
-new version is declared. Consumers must check `schema_version`, `exit_reason`,
-`read_faults`, `submission_faults`, and `stop_attempt` before treating data as a
-successful run.
+new version is declared. Consumers must check `schema_version`, `exit.reason`,
+`metrics.read_faults`, `metrics.submission_faults`,
+`metrics.master_stop_attempt`, and `metrics.slave_stop_attempt` before treating
+data as a successful run.
 
 ## Manual Acceptance Checklist
 
