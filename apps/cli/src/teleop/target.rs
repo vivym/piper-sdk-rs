@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use piper_control::TargetSpec;
 use piper_sdk::driver::ConnectionTarget;
 use std::str::FromStr;
@@ -161,24 +161,30 @@ fn resolve_one_role(
     file: Option<&TeleopConfigFile>,
 ) -> Result<ConcreteTeleopTarget> {
     let cli_selectors = cli_selectors(role, args);
-    if let Some((_, target)) = cli_selectors.into_iter().next() {
-        return ConcreteTeleopTarget::parse(&target);
+    if let Some((flag, target)) = cli_selectors.into_iter().next() {
+        return parse_role_target(role, flag, &target);
     }
     if let Some(target) = config_target(role, file) {
-        return ConcreteTeleopTarget::parse(target);
+        return parse_role_target(role, role.config_source(), target);
     }
-    ConcreteTeleopTarget::parse(role.default_linux_target())
+    parse_role_target(role, "default", role.default_linux_target())
 }
 
 fn ensure_one_cli_selector(role: Role, args: &TeleopDualArmArgs) -> Result<()> {
     let cli_selectors = cli_selectors(role, args);
     if cli_selectors.len() > 1 {
+        let flags = cli_selectors.iter().map(|(flag, _)| *flag).collect::<Vec<_>>().join(", ");
         bail!(
-            "{} role has multiple CLI target selectors; use exactly one",
-            role.name()
+            "{} role has multiple CLI target selectors ({flags}); use exactly one",
+            role.name(),
         );
     }
     Ok(())
+}
+
+fn parse_role_target(role: Role, source: &str, value: &str) -> Result<ConcreteTeleopTarget> {
+    ConcreteTeleopTarget::parse(value)
+        .with_context(|| format!("invalid {} target from {source}", role.name()))
 }
 
 fn missing_roles(args: &TeleopDualArmArgs, file: Option<&TeleopConfigFile>) -> Vec<&'static str> {
@@ -195,10 +201,14 @@ fn cli_selectors(role: Role, args: &TeleopDualArmArgs) -> Vec<(&'static str, Str
     let mut selectors = Vec::new();
     match role {
         Role::Master => {
-            push_selector(&mut selectors, "master-target", args.master_target.as_ref());
             push_selector(
                 &mut selectors,
-                "master-interface",
+                "--master-target",
+                args.master_target.as_ref(),
+            );
+            push_selector(
+                &mut selectors,
+                "--master-interface",
                 args.master_interface
                     .as_ref()
                     .map(|iface| format!("socketcan:{iface}"))
@@ -206,7 +216,7 @@ fn cli_selectors(role: Role, args: &TeleopDualArmArgs) -> Vec<(&'static str, Str
             );
             push_selector(
                 &mut selectors,
-                "master-serial",
+                "--master-serial",
                 args.master_serial
                     .as_ref()
                     .map(|serial| format!("gs-usb-serial:{serial}"))
@@ -214,7 +224,7 @@ fn cli_selectors(role: Role, args: &TeleopDualArmArgs) -> Vec<(&'static str, Str
             );
             push_selector(
                 &mut selectors,
-                "master-gs-usb-bus-address",
+                "--master-gs-usb-bus-address",
                 args.master_gs_usb_bus_address
                     .as_ref()
                     .map(|bus_address| format!("gs-usb-bus-address:{bus_address}"))
@@ -222,15 +232,15 @@ fn cli_selectors(role: Role, args: &TeleopDualArmArgs) -> Vec<(&'static str, Str
             );
         },
         Role::Slave => {
-            push_selector(&mut selectors, "slave-target", args.slave_target.as_ref());
+            push_selector(&mut selectors, "--slave-target", args.slave_target.as_ref());
             push_selector(
                 &mut selectors,
-                "slave-interface",
+                "--slave-interface",
                 args.slave_interface.as_ref().map(|iface| format!("socketcan:{iface}")).as_ref(),
             );
             push_selector(
                 &mut selectors,
-                "slave-serial",
+                "--slave-serial",
                 args.slave_serial
                     .as_ref()
                     .map(|serial| format!("gs-usb-serial:{serial}"))
@@ -238,7 +248,7 @@ fn cli_selectors(role: Role, args: &TeleopDualArmArgs) -> Vec<(&'static str, Str
             );
             push_selector(
                 &mut selectors,
-                "slave-gs-usb-bus-address",
+                "--slave-gs-usb-bus-address",
                 args.slave_gs_usb_bus_address
                     .as_ref()
                     .map(|bus_address| format!("gs-usb-bus-address:{bus_address}"))
@@ -279,6 +289,13 @@ impl Role {
         match self {
             Self::Master => "socketcan:can0",
             Self::Slave => "socketcan:can1",
+        }
+    }
+
+    fn config_source(self) -> &'static str {
+        match self {
+            Self::Master => "config [arms.master].target",
+            Self::Slave => "config [arms.slave].target",
         }
     }
 }
@@ -461,6 +478,8 @@ mod tests {
             .expect_err("multiple selectors must fail");
 
         assert!(err.to_string().contains("master"));
+        assert!(err.to_string().contains("--master-target"));
+        assert!(err.to_string().contains("--master-interface"));
     }
 
     #[test]
@@ -485,6 +504,47 @@ mod tests {
             .expect_err("multiple selectors must fail even with config");
 
         assert!(err.to_string().contains("slave"));
+    }
+
+    #[test]
+    fn malformed_cli_target_error_names_role_and_flag() {
+        let args = TeleopDualArmArgs {
+            master_target: Some("socketcan:".to_string()),
+            slave_interface: Some("can1".to_string()),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = resolve_role_targets(&args, None, TeleopPlatform::Linux)
+            .expect_err("malformed CLI target must fail");
+
+        let message = err.to_string();
+        assert!(message.contains("master"));
+        assert!(message.contains("--master-target"));
+    }
+
+    #[test]
+    fn malformed_config_target_error_names_role_and_source() {
+        let file: TeleopConfigFile = toml::from_str(
+            r#"
+            [arms.master]
+            target = "socketcan:can0"
+
+            [arms.slave]
+            target = "socketcan:"
+            "#,
+        )
+        .unwrap();
+
+        let err = resolve_role_targets(
+            &TeleopDualArmArgs::default_for_tests(),
+            Some(&file),
+            TeleopPlatform::Linux,
+        )
+        .expect_err("malformed config target must fail");
+
+        let message = err.to_string();
+        assert!(message.contains("slave"));
+        assert!(message.contains("config"));
     }
 
     #[test]

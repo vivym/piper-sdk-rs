@@ -34,6 +34,7 @@ pub enum TeleopTimingMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TeleopConfigFile {
     pub arms: Option<TeleopArmsConfig>,
     pub control: Option<TeleopControlConfig>,
@@ -42,17 +43,20 @@ pub struct TeleopConfigFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TeleopArmsConfig {
     pub master: Option<TeleopRoleTargetConfig>,
     pub slave: Option<TeleopRoleTargetConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TeleopRoleTargetConfig {
     pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TeleopControlConfig {
     pub mode: Option<TeleopMode>,
     pub frequency_hz: Option<f64>,
@@ -65,12 +69,14 @@ pub struct TeleopControlConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TeleopSafetyConfig {
     pub profile: Option<TeleopProfile>,
     pub gripper_mirror: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TeleopCalibrationConfig {
     pub file: Option<PathBuf>,
     pub max_error_rad: Option<f64>,
@@ -284,11 +290,69 @@ mod tests {
     }
 
     #[test]
+    fn hard_limits_reject_non_finite_values() {
+        let nan_err = TeleopControlSettings {
+            frequency_hz: f64::NAN,
+            ..TeleopControlSettings::default()
+        }
+        .validate()
+        .expect_err("NaN frequency must fail");
+        assert!(nan_err.to_string().contains("frequency_hz"));
+
+        let infinity_err = TeleopControlSettings {
+            reflection_gain: f64::INFINITY,
+            ..TeleopControlSettings::default()
+        }
+        .validate()
+        .expect_err("infinite reflection gain must fail");
+        assert!(infinity_err.to_string().contains("reflection_gain"));
+    }
+
+    #[test]
+    fn calibration_max_error_hard_limit_is_enforced() {
+        let err = ResolvedTeleopConfig::resolve(
+            TeleopDualArmArgs {
+                calibration_max_error_rad: Some(0.06),
+                ..TeleopDualArmArgs::default_for_tests()
+            },
+            None,
+        )
+        .expect_err("calibration max error above cap must fail");
+
+        assert!(err.to_string().contains("calibration_max_error_rad"));
+    }
+
+    #[test]
     fn default_mode_is_master_follower() {
         let resolved =
             ResolvedTeleopConfig::resolve(TeleopDualArmArgs::default_for_tests(), None).unwrap();
 
         assert_eq!(resolved.control.mode, TeleopMode::MasterFollower);
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_config_keys() {
+        let err = toml::from_str::<TeleopConfigFile>(
+            r#"
+            unexpected = true
+            "#,
+        )
+        .expect_err("unknown top-level keys must fail");
+
+        assert!(err.to_string().contains("unexpected"));
+    }
+
+    #[test]
+    fn rejects_unknown_nested_control_keys() {
+        let err = toml::from_str::<TeleopConfigFile>(
+            r#"
+            [control]
+            frequncy_hz = 200.0
+            "#,
+        )
+        .expect_err("unknown control keys must fail");
+
+        assert!(err.to_string().contains("frequncy_hz"));
     }
 
     #[test]
