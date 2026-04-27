@@ -1834,9 +1834,9 @@ impl Piper {
     /// # use piper_driver::Piper;
     /// # use piper_can::PiperFrame;
     /// # fn example(piper: &Piper) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    /// let frame1 = PiperFrame::new_standard(0x100, &[]);
-    /// let frame2 = PiperFrame::new_standard(0x101, &[]);
-    /// let frame3 = PiperFrame::new_standard(0x102, &[]);
+    /// let frame1 = PiperFrame::new_standard(0x100, &[])?;
+    /// let frame2 = PiperFrame::new_standard(0x101, &[])?;
+    /// let frame3 = PiperFrame::new_standard(0x102, &[])?;
     /// let frames = [frame1, frame2, frame3];
     /// if frames.len() > Piper::MAX_REALTIME_PACKAGE_SIZE {
     ///     return Err("Package too large".into());

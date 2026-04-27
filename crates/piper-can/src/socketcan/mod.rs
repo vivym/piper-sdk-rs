@@ -62,7 +62,7 @@ struct TimestampInfo {
 /// let mut adapter = SocketCanAdapter::new("can0").unwrap();
 ///
 /// // 发送帧
-/// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]);
+/// let frame = PiperFrame::new_standard(0x123, &[1, 2, 3, 4]).unwrap();
 /// adapter.send(frame).unwrap();
 ///
 /// // 接收帧
