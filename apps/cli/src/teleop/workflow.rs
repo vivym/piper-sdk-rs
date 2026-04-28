@@ -43,7 +43,8 @@ use crate::teleop::target::{
 };
 
 const CALIBRATED_HW_RAW_TIMING_SOURCE: &str = "calibrated_hw_raw";
-const EXPERIMENTAL_SOFT_SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_millis(200);
+const EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const EXPERIMENTAL_ACTIVE_SOFT_SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_millis(200);
 const EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub trait TeleopBackend {
@@ -786,6 +787,7 @@ fn experimental_raw_clock_dual_arm_read_policy() -> DualArmReadPolicy {
 }
 
 fn wait_for_experimental_soft_snapshot_ready<Read>(
+    phase: &'static str,
     timeout: Duration,
     poll_interval: Duration,
     mut read: Read,
@@ -800,13 +802,23 @@ where
             Ok(snapshot) => return Ok(snapshot),
             Err(error) if is_retryable_experimental_soft_snapshot_error(&error) => {
                 if start.elapsed() >= timeout {
-                    return Err(error);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "experimental raw-clock {phase} snapshot not ready after {}ms",
+                            timeout.as_millis()
+                        )
+                    });
                 }
 
                 let remaining = timeout.saturating_sub(start.elapsed());
                 let sleep_duration = poll_interval.min(remaining);
                 if sleep_duration.is_zero() {
-                    return Err(error);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "experimental raw-clock {phase} snapshot not ready after {}ms",
+                            timeout.as_millis()
+                        )
+                    });
                 }
 
                 std::thread::sleep(sleep_duration);
@@ -1151,7 +1163,8 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             .as_ref()
             .context("experimental raw-clock backend is not connected")?;
         let snapshot = wait_for_experimental_soft_snapshot_ready(
-            EXPERIMENTAL_SOFT_SNAPSHOT_READY_TIMEOUT,
+            "calibration capture",
+            EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT,
             EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL,
             || experimental_soft_snapshot(observers, experimental_raw_clock_dual_arm_read_policy()),
         )?;
@@ -1172,7 +1185,8 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             .as_ref()
             .context("experimental raw-clock backend is not connected")?;
         wait_for_experimental_soft_snapshot_ready(
-            EXPERIMENTAL_SOFT_SNAPSHOT_READY_TIMEOUT,
+            "pre-enable standby",
+            EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT,
             EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL,
             || experimental_soft_snapshot(observers, policy),
         )
@@ -1210,7 +1224,8 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             .as_ref()
             .context("experimental raw-clock backend is not connected")?;
         wait_for_experimental_soft_snapshot_ready(
-            EXPERIMENTAL_SOFT_SNAPSHOT_READY_TIMEOUT,
+            "post-enable active",
+            EXPERIMENTAL_ACTIVE_SOFT_SNAPSHOT_READY_TIMEOUT,
             EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL,
             || experimental_soft_snapshot(observers, policy),
         )
@@ -2850,6 +2865,18 @@ mod tests {
     }
 
     #[test]
+    fn experimental_pre_enable_snapshot_wait_budget_allows_feedback_startup_jitter() {
+        assert!(
+            EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT >= Duration::from_secs(2),
+            "pre-enable snapshot wait budget is too short: {EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT:?}"
+        );
+        assert!(
+            EXPERIMENTAL_ACTIVE_SOFT_SNAPSHOT_READY_TIMEOUT
+                < EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT
+        );
+    }
+
+    #[test]
     fn experimental_soft_snapshot_retry_classifier_accepts_contextual_incomplete_state() {
         let error = anyhow::Error::from(piper_client::types::RobotError::control_state_incomplete(
             0b111, 0x0f,
@@ -2860,10 +2887,35 @@ mod tests {
     }
 
     #[test]
+    fn experimental_soft_snapshot_ready_wait_reports_timeout_context() {
+        let error =
+            wait_for_experimental_soft_snapshot_ready(
+                "pre-enable standby",
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                || -> Result<DualArmSnapshot> {
+                    Err(anyhow::Error::from(
+                        piper_client::types::RobotError::control_state_incomplete(0b111, 0x3c),
+                    )
+                    .context("experimental raw-clock slave dynamic feedback incomplete: mask=0x3c"))
+                },
+            )
+            .expect_err("timeout should include snapshot wait context");
+
+        let error = format!("{error:#}");
+        assert!(
+            error
+                .contains("experimental raw-clock pre-enable standby snapshot not ready after 1ms"),
+            "missing timeout context: {error}"
+        );
+    }
+
+    #[test]
     fn experimental_soft_snapshot_ready_wait_retries_incomplete_and_misaligned_states() {
         let attempts = Arc::new(Mutex::new(0usize));
 
         let snapshot = wait_for_experimental_soft_snapshot_ready(
+            "test",
             Duration::from_millis(50),
             Duration::from_millis(1),
             {

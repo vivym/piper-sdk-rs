@@ -23,6 +23,10 @@ TRACK_KP="${TRACK_KP:-2.0}"
 TRACK_KD="${TRACK_KD:-0.4}"
 MASTER_DAMPING="${MASTER_DAMPING:-0.8}"
 RAW_CLOCK_WARMUP_SECS="${RAW_CLOCK_WARMUP_SECS:-10}"
+# Observed SocketCAN raw-clock residual p95 can sit just above 500us during
+# startup refresh; keep this well below the existing 2000us max residual gate.
+RAW_CLOCK_RESIDUAL_P95_US="${RAW_CLOCK_RESIDUAL_P95_US:-1000}"
+RAW_CLOCK_RESIDUAL_MAX_US="${RAW_CLOCK_RESIDUAL_MAX_US:-2000}"
 # Keep the smoke gate below one 100Hz control tick while allowing the observed
 # independent-CAN feedback phase tail around 5ms.
 RAW_CLOCK_SKEW_US="${RAW_CLOCK_SKEW_US:-6000}"
@@ -44,6 +48,8 @@ cmd=(
     --track-kd "${TRACK_KD}"
     --master-damping "${MASTER_DAMPING}"
     --raw-clock-warmup-secs "${RAW_CLOCK_WARMUP_SECS}"
+    --raw-clock-residual-p95-us "${RAW_CLOCK_RESIDUAL_P95_US}"
+    --raw-clock-residual-max-us "${RAW_CLOCK_RESIDUAL_MAX_US}"
     --max-iterations "${MAX_ITERATIONS}"
     --save-calibration "${CALIBRATION_FILE}"
     --report-json "${REPORT_JSON}"
@@ -64,6 +70,8 @@ fi
     echo "track_kd=${TRACK_KD}"
     echo "master_damping=${MASTER_DAMPING}"
     echo "raw_clock_warmup_secs=${RAW_CLOCK_WARMUP_SECS}"
+    echo "raw_clock_residual_p95_us=${RAW_CLOCK_RESIDUAL_P95_US}"
+    echo "raw_clock_residual_max_us=${RAW_CLOCK_RESIDUAL_MAX_US}"
     echo "raw_clock_skew_us=${RAW_CLOCK_SKEW_US}"
     echo "max_iterations=${MAX_ITERATIONS}"
     echo "disable_gripper_mirror=${DISABLE_GRIPPER_MIRROR}"
