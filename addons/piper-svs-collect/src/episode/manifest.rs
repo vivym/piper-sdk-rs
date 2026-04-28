@@ -443,6 +443,7 @@ impl ManifestV1 {
         self.validate()?;
         validate_step_summary(
             "manifest.step_file",
+            &self.episode_id,
             self.step_file.step_count,
             self.step_file.last_step_index,
             summary,
@@ -880,7 +881,13 @@ impl ReportJson {
         summary: &StepFileSummary,
     ) -> Result<(), ManifestError> {
         self.validate()?;
-        validate_step_summary("report", self.step_count, self.last_step_index, summary)
+        validate_step_summary(
+            "report",
+            &self.episode_id,
+            self.step_count,
+            self.last_step_index,
+            summary,
+        )
     }
 
     pub fn for_test_faulted() -> Self {
@@ -1049,11 +1056,15 @@ fn validate_timestamps(timestamps: &EpisodeTimestamps) -> Result<(), ManifestErr
 
 fn validate_step_summary(
     field: &str,
+    episode_id: &str,
     step_count: u64,
     last_step_index: Option<u64>,
     summary: &StepFileSummary,
 ) -> Result<(), ManifestError> {
-    if step_count != summary.step_count || last_step_index != summary.last_step_index {
+    if episode_id != summary.episode_id
+        || step_count != summary.step_count
+        || last_step_index != summary.last_step_index
+    {
         return Err(ManifestError::InvalidManifest(format!(
             "{field} step metadata does not match decoded steps.bin"
         )));
@@ -1137,6 +1148,8 @@ fn validate_sign_array(field: &str, values: &[f64; 6]) -> Result<(), ManifestErr
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use crate::episode::wire::StepFileSummary;
 
     use super::*;
 
@@ -1281,5 +1294,29 @@ mod tests {
         let mut manifest = ManifestV1::for_test_complete();
         manifest.step_file.relative_path = PathBuf::from("nested/steps.bin");
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn manifest_step_summary_rejects_mismatched_episode_id() {
+        let manifest = ManifestV1::for_test_complete();
+        let summary = StepFileSummary {
+            episode_id: "20260428T010203Z-other-a1b2c3d4e5f6".to_string(),
+            step_count: manifest.step_file.step_count,
+            last_step_index: manifest.step_file.last_step_index,
+        };
+
+        assert!(manifest.validate_against_step_file_summary(&summary).is_err());
+    }
+
+    #[test]
+    fn report_step_summary_rejects_mismatched_episode_id() {
+        let report = ReportJson::for_test_faulted();
+        let summary = StepFileSummary {
+            episode_id: "20260428T010203Z-other-a1b2c3d4e5f6".to_string(),
+            step_count: report.step_count,
+            last_step_index: report.last_step_index,
+        };
+
+        assert!(report.validate_against_step_file_summary(&summary).is_err());
     }
 }

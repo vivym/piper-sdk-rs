@@ -1,7 +1,6 @@
+use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Write};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bincode::Options;
 use serde::{Deserialize, Serialize};
@@ -146,8 +145,9 @@ pub struct DecodedStepsFileV1 {
     pub summary: StepFileSummary,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StepFileSummary {
+    pub episode_id: String,
     pub step_count: u64,
     pub last_step_index: Option<u64>,
 }
@@ -547,8 +547,9 @@ impl SvsStepV1 {
 }
 
 impl StepFileSummary {
-    pub fn from_steps(steps: &[SvsStepV1]) -> Self {
+    pub fn new(episode_id: impl Into<String>, steps: &[SvsStepV1]) -> Self {
         Self {
+            episode_id: episode_id.into(),
             step_count: steps.len() as u64,
             last_step_index: steps.last().map(|step| step.step_index),
         }
@@ -560,14 +561,83 @@ pub fn write_steps_file(
     header: &SvsHeaderV1,
     steps: &[SvsStepV1],
 ) -> Result<StepFileSummary, WireError> {
-    let mut file = std::fs::File::create(path)?;
-    write_header(&mut file, header)?;
-    for step in steps {
-        write_step(&mut file, step)?;
+    header.validate()?;
+    validate_steps_sequence(steps)?;
+    let episode_id = header.episode_id()?.to_string();
+    let path = path.as_ref();
+    let temp_path = temp_path_for(path);
+
+    let result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
+        write_header(&mut file, header)?;
+        for step in steps {
+            write_step(&mut file, step)?;
+        }
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        persist_temp_no_overwrite(&temp_path, path)?;
+        Ok(StepFileSummary::new(episode_id, steps))
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
     }
-    file.flush()?;
-    file.sync_all()?;
-    Ok(StepFileSummary::from_steps(steps))
+    result
+}
+
+fn validate_steps_sequence(steps: &[SvsStepV1]) -> Result<(), WireError> {
+    for (expected, step) in steps.iter().enumerate() {
+        step.validate()?;
+        let expected = expected as u64;
+        if step.step_index != expected {
+            return Err(WireError::NonSequentialStepIndex {
+                expected,
+                actual: step.step_index,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("steps.bin");
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        piper_driver::heartbeat::monotonic_micros().max(1)
+    ))
+}
+
+fn persist_temp_no_overwrite(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(temp_path, final_path) {
+        Ok(()) => {
+            std::fs::remove_file(temp_path)?;
+            Ok(())
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(err),
+        Err(_link_err) => {
+            let mut src = File::open(temp_path)?;
+            let mut dst = OpenOptions::new().write(true).create_new(true).open(final_path)?;
+            let result = (|| {
+                std::io::copy(&mut src, &mut dst)?;
+                dst.flush()?;
+                dst.sync_all()
+            })();
+
+            match result {
+                Ok(()) => {
+                    drop(dst);
+                    std::fs::remove_file(temp_path)
+                },
+                Err(err) => {
+                    drop(dst);
+                    let _ = std::fs::remove_file(final_path);
+                    Err(err)
+                },
+            }
+        },
+    }
 }
 
 pub fn read_steps_file(path: impl AsRef<Path>) -> Result<DecodedStepsFileV1, WireError> {
@@ -577,6 +647,7 @@ pub fn read_steps_file(path: impl AsRef<Path>) -> Result<DecodedStepsFileV1, Wir
         .deserialize_from(&mut cursor)
         .map_err(|err| WireError::Bincode(err.to_string()))?;
     header.validate()?;
+    let episode_id = header.episode_id()?.to_string();
 
     let mut steps = Vec::new();
     let mut expected_step_index = 0_u64;
@@ -595,7 +666,7 @@ pub fn read_steps_file(path: impl AsRef<Path>) -> Result<DecodedStepsFileV1, Wir
         steps.push(step);
     }
 
-    let summary = StepFileSummary::from_steps(&steps);
+    let summary = StepFileSummary::new(episode_id, &steps);
     Ok(DecodedStepsFileV1 {
         header,
         steps,
@@ -741,8 +812,11 @@ mod episode_id_bytes_serde {
 
 #[cfg(test)]
 fn write_test_steps(dir: &tempfile::TempDir, step_count: u64) -> PathBuf {
-    let indexes: Vec<u64> = (0..step_count).collect();
-    write_test_steps_with_indexes(dir, &indexes)
+    let path = dir.path().join("steps.bin");
+    let header = SvsHeaderV1::for_test("20260427T000000Z-test-abcdef123456");
+    let steps: Vec<SvsStepV1> = (0..step_count).map(SvsStepV1::for_test).collect();
+    write_steps_file(&path, &header, &steps).unwrap();
+    path
 }
 
 #[cfg(test)]
@@ -750,7 +824,11 @@ fn write_test_steps_with_indexes(dir: &tempfile::TempDir, indexes: &[u64]) -> Pa
     let path = dir.path().join("steps.bin");
     let header = SvsHeaderV1::for_test("20260427T000000Z-test-abcdef123456");
     let steps: Vec<SvsStepV1> = indexes.iter().copied().map(SvsStepV1::for_test).collect();
-    write_steps_file(&path, &header, &steps).unwrap();
+    let mut file = File::create(&path).unwrap();
+    write_header(&mut file, &header).unwrap();
+    for step in &steps {
+        write_step(&mut file, step).unwrap();
+    }
     path
 }
 
@@ -792,5 +870,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_steps_with_indexes(&dir, &[0, 2]);
         assert!(read_steps_file(&path).is_err());
+    }
+
+    #[test]
+    fn public_write_steps_file_rejects_nonsequential_indexes_without_final_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("steps.bin");
+        let header = SvsHeaderV1::for_test("20260427T000000Z-test-abcdef123456");
+        let steps = [SvsStepV1::for_test(0), SvsStepV1::for_test(2)];
+
+        assert!(write_steps_file(&path, &header, &steps).is_err());
+        assert!(!path.exists());
     }
 }
