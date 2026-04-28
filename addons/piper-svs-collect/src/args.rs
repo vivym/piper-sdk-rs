@@ -51,6 +51,7 @@ pub struct Args {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn parses_required_svs_collect_args() {
@@ -74,7 +75,11 @@ mod tests {
 
         assert_eq!(args.master_target, "socketcan:can0");
         assert_eq!(args.slave_target, "socketcan:can1");
+        assert_eq!(args.model_dir.as_deref(), Some(Path::new("/tmp/model")));
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/out"));
+        assert_eq!(args.operator.as_deref(), Some("viv"));
         assert_eq!(args.task.as_deref(), Some("wiping"));
+        assert_eq!(args.timing_mode, "spin");
         assert!(args.yes);
     }
 }
