@@ -2584,6 +2584,22 @@ impl Piper<Active<MitPassthroughMode>, SoftRealtime> {
         Ok(())
     }
 
+    /// 从类型化关节数组构建已校验 MIT 批命令，并等待 SoftRealtime TX 线程确认发送结果。
+    pub fn command_torques_confirmed(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let raw = RawCommander::new(&self.driver);
+        let commands =
+            self.build_validated_mit_command_batch(positions, velocities, kp, kd, torques)?;
+        raw.send_validated_mit_command_batch_confirmed(commands, timeout)
+    }
+
     pub fn observer(&self) -> &Observer<SoftRealtime> {
         &self.observer
     }
@@ -5116,6 +5132,74 @@ mod tests {
             .expect("fresh matching 0x2A1 + 0x151 should allow MIT passthrough");
 
         assert!(matches!(active._state, Active(MitPassthroughMode)));
+    }
+
+    #[test]
+    fn soft_mit_passthrough_command_torques_confirmed_applies_firmware_quirks() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = enabled_joint_frames_after(Duration::from_millis(5));
+        frames.push(TimedFrame {
+            delay: Duration::from_millis(15),
+            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
+        });
+        frames.push(TimedFrame {
+            delay: Duration::ZERO,
+            frame: control_mode_echo_frame(
+                piper_protocol::control::ControlModeCommand::CanControl,
+                MoveMode::MoveM,
+                70,
+                piper_protocol::control::MitMode::Mit,
+                InstallPosition::Invalid,
+                101,
+            ),
+        });
+
+        let mut standby =
+            build_soft_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
+        standby.quirks = DeviceQuirks::from_firmware_version(Version::new(1, 7, 2));
+        let active = standby
+            .enable_mit_passthrough(MitModeConfig {
+                timeout: Duration::from_millis(80),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 70,
+            })
+            .expect("fresh matching 0x2A1 + 0x151 should allow MIT passthrough");
+        sent_frames.lock().expect("sent frames lock").clear();
+
+        let positions =
+            JointArray::from([Rad(1.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0), Rad(0.0)]);
+        let velocities = JointArray::splat(0.0);
+        let kp = JointArray::splat(8.0);
+        let kd = JointArray::splat(1.0);
+        let torques = JointArray::from([
+            NewtonMeter(4.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+        ]);
+
+        active
+            .command_torques_confirmed(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(20),
+            )
+            .expect("soft passthrough torque command should send");
+
+        let frames = wait_for_sent_frames(&sent_frames, 6);
+        assert_eq!(frames.len(), 6);
+
+        let expected = MitControlCommand::try_new(1, -1.0, 0.0, 8.0, 1.0, -1.0)
+            .expect("expected command should be valid")
+            .to_frame();
+        assert_eq!(frames[0].id(), expected.id());
+        assert_eq!(frames[0].data(), expected.data());
     }
 
     #[test]
