@@ -119,7 +119,16 @@ impl EpisodeWriter {
         header: SvsHeaderV1,
         capacity: usize,
     ) -> Result<Self, WriterError> {
-        Self::start(output_dir.as_ref(), header, capacity, false)
+        Self::start(output_dir.as_ref(), header, capacity, false, None)
+    }
+
+    pub fn new_with_backpressure_thresholds(
+        output_dir: impl AsRef<Path>,
+        header: SvsHeaderV1,
+        capacity: usize,
+        monitor: &WriterBackpressureMonitor,
+    ) -> Result<Self, WriterError> {
+        Self::start(output_dir.as_ref(), header, capacity, false, Some(monitor))
     }
 
     pub fn for_test_with_capacity(
@@ -131,6 +140,7 @@ impl EpisodeWriter {
             SvsHeaderV1::for_test("20260428T010203Z-test-000000000000"),
             capacity,
             true,
+            None,
         )
     }
 
@@ -162,6 +172,10 @@ impl EpisodeWriter {
         self.stats.snapshot()
     }
 
+    pub fn record_backpressure_threshold_tripped(&self) {
+        self.stats.backpressure_threshold_tripped.store(true, Ordering::Relaxed);
+    }
+
     pub fn pause_worker_for_test(&mut self) {
         self.pause_worker.store(true, Ordering::Release);
     }
@@ -181,6 +195,7 @@ impl EpisodeWriter {
             SvsHeaderV1::for_test("20260428T010203Z-test-000000000000"),
             capacity,
             true,
+            None,
         )
     }
 
@@ -203,6 +218,7 @@ impl EpisodeWriter {
         header: SvsHeaderV1,
         capacity: usize,
         start_paused: bool,
+        monitor: Option<&WriterBackpressureMonitor>,
     ) -> Result<Self, WriterError> {
         if capacity == 0 {
             return Err(WriterError::InvalidCapacity);
@@ -210,7 +226,7 @@ impl EpisodeWriter {
 
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
         let pause_worker = Arc::new(AtomicBool::new(start_paused));
-        let stats = Arc::new(AtomicWriterStats::default());
+        let stats = Arc::new(AtomicWriterStats::new(monitor));
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
         let output_dir = output_dir.to_path_buf();
         #[cfg(test)]
@@ -337,6 +353,19 @@ impl Default for AtomicWriterStats {
 }
 
 impl AtomicWriterStats {
+    fn new(monitor: Option<&WriterBackpressureMonitor>) -> Self {
+        let stats = Self::default();
+        if let Some(monitor) = monitor {
+            stats
+                .queue_full_stop_events
+                .store(monitor.queue_full_stop_events(), Ordering::Relaxed);
+            stats
+                .queue_full_stop_duration_ms
+                .store(monitor.queue_full_stop_duration_ms(), Ordering::Relaxed);
+        }
+        stats
+    }
+
     fn snapshot(&self) -> WriterStats {
         let first_queue_full = self.first_queue_full_host_mono_us.load(Ordering::Relaxed);
         let latest_queue_full = self.latest_queue_full_host_mono_us.load(Ordering::Relaxed);

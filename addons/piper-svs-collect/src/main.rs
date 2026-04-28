@@ -1,8 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
-use piper_svs_collect::args::Args;
+use piper_svs_collect::{args::Args, collector::run_from_args};
 
 fn main() -> Result<()> {
-    let _args = Args::parse();
-    Ok(())
+    run_from_args(Args::parse()).map(|_| ())
 }
