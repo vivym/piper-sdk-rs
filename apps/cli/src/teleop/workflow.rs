@@ -6,7 +6,8 @@ use piper_client::dual_arm::{
 };
 use piper_client::dual_arm_raw_clock::{
     ExperimentalRawClockConfig, ExperimentalRawClockDualArmActive,
-    ExperimentalRawClockDualArmStandby, ExperimentalRawClockMode, ExperimentalRawClockRunConfig,
+    ExperimentalRawClockDualArmStandby, ExperimentalRawClockMasterFollowerGains,
+    ExperimentalRawClockMode, ExperimentalRawClockRunConfig,
     ExperimentalRawClockRunExit as PiperRawClockRunExit, RawClockRuntimeExitReason,
     RawClockRuntimeReport, RawClockRuntimeThresholds,
 };
@@ -557,16 +558,7 @@ where
     }
 
     let started_at = Instant::now();
-    let console_handle = match io.start_console(settings_handle.clone(), started_at) {
-        Ok(handle) => handle,
-        Err(error) => {
-            return disable_experimental_after_error(
-                backend,
-                "failed to start teleop console",
-                error,
-            );
-        },
-    };
+    let console_handle = None;
 
     let loop_exit = backend.run_master_follower_raw_clock(
         settings_handle.clone(),
@@ -735,6 +727,16 @@ fn experimental_raw_clock_config_from_settings(
         max_iterations,
         thresholds,
         estimator_thresholds,
+    }
+}
+
+fn experimental_raw_clock_master_follower_gains(
+    settings: &RuntimeTeleopSettings,
+) -> ExperimentalRawClockMasterFollowerGains {
+    ExperimentalRawClockMasterFollowerGains {
+        track_kp: JointArray::splat(settings.track_kp),
+        track_kd: JointArray::splat(settings.track_kd),
+        master_damping: JointArray::splat(settings.master_damping),
     }
 }
 
@@ -1150,7 +1152,9 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             cancel_signal: Some(cancel_signal),
         };
 
-        match active.run_master_follower(runtime_settings.calibration, run_config) {
+        let gains = experimental_raw_clock_master_follower_gains(&runtime_settings);
+        match active.run_master_follower_with_gains(runtime_settings.calibration, gains, run_config)
+        {
             Ok(PiperRawClockRunExit::Standby { arms, report }) => {
                 self.experimental_standby = Some(*arms);
                 self.experimental_phase = ExperimentalBackendPhase::WarmedStandby;
@@ -1623,6 +1627,7 @@ mod tests {
     struct FakeTeleopBackend {
         trace: WorkflowTrace,
         call_counts: Arc<Mutex<FakeBackendCallCounts>>,
+        experimental_run_settings: Arc<Mutex<Option<RuntimeTeleopSettings>>>,
         health_failure: bool,
         standby_mismatch: bool,
         active_mismatch: bool,
@@ -1638,6 +1643,7 @@ mod tests {
             Self {
                 trace: WorkflowTrace::default(),
                 call_counts: Arc::new(Mutex::new(FakeBackendCallCounts::default())),
+                experimental_run_settings: Arc::new(Mutex::new(None)),
                 health_failure: false,
                 standby_mismatch: false,
                 active_mismatch: false,
@@ -1738,6 +1744,13 @@ mod tests {
 
         fn call_counts(&self) -> FakeBackendCallCounts {
             self.call_counts.lock().expect("call counts lock poisoned").clone()
+        }
+
+        fn experimental_run_settings(&self) -> Option<RuntimeTeleopSettings> {
+            self.experimental_run_settings
+                .lock()
+                .expect("experimental settings lock poisoned")
+                .clone()
         }
 
         fn was_disabled_or_faulted_before_report(&self) -> bool {
@@ -1881,11 +1894,15 @@ mod tests {
 
         fn run_master_follower_raw_clock(
             &mut self,
-            _settings: RuntimeTeleopSettingsHandle,
+            settings: RuntimeTeleopSettingsHandle,
             _raw_clock: TeleopRawClockSettings,
             _cancel_signal: Arc<AtomicBool>,
         ) -> Result<ExperimentalRawClockRunExit> {
             self.trace.push(WorkflowCall::RunLoop);
+            *self
+                .experimental_run_settings
+                .lock()
+                .expect("experimental settings lock poisoned") = Some(settings.snapshot());
             let mut counts = self.call_counts.lock().expect("call counts lock poisoned");
             counts.experimental_raw_clock_runs += 1;
             if self.experimental_run_exit.faulted {
@@ -1918,6 +1935,8 @@ mod tests {
         report_write_error: bool,
         console_start_error: bool,
         console_finished_error: bool,
+        console_switches_to_bilateral: bool,
+        last_report: Arc<Mutex<Option<TeleopJsonReport>>>,
     }
 
     impl Default for FakeTeleopIo {
@@ -1932,6 +1951,8 @@ mod tests {
                 report_write_error: false,
                 console_start_error: false,
                 console_finished_error: false,
+                console_switches_to_bilateral: false,
+                last_report: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -1989,6 +2010,14 @@ mod tests {
             }
         }
 
+        fn console_switches_to_bilateral_with_trace(trace: WorkflowTrace) -> Self {
+            Self {
+                trace,
+                console_switches_to_bilateral: true,
+                ..Self::default()
+            }
+        }
+
         fn report_and_console_error_with_trace(trace: WorkflowTrace) -> Self {
             Self {
                 trace,
@@ -2025,12 +2054,15 @@ mod tests {
 
         fn start_console(
             &mut self,
-            _settings: crate::teleop::controller::RuntimeTeleopSettingsHandle,
+            settings: crate::teleop::controller::RuntimeTeleopSettingsHandle,
             _started_at: Instant,
         ) -> Result<Option<JoinHandle<Result<()>>>> {
             self.trace.push(WorkflowCall::StartConsole);
             if self.console_start_error {
                 bail!("console failed to start");
+            }
+            if self.console_switches_to_bilateral {
+                settings.update_mode(TeleopMode::Bilateral)?;
             }
             if self.console_finished_error {
                 let handle = std::thread::spawn(|| bail!("console finished with error"));
@@ -2045,9 +2077,10 @@ mod tests {
         fn write_json_report(
             &mut self,
             _path: &Path,
-            _report: &crate::teleop::report::TeleopJsonReport,
+            report: &crate::teleop::report::TeleopJsonReport,
         ) -> Result<()> {
             self.trace.push(WorkflowCall::WriteReport);
+            *self.last_report.lock().expect("last report lock poisoned") = Some(report.clone());
             if self.report_write_error {
                 bail!("report write failed");
             }
@@ -2356,6 +2389,7 @@ mod tests {
         assert_eq!(status, TeleopExitStatus::Success);
         assert_eq!(backend.call_counts().experimental_raw_clock_runs, 1);
         assert_eq!(backend.call_counts().strict_runs, 0);
+        assert!(!trace.calls().contains(&WorkflowCall::StartConsole));
         assert_call_order(
             trace.calls(),
             &[
@@ -2366,6 +2400,55 @@ mod tests {
                 WorkflowCall::RunLoop,
             ],
         );
+    }
+
+    #[test]
+    fn experimental_raw_clock_run_receives_initial_master_follower_gains() {
+        let backend = FakeTeleopBackend::default().with_experimental_raw_clock_success();
+        let args = TeleopDualArmArgs {
+            track_kp: Some(9.25),
+            track_kd: Some(1.75),
+            master_damping: Some(0.65),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test(args, backend.clone())
+            .expect("experimental raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        let settings = backend
+            .experimental_run_settings()
+            .expect("raw-clock run should receive runtime settings");
+        assert_eq!(settings.mode, TeleopMode::MasterFollower);
+        assert_eq!(settings.track_kp, 9.25);
+        assert_eq!(settings.track_kd, 1.75);
+        assert_eq!(settings.master_damping, 0.65);
+    }
+
+    #[test]
+    fn experimental_raw_clock_does_not_report_console_bilateral_mode_update() {
+        let trace = WorkflowTrace::default();
+        let backend =
+            FakeTeleopBackend::with_trace(trace.clone()).with_experimental_raw_clock_success();
+        let io = FakeTeleopIo::console_switches_to_bilateral_with_trace(trace.clone());
+        let report_slot = io.last_report.clone();
+        let args = TeleopDualArmArgs {
+            report_json: Some(PathBuf::from("teleop-report.json")),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test_with_io(args, backend, io)
+            .expect("experimental raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        assert!(!trace.calls().contains(&WorkflowCall::StartConsole));
+        let report = report_slot
+            .lock()
+            .expect("last report lock poisoned")
+            .clone()
+            .expect("report should be written");
+        assert_eq!(report.mode.initial, "master_follower");
+        assert_eq!(report.mode.final_, "master_follower");
     }
 
     #[test]
@@ -2535,6 +2618,21 @@ mod tests {
         assert_eq!(config.estimator_thresholds.last_sample_age_us, 9_000);
         assert_eq!(config.thresholds.inter_arm_skew_max_us, 1500);
         assert_eq!(config.thresholds.last_sample_age_us, 9_000);
+    }
+
+    #[test]
+    fn experimental_raw_clock_settings_convert_to_client_controller_gains() {
+        let settings = RuntimeTeleopSettings::production(sample_calibration())
+            .with_track_gains(9.25, 1.75)
+            .unwrap()
+            .with_master_damping(0.65)
+            .unwrap();
+
+        let gains = experimental_raw_clock_master_follower_gains(&settings);
+
+        assert_eq!(gains.track_kp, JointArray::splat(9.25));
+        assert_eq!(gains.track_kd, JointArray::splat(1.75));
+        assert_eq!(gains.master_damping, JointArray::splat(0.65));
     }
 
     fn run_workflow_for_test(

@@ -99,6 +99,23 @@ impl ExperimentalRawClockConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExperimentalRawClockMasterFollowerGains {
+    pub track_kp: JointArray<f64>,
+    pub track_kd: JointArray<f64>,
+    pub master_damping: JointArray<f64>,
+}
+
+impl Default for ExperimentalRawClockMasterFollowerGains {
+    fn default() -> Self {
+        Self {
+            track_kp: JointArray::splat(5.0),
+            track_kd: JointArray::splat(0.8),
+            master_damping: JointArray::splat(0.2),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawClockRuntimeThresholds {
     pub inter_arm_skew_max_us: u64,
@@ -689,7 +706,23 @@ impl ExperimentalRawClockDualArmActive {
         calibration: DualArmCalibration,
         cfg: ExperimentalRawClockRunConfig,
     ) -> Result<ExperimentalRawClockRunExit, RawClockRuntimeError> {
-        self.run_with_controller(MasterFollowerController::new(calibration), cfg)
+        self.run_master_follower_with_gains(
+            calibration,
+            ExperimentalRawClockMasterFollowerGains::default(),
+            cfg,
+        )
+    }
+
+    pub fn run_master_follower_with_gains(
+        self,
+        calibration: DualArmCalibration,
+        gains: ExperimentalRawClockMasterFollowerGains,
+        cfg: ExperimentalRawClockRunConfig,
+    ) -> Result<ExperimentalRawClockRunExit, RawClockRuntimeError> {
+        self.run_with_controller(
+            master_follower_controller_with_gains(calibration, gains),
+            cfg,
+        )
     }
 
     fn run_with_controller<C>(
@@ -755,6 +788,15 @@ impl ExperimentalRawClockDualArmActive {
     ) -> (ExperimentalRawClockErrorState, ExperimentalFaultShutdown) {
         fault_shutdown_soft_realtime(self.master, self.slave, timeout)
     }
+}
+
+fn master_follower_controller_with_gains(
+    calibration: DualArmCalibration,
+    gains: ExperimentalRawClockMasterFollowerGains,
+) -> MasterFollowerController {
+    MasterFollowerController::new(calibration)
+        .with_track_gains(gains.track_kp, gains.track_kd)
+        .with_master_damping(gains.master_damping)
 }
 
 #[derive(Debug, Clone)]
@@ -1327,6 +1369,7 @@ fn percentile(samples: impl IntoIterator<Item = u64>, percentile: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dual_arm::JointMirrorMap;
     use crate::observer::{ControlSnapshot, Observer};
     use crate::types::{DeviceQuirks, JointArray, NewtonMeter, Rad, RadPerSecond};
     use piper_can::{
@@ -1768,6 +1811,7 @@ mod tests {
     #[derive(Default)]
     struct FakeIoState {
         command_log: Mutex<Vec<&'static str>>,
+        commands: Mutex<Vec<BilateralCommand>>,
         disable_attempts: Mutex<Vec<&'static str>>,
         fault_shutdowns: AtomicUsize,
     }
@@ -1850,9 +1894,10 @@ mod tests {
 
         fn submit_command(
             &mut self,
-            _command: &BilateralCommand,
+            command: &BilateralCommand,
             _timeout: Duration,
         ) -> RobotResult<()> {
+            self.state.commands.lock().expect("commands lock").push(command.clone());
             self.state.command_log.lock().expect("command log lock").push("slave");
             if matches!(self.command_failure, Some(FakeCommandFailure::Slave)) {
                 return Err(RobotError::ConfigError(
@@ -1919,6 +1964,25 @@ mod tests {
         max_iterations: usize,
         thresholds: RawClockRuntimeThresholds,
     ) -> (Arc<FakeIoState>, RawClockRuntimeReport) {
+        run_fake_runtime_with_controller(
+            io,
+            timing,
+            max_iterations,
+            thresholds,
+            TestCommandController,
+        )
+    }
+
+    fn run_fake_runtime_with_controller<C>(
+        io: FakeRuntimeIo,
+        timing: RawClockRuntimeTiming,
+        max_iterations: usize,
+        thresholds: RawClockRuntimeThresholds,
+        controller: C,
+    ) -> (Arc<FakeIoState>, RawClockRuntimeReport)
+    where
+        C: BilateralController,
+    {
         let state = io.state.clone();
         let core = RawClockRuntimeCore {
             io,
@@ -1931,18 +1995,23 @@ mod tests {
                 estimator_thresholds: thresholds_for_tests(),
             },
         };
-        let exit = run_raw_clock_runtime_core(
-            core,
-            TestCommandController,
-            ExperimentalRawClockRunConfig::default(),
-        )
-        .expect("fake runtime core should not return outer error");
+        let exit =
+            run_raw_clock_runtime_core(core, controller, ExperimentalRawClockRunConfig::default())
+                .expect("fake runtime core should not return outer error");
         let report = match exit {
             RawClockCoreExit::Standby { report, .. } | RawClockCoreExit::Faulted { report, .. } => {
                 report
             },
         };
         (state, report)
+    }
+
+    fn calibration_for_raw_clock_gains_test() -> DualArmCalibration {
+        DualArmCalibration {
+            master_zero: JointArray::splat(Rad(0.0)),
+            slave_zero: JointArray::splat(Rad(0.0)),
+            map: JointMirrorMap::left_right_mirror(),
+        }
     }
 
     #[test]
@@ -1952,6 +2021,38 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("master-follower"));
+    }
+
+    #[test]
+    fn raw_clock_master_follower_runtime_uses_configured_gains() {
+        let gains = ExperimentalRawClockMasterFollowerGains {
+            track_kp: JointArray::splat(9.25),
+            track_kd: JointArray::splat(1.75),
+            master_damping: JointArray::splat(0.65),
+        };
+        let controller =
+            master_follower_controller_with_gains(calibration_for_raw_clock_gains_test(), gains);
+        let io = FakeRuntimeIo::new().with_reads([FakeRead::pair(
+            raw_clock_snapshot_for_tests(10_000, 110_000),
+            raw_clock_snapshot_for_tests(20_000, 110_800),
+        )]);
+
+        let (state, report) = run_fake_runtime_with_controller(
+            io,
+            ready_timing_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            controller,
+        );
+
+        assert_eq!(report.iterations, 1);
+        assert_eq!(report.submission_faults, 0);
+        let commands = state.commands.lock().expect("commands lock");
+        assert_eq!(commands.len(), 1);
+        let command = &commands[0];
+        assert_eq!(command.slave_kp, gains.track_kp);
+        assert_eq!(command.slave_kd, gains.track_kd);
+        assert_eq!(command.master_kd, gains.master_damping);
     }
 
     #[test]
