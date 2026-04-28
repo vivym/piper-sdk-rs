@@ -12,12 +12,15 @@
 //! - **API Consistency**: Ignores gravity parameter (MuJoCo uses model's internal gravity)
 
 use crate::{
+    end_effector::{
+        EndEffectorKinematics, EndEffectorSelector, condition_number_from_singular_values,
+    },
     error::PhysicsError,
     traits::GravityCompensation,
     types::{JointState, JointTorques},
 };
 use mujoco_rs::{mujoco_c, prelude::*};
-use std::sync::Arc;
+use std::{ffi::CStr, sync::Arc};
 
 /// MuJoCo-based gravity compensation
 ///
@@ -339,6 +342,159 @@ impl MujocoGravityCompensation {
     /// Get mutable reference to MuJoCo data
     pub fn data_mut(&mut self) -> &mut MjData<Arc<MjModel>> {
         &mut self.data
+    }
+
+    /// Computes end-effector pose and translational Jacobian for an explicit MuJoCo site.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selector is empty, the site name is not uniquely
+    /// resolvable, the joint state contains non-finite values, or the model is
+    /// not a 6-DoF manipulator.
+    pub fn end_effector_kinematics(
+        &mut self,
+        selector: &EndEffectorSelector,
+        q: &JointState,
+    ) -> Result<EndEffectorKinematics, PhysicsError> {
+        selector.validate()?;
+        self.set_joint_positions(q)?;
+        self.data.forward();
+
+        let site_id = self.resolve_unique_site(&selector.site_name)?;
+        self.compute_site_kinematics(site_id)
+    }
+
+    fn set_joint_positions(&mut self, q: &JointState) -> Result<(), PhysicsError> {
+        if self.model.ffi().nq < 6 || self.model.ffi().nv != 6 {
+            return Err(PhysicsError::InvalidInput(format!(
+                "Expected 6-DOF robot with at least 6 qpos entries, got nq={} nv={}",
+                self.model.ffi().nq,
+                self.model.ffi().nv
+            )));
+        }
+
+        if q.as_slice().iter().any(|value| !value.is_finite()) {
+            return Err(PhysicsError::InvalidInput(
+                "joint positions must be finite".to_string(),
+            ));
+        }
+
+        self.data.qpos_mut()[0..6].copy_from_slice(q.as_slice());
+        self.data.qvel_mut()[0..6].fill(0.0);
+        self.data.qacc_mut()[0..6].fill(0.0);
+
+        Ok(())
+    }
+
+    fn resolve_unique_site(&self, site_name: &str) -> Result<i32, PhysicsError> {
+        let target = site_name.trim();
+        let mut matches = Vec::new();
+
+        for site_id in 0..self.model.ffi().nsite {
+            if self.site_name(site_id)? == target {
+                matches.push(site_id);
+            }
+        }
+
+        match matches.as_slice() {
+            [site_id] => Ok(*site_id),
+            [] => Err(PhysicsError::InvalidInput(format!(
+                "MuJoCo end-effector site '{target}' was not found"
+            ))),
+            _ => Err(PhysicsError::InvalidInput(format!(
+                "MuJoCo end-effector site '{target}' is ambiguous: matched {} sites",
+                matches.len()
+            ))),
+        }
+    }
+
+    fn site_name(&self, site_id: i32) -> Result<String, PhysicsError> {
+        if site_id < 0 || site_id >= self.model.ffi().nsite {
+            return Err(PhysicsError::InvalidInput(format!(
+                "MuJoCo site id {site_id} is out of range"
+            )));
+        }
+
+        let names = self.model.ffi().names;
+        if names.is_null() {
+            return Err(PhysicsError::CalculationFailed(
+                "MuJoCo model name table is null".to_string(),
+            ));
+        }
+
+        let site_idx = site_id as usize;
+        let name_offset = self.model.name_siteadr()[site_idx] as usize;
+        let name = unsafe { CStr::from_ptr(names.add(name_offset)) };
+
+        Ok(name.to_string_lossy().into_owned())
+    }
+
+    fn compute_site_kinematics(&self, site_id: i32) -> Result<EndEffectorKinematics, PhysicsError> {
+        if self.model.ffi().nv != 6 {
+            return Err(PhysicsError::InvalidInput(format!(
+                "Expected 6-DOF robot for end-effector Jacobian, got {} DOF",
+                self.model.ffi().nv
+            )));
+        }
+
+        if site_id < 0 || site_id >= self.model.ffi().nsite {
+            return Err(PhysicsError::InvalidInput(format!(
+                "MuJoCo site id {site_id} is out of range"
+            )));
+        }
+
+        let site_idx = site_id as usize;
+        let site_xpos = self.data.site_xpos()[site_idx];
+        let site_xmat = self.data.site_xmat()[site_idx];
+
+        let mut jacp = [0.0f64; 18];
+        let mut jacr = [0.0f64; 18];
+
+        unsafe {
+            mujoco_c::mj_jacSite(
+                self.model.ffi(),
+                self.data.ffi(),
+                jacp.as_mut_ptr(),
+                jacr.as_mut_ptr(),
+                site_id,
+            );
+        }
+
+        let jacp_matrix = nalgebra::Matrix3x6::from_row_slice(&jacp);
+        let translational_jacobian_base = Self::matrix3x6_to_array(&jacp_matrix);
+        let singular_values = jacp_matrix.svd(false, false).singular_values;
+        let jacobian_condition = condition_number_from_singular_values([
+            singular_values[0],
+            singular_values[1],
+            singular_values[2],
+        ]);
+
+        Ok(EndEffectorKinematics {
+            position_base_m: site_xpos,
+            rotation_base_from_ee: Self::row_major_matrix3_to_array(&site_xmat),
+            translational_jacobian_base,
+            jacobian_condition,
+        })
+    }
+
+    fn row_major_matrix3_to_array(row_major: &[f64; 9]) -> [[f64; 3]; 3] {
+        [
+            [row_major[0], row_major[1], row_major[2]],
+            [row_major[3], row_major[4], row_major[5]],
+            [row_major[6], row_major[7], row_major[8]],
+        ]
+    }
+
+    fn matrix3x6_to_array(matrix: &nalgebra::Matrix3x6<f64>) -> [[f64; 6]; 3] {
+        let mut out = [[0.0; 6]; 3];
+
+        for row in 0..3 {
+            for col in 0..6 {
+                out[row][col] = matrix[(row, col)];
+            }
+        }
+
+        out
     }
 
     /// Compute gravity compensation torques with dynamic payload
