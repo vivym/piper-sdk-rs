@@ -55,6 +55,20 @@ struct TimestampInfo {
     hw_raw_us: Option<u64>,
 }
 
+fn timestamp_provenance_from_parts(
+    hw_trans_us: Option<u64>,
+    system_ts_us: Option<u64>,
+    _hw_raw_us: Option<u64>,
+) -> TimestampProvenance {
+    if hw_trans_us.is_some() {
+        TimestampProvenance::Hardware
+    } else if system_ts_us.is_some() {
+        TimestampProvenance::Kernel
+    } else {
+        TimestampProvenance::None
+    }
+}
+
 /// SocketCAN 适配器
 ///
 /// 实现 `CanAdapter` trait，提供 Linux 平台下的 SocketCAN 支持。
@@ -311,7 +325,9 @@ impl SocketCanAdapter {
     /// # 注意
     /// - 此方法会过滤错误帧，只返回有效数据帧
     /// - 时间戳优先级：硬件时间戳（Transformed） > 软件时间戳 > 0（不可用）
-    /// - SocketCAN cmsg timestamps report `TimestampProvenance::Kernel`; missing timestamps report `None`.
+    /// - SocketCAN transformed hardware timestamps report `TimestampProvenance::Hardware`;
+    ///   software timestamps report `TimestampProvenance::Kernel`; missing/raw-only
+    ///   timestamps report `None`.
     pub fn receive_with_timestamp(&mut self) -> Result<ReceivedFrame, CanError> {
         if !self.started {
             return Err(CanError::NotStarted);
@@ -453,12 +469,13 @@ impl SocketCanAdapter {
                                 self.hw_timestamp_available = true;
                             }
 
-                            // SocketCAN delivers both hardware-transformed and software
-                            // timestamps through kernel control messages, so expose Kernel
-                            // provenance rather than claiming userspace-origin timing.
                             return Ok(TimestampInfo {
                                 timestamp_us,
-                                provenance: TimestampProvenance::Kernel,
+                                provenance: timestamp_provenance_from_parts(
+                                    hw_trans_us,
+                                    system_ts_us,
+                                    hw_raw_us,
+                                ),
                                 system_ts_us,
                                 hw_trans_us,
                                 hw_raw_us,
@@ -477,7 +494,11 @@ impl SocketCanAdapter {
 
                             return Ok(TimestampInfo {
                                 timestamp_us,
-                                provenance: TimestampProvenance::Kernel,
+                                provenance: timestamp_provenance_from_parts(
+                                    hw_trans_us,
+                                    system_ts_us,
+                                    hw_raw_us,
+                                ),
                                 system_ts_us,
                                 hw_trans_us,
                                 hw_raw_us,
@@ -491,7 +512,11 @@ impl SocketCanAdapter {
                         if hw_raw_us.is_some() {
                             return Ok(TimestampInfo {
                                 timestamp_us: 0,
-                                provenance: TimestampProvenance::None,
+                                provenance: timestamp_provenance_from_parts(
+                                    hw_trans_us,
+                                    system_ts_us,
+                                    hw_raw_us,
+                                ),
                                 system_ts_us,
                                 hw_trans_us,
                                 hw_raw_us,
@@ -968,6 +993,22 @@ mod tests {
     }
 
     #[test]
+    fn socketcan_unsplit_timestamp_parts_map_to_expected_provenance() {
+        assert_eq!(
+            timestamp_provenance_from_parts(Some(101), Some(100), Some(99)),
+            TimestampProvenance::Hardware
+        );
+        assert_eq!(
+            timestamp_provenance_from_parts(None, Some(100), Some(99)),
+            TimestampProvenance::Kernel
+        );
+        assert_eq!(
+            timestamp_provenance_from_parts(None, None, Some(99)),
+            TimestampProvenance::None
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn test_socketcan_adapter_receive_with_timestamp_full_flow() {
         // 验证 receive_with_timestamp() 完整流程（发送帧 → 接收帧）
@@ -1023,7 +1064,7 @@ mod tests {
         assert_eq!(
             received.timestamp_provenance,
             TimestampProvenance::Kernel,
-            "SocketCAN timestamps from control messages should expose kernel provenance"
+            "vcan software timestamps from control messages should expose kernel provenance"
         );
     }
 

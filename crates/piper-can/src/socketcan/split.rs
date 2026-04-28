@@ -143,6 +143,14 @@ fn should_buffer_bootstrap_frame(frame: &PiperFrame) -> bool {
     frame.is_standard() && is_robot_feedback_id(frame.id())
 }
 
+fn timestamp_provenance_for_source(source: TimestampSource) -> TimestampProvenance {
+    match source {
+        TimestampSource::Hardware => TimestampProvenance::Hardware,
+        TimestampSource::Software => TimestampProvenance::Kernel,
+        TimestampSource::None => TimestampProvenance::None,
+    }
+}
+
 /// 只读适配器（用于 RX 线程）
 ///
 /// 独立的 RX 适配器，持有 `CanSocket` 的克隆，
@@ -344,12 +352,8 @@ impl SocketCanRxAdapter {
 
             match parse_libc_can_frame_bytes(&frame_buf, msg_bytes, msg_flags) {
                 ParsedSocketCanFrame::Data(frame) => {
-                    let timestamp_provenance = match timestamp_info.source {
-                        TimestampSource::Hardware | TimestampSource::Software => {
-                            TimestampProvenance::Kernel
-                        },
-                        TimestampSource::None => TimestampProvenance::None,
-                    };
+                    let timestamp_provenance =
+                        timestamp_provenance_for_source(timestamp_info.source);
                     let raw_timestamp = RawTimestampInfo {
                         can_id: frame.raw_id(),
                         host_rx_mono_us,
@@ -834,5 +838,21 @@ mod tests {
 
         assert_eq!(received.timestamp_provenance, TimestampProvenance::Kernel);
         assert_eq!(received.raw_timestamp, Some(raw));
+    }
+
+    #[test]
+    fn socketcan_split_hw_trans_source_maps_to_hardware_provenance() {
+        assert_eq!(
+            timestamp_provenance_for_source(TimestampSource::Hardware),
+            TimestampProvenance::Hardware
+        );
+        assert_eq!(
+            timestamp_provenance_for_source(TimestampSource::Software),
+            TimestampProvenance::Kernel
+        );
+        assert_eq!(
+            timestamp_provenance_for_source(TimestampSource::None),
+            TimestampProvenance::None
+        );
     }
 }
