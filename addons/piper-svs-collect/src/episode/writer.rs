@@ -458,6 +458,13 @@ fn run_worker_inner(
 
         match receiver.recv_timeout(Duration::from_millis(10)) {
             Ok(step) => {
+                if step.step_index != step_count {
+                    return Err(wire::WireError::NonSequentialStepIndex {
+                        expected: step_count,
+                        actual: step.step_index,
+                    }
+                    .into());
+                }
                 wire::write_step(&mut file, &step)?;
                 step_count = step_count.saturating_add(1);
                 last_step_index = Some(step.step_index);
@@ -543,11 +550,23 @@ fn persist_temp_no_overwrite(temp_path: &Path, final_path: &Path) -> std::io::Re
         Err(_link_err) => {
             let mut src = File::open(temp_path)?;
             let mut dst = OpenOptions::new().write(true).create_new(true).open(final_path)?;
-            std::io::copy(&mut src, &mut dst)?;
-            dst.flush()?;
-            dst.sync_all()?;
-            drop(dst);
-            std::fs::remove_file(temp_path)
+            let result = (|| {
+                std::io::copy(&mut src, &mut dst)?;
+                dst.flush()?;
+                dst.sync_all()
+            })();
+
+            match result {
+                Ok(()) => {
+                    drop(dst);
+                    std::fs::remove_file(temp_path)
+                },
+                Err(err) => {
+                    drop(dst);
+                    let _ = std::fs::remove_file(final_path);
+                    Err(err)
+                },
+            }
         },
     }
 }
@@ -659,6 +678,30 @@ mod tests {
             std::fs::read(dir.path().join("steps.bin")).unwrap(),
             b"existing"
         );
+    }
+
+    #[test]
+    fn finish_rejects_nonsequential_step_indexes_without_final_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = EpisodeWriter::for_test_with_capacity(dir.path(), 2).unwrap();
+
+        writer.try_enqueue(SvsStepV1::for_test(0)).unwrap();
+        writer.try_enqueue(SvsStepV1::for_test(2)).unwrap();
+
+        assert!(matches!(writer.finish(), Err(WriterError::Wire(_))));
+        assert!(!dir.path().join("steps.bin").exists());
+    }
+
+    #[test]
+    fn fallback_copy_failure_removes_only_final_file_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp_dir = dir.path().join("temp-as-directory");
+        let final_path = dir.path().join("steps.bin");
+        std::fs::create_dir(&temp_dir).unwrap();
+
+        assert!(persist_temp_no_overwrite(&temp_dir, &final_path).is_err());
+        assert!(!final_path.exists());
+        assert!(temp_dir.exists());
     }
 
     #[test]

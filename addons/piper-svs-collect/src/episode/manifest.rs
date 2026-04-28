@@ -861,16 +861,15 @@ impl ReportJson {
                 "dual_arm.iterations must be >= step_count".to_string(),
             ));
         }
-        if self.status == EpisodeStatus::Complete
-            && (!self.final_flush_result.success
-                || self.final_flush_result.error.is_some()
-                || self.writer.flush_failed
-                || self.writer.queue_full_events > 0
-                || self.writer.dropped_step_count > 0
-                || self.writer.backpressure_threshold_tripped)
-        {
+        let has_writer_fault_indicator = !self.final_flush_result.success
+            || self.final_flush_result.error.is_some()
+            || self.writer.flush_failed
+            || self.writer.queue_full_events > 0
+            || self.writer.dropped_step_count > 0
+            || self.writer.backpressure_threshold_tripped;
+        if self.status != EpisodeStatus::Faulted && has_writer_fault_indicator {
             return Err(ManifestError::InvalidReport(
-                "complete report cannot contain writer fault indicators".to_string(),
+                "writer fault indicators require faulted status".to_string(),
             ));
         }
         Ok(())
@@ -1258,6 +1257,15 @@ mod tests {
 
         report.writer.dropped_step_count = 1;
         assert!(report.validate().is_err());
+    }
+
+    #[test]
+    fn non_faulted_report_status_rejects_writer_fault_indicators() {
+        for status in [EpisodeStatus::Cancelled, EpisodeStatus::Running] {
+            let mut report = ReportJson::for_test_faulted();
+            report.status = status;
+            assert!(report.validate().is_err());
+        }
     }
 
     #[test]
