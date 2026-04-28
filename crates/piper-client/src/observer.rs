@@ -413,6 +413,8 @@ where
             position: (gripper.travel / GRIPPER_POSITION_SCALE).clamp(0.0, 1.0),
             effort: (gripper.torque / GRIPPER_FORCE_SCALE).clamp(0.0, 1.0),
             enabled: gripper.is_enabled(),
+            hardware_timestamp_us: gripper.hardware_timestamp_us,
+            host_rx_mono_us: gripper.host_rx_mono_us,
         }
     }
 
@@ -806,6 +808,10 @@ pub struct GripperState {
     pub effort: f64,
     /// 使能状态
     pub enabled: bool,
+    /// 设备硬件时间戳（微秒）
+    pub hardware_timestamp_us: u64,
+    /// 主机接收时间戳（微秒）
+    pub host_rx_mono_us: u64,
 }
 
 impl Default for GripperState {
@@ -814,6 +820,8 @@ impl Default for GripperState {
             position: 0.0,
             effort: 0.0,
             enabled: false,
+            hardware_timestamp_us: 0,
+            host_rx_mono_us: 0,
         }
     }
 }
@@ -1037,6 +1045,39 @@ mod tests {
             .with_timestamp_us(timestamp_us)
     }
 
+    fn gripper_feedback_frame_with_values(
+        timestamp_us: u64,
+        travel_mm: f64,
+        torque_nm: f64,
+    ) -> PiperFrame {
+        let travel_raw = ((travel_mm * 1000.0).round() as i32).to_be_bytes();
+        let torque_raw = ((torque_nm * 1000.0).round() as i16).to_be_bytes();
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&travel_raw);
+        data[4..6].copy_from_slice(&torque_raw);
+        data[6] = 0b0100_0000;
+
+        PiperFrame::new_standard(ID_GRIPPER_FEEDBACK.raw().into(), data)
+            .unwrap()
+            .with_timestamp_us(timestamp_us)
+    }
+
+    fn observer_with_gripper_feedback(
+        hardware_timestamp_us: u64,
+        _host_rx_mono_us: u64,
+        travel_mm: f64,
+        torque_nm: f64,
+    ) -> Observer<StrictRealtime> {
+        let frame = gripper_feedback_frame_with_values(hardware_timestamp_us, travel_mm, torque_nm);
+        let (driver, observer) = start_observer_with_frames(vec![frame]);
+
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("gripper feedback should arrive");
+
+        observer
+    }
+
     fn joint_driver_low_speed_frame(
         joint_index: u8,
         enabled: bool,
@@ -1172,11 +1213,24 @@ mod tests {
             position: 0.5,
             effort: 0.7,
             enabled: true,
+            hardware_timestamp_us: 0,
+            host_rx_mono_us: 0,
         };
 
         // 验证归一化范围
         assert!(gripper.position >= 0.0 && gripper.position <= 1.0);
         assert!(gripper.effort >= 0.0 && gripper.effort <= 1.0);
+    }
+
+    #[test]
+    fn gripper_state_exposes_hardware_and_host_timestamps() {
+        let observer = observer_with_gripper_feedback(12_345, 67_890, 50.0, 1.0);
+        let gripper = observer.gripper_state();
+
+        assert_eq!(gripper.hardware_timestamp_us, 12_345);
+        assert!(gripper.host_rx_mono_us > 0);
+        assert_eq!(gripper.position, 0.5);
+        assert!(gripper.enabled);
     }
 
     #[test]

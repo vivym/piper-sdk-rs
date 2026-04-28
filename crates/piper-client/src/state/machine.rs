@@ -54,6 +54,15 @@ pub struct Maintenance {
 /// 机械臂已使能，可以发送运动命令。
 pub struct Active<Mode>(Mode);
 
+/// MIT 批命令确认回执。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmedMitBatch {
+    /// TX 线程完成整包发送后的确认信息。
+    pub tx_finished: piper_driver::MitBatchTxFinished,
+    /// 经过固件 quirk 修正和力矩缩放后的每关节 `t_ref`（N·m）。
+    pub mit_t_ref_nm: [f64; 6],
+}
+
 // ==================== 控制模式类型（零大小类型）====================
 
 /// MIT 模式
@@ -1883,13 +1892,27 @@ where
         kd: &JointArray<f64>,
         torques: &JointArray<NewtonMeter>,
     ) -> Result<[MitControlCommand; 6]> {
+        self.build_validated_mit_command_batch_with_t_refs(positions, velocities, kp, kd, torques)
+            .map(|(commands, _)| commands)
+    }
+
+    fn build_validated_mit_command_batch_with_t_refs(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+    ) -> Result<([MitControlCommand; 6], [f64; 6])> {
         let mut commands = [MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.0)?; 6];
+        let mut t_refs = [0.0; 6];
 
         for (index, joint) in Joint::ALL.into_iter().enumerate() {
             let joint_index = joint.index() as u8 + 1;
             let (position, flipped_torque) =
                 self.quirks.apply_flip(joint, positions[joint].0, torques[joint].0);
             let torque = self.quirks.scale_torque(joint, flipped_torque);
+            let torque_ref = torque as f32;
 
             commands[index] = MitControlCommand::try_new(
                 joint_index,
@@ -1897,11 +1920,12 @@ where
                 velocities[joint] as f32,
                 kp[joint] as f32,
                 kd[joint] as f32,
-                torque as f32,
+                torque_ref,
             )?;
+            t_refs[index] = f64::from(torque_ref);
         }
 
-        Ok(commands)
+        Ok((commands, t_refs))
     }
 
     /// 获取固件特性（DeviceQuirks）
@@ -2468,6 +2492,29 @@ where
         let commands =
             self.build_validated_mit_command_batch(positions, velocities, kp, kd, torques)?;
         raw.send_validated_mit_command_batch_confirmed(commands, timeout)
+    }
+
+    /// 发送 MIT 模式控制指令，等待 TX 线程完成整包发送，并返回批命令回执。
+    pub fn command_torques_confirmed_finished(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> Result<ConfirmedMitBatch> {
+        let raw = RawCommander::new(&self.driver);
+        let (commands, mit_t_ref_nm) = self.build_validated_mit_command_batch_with_t_refs(
+            positions, velocities, kp, kd, torques,
+        )?;
+        let tx_finished =
+            raw.send_validated_mit_command_batch_confirmed_finished(commands, timeout)?;
+
+        Ok(ConfirmedMitBatch {
+            tx_finished,
+            mit_t_ref_nm,
+        })
     }
 
     /// 控制夹爪
@@ -7553,6 +7600,46 @@ mod tests {
             .to_frame();
         assert_eq!(frames[0].id(), expected.id());
         assert_eq!(frames[0].data(), expected.data());
+    }
+
+    #[test]
+    fn command_torques_confirmed_finished_returns_post_quirk_t_refs() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let robot = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 7, 2)),
+            sent_frames,
+        );
+        let positions = JointArray::from([Rad(0.0); 6]);
+        let velocities = JointArray::from([0.0; 6]);
+        let kp = JointArray::from([0.0; 6]);
+        let kd = JointArray::from([0.0; 6]);
+        let torques = JointArray::from([
+            NewtonMeter(0.1),
+            NewtonMeter(0.2),
+            NewtonMeter(0.3),
+            NewtonMeter(0.4),
+            NewtonMeter(0.5),
+            NewtonMeter(0.6),
+        ]);
+
+        let receipt = robot
+            .command_torques_confirmed_finished(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(50),
+            )
+            .expect("confirmed send should succeed");
+
+        assert!(receipt.tx_finished.host_finished_mono_us > 0);
+        assert_eq!(receipt.mit_t_ref_nm.len(), 6);
+        assert!(receipt.mit_t_ref_nm.iter().all(|value| value.is_finite()));
+        assert_eq!(
+            receipt.mit_t_ref_nm,
+            [-0.025_f32, -0.05, 0.075, -0.4, 0.5, -0.6].map(f64::from)
+        );
     }
 
     #[test]

@@ -60,12 +60,13 @@ pub use dual_arm::{
 };
 pub use observer::{
     CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, ControlSnapshotFull,
-    MonitorReadPolicy, Observer, RuntimeHealthSnapshot,
+    GripperState, MonitorReadPolicy, Observer, RuntimeHealthSnapshot,
 };
 pub use piper_driver::RuntimeFaultKind;
 pub use recording::{
     RecordingConfig, RecordingHandle, RecordingMetadata, RecordingStats, StopCondition,
 };
+pub use state::machine::ConfirmedMitBatch;
 pub use state::{
     ConnectedPiper, Maintenance, MonitorOnly, MotionConnectedPiper, MotionConnectedState, Piper,
     SoftRealtime, StrictRealtime,
