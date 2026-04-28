@@ -26,6 +26,7 @@ mod connection;
 pub mod control;
 pub mod diagnostics;
 pub mod dual_arm;
+pub mod dual_arm_raw_clock;
 pub mod heartbeat;
 pub mod observer;
 pub(crate) mod raw_commander;
@@ -57,6 +58,10 @@ pub use dual_arm::{
     DualArmSafetyConfig, DualArmSnapshot, GripperTeleopConfig, JointMirrorMap,
     JointSpaceBilateralController, LoopTimingMode, MasterFollowerController, StopAttemptResult,
     SubmissionArm,
+};
+pub use dual_arm_raw_clock::{
+    ExperimentalRawClockConfig, ExperimentalRawClockDualArmActive,
+    ExperimentalRawClockDualArmStandby, RawClockRuntimeReport,
 };
 pub use observer::{
     CollisionProtectionSnapshot, ControlReadPolicy, ControlSnapshot, ControlSnapshotFull,
