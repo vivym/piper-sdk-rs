@@ -19,8 +19,9 @@ pub struct RawClockThresholds {
     pub last_sample_age_us: u64,
 }
 
+#[cfg(test)]
 impl RawClockThresholds {
-    pub const fn for_tests() -> Self {
+    const fn for_tests() -> Self {
         Self {
             warmup_samples: 4,
             warmup_window_us: 3_000,
@@ -144,7 +145,7 @@ impl RawClockEstimator {
         let residual_p95_us = percentile_sorted(&residuals, 95);
         let residual_p99_us = percentile_sorted(&residuals, 99);
         let residual_max_us = residuals.last().copied().unwrap_or(0);
-        let drift_ppm = self.drift_ppm(window_duration_us, residual_max_us);
+        let drift_ppm = self.drift_ppm();
 
         let metrics = HealthMetrics {
             sample_count,
@@ -257,21 +258,12 @@ impl RawClockEstimator {
             .unwrap_or(0)
     }
 
-    fn drift_ppm(&self, window_duration_us: u64, residual_max_us: u64) -> f64 {
+    fn drift_ppm(&self) -> f64 {
         let Some(slope) = self.slope else {
             return 0.0;
         };
 
-        let fitted_drift_ppm = (slope - 1.0) * 1_000_000.0;
-        if window_duration_us == 0 {
-            return fitted_drift_ppm;
-        }
-
-        // Short warmup windows can turn a few microseconds of receive jitter into
-        // large fitted ppm values. Report only drift beyond the residual bound.
-        let uncertainty_ppm = residual_max_us as f64 / window_duration_us as f64 * 1_000_000.0;
-        let drift_abs_ppm = (fitted_drift_ppm.abs() - uncertainty_ppm).max(0.0);
-        drift_abs_ppm.copysign(fitted_drift_ppm)
+        (slope - 1.0) * 1_000_000.0
     }
 
     fn unhealthy_reason(&self, metrics: HealthMetrics) -> Option<String> {
@@ -426,7 +418,7 @@ mod tests {
             warmup_window_us: 3_000,
             residual_p95_us: 20,
             residual_max_us: 50,
-            drift_abs_ppm: 100.0,
+            drift_abs_ppm: 500.0,
             sample_gap_max_us: 2_000,
             last_sample_age_us: 2_000,
         };
@@ -485,6 +477,34 @@ mod tests {
         let health = estimator.health(141_500);
         assert!(!health.healthy);
         assert!(health.drift_ppm.abs() > 10.0);
+    }
+
+    #[test]
+    fn fitted_drift_is_not_discounted_by_residual_uncertainty() {
+        let mut estimator = RawClockEstimator::new(RawClockThresholds {
+            warmup_samples: 4,
+            warmup_window_us: 30_000,
+            residual_p95_us: 20_000,
+            residual_max_us: 20_000,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_us: 10_000,
+            last_sample_age_us: 2_000,
+        });
+
+        estimator.push(sample(10_000, 110_040)).unwrap();
+        estimator.push(sample(20_000, 119_990)).unwrap();
+        estimator.push(sample(30_000, 130_000)).unwrap();
+        estimator.push(sample(40_000, 140_070)).unwrap();
+
+        let health = estimator.health(140_070);
+        assert!(
+            !health.healthy,
+            "fitted drift must fail health even when residual thresholds are loose: {health:?}"
+        );
+        assert!(
+            (health.drift_ppm - 1_000.0).abs() <= 1.0,
+            "drift_ppm must report fitted slope drift directly: {health:?}"
+        );
     }
 
     #[test]
