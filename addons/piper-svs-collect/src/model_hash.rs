@@ -1,0 +1,542 @@
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+
+use crate::calibration::sha256_hex;
+use crate::episode::MujocoRuntimeIdentity;
+use piper_physics::PhysicsError;
+use thiserror::Error;
+
+const MODEL_HASH_DOMAIN: &[u8] = b"PIPER_MUJOCO_MODEL_HASH_V1\n";
+const EMBEDDED_MODEL_HASH_DOMAIN: &[u8] = b"PIPER_MUJOCO_EMBEDDED_MODEL_HASH_V1\n";
+const HASH_ALGORITHM: &str = "sha256";
+const EMBEDDED_ROOT_XML: &str = "embedded.xml";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MujocoModelHash {
+    pub hash_algorithm: String,
+    pub sha256_hex: String,
+    pub root_xml_relative_path: PathBuf,
+}
+
+#[derive(Debug, Error)]
+pub enum ModelHashError {
+    #[error("MuJoCo model directory is not a directory: {path}")]
+    InvalidModelDirectory { path: PathBuf },
+    #[error("MuJoCo model path must be UTF-8: {path}")]
+    NonUtf8Path { path: PathBuf },
+    #[error("MuJoCo model path is not a canonical relative path: {path}")]
+    InvalidRelativePath { path: String },
+    #[error("MuJoCo model tree contains a symlink: {path}")]
+    Symlink { path: PathBuf },
+    #[error("MuJoCo model tree contains a non-regular file: {path}")]
+    NonRegularFile { path: PathBuf },
+    #[error("MuJoCo model tree contains a duplicate normalized path: {path}")]
+    DuplicateNormalizedPath { path: String },
+    #[error("MuJoCo root XML is not in the hashed model tree: {path}")]
+    RootXmlNotInModelTree { path: String },
+    #[error("MuJoCo XML file is not UTF-8: {path}")]
+    XmlNotUtf8 { path: String },
+    #[error("invalid MuJoCo XML in {path}: {message}")]
+    InvalidXml { path: String, message: String },
+    #[error("embedded MuJoCo model contains external file reference: file={reference}")]
+    EmbeddedExternalFileReference { reference: String },
+    #[error("MuJoCo XML file reference escapes hashed model tree in {xml_path}: file={reference}")]
+    EscapingFileReference { xml_path: String, reference: String },
+    #[error(
+        "MuJoCo XML file reference cannot be proven inside hashed tree in {xml_path}: file={reference}"
+    )]
+    UnresolvedFileReference { xml_path: String, reference: String },
+    #[error(
+        "MuJoCo XML attribute `{attribute}` in {xml_path} changes asset resolution and is not supported by the v1 model hash"
+    )]
+    UnsupportedAssetResolutionAttribute { xml_path: String, attribute: String },
+    #[error(
+        "MuJoCo runtime identity unavailable before MIT enable for runtime {version}: {source}"
+    )]
+    RuntimeIdentityUnavailable {
+        version: String,
+        source: PhysicsError,
+    },
+    #[error("MuJoCo runtime identity is missing native library hash or static build identity")]
+    MissingNativeRuntimeIdentity,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+pub fn hash_model_dir(
+    model_dir: impl AsRef<Path>,
+    root_xml_relative_path: impl AsRef<Path>,
+) -> Result<MujocoModelHash, ModelHashError> {
+    let model_dir = model_dir.as_ref();
+    let metadata = std::fs::symlink_metadata(model_dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ModelHashError::InvalidModelDirectory {
+            path: model_dir.to_path_buf(),
+        });
+    }
+
+    let root_xml = normalize_relative_path(root_xml_relative_path.as_ref())?;
+    let files = collect_model_files(model_dir)?;
+    let root_bytes = files.get(&root_xml).ok_or_else(|| ModelHashError::RootXmlNotInModelTree {
+        path: root_xml.clone(),
+    })?;
+    validate_xml_file_references(&root_xml, root_bytes, &files, XmlReferenceMode::Directory)?;
+
+    for (path, bytes) in &files {
+        if path != &root_xml && path.ends_with(".xml") {
+            validate_xml_file_references(path, bytes, &files, XmlReferenceMode::Directory)?;
+        }
+    }
+
+    let mut canonical = MODEL_HASH_DOMAIN.to_vec();
+    for (path, bytes) in &files {
+        append_canonical_file(&mut canonical, path.as_bytes(), bytes);
+    }
+
+    Ok(MujocoModelHash {
+        hash_algorithm: HASH_ALGORITHM.to_string(),
+        sha256_hex: sha256_hex(&canonical),
+        root_xml_relative_path: PathBuf::from(root_xml),
+    })
+}
+
+pub fn hash_embedded_model(xml_bytes: &[u8]) -> Result<MujocoModelHash, ModelHashError> {
+    validate_xml_file_references(
+        EMBEDDED_ROOT_XML,
+        xml_bytes,
+        &BTreeMap::new(),
+        XmlReferenceMode::Embedded,
+    )?;
+
+    let mut canonical = EMBEDDED_MODEL_HASH_DOMAIN.to_vec();
+    canonical.extend_from_slice(xml_bytes);
+
+    Ok(MujocoModelHash {
+        hash_algorithm: HASH_ALGORITHM.to_string(),
+        sha256_hex: sha256_hex(&canonical),
+        root_xml_relative_path: PathBuf::from(EMBEDDED_ROOT_XML),
+    })
+}
+
+pub fn current_mujoco_runtime_identity() -> Result<MujocoRuntimeIdentity, ModelHashError> {
+    let version = piper_physics::mujoco_runtime_version_string();
+    let identity = piper_physics::loaded_mujoco_library_identity().map_err(|source| {
+        ModelHashError::RuntimeIdentityUnavailable {
+            version: version.clone(),
+            source,
+        }
+    })?;
+
+    if identity.native_library_sha256.is_none() && identity.static_build_identity.is_none() {
+        return Err(ModelHashError::MissingNativeRuntimeIdentity);
+    }
+
+    Ok(MujocoRuntimeIdentity {
+        version: Some(version),
+        build_string: Some(identity.runtime_version),
+        rust_binding_version: identity.rust_binding_version,
+        native_library_sha256_hex: identity.native_library_sha256,
+        static_build_identity: identity.static_build_identity,
+    })
+}
+
+fn collect_model_files(model_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, ModelHashError> {
+    let mut files = BTreeMap::new();
+    walk_model_dir(model_dir, model_dir, &mut files)?;
+    Ok(files)
+}
+
+fn walk_model_dir(
+    model_dir: &Path,
+    current_dir: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), ModelHashError> {
+    for entry in std::fs::read_dir(current_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            return Err(ModelHashError::Symlink { path });
+        }
+
+        if metadata.is_dir() {
+            walk_model_dir(model_dir, &path, files)?;
+            continue;
+        }
+
+        if !metadata.is_file() {
+            return Err(ModelHashError::NonRegularFile { path });
+        }
+
+        let relative_path = path
+            .strip_prefix(model_dir)
+            .expect("walked paths are always under the model directory");
+        let normalized_path = normalize_relative_path(relative_path)?;
+        let bytes = std::fs::read(&path)?;
+        if files.insert(normalized_path.clone(), bytes).is_some() {
+            return Err(ModelHashError::DuplicateNormalizedPath {
+                path: normalized_path,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_relative_path(path: &Path) -> Result<String, ModelHashError> {
+    let mut components = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(component) => {
+                let component = component.to_str().ok_or_else(|| ModelHashError::NonUtf8Path {
+                    path: path.to_path_buf(),
+                })?;
+                if component.is_empty()
+                    || component == "."
+                    || component == ".."
+                    || component.contains('\\')
+                {
+                    return Err(ModelHashError::InvalidRelativePath {
+                        path: path.display().to_string(),
+                    });
+                }
+                components.push(component);
+            },
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(ModelHashError::InvalidRelativePath {
+                    path: path.display().to_string(),
+                });
+            },
+        }
+    }
+
+    if components.is_empty() {
+        return Err(ModelHashError::InvalidRelativePath {
+            path: path.display().to_string(),
+        });
+    }
+
+    Ok(components.join("/"))
+}
+
+fn append_canonical_file(out: &mut Vec<u8>, path: &[u8], content: &[u8]) {
+    out.push(b'F');
+    out.extend_from_slice(&(path.len() as u64).to_le_bytes());
+    out.extend_from_slice(path);
+    out.extend_from_slice(&(content.len() as u64).to_le_bytes());
+    out.extend_from_slice(content);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XmlReferenceMode {
+    Directory,
+    Embedded,
+}
+
+fn validate_xml_file_references(
+    xml_path: &str,
+    xml_bytes: &[u8],
+    files: &BTreeMap<String, Vec<u8>>,
+    mode: XmlReferenceMode,
+) -> Result<(), ModelHashError> {
+    let xml = std::str::from_utf8(xml_bytes).map_err(|_| ModelHashError::XmlNotUtf8 {
+        path: xml_path.to_string(),
+    })?;
+
+    let mut position = 0;
+    while let Some(start_offset) = xml[position..].find('<') {
+        let start = position + start_offset;
+        let remaining = &xml[start..];
+
+        if remaining.starts_with("<!--") {
+            position = find_after(xml, start, "-->", xml_path)?;
+            continue;
+        }
+        if remaining.starts_with("<![CDATA[") {
+            position = find_after(xml, start, "]]>", xml_path)?;
+            continue;
+        }
+        if remaining.starts_with("<?") {
+            position = find_after(xml, start, "?>", xml_path)?;
+            continue;
+        }
+        if remaining.starts_with("</") || remaining.starts_with("<!") {
+            position = find_after(xml, start, ">", xml_path)?;
+            continue;
+        }
+
+        let tag_end = find_tag_end(xml, start + 1, xml_path)?;
+        parse_start_tag_attributes(xml_path, &xml[start + 1..tag_end], files, mode)?;
+        position = tag_end + 1;
+    }
+
+    Ok(())
+}
+
+fn find_after(
+    xml: &str,
+    start: usize,
+    delimiter: &str,
+    xml_path: &str,
+) -> Result<usize, ModelHashError> {
+    xml[start..]
+        .find(delimiter)
+        .map(|offset| start + offset + delimiter.len())
+        .ok_or_else(|| ModelHashError::InvalidXml {
+            path: xml_path.to_string(),
+            message: format!("missing `{delimiter}`"),
+        })
+}
+
+fn find_tag_end(xml: &str, start: usize, xml_path: &str) -> Result<usize, ModelHashError> {
+    let mut quote = None;
+    for (offset, character) in xml[start..].char_indices() {
+        match (quote, character) {
+            (Some(current_quote), _) if character == current_quote => quote = None,
+            (None, '"' | '\'') => quote = Some(character),
+            (None, '>') => return Ok(start + offset),
+            _ => {},
+        }
+    }
+
+    Err(ModelHashError::InvalidXml {
+        path: xml_path.to_string(),
+        message: "unterminated start tag".to_string(),
+    })
+}
+
+fn parse_start_tag_attributes(
+    xml_path: &str,
+    tag: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+    mode: XmlReferenceMode,
+) -> Result<(), ModelHashError> {
+    let bytes = tag.as_bytes();
+    let mut index = 0;
+
+    skip_xml_whitespace(bytes, &mut index);
+    while index < bytes.len() && !is_xml_whitespace(bytes[index]) && bytes[index] != b'/' {
+        index += 1;
+    }
+
+    loop {
+        skip_xml_whitespace(bytes, &mut index);
+        if index >= bytes.len() || bytes[index] == b'/' {
+            return Ok(());
+        }
+
+        let name_start = index;
+        while index < bytes.len()
+            && !is_xml_whitespace(bytes[index])
+            && bytes[index] != b'='
+            && bytes[index] != b'/'
+        {
+            index += 1;
+        }
+        let name = &tag[name_start..index];
+
+        skip_xml_whitespace(bytes, &mut index);
+        if index >= bytes.len() || bytes[index] != b'=' {
+            return Err(ModelHashError::InvalidXml {
+                path: xml_path.to_string(),
+                message: format!("attribute `{name}` is missing a quoted value"),
+            });
+        }
+        index += 1;
+        skip_xml_whitespace(bytes, &mut index);
+
+        if index >= bytes.len() || (bytes[index] != b'"' && bytes[index] != b'\'') {
+            return Err(ModelHashError::InvalidXml {
+                path: xml_path.to_string(),
+                message: format!("attribute `{name}` is missing a quoted value"),
+            });
+        }
+        let quote = bytes[index];
+        index += 1;
+        let value_start = index;
+        while index < bytes.len() && bytes[index] != quote {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return Err(ModelHashError::InvalidXml {
+                path: xml_path.to_string(),
+                message: format!("attribute `{name}` has an unterminated value"),
+            });
+        }
+        let value = &tag[value_start..index];
+        index += 1;
+
+        match name {
+            "file" => validate_file_reference(xml_path, value, files, mode)?,
+            "assetdir" | "meshdir" | "texturedir" => {
+                return Err(ModelHashError::UnsupportedAssetResolutionAttribute {
+                    xml_path: xml_path.to_string(),
+                    attribute: name.to_string(),
+                });
+            },
+            _ => {},
+        }
+    }
+}
+
+fn validate_file_reference(
+    xml_path: &str,
+    reference: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+    mode: XmlReferenceMode,
+) -> Result<(), ModelHashError> {
+    if mode == XmlReferenceMode::Embedded {
+        return Err(ModelHashError::EmbeddedExternalFileReference {
+            reference: reference.to_string(),
+        });
+    }
+
+    if reference.is_empty()
+        || reference.contains('&')
+        || reference.contains('\0')
+        || reference.contains('\\')
+        || Path::new(reference).is_absolute()
+    {
+        return Err(ModelHashError::EscapingFileReference {
+            xml_path: xml_path.to_string(),
+            reference: reference.to_string(),
+        });
+    }
+
+    let normalized_reference = normalize_relative_path(Path::new(reference)).map_err(|_| {
+        ModelHashError::EscapingFileReference {
+            xml_path: xml_path.to_string(),
+            reference: reference.to_string(),
+        }
+    })?;
+    let resolved = resolve_against_xml_path(xml_path, &normalized_reference);
+    if !files.contains_key(&resolved) {
+        return Err(ModelHashError::UnresolvedFileReference {
+            xml_path: xml_path.to_string(),
+            reference: reference.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn resolve_against_xml_path(xml_path: &str, normalized_reference: &str) -> String {
+    match xml_path.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => format!("{parent}/{normalized_reference}"),
+        _ => normalized_reference.to_string(),
+    }
+}
+
+fn skip_xml_whitespace(bytes: &[u8], index: &mut usize) {
+    while *index < bytes.len() && is_xml_whitespace(bytes[*index]) {
+        *index += 1;
+    }
+}
+
+fn is_xml_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\n' | b'\r' | b'\t')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_dir_hash_rejects_symlinks_and_non_utf8_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("piper_no_gripper.xml"), "<mujoco/>").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("piper_no_gripper.xml", dir.path().join("link.xml")).unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[test]
+    fn embedded_model_hash_includes_domain_separator() {
+        let hash = hash_embedded_model(b"<mujoco/>").unwrap();
+        let direct = sha256_hex(b"<mujoco/>");
+        assert_ne!(hash.sha256_hex, direct);
+    }
+
+    #[test]
+    fn model_dir_hash_is_canonical_and_records_root_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("piper_no_gripper.xml"),
+            r#"<mujoco><asset><mesh file="assets/link.stl"/></asset></mujoco>"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("assets/link.stl"), b"mesh bytes").unwrap();
+
+        let hash = hash_model_dir(dir.path(), "piper_no_gripper.xml").unwrap();
+        let mut expected = b"PIPER_MUJOCO_MODEL_HASH_V1\n".to_vec();
+        append_expected_file(&mut expected, "assets/link.stl", b"mesh bytes");
+        append_expected_file(
+            &mut expected,
+            "piper_no_gripper.xml",
+            br#"<mujoco><asset><mesh file="assets/link.stl"/></asset></mujoco>"#,
+        );
+
+        assert_eq!(hash.sha256_hex, sha256_hex(&expected));
+        assert_eq!(
+            hash.root_xml_relative_path,
+            std::path::PathBuf::from("piper_no_gripper.xml")
+        );
+    }
+
+    #[test]
+    fn model_dir_hash_rejects_asset_paths_that_escape_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("piper_no_gripper.xml"),
+            r#"<mujoco><asset><mesh file="../outside.stl"/></asset></mujoco>"#,
+        )
+        .unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_dir_hash_rejects_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("piper_no_gripper.xml"), "<mujoco/>").unwrap();
+        std::fs::write(
+            dir.path().join(std::ffi::OsString::from_vec(vec![0xff])),
+            b"x",
+        )
+        .unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[test]
+    fn embedded_model_hash_rejects_external_file_references() {
+        let err =
+            hash_embedded_model(br#"<mujoco><include file="other.xml"/></mujoco>"#).unwrap_err();
+        assert!(err.to_string().contains("external file reference"));
+    }
+
+    #[test]
+    fn runtime_identity_wrapper_requires_native_library_identity() {
+        let err = current_mujoco_runtime_identity().unwrap_err();
+        assert!(err.to_string().contains("runtime identity"));
+    }
+
+    fn append_expected_file(out: &mut Vec<u8>, path: &str, bytes: &[u8]) {
+        out.push(b'F');
+        out.extend_from_slice(&(path.len() as u64).to_le_bytes());
+        out.extend_from_slice(path.as_bytes());
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+}
