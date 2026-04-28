@@ -1,13 +1,20 @@
 use anyhow::{Context, Result, bail};
-use piper_client::PiperBuilder;
 use piper_client::dual_arm::{
     BilateralExitReason, BilateralLoopConfig, BilateralRunReport, DualArmActiveMit, DualArmBuilder,
     DualArmCalibration, DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby,
-    JointMirrorMap,
+    JointMirrorMap, StopAttemptResult,
 };
-use piper_client::dual_arm_raw_clock::{RawClockRuntimeExitReason, RawClockRuntimeReport};
-use piper_client::state::{DisableConfig, MitModeConfig};
-use piper_tools::raw_clock::RawClockHealth;
+use piper_client::dual_arm_raw_clock::{
+    ExperimentalRawClockConfig, ExperimentalRawClockDualArmActive,
+    ExperimentalRawClockDualArmStandby, ExperimentalRawClockMode, ExperimentalRawClockRunConfig,
+    ExperimentalRawClockRunExit as PiperRawClockRunExit, RawClockRuntimeExitReason,
+    RawClockRuntimeReport, RawClockRuntimeThresholds,
+};
+use piper_client::observer::{ControlSnapshotFull, Observer};
+use piper_client::state::{DisableConfig, MitModeConfig, Piper, SoftRealtime, Standby};
+use piper_client::types::{JointArray, NewtonMeter, Rad, RadPerSecond};
+use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
+use piper_tools::raw_clock::{RawClockHealth, RawClockThresholds};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -30,7 +37,11 @@ use crate::teleop::report::{
     ReportCalibration, ReportTiming, TeleopExitStatus, TeleopJsonReport, TeleopReportInput,
     classify_exit, print_human_report,
 };
-use crate::teleop::target::{RoleTargets, TeleopPlatform, resolve_role_targets};
+use crate::teleop::target::{
+    ConcreteTeleopTarget, RoleTargets, TeleopPlatform, resolve_role_targets,
+};
+
+const CALIBRATED_HW_RAW_TIMING_SOURCE: &str = "calibrated_hw_raw";
 
 pub trait TeleopBackend {
     fn connect(&mut self, targets: &RoleTargets, baud_rate: u32) -> Result<()>;
@@ -64,6 +75,8 @@ pub trait ExperimentalRawClockTeleopBackend {
     fn warmup_raw_clock(
         &mut self,
         settings: &TeleopRawClockSettings,
+        frequency_hz: f64,
+        max_iterations: Option<usize>,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<RawClockWarmupSummary>;
 
@@ -147,8 +160,33 @@ pub struct StartupSummary {
     pub gripper_mirror: bool,
     pub experimental: bool,
     pub strict_realtime: bool,
+    pub timing_source: Option<String>,
     pub report_path: Option<PathBuf>,
     pub yes: bool,
+}
+
+impl StartupSummary {
+    #[cfg(test)]
+    fn experimental_raw_clock_for_tests(targets: RoleTargets) -> Self {
+        Self {
+            targets,
+            mode: TeleopMode::MasterFollower,
+            profile: TeleopProfile::Debug,
+            frequency_hz: 200.0,
+            track_kp: 8.0,
+            track_kd: 1.0,
+            master_damping: 0.4,
+            reflection_gain: 0.25,
+            calibration_source: "captured".to_string(),
+            calibration_path: None,
+            gripper_mirror: false,
+            experimental: true,
+            strict_realtime: false,
+            timing_source: Some(CALIBRATED_HW_RAW_TIMING_SOURCE.to_string()),
+            report_path: None,
+            yes: true,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -254,6 +292,7 @@ where
         gripper_mirror: resolved.safety.gripper_mirror,
         experimental: false,
         strict_realtime: true,
+        timing_source: None,
         report_path: args.report_json.clone(),
         yes: args.yes,
     };
@@ -387,7 +426,12 @@ where
     targets.ensure_experimental_raw_clock_supported(platform)?;
 
     backend.connect_soft(&targets, args.baud_rate)?;
-    let warmup = match backend.warmup_raw_clock(&resolved.raw_clock, cancel_signal.clone()) {
+    let warmup = match backend.warmup_raw_clock(
+        &resolved.raw_clock,
+        resolved.control.frequency_hz,
+        resolved.max_iterations,
+        cancel_signal.clone(),
+    ) {
         Ok(summary) => summary,
         Err(error) if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) => {
             return Ok(TeleopExitStatus::Success);
@@ -451,6 +495,7 @@ where
         gripper_mirror: resolved.safety.gripper_mirror,
         experimental: true,
         strict_realtime: false,
+        timing_source: Some(CALIBRATED_HW_RAW_TIMING_SOURCE.to_string()),
         report_path: args.report_json.clone(),
         yes: args.yes,
     };
@@ -588,7 +633,7 @@ fn report_timing_from_raw_clock(
     report: &RawClockRuntimeReport,
 ) -> ReportTiming {
     ReportTiming {
-        timing_source: "calibrated_raw_clock".to_string(),
+        timing_source: CALIBRATED_HW_RAW_TIMING_SOURCE.to_string(),
         experimental: true,
         strict_realtime: false,
         master_clock_drift_ppm: health_drift_ppm(&report.master).or(warmup.master_clock_drift_ppm),
@@ -662,6 +707,34 @@ fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
+    }
+}
+
+fn experimental_raw_clock_config_from_settings(
+    raw_clock: &TeleopRawClockSettings,
+    frequency_hz: f64,
+    max_iterations: Option<usize>,
+) -> ExperimentalRawClockConfig {
+    let estimator_thresholds = RawClockThresholds {
+        warmup_samples: (raw_clock.warmup_secs * 400).max(4) as usize,
+        warmup_window_us: raw_clock.warmup_secs * 1_000_000,
+        residual_p95_us: raw_clock.residual_p95_us,
+        residual_max_us: raw_clock.residual_max_us,
+        drift_abs_ppm: raw_clock.drift_abs_ppm,
+        sample_gap_max_us: raw_clock.sample_gap_max_ms * 1_000,
+        last_sample_age_us: raw_clock.last_sample_age_ms * 1_000,
+    };
+    let thresholds = RawClockRuntimeThresholds {
+        inter_arm_skew_max_us: raw_clock.inter_arm_skew_max_us,
+        last_sample_age_us: raw_clock.last_sample_age_ms * 1_000,
+    };
+
+    ExperimentalRawClockConfig {
+        mode: ExperimentalRawClockMode::MasterFollower,
+        frequency_hz,
+        max_iterations,
+        thresholds,
+        estimator_thresholds,
     }
 }
 
@@ -743,6 +816,21 @@ fn inspect_finished_console(handle: Option<JoinHandle<Result<()>>>) -> Result<()
 pub struct RealTeleopBackend {
     standby: Option<DualArmStandby>,
     active: Option<DualArmActiveMit>,
+    experimental_pending: Option<ExperimentalSoftRealtimeStandbyArms>,
+    experimental_standby: Option<ExperimentalRawClockDualArmStandby>,
+    experimental_active: Option<ExperimentalRawClockDualArmActive>,
+    experimental_observers: Option<ExperimentalSoftRealtimeObservers>,
+}
+
+struct ExperimentalSoftRealtimeStandbyArms {
+    master: Piper<Standby, SoftRealtime>,
+    slave: Piper<Standby, SoftRealtime>,
+}
+
+#[derive(Clone)]
+struct ExperimentalSoftRealtimeObservers {
+    master: Observer<SoftRealtime>,
+    slave: Observer<SoftRealtime>,
 }
 
 impl TeleopBackend for RealTeleopBackend {
@@ -756,6 +844,10 @@ impl TeleopBackend for RealTeleopBackend {
 
         self.standby = Some(DualArmBuilder::new(master_builder, slave_builder).build()?);
         self.active = None;
+        self.experimental_pending = None;
+        self.experimental_standby = None;
+        self.experimental_active = None;
+        self.experimental_observers = None;
         Ok(())
     }
 
@@ -834,49 +926,313 @@ impl TeleopBackend for RealTeleopBackend {
 }
 
 impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
-    fn connect_soft(&mut self, _targets: &RoleTargets, _baud_rate: u32) -> Result<()> {
-        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    fn connect_soft(&mut self, targets: &RoleTargets, baud_rate: u32) -> Result<()> {
+        let master = connect_soft_socketcan_standby("master", &targets.master, baud_rate)?;
+        let slave = connect_soft_socketcan_standby("slave", &targets.slave, baud_rate)?;
+        let observers = ExperimentalSoftRealtimeObservers {
+            master: master.observer().clone(),
+            slave: slave.observer().clone(),
+        };
+
+        self.standby = None;
+        self.active = None;
+        self.experimental_pending = Some(ExperimentalSoftRealtimeStandbyArms { master, slave });
+        self.experimental_standby = None;
+        self.experimental_active = None;
+        self.experimental_observers = Some(observers);
+        Ok(())
     }
 
     fn warmup_raw_clock(
         &mut self,
-        _settings: &TeleopRawClockSettings,
-        _cancel_signal: Arc<AtomicBool>,
+        settings: &TeleopRawClockSettings,
+        frequency_hz: f64,
+        max_iterations: Option<usize>,
+        cancel_signal: Arc<AtomicBool>,
     ) -> Result<RawClockWarmupSummary> {
-        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+        let config =
+            experimental_raw_clock_config_from_settings(settings, frequency_hz, max_iterations);
+        let standby = match self.experimental_standby.take() {
+            Some(standby) => standby,
+            None => {
+                let arms = self
+                    .experimental_pending
+                    .take()
+                    .context("experimental raw-clock backend is not connected")?;
+                ExperimentalRawClockDualArmStandby::new(arms.master, arms.slave, config)?
+            },
+        };
+
+        let warmed = standby.warmup(
+            DualArmReadPolicy::default().per_arm,
+            Duration::from_secs(settings.warmup_secs),
+            cancel_signal.as_ref(),
+        )?;
+        self.experimental_standby = Some(warmed);
+
+        Ok(RawClockWarmupSummary::default())
     }
 
-    fn capture_calibration(&self, _map: JointMirrorMap) -> Result<DualArmCalibration> {
-        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration> {
+        let observers = self
+            .experimental_observers
+            .as_ref()
+            .context("experimental raw-clock backend is not connected")?;
+        let snapshot = experimental_soft_snapshot(observers, DualArmReadPolicy::default())?;
+        Ok(DualArmCalibration {
+            master_zero: snapshot.left.state.position,
+            slave_zero: snapshot.right.state.position,
+            map,
+        })
     }
 
-    fn standby_snapshot(&self, _policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
-        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    fn standby_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+        let observers = self
+            .experimental_observers
+            .as_ref()
+            .context("experimental raw-clock backend is not connected")?;
+        experimental_soft_snapshot(observers, policy)
     }
 
     fn enable_mit_passthrough(
         &mut self,
-        _master: MitModeConfig,
-        _slave: MitModeConfig,
+        master: MitModeConfig,
+        slave: MitModeConfig,
     ) -> Result<()> {
-        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+        let standby = self
+            .experimental_standby
+            .take()
+            .context("experimental raw-clock backend is not in warmed standby")?;
+        let active = standby.enable_mit_passthrough(master, slave)?;
+        self.experimental_active = Some(active);
+        Ok(())
     }
 
-    fn active_snapshot(&self, _policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
-        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    fn active_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+        let observers = self
+            .experimental_observers
+            .as_ref()
+            .context("experimental raw-clock backend is not connected")?;
+        experimental_soft_snapshot(observers, policy)
     }
 
     fn disable_active_passthrough(&mut self) -> Result<()> {
-        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+        let active = self
+            .experimental_active
+            .take()
+            .context("experimental raw-clock backend is not active")?;
+        let standby = active.disable_both(DisableConfig::default())?;
+        self.experimental_standby = Some(standby);
+        Ok(())
     }
 
     fn run_master_follower_raw_clock(
         &mut self,
-        _settings: RuntimeTeleopSettingsHandle,
+        settings: RuntimeTeleopSettingsHandle,
         _raw_clock: TeleopRawClockSettings,
-        _cancel_signal: Arc<AtomicBool>,
+        cancel_signal: Arc<AtomicBool>,
     ) -> Result<ExperimentalRawClockRunExit> {
-        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+        let runtime_settings = settings.snapshot();
+        if runtime_settings.mode != TeleopMode::MasterFollower {
+            bail!("experimental calibrated raw clock currently supports master-follower mode only");
+        }
+
+        let active = self
+            .experimental_active
+            .take()
+            .context("experimental raw-clock backend is not active")?;
+        let run_config = ExperimentalRawClockRunConfig {
+            read_policy: DualArmReadPolicy::default().per_arm,
+            command_timeout: Duration::from_millis(20),
+            disable_config: DisableConfig::default(),
+            cancel_signal: Some(cancel_signal),
+        };
+
+        match active.run_master_follower(runtime_settings.calibration, run_config) {
+            Ok(PiperRawClockRunExit::Standby { arms, report }) => {
+                self.experimental_standby = Some(*arms);
+                Ok(ExperimentalRawClockRunExit {
+                    faulted: false,
+                    report,
+                })
+            },
+            Ok(PiperRawClockRunExit::Faulted { arms: _, report }) => {
+                Ok(ExperimentalRawClockRunExit {
+                    faulted: true,
+                    report,
+                })
+            },
+            Err(error) => Ok(ExperimentalRawClockRunExit {
+                faulted: true,
+                report: raw_clock_error_report(
+                    RawClockRuntimeExitReason::RuntimeTransportFault,
+                    error.to_string(),
+                ),
+            }),
+        }
+    }
+}
+
+fn connect_soft_socketcan_standby(
+    role: &'static str,
+    target: &ConcreteTeleopTarget,
+    baud_rate: u32,
+) -> Result<Piper<Standby, SoftRealtime>> {
+    let ConcreteTeleopTarget::SocketCan { iface } = target else {
+        bail!("experimental calibrated raw clock requires explicit SocketCAN target for {role}");
+    };
+
+    let connected = PiperBuilder::new()
+        .socketcan(iface.clone())
+        .baud_rate(baud_rate)
+        .build()
+        .with_context(|| {
+            format!("failed to connect experimental {role} SocketCAN target socketcan:{iface}")
+        })?;
+
+    match connected.require_motion()? {
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => Ok(standby),
+        MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_)) => {
+            bail!("maintenance required before experimental teleop")
+        },
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(_)) => {
+            bail!(
+                "experimental calibrated raw path expected SoftRealtime; use normal StrictRealtime teleop"
+            )
+        },
+    }
+}
+
+fn experimental_soft_snapshot(
+    observers: &ExperimentalSoftRealtimeObservers,
+    policy: DualArmReadPolicy,
+) -> Result<DualArmSnapshot> {
+    let left = experimental_soft_control_snapshot_full(&observers.master, policy, "master")?;
+    let right = experimental_soft_control_snapshot_full(&observers.slave, policy, "slave")?;
+    let position_skew_us = left.position_host_rx_mono_us.abs_diff(right.position_host_rx_mono_us);
+    let dynamic_skew_us = left.dynamic_host_rx_mono_us.abs_diff(right.dynamic_host_rx_mono_us);
+    let inter_arm_skew = Duration::from_micros(position_skew_us.max(dynamic_skew_us));
+    if inter_arm_skew > policy.max_inter_arm_skew {
+        bail!(
+            "experimental raw-clock dual-arm snapshot inter-arm skew {}us exceeds {}us",
+            inter_arm_skew.as_micros(),
+            policy.max_inter_arm_skew.as_micros()
+        );
+    }
+
+    Ok(DualArmSnapshot {
+        left,
+        right,
+        inter_arm_skew,
+        host_cycle_timestamp: Instant::now(),
+    })
+}
+
+fn experimental_soft_control_snapshot_full(
+    observer: &Observer<SoftRealtime>,
+    policy: DualArmReadPolicy,
+    role: &'static str,
+) -> Result<ControlSnapshotFull> {
+    let health = observer.runtime_health();
+    if !health.connected || !health.rx_alive || !health.tx_alive || health.fault.is_some() {
+        bail!(
+            "experimental raw-clock {role} runtime unhealthy: connected={}, rx_alive={}, tx_alive={}, fault={:?}",
+            health.connected,
+            health.rx_alive,
+            health.tx_alive,
+            health.fault
+        );
+    }
+    if health.last_feedback_age > policy.per_arm.max_feedback_age {
+        bail!(
+            "experimental raw-clock {role} feedback age {:?} exceeds {:?}",
+            health.last_feedback_age,
+            policy.per_arm.max_feedback_age
+        );
+    }
+
+    let position = observer.raw_joint_position_state();
+    let dynamic = observer.raw_joint_dynamic_state();
+    if !position.is_fully_valid() {
+        bail!(
+            "experimental raw-clock {role} position feedback incomplete: mask=0x{:02x}",
+            position.frame_valid_mask
+        );
+    }
+    if !dynamic.is_complete() {
+        bail!(
+            "experimental raw-clock {role} dynamic feedback incomplete: mask=0x{:02x}",
+            dynamic.valid_mask
+        );
+    }
+
+    let skew_us = signed_us_diff(dynamic.group_timestamp_us, position.hardware_timestamp_us);
+    if position.hardware_timestamp_us.abs_diff(dynamic.group_timestamp_us)
+        > policy.per_arm.max_state_skew_us
+    {
+        bail!(
+            "experimental raw-clock {role} state skew {}us exceeds {}us",
+            skew_us,
+            policy.per_arm.max_state_skew_us
+        );
+    }
+
+    Ok(ControlSnapshotFull {
+        state: piper_client::observer::ControlSnapshot {
+            position: JointArray::new(position.joint_pos.map(Rad)),
+            velocity: JointArray::new(dynamic.joint_vel.map(RadPerSecond)),
+            torque: JointArray::new(dynamic.get_all_torques().map(NewtonMeter)),
+            position_timestamp_us: position.hardware_timestamp_us,
+            dynamic_timestamp_us: dynamic.group_timestamp_us,
+            skew_us,
+        },
+        position_host_rx_mono_us: position.host_rx_mono_us,
+        dynamic_host_rx_mono_us: dynamic.group_host_rx_mono_us,
+        feedback_age: health.last_feedback_age,
+    })
+}
+
+fn signed_us_diff(left: u64, right: u64) -> i64 {
+    let diff = left as i128 - right as i128;
+    diff.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn raw_clock_error_report(
+    exit_reason: RawClockRuntimeExitReason,
+    last_error: String,
+) -> RawClockRuntimeReport {
+    RawClockRuntimeReport {
+        master: empty_raw_clock_health_for_error(),
+        slave: empty_raw_clock_health_for_error(),
+        max_inter_arm_skew_us: 0,
+        inter_arm_skew_p95_us: 0,
+        clock_health_failures: 1,
+        read_faults: 0,
+        submission_faults: 0,
+        runtime_faults: 1,
+        iterations: 0,
+        exit_reason: Some(exit_reason),
+        master_stop_attempt: StopAttemptResult::NotAttempted,
+        slave_stop_attempt: StopAttemptResult::NotAttempted,
+        last_error: Some(last_error),
+    }
+}
+
+fn empty_raw_clock_health_for_error() -> RawClockHealth {
+    RawClockHealth {
+        healthy: false,
+        sample_count: 0,
+        window_duration_us: 0,
+        drift_ppm: f64::NAN,
+        residual_p50_us: 0,
+        residual_p95_us: 0,
+        residual_p99_us: 0,
+        residual_max_us: 0,
+        sample_gap_max_us: 0,
+        last_sample_age_us: u64::MAX,
+        raw_timestamp_regressions: 0,
+        reason: Some("runtime did not produce raw-clock health".to_string()),
     }
 }
 
@@ -1003,6 +1359,9 @@ fn print_startup_summary(summary: &StartupSummary) -> Result<()> {
     writeln!(stderr, "  gripper mirror: {}", summary.gripper_mirror)?;
     writeln!(stderr, "  experimental={}", summary.experimental)?;
     writeln!(stderr, "  strict_realtime={}", summary.strict_realtime)?;
+    if let Some(timing_source) = &summary.timing_source {
+        writeln!(stderr, "  timing_source={timing_source}")?;
+    }
     if let Some(path) = &summary.report_path {
         writeln!(stderr, "  report json: {}", path.display())?;
     }
@@ -1093,7 +1452,7 @@ pub async fn run_dual_arm(args: TeleopDualArmArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::teleop::report::TeleopExitStatus;
-    use crate::teleop::target::TeleopPlatform;
+    use crate::teleop::target::{ConcreteTeleopTarget, TeleopPlatform};
     use anyhow::{Result, bail};
     use piper_client::dual_arm::{
         BilateralExitReason, BilateralLoopConfig, BilateralRunReport, DualArmCalibration,
@@ -1355,6 +1714,8 @@ mod tests {
         fn warmup_raw_clock(
             &mut self,
             _settings: &TeleopRawClockSettings,
+            _frequency_hz: f64,
+            _max_iterations: Option<usize>,
             cancel_signal: Arc<AtomicBool>,
         ) -> Result<RawClockWarmupSummary> {
             self.trace.push(WorkflowCall::RawClockWarmup);
@@ -1898,6 +2259,24 @@ mod tests {
     }
 
     #[test]
+    fn real_experimental_backend_formats_socketcan_targets_for_startup_summary() {
+        let targets = RoleTargets {
+            master: ConcreteTeleopTarget::SocketCan {
+                iface: "can0".to_string(),
+            },
+            slave: ConcreteTeleopTarget::SocketCan {
+                iface: "can1".to_string(),
+            },
+        };
+
+        let summary = StartupSummary::experimental_raw_clock_for_tests(targets);
+
+        assert_eq!(summary.timing_source.as_deref(), Some("calibrated_hw_raw"));
+        assert!(summary.experimental);
+        assert!(!summary.strict_realtime);
+    }
+
+    #[test]
     fn experimental_raw_clock_health_failure_reports_failure() {
         let backend =
             FakeTeleopBackend::default().with_experimental_timing_failure("inter-arm skew");
@@ -1961,6 +2340,34 @@ mod tests {
 
         assert_eq!(timing.estimated_inter_arm_skew_p95_us, Some(77));
         assert_eq!(timing.max_estimated_inter_arm_skew_us, Some(100));
+    }
+
+    #[test]
+    fn experimental_raw_clock_settings_convert_to_runtime_thresholds() {
+        let settings = TeleopRawClockSettings {
+            experimental_calibrated_raw: true,
+            warmup_secs: 3,
+            residual_p95_us: 120,
+            residual_max_us: 300,
+            drift_abs_ppm: 42.0,
+            sample_gap_max_ms: 7,
+            last_sample_age_ms: 9,
+            inter_arm_skew_max_us: 1500,
+        };
+
+        let config = experimental_raw_clock_config_from_settings(&settings, 333.0, Some(12));
+
+        assert_eq!(config.frequency_hz, 333.0);
+        assert_eq!(config.max_iterations, Some(12));
+        assert_eq!(config.estimator_thresholds.warmup_samples, 1200);
+        assert_eq!(config.estimator_thresholds.warmup_window_us, 3_000_000);
+        assert_eq!(config.estimator_thresholds.residual_p95_us, 120);
+        assert_eq!(config.estimator_thresholds.residual_max_us, 300);
+        assert_eq!(config.estimator_thresholds.drift_abs_ppm, 42.0);
+        assert_eq!(config.estimator_thresholds.sample_gap_max_us, 7_000);
+        assert_eq!(config.estimator_thresholds.last_sample_age_us, 9_000);
+        assert_eq!(config.thresholds.inter_arm_skew_max_us, 1500);
+        assert_eq!(config.thresholds.last_sample_age_us, 9_000);
     }
 
     fn run_workflow_for_test(
