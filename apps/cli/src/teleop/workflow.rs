@@ -5,7 +5,9 @@ use piper_client::dual_arm::{
     DualArmCalibration, DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby,
     JointMirrorMap,
 };
+use piper_client::dual_arm_raw_clock::{RawClockRuntimeExitReason, RawClockRuntimeReport};
 use piper_client::state::{DisableConfig, MitModeConfig};
+use piper_tools::raw_clock::RawClockHealth;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -18,13 +20,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::commands::teleop::TeleopDualArmArgs;
 use crate::teleop::calibration::{CalibrationFile, check_posture_compatibility};
-use crate::teleop::config::{ResolvedTeleopConfig, TeleopConfigFile, TeleopMode, TeleopProfile};
+use crate::teleop::config::{
+    ResolvedTeleopConfig, TeleopConfigFile, TeleopMode, TeleopProfile, TeleopRawClockSettings,
+};
 use crate::teleop::controller::{
     RuntimeTeleopController, RuntimeTeleopSettings, RuntimeTeleopSettingsHandle,
 };
 use crate::teleop::report::{
-    ReportCalibration, TeleopExitStatus, TeleopJsonReport, TeleopReportInput, classify_exit,
-    print_human_report,
+    ReportCalibration, ReportTiming, TeleopExitStatus, TeleopJsonReport, TeleopReportInput,
+    classify_exit, print_human_report,
 };
 use crate::teleop::target::{RoleTargets, TeleopPlatform, resolve_role_targets};
 
@@ -54,6 +58,32 @@ pub trait TeleopBackend {
     ) -> Result<TeleopLoopExit>;
 }
 
+pub trait ExperimentalRawClockTeleopBackend {
+    fn connect_soft(&mut self, targets: &RoleTargets, baud_rate: u32) -> Result<()>;
+
+    fn warmup_raw_clock(
+        &mut self,
+        settings: &TeleopRawClockSettings,
+        cancel_signal: Arc<AtomicBool>,
+    ) -> Result<RawClockWarmupSummary>;
+
+    fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration>;
+
+    /// Enables both arms in SoftRealtime MIT passthrough mode.
+    ///
+    /// If this returns `Err`, implementations are responsible for cleaning up any partially
+    /// dispatched enable attempt before returning.
+    fn enable_mit_passthrough(&mut self, master: MitModeConfig, slave: MitModeConfig)
+    -> Result<()>;
+
+    fn run_master_follower_raw_clock(
+        &mut self,
+        settings: RuntimeTeleopSettingsHandle,
+        raw_clock: TeleopRawClockSettings,
+        cancel_signal: Arc<AtomicBool>,
+    ) -> Result<ExperimentalRawClockRunExit>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum EnableOutcome {
@@ -64,6 +94,23 @@ pub enum EnableOutcome {
 pub struct TeleopLoopExit {
     pub faulted: bool,
     pub report: BilateralRunReport,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RawClockWarmupSummary {
+    pub master_clock_drift_ppm: Option<f64>,
+    pub slave_clock_drift_ppm: Option<f64>,
+    pub master_residual_p95_us: Option<u64>,
+    pub slave_residual_p95_us: Option<u64>,
+    pub max_estimated_inter_arm_skew_us: Option<u64>,
+    pub estimated_inter_arm_skew_p95_us: Option<u64>,
+    pub clock_health_failures: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExperimentalRawClockRunExit {
+    pub faulted: bool,
+    pub report: RawClockRuntimeReport,
 }
 
 pub trait TeleopIo {
@@ -92,30 +139,35 @@ pub struct StartupSummary {
     pub calibration_source: String,
     pub calibration_path: Option<PathBuf>,
     pub gripper_mirror: bool,
+    pub experimental: bool,
+    pub strict_realtime: bool,
     pub report_path: Option<PathBuf>,
     pub yes: bool,
 }
 
 #[allow(dead_code)]
-pub fn run_workflow<B: TeleopBackend>(
+pub fn run_workflow<B>(
     args: TeleopDualArmArgs,
     backend: &mut B,
     io: &mut dyn TeleopIo,
-) -> Result<TeleopExitStatus> {
+) -> Result<TeleopExitStatus>
+where
+    B: TeleopBackend + ExperimentalRawClockTeleopBackend,
+{
     run_workflow_on_platform(args, backend, io, TeleopPlatform::current())
 }
 
-pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
+pub(crate) fn run_workflow_on_platform<B>(
     args: TeleopDualArmArgs,
     backend: &mut B,
     io: &mut dyn TeleopIo,
     platform: TeleopPlatform,
-) -> Result<TeleopExitStatus> {
+) -> Result<TeleopExitStatus>
+where
+    B: TeleopBackend + ExperimentalRawClockTeleopBackend,
+{
     let config_file = args.config.as_deref().map(TeleopConfigFile::load).transpose()?;
     let resolved = ResolvedTeleopConfig::resolve(args.clone(), config_file.clone())?;
-
-    let loaded_calibration =
-        resolved.calibration.file.as_deref().map(load_calibration).transpose()?;
 
     if let Some(path) = &args.save_calibration
         && path.exists()
@@ -128,6 +180,21 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
 
     let targets = resolve_role_targets(&args, config_file.as_ref(), platform)?;
     let cancel_signal = io.cancel_signal();
+
+    if resolved.raw_clock.experimental_calibrated_raw {
+        return run_experimental_raw_clock_workflow(
+            args,
+            backend,
+            io,
+            platform,
+            resolved,
+            targets,
+            cancel_signal,
+        );
+    }
+
+    let loaded_calibration =
+        resolved.calibration.file.as_deref().map(load_calibration).transpose()?;
 
     backend.connect(&targets, args.baud_rate)?;
     backend.runtime_health_ok().context("runtime health check failed")?;
@@ -143,7 +210,8 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
             },
         ),
         None => {
-            let calibration = backend.capture_calibration(JointMirrorMap::left_right_mirror())?;
+            let calibration =
+                TeleopBackend::capture_calibration(backend, JointMirrorMap::left_right_mirror())?;
             let created_at_unix_ms = current_unix_ms();
             if let Some(path) = &args.save_calibration {
                 // The Task 8 startup order saves captured calibration before operator confirmation.
@@ -178,6 +246,8 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
             .clone()
             .or_else(|| args.save_calibration.clone()),
         gripper_mirror: resolved.safety.gripper_mirror,
+        experimental: false,
+        strict_realtime: true,
         report_path: args.report_json.clone(),
         yes: args.yes,
     };
@@ -290,6 +360,243 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
     inspect_finished_console(console_handle)?;
 
     Ok(classify_exit(loop_exit.faulted, &loop_exit.report))
+}
+
+fn run_experimental_raw_clock_workflow<B>(
+    args: TeleopDualArmArgs,
+    backend: &mut B,
+    io: &mut dyn TeleopIo,
+    platform: TeleopPlatform,
+    resolved: ResolvedTeleopConfig,
+    targets: RoleTargets,
+    cancel_signal: Arc<AtomicBool>,
+) -> Result<TeleopExitStatus>
+where
+    B: ExperimentalRawClockTeleopBackend,
+{
+    if platform != TeleopPlatform::Linux {
+        bail!("experimental calibrated raw clock requires Linux SocketCAN targets");
+    }
+    targets.ensure_experimental_raw_clock_supported(platform)?;
+
+    backend.connect_soft(&targets, args.baud_rate)?;
+    let warmup = match backend.warmup_raw_clock(&resolved.raw_clock, cancel_signal.clone()) {
+        Ok(summary) => summary,
+        Err(error) if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) => {
+            return Ok(TeleopExitStatus::Success);
+        },
+        Err(error) => return Err(error).context("raw-clock warmup failed"),
+    };
+
+    if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
+        return Ok(TeleopExitStatus::Success);
+    }
+
+    let loaded_calibration =
+        resolved.calibration.file.as_deref().map(load_calibration).transpose()?;
+    let (calibration, report_calibration) = match loaded_calibration {
+        Some((file, calibration)) => (
+            calibration,
+            ReportCalibration {
+                source: "file".to_string(),
+                path: resolved.calibration.file.as_ref().map(|path| path.display().to_string()),
+                created_at_unix_ms: Some(file.created_at_unix_ms),
+                max_error_rad: resolved.calibration.max_error_rad,
+            },
+        ),
+        None => {
+            let calibration = ExperimentalRawClockTeleopBackend::capture_calibration(
+                backend,
+                JointMirrorMap::left_right_mirror(),
+            )?;
+            let created_at_unix_ms = current_unix_ms();
+            if let Some(path) = &args.save_calibration {
+                CalibrationFile::from_calibration(&calibration, None, created_at_unix_ms)
+                    .save_new(path)?;
+            }
+            (
+                calibration,
+                ReportCalibration {
+                    source: "captured".to_string(),
+                    path: args.save_calibration.as_ref().map(|path| path.display().to_string()),
+                    created_at_unix_ms: Some(created_at_unix_ms),
+                    max_error_rad: resolved.calibration.max_error_rad,
+                },
+            )
+        },
+    };
+
+    let summary = StartupSummary {
+        targets: targets.clone(),
+        mode: resolved.control.mode,
+        profile: resolved.safety.profile,
+        frequency_hz: resolved.control.frequency_hz,
+        track_kp: resolved.control.track_kp,
+        track_kd: resolved.control.track_kd,
+        master_damping: resolved.control.master_damping,
+        reflection_gain: resolved.control.reflection_gain,
+        calibration_source: report_calibration.source.clone(),
+        calibration_path: resolved
+            .calibration
+            .file
+            .clone()
+            .or_else(|| args.save_calibration.clone()),
+        gripper_mirror: resolved.safety.gripper_mirror,
+        experimental: true,
+        strict_realtime: false,
+        report_path: args.report_json.clone(),
+        yes: args.yes,
+    };
+    if !io.confirm_start(&summary)? {
+        if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
+            return Ok(TeleopExitStatus::Success);
+        }
+        bail!("operator confirmation declined");
+    }
+
+    if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
+        return Ok(TeleopExitStatus::Success);
+    }
+
+    let settings = RuntimeTeleopSettings::production(calibration.clone())
+        .with_mode(resolved.control.mode)?
+        .with_track_gains(resolved.control.track_kp, resolved.control.track_kd)?
+        .with_master_damping(resolved.control.master_damping)?
+        .with_reflection_gain(resolved.control.reflection_gain)?;
+    let settings_handle = RuntimeTeleopSettingsHandle::new(settings)?;
+    let initial_mode = settings_handle.snapshot().mode;
+    let started_at = Instant::now();
+    let console_handle = io.start_console(settings_handle.clone(), started_at)?;
+
+    backend.enable_mit_passthrough(MitModeConfig::default(), MitModeConfig::default())?;
+    let loop_exit = backend.run_master_follower_raw_clock(
+        settings_handle.clone(),
+        resolved.raw_clock.clone(),
+        cancel_signal,
+    )?;
+
+    let final_mode = settings_handle.snapshot().mode;
+    let timing = report_timing_from_raw_clock(&warmup, &loop_exit.report);
+    let faulted = loop_exit.faulted || timing.clock_health_failures > 0;
+    let bilateral_report = bilateral_report_from_raw_clock(&loop_exit.report);
+    let report = TeleopJsonReport::from_run(TeleopReportInput {
+        platform,
+        targets,
+        profile: resolved.safety.profile,
+        initial_mode,
+        final_mode,
+        control: resolved.control.clone(),
+        safety: resolved.safety.clone(),
+        calibration: report_calibration,
+        timing: Some(timing.clone()),
+        faulted,
+        report: &bilateral_report,
+    });
+    print_human_report(&report, started_at.elapsed());
+
+    if let Some(path) = &args.report_json {
+        io.write_json_report(path, &report)?;
+    }
+    inspect_finished_console(console_handle)?;
+
+    let status = classify_experimental_raw_clock_exit(faulted, &loop_exit.report, &timing);
+    if status == TeleopExitStatus::Failure {
+        let message = loop_exit
+            .report
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "experimental raw-clock timing health failure".to_string());
+        bail!("{message}");
+    }
+    Ok(status)
+}
+
+fn classify_experimental_raw_clock_exit(
+    faulted: bool,
+    report: &RawClockRuntimeReport,
+    timing: &ReportTiming,
+) -> TeleopExitStatus {
+    if !faulted
+        && timing.clock_health_failures == 0
+        && matches!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::Cancelled | RawClockRuntimeExitReason::MaxIterations)
+        )
+    {
+        TeleopExitStatus::Success
+    } else {
+        TeleopExitStatus::Failure
+    }
+}
+
+fn report_timing_from_raw_clock(
+    warmup: &RawClockWarmupSummary,
+    report: &RawClockRuntimeReport,
+) -> ReportTiming {
+    ReportTiming {
+        timing_source: "calibrated_raw_clock".to_string(),
+        experimental: true,
+        strict_realtime: false,
+        master_clock_drift_ppm: health_drift_ppm(&report.master).or(warmup.master_clock_drift_ppm),
+        slave_clock_drift_ppm: health_drift_ppm(&report.slave).or(warmup.slave_clock_drift_ppm),
+        master_residual_p95_us: health_residual_p95_us(&report.master)
+            .or(warmup.master_residual_p95_us),
+        slave_residual_p95_us: health_residual_p95_us(&report.slave)
+            .or(warmup.slave_residual_p95_us),
+        max_estimated_inter_arm_skew_us: max_optional_u64(
+            Some(report.max_inter_arm_skew_us),
+            warmup.max_estimated_inter_arm_skew_us,
+        ),
+        estimated_inter_arm_skew_p95_us: Some(report.inter_arm_skew_p95_us)
+            .or(warmup.estimated_inter_arm_skew_p95_us),
+        clock_health_failures: report
+            .clock_health_failures
+            .saturating_add(warmup.clock_health_failures),
+    }
+}
+
+fn bilateral_report_from_raw_clock(report: &RawClockRuntimeReport) -> BilateralRunReport {
+    BilateralRunReport {
+        iterations: report.iterations,
+        read_faults: report.read_faults,
+        submission_faults: report.submission_faults,
+        max_inter_arm_skew: Duration::from_micros(report.max_inter_arm_skew_us),
+        exit_reason: report.exit_reason.map(map_raw_clock_exit_reason),
+        left_stop_attempt: report.master_stop_attempt,
+        right_stop_attempt: report.slave_stop_attempt,
+        last_error: report.last_error.clone(),
+        ..BilateralRunReport::default()
+    }
+}
+
+fn map_raw_clock_exit_reason(reason: RawClockRuntimeExitReason) -> BilateralExitReason {
+    match reason {
+        RawClockRuntimeExitReason::MaxIterations => BilateralExitReason::MaxIterations,
+        RawClockRuntimeExitReason::Cancelled => BilateralExitReason::Cancelled,
+        RawClockRuntimeExitReason::ReadFault => BilateralExitReason::ReadFault,
+        RawClockRuntimeExitReason::ControllerFault => BilateralExitReason::ControllerFault,
+        RawClockRuntimeExitReason::SubmissionFault => BilateralExitReason::SubmissionFault,
+        RawClockRuntimeExitReason::RuntimeManualFault => BilateralExitReason::RuntimeManualFault,
+        RawClockRuntimeExitReason::RuntimeTransportFault
+        | RawClockRuntimeExitReason::RawClockFault
+        | RawClockRuntimeExitReason::ClockHealthFault => BilateralExitReason::RuntimeTransportFault,
+    }
+}
+
+fn health_drift_ppm(health: &RawClockHealth) -> Option<f64> {
+    (health.sample_count > 0 && health.drift_ppm.is_finite()).then_some(health.drift_ppm)
+}
+
+fn health_residual_p95_us(health: &RawClockHealth) -> Option<u64> {
+    (health.sample_count > 0).then_some(health.residual_p95_us)
+}
+
+fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn disable_active_after_error<B, T>(
@@ -444,6 +751,41 @@ impl TeleopBackend for RealTeleopBackend {
     }
 }
 
+impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
+    fn connect_soft(&mut self, _targets: &RoleTargets, _baud_rate: u32) -> Result<()> {
+        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    }
+
+    fn warmup_raw_clock(
+        &mut self,
+        _settings: &TeleopRawClockSettings,
+        _cancel_signal: Arc<AtomicBool>,
+    ) -> Result<RawClockWarmupSummary> {
+        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    }
+
+    fn capture_calibration(&self, _map: JointMirrorMap) -> Result<DualArmCalibration> {
+        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    }
+
+    fn enable_mit_passthrough(
+        &mut self,
+        _master: MitModeConfig,
+        _slave: MitModeConfig,
+    ) -> Result<()> {
+        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    }
+
+    fn run_master_follower_raw_clock(
+        &mut self,
+        _settings: RuntimeTeleopSettingsHandle,
+        _raw_clock: TeleopRawClockSettings,
+        _cancel_signal: Arc<AtomicBool>,
+    ) -> Result<ExperimentalRawClockRunExit> {
+        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    }
+}
+
 pub struct RealTeleopIo {
     cancel: Arc<AtomicBool>,
 }
@@ -565,6 +907,8 @@ fn print_startup_summary(summary: &StartupSummary) -> Result<()> {
         writeln!(stderr, "  calibration path: {}", path.display())?;
     }
     writeln!(stderr, "  gripper mirror: {}", summary.gripper_mirror)?;
+    writeln!(stderr, "  experimental={}", summary.experimental)?;
+    writeln!(stderr, "  strict_realtime={}", summary.strict_realtime)?;
     if let Some(path) = &summary.report_path {
         writeln!(stderr, "  report json: {}", path.display())?;
     }
@@ -659,7 +1003,7 @@ mod tests {
     use anyhow::{Result, bail};
     use piper_client::dual_arm::{
         BilateralExitReason, BilateralLoopConfig, BilateralRunReport, DualArmCalibration,
-        DualArmReadPolicy, DualArmSnapshot, JointMirrorMap,
+        DualArmReadPolicy, DualArmSnapshot, JointMirrorMap, StopAttemptResult,
     };
     use piper_client::observer::{ControlSnapshot, ControlSnapshotFull};
     use piper_client::state::MitModeConfig;
@@ -701,9 +1045,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct FakeBackendCallCounts {
+        experimental_raw_clock_runs: usize,
+        strict_runs: usize,
+        fault_shutdown_attempted: bool,
+        master_stop_attempts: usize,
+        slave_stop_attempts: usize,
+    }
+
     #[derive(Debug, Clone)]
     struct FakeTeleopBackend {
         trace: WorkflowTrace,
+        call_counts: Arc<Mutex<FakeBackendCallCounts>>,
         health_failure: bool,
         standby_mismatch: bool,
         active_mismatch: bool,
@@ -711,12 +1065,14 @@ mod tests {
         enable_error: bool,
         disabled_or_faulted: Arc<AtomicBool>,
         loop_exit: TeleopLoopExit,
+        experimental_run_exit: ExperimentalRawClockRunExit,
     }
 
     impl Default for FakeTeleopBackend {
         fn default() -> Self {
             Self {
                 trace: WorkflowTrace::default(),
+                call_counts: Arc::new(Mutex::new(FakeBackendCallCounts::default())),
                 health_failure: false,
                 standby_mismatch: false,
                 active_mismatch: false,
@@ -729,6 +1085,10 @@ mod tests {
                         exit_reason: Some(BilateralExitReason::MaxIterations),
                         ..BilateralRunReport::default()
                     },
+                },
+                experimental_run_exit: ExperimentalRawClockRunExit {
+                    faulted: false,
+                    report: raw_clock_report_success(),
                 },
             }
         }
@@ -795,8 +1155,24 @@ mod tests {
             }
         }
 
+        fn with_experimental_raw_clock_success(self) -> Self {
+            self
+        }
+
+        fn with_experimental_timing_failure(mut self, message: &str) -> Self {
+            self.experimental_run_exit = ExperimentalRawClockRunExit {
+                faulted: true,
+                report: raw_clock_report_timing_failure(message),
+            };
+            self
+        }
+
         fn calls(&self) -> Vec<WorkflowCall> {
             self.trace.calls()
+        }
+
+        fn call_counts(&self) -> FakeBackendCallCounts {
+            self.call_counts.lock().expect("call counts lock poisoned").clone()
         }
 
         fn was_disabled_or_faulted_before_report(&self) -> bool {
@@ -864,8 +1240,84 @@ mod tests {
             _cfg: BilateralLoopConfig,
         ) -> Result<TeleopLoopExit> {
             self.trace.push(WorkflowCall::RunLoop);
+            self.call_counts.lock().expect("call counts lock poisoned").strict_runs += 1;
             self.disabled_or_faulted.store(true, Ordering::SeqCst);
             Ok(self.loop_exit.clone())
+        }
+    }
+
+    impl ExperimentalRawClockTeleopBackend for FakeTeleopBackend {
+        fn connect_soft(
+            &mut self,
+            _targets: &crate::teleop::target::RoleTargets,
+            _baud_rate: u32,
+        ) -> Result<()> {
+            self.trace.push(WorkflowCall::Connect);
+            Ok(())
+        }
+
+        fn warmup_raw_clock(
+            &mut self,
+            _settings: &TeleopRawClockSettings,
+            cancel_signal: Arc<AtomicBool>,
+        ) -> Result<RawClockWarmupSummary> {
+            if cancel_signal.load(Ordering::SeqCst) {
+                bail!("raw-clock warmup cancelled");
+            }
+            Ok(RawClockWarmupSummary {
+                master_clock_drift_ppm: Some(1.0),
+                slave_clock_drift_ppm: Some(1.5),
+                master_residual_p95_us: Some(12),
+                slave_residual_p95_us: Some(14),
+                max_estimated_inter_arm_skew_us: Some(100),
+                estimated_inter_arm_skew_p95_us: Some(80),
+                clock_health_failures: 0,
+            })
+        }
+
+        fn capture_calibration(&self, _map: JointMirrorMap) -> Result<DualArmCalibration> {
+            self.trace.push(WorkflowCall::CaptureCalibration);
+            Ok(sample_calibration())
+        }
+
+        fn enable_mit_passthrough(
+            &mut self,
+            _master: MitModeConfig,
+            _slave: MitModeConfig,
+        ) -> Result<()> {
+            self.trace.push(WorkflowCall::Enable);
+            if self.enable_error {
+                bail!("enable confirmation failed");
+            }
+            Ok(())
+        }
+
+        fn run_master_follower_raw_clock(
+            &mut self,
+            _settings: RuntimeTeleopSettingsHandle,
+            _raw_clock: TeleopRawClockSettings,
+            _cancel_signal: Arc<AtomicBool>,
+        ) -> Result<ExperimentalRawClockRunExit> {
+            self.trace.push(WorkflowCall::RunLoop);
+            let mut counts = self.call_counts.lock().expect("call counts lock poisoned");
+            counts.experimental_raw_clock_runs += 1;
+            if self.experimental_run_exit.faulted {
+                counts.fault_shutdown_attempted = true;
+                if self.experimental_run_exit.report.master_stop_attempt
+                    != StopAttemptResult::NotAttempted
+                {
+                    counts.master_stop_attempts += 1;
+                }
+                if self.experimental_run_exit.report.slave_stop_attempt
+                    != StopAttemptResult::NotAttempted
+                {
+                    counts.slave_stop_attempts += 1;
+                }
+            }
+            drop(counts);
+
+            self.disabled_or_faulted.store(true, Ordering::SeqCst);
+            Ok(self.experimental_run_exit.clone())
         }
     }
 
@@ -1300,6 +1752,32 @@ mod tests {
         assert_eq!(backend.calls(), Vec::<WorkflowCall>::new());
     }
 
+    #[test]
+    fn experimental_raw_clock_uses_experimental_backend_path() {
+        let backend = FakeTeleopBackend::default().with_experimental_raw_clock_success();
+
+        let status = run_workflow_for_test(experimental_args(), backend.clone())
+            .expect("experimental raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        assert_eq!(backend.call_counts().experimental_raw_clock_runs, 1);
+        assert_eq!(backend.call_counts().strict_runs, 0);
+    }
+
+    #[test]
+    fn experimental_raw_clock_health_failure_reports_failure() {
+        let backend =
+            FakeTeleopBackend::default().with_experimental_timing_failure("inter-arm skew");
+
+        let err = run_workflow_for_test(experimental_args(), backend.clone())
+            .expect_err("experimental timing health failure should fail workflow");
+
+        assert!(err.to_string().contains("inter-arm skew"));
+        assert!(backend.call_counts().fault_shutdown_attempted);
+        assert_eq!(backend.call_counts().master_stop_attempts, 1);
+        assert_eq!(backend.call_counts().slave_stop_attempts, 1);
+    }
+
     fn run_workflow_for_test(
         args: TeleopDualArmArgs,
         backend: FakeTeleopBackend,
@@ -1334,6 +1812,14 @@ mod tests {
         }
     }
 
+    fn experimental_args() -> TeleopDualArmArgs {
+        TeleopDualArmArgs {
+            experimental_calibrated_raw: true,
+            mode: Some(TeleopMode::MasterFollower),
+            ..valid_args()
+        }
+    }
+
     fn args_with_calibration(path: &Path) -> TeleopDualArmArgs {
         TeleopDualArmArgs {
             calibration_file: Some(path.to_path_buf()),
@@ -1364,6 +1850,52 @@ mod tests {
                 panic!("missing call {call:?} in {actual:?}");
             };
             search_from += offset + 1;
+        }
+    }
+
+    fn raw_clock_report_success() -> RawClockRuntimeReport {
+        RawClockRuntimeReport {
+            master: raw_clock_health_for_tests(1.0, 12),
+            slave: raw_clock_health_for_tests(1.5, 14),
+            max_inter_arm_skew_us: 100,
+            inter_arm_skew_p95_us: 80,
+            clock_health_failures: 0,
+            read_faults: 0,
+            submission_faults: 0,
+            runtime_faults: 0,
+            iterations: 1,
+            exit_reason: Some(RawClockRuntimeExitReason::MaxIterations),
+            master_stop_attempt: StopAttemptResult::NotAttempted,
+            slave_stop_attempt: StopAttemptResult::NotAttempted,
+            last_error: None,
+        }
+    }
+
+    fn raw_clock_report_timing_failure(message: &str) -> RawClockRuntimeReport {
+        RawClockRuntimeReport {
+            clock_health_failures: 1,
+            exit_reason: Some(RawClockRuntimeExitReason::RawClockFault),
+            master_stop_attempt: StopAttemptResult::ConfirmedSent,
+            slave_stop_attempt: StopAttemptResult::ConfirmedSent,
+            last_error: Some(message.to_string()),
+            ..raw_clock_report_success()
+        }
+    }
+
+    fn raw_clock_health_for_tests(drift_ppm: f64, residual_p95_us: u64) -> RawClockHealth {
+        RawClockHealth {
+            healthy: true,
+            sample_count: 8,
+            window_duration_us: 10_000,
+            drift_ppm,
+            residual_p50_us: residual_p95_us / 2,
+            residual_p95_us,
+            residual_p99_us: residual_p95_us,
+            residual_max_us: residual_p95_us,
+            sample_gap_max_us: 1_000,
+            last_sample_age_us: 100,
+            raw_timestamp_regressions: 0,
+            reason: None,
         }
     }
 

@@ -69,6 +69,22 @@ impl ConcreteTeleopTarget {
         }
     }
 
+    pub fn ensure_experimental_raw_clock_supported(&self, platform: TeleopPlatform) -> Result<()> {
+        match self {
+            Self::SocketCan { .. } => match platform {
+                TeleopPlatform::Linux => Ok(()),
+                TeleopPlatform::Other => {
+                    bail!("experimental calibrated raw clock requires Linux SocketCAN targets")
+                },
+            },
+            Self::GsUsbSerial { .. } | Self::GsUsbBusAddress { .. } => {
+                bail!(
+                    "GS-USB targets are not supported by experimental calibrated raw clock; use explicit SocketCAN targets"
+                )
+            },
+        }
+    }
+
     pub fn to_connection_target(&self) -> ConnectionTarget {
         match self {
             Self::SocketCan { iface } => ConnectionTarget::SocketCan {
@@ -127,6 +143,12 @@ impl RoleTargets {
         self.slave.ensure_v1_runtime_supported(platform)?;
         Ok(())
     }
+
+    pub fn ensure_experimental_raw_clock_supported(&self, platform: TeleopPlatform) -> Result<()> {
+        self.master.ensure_experimental_raw_clock_supported(platform)?;
+        self.slave.ensure_experimental_raw_clock_supported(platform)?;
+        Ok(())
+    }
 }
 
 pub fn resolve_role_targets(
@@ -138,6 +160,12 @@ pub fn resolve_role_targets(
     ensure_one_cli_selector(Role::Slave, args)?;
 
     let missing_roles = missing_roles(args, file);
+    if args.experimental_calibrated_raw && !missing_roles.is_empty() {
+        bail!(
+            "experimental calibrated raw clock requires explicit SocketCAN targets for master and slave; defaults are not allowed; missing {}",
+            missing_roles.join(" and ")
+        );
+    }
     if platform == TeleopPlatform::Other && !missing_roles.is_empty() {
         bail!(
             "dual-arm teleop targets are required on non-Linux; missing {}",
@@ -151,7 +179,11 @@ pub fn resolve_role_targets(
     };
 
     targets.validate_no_duplicates()?;
-    targets.ensure_v1_runtime_supported(platform)?;
+    if args.experimental_calibrated_raw {
+        targets.ensure_experimental_raw_clock_supported(platform)?;
+    } else {
+        targets.ensure_v1_runtime_supported(platform)?;
+    }
     Ok(targets)
 }
 
@@ -449,6 +481,38 @@ mod tests {
                 iface: "can1".to_string()
             }
         );
+    }
+
+    #[test]
+    fn experimental_raw_clock_requires_socketcan_targets() {
+        let args = TeleopDualArmArgs {
+            experimental_calibrated_raw: true,
+            master_serial: Some("MASTER".to_string()),
+            slave_serial: Some("SLAVE".to_string()),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = resolve_role_targets(&args, None, TeleopPlatform::Linux)
+            .expect_err("experimental raw-clock teleop must reject GS-USB targets");
+
+        assert!(err.to_string().contains("GS-USB"));
+    }
+
+    #[test]
+    fn experimental_raw_clock_rejects_default_or_omitted_targets() {
+        let args = TeleopDualArmArgs {
+            experimental_calibrated_raw: true,
+            master_interface: None,
+            slave_interface: None,
+            master_serial: None,
+            slave_serial: None,
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = resolve_role_targets(&args, None, TeleopPlatform::Linux)
+            .expect_err("experimental raw-clock teleop must reject implicit defaults");
+
+        assert!(err.to_string().contains("explicit SocketCAN"));
     }
 
     #[test]
