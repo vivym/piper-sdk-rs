@@ -32,6 +32,8 @@ pub struct TeleopJsonReport {
     pub mode: ReportMode,
     pub control: ReportControl,
     pub calibration: ReportCalibration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<ReportTiming>,
     pub exit: ReportExit,
     pub metrics: ReportMetrics,
 }
@@ -65,6 +67,20 @@ pub struct ReportCalibration {
     pub path: Option<String>,
     pub created_at_unix_ms: Option<u64>,
     pub max_error_rad: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReportTiming {
+    pub timing_source: String,
+    pub experimental: bool,
+    pub strict_realtime: bool,
+    pub master_clock_drift_ppm: Option<f64>,
+    pub slave_clock_drift_ppm: Option<f64>,
+    pub master_residual_p95_us: Option<u64>,
+    pub slave_residual_p95_us: Option<u64>,
+    pub max_estimated_inter_arm_skew_us: Option<u64>,
+    pub estimated_inter_arm_skew_p95_us: Option<u64>,
+    pub clock_health_failures: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -108,6 +124,7 @@ pub struct TeleopReportInput<'a> {
     pub control: TeleopControlSettings,
     pub safety: TeleopSafetySettings,
     pub calibration: ReportCalibration,
+    pub timing: Option<ReportTiming>,
     pub faulted: bool,
     pub report: &'a BilateralRunReport,
 }
@@ -152,6 +169,7 @@ impl TeleopJsonReport {
                 gripper_mirror: input.safety.gripper_mirror,
             },
             calibration: input.calibration,
+            timing: input.timing,
             exit: ReportExit {
                 clean,
                 reason: report.exit_reason.map(format_exit_reason).map(str::to_string),
@@ -238,6 +256,17 @@ pub fn write_human_report<W: Write>(
         report.metrics.max_real_dt_us,
         report.metrics.max_cycle_lag_us
     )?;
+    if let Some(timing) = &report.timing {
+        writeln!(writer, "timing_source={}", timing.timing_source)?;
+        writeln!(writer, "experimental={}", timing.experimental)?;
+        writeln!(writer, "strict_realtime={}", timing.strict_realtime)?;
+        writeln!(
+            writer,
+            "raw_clock max_skew_us={} p95_skew_us={}",
+            timing.max_estimated_inter_arm_skew_us.unwrap_or(0),
+            timing.estimated_inter_arm_skew_p95_us.unwrap_or(0)
+        )?;
+    }
     writeln!(
         writer,
         "master: tx_frames={} overwrites={} fault_aborts={} stop_attempt={} master_runtime_fault={}",
@@ -517,6 +546,62 @@ mod tests {
     }
 
     #[test]
+    fn report_serializes_experimental_raw_clock_timing() {
+        let sdk_report = BilateralRunReport::default();
+        let mut input = sample_input(false, &sdk_report);
+        input.timing = Some(ReportTiming {
+            timing_source: "calibrated_hw_raw".to_string(),
+            experimental: true,
+            strict_realtime: false,
+            master_clock_drift_ppm: Some(3.0),
+            slave_clock_drift_ppm: Some(-2.0),
+            master_residual_p95_us: Some(120),
+            slave_residual_p95_us: Some(130),
+            max_estimated_inter_arm_skew_us: Some(900),
+            estimated_inter_arm_skew_p95_us: Some(400),
+            clock_health_failures: 0,
+        });
+
+        let value = serde_json::to_value(TeleopJsonReport::from_run(input)).unwrap();
+        assert_eq!(value["timing"]["timing_source"], "calibrated_hw_raw");
+        assert_eq!(value["timing"]["experimental"], true);
+        assert_eq!(value["timing"]["strict_realtime"], false);
+    }
+
+    #[test]
+    fn normal_report_omits_timing() {
+        let value = serde_json::to_value(sample_json_report()).unwrap();
+
+        assert!(value.get("timing").is_none());
+    }
+
+    #[test]
+    fn human_report_includes_experimental_timing_when_present() {
+        let mut output = Vec::new();
+        let mut report = sample_json_report();
+        report.timing = Some(ReportTiming {
+            timing_source: "calibrated_hw_raw".to_string(),
+            experimental: true,
+            strict_realtime: false,
+            master_clock_drift_ppm: None,
+            slave_clock_drift_ppm: None,
+            master_residual_p95_us: None,
+            slave_residual_p95_us: None,
+            max_estimated_inter_arm_skew_us: Some(900),
+            estimated_inter_arm_skew_p95_us: Some(400),
+            clock_health_failures: 0,
+        });
+
+        write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("timing_source=calibrated_hw_raw"));
+        assert!(output.contains("experimental=true"));
+        assert!(output.contains("strict_realtime=false"));
+        assert!(output.contains("raw_clock max_skew_us=900 p95_skew_us=400"));
+    }
+
+    #[test]
     fn human_report_includes_required_diagnostics() {
         let mut output = Vec::new();
         let report = sample_json_report();
@@ -666,6 +751,7 @@ mod tests {
                 created_at_unix_ms: Some(1_770_000_000_000),
                 max_error_rad: 0.05,
             },
+            timing: None,
             faulted,
             report,
         }

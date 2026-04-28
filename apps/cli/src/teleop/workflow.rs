@@ -278,6 +278,7 @@ pub(crate) fn run_workflow_on_platform<B: TeleopBackend>(
         control: resolved.control.clone(),
         safety: resolved.safety.clone(),
         calibration: report_calibration,
+        timing: None,
         faulted: loop_exit.faulted,
         report: &loop_exit.report,
     });
