@@ -1,0 +1,99 @@
+[stiffness]
+k_min = [80.0, 80.0, 60.0]
+k_max = [500.0, 500.0, 350.0]
+k_base_free = [120.0, 120.0, 100.0]
+k_base_contact = [220.0, 220.0, 180.0]
+lpf_cutoff_hz = 8.0
+max_delta_per_second = [250.0, 250.0, 180.0]
+
+[contact]
+residual_enter = 2.5
+residual_exit = 1.2
+min_hold_ms = 80
+
+[frames]
+master_to_slave_rotation = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+[calibration]
+mirror_map_kind = "left-right"
+calibration_max_error_rad = 0.05
+
+[calibration.mirror_map]
+permutation = [0, 1, 2, 3, 4, 5]
+position_sign = [-1.0, 1.0, 1.0, -1.0, 1.0, -1.0]
+velocity_sign = [-1.0, 1.0, 1.0, -1.0, 1.0, -1.0]
+torque_sign = [-1.0, 1.0, 1.0, -1.0, 1.0, -1.0]
+
+[mujoco]
+master_ee_site = "master_tool_center"
+slave_ee_site = "slave_tool_center"
+
+[cue]
+dls_lambda = 0.01
+max_jacobian_condition = 250.0
+master_lpf_cutoff_hz = 20.0
+slave_lpf_cutoff_hz = 20.0
+w_u = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+w_r = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+[cue.master_phi]
+mode = ["signed", "signed", "signed"]
+deadband = [0.15, 0.15, 0.10]
+scale = [0.8, 0.8, 1.0]
+limit = [8.0, 8.0, 10.0]
+
+[cue.slave_phi]
+mode = ["signed", "signed", "signed"]
+deadband = [0.15, 0.15, 0.10]
+scale = [0.8, 0.8, 1.0]
+limit = [8.0, 8.0, 10.0]
+
+[dynamics]
+master_mode = "gravity"
+slave_mode = "partial"
+qacc_lpf_cutoff_hz = 20.0
+max_abs_qacc = 50.0
+
+[dynamics.master_payload]
+mass_kg = 0.0
+com_m = [0.0, 0.0, 0.0]
+
+[dynamics.slave_payload]
+mass_kg = 0.0
+com_m = [0.0, 0.0, 0.0]
+
+[control]
+loop_frequency_hz = 200.0
+dt_clamp_multiplier = 2.0
+warmup_cycles = 3
+track_kp_min = [2.0, 2.0, 2.0, 1.0, 1.0, 1.0]
+track_kp_max = [8.0, 8.0, 8.0, 3.0, 3.0, 3.0]
+track_kd = [1.0, 1.0, 1.0, 0.4, 0.4, 0.4]
+master_kp = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+master_kd = [0.3, 0.3, 0.3, 0.15, 0.15, 0.15]
+reflection_gain_min = [0.05, 0.05, 0.05]
+reflection_gain_max = [0.25, 0.25, 0.30]
+joint_stiffness_projection = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.3, 0.3, 0.0], [0.0, 0.3, 0.3], [0.3, 0.0, 0.3]]
+reflection_projection = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+reflection_residual_deadband = 2.5
+reflection_residual_attenuation = 0.15
+reflection_residual_min_scale = 0.2
+master_interaction_lpf_cutoff_hz = 20.0
+master_interaction_limit_nm = [1.2, 1.2, 1.2, 0.8, 0.8, 0.8]
+master_interaction_slew_limit_nm_per_s = [40.0, 40.0, 40.0, 25.0, 25.0, 25.0]
+master_passivity_enabled = true
+master_passivity_max_damping = [1.0, 1.0, 1.0, 0.5, 0.5, 0.5]
+slave_feedforward_limit_nm = [3.5, 3.5, 3.5, 2.0, 2.0, 2.0]
+
+[gripper]
+mirror_enabled = true
+update_divider = 4
+position_deadband = 0.02
+effort_scale = 1.0
+max_feedback_age_ms = 100
+
+[writer]
+queue_capacity = 8192
+queue_full_stop_events = 10
+queue_full_stop_duration_ms = 100
+flush_timeout_ms = 5000
