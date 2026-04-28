@@ -38,6 +38,16 @@ baseline before confirmation if no calibration file is supplied.
 - `gain reflection-gain <value>`
 - `quit`
 
+## Runtime Control Defaults
+
+The CLI resolves dual-arm teleop to the SDK's unconfirmed submission mode by
+default. This preserves the low-jitter behavior used by earlier teleop builds.
+
+The SDK runtime now stores the master interaction torque slew limit in Nm/s. The
+CLI keeps the previous profile behavior by migrating the former per-tick value
+to Nm/s at the resolved loop rate; the default remains equivalent to
+`0.25 Nm/tick` at the selected control frequency.
+
 ## Report Interpretation
 
 The human report and JSON report use master/slave naming even though the SDK

@@ -355,6 +355,7 @@ fn format_exit_reason(reason: BilateralExitReason) -> &'static str {
         BilateralExitReason::ControllerFault => "controller_fault",
         BilateralExitReason::CompensationFault => "compensation_fault",
         BilateralExitReason::SubmissionFault => "submission_fault",
+        BilateralExitReason::TelemetrySinkFault => "telemetry_sink_fault",
         BilateralExitReason::RuntimeTransportFault => "runtime_transport_fault",
         BilateralExitReason::RuntimeManualFault => "runtime_manual_fault",
     }

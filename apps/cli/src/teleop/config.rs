@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use piper_client::dual_arm::{BilateralLoopConfig, LoopTimingMode};
+use piper_client::dual_arm::{BilateralLoopConfig, BilateralSubmissionMode, LoopTimingMode};
+use piper_client::types::{JointArray, NewtonMeter};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -221,6 +222,9 @@ impl ResolvedTeleopConfig {
             cancel_signal: Some(cancel_signal),
             ..BilateralLoopConfig::default()
         };
+        config.submission_mode = BilateralSubmissionMode::Unconfirmed;
+        config.master_interaction_slew_limit_nm_per_s =
+            JointArray::splat(NewtonMeter(0.25 * self.control.frequency_hz));
         if let Some(timing_mode) = self.timing_mode {
             config.timing_mode = match timing_mode {
                 TeleopTimingMode::Sleep => LoopTimingMode::Sleep,
@@ -392,6 +396,14 @@ mod tests {
         assert_eq!(loop_config.frequency_hz, 150.0);
         assert_eq!(loop_config.max_iterations, Some(3));
         assert_eq!(loop_config.timing_mode, LoopTimingMode::Sleep);
+        assert_eq!(
+            loop_config.submission_mode,
+            BilateralSubmissionMode::Unconfirmed
+        );
+        assert_eq!(
+            loop_config.master_interaction_slew_limit_nm_per_s,
+            JointArray::splat(NewtonMeter(37.5))
+        );
         assert!(!loop_config.gripper.enabled);
         assert!(!cancel_signal.load(Ordering::Relaxed));
         assert!(loop_config.cancel_signal.is_some());
