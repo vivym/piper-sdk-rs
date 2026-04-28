@@ -33,7 +33,11 @@ pub mod can {
     pub use piper_can::MockCanAdapter;
     #[cfg(all(
         target_os = "linux",
-        any(feature = "socketcan", feature = "auto-backend")
+        any(
+            feature = "socketcan",
+            feature = "auto-backend",
+            feature = "target-socketcan"
+        )
     ))]
     pub use piper_can::SocketCanAdapter;
     #[cfg(any(feature = "gs_usb", feature = "auto-backend"))]
