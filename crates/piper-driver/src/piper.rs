@@ -1550,6 +1550,8 @@ pub type MaintenanceLeaseGate = MaintenanceGate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MitBatchTxFinished {
+    /// `heartbeat::monotonic_micros()` timestamp sampled by the TX thread after
+    /// the final frame in the confirmed realtime package is sent successfully.
     pub host_finished_mono_us: u64,
 }
 
