@@ -9,13 +9,14 @@ use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub const RECORDING_VERSION: u8 = 3;
 pub const MAX_RECORDING_BODY_BYTES: u64 = 1_073_741_824;
 pub const MAX_RECORDING_FRAMES: usize = 20_000_000;
 pub const MAX_METADATA_STRING_BYTES: usize = 16_384;
+const RECORDING_FILE_HEADER_BYTES: u64 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordingLimits {
@@ -198,6 +199,126 @@ pub fn save_path(recording: &PiperRecording, path: &Path) -> Result<()> {
     writer.flush().context("flush recording file")?;
 
     Ok(())
+}
+
+/// Incrementally writes a strict v3 recording without buffering all frames in memory.
+///
+/// The writer emits the file header and metadata immediately, reserves the v3
+/// frame-count field, streams encoded frames as they arrive, and patches the
+/// final frame count in [`StreamingRecordingWriter::finish`].
+pub struct StreamingRecordingWriter<W> {
+    writer: W,
+    frame_count_offset: u64,
+    frame_count: u64,
+    limits: RecordingLimits,
+}
+
+impl<W: Write + Seek> StreamingRecordingWriter<W> {
+    pub fn new(writer: W, metadata: &RecordingMetadata) -> Result<Self> {
+        Self::new_with_limits(writer, metadata, RecordingLimits::default())
+    }
+
+    pub fn new_with_limits(
+        mut writer: W,
+        metadata: &RecordingMetadata,
+        limits: RecordingLimits,
+    ) -> Result<Self> {
+        validate_metadata_string("interface", &metadata.interface, limits)?;
+        validate_metadata_string("platform", &metadata.platform, limits)?;
+        validate_metadata_string("operator", &metadata.operator, limits)?;
+        validate_metadata_string("notes", &metadata.notes, limits)?;
+
+        writer.write_all(MAGIC).context("write recording magic")?;
+        writer.write_all(&[RECORDING_VERSION]).context("write recording version")?;
+        v3_options()
+            .serialize_into(&mut writer, &RECORDING_VERSION)
+            .context("write recording body version")?;
+        v3_options()
+            .serialize_into(
+                &mut writer,
+                &BincodeRecordingMetadata {
+                    start_time: metadata.start_time,
+                    interface: &metadata.interface,
+                    bus_speed: metadata.bus_speed,
+                    platform: &metadata.platform,
+                    operator: &metadata.operator,
+                    notes: &metadata.notes,
+                },
+            )
+            .context("write recording metadata")?;
+
+        let frame_count_offset = writer.stream_position().context("locate frame count field")?;
+        v3_options()
+            .serialize_into(&mut writer, &0_u64)
+            .context("write placeholder frame count")?;
+
+        let body_len = writer
+            .stream_position()
+            .context("measure recording body")?
+            .saturating_sub(RECORDING_FILE_HEADER_BYTES);
+        if body_len > limits.max_body_bytes {
+            bail!(
+                "recording body is {} bytes, limit is {}",
+                body_len,
+                limits.max_body_bytes
+            );
+        }
+
+        Ok(Self {
+            writer,
+            frame_count_offset,
+            frame_count: 0,
+            limits,
+        })
+    }
+
+    pub fn push_frame(&mut self, frame: &TimestampedFrame) -> Result<()> {
+        if self.frame_count as usize >= self.limits.max_frames {
+            bail!(
+                "recording contains more than {} frames",
+                self.limits.max_frames
+            );
+        }
+
+        v3_options()
+            .serialize_into(&mut self.writer, &BincodeRecordedFrameV3::from(frame))
+            .context("write recording frame")?;
+        self.frame_count += 1;
+
+        let body_len = self
+            .writer
+            .stream_position()
+            .context("measure recording body")?
+            .saturating_sub(RECORDING_FILE_HEADER_BYTES);
+        if body_len > self.limits.max_body_bytes {
+            bail!(
+                "recording body is {} bytes, limit is {}",
+                body_len,
+                self.limits.max_body_bytes
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    pub fn finish(mut self) -> Result<W> {
+        let end_offset = self.writer.stream_position().context("locate recording end")?;
+        self.writer
+            .seek(SeekFrom::Start(self.frame_count_offset))
+            .context("seek to frame count field")?;
+        v3_options()
+            .serialize_into(&mut self.writer, &self.frame_count)
+            .context("write final frame count")?;
+        self.writer
+            .seek(SeekFrom::Start(end_offset))
+            .context("seek back to recording end")?;
+        self.writer.flush().context("flush recording stream")?;
+        Ok(self.writer)
+    }
 }
 
 pub fn load_path(path: &Path) -> Result<PiperRecording> {
@@ -558,6 +679,7 @@ where
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::io::Cursor;
 
     fn metadata() -> RecordingMetadata {
         RecordingMetadata {
@@ -692,6 +814,24 @@ mod tests {
 
         let loaded = load_path(temp_file.path()).unwrap();
         assert_eq!(loaded.frames, recording_with_locked_frames().frames);
+    }
+
+    #[test]
+    fn streaming_writer_matches_locked_v3_file_bytes() {
+        let recording = recording_with_locked_frames();
+        let mut writer =
+            StreamingRecordingWriter::new(Cursor::new(Vec::new()), &recording.metadata).unwrap();
+        for frame in &recording.frames {
+            writer.push_frame(frame).unwrap();
+        }
+        assert_eq!(writer.frame_count(), 2);
+
+        let bytes = writer.finish().unwrap().into_inner();
+
+        assert_eq!(bytes, expected_locked_file_bytes());
+        let body = &bytes[RECORDING_FILE_HEADER_BYTES as usize..];
+        let decoded = deserialize_body(body).unwrap();
+        assert_eq!(decoded.frames, recording.frames);
     }
 
     #[test]

@@ -5,9 +5,9 @@
 use crate::ProtocolDiagnostic;
 use crate::WaitError;
 use crate::command::{
-    CommandPriority, DeliveryPhase, MaintenanceCommandMeta, PiperCommand, RealtimeCommand,
-    ReliableCommand, ReliableCommandKind, SoftRealtimeCommand, SoftRealtimeMailbox,
-    SoftRealtimeTryReserveError, SoftRealtimeTrySendError,
+    CommandPriority, DeliveryPhase, DeliveryReceipt, MaintenanceCommandMeta, PiperCommand,
+    RealtimeCommand, ReliableCommand, ReliableCommandKind, SoftRealtimeCommand,
+    SoftRealtimeMailbox, SoftRealtimeTryReserveError, SoftRealtimeTrySendError,
 };
 use crate::diagnostics::{DiagnosticEvent, QueryDiagnostic};
 use crate::error::DriverError;
@@ -234,19 +234,54 @@ where
     }
 }
 
+fn recv_until_deadline_strict<T, F>(
+    rx: &Receiver<T>,
+    deadline: Instant,
+    timeout_error: F,
+) -> Result<T, DriverError>
+where
+    F: Fn() -> DriverError,
+{
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(timeout_error());
+    };
+
+    match rx.recv_timeout(remaining) {
+        Ok(value) => Ok(value),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(timeout_error()),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(DriverError::ChannelClosed),
+    }
+}
+
 fn wait_for_maintenance_send_result(
     ack_rx: Receiver<MaintenanceSendPhase>,
     deadline: Instant,
 ) -> Result<(), DriverError> {
     match recv_until_deadline(&ack_rx, deadline, || DriverError::Timeout)? {
-        DeliveryPhase::Finished(result) => result,
+        DeliveryPhase::Finished(result) => result.map(|_| ()),
         DeliveryPhase::Committed { .. } => loop {
             match ack_rx.recv() {
-                Ok(DeliveryPhase::Finished(result)) => return result,
+                Ok(DeliveryPhase::Finished(result)) => return result.map(|_| ()),
                 Ok(DeliveryPhase::Committed { .. }) => continue,
                 Err(_) => return Err(DriverError::ChannelClosed),
             }
         },
+    }
+}
+
+fn wait_for_delivery_result_with_receipt<F>(
+    ack_rx: Receiver<DeliveryPhase>,
+    deadline: Instant,
+    timeout_error: F,
+) -> Result<DeliveryReceipt, DriverError>
+where
+    F: Fn() -> DriverError,
+{
+    loop {
+        match recv_until_deadline_strict(&ack_rx, deadline, &timeout_error)? {
+            DeliveryPhase::Finished(result) => return result,
+            DeliveryPhase::Committed { .. } => continue,
+        }
     }
 }
 
@@ -287,6 +322,21 @@ where
     F: Fn() -> DriverError,
 {
     wait_for_delivery_result_with_commit(ack_rx, deadline, timeout_error).map(|_| ())
+}
+
+pub fn wait_for_delivery_finished<F>(
+    ack_rx: Receiver<DeliveryPhase>,
+    deadline: Instant,
+    timeout_error: F,
+) -> Result<MitBatchTxFinished, DriverError>
+where
+    F: Fn() -> DriverError,
+{
+    let receipt = wait_for_delivery_result_with_receipt(ack_rx, deadline, &timeout_error)?;
+    let host_finished_mono_us = receipt.host_finished_mono_us.ok_or_else(timeout_error)?;
+    Ok(MitBatchTxFinished {
+        host_finished_mono_us,
+    })
 }
 
 #[doc(hidden)]
@@ -1497,6 +1547,13 @@ pub type MaintenanceStateSignal = MaintenanceGate;
 
 #[doc(hidden)]
 pub type MaintenanceLeaseGate = MaintenanceGate;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MitBatchTxFinished {
+    /// `heartbeat::monotonic_micros()` timestamp sampled by the TX thread after
+    /// the final frame in the confirmed realtime package is sent successfully.
+    pub host_finished_mono_us: u64,
+}
 
 /// 停机命令的有界确认句柄。
 ///
@@ -4175,6 +4232,57 @@ impl Piper {
         wait_for_delivery_result(ack_rx, deadline, || DriverError::RealtimeDeliveryTimeout)
     }
 
+    /// 发送实时帧包并返回 TX 线程完成整包发送后的主机单调时间戳。
+    ///
+    /// 与 `send_realtime_package_confirmed` 不同，本方法的等待窗口覆盖最终
+    /// `Finished` 回执；如果 TX 线程只在 deadline 前提交但未在 deadline 前完成整包发送，
+    /// 调用方会收到 `RealtimeDeliveryTimeout`。
+    pub fn send_realtime_package_confirmed_finished(
+        &self,
+        frames: impl IntoIterator<Item = PiperFrame>,
+        timeout: Duration,
+    ) -> Result<MitBatchTxFinished, DriverError> {
+        use crate::command::FrameBuffer;
+
+        if !self.backend_capability.is_strict_realtime() {
+            return Err(DriverError::InvalidInput(
+                "strict realtime package delivery is only available on StrictRealtime backends"
+                    .to_string(),
+            ));
+        }
+        if !self.tx_thread_alive() {
+            return Err(DriverError::ChannelClosed);
+        }
+        if self.replay_mode_active() || self.replay_barrier_active() {
+            return Err(DriverError::ReplayModeActive);
+        }
+        if !self.normal_control_open() {
+            return Err(DriverError::ControlPathClosed);
+        }
+
+        let buffer: FrameBuffer = frames.into_iter().collect();
+
+        if buffer.is_empty() {
+            return Err(DriverError::InvalidInput(
+                "Frame package cannot be empty".to_string(),
+            ));
+        }
+
+        if buffer.len() > Self::MAX_REALTIME_PACKAGE_SIZE {
+            return Err(DriverError::InvalidInput(format!(
+                "Frame package too large: {} (max: {})",
+                buffer.len(),
+                Self::MAX_REALTIME_PACKAGE_SIZE
+            )));
+        }
+
+        let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(2);
+        self.send_realtime_command(RealtimeCommand::confirmed(buffer, deadline, ack_tx))?;
+
+        wait_for_delivery_finished(ack_rx, deadline, || DriverError::RealtimeDeliveryTimeout)
+    }
+
     /// 发送 SoftRealtime 原始批命令并等待实际发送结果。
     pub fn send_soft_realtime_package_confirmed(
         &self,
@@ -5466,6 +5574,41 @@ mod tests {
                 return Err(CanError::Timeout);
             }
             self.sent_frames.lock().expect("sent frames lock").push(frame);
+            Ok(())
+        }
+    }
+
+    struct TimingRecordingTxAdapter {
+        sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
+        send_return_times: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl piper_can::RealtimeTxAdapter for TimingRecordingTxAdapter {
+        fn send_control(&mut self, frame: PiperFrame, budget: Duration) -> Result<(), CanError> {
+            if budget.is_zero() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            self.send_return_times
+                .lock()
+                .expect("send return times lock")
+                .push(crate::heartbeat::monotonic_micros().max(1));
+            Ok(())
+        }
+
+        fn send_shutdown_until(
+            &mut self,
+            frame: PiperFrame,
+            deadline: Instant,
+        ) -> Result<(), CanError> {
+            if deadline <= Instant::now() {
+                return Err(CanError::Timeout);
+            }
+            self.sent_frames.lock().expect("sent frames lock").push(frame);
+            self.send_return_times
+                .lock()
+                .expect("send return times lock")
+                .push(crate::heartbeat::monotonic_micros().max(1));
             Ok(())
         }
     }
@@ -7528,6 +7671,44 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_for_delivery_finished_rejects_finished_after_deadline() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let deadline = Instant::now() + Duration::from_millis(1);
+        tx.send(DeliveryPhase::Committed {
+            host_commit_mono_us: 1,
+        })
+        .expect("committed phase should enqueue before deadline");
+
+        while Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+
+        tx.send(DeliveryPhase::Finished(Ok(DeliveryReceipt::finished_at(2))))
+            .expect("finished phase should enqueue after deadline");
+
+        let error =
+            wait_for_delivery_finished(rx, deadline, || DriverError::RealtimeDeliveryTimeout)
+                .expect_err("late finished phase must not satisfy the absolute deadline");
+
+        assert!(matches!(error, DriverError::RealtimeDeliveryTimeout));
+    }
+
+    #[test]
+    fn test_wait_for_delivery_finished_uses_caller_timeout_error_for_missing_timestamp() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(DeliveryPhase::Finished(Ok(DeliveryReceipt::none())))
+            .expect("finished phase should enqueue");
+
+        let error =
+            wait_for_delivery_finished(rx, Instant::now() + Duration::from_millis(50), || {
+                DriverError::RealtimeDeliveryTimeout
+            })
+            .expect_err("missing finished timestamp should use the caller timeout error");
+
+        assert!(matches!(error, DriverError::RealtimeDeliveryTimeout));
+    }
+
+    #[test]
     fn test_soft_realtime_rejects_strict_mailbox_apis() {
         let piper = Piper::new_dual_thread_parts(SoftRxAdapter, MockTxAdapter, None).unwrap();
 
@@ -8894,6 +9075,69 @@ mod tests {
 
         let sent = sent_frames.lock().expect("sent frames lock");
         assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn realtime_confirmed_package_returns_finished_timestamp_after_success() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let send_return_times = Arc::new(Mutex::new(Vec::new()));
+        let driver = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            TimingRecordingTxAdapter {
+                sent_frames: sent_frames.clone(),
+                send_return_times: send_return_times.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x15a, [0x01]).unwrap(),
+            PiperFrame::new_standard(0x15b, [0x02]).unwrap(),
+            PiperFrame::new_standard(0x15c, [0x03]).unwrap(),
+            PiperFrame::new_standard(0x15d, [0x04]).unwrap(),
+            PiperFrame::new_standard(0x15e, [0x05]).unwrap(),
+            PiperFrame::new_standard(0x15f, [0x06]).unwrap(),
+        ];
+
+        let receipt = driver
+            .send_realtime_package_confirmed_finished(frames, Duration::from_millis(50))
+            .expect("confirmed package should succeed");
+
+        assert!(receipt.host_finished_mono_us > 0);
+        assert_eq!(sent_frames.lock().unwrap().len(), 6);
+        assert!(
+            receipt.host_finished_mono_us >= *send_return_times.lock().unwrap().last().unwrap(),
+            "finished timestamp must be sampled after the last successful frame send"
+        );
+    }
+
+    #[test]
+    fn realtime_confirmed_package_timeout_returns_no_finished_timestamp() {
+        let driver = Piper::new_dual_thread_parts_unvalidated(
+            MockRxAdapter,
+            FailOnNthTxAdapter {
+                fail_on: 3,
+                sends: 0,
+            },
+            None,
+        )
+        .unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x15a, [0x01]).unwrap(),
+            PiperFrame::new_standard(0x15b, [0x02]).unwrap(),
+            PiperFrame::new_standard(0x15c, [0x03]).unwrap(),
+            PiperFrame::new_standard(0x15d, [0x04]).unwrap(),
+            PiperFrame::new_standard(0x15e, [0x05]).unwrap(),
+            PiperFrame::new_standard(0x15f, [0x06]).unwrap(),
+        ];
+        let err = driver
+            .send_realtime_package_confirmed_finished(frames, Duration::from_millis(200))
+            .expect_err("partial delivery must fail");
+
+        assert!(matches!(
+            err,
+            DriverError::RealtimeDeliveryFailed { .. } | DriverError::RealtimeDeliveryTimeout
+        ));
     }
 
     #[test]

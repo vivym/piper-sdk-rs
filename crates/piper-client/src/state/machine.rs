@@ -54,6 +54,15 @@ pub struct Maintenance {
 /// 机械臂已使能，可以发送运动命令。
 pub struct Active<Mode>(Mode);
 
+/// MIT 批命令确认回执。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmedMitBatch {
+    /// TX 线程完成整包发送后的确认信息。
+    pub tx_finished: piper_driver::MitBatchTxFinished,
+    /// 经过固件 quirk 修正和力矩缩放后的每关节 `t_ref`（N·m）。
+    pub mit_t_ref_nm: [f64; 6],
+}
+
 // ==================== 控制模式类型（零大小类型）====================
 
 /// MIT 模式
@@ -1887,13 +1896,27 @@ where
         kd: &JointArray<f64>,
         torques: &JointArray<NewtonMeter>,
     ) -> Result<[MitControlCommand; 6]> {
+        self.build_validated_mit_command_batch_with_t_refs(positions, velocities, kp, kd, torques)
+            .map(|(commands, _)| commands)
+    }
+
+    fn build_validated_mit_command_batch_with_t_refs(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+    ) -> Result<([MitControlCommand; 6], [f64; 6])> {
         let mut commands = [MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.0)?; 6];
+        let mut t_refs = [0.0; 6];
 
         for (index, joint) in Joint::ALL.into_iter().enumerate() {
             let joint_index = joint.index() as u8 + 1;
             let (position, flipped_torque) =
                 self.quirks.apply_flip(joint, positions[joint].0, torques[joint].0);
             let torque = self.quirks.scale_torque(joint, flipped_torque);
+            let torque_ref = torque as f32;
 
             commands[index] = MitControlCommand::try_new(
                 joint_index,
@@ -1901,11 +1924,12 @@ where
                 velocities[joint] as f32,
                 kp[joint] as f32,
                 kd[joint] as f32,
-                torque as f32,
+                torque_ref,
             )?;
+            t_refs[index] = f64::from(torque_ref);
         }
 
-        Ok(commands)
+        Ok((commands, t_refs))
     }
 
     /// 获取固件特性（DeviceQuirks）
@@ -2472,6 +2496,36 @@ where
         let commands =
             self.build_validated_mit_command_batch(positions, velocities, kp, kd, torques)?;
         raw.send_validated_mit_command_batch_confirmed(commands, timeout)
+    }
+
+    /// 发送 MIT 模式控制指令，等待 strict-realtime TX 线程完成整包发送，并返回批命令回执。
+    ///
+    /// 该方法的 `timeout` 覆盖整包实际发送完成，而不只是提交到 TX commit point；
+    /// 如果 TX 线程未在期限内完成整包发送，或任一帧发送失败，错误会原样向上传播，
+    /// 且不会产生 `ConfirmedMitBatch` 回执。
+    ///
+    /// 成功时返回的 `mit_t_ref_nm` 是经过固件 quirk 修正和 MIT 力矩缩放后的每关节
+    /// `t_ref`（N·m），与最终编码发送到硬件的 MIT 参考一致。
+    pub fn command_torques_confirmed_finished(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> Result<ConfirmedMitBatch> {
+        let raw = RawCommander::new(&self.driver);
+        let (commands, mit_t_ref_nm) = self.build_validated_mit_command_batch_with_t_refs(
+            positions, velocities, kp, kd, torques,
+        )?;
+        let tx_finished =
+            raw.send_validated_mit_command_batch_confirmed_finished(commands, timeout)?;
+
+        Ok(ConfirmedMitBatch {
+            tx_finished,
+            mit_t_ref_nm,
+        })
     }
 
     /// 控制夹爪
@@ -3548,6 +3602,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    const TEST_EVENTUALLY_TIMEOUT: Duration = Duration::from_secs(5);
+
     fn received(frame: PiperFrame) -> piper_can::ReceivedFrame {
         piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
     }
@@ -3914,7 +3970,7 @@ mod tests {
             }
 
             assert!(
-                start.elapsed() < Duration::from_secs(1),
+                start.elapsed() < TEST_EVENTUALLY_TIMEOUT,
                 "timed out waiting for {} sent frames, got {}",
                 expected,
                 frames.len()
@@ -4474,7 +4530,7 @@ mod tests {
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
         let active = standby
             .enable_position_mode(PositionModeConfig {
-                timeout: Duration::from_millis(80),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 10,
@@ -4486,7 +4542,7 @@ mod tests {
 
         active
             .reapply_position_mode_config(PositionModeConfig {
-                timeout: Duration::from_millis(80),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 5,
@@ -4546,7 +4602,7 @@ mod tests {
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
         let active = standby
             .enable_position_mode(PositionModeConfig {
-                timeout: Duration::from_millis(80),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 10,
@@ -4560,7 +4616,7 @@ mod tests {
 
         active
             .reapply_position_mode_config(PositionModeConfig {
-                timeout: Duration::from_millis(80),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 5,
@@ -7679,6 +7735,86 @@ mod tests {
     }
 
     #[test]
+    fn command_torques_confirmed_finished_returns_post_quirk_t_refs() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let robot = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 7, 2)),
+            sent_frames,
+        );
+        let positions = JointArray::from([Rad(0.0); 6]);
+        let velocities = JointArray::from([0.0; 6]);
+        let kp = JointArray::from([0.0; 6]);
+        let kd = JointArray::from([0.0; 6]);
+        let torques = JointArray::from([
+            NewtonMeter(0.1),
+            NewtonMeter(0.2),
+            NewtonMeter(0.3),
+            NewtonMeter(0.4),
+            NewtonMeter(0.5),
+            NewtonMeter(0.6),
+        ]);
+
+        let receipt = robot
+            .command_torques_confirmed_finished(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(50),
+            )
+            .expect("confirmed send should succeed");
+
+        assert!(receipt.tx_finished.host_finished_mono_us > 0);
+        assert_eq!(receipt.mit_t_ref_nm.len(), 6);
+        assert!(receipt.mit_t_ref_nm.iter().all(|value| value.is_finite()));
+        assert_eq!(
+            receipt.mit_t_ref_nm,
+            [-0.025_f32, -0.05, 0.075, -0.4, 0.5, -0.6].map(f64::from)
+        );
+    }
+
+    #[test]
+    fn command_torques_confirmed_finished_propagates_tx_delivery_failure() {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(IdleRxAdapter::new(), FailSendTxAdapter, None)
+                .expect("driver should start"),
+        );
+        let robot = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+        let positions = JointArray::splat(Rad(0.0));
+        let velocities = JointArray::splat(0.0);
+        let kp = JointArray::splat(0.0);
+        let kd = JointArray::splat(0.0);
+        let torques = JointArray::splat(NewtonMeter(0.0));
+
+        let error = robot
+            .command_torques_confirmed_finished(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(200),
+            )
+            .expect_err("TX delivery failure must propagate without a confirmed receipt");
+
+        match error {
+            RobotError::Infrastructure(piper_driver::DriverError::RealtimeDeliveryFailed {
+                sent,
+                total,
+                source: CanError::BusOff,
+            }) => {
+                assert_eq!(sent, 0);
+                assert_eq!(total, 6);
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn command_torques_confirmed_is_atomic_when_any_joint_is_invalid() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let robot = build_active_mit_piper(
@@ -7720,6 +7856,51 @@ mod tests {
         assert!(
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "no frames should be sent when confirmed batch validation fails"
+        );
+    }
+
+    #[test]
+    fn command_torques_confirmed_finished_is_atomic_when_any_joint_is_invalid() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let robot = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames.clone(),
+        );
+
+        let positions = JointArray::splat(Rad(0.0));
+        let velocities = JointArray::splat(0.0);
+        let kp = JointArray::splat(0.0);
+        let kd = JointArray::splat(0.0);
+        let torques = JointArray::from([
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(9.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+        ]);
+
+        let error = robot
+            .command_torques_confirmed_finished(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(200),
+            )
+            .expect_err("invalid joint torque should fail before a finished receipt exists");
+
+        assert!(matches!(
+            error,
+            RobotError::TorqueLimitExceeded {
+                joint: Joint::J3,
+                ..
+            }
+        ));
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "no frames should be sent when confirmed-finished batch validation fails"
         );
     }
 

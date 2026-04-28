@@ -74,6 +74,18 @@ impl<'a> RawCommander<'a> {
         Ok(())
     }
 
+    /// 发送已规范化、已校验的 MIT 批命令，并等待 TX 线程完成整包发送。
+    pub(crate) fn send_validated_mit_command_batch_confirmed_finished(
+        &self,
+        commands: [MitControlCommand; 6],
+        timeout: Duration,
+    ) -> Result<piper_driver::MitBatchTxFinished> {
+        let frames_array = commands.map(MitControlCommand::to_frame);
+        self.driver
+            .send_realtime_package_confirmed_finished(frames_array, timeout)
+            .map_err(Into::into)
+    }
+
     /// 批量发送位置控制指令（一次性发送所有 6 个关节）
     ///
     /// **关键修复**：此方法一次性发送所有 6 个关节，避免关节覆盖问题。

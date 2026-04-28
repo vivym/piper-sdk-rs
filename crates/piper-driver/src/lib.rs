@@ -45,8 +45,8 @@ pub use pipeline::{PipelineConfig, rx_loop};
 pub use piper::{
     HealthStatus, MaintenanceGate, MaintenanceGateState, MaintenanceLeaseAcquireResult,
     MaintenanceLeaseGate, MaintenanceLeaseSnapshot, MaintenanceRevocationEvent,
-    MaintenanceRevocationReason, MaintenanceStateSignal, ManualFaultRecoveryResult, NormalSendGate,
-    Piper, RuntimeFaultKind, ShutdownLane, ShutdownReceipt,
+    MaintenanceRevocationReason, MaintenanceStateSignal, ManualFaultRecoveryResult,
+    MitBatchTxFinished, NormalSendGate, Piper, RuntimeFaultKind, ShutdownLane, ShutdownReceipt,
 };
 pub use piper_can::BackendCapability;
 pub use piper_protocol::ProtocolDiagnostic;

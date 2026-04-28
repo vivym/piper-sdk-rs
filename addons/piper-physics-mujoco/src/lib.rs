@@ -78,6 +78,7 @@
 pub use nalgebra;
 
 mod dual_arm;
+mod end_effector;
 mod error;
 mod runner;
 mod traits;
@@ -87,6 +88,10 @@ mod types;
 pub use dual_arm::{
     DualArmMujocoCompensatorConfig, DynamicsMode, MujocoDualArmCompensator, PayloadSpec,
     SharedModeState, SharedPayloadState,
+};
+pub use end_effector::{
+    EndEffectorKinematics, EndEffectorSelector, MujocoRuntimeIdentity,
+    loaded_mujoco_library_identity, mujoco_runtime_version_string,
 };
 pub use error::{GravityCompensationRunnerError, PhysicsError};
 pub use runner::{
