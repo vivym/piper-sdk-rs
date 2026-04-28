@@ -87,6 +87,46 @@ new version is declared. Consumers must check `schema_version`, `exit.reason`,
 `metrics.master_stop_attempt`, and `metrics.slave_stop_attempt` before treating
 data as a successful run.
 
+## Experimental Calibrated Raw-Clock Mode
+
+This mode is for lab validation with Linux SocketCAN `gs_usb` interfaces that
+expose `hardware-raw-clock` but cannot satisfy the production StrictRealtime
+path. It is not StrictRealtime and must be enabled explicitly.
+
+First run the read-only probe:
+
+```bash
+cargo run -p piper-sdk --example socketcan_raw_clock_probe -- \
+  --left-interface can0 \
+  --right-interface can1 \
+  --duration-secs 300 \
+  --out artifacts/teleop/raw-clock-probe.json
+```
+
+Then run a bounded master-follower trial:
+
+```bash
+piper-cli teleop dual-arm \
+  --master-interface can0 \
+  --slave-interface can1 \
+  --mode master-follower \
+  --disable-gripper-mirror \
+  --experimental-calibrated-raw \
+  --max-iterations 12000 \
+  --report-json artifacts/teleop/raw-clock-report.json
+```
+
+The report must show `timing_source=calibrated_hw_raw`,
+`experimental=true`, and `strict_realtime=false`.
+
+### Manual Acceptance Checklist
+
+1. Probe runs for 5 minutes without raw timestamp regression.
+2. p95 residual and max skew are within configured thresholds.
+3. Bounded `master-follower` exits cleanly.
+4. Report marks run experimental and non-strict.
+5. Disconnecting one feedback path causes bounded shutdown.
+
 ## Manual Acceptance Checklist
 
 1. Confirm both links are independent StrictRealtime SocketCAN links.
