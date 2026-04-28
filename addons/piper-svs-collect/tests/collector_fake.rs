@@ -5,6 +5,13 @@ use piper_svs_collect::collector::{
 use piper_svs_collect::episode::manifest::EpisodeStatus;
 use piper_svs_collect::episode::wire::read_steps_file;
 
+fn assert_faulted_manifest_and_report(path: &std::path::Path) {
+    let manifest = read_manifest_toml(&path.join("manifest.toml")).unwrap();
+    assert_eq!(manifest.status, EpisodeStatus::Faulted);
+    let report = read_report_json(&path.join("report.json")).unwrap();
+    assert_eq!(report.status, EpisodeStatus::Faulted);
+}
+
 #[test]
 fn fake_workflow_writes_complete_episode() {
     let out = tempfile::tempdir().unwrap();
@@ -24,6 +31,42 @@ fn fake_workflow_writes_complete_episode() {
         read_steps_file(result.path.join("steps.bin")).unwrap().steps.len(),
         3
     );
+}
+
+#[test]
+fn writer_startup_failure_finalizes_faulted_episode() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_writer_capacity(0);
+
+    let result = harness.run(out.path()).expect("writer startup failure should finalize episode");
+
+    assert_eq!(result.status, EpisodeStatus::Faulted);
+    assert_faulted_manifest_and_report(&result.path);
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert!(!report.final_flush_result.success);
+    assert!(report.writer.flush_failed);
+}
+
+#[test]
+fn corrupt_steps_file_faults_episode_instead_of_claiming_complete() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_iterations(1)
+        .with_corrupt_steps_after_finish();
+
+    let result = harness
+        .run(out.path())
+        .expect("collector should finalize corrupt steps as faulted");
+
+    assert_eq!(result.status, EpisodeStatus::Faulted);
+    assert_faulted_manifest_and_report(&result.path);
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert!(report.dual_arm.last_error.as_deref().unwrap_or_default().contains("steps.bin"));
 }
 
 #[test]

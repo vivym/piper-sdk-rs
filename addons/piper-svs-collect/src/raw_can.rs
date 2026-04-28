@@ -424,7 +424,7 @@ fn run_capture_loop(
     external_cancel: Arc<AtomicBool>,
     status: Arc<RawCanStatusTracker>,
 ) {
-    while !stop_signal.load(Ordering::Acquire) && !external_cancel.load(Ordering::Acquire) {
+    while !should_stop_capture(&stop_signal, &external_cancel, &status) {
         match capture.socket.receive() {
             Ok(Some(packet)) => match timestamped_frame_from_packet(packet) {
                 Ok(Some(frame)) => {
@@ -451,6 +451,22 @@ fn run_capture_loop(
     if capture.writer.finish().is_err() {
         status.mark_degraded();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn should_stop_capture(
+    stop_signal: &AtomicBool,
+    external_cancel: &AtomicBool,
+    status: &RawCanStatusTracker,
+) -> bool {
+    if stop_signal.load(Ordering::Acquire) {
+        return true;
+    }
+    if external_cancel.load(Ordering::Acquire) {
+        status.mark_degraded();
+        return true;
+    }
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -715,6 +731,16 @@ mod tests {
         );
 
         assert!(result.is_err());
+        assert_eq!(status.raw_can_status(), RawCanCaptureStatus::Degraded);
+    }
+
+    #[test]
+    fn external_cancel_marks_raw_can_degraded() {
+        let stop = AtomicBool::new(false);
+        let external_cancel = AtomicBool::new(true);
+        let status = RawCanStatusTracker::ok();
+
+        assert!(should_stop_capture(&stop, &external_cancel, &status));
         assert_eq!(status.raw_can_status(), RawCanCaptureStatus::Degraded);
     }
 

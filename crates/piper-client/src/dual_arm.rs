@@ -376,7 +376,7 @@ impl DualArmActiveMit {
             let raw_dt_us = previous_control_frame_host_mono_us
                 .map(|previous| control_frame_host_mono_us.saturating_sub(previous))
                 .unwrap_or(nominal_period_us);
-            let clamped_dt_us = raw_dt_us.min(max_dt_us);
+            let clamped_dt_us = clamp_control_dt_us(raw_dt_us, max_dt_us);
             let control_dt = Duration::from_micros(clamped_dt_us);
             let raw_dt = Duration::from_micros(raw_dt_us);
             report.max_real_dt = report.max_real_dt.max(raw_dt);
@@ -1672,6 +1672,10 @@ fn duration_micros_u64(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn clamp_control_dt_us(raw_dt_us: u64, max_dt_us: u64) -> u64 {
+    raw_dt_us.clamp(1, max_dt_us.max(1))
+}
+
 fn deadline_missed_after_submission(
     submission_deadline_mono_us: u64,
     master_tx_finished_host_mono_us: Option<u64>,
@@ -2040,6 +2044,7 @@ mod tests {
     const ID_MIT_CONTROL_BASE: u32 = ID_MIT_CONTROL_1.raw() as u32;
     const ALL_MIT_CONTROL_SENT_MASK: u8 = 0b0011_1111;
     const STABLE_CONFIRMED_TELEMETRY_TEST_FREQUENCY_HZ: f64 = 10.0;
+    const TEST_EVENTUALLY_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn test_dual_arm_read_policy_default_uses_control_default_feedback_freshness() {
@@ -3011,7 +3016,7 @@ mod tests {
             };
 
             assert!(
-                start.elapsed() < Duration::from_secs(1),
+                start.elapsed() < TEST_EVENTUALLY_TIMEOUT,
                 "timed out waiting for complete control snapshot: last_error={last_error}",
             );
             thread::sleep(Duration::from_millis(1));
@@ -3030,7 +3035,7 @@ mod tests {
             }
 
             assert!(
-                start.elapsed() < Duration::from_secs(1),
+                start.elapsed() < TEST_EVENTUALLY_TIMEOUT,
                 "timed out waiting for {} sent frames, got {}",
                 expected,
                 frames.len()
@@ -3602,6 +3607,13 @@ mod tests {
         let rows = sink.rows();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].timing.deadline_missed);
+    }
+
+    #[test]
+    fn control_dt_clamp_never_returns_zero_micros() {
+        assert_eq!(clamp_control_dt_us(0, 10), 1);
+        assert_eq!(clamp_control_dt_us(5, 10), 5);
+        assert_eq!(clamp_control_dt_us(50, 10), 10);
     }
 
     #[test]

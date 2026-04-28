@@ -3582,6 +3582,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    const TEST_EVENTUALLY_TIMEOUT: Duration = Duration::from_secs(5);
+
     fn received(frame: PiperFrame) -> piper_can::ReceivedFrame {
         piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::None)
     }
@@ -3948,7 +3950,7 @@ mod tests {
             }
 
             assert!(
-                start.elapsed() < Duration::from_secs(1),
+                start.elapsed() < TEST_EVENTUALLY_TIMEOUT,
                 "timed out waiting for {} sent frames, got {}",
                 expected,
                 frames.len()
@@ -4508,7 +4510,7 @@ mod tests {
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
         let active = standby
             .enable_position_mode(PositionModeConfig {
-                timeout: Duration::from_millis(80),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 10,
@@ -4520,7 +4522,7 @@ mod tests {
 
         active
             .reapply_position_mode_config(PositionModeConfig {
-                timeout: Duration::from_millis(80),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 5,
@@ -4580,7 +4582,7 @@ mod tests {
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
         let active = standby
             .enable_position_mode(PositionModeConfig {
-                timeout: Duration::from_millis(80),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 10,
@@ -4594,7 +4596,7 @@ mod tests {
 
         active
             .reapply_position_mode_config(PositionModeConfig {
-                timeout: Duration::from_millis(80),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 5,

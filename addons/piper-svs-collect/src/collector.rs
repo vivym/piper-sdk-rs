@@ -104,6 +104,7 @@ pub struct FakeCollectorHarness {
     writer_capacity: usize,
     pause_writer_until_shutdown: bool,
     writer_flush_failure: bool,
+    corrupt_steps_after_finish: bool,
     gripper_feedback: BTreeMap<usize, GripperTiming>,
     raw_can_requested: bool,
     raw_can_degraded_after_step: Option<usize>,
@@ -198,6 +199,7 @@ struct RealRunContext {
     episode_dir: PathBuf,
     base: RealEpisodeBase,
     raw_can: Arc<RawCanStatusTracker>,
+    writer_flush_timeout: Duration,
 }
 
 trait CollectorBackend {
@@ -313,6 +315,7 @@ impl Default for FakeCollectorHarness {
             writer_capacity: DEFAULT_WRITER_CAPACITY,
             pause_writer_until_shutdown: false,
             writer_flush_failure: false,
+            corrupt_steps_after_finish: false,
             gripper_feedback: BTreeMap::new(),
             raw_can_requested: false,
             raw_can_degraded_after_step: None,
@@ -526,6 +529,11 @@ impl FakeCollectorHarness {
         self
     }
 
+    pub fn with_corrupt_steps_after_finish(mut self) -> Self {
+        self.corrupt_steps_after_finish = true;
+        self
+    }
+
     pub fn with_gripper_feedback_at_step(mut self, step: usize, timing: GripperTiming) -> Self {
         self.gripper_feedback.insert(step, timing);
         self
@@ -581,6 +589,70 @@ impl FakeCollectorHarness {
             step_count: 0,
             last_step_index: None,
         };
+        let header = SvsHeaderV1::new(
+            &episode_id,
+            STARTED_UNIX_NS / 1_000_000,
+            EPISODE_START_HOST_MONO_US,
+        )?;
+        let fake_profile = fake_effective_profile();
+        let fake_monitor = writer_backpressure_monitor_from_profile(&fake_profile);
+        let raw_can = Arc::new(if self.raw_can_degraded_after_step.is_some() {
+            RawCanStatusTracker::ok()
+        } else if self.raw_can_requested {
+            RawCanStatusTracker::requested()
+        } else {
+            RawCanStatusTracker::disabled()
+        });
+        let mut writer = match EpisodeWriter::new_with_backpressure_thresholds(
+            &episode_dir,
+            header,
+            self.writer_capacity,
+            &fake_monitor,
+        ) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let mut writer_stats = WriterStats::with_backpressure_thresholds(&fake_monitor);
+                let error = anyhow!("failed to start episode writer: {error}");
+                writer_stats.flush_failed = true;
+                writer_stats.flush_error = Some(error.to_string());
+                let final_flush_result = WriterFlushResultJson {
+                    success: false,
+                    error: Some(error.to_string()),
+                };
+                write_report(FakeReportWrite {
+                    episode_dir: &episode_dir,
+                    episode_id: &episode_id,
+                    status: EpisodeStatus::Faulted,
+                    raw_can_enabled: raw_can.raw_can_status() != RawCanCaptureStatus::Disabled,
+                    raw_can_degraded: raw_can.raw_can_status() == RawCanCaptureStatus::Degraded,
+                    raw_can_finalizer_status: Some(raw_can.finalizer_status()),
+                    attempted_iterations: 0,
+                    summary: &initial_summary,
+                    exit_reason: None,
+                    final_flush_result,
+                    writer_stats: &writer_stats,
+                    last_error: Some(error.to_string()),
+                })?;
+                write_manifest(FakeManifestWrite {
+                    episode_dir: &episode_dir,
+                    episode_id: &episode_id,
+                    status: EpisodeStatus::Faulted,
+                    ended_unix_ns: Some(ENDED_UNIX_NS),
+                    summary: &initial_summary,
+                    artifacts: &artifacts,
+                    raw_can_enabled: raw_can.raw_can_status() != RawCanCaptureStatus::Disabled,
+                    raw_can_finalizer_status: raw_can.finalizer_status(),
+                })?;
+                return Ok(CollectorRunResult {
+                    status: EpisodeStatus::Faulted,
+                    path: episode_dir,
+                    dual_arm_exit_reason: None,
+                    loop_stopped_before_requested_iterations: true,
+                    enable_mit_calls: 0,
+                    disable_called: false,
+                });
+            },
+        };
         write_manifest(FakeManifestWrite {
             episode_dir: &episode_dir,
             episode_id: &episode_id,
@@ -591,19 +663,6 @@ impl FakeCollectorHarness {
             raw_can_enabled: self.raw_can_requested(),
             raw_can_finalizer_status: "running".to_string(),
         })?;
-        let header = SvsHeaderV1::new(
-            &episode_id,
-            STARTED_UNIX_NS / 1_000_000,
-            EPISODE_START_HOST_MONO_US,
-        )?;
-        let fake_profile = fake_effective_profile();
-        let fake_monitor = writer_backpressure_monitor_from_profile(&fake_profile);
-        let mut writer = EpisodeWriter::new_with_backpressure_thresholds(
-            &episode_dir,
-            header,
-            self.writer_capacity,
-            &fake_monitor,
-        )?;
         if self.pause_writer_until_shutdown {
             writer.pause_worker_for_test();
         }
@@ -615,13 +674,6 @@ impl FakeCollectorHarness {
         let mut enable_mit_calls = 0_u32;
         let mut disable_called = false;
         let mut attempted_iterations = 0_u64;
-        let raw_can = Arc::new(if self.raw_can_degraded_after_step.is_some() {
-            RawCanStatusTracker::ok()
-        } else if self.raw_can_requested {
-            RawCanStatusTracker::requested()
-        } else {
-            RawCanStatusTracker::disabled()
-        });
         let stager = Arc::new(SvsTickStager::new());
         let dynamics_slot = Arc::new(SvsDynamicsSlot::new());
         let feedback_history = Arc::new(Mutex::new(AppliedMasterFeedbackHistory::default()));
@@ -633,6 +685,7 @@ impl FakeCollectorHarness {
             writer_backpressure_monitor_from_profile(&fake_profile),
             EPISODE_START_HOST_MONO_US,
         );
+        let writer_flush_timeout = Duration::from_millis(fake_profile.writer.flush_timeout_ms);
         let controller = SvsController::with_shared(
             fake_profile,
             fake_dual_arm_calibration(),
@@ -670,7 +723,7 @@ impl FakeCollectorHarness {
             fs::write(episode_dir.join("steps.bin"), b"forced flush collision")?;
         }
         let writer_stats_before_finish = writer.writer_stats();
-        let flush_summary = writer.finish();
+        let flush_summary = writer.finish_with_timeout(writer_flush_timeout);
         let mut writer_stats =
             merge_writer_stats(writer_stats_before_finish, writer.writer_stats());
         let final_flush_result = match flush_summary {
@@ -695,13 +748,17 @@ impl FakeCollectorHarness {
             loop_stopped_before_requested_iterations = true;
         }
 
-        let summary = crate::episode::wire::read_steps_file(episode_dir.join("steps.bin"))
-            .map(|decoded| decoded.summary)
-            .unwrap_or_else(|_| crate::episode::wire::StepFileSummary {
-                episode_id: episode_id.clone(),
-                step_count: writer_stats.encoded_step_count,
-                last_step_index: writer_stats.last_step_index,
-            });
+        if self.corrupt_steps_after_finish {
+            fs::write(episode_dir.join("steps.bin"), b"corrupt steps after flush")?;
+        }
+        let mut report_last_error = writer_stats.flush_error.clone();
+        let summary = read_final_step_summary(
+            episode_dir.join("steps.bin"),
+            &episode_id,
+            &writer_stats,
+            &mut status,
+            &mut report_last_error,
+        );
         let raw_finalizer_status = raw_can.finalizer_status();
         write_report(FakeReportWrite {
             episode_dir: &episode_dir,
@@ -715,6 +772,7 @@ impl FakeCollectorHarness {
             exit_reason: dual_arm_exit_reason,
             final_flush_result,
             writer_stats: &writer_stats,
+            last_error: report_last_error,
         })?;
         write_manifest(FakeManifestWrite {
             episode_dir: &episode_dir,
@@ -779,6 +837,19 @@ impl SharedEpisodeWriter {
             .take()
             .ok_or_else(|| anyhow!("episode writer has already been finished"))?;
         match writer.finish() {
+            Ok(summary) => Ok(summary),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn finish_with_timeout(&self, timeout: Duration) -> Result<WriterFlushSummary> {
+        let writer = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("episode writer lock is poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow!("episode writer has already been finished"))?;
+        match writer.finish_with_timeout(timeout) {
             Ok(summary) => Ok(summary),
             Err(error) => Err(error.into()),
         }
@@ -1045,6 +1116,8 @@ fn run_real_collector(args: Args, cancel: CollectorCancelToken) -> Result<Collec
     } else {
         RawCanStatusTracker::disabled()
     });
+    let writer_flush_timeout =
+        Duration::from_millis(resolved_profile.profile.writer.flush_timeout_ms);
     let base = build_real_manifest_base(RealManifestInputs {
         episode_id: episode_id.clone(),
         task_raw_name: task_name,
@@ -1072,19 +1145,13 @@ fn run_real_collector(args: Args, cancel: CollectorCancelToken) -> Result<Collec
         episode_dir: episode_dir.clone(),
         base,
         raw_can: Arc::clone(&raw_can),
+        writer_flush_timeout,
     };
-    write_real_manifest(
-        &context,
-        EpisodeStatus::Running,
-        None,
-        &crate::episode::wire::StepFileSummary {
-            episode_id: episode_id.clone(),
-            step_count: 0,
-            last_step_index: None,
-        },
-        "running".to_string(),
-        true,
-    )?;
+    let initial_summary = crate::episode::wire::StepFileSummary {
+        episode_id: episode_id.clone(),
+        step_count: 0,
+        last_step_index: None,
+    };
 
     let header = SvsHeaderV1::new(
         &episode_id,
@@ -1092,14 +1159,23 @@ fn run_real_collector(args: Args, cancel: CollectorCancelToken) -> Result<Collec
         episode_start_host_mono_us,
     )?;
     let writer_monitor = writer_backpressure_monitor_from_profile(&resolved_profile.profile);
-    let writer = Arc::new(SharedEpisodeWriter::new(
-        EpisodeWriter::new_with_backpressure_thresholds(
-            &episode_dir,
-            header,
-            resolved_profile.profile.writer.queue_capacity,
-            &writer_monitor,
-        )?,
-    ));
+    let writer = match EpisodeWriter::new_with_backpressure_thresholds(
+        &episode_dir,
+        header,
+        resolved_profile.profile.writer.queue_capacity,
+        &writer_monitor,
+    ) {
+        Ok(writer) => Arc::new(SharedEpisodeWriter::new(writer)),
+        Err(error) => return finalize_writer_startup_failure(&context, &writer_monitor, error),
+    };
+    write_real_manifest(
+        &context,
+        EpisodeStatus::Running,
+        None,
+        &initial_summary,
+        "running".to_string(),
+        true,
+    )?;
     let sink = Arc::new(SvsTelemetrySink::new(
         Arc::clone(&stager),
         Arc::clone(&feedback_history),
@@ -1647,6 +1723,58 @@ fn write_real_manifest(
     }
 }
 
+fn finalize_writer_startup_failure(
+    context: &RealRunContext,
+    writer_monitor: &WriterBackpressureMonitor,
+    error: impl std::fmt::Display,
+) -> Result<CollectorRunResult> {
+    let error = anyhow!("failed to start episode writer: {error}");
+    let mut writer_stats = WriterStats::with_backpressure_thresholds(writer_monitor);
+    writer_stats.flush_failed = true;
+    writer_stats.flush_error = Some(error.to_string());
+    let final_flush_result = WriterFlushResultJson {
+        success: false,
+        error: Some(error.to_string()),
+    };
+    let report = BilateralRunReport {
+        last_error: Some(error.to_string()),
+        ..BilateralRunReport::default()
+    };
+    let summary = crate::episode::wire::StepFileSummary {
+        episode_id: context.episode_id.clone(),
+        step_count: 0,
+        last_step_index: None,
+    };
+    let ended_unix_ns = current_unix_ns().max(context.base.started_unix_ns);
+
+    write_real_report(
+        context,
+        EpisodeStatus::Faulted,
+        ended_unix_ns,
+        &summary,
+        &report,
+        final_flush_result,
+        &writer_stats,
+    )?;
+    write_real_manifest(
+        context,
+        EpisodeStatus::Faulted,
+        Some(ended_unix_ns),
+        &summary,
+        context.raw_can.finalizer_status(),
+        true,
+    )?;
+
+    Ok(CollectorRunResult {
+        status: EpisodeStatus::Faulted,
+        path: context.episode_dir.clone(),
+        dual_arm_exit_reason: None,
+        loop_stopped_before_requested_iterations: true,
+        enable_mit_calls: 0,
+        disable_called: false,
+    })
+}
+
 fn finish_writer_and_finalize(
     context: &RealRunContext,
     writer: &Arc<SharedEpisodeWriter>,
@@ -1661,7 +1789,7 @@ fn finish_writer_and_finalize(
     }
 
     let writer_stats_before_finish = writer.writer_stats();
-    let flush_summary = writer.finish();
+    let flush_summary = writer.finish_with_timeout(context.writer_flush_timeout);
     let mut writer_stats = merge_writer_stats(writer_stats_before_finish, writer.writer_stats());
     let final_flush_result = match flush_summary {
         Ok(_summary) => WriterFlushResultJson {
@@ -1687,13 +1815,13 @@ fn finish_writer_and_finalize(
         report.exit_reason = Some(BilateralExitReason::TelemetrySinkFault);
     }
 
-    let summary = crate::episode::wire::read_steps_file(context.episode_dir.join("steps.bin"))
-        .map(|decoded| decoded.summary)
-        .unwrap_or_else(|_| crate::episode::wire::StepFileSummary {
-            episode_id: context.episode_id.clone(),
-            step_count: writer_stats.encoded_step_count,
-            last_step_index: writer_stats.last_step_index,
-        });
+    let summary = read_final_step_summary(
+        context.episode_dir.join("steps.bin"),
+        &context.episode_id,
+        &writer_stats,
+        &mut status,
+        &mut report.last_error,
+    );
     let ended_unix_ns = current_unix_ns().max(context.base.started_unix_ns);
     write_real_report(
         context,
@@ -1721,6 +1849,32 @@ fn finish_writer_and_finalize(
         enable_mit_calls,
         disable_called,
     })
+}
+
+fn read_final_step_summary(
+    path: impl AsRef<Path>,
+    episode_id: &str,
+    writer_stats: &WriterStats,
+    status: &mut EpisodeStatus,
+    last_error: &mut Option<String>,
+) -> crate::episode::wire::StepFileSummary {
+    let path = path.as_ref();
+    match crate::episode::wire::read_steps_file(path) {
+        Ok(decoded) => decoded.summary,
+        Err(error) => {
+            if *status != EpisodeStatus::Faulted {
+                *status = EpisodeStatus::Faulted;
+            }
+            if last_error.is_none() {
+                *last_error = Some(format!("failed to validate {}: {error}", path.display()));
+            }
+            crate::episode::wire::StepFileSummary {
+                episode_id: episode_id.to_string(),
+                step_count: writer_stats.encoded_step_count,
+                last_step_index: writer_stats.last_step_index,
+            }
+        },
+    }
 }
 
 fn write_real_report(
@@ -1789,7 +1943,7 @@ fn write_real_report(
     };
     report_json.validate()?;
     let text = serde_json::to_string_pretty(&report_json)?;
-    write_replace_file(context.episode_dir.join("report.json"), text.as_bytes())?;
+    write_new_file(context.episode_dir.join("report.json"), text.as_bytes())?;
     Ok(())
 }
 
@@ -2279,6 +2433,7 @@ struct FakeReportWrite<'a> {
     exit_reason: Option<BilateralExitReason>,
     final_flush_result: WriterFlushResultJson,
     writer_stats: &'a WriterStats,
+    last_error: Option<String>,
 }
 
 fn persist_episode_inputs(episode_dir: &Path) -> Result<PersistedArtifacts> {
@@ -2366,13 +2521,13 @@ fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
             exit_reason: input.exit_reason.map(|reason| format!("{reason:?}")),
             left_stop_attempt: "ConfirmedSent".to_string(),
             right_stop_attempt: "ConfirmedSent".to_string(),
-            last_error: input.writer_stats.flush_error.clone(),
+            last_error: input.last_error.clone(),
         },
         writer: WriterReportJson::from(input.writer_stats),
     };
     report.validate()?;
     let text = serde_json::to_string_pretty(&report)?;
-    write_replace_file(input.episode_dir.join("report.json"), text.as_bytes())?;
+    write_new_file(input.episode_dir.join("report.json"), text.as_bytes())?;
     Ok(())
 }
 
@@ -2710,6 +2865,40 @@ fn flatten3x6(values: [[f64; 6]; 3]) -> [f64; 18] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_report_refuses_existing_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("report.json");
+        fs::write(&report_path, b"existing").unwrap();
+        let summary = crate::episode::wire::StepFileSummary {
+            episode_id: "20260428T010203Z-test-000000000000".to_string(),
+            step_count: 0,
+            last_step_index: None,
+        };
+        let writer_stats = WriterStats::default();
+
+        let result = write_report(FakeReportWrite {
+            episode_dir: dir.path(),
+            episode_id: &summary.episode_id,
+            status: EpisodeStatus::Faulted,
+            raw_can_enabled: false,
+            raw_can_degraded: false,
+            raw_can_finalizer_status: Some("not_enabled".to_string()),
+            attempted_iterations: 0,
+            summary: &summary,
+            exit_reason: None,
+            final_flush_result: WriterFlushResultJson {
+                success: false,
+                error: Some("startup failed".to_string()),
+            },
+            writer_stats: &writer_stats,
+            last_error: Some("startup failed".to_string()),
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&report_path).unwrap(), b"existing");
+    }
 
     #[test]
     fn write_new_file_refuses_existing_metadata() {

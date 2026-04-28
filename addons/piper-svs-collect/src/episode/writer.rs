@@ -30,6 +30,8 @@ pub enum WriterError {
     AlreadyFinished,
     #[error("writer worker panicked")]
     WorkerPanicked,
+    #[error("writer flush timed out after {timeout_ms} ms")]
+    FlushTimeout { timeout_ms: u64 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -211,6 +213,18 @@ impl EpisodeWriter {
             return Err(WriterError::AlreadyFinished);
         };
         join_worker(worker, &self.stats)
+    }
+
+    pub fn finish_with_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<WriterFlushSummary, WriterError> {
+        self.pause_worker.store(false, Ordering::Release);
+        drop(self.sender.take());
+        let Some(worker) = self.worker.take() else {
+            return Err(WriterError::AlreadyFinished);
+        };
+        join_worker_with_timeout(worker, &self.stats, timeout)
     }
 
     fn start(
@@ -603,9 +617,40 @@ fn join_worker(
     }
 }
 
+fn join_worker_with_timeout(
+    worker: JoinHandle<Result<WriterFlushSummary, WriterError>>,
+    stats: &Arc<AtomicWriterStats>,
+    timeout: Duration,
+) -> Result<WriterFlushSummary, WriterError> {
+    let timeout_ms = duration_millis_u64(timeout);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker_stats = Arc::clone(stats);
+    thread::spawn(move || {
+        let result = join_worker(worker, &worker_stats);
+        let _ = sender.send(result);
+    });
+
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let error = format!("writer flush timed out after {timeout_ms} ms");
+            mark_flush_failed(stats, error);
+            Err(WriterError::FlushTimeout { timeout_ms })
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            mark_flush_failed(stats, "writer join thread stopped".to_string());
+            Err(WriterError::WorkerStopped)
+        },
+    }
+}
+
 fn mark_flush_failed(stats: &Arc<AtomicWriterStats>, error: String) {
     stats.flush_failed.store(true, Ordering::Relaxed);
     *stats.flush_error.lock().expect("writer flush error lock poisoned") = Some(error);
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn prepare_steps_file(
@@ -866,5 +911,27 @@ mod tests {
         assert_eq!(stats.queue_full_stop_duration_ms, 250);
         assert_eq!(report.queue_full_stop_events, 7);
         assert_eq!(report.queue_full_stop_duration_ms, 250);
+    }
+
+    #[test]
+    fn join_worker_with_timeout_faults_without_waiting_forever() {
+        let stats = Arc::new(AtomicWriterStats::default());
+        let worker = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(2));
+            Ok(WriterFlushSummary {
+                path: PathBuf::from("steps.bin"),
+                step_count: 0,
+                last_step_index: None,
+            })
+        });
+
+        let start = Instant::now();
+        let result = join_worker_with_timeout(worker, &stats, Duration::from_millis(10));
+
+        assert!(matches!(result, Err(WriterError::FlushTimeout { .. })));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        let snapshot = stats.snapshot();
+        assert!(snapshot.flush_failed);
+        assert!(snapshot.flush_error.as_deref().unwrap_or_default().contains("timed out"));
     }
 }
