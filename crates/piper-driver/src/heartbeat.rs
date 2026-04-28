@@ -7,13 +7,8 @@
 //! - Unaffected by system clock changes (NTP, manual adjustments)
 //! - Safe to store in AtomicU64 for lock-free access
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-
-/// Global anchor point for monotonic time
-/// Set once on first access, never changes
-static APP_START: OnceLock<Instant> = OnceLock::new();
+use std::time::Duration;
 
 /// Get monotonic time as microseconds since app start
 ///
@@ -22,8 +17,7 @@ static APP_START: OnceLock<Instant> = OnceLock::new();
 /// - Unaffected by system clock changes
 /// - Safe to store in AtomicU64
 pub fn monotonic_micros() -> u64 {
-    let start = APP_START.get_or_init(Instant::now);
-    start.elapsed().as_micros() as u64
+    piper_can::monotonic_micros()
 }
 
 /// Connection health monitor
@@ -207,5 +201,15 @@ mod tests {
             );
             last = current;
         }
+    }
+
+    #[test]
+    fn monotonic_micros_delegates_to_piper_can_epoch() {
+        let driver_before = monotonic_micros();
+        let can_now = piper_can::monotonic_micros();
+        let driver_after = monotonic_micros();
+
+        assert!(driver_before <= can_now);
+        assert!(can_now <= driver_after);
     }
 }

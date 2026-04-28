@@ -810,6 +810,7 @@ pub struct ParserState<'a> {
     pub pending_joint_pos: [f64; 6],
     /// 关节位置帧组元数据（mask、每槽位时间戳、组起始时间）
     joint_pos_group: PendingFrameGroup<3>,
+    joint_pos_raw_timings: [Option<RawFeedbackTiming>; 3],
 
     // === 末端位姿状态：帧组同步（0x2A2-0x2A4） ===
     /// 待提交的末端位姿数据（6个自由度：x, y, z, rx, ry, rz）
@@ -820,6 +821,7 @@ pub struct ParserState<'a> {
     // === 关节动态状态：缓冲提交（关键改进） ===
     /// 待提交的关节动态状态
     pub pending_joint_dynamic: JointDynamicState,
+    pending_joint_dynamic_raw_timings: [Option<RawFeedbackTiming>; 6],
     /// 速度帧更新掩码（Bit 0-5 对应 Joint 1-6）
     pub vel_update_mask: u8,
     /// 当前速度分组开始时间（系统时间，用于统一超时语义）
@@ -851,9 +853,11 @@ impl<'a> ParserState<'a> {
         Self {
             pending_joint_pos: [0.0; 6],
             joint_pos_group: PendingFrameGroup::new(),
+            joint_pos_raw_timings: [None; 3],
             pending_end_pose: [0.0; 6],
             end_pose_group: PendingFrameGroup::new(),
             pending_joint_dynamic: JointDynamicState::default(),
+            pending_joint_dynamic_raw_timings: [None; 6],
             vel_update_mask: 0,
             pending_velocity_started_at: None,
             last_vel_packet_time_us: 0,
@@ -872,6 +876,7 @@ impl<'a> Default for ParserState<'a> {
 
 fn reset_pending_velocity(state: &mut ParserState) {
     state.pending_joint_dynamic = JointDynamicState::default();
+    state.pending_joint_dynamic_raw_timings = [None; 6];
     state.vel_update_mask = 0;
     state.pending_velocity_started_at = None;
     state.last_vel_packet_time_us = 0;
@@ -880,6 +885,7 @@ fn reset_pending_velocity(state: &mut ParserState) {
 fn reset_pending_joint_position(state: &mut ParserState) {
     state.pending_joint_pos = [0.0; 6];
     state.joint_pos_group.reset();
+    state.joint_pos_raw_timings = [None; 3];
 }
 
 fn reset_pending_end_pose(state: &mut ParserState) {
@@ -916,6 +922,39 @@ fn control_grade_group_ready(
     }
 
     max_ts.saturating_sub(min_ts) <= STRICT_GROUP_MAX_SPAN_US
+}
+
+#[inline]
+fn raw_timings_have_hw_raw<const N: usize>(raw_timings: &[Option<RawFeedbackTiming>; N]) -> bool {
+    raw_timings
+        .iter()
+        .all(|timing| timing.is_some_and(|timing| timing.hw_raw_us.is_some()))
+}
+
+#[inline]
+fn newest_raw_feedback_timing<const N: usize>(
+    raw_timings: &[Option<RawFeedbackTiming>; N],
+) -> Option<RawFeedbackTiming> {
+    raw_timings.iter().copied().fold(None, RawFeedbackTiming::newest)
+}
+
+#[inline]
+fn experimental_raw_clock_group_ready(
+    group: &PendingFrameGroup<3>,
+    backend_capability: BackendCapability,
+    raw_timings: &[Option<RawFeedbackTiming>; 3],
+) -> bool {
+    backend_capability.is_soft_realtime()
+        && complete_group_ready(group.mask)
+        && raw_timings_have_hw_raw(raw_timings)
+}
+
+#[inline]
+fn experimental_raw_clock_dynamic_group_ready(
+    backend_capability: BackendCapability,
+    raw_timings: &[Option<RawFeedbackTiming>; 6],
+) -> bool {
+    backend_capability.is_soft_realtime() && raw_timings_have_hw_raw(raw_timings)
 }
 
 #[inline]
@@ -1060,14 +1099,18 @@ fn commit_pending_velocity(
             .joint_dynamic_updates
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if backend_capability.is_strict_realtime() {
-            if state.pending_joint_dynamic.group_span_us() <= STRICT_GROUP_MAX_SPAN_US {
-                ctx.publish_control_joint_dynamic(state.pending_joint_dynamic);
-            } else {
-                metrics
-                    .rx_joint_dynamic_control_grade_rejected_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+        let strict_dynamic_ready = backend_capability.is_strict_realtime()
+            && state.pending_joint_dynamic.group_span_us() <= STRICT_GROUP_MAX_SPAN_US;
+        let raw_clock_dynamic_ready = experimental_raw_clock_dynamic_group_ready(
+            backend_capability,
+            &state.pending_joint_dynamic_raw_timings,
+        );
+        if strict_dynamic_ready || raw_clock_dynamic_ready {
+            ctx.publish_control_joint_dynamic(state.pending_joint_dynamic);
+        } else if backend_capability.is_strict_realtime() {
+            metrics
+                .rx_joint_dynamic_control_grade_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     } else {
         metrics.rx_joint_dynamic_groups_dropped_total.fetch_add(1, Ordering::Relaxed);
@@ -1144,8 +1187,8 @@ pub(crate) fn io_loop(
         // ============================================================
         // 1. 接收 CAN 帧（带超时，避免阻塞）
         // ============================================================
-        let frame = match can.receive() {
-            Ok(received) => received.frame,
+        let received = match can.receive() {
+            Ok(received) => received,
             Err(CanError::Timeout) => {
                 // 超时是正常情况，检查各个 pending 状态的年龄
 
@@ -1174,8 +1217,9 @@ pub(crate) fn io_loop(
         // ============================================================
         // 2. 根据 CAN ID 解析帧并更新状态
         // ============================================================
+        let frame = received.frame;
         let parsed = parse_and_update_state(
-            &frame,
+            &received,
             backend_capability,
             &ctx,
             &config,
@@ -1401,7 +1445,7 @@ pub fn rx_loop(
         // ============================================================
         // 复用 io_loop 中的解析逻辑（通过调用辅助函数）
         let parsed = parse_and_update_state(
-            &frame,
+            &received,
             backend_capability,
             &ctx,
             &config,
@@ -2582,7 +2626,7 @@ struct ParsedFeedbackOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn parse_and_update_state(
-    frame: &PiperFrame,
+    received: &piper_can::ReceivedFrame,
     backend_capability: BackendCapability,
     ctx: &Arc<PiperContext>,
     config: &PipelineConfig,
@@ -2591,12 +2635,17 @@ fn parse_and_update_state(
 ) -> ParsedFeedbackOutcome {
     let mut outcome = ParsedFeedbackOutcome::default();
     let frame_group_timeout = Duration::from_millis(config.frame_group_timeout_ms);
+    let frame = &received.frame;
+    let raw_feedback = received.raw_timestamp.and_then(RawFeedbackTiming::from_raw_timestamp);
+    let receive_host_rx_mono_us = raw_feedback
+        .map(|timing| timing.host_rx_mono_us)
+        .unwrap_or_else(host_rx_mono_us);
 
     match frame.id().as_standard() {
         Some(ID_JOINT_FEEDBACK_12) => {
             if let Ok(feedback) = JointFeedback12::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_joint_position_group(
@@ -2609,10 +2658,12 @@ fn parse_and_update_state(
                 state.pending_joint_pos[0] = feedback.j1_rad();
                 state.pending_joint_pos[1] = feedback.j2_rad();
                 state.joint_pos_group.write_slot(0, alignment_timestamp_us, host_rx_mono_us);
+                state.joint_pos_raw_timings[0] = raw_feedback;
 
                 ctx.publish_raw_joint_position(JointPositionState {
                     hardware_timestamp_us: state.joint_pos_group.max_alignment_timestamp_us(),
                     host_rx_mono_us,
+                    raw_feedback_timing: newest_raw_feedback_timing(&state.joint_pos_raw_timings),
                     joint_pos: state.pending_joint_pos,
                     frame_valid_mask: state.joint_pos_group.mask,
                 });
@@ -2626,7 +2677,7 @@ fn parse_and_update_state(
         Some(ID_JOINT_FEEDBACK_34) => {
             if let Ok(feedback) = JointFeedback34::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_joint_position_group(
@@ -2639,10 +2690,12 @@ fn parse_and_update_state(
                 state.pending_joint_pos[2] = feedback.j3_rad();
                 state.pending_joint_pos[3] = feedback.j4_rad();
                 state.joint_pos_group.write_slot(1, alignment_timestamp_us, host_rx_mono_us);
+                state.joint_pos_raw_timings[1] = raw_feedback;
 
                 ctx.publish_raw_joint_position(JointPositionState {
                     hardware_timestamp_us: state.joint_pos_group.max_alignment_timestamp_us(),
                     host_rx_mono_us,
+                    raw_feedback_timing: newest_raw_feedback_timing(&state.joint_pos_raw_timings),
                     joint_pos: state.pending_joint_pos,
                     frame_valid_mask: state.joint_pos_group.mask,
                 });
@@ -2656,7 +2709,7 @@ fn parse_and_update_state(
         Some(ID_JOINT_FEEDBACK_56) => {
             if let Ok(feedback) = JointFeedback56::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_joint_position_group(
@@ -2669,10 +2722,12 @@ fn parse_and_update_state(
                 state.pending_joint_pos[4] = feedback.j5_rad();
                 state.pending_joint_pos[5] = feedback.j6_rad();
                 state.joint_pos_group.write_slot(2, alignment_timestamp_us, host_rx_mono_us);
+                state.joint_pos_raw_timings[2] = raw_feedback;
 
                 let new_joint_pos_state = JointPositionState {
                     hardware_timestamp_us: state.joint_pos_group.max_alignment_timestamp_us(),
                     host_rx_mono_us: state.joint_pos_group.max_host_rx_mono_us(),
+                    raw_feedback_timing: newest_raw_feedback_timing(&state.joint_pos_raw_timings),
                     joint_pos: state.pending_joint_pos,
                     frame_valid_mask: state.joint_pos_group.mask,
                 };
@@ -2682,7 +2737,13 @@ fn parse_and_update_state(
                         .load()
                         .joint_position_updates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if control_grade_group_ready(&state.joint_pos_group, backend_capability) {
+                    if control_grade_group_ready(&state.joint_pos_group, backend_capability)
+                        || experimental_raw_clock_group_ready(
+                            &state.joint_pos_group,
+                            backend_capability,
+                            &state.joint_pos_raw_timings,
+                        )
+                    {
                         ctx.publish_control_joint_position(new_joint_pos_state);
                     } else {
                         metrics
@@ -2704,7 +2765,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = EndPoseFeedback1::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_end_pose_raw_frame();
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_end_pose_group(
@@ -2741,7 +2802,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = EndPoseFeedback2::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_end_pose_raw_frame();
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_end_pose_group(
@@ -2778,7 +2839,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = EndPoseFeedback3::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_end_pose_raw_frame();
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_end_pose_group(
@@ -2863,12 +2924,17 @@ fn parse_and_update_state(
                     }
                 }
 
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 state.pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                 state.pending_joint_dynamic.joint_current[joint_index] = feedback.current();
                 state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us();
                 state.pending_joint_dynamic.group_host_rx_mono_us = host_rx_mono_us;
                 state.pending_joint_dynamic.group_timestamp_us = frame.timestamp_us();
+                state.pending_joint_dynamic.raw_feedback_timing = RawFeedbackTiming::newest(
+                    state.pending_joint_dynamic.raw_feedback_timing,
+                    raw_feedback,
+                );
+                state.pending_joint_dynamic_raw_timings[joint_index] = raw_feedback;
 
                 if state.vel_update_mask == 0 {
                     state.pending_velocity_started_at = Some(now);
@@ -2896,7 +2962,7 @@ fn parse_and_update_state(
             if let Ok(feedback) = RobotStatusFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
                 outcome.maintenance_gate_may_have_changed = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
 
                 let fault_angle_limit_mask = feedback.fault_code_angle_limit.joint1_limit() as u8
                     | (feedback.fault_code_angle_limit.joint2_limit() as u8) << 1
@@ -2948,7 +3014,7 @@ fn parse_and_update_state(
         Some(ID_GRIPPER_FEEDBACK) => {
             if let Ok(feedback) = GripperFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
 
                 let current = ctx.gripper.load();
                 let last_travel = current.last_travel;
@@ -2984,7 +3050,7 @@ fn parse_and_update_state(
                     outcome.counts_as_robot_feedback = true;
                     outcome.maintenance_gate_may_have_changed = true;
                     outcome.low_speed_drive_state_updated = true;
-                    let host_rx_mono_us = host_rx_mono_us();
+                    let host_rx_mono_us = receive_host_rx_mono_us;
                     if let Ok(mut store) = ctx.joint_driver_low_speed_observation.write() {
                         store.record_slot(
                             joint_idx,
@@ -3101,7 +3167,7 @@ fn parse_and_update_state(
                 DecodeResult::Data(typed) => {
                     outcome.counts_as_robot_feedback = true;
                     ctx.observation_metrics.record_collision_protection_raw_frame();
-                    let host_rx_mono_us = host_rx_mono_us();
+                    let host_rx_mono_us = receive_host_rx_mono_us;
 
                     if let Ok(mut collision) = ctx.collision_protection.try_write() {
                         collision.hardware_timestamp_us =
@@ -3162,7 +3228,7 @@ fn parse_and_update_state(
         Some(ID_SETTING_RESPONSE) => {
             if let Ok(feedback) = SettingResponse::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
 
                 if let Ok(mut setting_response) = ctx.setting_response.write() {
                     setting_response.hardware_timestamp_us = frame.timestamp_us();
@@ -3179,7 +3245,7 @@ fn parse_and_update_state(
                 let joint_idx = (feedback.joint_index as usize).saturating_sub(1);
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_joint_limit_config_raw_frame();
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
 
                 if let Ok(mut joint_limit) = ctx.joint_limit_config.write() {
                     joint_limit.joint_limits_max[joint_idx] = feedback.max_angle().to_radians();
@@ -3246,7 +3312,7 @@ fn parse_and_update_state(
                 if joint_idx < 6 {
                     outcome.counts_as_robot_feedback = true;
                     ctx.observation_metrics.record_joint_accel_config_raw_frame();
-                    let host_rx_mono_us = host_rx_mono_us();
+                    let host_rx_mono_us = receive_host_rx_mono_us;
                     let hardware_timestamp_us =
                         (frame.timestamp_us() != 0).then_some(frame.timestamp_us());
 
@@ -3336,7 +3402,7 @@ fn parse_and_update_state(
             Ok(feedback) => {
                 outcome.counts_as_robot_feedback = true;
                 ctx.observation_metrics.record_end_limit_config_raw_frame();
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let hardware_timestamp_us =
                     (frame.timestamp_us() != 0).then_some(frame.timestamp_us());
 
@@ -3414,7 +3480,7 @@ fn parse_and_update_state(
         Some(ID_FIRMWARE_READ) => {
             if let Ok(feedback) = FirmwareReadFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
 
                 if let Ok(mut firmware_state) = ctx.firmware_version.write() {
                     firmware_state
@@ -3434,7 +3500,7 @@ fn parse_and_update_state(
         Some(ID_CONTROL_MODE) => {
             if let Ok(feedback) = ControlModeCommandFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
 
                 let new_state = MasterSlaveControlModeState {
                     hardware_timestamp_us: frame.timestamp_us(),
@@ -3458,7 +3524,7 @@ fn parse_and_update_state(
         Some(ID_JOINT_CONTROL_12) => {
             if let Ok(feedback) = JointControl12Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_joint_control_group(
@@ -3475,7 +3541,7 @@ fn parse_and_update_state(
         Some(ID_JOINT_CONTROL_34) => {
             if let Ok(feedback) = JointControl34Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_joint_control_group(
@@ -3492,7 +3558,7 @@ fn parse_and_update_state(
         Some(ID_JOINT_CONTROL_56) => {
             if let Ok(feedback) = JointControl56Feedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
                 let alignment_timestamp_us =
                     group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 maybe_reset_joint_control_group(
@@ -3527,7 +3593,7 @@ fn parse_and_update_state(
         Some(ID_GRIPPER_CONTROL) => {
             if let Ok(feedback) = GripperControlFeedback::try_from(*frame) {
                 outcome.counts_as_robot_feedback = true;
-                let host_rx_mono_us = host_rx_mono_us();
+                let host_rx_mono_us = receive_host_rx_mono_us;
 
                 let new_state = MasterSlaveGripperControlState {
                     hardware_timestamp_us: frame.timestamp_us(),
@@ -3830,6 +3896,46 @@ mod tests {
         PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
     }
 
+    fn joint_driver_high_speed_frame(joint_index: u8, timestamp_us: u64) -> PiperFrame {
+        let id = ID_JOINT_DRIVER_HIGH_SPEED_BASE_RAW + u32::from(joint_index.saturating_sub(1));
+        let speed_val = 1000 + i16::from(joint_index);
+        let current_val = 2000 + i16::from(joint_index);
+        let position_val = i32::from(joint_index) * 10;
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&speed_val.to_be_bytes());
+        data[2..4].copy_from_slice(&current_val.to_be_bytes());
+        data[4..8].copy_from_slice(&position_val.to_be_bytes());
+
+        PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
+    }
+
+    fn received_with_hw_raw(frame: PiperFrame, host_rx_mono_us: u64) -> piper_can::ReceivedFrame {
+        let can_id = frame.raw_id() & 0x1FFF_FFFF;
+        piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::Kernel)
+            .with_raw_timestamp(piper_can::RawTimestampInfo {
+                can_id,
+                host_rx_mono_us,
+                system_ts_us: None,
+                hw_trans_us: None,
+                hw_raw_us: Some(host_rx_mono_us.saturating_sub(1_000)),
+            })
+    }
+
+    fn received_without_raw(frame: PiperFrame) -> piper_can::ReceivedFrame {
+        piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::Kernel)
+    }
+
+    fn parse_received_for_test(
+        ctx: &Arc<PiperContext>,
+        state: &mut ParserState,
+        metrics: &Arc<PiperMetrics>,
+        config: &PipelineConfig,
+        backend_capability: BackendCapability,
+        received: piper_can::ReceivedFrame,
+    ) {
+        parse_and_update_state(&received, backend_capability, ctx, config, state, metrics);
+    }
+
     fn robot_status_frame_with_status(
         control_mode: ControlMode,
         robot_status: RobotStatus,
@@ -3860,8 +3966,9 @@ mod tests {
         config: &PipelineConfig,
         frame: PiperFrame,
     ) {
+        let received = piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::Kernel);
         parse_and_update_state(
-            &frame,
+            &received,
             BackendCapability::StrictRealtime,
             ctx,
             config,
@@ -3912,8 +4019,9 @@ mod tests {
         normal_send_gate: &Arc<NormalSendGate>,
         driver_mode: &Arc<crate::mode::AtomicDriverMode>,
     ) {
+        let received = piper_can::ReceivedFrame::new(frame, piper_can::TimestampProvenance::Kernel);
         let parsed = parse_and_update_state(
-            &frame,
+            &received,
             BackendCapability::StrictRealtime,
             ctx,
             config,
@@ -4774,6 +4882,100 @@ mod tests {
             metrics.rx_joint_position_control_grade_rejected_total.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[test]
+    fn soft_realtime_with_complete_hw_raw_groups_publishes_experimental_control_pair() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+
+        let position_frames = [
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12, 10.0, 20.0, 1_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34, 30.0, 40.0, 1_001),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56, 50.0, 60.0, 1_002),
+        ];
+        for (index, frame) in position_frames.into_iter().enumerate() {
+            parse_received_for_test(
+                &ctx,
+                &mut state,
+                &metrics,
+                &config,
+                BackendCapability::SoftRealtime,
+                received_with_hw_raw(frame, 10_000 + index as u64),
+            );
+        }
+
+        for joint_index in 1..=6 {
+            parse_received_for_test(
+                &ctx,
+                &mut state,
+                &metrics,
+                &config,
+                BackendCapability::SoftRealtime,
+                received_with_hw_raw(
+                    joint_driver_high_speed_frame(joint_index, 2_000 + u64::from(joint_index)),
+                    20_000 + u64::from(joint_index),
+                ),
+            );
+        }
+
+        let view = ctx.capture_control_read_view();
+        assert!(view.pair.position_sequence > 0);
+        assert!(view.pair.dynamic_sequence > 0);
+        assert!(view.pair.joint_position.raw_feedback_timing.is_some());
+        assert!(view.pair.joint_dynamic.raw_feedback_timing.is_some());
+    }
+
+    #[test]
+    fn soft_realtime_without_all_raw_timestamps_does_not_publish_experimental_control_pair() {
+        let ctx = Arc::new(PiperContext::new());
+        let metrics = Arc::new(PiperMetrics::new());
+        let config = PipelineConfig::default();
+        let mut state = ParserState::new();
+
+        let position_frames = [
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12, 10.0, 20.0, 1_000),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34, 30.0, 40.0, 1_001),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56, 50.0, 60.0, 1_002),
+        ];
+        for (index, frame) in position_frames.into_iter().enumerate() {
+            let received = if index == 1 {
+                received_without_raw(frame)
+            } else {
+                received_with_hw_raw(frame, 10_000 + index as u64)
+            };
+            parse_received_for_test(
+                &ctx,
+                &mut state,
+                &metrics,
+                &config,
+                BackendCapability::SoftRealtime,
+                received,
+            );
+        }
+
+        for joint_index in 1..=6 {
+            let frame = joint_driver_high_speed_frame(joint_index, 2_000 + u64::from(joint_index));
+            let received = if joint_index == 4 {
+                received_without_raw(frame)
+            } else {
+                received_with_hw_raw(frame, 20_000 + u64::from(joint_index))
+            };
+            parse_received_for_test(
+                &ctx,
+                &mut state,
+                &metrics,
+                &config,
+                BackendCapability::SoftRealtime,
+                received,
+            );
+        }
+
+        let view = ctx.capture_control_read_view();
+        assert_eq!(view.pair.position_sequence, 0);
+        assert_eq!(view.pair.dynamic_sequence, 0);
     }
 
     #[test]

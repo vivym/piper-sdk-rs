@@ -24,7 +24,7 @@
 
 use crate::{
     BackendCapability, CanAdapter, CanDeviceError, CanDeviceErrorKind, CanError, CanId, PiperFrame,
-    ReceivedFrame, TimestampProvenance,
+    RawTimestampInfo, ReceivedFrame, TimestampProvenance,
 };
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
@@ -50,6 +50,9 @@ pub use split::{SocketCanRxAdapter, SocketCanTxAdapter};
 struct TimestampInfo {
     timestamp_us: u64,
     provenance: TimestampProvenance,
+    system_ts_us: Option<u64>,
+    hw_trans_us: Option<u64>,
+    hw_raw_us: Option<u64>,
 }
 
 /// SocketCAN 适配器
@@ -346,7 +349,7 @@ impl SocketCanAdapter {
             let mut iov = [IoSliceMut::new(&mut frame_buf)];
 
             // 调用 recvmsg
-            let (msg_bytes, msg_flags, timestamp_info) = {
+            let (msg_bytes, msg_flags, timestamp_info, host_rx_mono_us) = {
                 let msg = match recvmsg::<SockaddrStorage>(
                     fd,
                     &mut iov,
@@ -365,16 +368,25 @@ impl SocketCanAdapter {
                     },
                 };
 
+                let host_rx_mono_us = crate::monotonic_micros();
                 let timestamp_info = self.extract_timestamp_from_cmsg(&msg)?;
-                (msg.bytes, msg.flags.bits(), timestamp_info)
+                (msg.bytes, msg.flags.bits(), timestamp_info, host_rx_mono_us)
             };
 
             match parse_libc_can_frame_bytes(&frame_buf, msg_bytes, msg_flags) {
                 ParsedSocketCanFrame::Data(frame) => {
+                    let raw_timestamp = RawTimestampInfo {
+                        can_id: frame.raw_id(),
+                        host_rx_mono_us,
+                        system_ts_us: timestamp_info.system_ts_us,
+                        hw_trans_us: timestamp_info.hw_trans_us,
+                        hw_raw_us: timestamp_info.hw_raw_us,
+                    };
                     return Ok(ReceivedFrame::new(
                         frame.with_timestamp_us(timestamp_info.timestamp_us),
                         timestamp_info.provenance,
-                    ));
+                    )
+                    .with_raw_timestamp(raw_timestamp));
                 },
                 ParsedSocketCanFrame::RecoverableNonData => continue,
                 ParsedSocketCanFrame::Fatal(error) => return Err(error),
@@ -407,6 +419,9 @@ impl SocketCanAdapter {
             return Ok(TimestampInfo {
                 timestamp_us: 0,
                 provenance: TimestampProvenance::None,
+                system_ts_us: None,
+                hw_trans_us: None,
+                hw_raw_us: None,
             }); // 未启用时间戳
         }
 
@@ -416,45 +431,56 @@ impl SocketCanAdapter {
                 for cmsg in cmsgs {
                     // 注意：nix 0.30 中使用 ScmTimestampsns，Timestamps 结构体有 system/hw_trans/hw_raw 字段
                     if let ControlMessageOwned::ScmTimestampsns(timestamps) = cmsg {
+                        let system_ts_us = Self::timespec_to_micros_if_nonzero(
+                            timestamps.system.tv_sec(),
+                            timestamps.system.tv_nsec(),
+                        );
+                        let hw_trans_us = Self::timespec_to_micros_if_nonzero(
+                            timestamps.hw_trans.tv_sec(),
+                            timestamps.hw_trans.tv_nsec(),
+                        );
+                        let hw_raw_us = Self::timespec_to_micros_if_nonzero(
+                            timestamps.hw_raw.tv_sec(),
+                            timestamps.hw_raw.tv_nsec(),
+                        );
+
                         // ✅ 优先级 1：硬件时间戳（已同步到系统时钟）
                         // timestamps.hw_trans 是硬件时间经过内核转换后的系统时间
                         // 这是最理想的：硬件精度 + 系统时间轴一致性
-                        let hw_trans_ts = timestamps.hw_trans;
-                        if hw_trans_ts.tv_sec() != 0 || hw_trans_ts.tv_nsec() != 0 {
+                        if let Some(timestamp_us) = hw_trans_us {
                             if !self.hw_timestamp_available {
                                 trace!("Hardware timestamp (system-synced) detected and enabled");
                                 self.hw_timestamp_available = true;
                             }
 
-                            let timestamp_us = Self::timespec_to_micros(
-                                hw_trans_ts.tv_sec(),
-                                hw_trans_ts.tv_nsec(),
-                            );
                             // SocketCAN delivers both hardware-transformed and software
                             // timestamps through kernel control messages, so expose Kernel
                             // provenance rather than claiming userspace-origin timing.
                             return Ok(TimestampInfo {
                                 timestamp_us,
                                 provenance: TimestampProvenance::Kernel,
+                                system_ts_us,
+                                hw_trans_us,
+                                hw_raw_us,
                             });
                         }
 
                         // ✅ 优先级 2：软件时间戳（系统中断时间）
                         // 如果硬件时间戳不可用，降级到软件时间戳
                         // 精度仍然很好（微秒级），适合高频力控
-                        let sw_ts = timestamps.system;
-                        if sw_ts.tv_sec() != 0 || sw_ts.tv_nsec() != 0 {
+                        if let Some(timestamp_us) = system_ts_us {
                             if !self.hw_timestamp_available {
                                 trace!(
                                     "Hardware timestamp not available, using software timestamp"
                                 );
                             }
 
-                            let timestamp_us =
-                                Self::timespec_to_micros(sw_ts.tv_sec(), sw_ts.tv_nsec());
                             return Ok(TimestampInfo {
                                 timestamp_us,
                                 provenance: TimestampProvenance::Kernel,
+                                system_ts_us,
+                                hw_trans_us,
+                                hw_raw_us,
                             });
                         }
 
@@ -462,6 +488,15 @@ impl SocketCanAdapter {
                         // timestamps.hw_raw 是网卡内部计数器，通常与系统时间不在同一量级
                         // 仅在特殊场景（如 PTP 同步）下使用
                         // 当前实现不返回此值，避免时间轴错乱
+                        if hw_raw_us.is_some() {
+                            return Ok(TimestampInfo {
+                                timestamp_us: 0,
+                                provenance: TimestampProvenance::None,
+                                system_ts_us,
+                                hw_trans_us,
+                                hw_raw_us,
+                            });
+                        }
                     }
                 }
             },
@@ -471,6 +506,9 @@ impl SocketCanAdapter {
                 return Ok(TimestampInfo {
                     timestamp_us: 0,
                     provenance: TimestampProvenance::None,
+                    system_ts_us: None,
+                    hw_trans_us: None,
+                    hw_raw_us: None,
                 });
             },
         }
@@ -479,6 +517,9 @@ impl SocketCanAdapter {
         Ok(TimestampInfo {
             timestamp_us: 0,
             provenance: TimestampProvenance::None,
+            system_ts_us: None,
+            hw_trans_us: None,
+            hw_raw_us: None,
         })
     }
 
@@ -500,6 +541,10 @@ impl SocketCanAdapter {
         // 计算：timestamp_us = tv_sec * 1_000_000 + tv_nsec / 1000
         // u64 可以存储从 Unix 纪元开始的绝对时间戳（无需截断）
         (tv_sec as u64) * 1_000_000 + ((tv_nsec as u64) / 1000)
+    }
+
+    fn timespec_to_micros_if_nonzero(tv_sec: i64, tv_nsec: i64) -> Option<u64> {
+        (tv_sec != 0 || tv_nsec != 0).then(|| Self::timespec_to_micros(tv_sec, tv_nsec))
     }
 }
 
@@ -565,7 +610,11 @@ impl SplittableAdapter for SocketCanAdapter {
         let adapter = ManuallyDrop::new(self);
 
         // 创建 RX 适配器（会克隆 socket）
-        let rx_adapter = SocketCanRxAdapter::new(&adapter.socket, adapter.read_timeout)?;
+        let rx_adapter = SocketCanRxAdapter::new_with_iface(
+            &adapter.socket,
+            adapter.read_timeout,
+            adapter.interface.clone(),
+        )?;
 
         // 创建 TX 适配器（会克隆 socket）
         let tx_adapter = SocketCanTxAdapter::new(&adapter.socket)?;

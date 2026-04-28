@@ -8,6 +8,9 @@ use thiserror::Error;
 // 重新导出 piper-protocol 中的 typed frame primitives.
 pub use piper_protocol::{CanData, CanId, ExtendedCanId, FrameError, PiperFrame, StandardCanId};
 
+pub mod raw_timestamp;
+pub use raw_timestamp::{RawTimestampInfo, RawTimestampSample, monotonic_micros};
+
 // SocketCAN (Linux only)
 // 优先级：mock 优先级最高，然后是显式 feature，最后是 auto-backend
 #[cfg(all(
@@ -129,6 +132,7 @@ pub enum TimestampProvenance {
 pub struct ReceivedFrame {
     pub frame: PiperFrame,
     pub timestamp_provenance: TimestampProvenance,
+    pub raw_timestamp: Option<RawTimestampInfo>,
 }
 
 impl ReceivedFrame {
@@ -136,7 +140,13 @@ impl ReceivedFrame {
         Self {
             frame,
             timestamp_provenance,
+            raw_timestamp: None,
         }
+    }
+
+    pub fn with_raw_timestamp(mut self, raw_timestamp: RawTimestampInfo) -> Self {
+        self.raw_timestamp = Some(raw_timestamp);
+        self
     }
 }
 

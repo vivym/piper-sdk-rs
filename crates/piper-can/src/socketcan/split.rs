@@ -24,7 +24,8 @@
 
 use crate::{
     BackendCapability, CanDeviceError, CanDeviceErrorKind, CanError, CanId, PiperFrame,
-    RealtimeTxAdapter, ReceivedFrame, RxAdapter, TimestampProvenance,
+    RawTimestampInfo, RawTimestampSample, RealtimeTxAdapter, ReceivedFrame, RxAdapter,
+    TimestampProvenance,
 };
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
@@ -105,13 +106,18 @@ enum TimestampSource {
 struct TimestampInfo {
     timestamp_us: u64,
     source: TimestampSource,
+    system_ts_us: Option<u64>,
+    hw_trans_us: Option<u64>,
+    hw_raw_us: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SocketCanReceivedFrame {
     frame: PiperFrame,
     timestamp_source: TimestampSource,
     timestamp_provenance: TimestampProvenance,
+    raw_timestamp: Option<RawTimestampInfo>,
+    raw_sample: RawTimestampSample,
 }
 
 fn classify_startup_probe_frame(
@@ -149,6 +155,7 @@ fn should_buffer_bootstrap_frame(frame: &PiperFrame) -> bool {
 /// - **时间戳支持**：使用 `recvmsg` 和 CMSG 提取硬件/软件时间戳（与 `SocketCanAdapter` 一致）
 pub struct SocketCanRxAdapter {
     socket: CanSocket,
+    iface: String,
     read_timeout: Duration,
     /// 是否启用时间戳（从原始 socket 继承，SocketCanAdapter 初始化时已启用）
     timestamping_enabled: bool,
@@ -171,6 +178,14 @@ impl SocketCanRxAdapter {
     /// # 错误
     /// - `CanError::Io`: 克隆 socket 或配置过滤器失败
     pub fn new(socket: &CanSocket, read_timeout: Duration) -> Result<Self, CanError> {
+        Self::new_with_iface(socket, read_timeout, "unknown")
+    }
+
+    pub(crate) fn new_with_iface(
+        socket: &CanSocket,
+        read_timeout: Duration,
+        iface: impl Into<String>,
+    ) -> Result<Self, CanError> {
         // 克隆 socket（使用 dup() 系统调用）
         let rx_socket = dup_socket(socket)?;
 
@@ -204,6 +219,7 @@ impl SocketCanRxAdapter {
 
         Ok(Self {
             socket: rx_socket,
+            iface: iface.into(),
             read_timeout,
             timestamping_enabled,
             hw_timestamp_available,
@@ -268,6 +284,14 @@ impl SocketCanRxAdapter {
         Ok(())
     }
 
+    pub fn receive_raw_timestamp_sample(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<RawTimestampSample, CanError> {
+        let received = self.receive_live(timeout)?;
+        Ok(received.raw_sample)
+    }
+
     fn receive_live(&mut self, timeout: Duration) -> Result<SocketCanReceivedFrame, CanError> {
         loop {
             let fd = self.socket.as_raw_fd();
@@ -292,7 +316,7 @@ impl SocketCanRxAdapter {
             let mut frame_buf = [0u8; CANFD_MTU];
             let mut cmsg_buf = [0u8; 1024];
 
-            let (msg_bytes, msg_flags, timestamp_info) = {
+            let (msg_bytes, msg_flags, timestamp_info, host_rx_mono_us) = {
                 let mut iov = [IoSliceMut::new(&mut frame_buf)];
 
                 let msg = match recvmsg::<SockaddrStorage>(
@@ -313,8 +337,9 @@ impl SocketCanRxAdapter {
                     },
                 };
 
+                let host_rx_mono_us = crate::monotonic_micros();
                 let timestamp_info = self.extract_timestamp_from_cmsg(&msg)?;
-                (msg.bytes, msg.flags.bits(), timestamp_info)
+                (msg.bytes, msg.flags.bits(), timestamp_info, host_rx_mono_us)
             };
 
             match parse_libc_can_frame_bytes(&frame_buf, msg_bytes, msg_flags) {
@@ -325,10 +350,23 @@ impl SocketCanRxAdapter {
                         },
                         TimestampSource::None => TimestampProvenance::None,
                     };
+                    let raw_timestamp = RawTimestampInfo {
+                        can_id: frame.raw_id(),
+                        host_rx_mono_us,
+                        system_ts_us: timestamp_info.system_ts_us,
+                        hw_trans_us: timestamp_info.hw_trans_us,
+                        hw_raw_us: timestamp_info.hw_raw_us,
+                    };
+                    let raw_sample = RawTimestampSample {
+                        iface: self.iface.clone(),
+                        info: raw_timestamp,
+                    };
                     return Ok(SocketCanReceivedFrame {
                         frame: frame.with_timestamp_us(timestamp_info.timestamp_us),
                         timestamp_source: timestamp_info.source,
                         timestamp_provenance,
+                        raw_timestamp: Some(raw_timestamp),
+                        raw_sample,
                     });
                 },
                 ParsedSocketCanFrame::RecoverableNonData => continue,
@@ -354,8 +392,13 @@ impl RxAdapter for SocketCanRxAdapter {
             return Ok(received);
         }
 
-        self.receive_live(self.read_timeout)
-            .map(|received| ReceivedFrame::new(received.frame, received.timestamp_provenance))
+        self.receive_live(self.read_timeout).map(|received| {
+            let mut frame = ReceivedFrame::new(received.frame, received.timestamp_provenance);
+            if let Some(raw_timestamp) = received.raw_timestamp {
+                frame = frame.with_raw_timestamp(raw_timestamp);
+            }
+            frame
+        })
     }
 
     fn backend_capability(&self) -> BackendCapability {
@@ -384,8 +427,11 @@ impl RxAdapter for SocketCanRxAdapter {
                 Ok(received) => {
                     let frame = received.frame;
                     if should_buffer_bootstrap_frame(&frame) {
-                        self.bootstrap_frames
-                            .push_back(ReceivedFrame::new(frame, received.timestamp_provenance));
+                        let mut buffered = ReceivedFrame::new(frame, received.timestamp_provenance);
+                        if let Some(raw_timestamp) = received.raw_timestamp {
+                            buffered = buffered.with_raw_timestamp(raw_timestamp);
+                        }
+                        self.bootstrap_frames.push_back(buffered);
                     }
                     let Some(capability) =
                         classify_startup_probe_frame(&frame, received.timestamp_source)
@@ -432,6 +478,9 @@ impl SocketCanRxAdapter {
             return Ok(TimestampInfo {
                 timestamp_us: 0,
                 source: TimestampSource::None,
+                system_ts_us: None,
+                hw_trans_us: None,
+                hw_raw_us: None,
             });
         }
 
@@ -440,38 +489,59 @@ impl SocketCanRxAdapter {
             Ok(cmsgs) => {
                 for cmsg in cmsgs {
                     if let ControlMessageOwned::ScmTimestampsns(timestamps) = cmsg {
+                        let system_ts_us = Self::timespec_to_micros_if_nonzero(
+                            timestamps.system.tv_sec(),
+                            timestamps.system.tv_nsec(),
+                        );
+                        let hw_trans_us = Self::timespec_to_micros_if_nonzero(
+                            timestamps.hw_trans.tv_sec(),
+                            timestamps.hw_trans.tv_nsec(),
+                        );
+                        let hw_raw_us = Self::timespec_to_micros_if_nonzero(
+                            timestamps.hw_raw.tv_sec(),
+                            timestamps.hw_raw.tv_nsec(),
+                        );
+
                         // ✅ 优先级 1：硬件时间戳（已同步到系统时钟）
-                        let hw_trans_ts = timestamps.hw_trans;
-                        if hw_trans_ts.tv_sec() != 0 || hw_trans_ts.tv_nsec() != 0 {
+                        if let Some(timestamp_us) = hw_trans_us {
                             if !self.hw_timestamp_available {
                                 trace!("Hardware timestamp (system-synced) detected and enabled");
                                 self.hw_timestamp_available = true;
                             }
 
-                            let timestamp_us = Self::timespec_to_micros(
-                                hw_trans_ts.tv_sec(),
-                                hw_trans_ts.tv_nsec(),
-                            );
                             return Ok(TimestampInfo {
                                 timestamp_us,
                                 source: TimestampSource::Hardware,
+                                system_ts_us,
+                                hw_trans_us,
+                                hw_raw_us,
                             });
                         }
 
                         // ✅ 优先级 2：软件时间戳（系统中断时间）
-                        let sw_ts = timestamps.system;
-                        if sw_ts.tv_sec() != 0 || sw_ts.tv_nsec() != 0 {
+                        if let Some(timestamp_us) = system_ts_us {
                             if !self.hw_timestamp_available {
                                 trace!(
                                     "Hardware timestamp not available, using software timestamp"
                                 );
                             }
 
-                            let timestamp_us =
-                                Self::timespec_to_micros(sw_ts.tv_sec(), sw_ts.tv_nsec());
                             return Ok(TimestampInfo {
                                 timestamp_us,
                                 source: TimestampSource::Software,
+                                system_ts_us,
+                                hw_trans_us,
+                                hw_raw_us,
+                            });
+                        }
+
+                        if hw_raw_us.is_some() {
+                            return Ok(TimestampInfo {
+                                timestamp_us: 0,
+                                source: TimestampSource::None,
+                                system_ts_us,
+                                hw_trans_us,
+                                hw_raw_us,
                             });
                         }
                     }
@@ -483,6 +553,9 @@ impl SocketCanRxAdapter {
                 return Ok(TimestampInfo {
                     timestamp_us: 0,
                     source: TimestampSource::None,
+                    system_ts_us: None,
+                    hw_trans_us: None,
+                    hw_raw_us: None,
                 });
             },
         }
@@ -491,6 +564,9 @@ impl SocketCanRxAdapter {
         Ok(TimestampInfo {
             timestamp_us: 0,
             source: TimestampSource::None,
+            system_ts_us: None,
+            hw_trans_us: None,
+            hw_raw_us: None,
         })
     }
 
@@ -504,6 +580,10 @@ impl SocketCanRxAdapter {
     /// - `u64`: 微秒数（支持绝对时间戳，从 Unix 纪元开始）
     fn timespec_to_micros(tv_sec: i64, tv_nsec: i64) -> u64 {
         (tv_sec as u64) * 1_000_000 + ((tv_nsec as u64) / 1000)
+    }
+
+    fn timespec_to_micros_if_nonzero(tv_sec: i64, tv_nsec: i64) -> Option<u64> {
+        (tv_sec != 0 || tv_nsec != 0).then(|| Self::timespec_to_micros(tv_sec, tv_nsec))
     }
 }
 
@@ -711,5 +791,48 @@ mod tests {
 
         assert!(should_buffer_bootstrap_frame(&robot_frame));
         assert!(!should_buffer_bootstrap_frame(&noise_frame));
+    }
+
+    #[test]
+    fn startup_probe_does_not_treat_raw_only_timestamp_as_strict() {
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8]).unwrap();
+
+        assert_eq!(
+            classify_startup_probe_frame(&frame, TimestampSource::None),
+            None
+        );
+    }
+
+    #[test]
+    fn timestamp_info_with_hw_raw_only_is_not_hardware_source() {
+        let info = TimestampInfo {
+            timestamp_us: 123,
+            source: TimestampSource::Software,
+            system_ts_us: Some(123),
+            hw_trans_us: None,
+            hw_raw_us: Some(100),
+        };
+
+        assert_eq!(info.source, TimestampSource::Software);
+        assert!(info.hw_raw_us.is_some());
+        assert!(info.hw_trans_us.is_none());
+    }
+
+    #[test]
+    fn received_frame_can_carry_raw_timestamp_without_changing_provenance() {
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8]).unwrap();
+        let raw = crate::RawTimestampInfo {
+            can_id: ID_JOINT_FEEDBACK_12.raw() as u32,
+            host_rx_mono_us: 123,
+            system_ts_us: Some(123),
+            hw_trans_us: None,
+            hw_raw_us: Some(100),
+        };
+
+        let received =
+            ReceivedFrame::new(frame, TimestampProvenance::Kernel).with_raw_timestamp(raw);
+
+        assert_eq!(received.timestamp_provenance, TimestampProvenance::Kernel);
+        assert_eq!(received.raw_timestamp, Some(raw));
     }
 }

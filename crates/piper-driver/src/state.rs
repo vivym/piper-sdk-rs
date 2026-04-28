@@ -221,6 +221,40 @@ impl<T: Copy + Default, const N: usize> Drop for RealtimeSnapshotSlotGuard<'_, T
     }
 }
 
+/// Raw SocketCAN timestamp timing preserved from a contributing feedback frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RawFeedbackTiming {
+    pub can_id: u32,
+    pub host_rx_mono_us: u64,
+    pub system_ts_us: Option<u64>,
+    pub hw_trans_us: Option<u64>,
+    pub hw_raw_us: Option<u64>,
+}
+
+impl RawFeedbackTiming {
+    pub fn from_raw_timestamp(raw: piper_can::RawTimestampInfo) -> Option<Self> {
+        Some(Self {
+            can_id: raw.can_id,
+            host_rx_mono_us: raw.host_rx_mono_us,
+            system_ts_us: raw.system_ts_us,
+            hw_trans_us: raw.hw_trans_us,
+            hw_raw_us: raw.hw_raw_us,
+        })
+    }
+
+    pub fn newest(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(left), Some(right)) => Some(if right.host_rx_mono_us >= left.host_rx_mono_us {
+                right
+            } else {
+                left
+            }),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        }
+    }
+}
+
 /// 关节位置状态（帧组同步）
 ///
 /// 更新频率：~500Hz
@@ -236,6 +270,9 @@ pub struct JointPositionState {
     ///
     /// **注意**：这是系统时间戳，用于计算接收延迟和系统处理时间。
     pub host_rx_mono_us: u64,
+
+    /// Newest raw timestamp timing from the position feedback frames that built this state.
+    pub raw_feedback_timing: Option<RawFeedbackTiming>,
 
     /// 关节位置（弧度）[J1, J2, J3, J4, J5, J6]
     pub joint_pos: [f64; 6],
@@ -427,6 +464,9 @@ pub struct JointDynamicState {
     pub group_timestamp_us: u64,
     /// 整个组在主机侧提交时的系统时间戳（微秒）
     pub group_host_rx_mono_us: u64,
+
+    /// Newest raw timestamp timing from the dynamic feedback frames that built this state.
+    pub raw_feedback_timing: Option<RawFeedbackTiming>,
 
     // === 关节速度/电流（来自 0x251-0x256，独立帧） ===
     /// 关节速度（rad/s）[J1, J2, J3, J4, J5, J6]
@@ -2702,6 +2742,8 @@ pub struct AlignedMotionState {
     pub dynamic_timestamp_us: u64,
     pub position_host_rx_mono_us: u64,
     pub dynamic_host_rx_mono_us: u64,
+    pub position_raw_feedback_timing: Option<RawFeedbackTiming>,
+    pub dynamic_raw_feedback_timing: Option<RawFeedbackTiming>,
     pub position_frame_valid_mask: u8,
     pub dynamic_valid_mask: u8,
     pub dynamic_group_span_us: u64,
@@ -2727,6 +2769,13 @@ impl AlignedMotionState {
     /// 控制级 pair 的反馈年龄（取位置/动态中较老的一侧）。
     pub fn feedback_age(&self) -> std::time::Duration {
         control_feedback_age(self.position_host_rx_mono_us, self.dynamic_host_rx_mono_us)
+    }
+
+    pub fn newest_raw_feedback_timing(&self) -> Option<RawFeedbackTiming> {
+        RawFeedbackTiming::newest(
+            self.position_raw_feedback_timing,
+            self.dynamic_raw_feedback_timing,
+        )
     }
 }
 
@@ -2883,6 +2932,7 @@ mod tests {
         JointPositionState {
             hardware_timestamp_us: seq,
             host_rx_mono_us: seq.saturating_add(1_000),
+            raw_feedback_timing: None,
             joint_pos: std::array::from_fn(|index| seq as f64 + index as f64),
             frame_valid_mask: mask,
         }
@@ -2901,11 +2951,81 @@ mod tests {
         JointDynamicState {
             group_timestamp_us: seq,
             group_host_rx_mono_us: seq.saturating_add(3_000),
+            raw_feedback_timing: None,
             joint_vel: std::array::from_fn(|index| seq as f64 + index as f64 * 0.1),
             joint_current: std::array::from_fn(|index| seq as f64 + index as f64 * 0.01),
             timestamps: std::array::from_fn(|index| seq.saturating_add(index as u64)),
             valid_mask: mask,
         }
+    }
+
+    fn sample_raw_feedback_timing(can_id: u32, host_rx_mono_us: u64) -> RawFeedbackTiming {
+        RawFeedbackTiming {
+            can_id,
+            host_rx_mono_us,
+            system_ts_us: Some(host_rx_mono_us.saturating_sub(10)),
+            hw_trans_us: None,
+            hw_raw_us: Some(host_rx_mono_us.saturating_sub(100)),
+        }
+    }
+
+    #[test]
+    fn raw_feedback_timing_defaults_to_none_and_selects_newest_by_host_time() {
+        assert!(JointPositionState::default().raw_feedback_timing.is_none());
+        assert!(JointDynamicState::default().raw_feedback_timing.is_none());
+
+        let older = sample_raw_feedback_timing(0x2A5, 1_000);
+        let newer = sample_raw_feedback_timing(0x256, 1_500);
+
+        assert_eq!(
+            RawFeedbackTiming::newest(Some(older), Some(newer)),
+            Some(newer)
+        );
+        assert_eq!(RawFeedbackTiming::newest(Some(older), None), Some(older));
+        assert_eq!(RawFeedbackTiming::newest(None, Some(newer)), Some(newer));
+        assert_eq!(RawFeedbackTiming::newest(None, None), None);
+    }
+
+    #[test]
+    fn raw_feedback_timing_preserves_raw_timestamp_info_fields() {
+        let raw = piper_can::RawTimestampInfo {
+            can_id: 0x251,
+            host_rx_mono_us: 5_000,
+            system_ts_us: Some(4_900),
+            hw_trans_us: Some(4_800),
+            hw_raw_us: Some(123_456),
+        };
+
+        let timing = RawFeedbackTiming::from_raw_timestamp(raw).unwrap();
+
+        assert_eq!(timing.can_id, raw.can_id);
+        assert_eq!(timing.host_rx_mono_us, raw.host_rx_mono_us);
+        assert_eq!(timing.system_ts_us, raw.system_ts_us);
+        assert_eq!(timing.hw_trans_us, raw.hw_trans_us);
+        assert_eq!(timing.hw_raw_us, raw.hw_raw_us);
+    }
+
+    #[test]
+    fn aligned_motion_exposes_newest_raw_feedback_timing_from_position_and_dynamic() {
+        let older = sample_raw_feedback_timing(0x2A7, 11_003);
+        let newer = sample_raw_feedback_timing(0x256, 11_006);
+        let state = AlignedMotionState {
+            joint_pos: [0.0; 6],
+            joint_vel: [0.0; 6],
+            joint_current: [0.0; 6],
+            position_timestamp_us: 1_000,
+            dynamic_timestamp_us: 1_001,
+            position_host_rx_mono_us: 11_003,
+            dynamic_host_rx_mono_us: 11_006,
+            position_raw_feedback_timing: Some(older),
+            dynamic_raw_feedback_timing: Some(newer),
+            position_frame_valid_mask: 0b111,
+            dynamic_valid_mask: 0b111111,
+            dynamic_group_span_us: 1,
+            skew_us: 1,
+        };
+
+        assert_eq!(state.newest_raw_feedback_timing(), Some(newer));
     }
 
     #[test]
@@ -3068,6 +3188,7 @@ mod tests {
         let state = JointDynamicState {
             group_timestamp_us: 1000,
             group_host_rx_mono_us: 2000,
+            raw_feedback_timing: None,
             joint_vel: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             joint_current: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
             timestamps: [100, 200, 300, 400, 500, 600],
@@ -3098,6 +3219,8 @@ mod tests {
             dynamic_group_span_us: 0,
             position_host_rx_mono_us: 2000,
             dynamic_host_rx_mono_us: 2500,
+            position_raw_feedback_timing: None,
+            dynamic_raw_feedback_timing: None,
             position_frame_valid_mask: 0b111,
             dynamic_valid_mask: 0b111111,
             skew_us: 500,
@@ -3117,6 +3240,8 @@ mod tests {
             dynamic_group_span_us: 0,
             position_host_rx_mono_us: 2000,
             dynamic_host_rx_mono_us: 2500,
+            position_raw_feedback_timing: None,
+            dynamic_raw_feedback_timing: None,
             position_frame_valid_mask: 0b111,
             dynamic_valid_mask: 0b111111,
             skew_us: 500,
@@ -3138,6 +3263,8 @@ mod tests {
                 dynamic_group_span_us: 0,
                 position_host_rx_mono_us: 2000,
                 dynamic_host_rx_mono_us: 2500,
+                position_raw_feedback_timing: None,
+                dynamic_raw_feedback_timing: None,
                 position_frame_valid_mask: 0b111,
                 dynamic_valid_mask: 0b111111,
                 skew_us: 500,
@@ -3160,6 +3287,8 @@ mod tests {
             dynamic_group_span_us: 0,
             position_host_rx_mono_us: 2000,
             dynamic_host_rx_mono_us: 2500,
+            position_raw_feedback_timing: None,
+            dynamic_raw_feedback_timing: None,
             position_frame_valid_mask: 0b111,
             dynamic_valid_mask: 0b111111,
             skew_us: 500,
@@ -3183,6 +3312,8 @@ mod tests {
             dynamic_group_span_us: 0,
             position_host_rx_mono_us: 0,
             dynamic_host_rx_mono_us: 0,
+            position_raw_feedback_timing: None,
+            dynamic_raw_feedback_timing: None,
             position_frame_valid_mask: 0b111,
             dynamic_valid_mask: 0b111111,
             skew_us: 0,
@@ -3220,6 +3351,7 @@ mod tests {
         let state = JointPositionState {
             hardware_timestamp_us: 1000,
             host_rx_mono_us: 2000,
+            raw_feedback_timing: None,
             joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             frame_valid_mask: 0b0000_0111, // Bit 0-2 全部为 1
         };
@@ -3286,6 +3418,7 @@ mod tests {
         let state = JointPositionState {
             hardware_timestamp_us: 1000,
             host_rx_mono_us: 2000,
+            raw_feedback_timing: None,
             joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             frame_valid_mask: 0b0000_0111,
         };
@@ -3388,6 +3521,7 @@ mod tests {
             joint_position: JointPositionState {
                 hardware_timestamp_us: 1000,
                 host_rx_mono_us: 2000,
+                raw_feedback_timing: None,
                 joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 frame_valid_mask: 0b0000_0111,
             },
@@ -3425,6 +3559,7 @@ mod tests {
         let joint_position = JointPositionState {
             hardware_timestamp_us: 101,
             host_rx_mono_us: 202,
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         };
@@ -3538,6 +3673,7 @@ mod tests {
         let complete = JointPositionState {
             hardware_timestamp_us: 100,
             host_rx_mono_us: 200,
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         };
@@ -3553,6 +3689,7 @@ mod tests {
         ctx.publish_raw_joint_position(JointPositionState {
             hardware_timestamp_us: 101,
             host_rx_mono_us: 201,
+            raw_feedback_timing: None,
             joint_pos: [2.0; 6],
             frame_valid_mask: 0b001,
         });
@@ -3604,6 +3741,7 @@ mod tests {
         let complete = JointDynamicState {
             group_timestamp_us: 500,
             group_host_rx_mono_us: 600,
+            raw_feedback_timing: None,
             joint_vel: [1.0; 6],
             joint_current: [2.0; 6],
             timestamps: [10; 6],
@@ -3621,6 +3759,7 @@ mod tests {
         ctx.publish_raw_joint_dynamic(JointDynamicState {
             group_timestamp_us: 501,
             group_host_rx_mono_us: 601,
+            raw_feedback_timing: None,
             joint_vel: [3.0; 6],
             joint_current: [4.0; 6],
             timestamps: [20; 6],

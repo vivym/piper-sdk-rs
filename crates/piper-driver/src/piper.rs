@@ -3520,6 +3520,8 @@ impl Piper {
             dynamic_timestamp_us: joint_dynamic.group_timestamp_us,
             position_host_rx_mono_us: joint_position.host_rx_mono_us,
             dynamic_host_rx_mono_us: joint_dynamic.group_host_rx_mono_us,
+            position_raw_feedback_timing: joint_position.raw_feedback_timing,
+            dynamic_raw_feedback_timing: joint_dynamic.raw_feedback_timing,
             position_frame_valid_mask: joint_position.frame_valid_mask,
             dynamic_valid_mask: joint_dynamic.valid_mask,
             dynamic_group_span_us: joint_dynamic.group_span_us(),
@@ -6781,12 +6783,14 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
             host_rx_mono_us: 2_000,
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         });
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 1_000,
             group_host_rx_mono_us: 2_000,
+            raw_feedback_timing: None,
             joint_vel: [2.0; 6],
             joint_current: [3.0; 6],
             timestamps: [1_000; 6],
@@ -6811,6 +6815,50 @@ mod tests {
     }
 
     #[test]
+    fn aligned_motion_exposes_newest_raw_feedback_timing_from_contributing_frames() {
+        let mock_can = MockCanAdapter;
+        let piper = Piper::new_dual_thread(mock_can, None).unwrap();
+        let position_raw = RawFeedbackTiming {
+            can_id: 0x2A7,
+            host_rx_mono_us: 11_003,
+            system_ts_us: Some(11_001),
+            hw_trans_us: None,
+            hw_raw_us: Some(10_003),
+        };
+        let dynamic_raw = RawFeedbackTiming {
+            can_id: 0x256,
+            host_rx_mono_us: 11_006,
+            system_ts_us: Some(11_004),
+            hw_trans_us: None,
+            hw_raw_us: Some(10_006),
+        };
+
+        piper.ctx.publish_control_joint_position(JointPositionState {
+            hardware_timestamp_us: 1_000,
+            host_rx_mono_us: 11_003,
+            raw_feedback_timing: Some(position_raw),
+            joint_pos: [0.0; 6],
+            frame_valid_mask: 0b0000_0111,
+        });
+        piper.ctx.publish_control_joint_dynamic(JointDynamicState {
+            group_timestamp_us: 1_001,
+            group_host_rx_mono_us: 11_006,
+            raw_feedback_timing: Some(dynamic_raw),
+            joint_vel: [0.0; 6],
+            joint_current: [0.0; 6],
+            timestamps: [1_001; 6],
+            valid_mask: 0b0011_1111,
+        });
+
+        let state = match piper.get_aligned_motion(5_000, Duration::from_secs(3600)) {
+            AlignmentResult::Ok(state) => state,
+            other => panic!("expected aligned state, got {other:?}"),
+        };
+
+        assert_eq!(state.newest_raw_feedback_timing(), Some(dynamic_raw));
+    }
+
+    #[test]
     fn test_get_aligned_motion_misaligned_threshold() {
         let mock_can = MockCanAdapter;
         let piper = Piper::new_dual_thread(mock_can, None).unwrap();
@@ -6818,12 +6866,14 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
             host_rx_mono_us: 2_000,
+            raw_feedback_timing: None,
             joint_pos: [0.0; 6],
             frame_valid_mask: 0b111,
         });
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 2_000,
             group_host_rx_mono_us: 3_000,
+            raw_feedback_timing: None,
             joint_vel: [0.0; 6],
             joint_current: [0.0; 6],
             timestamps: [2_000; 6],
@@ -8557,12 +8607,14 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
             host_rx_mono_us: 2_000,
+            raw_feedback_timing: None,
             joint_pos: [0.0; 6],
             frame_valid_mask: 0b101,
         });
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 1_000,
             group_host_rx_mono_us: 2_000,
+            raw_feedback_timing: None,
             joint_vel: [0.0; 6],
             joint_current: [0.0; 6],
             timestamps: [1_000; 6],
@@ -8596,6 +8648,7 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
             host_rx_mono_us: 2_000,
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         });
@@ -8627,12 +8680,14 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
             host_rx_mono_us: 2_000,
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         });
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 1_000,
             group_host_rx_mono_us: 2_000,
+            raw_feedback_timing: None,
             joint_vel: [10.0; 6],
             joint_current: [20.0; 6],
             timestamps: [1_000; 6],
@@ -8651,6 +8706,7 @@ mod tests {
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 3_000,
             group_host_rx_mono_us: 4_000,
+            raw_feedback_timing: None,
             joint_vel: [30.0; 6],
             joint_current: [40.0; 6],
             timestamps: [3_000; 6],
@@ -8676,6 +8732,7 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 3_000,
             host_rx_mono_us: 4_000,
+            raw_feedback_timing: None,
             joint_pos: [3.0; 6],
             frame_valid_mask: 0b111,
         });
@@ -8706,12 +8763,14 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 1_000,
             host_rx_mono_us: now,
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         });
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 1_000,
             group_host_rx_mono_us: now,
+            raw_feedback_timing: None,
             joint_vel: [10.0; 6],
             joint_current: [20.0; 6],
             timestamps: [1_000; 6],
@@ -8732,12 +8791,14 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 2_000,
             host_rx_mono_us: now,
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         });
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 2_000,
             group_host_rx_mono_us: now.saturating_sub(20_000),
+            raw_feedback_timing: None,
             joint_vel: [10.0; 6],
             joint_current: [20.0; 6],
             timestamps: [2_000; 6],
@@ -8757,12 +8818,14 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 3_000,
             host_rx_mono_us: now.saturating_sub(20_000),
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         });
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 3_000,
             group_host_rx_mono_us: now,
+            raw_feedback_timing: None,
             joint_vel: [10.0; 6],
             joint_current: [20.0; 6],
             timestamps: [3_000; 6],
@@ -8781,12 +8844,14 @@ mod tests {
         piper.ctx.publish_control_joint_position(JointPositionState {
             hardware_timestamp_us: 4_000,
             host_rx_mono_us: now,
+            raw_feedback_timing: None,
             joint_pos: [1.0; 6],
             frame_valid_mask: 0b111,
         });
         piper.ctx.publish_control_joint_dynamic(JointDynamicState {
             group_timestamp_us: 4_000,
             group_host_rx_mono_us: now,
+            raw_feedback_timing: None,
             joint_vel: [10.0; 6],
             joint_current: [20.0; 6],
             timestamps: [4_000; 6],
