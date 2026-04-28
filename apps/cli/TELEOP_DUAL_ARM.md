@@ -118,8 +118,9 @@ piper-cli teleop dual-arm \
   --report-json artifacts/teleop/raw-clock-report.json
 ```
 
-The report must show `timing_source=calibrated_hw_raw`,
-`experimental=true`, and `strict_realtime=false`.
+The JSON report must show `timing.timing_source=calibrated_hw_raw`,
+`timing.experimental=true`, and `timing.strict_realtime=false`. The human
+report prints the same timing values with bare field names.
 
 ### Experimental Acceptance Checklist
 
@@ -131,13 +132,14 @@ The report must show `timing_source=calibrated_hw_raw`,
 4. Probe JSON residuals are within the configured thresholds, including
    `left.health.residual_p95_us`, `right.health.residual_p95_us`,
    `left.health.residual_max_us`, and `right.health.residual_max_us`.
-5. Probe JSON shows `max_estimated_inter_arm_skew_us` within the configured
-   threshold.
+5. Probe JSON shows `max_estimated_inter_arm_skew_us` within the teleop
+   raw-clock threshold for the trial, `--raw-clock-inter-arm-skew-max-us`, or
+   its default if the flag is omitted.
 6. The bounded normal `master-follower` trial exits cleanly with
    `exit.clean=true`, `exit.reason=max_iterations`, and `exit.faulted=false`.
-7. Teleop report marks the run experimental and non-strict with
-   `timing_source=calibrated_hw_raw`, `experimental=true`, and
-   `strict_realtime=false`.
+7. Teleop JSON report marks the run experimental and non-strict with
+   `timing.timing_source=calibrated_hw_raw`, `timing.experimental=true`, and
+   `timing.strict_realtime=false`.
 8. The bounded normal teleop report shows no clock-health, runtime, read, or
    submission faults: `timing.clock_health_failures=0`, `exit.last_error=null`,
    `metrics.read_faults=0`, and `metrics.submission_faults=0`.
