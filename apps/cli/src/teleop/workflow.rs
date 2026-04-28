@@ -29,14 +29,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::commands::teleop::TeleopDualArmArgs;
 use crate::teleop::calibration::{CalibrationFile, check_posture_compatibility};
 use crate::teleop::config::{
-    ResolvedTeleopConfig, TeleopConfigFile, TeleopMode, TeleopProfile, TeleopRawClockSettings,
+    ResolvedTeleopConfig, TeleopConfigFile, TeleopJointMap, TeleopMode, TeleopProfile,
+    TeleopRawClockSettings,
 };
 use crate::teleop::controller::{
     RuntimeTeleopController, RuntimeTeleopSettings, RuntimeTeleopSettingsHandle,
 };
 use crate::teleop::report::{
-    ReportCalibration, ReportTiming, TeleopExitStatus, TeleopJsonReport, TeleopReportInput,
-    classify_exit, print_human_report,
+    ReportCalibration, ReportJointMotion, ReportTiming, TeleopExitStatus, TeleopJsonReport,
+    TeleopReportInput, classify_exit, print_human_report,
 };
 use crate::teleop::target::{
     ConcreteTeleopTarget, RoleTargets, TeleopPlatform, resolve_role_targets,
@@ -44,7 +45,7 @@ use crate::teleop::target::{
 
 const CALIBRATED_HW_RAW_TIMING_SOURCE: &str = "calibrated_hw_raw";
 const EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_secs(2);
-const EXPERIMENTAL_ACTIVE_SOFT_SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_millis(200);
+const EXPERIMENTAL_ACTIVE_SOFT_SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub trait TeleopBackend {
@@ -83,8 +84,6 @@ pub trait ExperimentalRawClockTeleopBackend {
         max_iterations: Option<usize>,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<RawClockWarmupSummary>;
-
-    fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration>;
 
     fn standby_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot>;
 
@@ -139,6 +138,7 @@ pub struct ExperimentalRawClockRunExit {
 pub trait TeleopIo {
     fn cancel_signal(&self) -> Arc<AtomicBool>;
     fn confirm_start(&mut self, summary: &StartupSummary) -> Result<bool>;
+    fn startup_status(&mut self, stage: StartupStage) -> Result<()>;
     fn cancel_requested(&self) -> bool;
     fn start_console(
         &mut self,
@@ -146,6 +146,17 @@ pub trait TeleopIo {
         started_at: Instant,
     ) -> Result<Option<JoinHandle<Result<()>>>>;
     fn write_json_report(&mut self, path: &Path, report: &TeleopJsonReport) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupStage {
+    RefreshingRawClock { warmup_secs: u64 },
+    CheckingPreEnablePosture,
+    EnablingMitPassthrough,
+    ReadingActiveSnapshot,
+    CapturingActiveZeroCalibration,
+    CheckingPostEnablePosture,
+    StartingControlLoop,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +172,7 @@ pub struct StartupSummary {
     pub reflection_gain: f64,
     pub calibration_source: String,
     pub calibration_path: Option<PathBuf>,
+    pub calibration_joint_map: Option<TeleopJointMap>,
     pub gripper_mirror: bool,
     pub experimental: bool,
     pub strict_realtime: bool,
@@ -183,6 +195,7 @@ impl StartupSummary {
             reflection_gain: 0.25,
             calibration_source: "captured".to_string(),
             calibration_path: None,
+            calibration_joint_map: Some(TeleopJointMap::LeftRightMirror),
             gripper_mirror: false,
             experimental: true,
             strict_realtime: false,
@@ -258,8 +271,10 @@ where
             },
         ),
         None => {
-            let calibration =
-                TeleopBackend::capture_calibration(backend, JointMirrorMap::left_right_mirror())?;
+            let calibration = TeleopBackend::capture_calibration(
+                backend,
+                resolved.calibration.joint_map.to_joint_mirror_map(),
+            )?;
             let created_at_unix_ms = current_unix_ms();
             if let Some(path) = &args.save_calibration {
                 // The Task 8 startup order saves captured calibration before operator confirmation.
@@ -293,6 +308,8 @@ where
             .file
             .clone()
             .or_else(|| args.save_calibration.clone()),
+        calibration_joint_map: (report_calibration.source == "captured")
+            .then_some(resolved.calibration.joint_map),
         gripper_mirror: resolved.safety.gripper_mirror,
         experimental: false,
         strict_realtime: true,
@@ -399,6 +416,7 @@ where
         safety: resolved.safety.clone(),
         calibration: report_calibration,
         timing: None,
+        joint_motion: None,
         faulted: loop_exit.faulted,
         report: &loop_exit.report,
     });
@@ -449,37 +467,15 @@ where
 
     let loaded_calibration =
         resolved.calibration.file.as_deref().map(load_calibration).transpose()?;
-    let (calibration, report_calibration) = match loaded_calibration {
-        Some((file, calibration)) => (
-            calibration,
-            ReportCalibration {
-                source: "file".to_string(),
-                path: resolved.calibration.file.as_ref().map(|path| path.display().to_string()),
-                created_at_unix_ms: Some(file.created_at_unix_ms),
-                max_error_rad: resolved.calibration.max_error_rad,
-            },
-        ),
-        None => {
-            let calibration = ExperimentalRawClockTeleopBackend::capture_calibration(
-                backend,
-                JointMirrorMap::left_right_mirror(),
-            )?;
-            let created_at_unix_ms = current_unix_ms();
-            if let Some(path) = &args.save_calibration {
-                CalibrationFile::from_calibration(&calibration, None, created_at_unix_ms)
-                    .save_new(path)?;
-            }
-            (
-                calibration,
-                ReportCalibration {
-                    source: "captured".to_string(),
-                    path: args.save_calibration.as_ref().map(|path| path.display().to_string()),
-                    created_at_unix_ms: Some(created_at_unix_ms),
-                    max_error_rad: resolved.calibration.max_error_rad,
-                },
-            )
-        },
+    let summary_calibration_source = if loaded_calibration.is_some() {
+        "file"
+    } else {
+        "captured"
     };
+    let summary_calibration_path =
+        resolved.calibration.file.clone().or_else(|| args.save_calibration.clone());
+    let summary_calibration_joint_map =
+        loaded_calibration.is_none().then_some(resolved.calibration.joint_map);
 
     let summary = StartupSummary {
         targets: targets.clone(),
@@ -490,12 +486,9 @@ where
         track_kd: resolved.control.track_kd,
         master_damping: resolved.control.master_damping,
         reflection_gain: resolved.control.reflection_gain,
-        calibration_source: report_calibration.source.clone(),
-        calibration_path: resolved
-            .calibration
-            .file
-            .clone()
-            .or_else(|| args.save_calibration.clone()),
+        calibration_source: summary_calibration_source.to_string(),
+        calibration_path: summary_calibration_path,
+        calibration_joint_map: summary_calibration_joint_map,
         gripper_mirror: resolved.safety.gripper_mirror,
         experimental: true,
         strict_realtime: false,
@@ -510,6 +503,9 @@ where
         bail!("operator confirmation declined");
     }
 
+    io.startup_status(StartupStage::RefreshingRawClock {
+        warmup_secs: resolved.raw_clock.warmup_secs,
+    })?;
     let warmup = match backend.warmup_raw_clock(
         &resolved.raw_clock,
         resolved.control.frequency_hz,
@@ -523,29 +519,25 @@ where
         Err(error) => return Err(error).context("post-confirmation raw-clock refresh failed"),
     };
 
-    let standby_snapshot = ExperimentalRawClockTeleopBackend::standby_snapshot(
-        backend,
-        experimental_raw_clock_dual_arm_read_policy(),
-    )?;
-    check_snapshot_posture(
-        &calibration,
-        &standby_snapshot,
-        resolved.calibration.max_error_rad,
-    )
-    .context("pre-enable posture compatibility check failed")?;
+    if let Some((_, calibration)) = &loaded_calibration {
+        io.startup_status(StartupStage::CheckingPreEnablePosture)?;
+        let standby_snapshot = ExperimentalRawClockTeleopBackend::standby_snapshot(
+            backend,
+            experimental_raw_clock_dual_arm_read_policy(),
+        )?;
+        check_snapshot_posture(
+            calibration,
+            &standby_snapshot,
+            resolved.calibration.max_error_rad,
+        )
+        .context("pre-enable posture compatibility check failed")?;
+    }
 
     if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
         return Ok(TeleopExitStatus::Success);
     }
 
-    let settings = RuntimeTeleopSettings::production(calibration.clone())
-        .with_mode(resolved.control.mode)?
-        .with_track_gains(resolved.control.track_kp, resolved.control.track_kd)?
-        .with_master_damping(resolved.control.master_damping)?
-        .with_reflection_gain(resolved.control.reflection_gain)?;
-    let settings_handle = RuntimeTeleopSettingsHandle::new(settings)?;
-    let initial_mode = settings_handle.snapshot().mode;
-
+    io.startup_status(StartupStage::EnablingMitPassthrough)?;
     backend.enable_mit_passthrough(MitModeConfig::default(), MitModeConfig::default())?;
 
     if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
@@ -555,6 +547,7 @@ where
         return Ok(TeleopExitStatus::Success);
     }
 
+    io.startup_status(StartupStage::ReadingActiveSnapshot)?;
     let active_snapshot = match ExperimentalRawClockTeleopBackend::active_snapshot(
         backend,
         experimental_raw_clock_dual_arm_read_policy(),
@@ -564,20 +557,91 @@ where
             return disable_experimental_after_error(backend, "active snapshot read failed", error);
         },
     };
-    if let Err(error) = check_snapshot_posture(
-        &calibration,
-        &active_snapshot,
-        resolved.calibration.max_error_rad,
-    ) {
-        backend
-            .disable_active_passthrough()
-            .context("failed to disable experimental raw-clock teleop after posture mismatch")?;
-        return Err(error).context("post-enable posture compatibility check failed");
-    }
+    let (calibration, report_calibration) = match loaded_calibration {
+        Some((file, calibration)) => {
+            io.startup_status(StartupStage::CheckingPostEnablePosture)?;
+            if let Err(error) = check_snapshot_posture(
+                &calibration,
+                &active_snapshot,
+                resolved.calibration.max_error_rad,
+            ) {
+                backend.disable_active_passthrough().context(
+                    "failed to disable experimental raw-clock teleop after posture mismatch",
+                )?;
+                return Err(error).context("post-enable posture compatibility check failed");
+            }
+            (
+                calibration,
+                ReportCalibration {
+                    source: "file".to_string(),
+                    path: resolved.calibration.file.as_ref().map(|path| path.display().to_string()),
+                    created_at_unix_ms: Some(file.created_at_unix_ms),
+                    max_error_rad: resolved.calibration.max_error_rad,
+                },
+            )
+        },
+        None => {
+            io.startup_status(StartupStage::CapturingActiveZeroCalibration)?;
+            let calibration = calibration_from_snapshot(
+                &active_snapshot,
+                resolved.calibration.joint_map.to_joint_mirror_map(),
+            );
+            let created_at_unix_ms = current_unix_ms();
+            if let Some(path) = &args.save_calibration
+                && let Err(error) =
+                    CalibrationFile::from_calibration(&calibration, None, created_at_unix_ms)
+                        .save_new(path)
+            {
+                return disable_experimental_after_error(
+                    backend,
+                    "failed to save experimental raw-clock calibration",
+                    error,
+                );
+            }
+            (
+                calibration,
+                ReportCalibration {
+                    source: "captured".to_string(),
+                    path: args.save_calibration.as_ref().map(|path| path.display().to_string()),
+                    created_at_unix_ms: Some(created_at_unix_ms),
+                    max_error_rad: resolved.calibration.max_error_rad,
+                },
+            )
+        },
+    };
+
+    let settings = match (|| {
+        RuntimeTeleopSettings::production(calibration.clone())
+            .with_mode(resolved.control.mode)?
+            .with_track_gains(resolved.control.track_kp, resolved.control.track_kd)?
+            .with_master_damping(resolved.control.master_damping)?
+            .with_reflection_gain(resolved.control.reflection_gain)
+    })() {
+        Ok(settings) => settings,
+        Err(error) => {
+            return disable_experimental_after_error(
+                backend,
+                "failed to build runtime teleop settings",
+                error,
+            );
+        },
+    };
+    let settings_handle = match RuntimeTeleopSettingsHandle::new(settings) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return disable_experimental_after_error(
+                backend,
+                "failed to initialize runtime teleop settings",
+                error,
+            );
+        },
+    };
+    let initial_mode = settings_handle.snapshot().mode;
 
     let started_at = Instant::now();
     let console_handle = None;
 
+    io.startup_status(StartupStage::StartingControlLoop)?;
     let loop_exit = backend.run_master_follower_raw_clock(
         settings_handle.clone(),
         resolved.raw_clock.clone(),
@@ -598,6 +662,7 @@ where
         safety: resolved.safety.clone(),
         calibration: report_calibration,
         timing: Some(timing.clone()),
+        joint_motion: report_joint_motion_from_raw_clock(&loop_exit.report),
         faulted,
         report: &bilateral_report,
     });
@@ -662,6 +727,21 @@ fn report_timing_from_raw_clock(
             .clock_health_failures
             .saturating_add(warmup.clock_health_failures),
     }
+}
+
+fn report_joint_motion_from_raw_clock(report: &RawClockRuntimeReport) -> Option<ReportJointMotion> {
+    let stats = report.joint_motion?;
+    Some(ReportJointMotion {
+        master_feedback_min_rad: stats.master_feedback_min_rad,
+        master_feedback_max_rad: stats.master_feedback_max_rad,
+        master_feedback_delta_rad: stats.master_feedback_delta_rad,
+        slave_command_min_rad: stats.slave_command_min_rad,
+        slave_command_max_rad: stats.slave_command_max_rad,
+        slave_command_delta_rad: stats.slave_command_delta_rad,
+        slave_feedback_min_rad: stats.slave_feedback_min_rad,
+        slave_feedback_max_rad: stats.slave_feedback_max_rad,
+        slave_feedback_delta_rad: stats.slave_feedback_delta_rad,
+    })
 }
 
 fn bilateral_report_from_raw_clock(report: &RawClockRuntimeReport) -> BilateralRunReport {
@@ -895,6 +975,17 @@ fn check_snapshot_posture(
         max_error_rad,
     )
     .context("posture is incompatible with calibration")
+}
+
+fn calibration_from_snapshot(
+    snapshot: &DualArmSnapshot,
+    map: JointMirrorMap,
+) -> DualArmCalibration {
+    DualArmCalibration {
+        master_zero: snapshot.left.state.position,
+        slave_zero: snapshot.right.state.position,
+        map,
+    }
 }
 
 fn current_unix_ms() -> u64 {
@@ -1151,28 +1242,6 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         self.experimental_phase = ExperimentalBackendPhase::WarmedStandby;
 
         Ok(RawClockWarmupSummary::default())
-    }
-
-    fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration> {
-        self.require_experimental_phase(ExperimentalBackendPhase::WarmedStandby, "warmed standby")?;
-        self.experimental_standby
-            .as_ref()
-            .context("experimental raw-clock backend is not in warmed standby")?;
-        let observers = self
-            .experimental_observers
-            .as_ref()
-            .context("experimental raw-clock backend is not connected")?;
-        let snapshot = wait_for_experimental_soft_snapshot_ready(
-            "calibration capture",
-            EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT,
-            EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL,
-            || experimental_soft_snapshot(observers, experimental_raw_clock_dual_arm_read_policy()),
-        )?;
-        Ok(DualArmCalibration {
-            master_zero: snapshot.left.state.position,
-            slave_zero: snapshot.right.state.position,
-            map,
-        })
     }
 
     fn standby_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
@@ -1457,6 +1526,7 @@ fn raw_clock_error_report(
     RawClockRuntimeReport {
         master: empty_raw_clock_health_for_error(),
         slave: empty_raw_clock_health_for_error(),
+        joint_motion: None,
         max_inter_arm_skew_us: 0,
         inter_arm_skew_p95_us: 0,
         clock_health_failures: 0,
@@ -1568,6 +1638,10 @@ impl TeleopIo for RealTeleopIo {
         read_yes_from_stdin_unless_cancelled(&self.cancel)
     }
 
+    fn startup_status(&mut self, stage: StartupStage) -> Result<()> {
+        print_startup_status(stage)
+    }
+
     fn cancel_requested(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }
@@ -1591,6 +1665,31 @@ impl TeleopIo for RealTeleopIo {
 
 fn print_startup_summary(summary: &StartupSummary) -> Result<()> {
     write_startup_summary(io::stderr().lock(), summary)
+}
+
+fn print_startup_status(stage: StartupStage) -> Result<()> {
+    writeln!(io::stderr().lock(), "{}", format_startup_status(stage))?;
+    Ok(())
+}
+
+fn format_startup_status(stage: StartupStage) -> String {
+    match stage {
+        StartupStage::RefreshingRawClock { warmup_secs } => {
+            format!("startup: refreshing raw-clock timing (~{warmup_secs}s)...")
+        },
+        StartupStage::CheckingPreEnablePosture => {
+            "startup: checking pre-enable posture...".to_string()
+        },
+        StartupStage::EnablingMitPassthrough => "startup: enabling MIT passthrough...".to_string(),
+        StartupStage::ReadingActiveSnapshot => "startup: reading active snapshot...".to_string(),
+        StartupStage::CapturingActiveZeroCalibration => {
+            "startup: capturing active-zero calibration...".to_string()
+        },
+        StartupStage::CheckingPostEnablePosture => {
+            "startup: checking post-enable posture...".to_string()
+        },
+        StartupStage::StartingControlLoop => "startup: starting teleop control loop...".to_string(),
+    }
 }
 
 fn write_startup_summary<W: Write>(mut writer: W, summary: &StartupSummary) -> Result<()> {
@@ -1620,6 +1719,13 @@ fn write_startup_summary<W: Write>(mut writer: W, summary: &StartupSummary) -> R
     writeln!(writer, "  calibration: {}", summary.calibration_source)?;
     if let Some(path) = &summary.calibration_path {
         writeln!(writer, "  calibration path: {}", path.display())?;
+    }
+    if let Some(joint_map) = summary.calibration_joint_map {
+        writeln!(
+            writer,
+            "  calibration joint map: {}",
+            format_joint_map_for_operator(joint_map)
+        )?;
     }
     writeln!(writer, "  gripper mirror: {}", summary.gripper_mirror)?;
     writeln!(writer, "  experimental={}", summary.experimental)?;
@@ -1694,6 +1800,10 @@ fn format_profile_for_operator(profile: TeleopProfile) -> &'static str {
     }
 }
 
+fn format_joint_map_for_operator(joint_map: TeleopJointMap) -> &'static str {
+    joint_map.as_str()
+}
+
 pub fn run_dual_arm_blocking(
     args: TeleopDualArmArgs,
     backend: &mut RealTeleopBackend,
@@ -1741,6 +1851,7 @@ mod tests {
         RuntimeHealth,
         RawClockWarmup,
         ConfirmStart,
+        StartupStatus(StartupStage),
         StandbySnapshot,
         CaptureCalibration,
         Enable,
@@ -2008,11 +2119,6 @@ mod tests {
             })
         }
 
-        fn capture_calibration(&self, _map: JointMirrorMap) -> Result<DualArmCalibration> {
-            self.trace.push(WorkflowCall::CaptureCalibration);
-            Ok(sample_calibration())
-        }
-
         fn standby_snapshot(&self, _policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
             self.trace.push(WorkflowCall::StandbySnapshot);
             Ok(sample_snapshot(self.standby_mismatch))
@@ -2191,6 +2297,11 @@ mod tests {
                 self.cancel.store(true, Ordering::SeqCst);
             }
             Ok(self.confirm)
+        }
+
+        fn startup_status(&mut self, stage: StartupStage) -> Result<()> {
+            self.trace.push(WorkflowCall::StartupStatus(stage));
+            Ok(())
         }
 
         fn cancel_requested(&self) -> bool {
@@ -2556,6 +2667,100 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raw_clock_captures_calibration_from_active_snapshot_after_enable() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_path = temp.path().join("calibration.toml");
+        let trace = WorkflowTrace::default();
+        let backend = FakeTeleopBackend {
+            trace: trace.clone(),
+            active_mismatch: true,
+            ..FakeTeleopBackend::default()
+        };
+        let io = FakeTeleopIo {
+            trace: trace.clone(),
+            ..FakeTeleopIo::default()
+        };
+        let args = TeleopDualArmArgs {
+            save_calibration: Some(save_path.clone()),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test_with_io(args, backend, io)
+            .expect("experimental raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        assert_call_order(
+            trace.calls(),
+            &[
+                WorkflowCall::Connect,
+                WorkflowCall::RawClockWarmup,
+                WorkflowCall::ConfirmStart,
+                WorkflowCall::RawClockWarmup,
+                WorkflowCall::Enable,
+                WorkflowCall::ActiveSnapshot,
+                WorkflowCall::RunLoop,
+            ],
+        );
+        assert!(!trace.calls().contains(&WorkflowCall::CaptureCalibration));
+        assert!(!trace.calls().contains(&WorkflowCall::StandbySnapshot));
+
+        let saved = CalibrationFile::load(&save_path).expect("calibration should be saved");
+        assert_eq!(saved.zero.master, [0.0; 6]);
+        assert_eq!(saved.zero.slave, [1.0; 6]);
+    }
+
+    #[test]
+    fn experimental_raw_clock_captured_calibration_uses_configured_joint_map() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_path = temp.path().join("calibration.toml");
+        let args = TeleopDualArmArgs {
+            save_calibration: Some(save_path.clone()),
+            joint_map: Some(TeleopJointMap::Identity),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test(args, FakeTeleopBackend::default())
+            .expect("experimental raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        let saved = CalibrationFile::load(&save_path).expect("calibration should be saved");
+        assert_eq!(saved.map.position_sign, [1.0; 6]);
+        assert_eq!(saved.map.velocity_sign, [1.0; 6]);
+        assert_eq!(saved.map.torque_sign, [1.0; 6]);
+    }
+
+    #[test]
+    fn experimental_raw_clock_reports_post_confirmation_startup_stages() {
+        let trace = WorkflowTrace::default();
+        let backend =
+            FakeTeleopBackend::with_trace(trace.clone()).with_experimental_raw_clock_success();
+        let io = FakeTeleopIo {
+            trace: trace.clone(),
+            ..FakeTeleopIo::default()
+        };
+
+        let status = run_workflow_for_test_with_io(experimental_args(), backend, io)
+            .expect("experimental raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        assert_call_order(
+            trace.calls(),
+            &[
+                WorkflowCall::ConfirmStart,
+                WorkflowCall::StartupStatus(StartupStage::RefreshingRawClock { warmup_secs: 10 }),
+                WorkflowCall::RawClockWarmup,
+                WorkflowCall::StartupStatus(StartupStage::EnablingMitPassthrough),
+                WorkflowCall::Enable,
+                WorkflowCall::StartupStatus(StartupStage::ReadingActiveSnapshot),
+                WorkflowCall::ActiveSnapshot,
+                WorkflowCall::StartupStatus(StartupStage::CapturingActiveZeroCalibration),
+                WorkflowCall::StartupStatus(StartupStage::StartingControlLoop),
+                WorkflowCall::RunLoop,
+            ],
+        );
+    }
+
+    #[test]
     fn experimental_raw_clock_run_receives_initial_master_follower_gains() {
         let backend = FakeTeleopBackend::default().with_experimental_raw_clock_success();
         let args = TeleopDualArmArgs {
@@ -2643,11 +2848,17 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raw_clock_pre_enable_posture_mismatch_fails_before_enable() {
+    fn experimental_raw_clock_loaded_calibration_pre_enable_posture_mismatch_fails_before_enable() {
+        let temp = tempfile::tempdir().unwrap();
+        let cal_path = temp.path().join("calibration.toml");
+        write_sample_calibration_file(&cal_path);
         let backend = FakeTeleopBackend::with_standby_snapshot_mismatch();
 
-        let err = run_workflow_for_test(experimental_args(), backend.clone())
-            .expect_err("pre-enable mismatch should stop experimental raw-clock workflow");
+        let err = run_workflow_for_test(
+            experimental_args_with_calibration(&cal_path),
+            backend.clone(),
+        )
+        .expect_err("pre-enable mismatch should stop experimental raw-clock workflow");
 
         assert!(err.to_string().contains("posture"));
         assert!(backend.calls().contains(&WorkflowCall::StandbySnapshot));
@@ -2656,11 +2867,18 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raw_clock_post_enable_posture_mismatch_disables_without_run() {
+    fn experimental_raw_clock_loaded_calibration_post_enable_posture_mismatch_disables_without_run()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let cal_path = temp.path().join("calibration.toml");
+        write_sample_calibration_file(&cal_path);
         let backend = FakeTeleopBackend::with_active_snapshot_mismatch();
 
-        let err = run_workflow_for_test(experimental_args(), backend.clone())
-            .expect_err("post-enable mismatch should stop experimental raw-clock workflow");
+        let err = run_workflow_for_test(
+            experimental_args_with_calibration(&cal_path),
+            backend.clone(),
+        )
+        .expect_err("post-enable mismatch should stop experimental raw-clock workflow");
 
         assert!(err.to_string().contains("posture"));
         assert_call_order(
@@ -2672,6 +2890,44 @@ mod tests {
             ],
         );
         assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn experimental_raw_clock_loaded_calibration_reports_posture_startup_stages() {
+        let temp = tempfile::tempdir().unwrap();
+        let cal_path = temp.path().join("calibration.toml");
+        write_sample_calibration_file(&cal_path);
+        let trace = WorkflowTrace::default();
+        let backend =
+            FakeTeleopBackend::with_trace(trace.clone()).with_experimental_raw_clock_success();
+        let io = FakeTeleopIo {
+            trace: trace.clone(),
+            ..FakeTeleopIo::default()
+        };
+
+        let status = run_workflow_for_test_with_io(
+            experimental_args_with_calibration(&cal_path),
+            backend,
+            io,
+        )
+        .expect("loaded calibration raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        assert_call_order(
+            trace.calls(),
+            &[
+                WorkflowCall::StartupStatus(StartupStage::RefreshingRawClock { warmup_secs: 10 }),
+                WorkflowCall::StartupStatus(StartupStage::CheckingPreEnablePosture),
+                WorkflowCall::StandbySnapshot,
+                WorkflowCall::StartupStatus(StartupStage::EnablingMitPassthrough),
+                WorkflowCall::Enable,
+                WorkflowCall::StartupStatus(StartupStage::ReadingActiveSnapshot),
+                WorkflowCall::ActiveSnapshot,
+                WorkflowCall::StartupStatus(StartupStage::CheckingPostEnablePosture),
+                WorkflowCall::StartupStatus(StartupStage::StartingControlLoop),
+                WorkflowCall::RunLoop,
+            ],
+        );
     }
 
     #[test]
@@ -2743,6 +2999,31 @@ mod tests {
 
         assert_eq!(timing.estimated_inter_arm_skew_p95_us, Some(77));
         assert_eq!(timing.max_estimated_inter_arm_skew_us, Some(100));
+    }
+
+    #[test]
+    fn raw_clock_report_joint_motion_maps_to_cli_report_shape() {
+        let report = RawClockRuntimeReport {
+            joint_motion: Some(piper_client::dual_arm_raw_clock::RawClockJointMotionStats {
+                master_feedback_min_rad: [0.0, 0.0, 0.0, -1.2, 0.0, 0.0],
+                master_feedback_max_rad: [0.0, 0.0, 0.0, -0.7, 0.0, 0.0],
+                master_feedback_delta_rad: [0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+                slave_command_min_rad: [0.0, 0.0, 0.0, 0.6, 0.0, 0.0],
+                slave_command_max_rad: [0.0, 0.0, 0.0, 1.1, 0.0, 0.0],
+                slave_command_delta_rad: [0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+                slave_feedback_min_rad: [0.0, 0.0, 0.0, -1.1, 0.0, 0.0],
+                slave_feedback_max_rad: [0.0, 0.0, 0.0, -1.1, 0.0, 0.0],
+                slave_feedback_delta_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            }),
+            ..raw_clock_report_success()
+        };
+
+        let motion =
+            report_joint_motion_from_raw_clock(&report).expect("joint motion should be mapped");
+
+        assert_eq!(motion.master_feedback_delta_rad[3], 0.5);
+        assert_eq!(motion.slave_command_delta_rad[3], 0.5);
+        assert_eq!(motion.slave_feedback_delta_rad[3], 0.0);
     }
 
     #[test]
@@ -2865,14 +3146,14 @@ mod tests {
     }
 
     #[test]
-    fn experimental_pre_enable_snapshot_wait_budget_allows_feedback_startup_jitter() {
+    fn experimental_snapshot_wait_budgets_allow_feedback_startup_jitter() {
         assert!(
             EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT >= Duration::from_secs(2),
             "pre-enable snapshot wait budget is too short: {EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT:?}"
         );
         assert!(
-            EXPERIMENTAL_ACTIVE_SOFT_SNAPSHOT_READY_TIMEOUT
-                < EXPERIMENTAL_PRE_ENABLE_SOFT_SNAPSHOT_READY_TIMEOUT
+            EXPERIMENTAL_ACTIVE_SOFT_SNAPSHOT_READY_TIMEOUT >= Duration::from_secs(2),
+            "post-enable active snapshot wait budget is too short: {EXPERIMENTAL_ACTIVE_SOFT_SNAPSHOT_READY_TIMEOUT:?}"
         );
     }
 
@@ -3004,6 +3285,13 @@ mod tests {
         }
     }
 
+    fn experimental_args_with_calibration(path: &Path) -> TeleopDualArmArgs {
+        TeleopDualArmArgs {
+            calibration_file: Some(path.to_path_buf()),
+            ..experimental_args()
+        }
+    }
+
     fn args_with_calibration(path: &Path) -> TeleopDualArmArgs {
         TeleopDualArmArgs {
             calibration_file: Some(path.to_path_buf()),
@@ -3041,6 +3329,7 @@ mod tests {
         RawClockRuntimeReport {
             master: raw_clock_health_for_tests(1.0, 12),
             slave: raw_clock_health_for_tests(1.5, 14),
+            joint_motion: None,
             max_inter_arm_skew_us: 100,
             inter_arm_skew_p95_us: 80,
             clock_health_failures: 0,
@@ -3104,6 +3393,12 @@ mod tests {
                 torque_sign: [1.0; 6],
             },
         }
+    }
+
+    fn write_sample_calibration_file(path: &Path) {
+        CalibrationFile::from_calibration(&sample_calibration(), None, 123)
+            .save_new(path)
+            .expect("sample calibration file should be saved");
     }
 
     fn sample_snapshot(mismatch: bool) -> DualArmSnapshot {

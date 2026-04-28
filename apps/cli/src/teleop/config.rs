@@ -2,8 +2,10 @@
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use piper_client::dual_arm::{BilateralLoopConfig, BilateralSubmissionMode, LoopTimingMode};
-use piper_client::types::{JointArray, NewtonMeter};
+use piper_client::dual_arm::{
+    BilateralLoopConfig, BilateralSubmissionMode, JointMirrorMap, LoopTimingMode,
+};
+use piper_client::types::{Joint, JointArray, NewtonMeter};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -48,6 +50,35 @@ pub enum TeleopProfile {
 pub enum TeleopTimingMode {
     Sleep,
     Spin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TeleopJointMap {
+    Identity,
+    #[default]
+    LeftRightMirror,
+}
+
+impl TeleopJointMap {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::LeftRightMirror => "left-right-mirror",
+        }
+    }
+
+    pub fn to_joint_mirror_map(self) -> JointMirrorMap {
+        match self {
+            Self::Identity => JointMirrorMap {
+                permutation: Joint::ALL,
+                position_sign: [1.0; 6],
+                velocity_sign: [1.0; 6],
+                torque_sign: [1.0; 6],
+            },
+            Self::LeftRightMirror => JointMirrorMap::left_right_mirror(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -98,6 +129,7 @@ pub struct TeleopSafetyConfig {
 pub struct TeleopCalibrationConfig {
     pub file: Option<PathBuf>,
     pub max_error_rad: Option<f64>,
+    pub joint_map: Option<TeleopJointMap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -132,6 +164,7 @@ pub struct TeleopSafetySettings {
 pub struct TeleopCalibrationSettings {
     pub file: Option<PathBuf>,
     pub max_error_rad: f64,
+    pub joint_map: TeleopJointMap,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -343,6 +376,10 @@ impl ResolvedTeleopConfig {
                     .calibration_file
                     .or_else(|| file_calibration.and_then(|calibration| calibration.file.clone())),
                 max_error_rad: calibration_max_error_rad,
+                joint_map: args
+                    .joint_map
+                    .or_else(|| file_calibration.and_then(|calibration| calibration.joint_map))
+                    .unwrap_or_default(),
             },
             raw_clock,
             max_iterations: args
@@ -510,6 +547,25 @@ mod tests {
         let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
         assert!(resolved.raw_clock.experimental_calibrated_raw);
         assert_eq!(resolved.raw_clock.warmup_secs, 10);
+    }
+
+    #[test]
+    fn cli_joint_map_overrides_file_joint_map() {
+        let file = TeleopConfigFile {
+            calibration: Some(TeleopCalibrationConfig {
+                joint_map: Some(TeleopJointMap::LeftRightMirror),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let args = TeleopDualArmArgs {
+            joint_map: Some(TeleopJointMap::Identity),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
+
+        assert_eq!(resolved.calibration.joint_map, TeleopJointMap::Identity);
     }
 
     #[test]

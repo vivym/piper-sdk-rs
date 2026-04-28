@@ -60,6 +60,8 @@ pub struct TeleopDualArmArgs {
     pub calibration_file: Option<PathBuf>,
     #[arg(long)]
     pub calibration_max_error_rad: Option<f64>,
+    #[arg(long, value_enum)]
+    pub joint_map: Option<crate::teleop::config::TeleopJointMap>,
     #[arg(long)]
     pub save_calibration: Option<PathBuf>,
     #[arg(long)]
@@ -120,6 +122,7 @@ impl TeleopDualArmArgs {
             disable_gripper_mirror: false,
             calibration_file: None,
             calibration_max_error_rad: None,
+            joint_map: None,
             save_calibration: None,
             report_json: None,
             yes: false,
@@ -217,6 +220,30 @@ mod tests {
     }
 
     #[test]
+    fn dual_arm_command_parses_joint_map() {
+        let cmd = TeleopCommand::try_parse_from([
+            "teleop",
+            "dual-arm",
+            "--master-interface",
+            "can0",
+            "--slave-interface",
+            "can1",
+            "--joint-map",
+            "identity",
+        ])
+        .expect("joint map option should parse");
+
+        match cmd.action {
+            TeleopAction::DualArm(args) => {
+                assert_eq!(
+                    args.joint_map,
+                    Some(crate::teleop::config::TeleopJointMap::Identity)
+                );
+            },
+        }
+    }
+
+    #[test]
     fn dual_arm_help_mentions_realtime_runtime_and_key_options() {
         let err = TeleopCommand::try_parse_from(["teleop", "dual-arm", "--help"])
             .expect_err("--help should return clap help");
@@ -228,6 +255,7 @@ mod tests {
         assert!(help.contains("--slave-target"));
         assert!(help.contains("--mode"));
         assert!(help.contains("--profile"));
+        assert!(help.contains("--joint-map"));
         assert!(help.contains("--calibration-file"));
         assert!(help.contains("--report-json"));
     }

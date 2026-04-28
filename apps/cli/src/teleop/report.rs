@@ -91,7 +91,7 @@ pub struct ReportExit {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ReportMetrics {
     pub iterations: usize,
     pub read_faults: u32,
@@ -112,6 +112,21 @@ pub struct ReportMetrics {
     pub slave_stop_attempt: String,
     pub master_runtime_fault: Option<String>,
     pub slave_runtime_fault: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joint_motion: Option<ReportJointMotion>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReportJointMotion {
+    pub master_feedback_min_rad: [f64; 6],
+    pub master_feedback_max_rad: [f64; 6],
+    pub master_feedback_delta_rad: [f64; 6],
+    pub slave_command_min_rad: [f64; 6],
+    pub slave_command_max_rad: [f64; 6],
+    pub slave_command_delta_rad: [f64; 6],
+    pub slave_feedback_min_rad: [f64; 6],
+    pub slave_feedback_max_rad: [f64; 6],
+    pub slave_feedback_delta_rad: [f64; 6],
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +140,7 @@ pub struct TeleopReportInput<'a> {
     pub safety: TeleopSafetySettings,
     pub calibration: ReportCalibration,
     pub timing: Option<ReportTiming>,
+    pub joint_motion: Option<ReportJointMotion>,
     pub faulted: bool,
     pub report: &'a BilateralRunReport,
 }
@@ -205,6 +221,7 @@ impl TeleopJsonReport {
                     .last_runtime_fault_right
                     .map(format_runtime_fault)
                     .map(str::to_string),
+                joint_motion: input.joint_motion,
             },
         }
     }
@@ -289,6 +306,23 @@ pub fn write_human_report<W: Write>(
     if let Some(last_error) = &report.exit.last_error {
         writeln!(writer, "last_error: {last_error}")?;
     }
+    if let Some(joint_motion) = &report.metrics.joint_motion {
+        writeln!(
+            writer,
+            "joint_motion master_feedback_delta_rad={}",
+            format_joint_array(joint_motion.master_feedback_delta_rad)
+        )?;
+        writeln!(
+            writer,
+            "joint_motion slave_command_delta_rad={}",
+            format_joint_array(joint_motion.slave_command_delta_rad)
+        )?;
+        writeln!(
+            writer,
+            "joint_motion slave_feedback_delta_rad={}",
+            format_joint_array(joint_motion.slave_feedback_delta_rad)
+        )?;
+    }
     Ok(())
 }
 
@@ -348,6 +382,14 @@ fn duration_us(duration: Duration) -> u64 {
 
 fn format_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn format_joint_array(values: [f64; 6]) -> String {
+    let values = values.map(|value| format!("{value:.6}"));
+    format!(
+        "[{}, {}, {}, {}, {}, {}]",
+        values[0], values[1], values[2], values[3], values[4], values[5]
+    )
 }
 
 fn format_mode(mode: TeleopMode) -> &'static str {
@@ -575,6 +617,38 @@ mod tests {
     }
 
     #[test]
+    fn json_report_serializes_joint_motion_diagnostics() {
+        let sdk_report = BilateralRunReport::default();
+        let mut input = sample_input(false, &sdk_report);
+        input.joint_motion = Some(ReportJointMotion {
+            master_feedback_delta_rad: [0.0, 0.0, 0.0, 0.50, 0.0, 0.0],
+            slave_command_delta_rad: [0.0, 0.0, 0.0, 0.50, 0.0, 0.0],
+            slave_feedback_delta_rad: [0.0, 0.0, 0.0, 0.00, 0.0, 0.0],
+            master_feedback_min_rad: [0.0, 0.0, 0.0, -1.20, 0.0, 0.0],
+            master_feedback_max_rad: [0.0, 0.0, 0.0, -0.70, 0.0, 0.0],
+            slave_command_min_rad: [0.0, 0.0, 0.0, 0.60, 0.0, 0.0],
+            slave_command_max_rad: [0.0, 0.0, 0.0, 1.10, 0.0, 0.0],
+            slave_feedback_min_rad: [0.0, 0.0, 0.0, -1.10, 0.0, 0.0],
+            slave_feedback_max_rad: [0.0, 0.0, 0.0, -1.10, 0.0, 0.0],
+        });
+
+        let value = serde_json::to_value(TeleopJsonReport::from_run(input)).unwrap();
+
+        assert_eq!(
+            value["metrics"]["joint_motion"]["master_feedback_delta_rad"][3],
+            0.50
+        );
+        assert_eq!(
+            value["metrics"]["joint_motion"]["slave_command_delta_rad"][3],
+            0.50
+        );
+        assert_eq!(
+            value["metrics"]["joint_motion"]["slave_feedback_delta_rad"][3],
+            0.00
+        );
+    }
+
+    #[test]
     fn normal_report_omits_timing() {
         let value = serde_json::to_value(sample_json_report()).unwrap();
 
@@ -783,6 +857,7 @@ mod tests {
                 max_error_rad: 0.05,
             },
             timing: None,
+            joint_motion: None,
             faulted,
             report,
         }

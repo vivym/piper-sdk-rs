@@ -10,6 +10,7 @@ cd "${REPO_ROOT}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${TELEOP_OUT_DIR:-artifacts/teleop/${TIMESTAMP}}"
 RUN_LOG="${OUTPUT_DIR}/run.log"
+BUILD_LOG="${OUTPUT_DIR}/build.log"
 COMMAND_FILE="${OUTPUT_DIR}/command.txt"
 ENV_FILE="${OUTPUT_DIR}/environment.txt"
 CALIBRATION_FILE="${CALIBRATION_FILE:-${OUTPUT_DIR}/calib-smoke.toml}"
@@ -18,14 +19,15 @@ REPORT_JSON="${REPORT_JSON:-${OUTPUT_DIR}/report-smoke-hold.json}"
 MASTER_IFACE="${MASTER_IFACE:-can0}"
 SLAVE_IFACE="${SLAVE_IFACE:-can1}"
 MODE="${TELEOP_MODE:-master-follower}"
+JOINT_MAP="${JOINT_MAP:-identity}"
 FREQUENCY_HZ="${FREQUENCY_HZ:-100}"
 TRACK_KP="${TRACK_KP:-2.0}"
 TRACK_KD="${TRACK_KD:-0.4}"
 MASTER_DAMPING="${MASTER_DAMPING:-0.8}"
 RAW_CLOCK_WARMUP_SECS="${RAW_CLOCK_WARMUP_SECS:-10}"
-# Observed SocketCAN raw-clock residual p95 can sit just above 500us during
-# startup refresh; keep this well below the existing 2000us max residual gate.
-RAW_CLOCK_RESIDUAL_P95_US="${RAW_CLOCK_RESIDUAL_P95_US:-1000}"
+# Observed SocketCAN raw-clock residual p95 can briefly reach ~1ms during
+# longer smoke runs; keep this below the existing 2000us max residual gate.
+RAW_CLOCK_RESIDUAL_P95_US="${RAW_CLOCK_RESIDUAL_P95_US:-1500}"
 RAW_CLOCK_RESIDUAL_MAX_US="${RAW_CLOCK_RESIDUAL_MAX_US:-2000}"
 # Keep the smoke gate below one 100Hz control tick while allowing the observed
 # independent-CAN feedback phase tail around 5ms.
@@ -33,14 +35,20 @@ RAW_CLOCK_SKEW_US="${RAW_CLOCK_SKEW_US:-6000}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-300}"
 DISABLE_GRIPPER_MIRROR="${DISABLE_GRIPPER_MIRROR:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
 
 mkdir -p "${OUTPUT_DIR}"
 
+build_cmd=(
+    cargo build -p piper-cli
+)
+
 cmd=(
-    cargo run -p piper-cli -- teleop dual-arm
+    target/debug/piper-cli teleop dual-arm
     --master-interface "${MASTER_IFACE}"
     --slave-interface "${SLAVE_IFACE}"
     --mode "${MODE}"
+    --joint-map "${JOINT_MAP}"
     --experimental-calibrated-raw
     --raw-clock-inter-arm-skew-max-us "${RAW_CLOCK_SKEW_US}"
     --frequency-hz "${FREQUENCY_HZ}"
@@ -65,6 +73,7 @@ fi
     echo "master_iface=${MASTER_IFACE}"
     echo "slave_iface=${SLAVE_IFACE}"
     echo "mode=${MODE}"
+    echo "joint_map=${JOINT_MAP}"
     echo "frequency_hz=${FREQUENCY_HZ}"
     echo "track_kp=${TRACK_KP}"
     echo "track_kd=${TRACK_KD}"
@@ -75,22 +84,29 @@ fi
     echo "raw_clock_skew_us=${RAW_CLOCK_SKEW_US}"
     echo "max_iterations=${MAX_ITERATIONS}"
     echo "disable_gripper_mirror=${DISABLE_GRIPPER_MIRROR}"
+    echo "skip_build=${SKIP_BUILD}"
     echo "git_revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 } > "${ENV_FILE}"
 
-printf "%q " "${cmd[@]}" > "${COMMAND_FILE}"
-printf "\n" >> "${COMMAND_FILE}"
+{
+    echo "Build command:"
+    printf "%q " "${build_cmd[@]}"
+    printf "\n\nRun command:\n"
+    printf "%q " "${cmd[@]}"
+    printf "\n"
+} > "${COMMAND_FILE}"
 
 echo "Teleop smoke output: ${OUTPUT_DIR}"
 echo "Calibration file: ${CALIBRATION_FILE}"
 echo "Report JSON: ${REPORT_JSON}"
+echo "Build log: ${BUILD_LOG}"
 echo "Run log: ${RUN_LOG}"
 echo
-echo "Safety note: support both arms in the intended mirrored zero pose before typing yes."
+echo "Safety note: support both arms in the intended zero pose for joint map '${JOINT_MAP}' before typing yes."
 echo "This script intentionally does not pass --yes; the CLI will require operator confirmation."
 echo "After yes, the CLI refreshes raw-clock timing before enabling the arms."
 echo
-echo "Command:"
+echo "Commands:"
 cat "${COMMAND_FILE}"
 echo
 
@@ -99,15 +115,61 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     exit 0
 fi
 
+if [[ "${SKIP_BUILD}" != "1" ]]; then
+    "${build_cmd[@]}" 2>&1 | tee "${BUILD_LOG}"
+fi
+
+run_pid=""
+interrupt_count=0
+
+handle_interrupt() {
+    interrupt_count=$((interrupt_count + 1))
+    if [[ -n "${run_pid}" ]] && kill -0 "${run_pid}" 2>/dev/null; then
+        if [[ "${interrupt_count}" -eq 1 ]]; then
+            echo
+            echo "Ctrl-C received; requesting teleop shutdown. Wait for the CLI report..."
+            kill -INT "${run_pid}" 2>/dev/null || true
+        else
+            echo
+            echo "Second interrupt received; forcing teleop process to terminate."
+            kill -TERM "${run_pid}" 2>/dev/null || true
+        fi
+    fi
+}
+
 set +e
-"${cmd[@]}" 2>&1 | tee "${RUN_LOG}"
-status=${PIPESTATUS[0]}
+trap handle_interrupt INT TERM
+"${cmd[@]}" > >(tee "${RUN_LOG}") 2>&1 &
+run_pid=$!
+while true; do
+    wait "${run_pid}"
+    status=$?
+    if kill -0 "${run_pid}" 2>/dev/null; then
+        continue
+    fi
+    break
+done
+trap - INT TERM
+run_pid=""
 set -e
 
 if [[ -f "${REPORT_JSON}" && -x "$(command -v jq 2>/dev/null)" ]]; then
     echo
     echo "Report summary:"
-    jq '{faulted, timing, control, calibration}' "${REPORT_JSON}"
+    jq '{
+        faulted,
+        timing,
+        control,
+        calibration,
+        j4_motion_delta_rad: (
+            if .metrics.joint_motion then {
+                master_feedback: .metrics.joint_motion.master_feedback_delta_rad[3],
+                slave_command: .metrics.joint_motion.slave_command_delta_rad[3],
+                slave_feedback: .metrics.joint_motion.slave_feedback_delta_rad[3]
+            } else null end
+        ),
+        joint_motion: .metrics.joint_motion
+    }' "${REPORT_JSON}"
 fi
 
 exit "${status}"

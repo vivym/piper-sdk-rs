@@ -136,7 +136,9 @@ impl RawClockRuntimeThresholds {
     const fn for_tests() -> Self {
         Self {
             inter_arm_skew_max_us: 2_000,
-            last_sample_age_us: 2_000,
+            // Fake runtime tests use synthetic receive timestamps with the real
+            // monotonic clock; dedicated gate tests cover age rejection.
+            last_sample_age_us: u64::MAX,
         }
     }
 }
@@ -154,6 +156,7 @@ pub struct RawClockTickTiming {
 pub struct RawClockRuntimeReport {
     pub master: RawClockHealth,
     pub slave: RawClockHealth,
+    pub joint_motion: Option<RawClockJointMotionStats>,
     pub max_inter_arm_skew_us: u64,
     pub inter_arm_skew_p95_us: u64,
     pub clock_health_failures: u64,
@@ -175,6 +178,119 @@ pub struct RawClockRuntimeReport {
     pub master_stop_attempt: StopAttemptResult,
     pub slave_stop_attempt: StopAttemptResult,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawClockJointMotionStats {
+    pub master_feedback_min_rad: [f64; 6],
+    pub master_feedback_max_rad: [f64; 6],
+    pub master_feedback_delta_rad: [f64; 6],
+    pub slave_command_min_rad: [f64; 6],
+    pub slave_command_max_rad: [f64; 6],
+    pub slave_command_delta_rad: [f64; 6],
+    pub slave_feedback_min_rad: [f64; 6],
+    pub slave_feedback_max_rad: [f64; 6],
+    pub slave_feedback_delta_rad: [f64; 6],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RawClockJointMotionBounds {
+    master_feedback_min_rad: [f64; 6],
+    master_feedback_max_rad: [f64; 6],
+    slave_command_min_rad: [f64; 6],
+    slave_command_max_rad: [f64; 6],
+    slave_feedback_min_rad: [f64; 6],
+    slave_feedback_max_rad: [f64; 6],
+}
+
+impl RawClockJointMotionBounds {
+    fn new(snapshot: &DualArmSnapshot, command: &BilateralCommand) -> Self {
+        let master_feedback = rad_array(snapshot.left.state.position);
+        let slave_command = rad_array(command.slave_position);
+        let slave_feedback = rad_array(snapshot.right.state.position);
+        Self {
+            master_feedback_min_rad: master_feedback,
+            master_feedback_max_rad: master_feedback,
+            slave_command_min_rad: slave_command,
+            slave_command_max_rad: slave_command,
+            slave_feedback_min_rad: slave_feedback,
+            slave_feedback_max_rad: slave_feedback,
+        }
+    }
+
+    fn record(&mut self, snapshot: &DualArmSnapshot, command: &BilateralCommand) {
+        update_bounds(
+            &mut self.master_feedback_min_rad,
+            &mut self.master_feedback_max_rad,
+            rad_array(snapshot.left.state.position),
+        );
+        update_bounds(
+            &mut self.slave_command_min_rad,
+            &mut self.slave_command_max_rad,
+            rad_array(command.slave_position),
+        );
+        update_bounds(
+            &mut self.slave_feedback_min_rad,
+            &mut self.slave_feedback_max_rad,
+            rad_array(snapshot.right.state.position),
+        );
+    }
+
+    fn snapshot(self) -> RawClockJointMotionStats {
+        RawClockJointMotionStats {
+            master_feedback_min_rad: self.master_feedback_min_rad,
+            master_feedback_max_rad: self.master_feedback_max_rad,
+            master_feedback_delta_rad: delta_array(
+                self.master_feedback_min_rad,
+                self.master_feedback_max_rad,
+            ),
+            slave_command_min_rad: self.slave_command_min_rad,
+            slave_command_max_rad: self.slave_command_max_rad,
+            slave_command_delta_rad: delta_array(
+                self.slave_command_min_rad,
+                self.slave_command_max_rad,
+            ),
+            slave_feedback_min_rad: self.slave_feedback_min_rad,
+            slave_feedback_max_rad: self.slave_feedback_max_rad,
+            slave_feedback_delta_rad: delta_array(
+                self.slave_feedback_min_rad,
+                self.slave_feedback_max_rad,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RawClockJointMotionAccumulator {
+    bounds: Option<RawClockJointMotionBounds>,
+}
+
+impl RawClockJointMotionAccumulator {
+    fn record(&mut self, snapshot: &DualArmSnapshot, command: &BilateralCommand) {
+        match &mut self.bounds {
+            Some(bounds) => bounds.record(snapshot, command),
+            None => self.bounds = Some(RawClockJointMotionBounds::new(snapshot, command)),
+        }
+    }
+
+    fn snapshot(&self) -> Option<RawClockJointMotionStats> {
+        self.bounds.map(RawClockJointMotionBounds::snapshot)
+    }
+}
+
+fn rad_array(values: JointArray<Rad>) -> [f64; 6] {
+    values.map(|value| value.0).into_array()
+}
+
+fn update_bounds(min: &mut [f64; 6], max: &mut [f64; 6], values: [f64; 6]) {
+    for index in 0..6 {
+        min[index] = min[index].min(values[index]);
+        max[index] = max[index].max(values[index]);
+    }
+}
+
+fn delta_array(min: [f64; 6], max: [f64; 6]) -> [f64; 6] {
+    std::array::from_fn(|index| max[index] - min[index])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,6 +679,7 @@ impl RawClockRuntimeTiming {
         RawClockRuntimeReport {
             master: self.report_health(RawClockSide::Master, now_host_us),
             slave: self.report_health(RawClockSide::Slave, now_host_us),
+            joint_motion: None,
             max_inter_arm_skew_us: self.max_inter_arm_skew_us,
             inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
             clock_health_failures: self.clock_health_failures,
@@ -1019,6 +1136,7 @@ where
     let nominal_period = Duration::from_secs_f64(1.0 / config.frequency_hz);
     let mut iterations = 0usize;
     let mut next_tick = Instant::now();
+    let mut joint_motion = RawClockJointMotionAccumulator::default();
 
     loop {
         if let Some(max_iterations) = config.max_iterations
@@ -1030,6 +1148,7 @@ where
                 Some(RawClockRuntimeExitReason::MaxIterations),
             );
             report.iterations = iterations;
+            attach_joint_motion(&mut report, &joint_motion);
             let standby = io.disable_both(cfg.disable_config.clone())?;
             report.apply_telemetry(standby.telemetry);
             return Ok(RawClockCoreExit::Standby {
@@ -1047,6 +1166,7 @@ where
                 Some(RawClockRuntimeExitReason::Cancelled),
             );
             report.last_error = Some("raw-clock runtime cancelled".to_string());
+            attach_joint_motion(&mut report, &joint_motion);
             let standby = io.disable_both(cfg.disable_config.clone())?;
             report.apply_telemetry(standby.telemetry);
             return Ok(RawClockCoreExit::Standby {
@@ -1071,6 +1191,7 @@ where
             let report = fault_report_from_timing(
                 &timing,
                 iterations,
+                &joint_motion,
                 exit_reason,
                 err.to_string(),
                 |report| {
@@ -1092,6 +1213,7 @@ where
                 let report = fault_report_from_timing(
                     &timing,
                     iterations,
+                    &joint_motion,
                     RawClockRuntimeExitReason::ReadFault,
                     err.to_string(),
                     |report| report.read_faults = report.read_faults.saturating_add(1),
@@ -1109,6 +1231,7 @@ where
                 let report = fault_report_from_timing(
                     &timing,
                     iterations,
+                    &joint_motion,
                     RawClockRuntimeExitReason::ReadFault,
                     err.to_string(),
                     |report| report.read_faults = report.read_faults.saturating_add(1),
@@ -1128,6 +1251,7 @@ where
                 let report = fault_report_from_timing(
                     &timing,
                     iterations,
+                    &joint_motion,
                     RawClockRuntimeExitReason::RawClockFault,
                     err.to_string(),
                     |_| {},
@@ -1150,8 +1274,14 @@ where
             } else {
                 RawClockRuntimeExitReason::RawClockFault
             };
-            let report =
-                fault_report_from_timing(&timing, iterations, exit_reason, err.to_string(), |_| {});
+            let report = fault_report_from_timing(
+                &timing,
+                iterations,
+                &joint_motion,
+                exit_reason,
+                err.to_string(),
+                |_| {},
+            );
             let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
             return Ok(RawClockCoreExit::Faulted {
                 arms: fault.arms,
@@ -1170,6 +1300,7 @@ where
                 let report = fault_report_from_timing(
                     &timing,
                     iterations,
+                    &joint_motion,
                     RawClockRuntimeExitReason::ControllerFault,
                     err.to_string(),
                     |_| {},
@@ -1181,11 +1312,13 @@ where
                 });
             },
         };
+        joint_motion.record(&snapshot, &command);
 
         if let Err(err) = io.submit_command(&command, cfg.command_timeout) {
             let report = fault_report_from_timing(
                 &timing,
                 iterations,
+                &joint_motion,
                 RawClockRuntimeExitReason::SubmissionFault,
                 err.to_string(),
                 |report| {
@@ -1215,14 +1348,23 @@ where
 fn fault_report_from_timing(
     timing: &RawClockRuntimeTiming,
     iterations: usize,
+    joint_motion: &RawClockJointMotionAccumulator,
     exit_reason: RawClockRuntimeExitReason,
     error: String,
     update: impl FnOnce(&mut RawClockRuntimeReport),
 ) -> RawClockRuntimeReport {
     let mut report = timing.report(piper_can::monotonic_micros(), iterations, Some(exit_reason));
     report.last_error = Some(error);
+    attach_joint_motion(&mut report, joint_motion);
     update(&mut report);
     report
+}
+
+fn attach_joint_motion(
+    report: &mut RawClockRuntimeReport,
+    joint_motion: &RawClockJointMotionAccumulator,
+) {
+    report.joint_motion = joint_motion.snapshot();
 }
 
 fn submit_soft_realtime_command(
@@ -1636,7 +1778,9 @@ mod tests {
             residual_max_us: 250,
             drift_abs_ppm: 500.0,
             sample_gap_max_us: 10_000,
-            last_sample_age_us: 2_000,
+            // Fake runtime tests drive timing with synthetic host timestamps while
+            // the runtime itself samples the real monotonic clock.
+            last_sample_age_us: u64::MAX,
         }
     }
 
@@ -1655,6 +1799,13 @@ mod tests {
             raw_timestamp_regressions: 0,
             reason: None,
         }
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {actual} to be close to {expected}"
+        );
     }
 
     fn control_snapshot_for_tests() -> ControlSnapshot {
@@ -1693,6 +1844,16 @@ mod tests {
         }
     }
 
+    fn raw_clock_snapshot_with_positions_for_tests(
+        raw_us: u64,
+        host_rx_mono_us: u64,
+        positions: [f64; 6],
+    ) -> ExperimentalRawClockSnapshot {
+        let mut snapshot = raw_clock_snapshot_for_tests(raw_us, host_rx_mono_us);
+        snapshot.state.position = JointArray::new(positions.map(Rad));
+        snapshot
+    }
+
     fn raw_clock_snapshot_without_raw_timing_for_tests() -> ExperimentalRawClockSnapshot {
         ExperimentalRawClockSnapshot {
             state: control_snapshot_for_tests(),
@@ -1724,6 +1885,26 @@ mod tests {
             ],
         );
         timing
+    }
+
+    fn ready_timing_near_now_for_tests() -> (RawClockRuntimeTiming, u64) {
+        let base_host_us = piper_can::monotonic_micros().saturating_sub(5_000);
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        timing.seed_ready_for_tests(
+            &[
+                raw_clock_snapshot_for_tests(7_000, base_host_us),
+                raw_clock_snapshot_for_tests(8_000, base_host_us + 1_000),
+                raw_clock_snapshot_for_tests(9_000, base_host_us + 2_000),
+                raw_clock_snapshot_for_tests(10_000, base_host_us + 3_000),
+            ],
+            &[
+                raw_clock_snapshot_for_tests(17_000, base_host_us + 500),
+                raw_clock_snapshot_for_tests(18_000, base_host_us + 1_500),
+                raw_clock_snapshot_for_tests(19_000, base_host_us + 2_500),
+                raw_clock_snapshot_for_tests(20_000, base_host_us + 3_500),
+            ],
+        );
+        (timing, base_host_us + 4_000)
     }
 
     fn test_command() -> BilateralCommand {
@@ -2163,6 +2344,22 @@ mod tests {
         }
     }
 
+    struct MirrorJ4CommandController;
+
+    impl BilateralController for MirrorJ4CommandController {
+        type Error = Infallible;
+
+        fn tick(
+            &mut self,
+            snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            let mut command = test_command();
+            command.slave_position[3] = Rad(-snapshot.left.state.position[3].0);
+            Ok(command)
+        }
+    }
+
     struct FakeStandbyArms;
 
     struct FakeErrorArms;
@@ -2564,6 +2761,85 @@ mod tests {
             .to_frame();
         assert_eq!(events[6].1.id(), expected_master_zero.id());
         assert_eq!(events[6].1.data(), expected_master_zero.data());
+    }
+
+    #[test]
+    fn raw_clock_joint_motion_stats_capture_feedback_and_command_ranges() {
+        let mut motion = RawClockJointMotionAccumulator::default();
+        let mut command = test_command();
+
+        let mut first_master = raw_clock_snapshot_for_tests(10_000, 110_000);
+        first_master.state.position = JointArray::new([0.0, 0.0, 0.0, -1.2, 0.0, 0.0].map(Rad));
+        let mut first_slave = raw_clock_snapshot_for_tests(20_000, 110_500);
+        first_slave.state.position = JointArray::new([0.0, 0.0, 0.0, -1.1, 0.0, 0.0].map(Rad));
+        command.slave_position = JointArray::new([0.0, 0.0, 0.0, 1.1, 0.0, 0.0].map(Rad));
+        motion.record(
+            &raw_dual_arm_snapshot(&first_master, &first_slave, 500),
+            &command,
+        );
+
+        let mut second_master = raw_clock_snapshot_for_tests(11_000, 111_000);
+        second_master.state.position = JointArray::new([0.0, 0.0, 0.0, -0.7, 0.0, 0.0].map(Rad));
+        let mut second_slave = raw_clock_snapshot_for_tests(21_000, 111_500);
+        second_slave.state.position = JointArray::new([0.0, 0.0, 0.0, -1.1, 0.0, 0.0].map(Rad));
+        command.slave_position = JointArray::new([0.0, 0.0, 0.0, 0.6, 0.0, 0.0].map(Rad));
+        motion.record(
+            &raw_dual_arm_snapshot(&second_master, &second_slave, 500),
+            &command,
+        );
+
+        let stats = motion.snapshot().expect("motion stats should be present");
+        assert_close(stats.master_feedback_delta_rad[3], 0.5);
+        assert_close(stats.slave_command_delta_rad[3], 0.5);
+        assert_close(stats.slave_feedback_delta_rad[3], 0.0);
+        assert_close(stats.master_feedback_min_rad[3], -1.2);
+        assert_close(stats.master_feedback_max_rad[3], -0.7);
+        assert_close(stats.slave_command_min_rad[3], 0.6);
+        assert_close(stats.slave_command_max_rad[3], 1.1);
+    }
+
+    #[test]
+    fn raw_clock_runtime_report_includes_joint_motion_stats() {
+        let (timing, first_host_us) = ready_timing_near_now_for_tests();
+        let io = FakeRuntimeIo::new().with_reads([
+            FakeRead::pair(
+                raw_clock_snapshot_with_positions_for_tests(
+                    11_000,
+                    first_host_us,
+                    [0.0, 0.0, 0.0, -1.2, 0.0, 0.0],
+                ),
+                raw_clock_snapshot_with_positions_for_tests(
+                    21_000,
+                    first_host_us + 500,
+                    [0.0, 0.0, 0.0, -1.1, 0.0, 0.0],
+                ),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_with_positions_for_tests(
+                    12_000,
+                    first_host_us + 1_000,
+                    [0.0, 0.0, 0.0, -0.7, 0.0, 0.0],
+                ),
+                raw_clock_snapshot_with_positions_for_tests(
+                    22_000,
+                    first_host_us + 1_500,
+                    [0.0, 0.0, 0.0, -1.1, 0.0, 0.0],
+                ),
+            ),
+        ]);
+
+        let (_state, report) = run_fake_runtime_with_controller(
+            io,
+            timing,
+            2,
+            RawClockRuntimeThresholds::for_tests(),
+            MirrorJ4CommandController,
+        );
+
+        let stats = report.joint_motion.expect("joint motion stats should be present");
+        assert_close(stats.master_feedback_delta_rad[3], 0.5);
+        assert_close(stats.slave_command_delta_rad[3], 0.5);
+        assert_close(stats.slave_feedback_delta_rad[3], 0.0);
     }
 
     #[test]
