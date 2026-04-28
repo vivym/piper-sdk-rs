@@ -17,7 +17,7 @@ nalgebra = { version = "0.32", features = ["std"] }
 piper-client = { path = "../../crates/piper-client", version = "0.0.3", default-features = false, features = ["socketcan"] }
 piper-control = { path = "../../crates/piper-control", version = "0.0.3" }
 piper-driver = { path = "../../crates/piper-driver", version = "0.0.3", default-features = false, features = ["socketcan"] }
-piper-physics = { path = "../piper-physics-mujoco", version = "0.0.3", optional = true }
+piper-physics = { path = "../piper-physics-mujoco", version = "0.0.3" }
 piper-sdk = { path = "../../crates/piper-sdk", version = "0.0.3", default-features = false, features = ["socketcan"] }
 piper-tools = { path = "../../crates/piper-tools", version = "0.0.3" }
 ryu = "1.0"
