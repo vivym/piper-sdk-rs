@@ -10,7 +10,7 @@ members = [
     "crates/piper-tools",
     "apps/cli",
 ]
-exclude = ["addons/piper-physics-mujoco"]
+exclude = ["addons/piper-physics-mujoco", "addons/piper-svs-collect"]
 
 [workspace.package]
 version = "0.0.3"
