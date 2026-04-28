@@ -1064,7 +1064,6 @@ mod tests {
 
     fn observer_with_gripper_feedback(
         hardware_timestamp_us: u64,
-        _host_rx_mono_us: u64,
         travel_mm: f64,
         torque_nm: f64,
     ) -> Observer<StrictRealtime> {
@@ -1224,10 +1223,10 @@ mod tests {
 
     #[test]
     fn gripper_state_exposes_hardware_and_host_timestamps() {
-        let observer = observer_with_gripper_feedback(12_345, 67_890, 50.0, 1.0);
+        let observer = observer_with_gripper_feedback(0, 50.0, 1.0);
         let gripper = observer.gripper_state();
 
-        assert_eq!(gripper.hardware_timestamp_us, 12_345);
+        assert_eq!(gripper.hardware_timestamp_us, 0);
         assert!(gripper.host_rx_mono_us > 0);
         assert_eq!(gripper.position, 0.5);
         assert!(gripper.enabled);

@@ -2494,7 +2494,14 @@ where
         raw.send_validated_mit_command_batch_confirmed(commands, timeout)
     }
 
-    /// 发送 MIT 模式控制指令，等待 TX 线程完成整包发送，并返回批命令回执。
+    /// 发送 MIT 模式控制指令，等待 strict-realtime TX 线程完成整包发送，并返回批命令回执。
+    ///
+    /// 该方法的 `timeout` 覆盖整包实际发送完成，而不只是提交到 TX commit point；
+    /// 如果 TX 线程未在期限内完成整包发送，或任一帧发送失败，错误会原样向上传播，
+    /// 且不会产生 `ConfirmedMitBatch` 回执。
+    ///
+    /// 成功时返回的 `mit_t_ref_nm` 是经过固件 quirk 修正和 MIT 力矩缩放后的每关节
+    /// `t_ref`（N·m），与最终编码发送到硬件的 MIT 参考一致。
     pub fn command_torques_confirmed_finished(
         &self,
         positions: &JointArray<Rad>,
@@ -7643,6 +7650,46 @@ mod tests {
     }
 
     #[test]
+    fn command_torques_confirmed_finished_propagates_tx_delivery_failure() {
+        let driver = Arc::new(
+            RobotPiper::new_dual_thread_parts(IdleRxAdapter::new(), FailSendTxAdapter, None)
+                .expect("driver should start"),
+        );
+        let robot = build_active_mit_piper_with_driver(
+            driver,
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+        );
+        let positions = JointArray::splat(Rad(0.0));
+        let velocities = JointArray::splat(0.0);
+        let kp = JointArray::splat(0.0);
+        let kd = JointArray::splat(0.0);
+        let torques = JointArray::splat(NewtonMeter(0.0));
+
+        let error = robot
+            .command_torques_confirmed_finished(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(200),
+            )
+            .expect_err("TX delivery failure must propagate without a confirmed receipt");
+
+        match error {
+            RobotError::Infrastructure(piper_driver::DriverError::RealtimeDeliveryFailed {
+                sent,
+                total,
+                source: CanError::BusOff,
+            }) => {
+                assert_eq!(sent, 0);
+                assert_eq!(total, 6);
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn command_torques_confirmed_is_atomic_when_any_joint_is_invalid() {
         let sent_frames = Arc::new(Mutex::new(Vec::new()));
         let robot = build_active_mit_piper(
@@ -7684,6 +7731,51 @@ mod tests {
         assert!(
             sent_frames.lock().expect("sent frames lock").is_empty(),
             "no frames should be sent when confirmed batch validation fails"
+        );
+    }
+
+    #[test]
+    fn command_torques_confirmed_finished_is_atomic_when_any_joint_is_invalid() {
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let robot = build_active_mit_piper(
+            DeviceQuirks::from_firmware_version(Version::new(1, 8, 3)),
+            sent_frames.clone(),
+        );
+
+        let positions = JointArray::splat(Rad(0.0));
+        let velocities = JointArray::splat(0.0);
+        let kp = JointArray::splat(0.0);
+        let kd = JointArray::splat(0.0);
+        let torques = JointArray::from([
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(9.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+            NewtonMeter(0.0),
+        ]);
+
+        let error = robot
+            .command_torques_confirmed_finished(
+                &positions,
+                &velocities,
+                &kp,
+                &kd,
+                &torques,
+                Duration::from_millis(200),
+            )
+            .expect_err("invalid joint torque should fail before a finished receipt exists");
+
+        assert!(matches!(
+            error,
+            RobotError::TorqueLimitExceeded {
+                joint: Joint::J3,
+                ..
+            }
+        ));
+        assert!(
+            sent_frames.lock().expect("sent frames lock").is_empty(),
+            "no frames should be sent when confirmed-finished batch validation fails"
         );
     }
 
