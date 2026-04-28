@@ -225,6 +225,7 @@ impl RawClockEstimator {
         let retention_window_us = self
             .thresholds
             .warmup_window_us
+            .saturating_mul(2)
             .saturating_add(self.thresholds.sample_gap_max_us)
             .max(self.thresholds.sample_gap_max_us.saturating_mul(4));
         while self.samples.front().is_some_and(|sample| {
@@ -720,6 +721,36 @@ mod tests {
         }
 
         let health = estimator.health(120_900);
+        assert!(health.healthy, "{health:?}");
+        assert!(health.window_duration_us >= 10_000, "{health:?}");
+    }
+
+    #[test]
+    fn retention_bridges_continuity_boundary_until_runtime_window_matures() {
+        let thresholds = RawClockThresholds {
+            warmup_samples: 4,
+            warmup_window_us: 10_000,
+            residual_p95_us: 20,
+            residual_max_us: 50,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_us: 1_000,
+            last_sample_age_us: 2_000,
+        };
+        let mut estimator = RawClockEstimator::new(thresholds);
+
+        for index in 0..=10 {
+            let offset_us = index * 1_000;
+            estimator.push(sample(10_000 + offset_us, 110_000 + offset_us)).unwrap();
+        }
+        assert!(estimator.health(120_000).healthy);
+
+        estimator.mark_continuity_boundary();
+        for index in 0..=97 {
+            let offset_us = index * 100;
+            estimator.push(sample(21_400 + offset_us, 121_400 + offset_us)).unwrap();
+        }
+
+        let health = estimator.health(131_100);
         assert!(health.healthy, "{health:?}");
         assert!(health.window_duration_us >= 10_000, "{health:?}");
     }
