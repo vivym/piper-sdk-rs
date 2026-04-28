@@ -1070,9 +1070,23 @@ mod tests {
         let frame = gripper_feedback_frame_with_values(hardware_timestamp_us, travel_mm, torque_nm);
         let (driver, observer) = start_observer_with_frames(vec![frame]);
 
-        driver
-            .wait_for_feedback(Duration::from_millis(200))
-            .expect("gripper feedback should arrive");
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            driver
+                .wait_for_feedback(Duration::from_millis(10))
+                .expect("gripper feedback should arrive");
+            let gripper = observer.gripper_state();
+            if gripper.hardware_timestamp_us == hardware_timestamp_us
+                && gripper.host_rx_mono_us > 0
+                && (gripper.position - travel_mm / 100.0).abs() < f64::EPSILON
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for gripper feedback to become visible"
+            );
+        }
 
         observer
     }
