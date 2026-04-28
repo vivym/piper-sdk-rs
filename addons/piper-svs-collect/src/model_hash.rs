@@ -75,7 +75,7 @@ pub fn hash_model_dir(
         });
     }
 
-    let root_xml = normalize_relative_path(root_xml_relative_path.as_ref())?;
+    let root_xml = normalize_reference_path(root_xml_relative_path.as_ref())?;
     let files = collect_model_files(model_dir)?;
     validate_reachable_xml_files(&root_xml, &files)?;
 
@@ -94,6 +94,7 @@ pub fn hash_model_dir(
 pub fn hash_embedded_model(xml_bytes: &[u8]) -> Result<MujocoModelHash, ModelHashError> {
     validate_xml_file_references(
         EMBEDDED_ROOT_XML,
+        "",
         xml_bytes,
         &BTreeMap::new(),
         XmlReferenceMode::Embedded,
@@ -155,7 +156,7 @@ fn walk_model_dir(
         let relative_path = path
             .strip_prefix(model_dir)
             .expect("walked paths are always under the model directory");
-        let normalized_path = normalize_relative_path(relative_path)?;
+        let normalized_path = normalize_filesystem_relative_path(relative_path)?;
 
         if metadata.is_dir() {
             walk_model_dir(model_dir, &path, files)?;
@@ -177,9 +178,19 @@ fn walk_model_dir(
     Ok(())
 }
 
-fn normalize_relative_path(path: &Path) -> Result<String, ModelHashError> {
-    validate_raw_relative_path(path)?;
+fn normalize_filesystem_relative_path(path: &Path) -> Result<String, ModelHashError> {
+    normalize_path_components(path, false)
+}
 
+fn normalize_reference_path(path: &Path) -> Result<String, ModelHashError> {
+    validate_raw_relative_path(path)?;
+    normalize_path_components(path, true)
+}
+
+fn normalize_path_components(
+    path: &Path,
+    reject_backslash_components: bool,
+) -> Result<String, ModelHashError> {
     let mut components = Vec::new();
 
     for component in path.components() {
@@ -191,7 +202,7 @@ fn normalize_relative_path(path: &Path) -> Result<String, ModelHashError> {
                 if component.is_empty()
                     || component == "."
                     || component == ".."
-                    || component.contains('\\')
+                    || (reject_backslash_components && component.contains('\\'))
                 {
                     return Err(ModelHashError::InvalidRelativePath {
                         path: path.display().to_string(),
@@ -216,7 +227,14 @@ fn normalize_relative_path(path: &Path) -> Result<String, ModelHashError> {
         });
     }
 
-    Ok(components.join("/"))
+    let normalized = components.join("/");
+    if normalized.contains('\\') {
+        return Err(ModelHashError::InvalidRelativePath {
+            path: path.display().to_string(),
+        });
+    }
+
+    Ok(normalized)
 }
 
 fn validate_raw_relative_path(path: &Path) -> Result<(), ModelHashError> {
@@ -261,6 +279,7 @@ fn validate_reachable_xml_files(
 ) -> Result<(), ModelHashError> {
     let mut pending = vec![root_xml.to_string()];
     let mut validated = BTreeSet::new();
+    let root_xml_dir = root_xml_parent(root_xml);
 
     while let Some(xml_path) = pending.pop() {
         if !validated.insert(xml_path.clone()) {
@@ -270,8 +289,13 @@ fn validate_reachable_xml_files(
         let bytes = files.get(&xml_path).ok_or_else(|| ModelHashError::RootXmlNotInModelTree {
             path: xml_path.clone(),
         })?;
-        let includes =
-            validate_xml_file_references(&xml_path, bytes, files, XmlReferenceMode::Directory)?;
+        let includes = validate_xml_file_references(
+            &xml_path,
+            root_xml_dir,
+            bytes,
+            files,
+            XmlReferenceMode::Directory,
+        )?;
         pending.extend(includes);
     }
 
@@ -280,6 +304,7 @@ fn validate_reachable_xml_files(
 
 fn validate_xml_file_references(
     xml_path: &str,
+    root_xml_dir: &str,
     xml_bytes: &[u8],
     files: &BTreeMap<String, Vec<u8>>,
     mode: XmlReferenceMode,
@@ -307,15 +332,22 @@ fn validate_xml_file_references(
             position = find_after(xml, start, "?>", xml_path)?;
             continue;
         }
-        if remaining.starts_with("</") || remaining.starts_with("<!") {
+        if remaining.starts_with("</") {
             position = find_after(xml, start, ">", xml_path)?;
             continue;
+        }
+        if remaining.starts_with("<!") {
+            return Err(ModelHashError::InvalidXml {
+                path: xml_path.to_string(),
+                message: "unsupported XML declaration".to_string(),
+            });
         }
 
         let tag_end = find_tag_end(xml, start + 1, xml_path)?;
         saw_start_tag = true;
         includes.extend(parse_start_tag_attributes(
             xml_path,
+            root_xml_dir,
             &xml[start + 1..tag_end],
             files,
             mode,
@@ -367,6 +399,7 @@ fn find_tag_end(xml: &str, start: usize, xml_path: &str) -> Result<usize, ModelH
 
 fn parse_start_tag_attributes(
     xml_path: &str,
+    root_xml_dir: &str,
     tag: &str,
     files: &BTreeMap<String, Vec<u8>>,
     mode: XmlReferenceMode,
@@ -438,12 +471,12 @@ fn parse_start_tag_attributes(
 
         match name {
             "file" => {
-                let resolved = validate_file_reference(xml_path, value, files, mode)?;
+                let resolved = validate_file_reference(xml_path, root_xml_dir, value, files, mode)?;
                 if tag_name == "include" {
                     includes.push(resolved);
                 }
             },
-            "assetdir" | "meshdir" | "texturedir" => {
+            "assetdir" | "meshdir" | "texturedir" | "strippath" => {
                 return Err(ModelHashError::UnsupportedAssetResolutionAttribute {
                     xml_path: xml_path.to_string(),
                     attribute: name.to_string(),
@@ -456,6 +489,7 @@ fn parse_start_tag_attributes(
 
 fn validate_file_reference(
     xml_path: &str,
+    root_xml_dir: &str,
     reference: &str,
     files: &BTreeMap<String, Vec<u8>>,
     mode: XmlReferenceMode,
@@ -478,13 +512,13 @@ fn validate_file_reference(
         });
     }
 
-    let normalized_reference = normalize_relative_path(Path::new(reference)).map_err(|_| {
+    let normalized_reference = normalize_reference_path(Path::new(reference)).map_err(|_| {
         ModelHashError::EscapingFileReference {
             xml_path: xml_path.to_string(),
             reference: reference.to_string(),
         }
     })?;
-    let resolved = resolve_against_xml_path(xml_path, &normalized_reference);
+    let resolved = resolve_against_root_xml_dir(root_xml_dir, &normalized_reference);
     if !files.contains_key(&resolved) {
         return Err(ModelHashError::UnresolvedFileReference {
             xml_path: xml_path.to_string(),
@@ -495,10 +529,18 @@ fn validate_file_reference(
     Ok(resolved)
 }
 
-fn resolve_against_xml_path(xml_path: &str, normalized_reference: &str) -> String {
-    match xml_path.rsplit_once('/') {
-        Some((parent, _)) if !parent.is_empty() => format!("{parent}/{normalized_reference}"),
-        _ => normalized_reference.to_string(),
+fn root_xml_parent(root_xml: &str) -> &str {
+    match root_xml.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => parent,
+        _ => "",
+    }
+}
+
+fn resolve_against_root_xml_dir(root_xml_dir: &str, normalized_reference: &str) -> String {
+    if root_xml_dir.is_empty() {
+        normalized_reference.to_string()
+    } else {
+        format!("{root_xml_dir}/{normalized_reference}")
     }
 }
 
@@ -620,6 +662,96 @@ mod tests {
         std::fs::write(dir.path().join("assets/mesh.stl"), b"mesh bytes").unwrap();
 
         assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[test]
+    fn nested_xml_file_references_resolve_from_root_xml_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models/nested")).unwrap();
+        std::fs::create_dir_all(dir.path().join("models/assets")).unwrap();
+        std::fs::write(
+            dir.path().join("models/root.xml"),
+            r#"<mujoco><include file="nested/nested.xml"/></mujoco>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/nested/nested.xml"),
+            r#"<asset><mesh file="assets/link.stl"/></asset>"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("models/assets/link.stl"), b"mesh bytes").unwrap();
+
+        hash_model_dir(dir.path(), "models/root.xml").unwrap();
+    }
+
+    #[test]
+    fn nested_xml_file_references_reject_including_file_relative_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models/nested/assets")).unwrap();
+        std::fs::write(
+            dir.path().join("models/root.xml"),
+            r#"<mujoco><include file="nested/nested.xml"/></mujoco>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/nested/nested.xml"),
+            r#"<asset><mesh file="assets/link.stl"/></asset>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/nested/assets/link.stl"),
+            b"mesh bytes",
+        )
+        .unwrap();
+
+        assert!(hash_model_dir(dir.path(), "models/root.xml").is_err());
+    }
+
+    #[test]
+    fn model_dir_hash_rejects_strippath_modifier() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("piper_no_gripper.xml"),
+            r#"<mujoco><compiler strippath="false"/></mujoco>"#,
+        )
+        .unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[test]
+    fn model_dir_hash_rejects_unsupported_xml_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("piper_no_gripper.xml"),
+            "<!DOCTYPE mujoco><mujoco/>",
+        )
+        .unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[test]
+    fn reference_path_normalization_rejects_raw_backslashes() {
+        assert!(normalize_reference_path(Path::new(r"assets\mesh.stl")).is_err());
+    }
+
+    #[test]
+    fn filesystem_path_normalization_uses_canonical_separators() {
+        let path = Path::new("models").join("assets").join("mesh.stl");
+        assert_eq!(
+            normalize_filesystem_relative_path(&path).unwrap(),
+            "models/assets/mesh.stl"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_path_normalization_accepts_windows_native_separators() {
+        assert_eq!(
+            normalize_filesystem_relative_path(Path::new(r"models\assets\mesh.stl")).unwrap(),
+            "models/assets/mesh.stl"
+        );
     }
 
     #[cfg(unix)]
