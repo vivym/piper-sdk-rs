@@ -18,6 +18,15 @@ pub const DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 100.0;
 pub const DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 2000;
+// Lab-experiment guardrails: generous enough for setup/debugging, low enough
+// that raw-clock health gates cannot be configured into practical no-ops.
+pub const MAX_RAW_CLOCK_WARMUP_SECS: u64 = 3600;
+pub const MAX_RAW_CLOCK_RESIDUAL_P95_US: u64 = 100_000;
+pub const MAX_RAW_CLOCK_RESIDUAL_MAX_US: u64 = 250_000;
+pub const MAX_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 1000.0;
+pub const MAX_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 1000;
+pub const MAX_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 1000;
+pub const MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -179,6 +188,64 @@ impl TeleopControlSettings {
     }
 }
 
+impl TeleopRawClockSettings {
+    pub fn validate(&self) -> Result<()> {
+        validate_u64_range(
+            "warmup_secs",
+            self.warmup_secs,
+            1,
+            MAX_RAW_CLOCK_WARMUP_SECS,
+        )?;
+        validate_u64_range(
+            "residual_p95_us",
+            self.residual_p95_us,
+            1,
+            MAX_RAW_CLOCK_RESIDUAL_P95_US,
+        )?;
+        validate_u64_range(
+            "residual_max_us",
+            self.residual_max_us,
+            1,
+            MAX_RAW_CLOCK_RESIDUAL_MAX_US,
+        )?;
+        if self.residual_p95_us > self.residual_max_us {
+            bail!(
+                "residual_p95_us must be less than or equal to residual_max_us; got residual_p95_us={} and residual_max_us={}",
+                self.residual_p95_us,
+                self.residual_max_us
+            );
+        }
+        if !self.drift_abs_ppm.is_finite()
+            || self.drift_abs_ppm <= 0.0
+            || self.drift_abs_ppm > MAX_RAW_CLOCK_DRIFT_ABS_PPM
+        {
+            bail!(
+                "drift_abs_ppm must be finite and greater than 0.0 up to {MAX_RAW_CLOCK_DRIFT_ABS_PPM}; got {}",
+                self.drift_abs_ppm
+            );
+        }
+        validate_u64_range(
+            "sample_gap_max_ms",
+            self.sample_gap_max_ms,
+            1,
+            MAX_RAW_CLOCK_SAMPLE_GAP_MAX_MS,
+        )?;
+        validate_u64_range(
+            "last_sample_age_ms",
+            self.last_sample_age_ms,
+            1,
+            MAX_RAW_CLOCK_LAST_SAMPLE_AGE_MS,
+        )?;
+        validate_u64_range(
+            "inter_arm_skew_max_us",
+            self.inter_arm_skew_max_us,
+            1,
+            MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US,
+        )?;
+        Ok(())
+    }
+}
+
 impl ResolvedTeleopConfig {
     pub fn resolve(args: TeleopDualArmArgs, file: Option<TeleopConfigFile>) -> Result<Self> {
         let file_control = file.as_ref().and_then(|file| file.control.as_ref());
@@ -249,6 +316,7 @@ impl ResolvedTeleopConfig {
                 .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.inter_arm_skew_max_us))
                 .unwrap_or(DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US),
         };
+        raw_clock.validate()?;
 
         let calibration_max_error_rad = args
             .calibration_max_error_rad
@@ -306,6 +374,13 @@ impl ResolvedTeleopConfig {
 fn validate_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
     if !value.is_finite() || value < min || value > max {
         bail!("{name} must be finite and between {min} and {max}; got {value}");
+    }
+    Ok(())
+}
+
+fn validate_u64_range(name: &str, value: u64, min: u64, max: u64) -> Result<()> {
+    if value < min || value > max {
+        bail!("{name} must be between {min} and {max}; got {value}");
     }
     Ok(())
 }
@@ -461,6 +536,63 @@ mod tests {
         let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
         assert!(!resolved.raw_clock.experimental_calibrated_raw);
         assert_eq!(resolved.raw_clock.warmup_secs, 30);
+    }
+
+    #[test]
+    fn raw_clock_validation_rejects_non_finite_drift() {
+        let args = TeleopDualArmArgs {
+            raw_clock_drift_abs_ppm: Some(f64::INFINITY),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+        assert!(err.to_string().contains("drift_abs_ppm"));
+    }
+
+    #[test]
+    fn raw_clock_validation_rejects_p95_above_max() {
+        let args = TeleopDualArmArgs {
+            raw_clock_residual_p95_us: Some(3000),
+            raw_clock_residual_max_us: Some(2000),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+        assert!(err.to_string().contains("residual_p95_us"));
+        assert!(err.to_string().contains("residual_max_us"));
+    }
+
+    #[test]
+    fn raw_clock_validation_rejects_zero_warmup() {
+        let args = TeleopDualArmArgs {
+            raw_clock_warmup_secs: Some(0),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+        assert!(err.to_string().contains("warmup_secs"));
+    }
+
+    #[test]
+    fn raw_clock_validation_rejects_zero_inter_arm_skew() {
+        let args = TeleopDualArmArgs {
+            raw_clock_inter_arm_skew_max_us: Some(0),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+        assert!(err.to_string().contains("inter_arm_skew_max_us"));
+    }
+
+    #[test]
+    fn raw_clock_validation_rejects_effectively_disabled_thresholds() {
+        let args = TeleopDualArmArgs {
+            raw_clock_residual_max_us: Some(u64::MAX),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+        assert!(err.to_string().contains("residual_max_us"));
     }
 
     #[test]
