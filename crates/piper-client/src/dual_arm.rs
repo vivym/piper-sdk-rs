@@ -629,7 +629,7 @@ impl DualArmActiveMit {
             }
 
             if let Some(sink) = &cfg.telemetry_sink {
-                let telemetry = BilateralLoopTelemetry {
+                let mut telemetry = BilateralLoopTelemetry {
                     control_frame: frame,
                     controller_command: controller_command
                         .expect("telemetry command clone should exist when sink is configured"),
@@ -644,6 +644,12 @@ impl DualArmActiveMit {
                     slave_tx_finished_host_mono_us,
                     timing,
                 };
+                telemetry.timing.deadline_missed |= deadline_missed_after_submission(
+                    submission_deadline_mono_us,
+                    master_tx_finished_host_mono_us,
+                    slave_tx_finished_host_mono_us,
+                    piper_driver::heartbeat::monotonic_micros(),
+                );
 
                 if let Err(err) = sink.on_tick(&telemetry) {
                     return telemetry_sink_fault_exit(active, report, &cfg, err);
@@ -1666,6 +1672,22 @@ fn duration_micros_u64(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn deadline_missed_after_submission(
+    submission_deadline_mono_us: u64,
+    master_tx_finished_host_mono_us: Option<u64>,
+    slave_tx_finished_host_mono_us: Option<u64>,
+    post_submission_host_mono_us: u64,
+) -> bool {
+    [
+        Some(post_submission_host_mono_us),
+        master_tx_finished_host_mono_us,
+        slave_tx_finished_host_mono_us,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|sample| sample > submission_deadline_mono_us)
+}
+
 fn remaining_until(deadline: Instant) -> Duration {
     deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO)
 }
@@ -2004,7 +2026,7 @@ mod tests {
     use piper_protocol::ids::{
         ID_CONTROL_MODE, ID_GRIPPER_CONTROL, ID_GRIPPER_FEEDBACK, ID_JOINT_DRIVER_HIGH_SPEED_1,
         ID_JOINT_DRIVER_LOW_SPEED_1, ID_JOINT_FEEDBACK_12, ID_JOINT_FEEDBACK_34,
-        ID_JOINT_FEEDBACK_56,
+        ID_JOINT_FEEDBACK_56, ID_MIT_CONTROL_1,
     };
     use semver::Version;
     use std::collections::VecDeque;
@@ -2015,6 +2037,9 @@ mod tests {
 
     const ID_JOINT_DRIVER_HIGH_SPEED_BASE: u32 = ID_JOINT_DRIVER_HIGH_SPEED_1.raw() as u32;
     const ID_JOINT_DRIVER_LOW_SPEED_BASE: u32 = ID_JOINT_DRIVER_LOW_SPEED_1.raw() as u32;
+    const ID_MIT_CONTROL_BASE: u32 = ID_MIT_CONTROL_1.raw() as u32;
+    const ALL_MIT_CONTROL_SENT_MASK: u8 = 0b0011_1111;
+    const STABLE_CONFIRMED_TELEMETRY_TEST_FREQUENCY_HZ: f64 = 10.0;
 
     #[test]
     fn test_dual_arm_read_policy_default_uses_control_default_feedback_freshness() {
@@ -2286,32 +2311,52 @@ mod tests {
         }
     }
 
-    struct ReplayPeerOnNthSendTxAdapter {
+    struct ReplayPeerAfterMitBatchTxAdapter {
         sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
         peer_driver: Arc<RobotPiper>,
-        replay_on_send: usize,
-        sends: usize,
+        mit_control_sent_mask: u8,
         replayed: Arc<AtomicBool>,
     }
 
-    impl ReplayPeerOnNthSendTxAdapter {
+    impl ReplayPeerAfterMitBatchTxAdapter {
         fn new(
             sent_frames: Arc<Mutex<Vec<PiperFrame>>>,
             peer_driver: Arc<RobotPiper>,
-            replay_on_send: usize,
             replayed: Arc<AtomicBool>,
         ) -> Self {
             Self {
                 sent_frames,
                 peer_driver,
-                replay_on_send,
-                sends: 0,
+                mit_control_sent_mask: 0,
                 replayed,
+            }
+        }
+
+        fn replay_peer_after_complete_mit_batch(&mut self, frame: PiperFrame) {
+            let raw_id = frame.raw_id();
+            let Some(bit_index) = raw_id.checked_sub(ID_MIT_CONTROL_BASE) else {
+                return;
+            };
+            if bit_index >= 6 {
+                return;
+            }
+
+            self.mit_control_sent_mask |= 1_u8 << bit_index;
+            if self.mit_control_sent_mask == ALL_MIT_CONTROL_SENT_MASK
+                && !self.replayed.load(AtomicOrdering::Acquire)
+            {
+                self.peer_driver
+                    .try_set_mode(
+                        piper_driver::mode::DriverMode::Replay,
+                        Duration::from_millis(50),
+                    )
+                    .expect("peer driver should enter replay mode for gripper send failure");
+                self.replayed.store(true, AtomicOrdering::Release);
             }
         }
     }
 
-    impl RealtimeTxAdapter for ReplayPeerOnNthSendTxAdapter {
+    impl RealtimeTxAdapter for ReplayPeerAfterMitBatchTxAdapter {
         fn send_control(
             &mut self,
             frame: PiperFrame,
@@ -2321,16 +2366,7 @@ mod tests {
                 return Err(CanError::Timeout);
             }
             self.sent_frames.lock().expect("sent frames lock").push(frame);
-            self.sends += 1;
-            if self.sends == self.replay_on_send {
-                self.peer_driver
-                    .try_set_mode(
-                        piper_driver::mode::DriverMode::Replay,
-                        Duration::from_millis(50),
-                    )
-                    .expect("peer driver should enter replay mode for gripper send failure");
-                self.replayed.store(true, AtomicOrdering::Release);
-            }
+            self.replay_peer_after_complete_mit_batch(frame);
             Ok(())
         }
 
@@ -3360,8 +3396,15 @@ mod tests {
         }
     }
 
-    fn one_tick_test_config(mut cfg: BilateralLoopConfig) -> BilateralLoopConfig {
-        cfg.frequency_hz = 200.0;
+    fn one_tick_test_config(cfg: BilateralLoopConfig) -> BilateralLoopConfig {
+        one_tick_test_config_at_frequency(cfg, 200.0)
+    }
+
+    fn one_tick_test_config_at_frequency(
+        mut cfg: BilateralLoopConfig,
+        frequency_hz: f64,
+    ) -> BilateralLoopConfig {
+        cfg.frequency_hz = frequency_hz;
         cfg.warmup_cycles = 0;
         cfg.max_iterations = Some(1);
         cfg.gripper.enabled = false;
@@ -3413,13 +3456,29 @@ mod tests {
     where
         C: BilateralController,
     {
+        run_fake_dual_arm_one_successful_submission_with_controller_at_frequency(
+            controller, cfg, 200.0,
+        )
+    }
+
+    fn run_fake_dual_arm_one_successful_submission_with_controller_at_frequency<C>(
+        controller: C,
+        cfg: BilateralLoopConfig,
+        frequency_hz: f64,
+    ) -> DualArmLoopExit
+    where
+        C: BilateralController,
+    {
         let arms = DualArmActiveMit {
             left: build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new()))),
             right: build_active_mit_piper(1_000, Arc::new(Mutex::new(Vec::new()))),
         };
 
-        arms.run_bilateral(controller, one_tick_test_config(cfg))
-            .expect("fake successful submission run should return a loop exit")
+        arms.run_bilateral(
+            controller,
+            one_tick_test_config_at_frequency(cfg, frequency_hz),
+        )
+        .expect("fake successful submission run should return a loop exit")
     }
 
     fn zero_snapshot() -> DualArmSnapshot {
@@ -3453,6 +3512,19 @@ mod tests {
     }
 
     #[test]
+    fn deadline_missed_after_submission_considers_tx_finished_and_post_sample() {
+        assert!(deadline_missed_after_submission(100, Some(101), None, 99));
+        assert!(deadline_missed_after_submission(100, None, Some(101), 99));
+        assert!(deadline_missed_after_submission(100, None, None, 101));
+        assert!(!deadline_missed_after_submission(
+            100,
+            Some(100),
+            Some(99),
+            100
+        ));
+    }
+
+    #[test]
     fn confirmed_submission_fault_writes_no_successful_telemetry() {
         let sink = RecordingTelemetrySink::default();
         let cfg = BilateralLoopConfig {
@@ -3479,12 +3551,13 @@ mod tests {
             ..BilateralLoopConfig::default()
         };
 
-        let exit = run_fake_dual_arm_one_successful_submission_with_controller(
+        let exit = run_fake_dual_arm_one_successful_submission_with_controller_at_frequency(
             FixedTorqueController {
                 master: JointArray::splat(NewtonMeter(0.5)),
                 slave: JointArray::splat(NewtonMeter(0.75)),
             },
             cfg,
+            STABLE_CONFIRMED_TELEMETRY_TEST_FREQUENCY_HZ,
         );
 
         assert!(matches!(exit, DualArmLoopExit::Standby { .. }));
@@ -3510,8 +3583,30 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_deadline_missed_includes_post_submission_work_before_sink() {
+        let sink = RecordingTelemetrySink::default();
+        let cfg = BilateralLoopConfig {
+            telemetry_sink: Some(Arc::new(sink.clone())),
+            ..BilateralLoopConfig::default()
+        };
+
+        let exit = run_fake_dual_arm_one_successful_submission_with_controller_at_frequency(
+            SlowForwardingController {
+                sleep_duration: Duration::from_millis(120),
+            },
+            cfg,
+            10.0,
+        );
+
+        assert!(matches!(exit, DualArmLoopExit::Standby { .. }));
+        let rows = sink.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].timing.deadline_missed);
+    }
+
+    #[test]
     fn telemetry_sink_error_stops_loop_without_another_cycle() {
-        let sink = FailingTelemetrySink::new("writer backpressure");
+        let sink = FailingTelemetrySink::new("telemetry sink rejected tick");
         let cfg = BilateralLoopConfig {
             telemetry_sink: Some(Arc::new(sink.clone())),
             ..BilateralLoopConfig::default()
@@ -3531,7 +3626,7 @@ mod tests {
     fn gripper_failed_command_telemetry_does_not_fault_loop() {
         let left_sent = Arc::new(Mutex::new(Vec::new()));
         let right_sent = Arc::new(Mutex::new(Vec::new()));
-        let replayed = Arc::new(AtomicBool::new(false));
+        let peer_replayed = Arc::new(AtomicBool::new(false));
         let right = build_piper_with_frames_and_tx_adapter(
             scripted_frames_with_gripper(1_000, 10.0, 0.5),
             RecordingTxAdapter::new(right_sent.clone()),
@@ -3542,21 +3637,28 @@ mod tests {
         let right_driver = right.driver.clone();
         let left = build_piper_with_frames_and_tx_adapter(
             scripted_frames_with_gripper(1_000, 50.0, 2.0),
-            ReplayPeerOnNthSendTxAdapter::new(left_sent, right_driver.clone(), 6, replayed.clone()),
+            ReplayPeerAfterMitBatchTxAdapter::new(
+                left_sent,
+                right_driver.clone(),
+                peer_replayed.clone(),
+            ),
             Duration::from_millis(20),
             active_mit_marker(),
         );
         wait_for_complete_control_snapshot(&left.observer().clone());
         let arms = DualArmActiveMit { left, right };
         let sink = RecordingTelemetrySink::default();
-        let mut cfg = one_tick_test_config(BilateralLoopConfig {
-            submission_mode: BilateralSubmissionMode::ConfirmedTxFinished,
-            telemetry_sink: Some(Arc::new(RestoreNormalModeTelemetrySink::new(
-                sink.clone(),
-                right_driver,
-            ))),
-            ..BilateralLoopConfig::default()
-        });
+        let mut cfg = one_tick_test_config_at_frequency(
+            BilateralLoopConfig {
+                submission_mode: BilateralSubmissionMode::ConfirmedTxFinished,
+                telemetry_sink: Some(Arc::new(RestoreNormalModeTelemetrySink::new(
+                    sink.clone(),
+                    right_driver,
+                ))),
+                ..BilateralLoopConfig::default()
+            },
+            STABLE_CONFIRMED_TELEMETRY_TEST_FREQUENCY_HZ,
+        );
         cfg.gripper = GripperTeleopConfig {
             enabled: true,
             update_divider: 1,
@@ -3569,7 +3671,7 @@ mod tests {
             .run_bilateral(ForwardingController::default(), cfg)
             .expect("gripper send failure should not fault the bilateral loop");
 
-        assert!(replayed.load(AtomicOrdering::Acquire));
+        assert!(peer_replayed.load(AtomicOrdering::Acquire));
         assert!(matches!(exit, DualArmLoopExit::Standby { .. }));
         assert_eq!(
             exit.report().exit_reason,
