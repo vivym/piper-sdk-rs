@@ -20,7 +20,7 @@ use crate::{
     types::{JointState, JointTorques},
 };
 use mujoco_rs::{mujoco_c, prelude::*};
-use std::{ffi::CStr, sync::Arc};
+use std::sync::Arc;
 
 /// MuJoCo-based gravity compensation
 ///
@@ -287,22 +287,11 @@ impl MujocoGravityCompensation {
 
         for name in possible_names {
             for i in 0..model.ffi().nsite {
-                // SAFETY: MuJoCo guarantees name_siteadr[i] is within bounds
-                let site_name = unsafe {
-                    let name_siteadr_ptr = model.ffi().name_siteadr;
-                    let name_offset = *name_siteadr_ptr.add(i as usize) as usize;
-                    let base_ptr = model.ffi().names;
-
-                    if base_ptr.is_null() {
-                        continue;
-                    }
-
-                    std::ffi::CStr::from_ptr(base_ptr.add(name_offset))
+                let Some(site_name) = model.id_to_name(MjtObj::mjOBJ_SITE, i) else {
+                    continue;
                 };
 
-                let site_name_str = site_name.to_string_lossy();
-
-                if site_name_str.contains(name) {
+                if site_name.contains(name) {
                     return Some(i);
                 }
             }
@@ -365,9 +354,9 @@ impl MujocoGravityCompensation {
     }
 
     fn set_joint_positions(&mut self, q: &JointState) -> Result<(), PhysicsError> {
-        if self.model.ffi().nq < 6 || self.model.ffi().nv != 6 {
+        if self.model.ffi().nq != 6 || self.model.ffi().nv != 6 {
             return Err(PhysicsError::InvalidInput(format!(
-                "Expected 6-DOF robot with at least 6 qpos entries, got nq={} nv={}",
+                "Expected 6-DOF robot with exactly 6 qpos entries, got nq={} nv={}",
                 self.model.ffi().nq,
                 self.model.ffi().nv
             )));
@@ -391,7 +380,7 @@ impl MujocoGravityCompensation {
         let mut matches = Vec::new();
 
         for site_id in 0..self.model.ffi().nsite {
-            if self.site_name(site_id)? == target {
+            if self.model.id_to_name(MjtObj::mjOBJ_SITE, site_id) == Some(target) {
                 matches.push(site_id);
             }
         }
@@ -406,27 +395,6 @@ impl MujocoGravityCompensation {
                 matches.len()
             ))),
         }
-    }
-
-    fn site_name(&self, site_id: i32) -> Result<String, PhysicsError> {
-        if site_id < 0 || site_id >= self.model.ffi().nsite {
-            return Err(PhysicsError::InvalidInput(format!(
-                "MuJoCo site id {site_id} is out of range"
-            )));
-        }
-
-        let names = self.model.ffi().names;
-        if names.is_null() {
-            return Err(PhysicsError::CalculationFailed(
-                "MuJoCo model name table is null".to_string(),
-            ));
-        }
-
-        let site_idx = site_id as usize;
-        let name_offset = self.model.name_siteadr()[site_idx] as usize;
-        let name = unsafe { CStr::from_ptr(names.add(name_offset)) };
-
-        Ok(name.to_string_lossy().into_owned())
     }
 
     fn compute_site_kinematics(&self, site_id: i32) -> Result<EndEffectorKinematics, PhysicsError> {
@@ -850,6 +818,79 @@ impl GravityCompensation for MujocoGravityCompensation {
 mod tests {
     use super::*;
 
+    fn six_hinge_model_with_unnamed_site_xml() -> &'static str {
+        r#"
+<mujoco model="six_hinge_with_unnamed_site">
+  <compiler angle="radian"/>
+  <worldbody>
+    <body name="link1">
+      <joint name="joint1" type="hinge" axis="1 0 0"/>
+      <geom type="sphere" size="0.01" density="1000"/>
+      <site pos="0 0 0"/>
+      <body name="link2" pos="0.1 0 0">
+        <joint name="joint2" type="hinge" axis="0 1 0"/>
+        <geom type="sphere" size="0.01" density="1000"/>
+        <body name="link3" pos="0.1 0 0">
+          <joint name="joint3" type="hinge" axis="0 0 1"/>
+          <geom type="sphere" size="0.01" density="1000"/>
+          <body name="link4" pos="0.1 0 0">
+            <joint name="joint4" type="hinge" axis="1 0 0"/>
+            <geom type="sphere" size="0.01" density="1000"/>
+            <body name="link5" pos="0.1 0 0">
+              <joint name="joint5" type="hinge" axis="0 1 0"/>
+              <geom type="sphere" size="0.01" density="1000"/>
+              <body name="link6" pos="0.1 0 0">
+                <joint name="joint6" type="hinge" axis="0 0 1"/>
+                <geom type="sphere" size="0.01" density="1000"/>
+                <site name="end_effector" pos="0.1 0 0"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
+"#
+    }
+
+    fn ball_plus_three_hinge_model_xml() -> &'static str {
+        r#"
+<mujoco model="ball_plus_three_hinges">
+  <compiler angle="radian"/>
+  <worldbody>
+    <body name="ball_link">
+      <joint name="ball" type="ball"/>
+      <geom type="sphere" size="0.01" density="1000"/>
+      <body name="hinge1" pos="0.1 0 0">
+        <joint name="joint1" type="hinge" axis="1 0 0"/>
+        <geom type="sphere" size="0.01" density="1000"/>
+        <body name="hinge2" pos="0.1 0 0">
+          <joint name="joint2" type="hinge" axis="0 1 0"/>
+          <geom type="sphere" size="0.01" density="1000"/>
+          <body name="hinge3" pos="0.1 0 0">
+            <joint name="joint3" type="hinge" axis="0 0 1"/>
+            <geom type="sphere" size="0.01" density="1000"/>
+            <site name="end_effector" pos="0.1 0 0"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
+"#
+    }
+
+    fn end_effector_selector() -> EndEffectorSelector {
+        EndEffectorSelector {
+            site_name: "end_effector".to_string(),
+        }
+    }
+
+    fn zero_joint_state() -> JointState {
+        JointState::from_iterator([0.0; 6])
+    }
+
     #[test]
     fn test_default_initialization() {
         // This test requires embedded XML file to exist
@@ -858,6 +899,37 @@ mod tests {
             assert!(gravity.is_initialized());
             assert_eq!(gravity.name(), "mujoco_simulation");
         }
+    }
+
+    #[test]
+    fn end_effector_resolution_skips_unnamed_sites() {
+        let mut gravity =
+            MujocoGravityCompensation::from_xml_string(six_hinge_model_with_unnamed_site_xml())
+                .expect("fixture model should load");
+
+        assert_eq!(gravity.model().id_to_name(MjtObj::mjOBJ_SITE, 0), None);
+
+        let kinematics = gravity
+            .end_effector_kinematics(&end_effector_selector(), &zero_joint_state())
+            .expect("named end-effector site should resolve after unnamed site");
+
+        assert!(kinematics.position_base_m.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn end_effector_kinematics_rejects_nq_mismatch() {
+        let mut gravity =
+            MujocoGravityCompensation::from_xml_string(ball_plus_three_hinge_model_xml())
+                .expect("fixture model should load");
+
+        let error = gravity
+            .end_effector_kinematics(&end_effector_selector(), &zero_joint_state())
+            .expect_err("nq != 6 must be rejected before writing qpos");
+
+        assert!(
+            matches!(&error, PhysicsError::InvalidInput(message) if message.contains("nq=7") && message.contains("nv=6")),
+            "unexpected error: {error}"
+        );
     }
 
     /// Test that MuJoCo row-major matrix is correctly converted to nalgebra
