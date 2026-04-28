@@ -78,17 +78,15 @@ pub(crate) fn condition_number_from_singular_values(values: [f64; 3]) -> f64 {
     let mut max = 0.0;
 
     for value in values {
-        if !value.is_finite() {
+        if !value.is_finite() || value < 0.0 {
             return f64::INFINITY;
         }
 
         max = f64::max(max, value);
-        if value > 0.0 {
-            min = f64::min(min, value);
-        }
+        min = f64::min(min, value);
     }
 
-    if min == f64::INFINITY || min <= f64::EPSILON {
+    if min <= f64::EPSILON {
         return f64::INFINITY;
     }
 
@@ -111,5 +109,11 @@ mod tests {
     fn computes_condition_number_from_singular_values() {
         let values = [10.0, 2.0, 0.5];
         assert_eq!(condition_number_from_singular_values(values), 20.0);
+    }
+
+    #[test]
+    fn singular_condition_number_is_infinite() {
+        let values = [10.0, 2.0, 0.0];
+        assert_eq!(condition_number_from_singular_values(values), f64::INFINITY);
     }
 }
