@@ -115,6 +115,12 @@ impl SvsDynamicsSlot {
             None => Err(SvsTickFrameError::MissingDynamics { requested: key }),
         }
     }
+
+    pub fn clear(&self) -> Result<(), SvsTickFrameError> {
+        let mut guard = self.slot.lock().map_err(|_| SvsTickFrameError::DynamicsSlotPoisoned)?;
+        *guard = None;
+        Ok(())
+    }
 }
 
 impl SvsTickStager {
@@ -154,6 +160,13 @@ impl SvsTickStager {
             }),
             None => Err(SvsTickFrameError::MissingControllerTick { requested: key }),
         }
+    }
+
+    pub fn clear(&self) -> Result<(), SvsTickFrameError> {
+        let mut guard =
+            self.slot.lock().map_err(|_| SvsTickFrameError::ControllerTickSlotPoisoned)?;
+        *guard = None;
+        Ok(())
     }
 }
 
@@ -218,6 +231,62 @@ mod tests {
 
         let taken = stager.take_for_telemetry(&telemetry_for_key(pending_key)).unwrap();
         assert_eq!(taken.key, pending_key);
+    }
+
+    #[test]
+    fn dynamics_slot_rejects_duplicate_and_preserves_mismatch() {
+        let pending_key = SnapshotKey {
+            master_dynamic_host_rx_mono_us: 10,
+            slave_dynamic_host_rx_mono_us: 20,
+        };
+        let requested_key = SnapshotKey {
+            master_dynamic_host_rx_mono_us: 11,
+            slave_dynamic_host_rx_mono_us: 20,
+        };
+        let slot = SvsDynamicsSlot::default();
+
+        slot.store_dynamics(dynamics_frame(pending_key)).unwrap();
+        assert!(matches!(
+            slot.store_dynamics(dynamics_frame(requested_key)),
+            Err(SvsTickFrameError::DynamicsAlreadyPending { pending, incoming })
+                if pending == pending_key && incoming == requested_key
+        ));
+        assert!(matches!(
+            slot.take_dynamics(requested_key),
+            Err(SvsTickFrameError::MismatchedSnapshotKey { expected, actual })
+                if expected == pending_key && actual == requested_key
+        ));
+
+        assert_eq!(slot.take_dynamics(pending_key).unwrap().key, pending_key);
+        assert!(matches!(
+            slot.take_dynamics(pending_key),
+            Err(SvsTickFrameError::MissingDynamics { requested }) if requested == pending_key
+        ));
+    }
+
+    #[test]
+    fn clear_drops_pending_slots() {
+        let key = SnapshotKey {
+            master_dynamic_host_rx_mono_us: 10,
+            slave_dynamic_host_rx_mono_us: 20,
+        };
+        let dynamics_slot = SvsDynamicsSlot::default();
+        let tick_stager = SvsTickStager::default();
+
+        dynamics_slot.store_dynamics(dynamics_frame(key)).unwrap();
+        tick_stager.store_controller_tick(pending_tick(key)).unwrap();
+
+        dynamics_slot.clear().unwrap();
+        tick_stager.clear().unwrap();
+
+        assert!(matches!(
+            dynamics_slot.take_dynamics(key),
+            Err(SvsTickFrameError::MissingDynamics { .. })
+        ));
+        assert!(matches!(
+            tick_stager.take_for_telemetry(&telemetry_for_key(key)),
+            Err(SvsTickFrameError::MissingControllerTick { .. })
+        ));
     }
 
     fn pending_tick(key: SnapshotKey) -> SvsPendingTick {

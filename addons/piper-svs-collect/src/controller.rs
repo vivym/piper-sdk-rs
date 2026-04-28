@@ -25,6 +25,8 @@ pub enum SvsControllerError {
     InvalidDt,
     #[error("SVS feedback history lock is poisoned")]
     FeedbackHistoryPoisoned,
+    #[error("{field} produced a non-finite controller value")]
+    NonFiniteOutput { field: &'static str },
     #[error(transparent)]
     Cue(#[from] CueError),
     #[error(transparent)]
@@ -81,7 +83,8 @@ impl From<ProfileError> for SvsControllerError {
 }
 
 impl SvsControllerOutput {
-    pub fn for_tests() -> Self {
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
         Self {
             controller_slave_position_rad: [0.0; 6],
             controller_slave_velocity_rad_s: [0.0; 6],
@@ -188,7 +191,7 @@ impl SvsController {
             cues,
             stiffness,
         };
-        let output = compute_controller_output(&self.profile, &input)?;
+        let output = compute_controller_output_validated(&self.profile, &input)?;
 
         self.stager.store_controller_tick(SvsPendingTick {
             key,
@@ -216,11 +219,18 @@ impl SvsController {
             master_ee: dynamics.master_ee.clone(),
             slave_ee: dynamics.slave_ee.clone(),
         };
-        let history = self
-            .feedback_history
-            .lock()
-            .map_err(|_| SvsControllerError::FeedbackHistoryPoisoned)?;
-        Ok(self.cue_state.update(&input, &history, dt_us)?)
+        let tau_master_feedback_subtracted_nm = {
+            let history = self
+                .feedback_history
+                .lock()
+                .map_err(|_| SvsControllerError::FeedbackHistoryPoisoned)?;
+            history.select_for_dynamic_rx(snapshot.left.dynamic_host_rx_mono_us)
+        };
+        Ok(self.cue_state.update_with_feedback_subtracted(
+            &input,
+            tau_master_feedback_subtracted_nm,
+            dt_us,
+        )?)
     }
 }
 
@@ -252,6 +262,12 @@ impl BilateralController for SvsController {
     fn reset(&mut self) -> Result<(), Self::Error> {
         self.cue_state = SvsCueState::from_effective_profile(&self.profile)?;
         self.stiffness_state = SvsStiffnessState::from_effective_profile(&self.profile)?;
+        self.stager.clear()?;
+        self.dynamics_slot.clear()?;
+        self.feedback_history
+            .lock()
+            .map_err(|_| SvsControllerError::FeedbackHistoryPoisoned)?
+            .clear();
         Ok(())
     }
 }
@@ -261,7 +277,13 @@ pub fn compute_controller_output(
     input: &SvsControlInput,
 ) -> Result<SvsControllerOutput, SvsControllerError> {
     profile.validate()?;
+    compute_controller_output_validated(profile, input)
+}
 
+fn compute_controller_output_validated(
+    profile: &EffectiveProfile,
+    input: &SvsControlInput,
+) -> Result<SvsControllerOutput, SvsControllerError> {
     let alpha_xyz = normalized_stiffness(
         input.stiffness.k_tele_n_per_m,
         profile.stiffness.k_min,
@@ -294,7 +316,7 @@ pub fn compute_controller_output(
         f_reflect_master_base,
     );
 
-    Ok(SvsControllerOutput {
+    let output = SvsControllerOutput {
         controller_slave_position_rad: joint_rad_to_array(
             input.calibration.master_to_slave_position(input.snapshot.left.state.position),
         ),
@@ -312,7 +334,9 @@ pub fn compute_controller_output(
         controller_master_interaction_nm,
         reflection_gain_xyz,
         reflection_residual_scale,
-    })
+    };
+    validate_controller_output(&output)?;
+    Ok(output)
 }
 
 fn duration_to_micros(duration: Duration) -> Result<u64, SvsControllerError> {
@@ -321,6 +345,54 @@ fn duration_to_micros(duration: Duration) -> Result<u64, SvsControllerError> {
         return Err(SvsControllerError::InvalidDt);
     }
     Ok(micros as u64)
+}
+
+fn validate_controller_output(output: &SvsControllerOutput) -> Result<(), SvsControllerError> {
+    validate_finite_array(
+        "controller_slave_position_rad",
+        &output.controller_slave_position_rad,
+    )?;
+    validate_finite_array(
+        "controller_slave_velocity_rad_s",
+        &output.controller_slave_velocity_rad_s,
+    )?;
+    validate_finite_array("controller_slave_kp", &output.controller_slave_kp)?;
+    validate_finite_array("controller_slave_kd", &output.controller_slave_kd)?;
+    validate_finite_array(
+        "controller_slave_feedforward_nm",
+        &output.controller_slave_feedforward_nm,
+    )?;
+    validate_finite_array(
+        "controller_master_position_rad",
+        &output.controller_master_position_rad,
+    )?;
+    validate_finite_array(
+        "controller_master_velocity_rad_s",
+        &output.controller_master_velocity_rad_s,
+    )?;
+    validate_finite_array("controller_master_kp", &output.controller_master_kp)?;
+    validate_finite_array("controller_master_kd", &output.controller_master_kd)?;
+    validate_finite_array(
+        "controller_master_interaction_nm",
+        &output.controller_master_interaction_nm,
+    )?;
+    validate_finite_array("reflection_gain_xyz", &output.reflection_gain_xyz)?;
+    if !output.reflection_residual_scale.is_finite() {
+        return Err(SvsControllerError::NonFiniteOutput {
+            field: "reflection_residual_scale",
+        });
+    }
+    Ok(())
+}
+
+fn validate_finite_array<const N: usize>(
+    field: &'static str,
+    values: &[f64; N],
+) -> Result<(), SvsControllerError> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(SvsControllerError::NonFiniteOutput { field });
+    }
+    Ok(())
 }
 
 fn normalized_stiffness(k_tele: [f64; 3], k_min: [f64; 3], k_max: [f64; 3]) -> [f64; 3] {
@@ -414,16 +486,23 @@ fn joint_newton_meter_to_array(values: JointArray<NewtonMeter>) -> [f64; 6] {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use piper_client::dual_arm::{DualArmCalibration, DualArmSnapshot, JointMirrorMap};
+    use piper_client::dual_arm::{
+        BilateralCommand, BilateralControlFrame, BilateralDynamicsCompensation,
+        BilateralFinalTorques, BilateralGripperCommandStatus, BilateralLoopGripperTelemetry,
+        BilateralLoopTelemetry, BilateralLoopTimingTelemetry, DualArmCalibration, DualArmSnapshot,
+        JointMirrorMap,
+    };
     use piper_client::observer::{ControlSnapshot, ControlSnapshotFull};
     use piper_client::types::{JointArray, NewtonMeter, Rad, RadPerSecond};
     use piper_physics::EndEffectorKinematics;
 
-    use crate::cue::SvsCueOutput;
+    use crate::cue::{AppliedMasterFeedback, AppliedMasterFeedbackHistory, SvsCueOutput};
     use crate::profile::EffectiveProfile;
     use crate::stiffness::{SvsContactState, SvsStiffnessOutput};
+    use crate::tick_frame::{SnapshotKey, SvsDynamicsFrame, SvsDynamicsSlot, SvsTickStager};
 
     use super::*;
 
@@ -461,6 +540,108 @@ mod tests {
         assert!(output.controller_master_interaction_nm[0] < 0.0);
         assert_eq!(output.controller_master_interaction_nm[1], 0.0);
         assert_eq!(output.controller_master_interaction_nm[2], 0.0);
+    }
+
+    #[test]
+    fn tick_with_compensation_consumes_dynamics_and_stages_pending_tick() {
+        let profile = EffectiveProfile::default_for_tests();
+        let stager = Arc::new(SvsTickStager::new());
+        let dynamics_slot = Arc::new(SvsDynamicsSlot::new());
+        let feedback_history = Arc::new(Mutex::new(AppliedMasterFeedbackHistory::default()));
+        let mut controller = SvsController::with_shared(
+            profile,
+            sample_calibration(),
+            Arc::clone(&stager),
+            Arc::clone(&dynamics_slot),
+            Arc::clone(&feedback_history),
+        )
+        .unwrap();
+        let snapshot = sample_snapshot(10_000, 10_100);
+        let key = SnapshotKey::from_snapshot(&snapshot);
+        dynamics_slot.store_dynamics(dynamics_frame(key)).unwrap();
+        let frame = BilateralControlFrame {
+            snapshot,
+            compensation: Some(BilateralDynamicsCompensation::default()),
+        };
+
+        let command =
+            controller.tick_with_compensation(&frame, Duration::from_micros(5_000)).unwrap();
+        let pending =
+            stager.take_for_telemetry(&telemetry_for_frame(frame, command.clone())).unwrap();
+
+        assert_eq!(pending.key, key);
+        assert_eq!(pending.dynamics.key, key);
+        assert_eq!(
+            command.slave_feedforward_torque,
+            JointArray::splat(NewtonMeter::ZERO)
+        );
+        assert_eq!(
+            pending.controller_output.controller_slave_position_rad,
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+        );
+    }
+
+    #[test]
+    fn reset_clears_staging_slots_and_feedback_history() {
+        let profile = EffectiveProfile::default_for_tests();
+        let stager = Arc::new(SvsTickStager::new());
+        let dynamics_slot = Arc::new(SvsDynamicsSlot::new());
+        let feedback_history = Arc::new(Mutex::new(AppliedMasterFeedbackHistory::default()));
+        let mut controller = SvsController::with_shared(
+            profile,
+            sample_calibration(),
+            Arc::clone(&stager),
+            Arc::clone(&dynamics_slot),
+            Arc::clone(&feedback_history),
+        )
+        .unwrap();
+        let snapshot = sample_snapshot(10_000, 10_100);
+        let key = SnapshotKey::from_snapshot(&snapshot);
+        let stale_dynamics_key = SnapshotKey {
+            master_dynamic_host_rx_mono_us: 20_000,
+            slave_dynamic_host_rx_mono_us: 20_100,
+        };
+        dynamics_slot.store_dynamics(dynamics_frame(key)).unwrap();
+        controller
+            .tick_with_compensation(
+                &BilateralControlFrame {
+                    snapshot,
+                    compensation: Some(BilateralDynamicsCompensation::default()),
+                },
+                Duration::from_micros(5_000),
+            )
+            .unwrap();
+        dynamics_slot.store_dynamics(dynamics_frame(stale_dynamics_key)).unwrap();
+        feedback_history.lock().unwrap().push(AppliedMasterFeedback {
+            master_tx_finished_host_mono_us: 9_000,
+            shaped_master_interaction_nm: [0.5; 6],
+        });
+
+        controller.reset().unwrap();
+
+        assert!(stager.take_for_telemetry(&telemetry_for_key(key)).is_err());
+        assert!(dynamics_slot.take_dynamics(stale_dynamics_key).is_err());
+        assert!(feedback_history.lock().unwrap().is_empty());
+        dynamics_slot.store_dynamics(dynamics_frame(stale_dynamics_key)).unwrap();
+    }
+
+    #[test]
+    fn controller_output_rejects_nonfinite_runtime_values() {
+        let profile = EffectiveProfile::default_for_tests();
+        let mut input = control_input(&profile);
+        input.snapshot.left.state.position = JointArray::new([
+            Rad(f64::NAN),
+            Rad(0.0),
+            Rad(0.0),
+            Rad(0.0),
+            Rad(0.0),
+            Rad(0.0),
+        ]);
+
+        assert!(matches!(
+            compute_controller_output(&profile, &input),
+            Err(SvsControllerError::NonFiniteOutput { .. })
+        ));
     }
 
     fn control_input(profile: &EffectiveProfile) -> SvsControlInput {
@@ -501,6 +682,94 @@ mod tests {
                 velocity_sign: [1.0; 6],
                 torque_sign: [1.0; 6],
             },
+        }
+    }
+
+    fn dynamics_frame(key: SnapshotKey) -> SvsDynamicsFrame {
+        SvsDynamicsFrame {
+            key,
+            master_model_torque_nm: [0.0; 6],
+            slave_model_torque_nm: [0.0; 6],
+            master_residual_nm: [0.0; 6],
+            slave_residual_nm: [0.0; 6],
+            master_ee: ee_with_jacobian(identity_translational_jacobian()),
+            slave_ee: ee_with_jacobian(identity_translational_jacobian()),
+        }
+    }
+
+    fn telemetry_for_key(key: SnapshotKey) -> BilateralLoopTelemetry {
+        telemetry_for_frame(
+            BilateralControlFrame {
+                snapshot: sample_snapshot(
+                    key.master_dynamic_host_rx_mono_us,
+                    key.slave_dynamic_host_rx_mono_us,
+                ),
+                compensation: Some(BilateralDynamicsCompensation::default()),
+            },
+            zero_command(),
+        )
+    }
+
+    fn telemetry_for_frame(
+        frame: BilateralControlFrame,
+        command: BilateralCommand,
+    ) -> BilateralLoopTelemetry {
+        BilateralLoopTelemetry {
+            control_frame: frame,
+            controller_command: command.clone(),
+            shaped_command: command,
+            compensation: frame.compensation,
+            gripper: BilateralLoopGripperTelemetry {
+                mirror_enabled: false,
+                master_available: false,
+                slave_available: false,
+                master_hw_timestamp_us: 0,
+                slave_hw_timestamp_us: 0,
+                master_host_rx_mono_us: 0,
+                slave_host_rx_mono_us: 0,
+                master_age_us: 0,
+                slave_age_us: 0,
+                master_position: 0.0,
+                master_effort: 0.0,
+                slave_position: 0.0,
+                slave_effort: 0.0,
+                command_status: BilateralGripperCommandStatus::None,
+                command_position: 0.0,
+                command_effort: 0.0,
+            },
+            final_torques: BilateralFinalTorques {
+                master: JointArray::splat(NewtonMeter::ZERO),
+                slave: JointArray::splat(NewtonMeter::ZERO),
+            },
+            master_t_ref_nm: None,
+            slave_t_ref_nm: None,
+            master_tx_finished_host_mono_us: Some(1),
+            slave_tx_finished_host_mono_us: Some(2),
+            timing: BilateralLoopTimingTelemetry {
+                scheduler_tick_start_host_mono_us: 1,
+                control_frame_host_mono_us: 2,
+                previous_control_frame_host_mono_us: None,
+                raw_dt_us: 5_000,
+                clamped_dt_us: 5_000,
+                nominal_period_us: 5_000,
+                submission_deadline_mono_us: 7_000,
+                deadline_missed: false,
+            },
+        }
+    }
+
+    fn zero_command() -> BilateralCommand {
+        BilateralCommand {
+            slave_position: JointArray::splat(Rad::ZERO),
+            slave_velocity: JointArray::splat(0.0),
+            slave_kp: JointArray::splat(0.0),
+            slave_kd: JointArray::splat(0.0),
+            slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
+            master_position: JointArray::splat(Rad::ZERO),
+            master_velocity: JointArray::splat(0.0),
+            master_kp: JointArray::splat(0.0),
+            master_kd: JointArray::splat(0.0),
+            master_interaction_torque: JointArray::splat(NewtonMeter::ZERO),
         }
     }
 

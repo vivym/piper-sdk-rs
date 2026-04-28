@@ -141,6 +141,10 @@ impl FeedbackHistory {
         selected.map_or([0.0; 6], |entry| entry.shaped_master_interaction_nm)
     }
 
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -176,6 +180,17 @@ impl SvsCueState {
         feedback_history: &FeedbackHistory,
         dt_us: u64,
     ) -> Result<SvsCueOutput, CueError> {
+        let tau_master_feedback_subtracted_nm =
+            feedback_history.select_for_dynamic_rx(input.master_dynamic_host_rx_mono_us);
+        self.update_with_feedback_subtracted(input, tau_master_feedback_subtracted_nm, dt_us)
+    }
+
+    pub fn update_with_feedback_subtracted(
+        &mut self,
+        input: &SvsCueInput,
+        tau_master_feedback_subtracted_nm: [f64; 6],
+        dt_us: u64,
+    ) -> Result<SvsCueOutput, CueError> {
         if dt_us == 0 {
             return Err(CueError::InvalidDt);
         }
@@ -184,6 +199,10 @@ impl SvsCueState {
         validate_finite_array6("master_tau_model_nm", &input.master_tau_model_nm)?;
         validate_finite_array6("slave_tau_measured_nm", &input.slave_tau_measured_nm)?;
         validate_finite_array6("slave_tau_model_nm", &input.slave_tau_model_nm)?;
+        validate_finite_array6(
+            "tau_master_feedback_subtracted_nm",
+            &tau_master_feedback_subtracted_nm,
+        )?;
         validate_condition(
             "master_ee.jacobian_condition",
             input.master_ee.jacobian_condition,
@@ -195,8 +214,6 @@ impl SvsCueState {
             self.profile.max_jacobian_condition,
         )?;
 
-        let tau_master_feedback_subtracted_nm =
-            feedback_history.select_for_dynamic_rx(input.master_dynamic_host_rx_mono_us);
         let tau_master_effort_residual_nm = subtract6(
             subtract6(input.master_tau_measured_nm, input.master_tau_model_nm),
             tau_master_feedback_subtracted_nm,
