@@ -576,6 +576,16 @@ impl Default for WriterProfile {
 }
 
 impl StiffnessProfile {
+    pub fn test_with_limits(k_min: [f64; 3], k_max: [f64; 3]) -> Self {
+        Self {
+            k_min,
+            k_max,
+            k_base_free: k_min,
+            k_base_contact: k_max,
+            ..Self::default()
+        }
+    }
+
     fn validate(&self) -> Result<(), ProfileError> {
         for (axis, ((k_min, k_max), (k_base_free, k_base_contact))) in self
             .k_min
