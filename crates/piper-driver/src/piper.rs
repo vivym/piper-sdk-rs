@@ -234,6 +234,25 @@ where
     }
 }
 
+fn recv_until_deadline_strict<T, F>(
+    rx: &Receiver<T>,
+    deadline: Instant,
+    timeout_error: F,
+) -> Result<T, DriverError>
+where
+    F: Fn() -> DriverError,
+{
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(timeout_error());
+    };
+
+    match rx.recv_timeout(remaining) {
+        Ok(value) => Ok(value),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(timeout_error()),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(DriverError::ChannelClosed),
+    }
+}
+
 fn wait_for_maintenance_send_result(
     ack_rx: Receiver<MaintenanceSendPhase>,
     deadline: Instant,
@@ -259,7 +278,7 @@ where
     F: Fn() -> DriverError,
 {
     loop {
-        match recv_until_deadline(&ack_rx, deadline, &timeout_error)? {
+        match recv_until_deadline_strict(&ack_rx, deadline, &timeout_error)? {
             DeliveryPhase::Finished(result) => return result,
             DeliveryPhase::Committed { .. } => continue,
         }
@@ -313,8 +332,8 @@ pub fn wait_for_delivery_finished<F>(
 where
     F: Fn() -> DriverError,
 {
-    let receipt = wait_for_delivery_result_with_receipt(ack_rx, deadline, timeout_error)?;
-    let host_finished_mono_us = receipt.host_finished_mono_us.ok_or(DriverError::Timeout)?;
+    let receipt = wait_for_delivery_result_with_receipt(ack_rx, deadline, &timeout_error)?;
+    let host_finished_mono_us = receipt.host_finished_mono_us.ok_or_else(timeout_error)?;
     Ok(MitBatchTxFinished {
         host_finished_mono_us,
     })
@@ -7597,6 +7616,44 @@ mod tests {
             .expect("ready ack should win over timeout");
 
         assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn test_wait_for_delivery_finished_rejects_finished_after_deadline() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let deadline = Instant::now() + Duration::from_millis(1);
+        tx.send(DeliveryPhase::Committed {
+            host_commit_mono_us: 1,
+        })
+        .expect("committed phase should enqueue before deadline");
+
+        while Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+
+        tx.send(DeliveryPhase::Finished(Ok(DeliveryReceipt::finished_at(2))))
+            .expect("finished phase should enqueue after deadline");
+
+        let error =
+            wait_for_delivery_finished(rx, deadline, || DriverError::RealtimeDeliveryTimeout)
+                .expect_err("late finished phase must not satisfy the absolute deadline");
+
+        assert!(matches!(error, DriverError::RealtimeDeliveryTimeout));
+    }
+
+    #[test]
+    fn test_wait_for_delivery_finished_uses_caller_timeout_error_for_missing_timestamp() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(DeliveryPhase::Finished(Ok(DeliveryReceipt::none())))
+            .expect("finished phase should enqueue");
+
+        let error =
+            wait_for_delivery_finished(rx, Instant::now() + Duration::from_millis(50), || {
+                DriverError::RealtimeDeliveryTimeout
+            })
+            .expect_err("missing finished timestamp should use the caller timeout error");
+
+        assert!(matches!(error, DriverError::RealtimeDeliveryTimeout));
     }
 
     #[test]
