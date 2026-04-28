@@ -1632,6 +1632,7 @@ impl Piper<Standby, SoftRealtime> {
         let enable_commit_host_mono_us = self
             .driver
             .send_reliable_frame_confirmed_commit_marker(enable_cmd.to_frame(), config.timeout)?;
+        let mut enable_cleanup = EnableCleanupGuard::armed(self.driver.as_ref());
         self.wait_for_enabled(
             enable_commit_host_mono_us,
             config.timeout,
@@ -1663,6 +1664,9 @@ impl Piper<Standby, SoftRealtime> {
                 trajectory_stay_time: 0,
             },
         )?;
+
+        enable_cleanup.disarm();
+        drop(enable_cleanup);
 
         Ok(transition_piper_state(
             self,
@@ -5132,6 +5136,41 @@ mod tests {
             .expect("fresh matching 0x2A1 + 0x151 should allow MIT passthrough");
 
         assert!(matches!(active._state, Active(MitPassthroughMode)));
+    }
+
+    #[test]
+    fn enable_mit_passthrough_timeout_after_enable_dispatch_sends_disable_all() {
+        use piper_protocol::control::MotorEnableCommand;
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let standby = build_soft_standby_piper(IdleRxAdapter::new(), sent.clone());
+        let config = MitModeConfig {
+            timeout: Duration::from_millis(20),
+            poll_interval: Duration::from_millis(1),
+            ..MitModeConfig::default()
+        };
+        let enable_all = MotorEnableCommand::enable_all().to_frame();
+
+        let enable_handle = thread::spawn(move || standby.enable_mit_passthrough(config));
+        wait_until(
+            Duration::from_secs(1),
+            || sent.lock().expect("sent frames lock").contains(&enable_all),
+            "enable_all must be dispatched before forcing passthrough confirmation timeout",
+        );
+
+        let err = match enable_handle.join().expect("enable_mit_passthrough thread should finish") {
+            Ok(_) => panic!("passthrough enable confirmation timeout must fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, RobotError::Timeout { .. }));
+        let frames = wait_for_sent_frames(&sent, 2);
+        assert!(
+            frames
+                .iter()
+                .any(|frame| *frame == MotorEnableCommand::disable_all().to_frame()),
+            "failed SoftRealtime MIT passthrough enable after dispatch must send disable_all"
+        );
     }
 
     #[test]

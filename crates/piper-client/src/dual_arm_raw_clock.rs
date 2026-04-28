@@ -3,6 +3,7 @@
 //! This module is intentionally separate from the production StrictRealtime dual-arm runtime.
 //! Raw-clock timing is accepted only for this explicitly experimental SoftRealtime path.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -30,6 +31,7 @@ use crate::state::{
 use crate::types::{JointArray, NewtonMeter, Rad, RadPerSecond, Result as RobotResult, RobotError};
 
 const FAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(20);
+const RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExperimentalRawClockMode {
@@ -299,7 +301,8 @@ pub struct ExperimentalRawClockSnapshot {
 pub struct RawClockRuntimeTiming {
     master: RawClockEstimator,
     slave: RawClockEstimator,
-    skew_samples_us: Vec<u64>,
+    skew_samples_us: VecDeque<u64>,
+    max_inter_arm_skew_us: u64,
     clock_health_failures: u64,
     last_master_raw_us: Option<u64>,
     last_slave_raw_us: Option<u64>,
@@ -310,7 +313,8 @@ impl RawClockRuntimeTiming {
         Self {
             master: RawClockEstimator::new(thresholds),
             slave: RawClockEstimator::new(thresholds),
-            skew_samples_us: Vec::new(),
+            skew_samples_us: VecDeque::with_capacity(RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY),
+            max_inter_arm_skew_us: 0,
             clock_health_failures: 0,
             last_master_raw_us: None,
             last_slave_raw_us: None,
@@ -349,7 +353,7 @@ impl RawClockRuntimeTiming {
                     side: RawClockSide::Slave.as_str(),
                 })?;
         let inter_arm_skew_us = master_feedback_time_us.abs_diff(slave_feedback_time_us);
-        self.skew_samples_us.push(inter_arm_skew_us);
+        self.record_skew_sample(inter_arm_skew_us);
 
         Ok(RawClockTickTiming {
             master_feedback_time_us,
@@ -441,6 +445,14 @@ impl RawClockRuntimeTiming {
         self.clock_health_failures = self.clock_health_failures.saturating_add(1);
     }
 
+    fn record_skew_sample(&mut self, inter_arm_skew_us: u64) {
+        self.max_inter_arm_skew_us = self.max_inter_arm_skew_us.max(inter_arm_skew_us);
+        if self.skew_samples_us.len() == RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY {
+            self.skew_samples_us.pop_front();
+        }
+        self.skew_samples_us.push_back(inter_arm_skew_us);
+    }
+
     fn report(
         &self,
         now_host_us: u64,
@@ -450,8 +462,8 @@ impl RawClockRuntimeTiming {
         RawClockRuntimeReport {
             master: self.master.health(now_host_us),
             slave: self.slave.health(now_host_us),
-            max_inter_arm_skew_us: self.skew_samples_us.iter().copied().max().unwrap_or(0),
-            inter_arm_skew_p95_us: percentile(&self.skew_samples_us, 95),
+            max_inter_arm_skew_us: self.max_inter_arm_skew_us,
+            inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
             clock_health_failures: self.clock_health_failures,
             read_faults: 0,
             submission_faults: 0,
@@ -937,6 +949,7 @@ where
             },
         };
 
+        let inter_arm_skew_us = tick.inter_arm_skew_us;
         if let Err(err) = RawClockRuntimeGate::new(config.thresholds).check_tick(tick) {
             if matches!(err, RawClockRuntimeError::ClockUnhealthy { .. }) {
                 timing.record_clock_health_failure();
@@ -955,7 +968,7 @@ where
             });
         }
 
-        let snapshot = raw_dual_arm_snapshot(&master, &slave);
+        let snapshot = raw_dual_arm_snapshot(&master, &slave, inter_arm_skew_us);
         let frame = BilateralControlFrame {
             snapshot,
             compensation: None,
@@ -1169,6 +1182,7 @@ fn map_raw_clock_push_error(
 fn raw_dual_arm_snapshot(
     master: &ExperimentalRawClockSnapshot,
     slave: &ExperimentalRawClockSnapshot,
+    inter_arm_skew_us: u64,
 ) -> DualArmSnapshot {
     DualArmSnapshot {
         left: ControlSnapshotFull {
@@ -1183,12 +1197,7 @@ fn raw_dual_arm_snapshot(
             dynamic_host_rx_mono_us: slave.newest_raw_feedback_timing.host_rx_mono_us,
             feedback_age: slave.feedback_age,
         },
-        inter_arm_skew: Duration::from_micros(
-            master
-                .newest_raw_feedback_timing
-                .host_rx_mono_us
-                .abs_diff(slave.newest_raw_feedback_timing.host_rx_mono_us),
-        ),
+        inter_arm_skew: Duration::from_micros(inter_arm_skew_us),
         host_cycle_timestamp: Instant::now(),
     }
 }
@@ -1304,12 +1313,12 @@ fn force_soft_error_state(
     }
 }
 
-fn percentile(samples: &[u64], percentile: u64) -> u64 {
-    if samples.is_empty() {
+fn percentile(samples: impl IntoIterator<Item = u64>, percentile: u64) -> u64 {
+    let mut sorted: Vec<_> = samples.into_iter().collect();
+    if sorted.is_empty() {
         return 0;
     }
 
-    let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     let rank = (percentile as usize * (sorted.len() - 1)).div_ceil(100);
     sorted[rank.min(sorted.len() - 1)]
@@ -1735,6 +1744,23 @@ mod tests {
         }
     }
 
+    struct RecordingSkewController {
+        seen_skew: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl BilateralController for RecordingSkewController {
+        type Error = Infallible;
+
+        fn tick(
+            &mut self,
+            snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            self.seen_skew.lock().expect("seen skew lock").push(snapshot.inter_arm_skew);
+            Ok(test_command())
+        }
+    }
+
     struct FakeStandbyArms;
 
     struct FakeErrorArms;
@@ -2027,6 +2053,58 @@ mod tests {
     }
 
     #[test]
+    fn dual_wrapper_slave_enable_failure_stops_already_enabled_master() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let master = build_soft_standby_piper(
+            PacedRxAdapter::new(active_feedback_script()),
+            LabeledRecordingTxAdapter::new("master", events.clone()),
+        );
+        let slave = build_soft_standby_piper(
+            PacedRxAdapter::new(Vec::new()),
+            LabeledRecordingTxAdapter::new("slave", events.clone()),
+        );
+        let standby = ExperimentalRawClockDualArmStandby {
+            master,
+            slave,
+            timing: ready_timing_for_tests(),
+            config: ExperimentalRawClockConfig::default(),
+        };
+
+        let err = match standby.enable_mit_passthrough(
+            MitModeConfig {
+                timeout: Duration::from_millis(100),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 70,
+            },
+            MitModeConfig {
+                timeout: Duration::from_millis(20),
+                debounce_threshold: 1,
+                poll_interval: Duration::from_millis(1),
+                speed_percent: 70,
+            },
+        ) {
+            Ok(_) => panic!("slave enable timeout must fail the dual wrapper enable"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::EnableFailed {
+                failed_side: "slave",
+                enabled_side_stop_attempt: Some(StopAttemptResult::ConfirmedSent),
+                ..
+            }
+        ));
+        let events = events.lock().expect("tx events lock").clone();
+        let master_events = events.iter().filter(|(label, _)| *label == "master").count();
+        assert!(
+            master_events >= 3,
+            "master TX path should receive bounded stop after slave enable failure"
+        );
+    }
+
+    #[test]
     fn runtime_gate_failure_prevents_another_normal_command() {
         let io = FakeRuntimeIo::new().with_reads([
             FakeRead::pair(
@@ -2244,6 +2322,42 @@ mod tests {
     }
 
     #[test]
+    fn controller_snapshot_receives_calibrated_raw_skew_not_host_receive_skew() {
+        let seen_skew = Arc::new(Mutex::new(Vec::new()));
+        let controller = RecordingSkewController {
+            seen_skew: seen_skew.clone(),
+        };
+        let io = FakeRuntimeIo::new().with_reads([FakeRead::pair(
+            raw_clock_snapshot_for_tests(10_000, 999_000),
+            raw_clock_snapshot_for_tests(20_000, 999_000),
+        )]);
+        let core = RawClockRuntimeCore {
+            io,
+            timing: ready_timing_for_tests(),
+            config: ExperimentalRawClockConfig {
+                mode: ExperimentalRawClockMode::MasterFollower,
+                frequency_hz: 10_000.0,
+                max_iterations: Some(1),
+                thresholds: RawClockRuntimeThresholds {
+                    inter_arm_skew_max_us: 20_000,
+                    last_sample_age_us: u64::MAX,
+                },
+                estimator_thresholds: thresholds_for_tests(),
+            },
+        };
+
+        let exit =
+            run_raw_clock_runtime_core(core, controller, ExperimentalRawClockRunConfig::default())
+                .expect("fake runtime core should run");
+        assert!(matches!(exit, RawClockCoreExit::Standby { .. }));
+
+        assert_eq!(
+            *seen_skew.lock().expect("seen skew lock"),
+            vec![Duration::from_micros(800)]
+        );
+    }
+
+    #[test]
     fn warmup_starting_empty_collects_not_ready_samples_instead_of_aborting() {
         let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
         timing
@@ -2295,12 +2409,34 @@ mod tests {
     #[test]
     fn runtime_report_includes_max_and_p95_inter_arm_skew() {
         let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
-        timing.skew_samples_us = (0..=100).collect();
+        for sample in 0..=100 {
+            timing.record_skew_sample(sample);
+        }
 
         let report = timing.report(120_000, 101, Some(RawClockRuntimeExitReason::MaxIterations));
 
         assert_eq!(report.max_inter_arm_skew_us, 100);
         assert_eq!(report.inter_arm_skew_p95_us, 95);
+    }
+
+    #[test]
+    fn skew_sample_retention_is_bounded_while_max_tracks_full_run() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let sample_count = RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY as u64 + 64;
+
+        for sample in 0..sample_count {
+            timing.record_skew_sample(sample);
+        }
+
+        assert_eq!(
+            timing.skew_samples_us.len(),
+            RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY
+        );
+        assert_eq!(timing.max_inter_arm_skew_us, sample_count - 1);
+
+        let report = timing.report(120_000, sample_count as usize, None);
+        assert_eq!(report.max_inter_arm_skew_us, sample_count - 1);
+        assert!(report.inter_arm_skew_p95_us >= sample_count - 256);
     }
 
     #[test]
