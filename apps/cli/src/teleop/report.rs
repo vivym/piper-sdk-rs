@@ -260,11 +260,12 @@ pub fn write_human_report<W: Write>(
         writeln!(writer, "timing_source={}", timing.timing_source)?;
         writeln!(writer, "experimental={}", timing.experimental)?;
         writeln!(writer, "strict_realtime={}", timing.strict_realtime)?;
+        let max_skew_us = format_optional_u64(timing.max_estimated_inter_arm_skew_us);
+        let p95_skew_us = format_optional_u64(timing.estimated_inter_arm_skew_p95_us);
         writeln!(
             writer,
             "raw_clock max_skew_us={} p95_skew_us={}",
-            timing.max_estimated_inter_arm_skew_us.unwrap_or(0),
-            timing.estimated_inter_arm_skew_p95_us.unwrap_or(0)
+            max_skew_us, p95_skew_us
         )?;
     }
     writeln!(
@@ -343,6 +344,10 @@ fn sync_directory(dir: &Path) {
 
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
 
 fn format_mode(mode: TeleopMode) -> &'static str {
@@ -599,6 +604,31 @@ mod tests {
         assert!(output.contains("experimental=true"));
         assert!(output.contains("strict_realtime=false"));
         assert!(output.contains("raw_clock max_skew_us=900 p95_skew_us=400"));
+    }
+
+    #[test]
+    fn human_report_marks_missing_raw_clock_skew_unknown() {
+        let mut output = Vec::new();
+        let mut report = sample_json_report();
+        report.timing = Some(ReportTiming {
+            timing_source: "calibrated_hw_raw".to_string(),
+            experimental: true,
+            strict_realtime: false,
+            master_clock_drift_ppm: None,
+            slave_clock_drift_ppm: None,
+            master_residual_p95_us: None,
+            slave_residual_p95_us: None,
+            max_estimated_inter_arm_skew_us: None,
+            estimated_inter_arm_skew_p95_us: None,
+            clock_health_failures: 0,
+        });
+
+        write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("max_skew_us=0"));
+        assert!(!output.contains("p95_skew_us=0"));
+        assert!(output.contains("raw_clock max_skew_us=unknown p95_skew_us=unknown"));
     }
 
     #[test]
