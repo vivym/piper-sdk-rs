@@ -81,6 +81,7 @@ pub struct RawClockEstimator {
 
 #[derive(Debug, Clone, Copy)]
 struct HealthMetrics {
+    fit_ready: bool,
     sample_count: usize,
     window_duration_us: u64,
     drift_ppm: f64,
@@ -130,6 +131,7 @@ impl RawClockEstimator {
     }
 
     pub fn health(&self, now_host_us: u64) -> RawClockHealth {
+        let fit_ready = self.slope.is_some() && self.offset.is_some();
         let sample_count = self.samples.len();
         let window_duration_us = self.window_duration_us();
         let sample_gap_max_us = self.sample_gap_max_us();
@@ -148,6 +150,7 @@ impl RawClockEstimator {
         let drift_ppm = self.drift_ppm();
 
         let metrics = HealthMetrics {
+            fit_ready,
             sample_count,
             window_duration_us,
             drift_ppm,
@@ -267,6 +270,9 @@ impl RawClockEstimator {
     }
 
     fn unhealthy_reason(&self, metrics: HealthMetrics) -> Option<String> {
+        if !metrics.fit_ready {
+            return Some("line fit unavailable".to_string());
+        }
         if metrics.sample_count < self.thresholds.warmup_samples {
             return Some(format!(
                 "sample count {} below warmup threshold {}",
@@ -442,6 +448,29 @@ mod tests {
         let err = estimator.push(sample(9_999, 110_100)).unwrap_err();
         assert!(matches!(err, RawClockError::RawTimestampRegression { .. }));
         assert!(!estimator.health(110_100).healthy);
+    }
+
+    #[test]
+    fn one_sample_without_fit_fails_closed_even_with_permissive_thresholds() {
+        let mut estimator = RawClockEstimator::new(RawClockThresholds {
+            warmup_samples: 1,
+            warmup_window_us: 0,
+            residual_p95_us: u64::MAX,
+            residual_max_us: u64::MAX,
+            drift_abs_ppm: f64::MAX,
+            sample_gap_max_us: u64::MAX,
+            last_sample_age_us: u64::MAX,
+        });
+
+        estimator.push(sample(10_000, 110_000)).unwrap();
+
+        assert!(estimator.map_raw_us(10_000).is_none());
+        let health = estimator.health(110_000);
+        assert!(!health.healthy, "{health:?}");
+        assert!(
+            health.reason.as_deref().is_some_and(|reason| reason.contains("fit")),
+            "{health:?}"
+        );
     }
 
     #[test]
