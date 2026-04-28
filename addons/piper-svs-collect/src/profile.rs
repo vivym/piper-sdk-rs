@@ -8,6 +8,7 @@ const EPSILON_ORTHONORMAL: f64 = 1e-6;
 const MIRROR_MAP_KIND_LEFT_RIGHT: &str = "left-right";
 const MIRROR_MAP_KIND_CUSTOM: &str = "custom";
 const PHI_MODE_SIGNED: &str = "signed";
+const PHI_MODE_ABSOLUTE: &str = "absolute";
 const PHI_MODE_POSITIVE: &str = "positive";
 const PHI_MODE_NEGATIVE: &str = "negative";
 const DYNAMICS_MODE_GRAVITY: &str = "gravity";
@@ -730,7 +731,7 @@ impl PhiProfile {
         for (index, mode) in self.mode.iter().enumerate() {
             if !matches!(
                 mode.as_str(),
-                PHI_MODE_SIGNED | PHI_MODE_POSITIVE | PHI_MODE_NEGATIVE
+                PHI_MODE_SIGNED | PHI_MODE_ABSOLUTE | PHI_MODE_POSITIVE | PHI_MODE_NEGATIVE
             ) {
                 return invalid(format!("{prefix}.mode[{index}] is unsupported"));
             }
@@ -1186,6 +1187,15 @@ mod tests {
         profile.control.loop_frequency_hz = 199.0;
 
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn validation_allows_absolute_phi_mode() {
+        let mut profile = EffectiveProfile::default_for_tests();
+        profile.cue.master_phi.mode = ["absolute", "absolute", "absolute"].map(String::from);
+        profile.cue.slave_phi.mode = ["absolute", "absolute", "absolute"].map(String::from);
+
+        profile.validate().unwrap();
     }
 
     #[test]

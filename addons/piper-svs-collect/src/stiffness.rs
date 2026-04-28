@@ -439,14 +439,24 @@ fn rate_limit_axis(previous: f64, target: f64, max_delta_per_second: f64, dt_sec
 mod tests {
     use super::*;
 
-    use crate::profile::StiffnessProfile;
+    use crate::profile::{ContactProfile, CueProfile, StiffnessProfile};
 
     #[test]
     fn stiffness_clips_before_lpf_and_rate_limit() {
         let profile = StiffnessProfile::test_with_limits([50.0; 3], [100.0; 3]);
-        let mut state = SvsStiffnessState::new(&profile).unwrap();
+        let mut cue = CueProfile {
+            w_u: [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ..CueProfile::default()
+        };
+        cue.master_phi.deadband = [0.0; 3];
+        cue.master_phi.limit = [1.0e12; 3];
+
+        let mut state =
+            SvsStiffnessState::with_profiles(&profile, &ContactProfile::default(), &cue, 200.0)
+                .unwrap();
         let output = state.update([1e9, 0.0, 0.0], [0.0; 3], 5_000).unwrap();
-        assert!(output.k_state_clipped_n_per_m[0] <= 100.0);
-        assert!(output.k_tele_n_per_m[0] <= 100.0);
+        assert!(output.k_state_raw_n_per_m[0] > profile.k_max[0]);
+        assert_eq!(output.k_state_clipped_n_per_m[0], profile.k_max[0]);
+        assert!(output.k_tele_n_per_m[0] <= profile.k_max[0]);
     }
 }
