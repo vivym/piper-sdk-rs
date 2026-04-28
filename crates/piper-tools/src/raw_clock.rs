@@ -211,6 +211,7 @@ impl RawClockEstimator {
         let retention_window_us = self
             .thresholds
             .warmup_window_us
+            .saturating_add(self.thresholds.sample_gap_max_us)
             .max(self.thresholds.sample_gap_max_us.saturating_mul(4));
         while self.samples.front().is_some_and(|sample| {
             newest_host_us.saturating_sub(sample.host_rx_mono_us) > retention_window_us
@@ -277,7 +278,7 @@ impl RawClockEstimator {
 
     fn window_duration_us(&self) -> u64 {
         match (self.samples.front(), self.samples.back()) {
-            (Some(first), Some(last)) => last.raw_us.saturating_sub(first.raw_us),
+            (Some(first), Some(last)) => last.host_rx_mono_us.saturating_sub(first.host_rx_mono_us),
             _ => 0,
         }
     }
@@ -612,5 +613,51 @@ mod tests {
         assert_eq!(health.residual_p95_us, 0);
         assert_eq!(health.last_sample_age_us, 100);
         assert_eq!(estimator.map_raw_us(12_500), Some(1_012_500));
+    }
+
+    #[test]
+    fn warmup_window_uses_fit_anchor_duration_not_raw_counter_span() {
+        let thresholds = RawClockThresholds {
+            warmup_samples: 4,
+            warmup_window_us: 10_000,
+            residual_p95_us: 20,
+            residual_max_us: 50,
+            drift_abs_ppm: 1_000.0,
+            sample_gap_max_us: 4_000,
+            last_sample_age_us: 2_000,
+        };
+        let mut estimator = RawClockEstimator::new(thresholds);
+
+        estimator.push_with_receive_mono_us(sample(10_000, 1_010_000), 110_000).unwrap();
+        estimator.push_with_receive_mono_us(sample(13_332, 1_013_333), 113_333).unwrap();
+        estimator.push_with_receive_mono_us(sample(16_664, 1_016_666), 116_666).unwrap();
+        estimator.push_with_receive_mono_us(sample(19_996, 1_020_000), 120_000).unwrap();
+
+        let health = estimator.health(120_100);
+        assert!(health.healthy, "{health:?}");
+        assert_eq!(health.window_duration_us, 10_000);
+    }
+
+    #[test]
+    fn retention_keeps_enough_history_for_warmup_window_between_samples() {
+        let thresholds = RawClockThresholds {
+            warmup_samples: 4,
+            warmup_window_us: 10_000,
+            residual_p95_us: 20,
+            residual_max_us: 50,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_us: 1_000,
+            last_sample_age_us: 2_000,
+        };
+        let mut estimator = RawClockEstimator::new(thresholds);
+
+        for index in 0..=12 {
+            let offset_us = index * 900;
+            estimator.push(sample(10_000 + offset_us, 110_000 + offset_us)).unwrap();
+        }
+
+        let health = estimator.health(120_900);
+        assert!(health.healthy, "{health:?}");
+        assert!(health.window_duration_us >= 10_000, "{health:?}");
     }
 }
