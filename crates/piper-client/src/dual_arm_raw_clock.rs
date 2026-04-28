@@ -392,6 +392,23 @@ impl RawClockRuntimeTiming {
         }
     }
 
+    fn reset_for_warmup(&mut self) {
+        self.master.reset();
+        self.slave.reset();
+        self.skew_samples_us.clear();
+        self.max_inter_arm_skew_us = 0;
+        self.clock_health_failures = 0;
+        self.last_master_raw_us = None;
+        self.last_slave_raw_us = None;
+        self.master_raw_timestamp_regressions = 0;
+        self.slave_raw_timestamp_regressions = 0;
+    }
+
+    fn mark_continuity_boundary(&mut self) {
+        self.master.mark_continuity_boundary();
+        self.slave.mark_continuity_boundary();
+    }
+
     pub fn ingest_snapshots(
         &mut self,
         master: &ExperimentalRawClockSnapshot,
@@ -619,6 +636,7 @@ impl ExperimentalRawClockDualArmStandby {
         warmup: Duration,
         cancel_signal: &AtomicBool,
     ) -> Result<Self, RawClockRuntimeError> {
+        self.timing.reset_for_warmup();
         let deadline = Instant::now() + warmup;
         while Instant::now() < deadline {
             if cancel_signal.load(Ordering::Acquire) {
@@ -646,10 +664,11 @@ impl ExperimentalRawClockDualArmStandby {
     }
 
     pub fn enable_mit_passthrough(
-        self,
+        mut self,
         master_cfg: MitModeConfig,
         slave_cfg: MitModeConfig,
     ) -> Result<ExperimentalRawClockDualArmActive, RawClockRuntimeError> {
+        self.timing.mark_continuity_boundary();
         let master = match self.master.enable_mit_passthrough(master_cfg) {
             Ok(master) => master,
             Err(source) => {
@@ -2883,6 +2902,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(timing.sample_counts_for_tests(), (1, 1));
+    }
+
+    #[test]
+    fn warmup_reset_clears_previous_estimator_window() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        timing
+            .warmup_tick_from_snapshots(
+                &raw_clock_snapshot_for_tests(10_000, 110_000),
+                &raw_clock_snapshot_for_tests(20_000, 110_800),
+                110_900,
+                RawClockRuntimeThresholds::for_tests(),
+            )
+            .unwrap();
+
+        timing.reset_for_warmup();
+
+        assert_eq!(timing.sample_counts_for_tests(), (0, 0));
+        timing
+            .warmup_tick_from_snapshots(
+                &raw_clock_snapshot_for_tests(100_000, 300_000),
+                &raw_clock_snapshot_for_tests(110_000, 300_800),
+                300_900,
+                RawClockRuntimeThresholds::for_tests(),
+            )
+            .unwrap();
+        assert_eq!(timing.sample_counts_for_tests(), (1, 1));
+    }
+
+    #[test]
+    fn continuity_boundary_ignores_mode_transition_gap_for_health_gate() {
+        let thresholds = RawClockThresholds {
+            warmup_samples: 4,
+            warmup_window_us: 12_000,
+            residual_p95_us: 20,
+            residual_max_us: 50,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_us: 2_000,
+            last_sample_age_us: 2_000,
+        };
+        let mut timing = RawClockRuntimeTiming::new(thresholds);
+        timing.seed_ready_for_tests(
+            &[
+                raw_clock_snapshot_for_tests(10_000, 110_000),
+                raw_clock_snapshot_for_tests(11_000, 111_000),
+                raw_clock_snapshot_for_tests(12_000, 112_000),
+                raw_clock_snapshot_for_tests(13_000, 113_000),
+            ],
+            &[
+                raw_clock_snapshot_for_tests(20_000, 110_800),
+                raw_clock_snapshot_for_tests(21_000, 111_800),
+                raw_clock_snapshot_for_tests(22_000, 112_800),
+                raw_clock_snapshot_for_tests(23_000, 113_800),
+            ],
+        );
+
+        timing.mark_continuity_boundary();
+
+        let tick = timing
+            .tick_from_snapshots(
+                &raw_clock_snapshot_for_tests(23_000, 123_000),
+                &raw_clock_snapshot_for_tests(33_000, 123_800),
+                123_900,
+            )
+            .expect("mode transition boundary should preserve fit while ignoring boundary gap");
+
+        assert!(tick.master_health.healthy, "{:?}", tick.master_health);
+        assert!(tick.slave_health.healthy, "{:?}", tick.slave_health);
+        assert_eq!(tick.master_health.sample_gap_max_us, 1_000);
+        assert_eq!(tick.slave_health.sample_gap_max_us, 1_000);
     }
 
     #[test]

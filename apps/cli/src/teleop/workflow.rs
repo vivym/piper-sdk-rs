@@ -11,9 +11,9 @@ use piper_client::dual_arm_raw_clock::{
     ExperimentalRawClockRunExit as PiperRawClockRunExit, RawClockRuntimeExitReason,
     RawClockRuntimeReport, RawClockRuntimeThresholds, RawClockSide,
 };
-use piper_client::observer::{ControlSnapshotFull, Observer};
+use piper_client::observer::{ControlReadPolicy, ControlSnapshotFull, Observer};
 use piper_client::state::{DisableConfig, MitModeConfig, Piper, SoftRealtime, Standby};
-use piper_client::types::{JointArray, NewtonMeter, Rad, RadPerSecond};
+use piper_client::types::{JointArray, NewtonMeter, Rad, RadPerSecond, RobotError};
 use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
 use piper_tools::raw_clock::{RawClockHealth, RawClockThresholds};
 use std::io::{self, Write};
@@ -43,6 +43,8 @@ use crate::teleop::target::{
 };
 
 const CALIBRATED_HW_RAW_TIMING_SOURCE: &str = "calibrated_hw_raw";
+const EXPERIMENTAL_SOFT_SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_millis(200);
+const EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub trait TeleopBackend {
     fn connect(&mut self, targets: &RoleTargets, baud_rate: u32) -> Result<()>;
@@ -427,7 +429,7 @@ where
     targets.ensure_experimental_raw_clock_supported(platform)?;
 
     backend.connect_soft(&targets, args.baud_rate)?;
-    let warmup = match backend.warmup_raw_clock(
+    match backend.warmup_raw_clock(
         &resolved.raw_clock,
         resolved.control.frequency_hz,
         resolved.max_iterations,
@@ -507,8 +509,23 @@ where
         bail!("operator confirmation declined");
     }
 
-    let standby_snapshot =
-        ExperimentalRawClockTeleopBackend::standby_snapshot(backend, DualArmReadPolicy::default())?;
+    let warmup = match backend.warmup_raw_clock(
+        &resolved.raw_clock,
+        resolved.control.frequency_hz,
+        resolved.max_iterations,
+        cancel_signal.clone(),
+    ) {
+        Ok(summary) => summary,
+        Err(error) if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) => {
+            return Ok(TeleopExitStatus::Success);
+        },
+        Err(error) => return Err(error).context("post-confirmation raw-clock refresh failed"),
+    };
+
+    let standby_snapshot = ExperimentalRawClockTeleopBackend::standby_snapshot(
+        backend,
+        experimental_raw_clock_dual_arm_read_policy(),
+    )?;
     check_snapshot_posture(
         &calibration,
         &standby_snapshot,
@@ -539,7 +556,7 @@ where
 
     let active_snapshot = match ExperimentalRawClockTeleopBackend::active_snapshot(
         backend,
-        DualArmReadPolicy::default(),
+        experimental_raw_clock_dual_arm_read_policy(),
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -727,7 +744,7 @@ fn experimental_raw_clock_config_from_settings(
     max_iterations: Option<usize>,
 ) -> ExperimentalRawClockConfig {
     let estimator_thresholds = RawClockThresholds {
-        warmup_samples: (raw_clock.warmup_secs * 400).max(4) as usize,
+        warmup_samples: raw_clock_warmup_sample_threshold(raw_clock),
         warmup_window_us: raw_clock.warmup_secs * 1_000_000,
         residual_p95_us: raw_clock.residual_p95_us,
         residual_max_us: raw_clock.residual_max_us,
@@ -747,6 +764,63 @@ fn experimental_raw_clock_config_from_settings(
         thresholds,
         estimator_thresholds,
     }
+}
+
+fn raw_clock_warmup_sample_threshold(raw_clock: &TeleopRawClockSettings) -> usize {
+    let warmup_ms = raw_clock.warmup_secs.saturating_mul(1_000);
+    let sample_gap_max_ms = raw_clock.sample_gap_max_ms.max(1);
+    let samples = warmup_ms.saturating_add(sample_gap_max_ms - 1) / sample_gap_max_ms;
+
+    usize::try_from(samples.max(4)).unwrap_or(usize::MAX)
+}
+
+fn experimental_raw_clock_control_read_policy() -> ControlReadPolicy {
+    ControlReadPolicy::default()
+}
+
+fn experimental_raw_clock_dual_arm_read_policy() -> DualArmReadPolicy {
+    DualArmReadPolicy {
+        per_arm: experimental_raw_clock_control_read_policy(),
+        max_inter_arm_skew: DualArmReadPolicy::default().max_inter_arm_skew,
+    }
+}
+
+fn wait_for_experimental_soft_snapshot_ready<Read>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut read: Read,
+) -> Result<DualArmSnapshot>
+where
+    Read: FnMut() -> Result<DualArmSnapshot>,
+{
+    let start = Instant::now();
+
+    loop {
+        match read() {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) if is_retryable_experimental_soft_snapshot_error(&error) => {
+                if start.elapsed() >= timeout {
+                    return Err(error);
+                }
+
+                let remaining = timeout.saturating_sub(start.elapsed());
+                let sleep_duration = poll_interval.min(remaining);
+                if sleep_duration.is_zero() {
+                    return Err(error);
+                }
+
+                std::thread::sleep(sleep_duration);
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_retryable_experimental_soft_snapshot_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<RobotError>(),
+        Some(RobotError::ControlStateIncomplete { .. } | RobotError::StateMisaligned { .. })
+    )
 }
 
 fn experimental_raw_clock_master_follower_gains(
@@ -1051,7 +1125,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         };
 
         let warmed = match standby.warmup(
-            DualArmReadPolicy::default().per_arm,
+            experimental_raw_clock_control_read_policy(),
             Duration::from_secs(settings.warmup_secs),
             cancel_signal.as_ref(),
         ) {
@@ -1076,7 +1150,11 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             .experimental_observers
             .as_ref()
             .context("experimental raw-clock backend is not connected")?;
-        let snapshot = experimental_soft_snapshot(observers, DualArmReadPolicy::default())?;
+        let snapshot = wait_for_experimental_soft_snapshot_ready(
+            EXPERIMENTAL_SOFT_SNAPSHOT_READY_TIMEOUT,
+            EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL,
+            || experimental_soft_snapshot(observers, experimental_raw_clock_dual_arm_read_policy()),
+        )?;
         Ok(DualArmCalibration {
             master_zero: snapshot.left.state.position,
             slave_zero: snapshot.right.state.position,
@@ -1093,7 +1171,11 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             .experimental_observers
             .as_ref()
             .context("experimental raw-clock backend is not connected")?;
-        experimental_soft_snapshot(observers, policy)
+        wait_for_experimental_soft_snapshot_ready(
+            EXPERIMENTAL_SOFT_SNAPSHOT_READY_TIMEOUT,
+            EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL,
+            || experimental_soft_snapshot(observers, policy),
+        )
     }
 
     fn enable_mit_passthrough(
@@ -1127,7 +1209,11 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             .experimental_observers
             .as_ref()
             .context("experimental raw-clock backend is not connected")?;
-        experimental_soft_snapshot(observers, policy)
+        wait_for_experimental_soft_snapshot_ready(
+            EXPERIMENTAL_SOFT_SNAPSHOT_READY_TIMEOUT,
+            EXPERIMENTAL_SOFT_SNAPSHOT_POLL_INTERVAL,
+            || experimental_soft_snapshot(observers, policy),
+        )
     }
 
     fn disable_active_passthrough(&mut self) -> Result<()> {
@@ -1165,7 +1251,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             .take()
             .context("experimental raw-clock backend is not active")?;
         let run_config = ExperimentalRawClockRunConfig {
-            read_policy: DualArmReadPolicy::default().per_arm,
+            read_policy: experimental_raw_clock_control_read_policy(),
             command_timeout: Duration::from_millis(20),
             disable_config: DisableConfig::default(),
             cancel_signal: Some(cancel_signal),
@@ -1244,11 +1330,15 @@ fn experimental_soft_snapshot(
     let dynamic_skew_us = left.dynamic_host_rx_mono_us.abs_diff(right.dynamic_host_rx_mono_us);
     let inter_arm_skew = Duration::from_micros(position_skew_us.max(dynamic_skew_us));
     if inter_arm_skew > policy.max_inter_arm_skew {
-        bail!(
-            "experimental raw-clock dual-arm snapshot inter-arm skew {}us exceeds {}us",
-            inter_arm_skew.as_micros(),
-            policy.max_inter_arm_skew.as_micros()
-        );
+        let skew_us = i64::try_from(inter_arm_skew.as_micros()).unwrap_or(i64::MAX);
+        let max_skew_us = u64::try_from(policy.max_inter_arm_skew.as_micros()).unwrap_or(u64::MAX);
+        return Err(RobotError::state_misaligned(skew_us, max_skew_us)).with_context(|| {
+            format!(
+                "experimental raw-clock dual-arm snapshot inter-arm skew {}us exceeds {}us",
+                inter_arm_skew.as_micros(),
+                policy.max_inter_arm_skew.as_micros()
+            )
+        });
     }
 
     Ok(DualArmSnapshot {
@@ -1275,37 +1365,54 @@ fn experimental_soft_control_snapshot_full(
         );
     }
     if health.last_feedback_age > policy.per_arm.max_feedback_age {
-        bail!(
-            "experimental raw-clock {role} feedback age {:?} exceeds {:?}",
+        return Err(RobotError::feedback_stale(
             health.last_feedback_age,
-            policy.per_arm.max_feedback_age
-        );
+            policy.per_arm.max_feedback_age,
+        )
+        .into());
     }
 
     let position = observer.raw_joint_position_state();
     let dynamic = observer.raw_joint_dynamic_state();
     if !position.is_fully_valid() {
-        bail!(
-            "experimental raw-clock {role} position feedback incomplete: mask=0x{:02x}",
-            position.frame_valid_mask
-        );
+        return Err(RobotError::control_state_incomplete(
+            position.frame_valid_mask,
+            dynamic.valid_mask,
+        ))
+        .with_context(|| {
+            format!(
+                "experimental raw-clock {role} position feedback incomplete: mask=0x{:02x}",
+                position.frame_valid_mask
+            )
+        });
     }
     if !dynamic.is_complete() {
-        bail!(
-            "experimental raw-clock {role} dynamic feedback incomplete: mask=0x{:02x}",
-            dynamic.valid_mask
-        );
+        return Err(RobotError::control_state_incomplete(
+            position.frame_valid_mask,
+            dynamic.valid_mask,
+        ))
+        .with_context(|| {
+            format!(
+                "experimental raw-clock {role} dynamic feedback incomplete: mask=0x{:02x}",
+                dynamic.valid_mask
+            )
+        });
     }
 
     let skew_us = signed_us_diff(dynamic.group_timestamp_us, position.hardware_timestamp_us);
     if position.hardware_timestamp_us.abs_diff(dynamic.group_timestamp_us)
         > policy.per_arm.max_state_skew_us
     {
-        bail!(
-            "experimental raw-clock {role} state skew {}us exceeds {}us",
+        return Err(RobotError::state_misaligned(
             skew_us,
-            policy.per_arm.max_state_skew_us
-        );
+            policy.per_arm.max_state_skew_us,
+        ))
+        .with_context(|| {
+            format!(
+                "experimental raw-clock {role} state skew {}us exceeds {}us",
+                skew_us, policy.per_arm.max_state_skew_us
+            )
+        });
     }
 
     Ok(ControlSnapshotFull {
@@ -2426,6 +2533,7 @@ mod tests {
                 WorkflowCall::Connect,
                 WorkflowCall::RawClockWarmup,
                 WorkflowCall::ConfirmStart,
+                WorkflowCall::RawClockWarmup,
                 WorkflowCall::Enable,
                 WorkflowCall::RunLoop,
             ],
@@ -2703,7 +2811,7 @@ mod tests {
 
         assert_eq!(config.frequency_hz, 333.0);
         assert_eq!(config.max_iterations, Some(12));
-        assert_eq!(config.estimator_thresholds.warmup_samples, 1200);
+        assert_eq!(config.estimator_thresholds.warmup_samples, 429);
         assert_eq!(config.estimator_thresholds.warmup_window_us, 3_000_000);
         assert_eq!(config.estimator_thresholds.residual_p95_us, 120);
         assert_eq!(config.estimator_thresholds.residual_max_us, 300);
@@ -2712,6 +2820,79 @@ mod tests {
         assert_eq!(config.estimator_thresholds.last_sample_age_us, 9_000);
         assert_eq!(config.thresholds.inter_arm_skew_max_us, 1500);
         assert_eq!(config.thresholds.last_sample_age_us, 9_000);
+    }
+
+    #[test]
+    fn experimental_raw_clock_warmup_sample_threshold_uses_sample_gap() {
+        let settings = TeleopRawClockSettings {
+            experimental_calibrated_raw: true,
+            warmup_secs: 10,
+            residual_p95_us: 500,
+            residual_max_us: 2000,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_ms: 20,
+            last_sample_age_ms: 20,
+            inter_arm_skew_max_us: 5000,
+        };
+
+        let config = experimental_raw_clock_config_from_settings(&settings, 100.0, Some(300));
+
+        assert_eq!(config.estimator_thresholds.warmup_samples, 500);
+    }
+
+    #[test]
+    fn experimental_raw_clock_read_policy_allows_observed_warmup_state_skew() {
+        let policy = experimental_raw_clock_control_read_policy();
+
+        assert_eq!(policy.max_state_skew_us, 5_000);
+        assert!(policy.max_state_skew_us > DualArmReadPolicy::default().per_arm.max_state_skew_us);
+        assert!(2_063 <= policy.max_state_skew_us);
+    }
+
+    #[test]
+    fn experimental_soft_snapshot_retry_classifier_accepts_contextual_incomplete_state() {
+        let error = anyhow::Error::from(piper_client::types::RobotError::control_state_incomplete(
+            0b111, 0x0f,
+        ))
+        .context("experimental raw-clock master dynamic feedback incomplete: mask=0x0f");
+
+        assert!(is_retryable_experimental_soft_snapshot_error(&error));
+    }
+
+    #[test]
+    fn experimental_soft_snapshot_ready_wait_retries_incomplete_and_misaligned_states() {
+        let attempts = Arc::new(Mutex::new(0usize));
+
+        let snapshot = wait_for_experimental_soft_snapshot_ready(
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let mut attempts = attempts.lock().unwrap();
+                    *attempts += 1;
+                    match *attempts {
+                        1 => Err(anyhow::Error::from(
+                            piper_client::types::RobotError::control_state_incomplete(0b111, 0x0f),
+                        )
+                        .context(
+                            "experimental raw-clock master dynamic feedback incomplete: mask=0x0f",
+                        )),
+                        2 => Err(anyhow::Error::from(
+                            piper_client::types::RobotError::state_misaligned(2_063, 2_000),
+                        )),
+                        _ => Ok(sample_snapshot(false)),
+                    }
+                }
+            },
+        )
+        .expect("readiness wait should retry until a complete aligned snapshot is available");
+
+        assert_eq!(
+            snapshot.left.state.position,
+            sample_snapshot(false).left.state.position
+        );
+        assert_eq!(*attempts.lock().unwrap(), 3);
     }
 
     #[test]

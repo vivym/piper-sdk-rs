@@ -81,6 +81,7 @@ pub struct RawClockEstimator {
     raw_timestamp_regressions: u64,
     slope: Option<f64>,
     offset: Option<f64>,
+    continuity_boundary_raw_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +121,20 @@ impl RawClockEstimator {
             raw_timestamp_regressions: 0,
             slope: None,
             offset: None,
+            continuity_boundary_raw_us: None,
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.raw_timestamp_regressions = 0;
+        self.slope = None;
+        self.offset = None;
+        self.continuity_boundary_raw_us = None;
+    }
+
+    pub fn mark_continuity_boundary(&mut self) {
+        self.continuity_boundary_raw_us = self.samples.back().map(|sample| sample.raw_us);
     }
 
     pub fn push(&mut self, sample: RawClockSample) -> Result<(), RawClockError> {
@@ -287,6 +301,11 @@ impl RawClockEstimator {
         self.samples
             .iter()
             .zip(self.samples.iter().skip(1))
+            .filter(|(previous, sample)| {
+                !self
+                    .continuity_boundary_raw_us
+                    .is_some_and(|boundary| previous.raw_us <= boundary && sample.raw_us > boundary)
+            })
             .map(|(previous, sample)| sample.raw_us.saturating_sub(previous.raw_us))
             .max()
             .unwrap_or(0)
@@ -479,6 +498,50 @@ mod tests {
         let err = estimator.push(sample(9_999, 110_100)).unwrap_err();
         assert!(matches!(err, RawClockError::RawTimestampRegression { .. }));
         assert!(!estimator.health(110_100).healthy);
+    }
+
+    #[test]
+    fn reset_clears_samples_fit_and_regression_state() {
+        let mut estimator = RawClockEstimator::new(RawClockThresholds::for_tests());
+        estimator.push(sample(10_000, 110_000)).unwrap();
+        let err = estimator.push(sample(9_999, 110_100)).unwrap_err();
+        assert!(matches!(err, RawClockError::RawTimestampRegression { .. }));
+
+        estimator.reset();
+
+        let health = estimator.health(110_200);
+        assert_eq!(health.sample_count, 0);
+        assert_eq!(health.raw_timestamp_regressions, 0);
+        assert!(estimator.map_raw_us(10_000).is_none());
+        estimator.push(sample(10_000, 110_300)).unwrap();
+    }
+
+    #[test]
+    fn continuity_boundary_ignores_single_cross_boundary_sample_gap() {
+        let thresholds = RawClockThresholds {
+            warmup_samples: 4,
+            warmup_window_us: 12_000,
+            residual_p95_us: 20,
+            residual_max_us: 50,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_us: 2_000,
+            last_sample_age_us: 2_000,
+        };
+        let mut estimator = RawClockEstimator::new(thresholds);
+
+        estimator.push(sample(10_000, 110_000)).unwrap();
+        estimator.push(sample(11_000, 111_000)).unwrap();
+        estimator.push(sample(12_000, 112_000)).unwrap();
+        estimator.push(sample(13_000, 113_000)).unwrap();
+        estimator.mark_continuity_boundary();
+        estimator.push(sample(20_000, 120_000)).unwrap();
+        estimator.push(sample(21_000, 121_000)).unwrap();
+        estimator.push(sample(22_000, 122_000)).unwrap();
+        estimator.push(sample(23_000, 123_000)).unwrap();
+
+        let health = estimator.health(123_100);
+        assert!(health.healthy, "{health:?}");
+        assert_eq!(health.sample_gap_max_us, 1_000);
     }
 
     #[test]
