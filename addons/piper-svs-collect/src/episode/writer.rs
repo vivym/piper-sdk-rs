@@ -50,6 +50,8 @@ pub enum EpisodeStopReason {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriterStats {
+    pub queue_full_stop_events: u64,
+    pub queue_full_stop_duration_ms: u64,
     pub queue_full_events: u64,
     pub dropped_step_count: u64,
     pub first_queue_full_host_mono_us: Option<u64>,
@@ -75,7 +77,6 @@ pub struct EpisodeWriter {
     pause_worker: Arc<AtomicBool>,
     stats: Arc<Mutex<WriterStats>>,
     worker: Option<JoinHandle<Result<WriterFlushSummary, WriterError>>>,
-    monotonic_origin: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -190,7 +191,6 @@ impl EpisodeWriter {
             pause_worker,
             stats,
             worker: Some(worker),
-            monotonic_origin: Instant::now(),
         })
     }
 
@@ -202,7 +202,7 @@ impl EpisodeWriter {
     }
 
     fn record_queue_full(&self, depth: usize) {
-        let now_us = saturating_u64(self.monotonic_origin.elapsed().as_micros());
+        let now_us = piper_driver::heartbeat::monotonic_micros().max(1);
         let depth = saturating_u32(depth);
         let mut stats = self.stats.lock().expect("writer stats lock poisoned");
         stats.queue_full_events = stats.queue_full_events.saturating_add(1);
@@ -225,6 +225,17 @@ impl Drop for EpisodeWriter {
 }
 
 impl WriterStats {
+    pub fn with_backpressure_thresholds(monitor: &WriterBackpressureMonitor) -> Self {
+        let mut stats = Self::default();
+        stats.record_backpressure_thresholds(monitor);
+        stats
+    }
+
+    pub fn record_backpressure_thresholds(&mut self, monitor: &WriterBackpressureMonitor) {
+        self.queue_full_stop_events = monitor.queue_full_stop_events();
+        self.queue_full_stop_duration_ms = monitor.queue_full_stop_duration_ms();
+    }
+
     pub fn has_fault(&self) -> bool {
         self.queue_full_events > 0
             || self.dropped_step_count > 0
@@ -240,6 +251,8 @@ impl WriterStats {
 impl From<&WriterStats> for WriterReportJson {
     fn from(stats: &WriterStats) -> Self {
         Self {
+            queue_full_stop_events: stats.queue_full_stop_events,
+            queue_full_stop_duration_ms: stats.queue_full_stop_duration_ms,
             queue_full_events: stats.queue_full_events,
             dropped_step_count: stats.dropped_step_count,
             first_queue_full_host_mono_us: stats.first_queue_full_host_mono_us,
@@ -289,6 +302,14 @@ impl WriterBackpressureMonitor {
 
     pub fn queue_full_events(&self) -> u64 {
         self.queue_full_events
+    }
+
+    pub fn queue_full_stop_events(&self) -> u64 {
+        self.event_threshold
+    }
+
+    pub fn queue_full_stop_duration_ms(&self) -> u64 {
+        self.duration_threshold.as_millis().min(u128::from(u64::MAX)) as u64
     }
 
     pub fn first_queue_full(&self) -> Option<Instant> {
@@ -433,10 +454,6 @@ fn saturating_u32(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
-fn saturating_u64(value: u128) -> u64 {
-    value.min(u128::from(u64::MAX)) as u64
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -465,6 +482,28 @@ mod tests {
     }
 
     #[test]
+    fn queue_full_timestamps_use_driver_host_monotonic_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = EpisodeWriter::for_test_with_capacity(dir.path(), 1).unwrap();
+        writer.pause_worker_for_test();
+
+        writer.try_enqueue(SvsStepV1::for_test(0)).unwrap();
+        let before = piper_driver::heartbeat::monotonic_micros();
+        assert!(matches!(
+            writer.try_enqueue(SvsStepV1::for_test(1)),
+            Err(WriterError::QueueFull)
+        ));
+
+        let stats = writer.stats();
+        let first = stats.first_queue_full_host_mono_us.unwrap();
+        let latest = stats.latest_queue_full_host_mono_us.unwrap();
+        assert!(first >= before);
+        assert!(latest >= before);
+        assert!(first > 0);
+        assert!(latest > 0);
+    }
+
+    #[test]
     fn sustained_queue_full_trips_stop_threshold() {
         let mut monitor = WriterBackpressureMonitor::new(2, Duration::from_millis(100));
         assert!(!monitor.record_queue_full(Instant::now()));
@@ -474,5 +513,19 @@ mod tests {
         let start = Instant::now();
         assert!(!duration_monitor.record_queue_full(start));
         assert!(duration_monitor.record_queue_full(start + Duration::from_millis(101)));
+    }
+
+    #[test]
+    fn backpressure_thresholds_are_recorded_in_stats_and_report() {
+        let monitor = WriterBackpressureMonitor::new(7, Duration::from_millis(250));
+        let stats = WriterStats::with_backpressure_thresholds(&monitor);
+        let report = WriterReportJson::from(&stats);
+
+        assert_eq!(monitor.queue_full_stop_events(), 7);
+        assert_eq!(monitor.queue_full_stop_duration_ms(), 250);
+        assert_eq!(stats.queue_full_stop_events, 7);
+        assert_eq!(stats.queue_full_stop_duration_ms, 250);
+        assert_eq!(report.queue_full_stop_events, 7);
+        assert_eq!(report.queue_full_stop_duration_ms, 250);
     }
 }

@@ -74,7 +74,8 @@ pub enum ProfileSourceKind {
     File,
     Generated,
     Captured,
-    EmbeddedDefault,
+    #[serde(rename = "built-in-defaults")]
+    BuiltInDefaults,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -197,6 +198,7 @@ pub struct GripperMirrorManifest {
     pub update_divider: u32,
     pub position_deadband: f64,
     pub effort_scale: f64,
+    pub max_feedback_age_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -268,6 +270,8 @@ pub struct WriterFlushResultJson {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriterReportJson {
+    pub queue_full_stop_events: u64,
+    pub queue_full_stop_duration_ms: u64,
     pub queue_full_events: u64,
     pub dropped_step_count: u64,
     pub first_queue_full_host_mono_us: Option<u64>,
@@ -497,6 +501,7 @@ impl ManifestV1 {
                 update_divider: 4,
                 position_deadband: 0.02,
                 effort_scale: 1.0,
+                max_feedback_age_ms: 100,
             },
             calibration: CalibrationManifest {
                 source_path: Some(PathBuf::from("calibration.toml")),
@@ -672,6 +677,15 @@ impl SourceArtifactManifest {
                 self.sha256_hex.as_deref(),
             )?;
         }
+        if self.source_kind == ProfileSourceKind::BuiltInDefaults
+            && (self.source_path.is_some()
+                || self.hash_algorithm.is_some()
+                || self.sha256_hex.is_some())
+        {
+            return Err(ManifestError::InvalidManifest(format!(
+                "{field} built-in-defaults source must not include file path or hash"
+            )));
+        }
         Ok(())
     }
 }
@@ -707,6 +721,11 @@ impl GripperMirrorManifest {
         if self.update_divider == 0 {
             return Err(ManifestError::InvalidManifest(
                 "gripper.update_divider must be non-zero".to_string(),
+            ));
+        }
+        if self.max_feedback_age_ms == 0 {
+            return Err(ManifestError::InvalidManifest(
+                "gripper.max_feedback_age_ms must be positive".to_string(),
             ));
         }
         validate_finite("gripper.position_deadband", self.position_deadband)?;
@@ -891,6 +910,8 @@ impl ReportJson {
                 last_error: Some("writer queue full".to_string()),
             },
             writer: WriterReportJson {
+                queue_full_stop_events: 2,
+                queue_full_stop_duration_ms: 100,
                 queue_full_events: 1,
                 dropped_step_count: 1,
                 first_queue_full_host_mono_us: Some(100),
@@ -1165,6 +1186,32 @@ mod tests {
         assert!(manifest.collector.revision.is_some() || manifest.collector.version.is_some());
         assert_eq!(manifest.task.raw_name, "Surface Following Demo!");
         assert_eq!(manifest.task.slug, "surface-following-demo");
+        assert_eq!(manifest.gripper.max_feedback_age_ms, 100);
+    }
+
+    #[test]
+    fn built_in_defaults_source_kind_serializes_and_validates_without_file_hash() {
+        assert_eq!(
+            serde_json::to_value(ProfileSourceKind::BuiltInDefaults).unwrap(),
+            serde_json::json!("built-in-defaults")
+        );
+
+        let artifact = SourceArtifactManifest {
+            source_kind: ProfileSourceKind::BuiltInDefaults,
+            source_path: None,
+            hash_algorithm: None,
+            sha256_hex: None,
+        };
+        artifact.validate("task_profile").unwrap();
+    }
+
+    #[test]
+    fn gripper_manifest_records_and_validates_max_feedback_age() {
+        let mut manifest = ManifestV1::for_test_complete();
+        assert_eq!(manifest.gripper.max_feedback_age_ms, 100);
+
+        manifest.gripper.max_feedback_age_ms = 0;
+        assert!(manifest.validate().is_err());
     }
 
     #[test]
@@ -1176,5 +1223,7 @@ mod tests {
         assert!(report.ended_unix_ns >= report.started_unix_ns);
         assert!(report.dual_arm.iterations >= report.step_count);
         assert!(report.writer.max_queue_depth >= report.writer.final_queue_depth);
+        assert_eq!(report.writer.queue_full_stop_events, 2);
+        assert_eq!(report.writer.queue_full_stop_duration_ms, 100);
     }
 }
