@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::{LockResult, MutexGuard};
@@ -78,6 +79,7 @@ struct AtomicWriterStats {
     final_queue_depth: AtomicU32,
     encoded_step_count: AtomicU64,
     last_step_index: AtomicU64,
+    enqueue_terminal_fault: AtomicBool,
     backpressure_threshold_tripped: AtomicBool,
     flush_failed: AtomicBool,
     flush_error: Mutex<Option<String>>,
@@ -97,6 +99,8 @@ pub struct EpisodeWriter {
     pause_worker: Arc<AtomicBool>,
     stats: Arc<AtomicWriterStats>,
     worker: Option<JoinHandle<Result<WriterFlushSummary, WriterError>>>,
+    #[cfg(test)]
+    startup_thread_id: Arc<Mutex<Option<std::thread::ThreadId>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +139,10 @@ impl EpisodeWriter {
             return Err(WriterError::AlreadyFinished);
         };
 
+        if self.stats.enqueue_terminal_fault.load(Ordering::Relaxed) {
+            return Err(WriterError::QueueFull);
+        }
+
         let depth_before = sender.len();
         match sender.try_send(step) {
             Ok(()) => {
@@ -163,6 +171,24 @@ impl EpisodeWriter {
         self.pause_worker.store(false, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub fn for_test_with_startup_thread_probe(
+        output_dir: impl AsRef<Path>,
+        capacity: usize,
+    ) -> Result<Self, WriterError> {
+        Self::start(
+            output_dir.as_ref(),
+            SvsHeaderV1::for_test("20260428T010203Z-test-000000000000"),
+            capacity,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn startup_thread_id_for_test(&self) -> Option<std::thread::ThreadId> {
+        *self.startup_thread_id.lock().expect("startup thread id lock poisoned")
+    }
+
     pub fn finish(mut self) -> Result<WriterFlushSummary, WriterError> {
         self.pause_worker.store(false, Ordering::Release);
         drop(self.sender.take());
@@ -182,29 +208,50 @@ impl EpisodeWriter {
             return Err(WriterError::InvalidCapacity);
         }
 
-        let (file, temp_path, final_path) = prepare_steps_file(output_dir, &header)?;
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
         let pause_worker = Arc::new(AtomicBool::new(start_paused));
         let stats = Arc::new(AtomicWriterStats::default());
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let output_dir = output_dir.to_path_buf();
+        #[cfg(test)]
+        let startup_thread_id = Arc::new(Mutex::new(None));
 
         let worker_pause = Arc::clone(&pause_worker);
         let worker_stats = Arc::clone(&stats);
+        #[cfg(test)]
+        let worker_startup_thread_id = Arc::clone(&startup_thread_id);
         let worker = thread::spawn(move || {
             run_worker(
                 receiver,
                 worker_pause,
                 worker_stats,
-                file,
-                temp_path,
-                final_path,
+                header,
+                output_dir,
+                startup_tx,
+                #[cfg(test)]
+                worker_startup_thread_id,
             )
         });
+
+        match startup_rx.recv() {
+            Ok(Ok(())) => {},
+            Ok(Err(err)) => {
+                let _ = worker.join();
+                return Err(err);
+            },
+            Err(_closed) => {
+                let _ = worker.join();
+                return Err(WriterError::WorkerStopped);
+            },
+        }
 
         Ok(Self {
             sender: Some(sender),
             pause_worker,
             stats,
             worker: Some(worker),
+            #[cfg(test)]
+            startup_thread_id,
         })
     }
 
@@ -217,6 +264,7 @@ impl EpisodeWriter {
     fn record_queue_full(&self, depth: usize) {
         let now_us = piper_driver::heartbeat::monotonic_micros().max(1);
         let depth = saturating_u32(depth);
+        self.stats.enqueue_terminal_fault.store(true, Ordering::Relaxed);
         self.stats.queue_full_events.fetch_add(1, Ordering::Relaxed);
         self.stats.dropped_step_count.fetch_add(1, Ordering::Relaxed);
         let _ = self.stats.first_queue_full_host_mono_us.compare_exchange(
@@ -278,6 +326,7 @@ impl Default for AtomicWriterStats {
             final_queue_depth: AtomicU32::new(0),
             encoded_step_count: AtomicU64::new(0),
             last_step_index: AtomicU64::new(u64::MAX),
+            enqueue_terminal_fault: AtomicBool::new(false),
             backpressure_threshold_tripped: AtomicBool::new(false),
             flush_failed: AtomicBool::new(false),
             flush_error: Mutex::new(None),
@@ -421,10 +470,32 @@ fn run_worker(
     receiver: Receiver<SvsStepV1>,
     pause_worker: Arc<AtomicBool>,
     stats: Arc<AtomicWriterStats>,
-    file: File,
-    temp_path: PathBuf,
-    final_path: PathBuf,
+    header: SvsHeaderV1,
+    output_dir: PathBuf,
+    startup_tx: SyncSender<Result<(), WriterError>>,
+    #[cfg(test)] startup_thread_id: Arc<Mutex<Option<std::thread::ThreadId>>>,
 ) -> Result<WriterFlushSummary, WriterError> {
+    #[cfg(test)]
+    {
+        *startup_thread_id.lock().expect("startup thread id lock poisoned") =
+            Some(thread::current().id());
+    }
+
+    let (file, temp_path, final_path) = match prepare_steps_file(&output_dir, &header) {
+        Ok(paths) => {
+            if startup_tx.send(Ok(())).is_err() {
+                return Err(WriterError::WorkerStopped);
+            }
+            paths
+        },
+        Err(err) => {
+            if startup_tx.send(Err(err)).is_err() {
+                return Err(WriterError::WorkerStopped);
+            }
+            return Err(WriterError::WorkerStopped);
+        },
+    };
+
     let result = run_worker_inner(
         receiver,
         pause_worker,
@@ -546,28 +617,7 @@ fn persist_temp_no_overwrite(temp_path: &Path, final_path: &Path) -> std::io::Re
             std::fs::remove_file(temp_path)?;
             Ok(())
         },
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(err),
-        Err(_link_err) => {
-            let mut src = File::open(temp_path)?;
-            let mut dst = OpenOptions::new().write(true).create_new(true).open(final_path)?;
-            let result = (|| {
-                std::io::copy(&mut src, &mut dst)?;
-                dst.flush()?;
-                dst.sync_all()
-            })();
-
-            match result {
-                Ok(()) => {
-                    drop(dst);
-                    std::fs::remove_file(temp_path)
-                },
-                Err(err) => {
-                    drop(dst);
-                    let _ = std::fs::remove_file(final_path);
-                    Err(err)
-                },
-            }
-        },
+        Err(err) => Err(err),
     }
 }
 
@@ -681,6 +731,43 @@ mod tests {
     }
 
     #[test]
+    fn first_queue_full_is_terminal_but_preserves_prefix_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = EpisodeWriter::for_test_with_capacity(dir.path(), 1).unwrap();
+        writer.pause_worker_for_test();
+
+        writer.try_enqueue(SvsStepV1::for_test(0)).unwrap();
+        assert!(matches!(
+            writer.try_enqueue(SvsStepV1::for_test(1)),
+            Err(WriterError::QueueFull)
+        ));
+        writer.resume_worker_for_test();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            writer.try_enqueue(SvsStepV1::for_test(2)),
+            Err(WriterError::QueueFull)
+        ));
+
+        let writer_stats = writer.stats();
+        let summary = writer.finish().unwrap();
+        let decoded = crate::episode::wire::read_steps_file(&summary.path).unwrap();
+        assert_eq!(summary.step_count, 1);
+        assert_eq!(summary.last_step_index, Some(0));
+        assert_eq!(decoded.summary.step_count, 1);
+        assert_eq!(writer_stats.queue_full_events, 1);
+        assert_eq!(writer_stats.dropped_step_count, 1);
+    }
+
+    #[test]
+    fn startup_file_setup_runs_on_worker_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller_thread = thread::current().id();
+        let writer = EpisodeWriter::for_test_with_startup_thread_probe(dir.path(), 1).unwrap();
+
+        assert_ne!(writer.startup_thread_id_for_test().unwrap(), caller_thread);
+    }
+
+    #[test]
     fn finish_rejects_nonsequential_step_indexes_without_final_file() {
         let dir = tempfile::tempdir().unwrap();
         let writer = EpisodeWriter::for_test_with_capacity(dir.path(), 2).unwrap();
@@ -693,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_copy_failure_removes_only_final_file_it_created() {
+    fn hard_link_failure_does_not_create_final_file() {
         let dir = tempfile::tempdir().unwrap();
         let temp_dir = dir.path().join("temp-as-directory");
         let final_path = dir.path().join("steps.bin");

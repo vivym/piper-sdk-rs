@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
@@ -615,28 +615,7 @@ fn persist_temp_no_overwrite(temp_path: &Path, final_path: &Path) -> std::io::Re
             std::fs::remove_file(temp_path)?;
             Ok(())
         },
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(err),
-        Err(_link_err) => {
-            let mut src = File::open(temp_path)?;
-            let mut dst = OpenOptions::new().write(true).create_new(true).open(final_path)?;
-            let result = (|| {
-                std::io::copy(&mut src, &mut dst)?;
-                dst.flush()?;
-                dst.sync_all()
-            })();
-
-            match result {
-                Ok(()) => {
-                    drop(dst);
-                    std::fs::remove_file(temp_path)
-                },
-                Err(err) => {
-                    drop(dst);
-                    let _ = std::fs::remove_file(final_path);
-                    Err(err)
-                },
-            }
-        },
+        Err(err) => Err(err),
     }
 }
 
@@ -824,7 +803,7 @@ fn write_test_steps_with_indexes(dir: &tempfile::TempDir, indexes: &[u64]) -> Pa
     let path = dir.path().join("steps.bin");
     let header = SvsHeaderV1::for_test("20260427T000000Z-test-abcdef123456");
     let steps: Vec<SvsStepV1> = indexes.iter().copied().map(SvsStepV1::for_test).collect();
-    let mut file = File::create(&path).unwrap();
+    let mut file = std::fs::File::create(&path).unwrap();
     write_header(&mut file, &header).unwrap();
     for step in &steps {
         write_step(&mut file, step).unwrap();
@@ -881,5 +860,17 @@ mod tests {
 
         assert!(write_steps_file(&path, &header, &steps).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn hard_link_failure_does_not_fallback_copy_to_final_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp_dir = dir.path().join("temp-as-directory");
+        let final_path = dir.path().join("steps.bin");
+        std::fs::create_dir(&temp_dir).unwrap();
+
+        assert!(persist_temp_no_overwrite(&temp_dir, &final_path).is_err());
+        assert!(!final_path.exists());
+        assert!(temp_dir.exists());
     }
 }
