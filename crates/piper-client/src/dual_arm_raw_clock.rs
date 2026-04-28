@@ -1501,9 +1501,61 @@ mod tests {
         ReceivedFrame::new(frame, TimestampProvenance::None)
     }
 
+    struct TxCountGate {
+        label: &'static str,
+        events: Arc<Mutex<Vec<TxEvent>>>,
+        expected_count: usize,
+    }
+
+    impl TxCountGate {
+        fn new(
+            label: &'static str,
+            events: Arc<Mutex<Vec<TxEvent>>>,
+            expected_count: usize,
+        ) -> Self {
+            Self {
+                label,
+                events,
+                expected_count,
+            }
+        }
+
+        fn is_open(&self) -> bool {
+            self.events
+                .lock()
+                .expect("tx events lock")
+                .iter()
+                .filter(|(label, _)| *label == self.label)
+                .count()
+                >= self.expected_count
+        }
+    }
+
     struct TimedFrame {
+        gate: Option<TxCountGate>,
+        gate_open_seen: bool,
         delay: Duration,
         frame: PiperFrame,
+    }
+
+    impl TimedFrame {
+        fn new(delay: Duration, frame: PiperFrame) -> Self {
+            Self {
+                gate: None,
+                gate_open_seen: false,
+                delay,
+                frame,
+            }
+        }
+
+        fn gated(gate: TxCountGate, frame: PiperFrame) -> Self {
+            Self {
+                gate: Some(gate),
+                gate_open_seen: false,
+                delay: Duration::ZERO,
+                frame,
+            }
+        }
     }
 
     struct PacedRxAdapter {
@@ -1525,8 +1577,21 @@ mod tests {
             if let Some(frame) = self.bootstrap.take() {
                 return Ok(received(frame));
             }
-            match self.frames.pop_front() {
+            match self.frames.front_mut() {
                 Some(timed) => {
+                    if let Some(gate) = &timed.gate {
+                        if !gate.is_open() {
+                            std::thread::sleep(Duration::from_millis(1));
+                            return Err(CanError::Timeout);
+                        }
+                        if !timed.gate_open_seen {
+                            timed.gate_open_seen = true;
+                            std::thread::sleep(Duration::from_millis(1));
+                            return Err(CanError::Timeout);
+                        }
+                    }
+
+                    let timed = self.frames.pop_front().expect("front frame should exist");
                     if !timed.delay.is_zero() {
                         std::thread::sleep(timed.delay);
                     }
@@ -1612,17 +1677,18 @@ mod tests {
         PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
     }
 
-    fn enabled_joint_frames_after(delay: Duration) -> Vec<TimedFrame> {
-        (1..=6)
-            .map(|joint_index| TimedFrame {
-                delay: if joint_index == 1 {
-                    delay
-                } else {
-                    Duration::ZERO
-                },
-                frame: joint_driver_state_frame(joint_index, true, joint_index as u64),
-            })
-            .collect()
+    fn enabled_joint_frames_after_gate(gate: TxCountGate) -> Vec<TimedFrame> {
+        let mut frames = vec![TimedFrame::gated(
+            gate,
+            joint_driver_state_frame(1, true, 1),
+        )];
+        frames.extend((2..=6).map(|joint_index| {
+            TimedFrame::new(
+                Duration::ZERO,
+                joint_driver_state_frame(joint_index, true, joint_index as u64),
+            )
+        }));
+        frames
     }
 
     fn robot_status_frame(
@@ -1687,15 +1753,19 @@ mod tests {
         }
     }
 
-    fn active_feedback_script() -> Vec<TimedFrame> {
-        let mut frames = enabled_joint_frames_after(Duration::from_millis(1));
-        frames.push(TimedFrame {
-            delay: Duration::from_millis(5),
-            frame: robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
-        });
-        frames.push(TimedFrame {
-            delay: Duration::ZERO,
-            frame: control_mode_echo_frame(
+    fn active_feedback_script(
+        label: &'static str,
+        events: Arc<Mutex<Vec<TxEvent>>>,
+    ) -> Vec<TimedFrame> {
+        let mut frames =
+            enabled_joint_frames_after_gate(TxCountGate::new(label, events.clone(), 1));
+        frames.push(TimedFrame::gated(
+            TxCountGate::new(label, events, 2),
+            robot_status_frame(ControlMode::CanControl, MoveMode::MoveM, 100),
+        ));
+        frames.push(TimedFrame::new(
+            Duration::ZERO,
+            control_mode_echo_frame(
                 ControlModeCommand::CanControl,
                 MoveMode::MoveM,
                 70,
@@ -1703,7 +1773,7 @@ mod tests {
                 InstallPosition::Invalid,
                 101,
             ),
-        });
+        ));
         frames
     }
 
@@ -1712,7 +1782,7 @@ mod tests {
         events: Arc<Mutex<Vec<TxEvent>>>,
     ) -> Piper<Active<MitPassthroughMode>, SoftRealtime> {
         let standby = build_soft_standby_piper(
-            PacedRxAdapter::new(active_feedback_script()),
+            PacedRxAdapter::new(active_feedback_script(label, events.clone())),
             LabeledRecordingTxAdapter::new(label, events),
         );
         let mut active = standby
@@ -1751,6 +1821,49 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for tx events");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn active_feedback_script_waits_for_matching_label_command_count() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut rx = PacedRxAdapter::new(active_feedback_script("slave", events.clone()));
+
+        rx.receive().expect("bootstrap timestamp frame should be immediate");
+
+        events
+            .lock()
+            .expect("tx events lock")
+            .push(("master", PiperFrame::new_standard(0x121, [0]).unwrap()));
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+
+        events
+            .lock()
+            .expect("tx events lock")
+            .push(("slave", PiperFrame::new_standard(0x122, [0]).unwrap()));
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+        let enabled = rx
+            .receive()
+            .expect("matching slave enable command should release enabled feedback");
+        assert_eq!(enabled.frame.id(), ID_JOINT_DRIVER_LOW_SPEED_1.into());
+
+        for _ in 0..5 {
+            rx.receive().expect("remaining enabled joint feedback should stay in order");
+        }
+
+        events
+            .lock()
+            .expect("tx events lock")
+            .push(("master", PiperFrame::new_standard(0x123, [0]).unwrap()));
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+
+        events
+            .lock()
+            .expect("tx events lock")
+            .push(("slave", PiperFrame::new_standard(0x124, [0]).unwrap()));
+        assert!(matches!(rx.receive(), Err(CanError::Timeout)));
+        let status =
+            rx.receive().expect("matching slave mode command should release mode feedback");
+        assert_eq!(status.frame.id(), ID_ROBOT_STATUS.into());
     }
 
     enum FakeRead {
@@ -2157,7 +2270,7 @@ mod tests {
     fn dual_wrapper_slave_enable_failure_stops_already_enabled_master() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let master = build_soft_standby_piper(
-            PacedRxAdapter::new(active_feedback_script()),
+            PacedRxAdapter::new(active_feedback_script("master", events.clone())),
             LabeledRecordingTxAdapter::new("master", events.clone()),
         );
         let slave = build_soft_standby_piper(
