@@ -820,6 +820,7 @@ pub struct RealTeleopBackend {
     experimental_standby: Option<ExperimentalRawClockDualArmStandby>,
     experimental_active: Option<ExperimentalRawClockDualArmActive>,
     experimental_observers: Option<ExperimentalSoftRealtimeObservers>,
+    experimental_phase: ExperimentalBackendPhase,
 }
 
 struct ExperimentalSoftRealtimeStandbyArms {
@@ -833,6 +834,56 @@ struct ExperimentalSoftRealtimeObservers {
     slave: Observer<SoftRealtime>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ExperimentalBackendPhase {
+    #[default]
+    Disconnected,
+    PendingWarmup,
+    WarmedStandby,
+    Active,
+    TerminalError,
+}
+
+impl ExperimentalBackendPhase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::PendingWarmup => "pending warmup",
+            Self::WarmedStandby => "warmed standby",
+            Self::Active => "active",
+            Self::TerminalError => "terminal error",
+        }
+    }
+}
+
+impl RealTeleopBackend {
+    fn clear_experimental_state(&mut self, phase: ExperimentalBackendPhase) {
+        self.experimental_pending = None;
+        self.experimental_standby = None;
+        self.experimental_active = None;
+        self.experimental_observers = None;
+        self.experimental_phase = phase;
+    }
+
+    fn mark_experimental_terminal(&mut self) {
+        self.clear_experimental_state(ExperimentalBackendPhase::TerminalError);
+    }
+
+    fn require_experimental_phase(
+        &self,
+        expected: ExperimentalBackendPhase,
+        expected_label: &'static str,
+    ) -> Result<()> {
+        if self.experimental_phase == expected {
+            return Ok(());
+        }
+        bail!(
+            "experimental raw-clock backend is not in {expected_label}; current phase is {}",
+            self.experimental_phase.label()
+        );
+    }
+}
+
 impl TeleopBackend for RealTeleopBackend {
     fn connect(&mut self, targets: &RoleTargets, baud_rate: u32) -> Result<()> {
         let master_builder = PiperBuilder::new()
@@ -844,10 +895,7 @@ impl TeleopBackend for RealTeleopBackend {
 
         self.standby = Some(DualArmBuilder::new(master_builder, slave_builder).build()?);
         self.active = None;
-        self.experimental_pending = None;
-        self.experimental_standby = None;
-        self.experimental_active = None;
-        self.experimental_observers = None;
+        self.clear_experimental_state(ExperimentalBackendPhase::Disconnected);
         Ok(())
     }
 
@@ -927,6 +975,7 @@ impl TeleopBackend for RealTeleopBackend {
 
 impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
     fn connect_soft(&mut self, targets: &RoleTargets, baud_rate: u32) -> Result<()> {
+        self.clear_experimental_state(ExperimentalBackendPhase::Disconnected);
         let master = connect_soft_socketcan_standby("master", &targets.master, baud_rate)?;
         let slave = connect_soft_socketcan_standby("slave", &targets.slave, baud_rate)?;
         let observers = ExperimentalSoftRealtimeObservers {
@@ -940,6 +989,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         self.experimental_standby = None;
         self.experimental_active = None;
         self.experimental_observers = Some(observers);
+        self.experimental_phase = ExperimentalBackendPhase::PendingWarmup;
         Ok(())
     }
 
@@ -952,6 +1002,16 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
     ) -> Result<RawClockWarmupSummary> {
         let config =
             experimental_raw_clock_config_from_settings(settings, frequency_hz, max_iterations);
+        config.validate()?;
+        if !matches!(
+            self.experimental_phase,
+            ExperimentalBackendPhase::PendingWarmup | ExperimentalBackendPhase::WarmedStandby
+        ) {
+            bail!(
+                "experimental raw-clock backend is not in pending warmup or warmed standby; current phase is {}",
+                self.experimental_phase.label()
+            );
+        }
         let standby = match self.experimental_standby.take() {
             Some(standby) => standby,
             None => {
@@ -959,21 +1019,38 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
                     .experimental_pending
                     .take()
                     .context("experimental raw-clock backend is not connected")?;
-                ExperimentalRawClockDualArmStandby::new(arms.master, arms.slave, config)?
+                match ExperimentalRawClockDualArmStandby::new(arms.master, arms.slave, config) {
+                    Ok(standby) => standby,
+                    Err(error) => {
+                        self.mark_experimental_terminal();
+                        return Err(error.into());
+                    },
+                }
             },
         };
 
-        let warmed = standby.warmup(
+        let warmed = match standby.warmup(
             DualArmReadPolicy::default().per_arm,
             Duration::from_secs(settings.warmup_secs),
             cancel_signal.as_ref(),
-        )?;
+        ) {
+            Ok(warmed) => warmed,
+            Err(error) => {
+                self.mark_experimental_terminal();
+                return Err(error.into());
+            },
+        };
         self.experimental_standby = Some(warmed);
+        self.experimental_phase = ExperimentalBackendPhase::WarmedStandby;
 
         Ok(RawClockWarmupSummary::default())
     }
 
     fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration> {
+        self.require_experimental_phase(ExperimentalBackendPhase::WarmedStandby, "warmed standby")?;
+        self.experimental_standby
+            .as_ref()
+            .context("experimental raw-clock backend is not in warmed standby")?;
         let observers = self
             .experimental_observers
             .as_ref()
@@ -987,6 +1064,10 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
     }
 
     fn standby_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+        self.require_experimental_phase(ExperimentalBackendPhase::WarmedStandby, "warmed standby")?;
+        self.experimental_standby
+            .as_ref()
+            .context("experimental raw-clock backend is not in warmed standby")?;
         let observers = self
             .experimental_observers
             .as_ref()
@@ -999,16 +1080,28 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         master: MitModeConfig,
         slave: MitModeConfig,
     ) -> Result<()> {
+        self.require_experimental_phase(ExperimentalBackendPhase::WarmedStandby, "warmed standby")?;
         let standby = self
             .experimental_standby
             .take()
             .context("experimental raw-clock backend is not in warmed standby")?;
-        let active = standby.enable_mit_passthrough(master, slave)?;
+        let active = match standby.enable_mit_passthrough(master, slave) {
+            Ok(active) => active,
+            Err(error) => {
+                self.mark_experimental_terminal();
+                return Err(error.into());
+            },
+        };
         self.experimental_active = Some(active);
+        self.experimental_phase = ExperimentalBackendPhase::Active;
         Ok(())
     }
 
     fn active_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+        self.require_experimental_phase(ExperimentalBackendPhase::Active, "active")?;
+        self.experimental_active
+            .as_ref()
+            .context("experimental raw-clock backend is not active")?;
         let observers = self
             .experimental_observers
             .as_ref()
@@ -1017,12 +1110,20 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
     }
 
     fn disable_active_passthrough(&mut self) -> Result<()> {
+        self.require_experimental_phase(ExperimentalBackendPhase::Active, "active")?;
         let active = self
             .experimental_active
             .take()
             .context("experimental raw-clock backend is not active")?;
-        let standby = active.disable_both(DisableConfig::default())?;
+        let standby = match active.disable_both(DisableConfig::default()) {
+            Ok(standby) => standby,
+            Err(error) => {
+                self.mark_experimental_terminal();
+                return Err(error.into());
+            },
+        };
         self.experimental_standby = Some(standby);
+        self.experimental_phase = ExperimentalBackendPhase::WarmedStandby;
         Ok(())
     }
 
@@ -1037,6 +1138,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             bail!("experimental calibrated raw clock currently supports master-follower mode only");
         }
 
+        self.require_experimental_phase(ExperimentalBackendPhase::Active, "active")?;
         let active = self
             .experimental_active
             .take()
@@ -1051,24 +1153,29 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         match active.run_master_follower(runtime_settings.calibration, run_config) {
             Ok(PiperRawClockRunExit::Standby { arms, report }) => {
                 self.experimental_standby = Some(*arms);
+                self.experimental_phase = ExperimentalBackendPhase::WarmedStandby;
                 Ok(ExperimentalRawClockRunExit {
                     faulted: false,
                     report,
                 })
             },
             Ok(PiperRawClockRunExit::Faulted { arms: _, report }) => {
+                self.mark_experimental_terminal();
                 Ok(ExperimentalRawClockRunExit {
                     faulted: true,
                     report,
                 })
             },
-            Err(error) => Ok(ExperimentalRawClockRunExit {
-                faulted: true,
-                report: raw_clock_error_report(
-                    RawClockRuntimeExitReason::RuntimeTransportFault,
-                    error.to_string(),
-                ),
-            }),
+            Err(error) => {
+                self.mark_experimental_terminal();
+                Ok(ExperimentalRawClockRunExit {
+                    faulted: true,
+                    report: raw_clock_error_report(
+                        RawClockRuntimeExitReason::RuntimeTransportFault,
+                        error.to_string(),
+                    ),
+                })
+            },
         }
     }
 }
@@ -1207,7 +1314,7 @@ fn raw_clock_error_report(
         slave: empty_raw_clock_health_for_error(),
         max_inter_arm_skew_us: 0,
         inter_arm_skew_p95_us: 0,
-        clock_health_failures: 1,
+        clock_health_failures: 0,
         read_faults: 0,
         submission_faults: 0,
         runtime_faults: 1,
@@ -2329,6 +2436,57 @@ mod tests {
             ],
         );
         assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn real_experimental_standby_snapshot_requires_warmed_standby_phase() {
+        let backend = RealTeleopBackend {
+            experimental_phase: ExperimentalBackendPhase::PendingWarmup,
+            ..RealTeleopBackend::default()
+        };
+
+        let err = ExperimentalRawClockTeleopBackend::standby_snapshot(
+            &backend,
+            DualArmReadPolicy::default(),
+        )
+        .expect_err("pending warmup phase should reject standby snapshots");
+
+        assert!(err.to_string().contains("warmed standby"));
+    }
+
+    #[test]
+    fn real_experimental_active_snapshot_requires_active_phase() {
+        let backend = RealTeleopBackend {
+            experimental_phase: ExperimentalBackendPhase::WarmedStandby,
+            ..RealTeleopBackend::default()
+        };
+
+        let err = ExperimentalRawClockTeleopBackend::active_snapshot(
+            &backend,
+            DualArmReadPolicy::default(),
+        )
+        .expect_err("warmed standby phase should reject active snapshots");
+
+        assert!(err.to_string().contains("active"));
+    }
+
+    #[test]
+    fn raw_clock_runtime_error_report_does_not_increment_clock_health_failures() {
+        let report = raw_clock_error_report(
+            RawClockRuntimeExitReason::RuntimeTransportFault,
+            "runtime API returned before report".to_string(),
+        );
+
+        assert_eq!(report.clock_health_failures, 0);
+        assert_eq!(report.runtime_faults, 1);
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::RuntimeTransportFault)
+        );
+        assert_eq!(
+            report.last_error.as_deref(),
+            Some("runtime API returned before report")
+        );
     }
 
     #[test]
