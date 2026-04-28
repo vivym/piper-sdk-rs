@@ -30,6 +30,7 @@
 // ⚠️ 禁止引入 piper-client
 // use piper_client::*;  // ❌ 禁止
 
+pub mod raw_clock;
 pub mod recording;
 pub mod timestamp;
 
@@ -40,6 +41,9 @@ pub mod statistics;
 pub mod safety;
 
 // 重新导出常用类型
+pub use raw_clock::{
+    RawClockError, RawClockEstimator, RawClockHealth, RawClockSample, RawClockThresholds,
+};
 pub use recording::{PiperRecording, RecordedFrameDirection, RecordingMetadata, TimestampedFrame};
 pub use safety::{SafetyConfig, SafetyLimits};
 pub use timestamp::{TimestampSource, detect_timestamp_source};
