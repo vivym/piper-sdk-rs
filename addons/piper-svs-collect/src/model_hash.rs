@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use crate::calibration::sha256_hex;
@@ -77,16 +77,7 @@ pub fn hash_model_dir(
 
     let root_xml = normalize_relative_path(root_xml_relative_path.as_ref())?;
     let files = collect_model_files(model_dir)?;
-    let root_bytes = files.get(&root_xml).ok_or_else(|| ModelHashError::RootXmlNotInModelTree {
-        path: root_xml.clone(),
-    })?;
-    validate_xml_file_references(&root_xml, root_bytes, &files, XmlReferenceMode::Directory)?;
-
-    for (path, bytes) in &files {
-        if path != &root_xml && path.ends_with(".xml") {
-            validate_xml_file_references(path, bytes, &files, XmlReferenceMode::Directory)?;
-        }
-    }
+    validate_reachable_xml_files(&root_xml, &files)?;
 
     let mut canonical = MODEL_HASH_DOMAIN.to_vec();
     for (path, bytes) in &files {
@@ -161,6 +152,11 @@ fn walk_model_dir(
             return Err(ModelHashError::Symlink { path });
         }
 
+        let relative_path = path
+            .strip_prefix(model_dir)
+            .expect("walked paths are always under the model directory");
+        let normalized_path = normalize_relative_path(relative_path)?;
+
         if metadata.is_dir() {
             walk_model_dir(model_dir, &path, files)?;
             continue;
@@ -170,10 +166,6 @@ fn walk_model_dir(
             return Err(ModelHashError::NonRegularFile { path });
         }
 
-        let relative_path = path
-            .strip_prefix(model_dir)
-            .expect("walked paths are always under the model directory");
-        let normalized_path = normalize_relative_path(relative_path)?;
         let bytes = std::fs::read(&path)?;
         if files.insert(normalized_path.clone(), bytes).is_some() {
             return Err(ModelHashError::DuplicateNormalizedPath {
@@ -186,6 +178,8 @@ fn walk_model_dir(
 }
 
 fn normalize_relative_path(path: &Path) -> Result<String, ModelHashError> {
+    validate_raw_relative_path(path)?;
+
     let mut components = Vec::new();
 
     for component in path.components() {
@@ -225,6 +219,28 @@ fn normalize_relative_path(path: &Path) -> Result<String, ModelHashError> {
     Ok(components.join("/"))
 }
 
+fn validate_raw_relative_path(path: &Path) -> Result<(), ModelHashError> {
+    let path = path.to_str().ok_or_else(|| ModelHashError::NonUtf8Path {
+        path: path.to_path_buf(),
+    })?;
+
+    if path.is_empty() || path.contains('\\') {
+        return Err(ModelHashError::InvalidRelativePath {
+            path: path.to_string(),
+        });
+    }
+
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(ModelHashError::InvalidRelativePath {
+                path: path.to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn append_canonical_file(out: &mut Vec<u8>, path: &[u8], content: &[u8]) {
     out.push(b'F');
     out.extend_from_slice(&(path.len() as u64).to_le_bytes());
@@ -239,17 +255,42 @@ enum XmlReferenceMode {
     Embedded,
 }
 
+fn validate_reachable_xml_files(
+    root_xml: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), ModelHashError> {
+    let mut pending = vec![root_xml.to_string()];
+    let mut validated = BTreeSet::new();
+
+    while let Some(xml_path) = pending.pop() {
+        if !validated.insert(xml_path.clone()) {
+            continue;
+        }
+
+        let bytes = files.get(&xml_path).ok_or_else(|| ModelHashError::RootXmlNotInModelTree {
+            path: xml_path.clone(),
+        })?;
+        let includes =
+            validate_xml_file_references(&xml_path, bytes, files, XmlReferenceMode::Directory)?;
+        pending.extend(includes);
+    }
+
+    Ok(())
+}
+
 fn validate_xml_file_references(
     xml_path: &str,
     xml_bytes: &[u8],
     files: &BTreeMap<String, Vec<u8>>,
     mode: XmlReferenceMode,
-) -> Result<(), ModelHashError> {
+) -> Result<Vec<String>, ModelHashError> {
     let xml = std::str::from_utf8(xml_bytes).map_err(|_| ModelHashError::XmlNotUtf8 {
         path: xml_path.to_string(),
     })?;
 
     let mut position = 0;
+    let mut saw_start_tag = false;
+    let mut includes = Vec::new();
     while let Some(start_offset) = xml[position..].find('<') {
         let start = position + start_offset;
         let remaining = &xml[start..];
@@ -272,11 +313,24 @@ fn validate_xml_file_references(
         }
 
         let tag_end = find_tag_end(xml, start + 1, xml_path)?;
-        parse_start_tag_attributes(xml_path, &xml[start + 1..tag_end], files, mode)?;
+        saw_start_tag = true;
+        includes.extend(parse_start_tag_attributes(
+            xml_path,
+            &xml[start + 1..tag_end],
+            files,
+            mode,
+        )?);
         position = tag_end + 1;
     }
 
-    Ok(())
+    if !saw_start_tag {
+        return Err(ModelHashError::InvalidXml {
+            path: xml_path.to_string(),
+            message: "no XML start tag found".to_string(),
+        });
+    }
+
+    Ok(includes)
 }
 
 fn find_after(
@@ -316,19 +370,29 @@ fn parse_start_tag_attributes(
     tag: &str,
     files: &BTreeMap<String, Vec<u8>>,
     mode: XmlReferenceMode,
-) -> Result<(), ModelHashError> {
+) -> Result<Vec<String>, ModelHashError> {
     let bytes = tag.as_bytes();
     let mut index = 0;
 
     skip_xml_whitespace(bytes, &mut index);
+    let tag_name_start = index;
     while index < bytes.len() && !is_xml_whitespace(bytes[index]) && bytes[index] != b'/' {
         index += 1;
     }
+    let tag_name = &tag[tag_name_start..index];
+    if tag_name.is_empty() {
+        return Err(ModelHashError::InvalidXml {
+            path: xml_path.to_string(),
+            message: "start tag is missing a name".to_string(),
+        });
+    }
+
+    let mut includes = Vec::new();
 
     loop {
         skip_xml_whitespace(bytes, &mut index);
         if index >= bytes.len() || bytes[index] == b'/' {
-            return Ok(());
+            return Ok(includes);
         }
 
         let name_start = index;
@@ -373,7 +437,12 @@ fn parse_start_tag_attributes(
         index += 1;
 
         match name {
-            "file" => validate_file_reference(xml_path, value, files, mode)?,
+            "file" => {
+                let resolved = validate_file_reference(xml_path, value, files, mode)?;
+                if tag_name == "include" {
+                    includes.push(resolved);
+                }
+            },
             "assetdir" | "meshdir" | "texturedir" => {
                 return Err(ModelHashError::UnsupportedAssetResolutionAttribute {
                     xml_path: xml_path.to_string(),
@@ -390,7 +459,7 @@ fn validate_file_reference(
     reference: &str,
     files: &BTreeMap<String, Vec<u8>>,
     mode: XmlReferenceMode,
-) -> Result<(), ModelHashError> {
+) -> Result<String, ModelHashError> {
     if mode == XmlReferenceMode::Embedded {
         return Err(ModelHashError::EmbeddedExternalFileReference {
             reference: reference.to_string(),
@@ -423,7 +492,7 @@ fn validate_file_reference(
         });
     }
 
-    Ok(())
+    Ok(resolved)
 }
 
 fn resolve_against_xml_path(xml_path: &str, normalized_reference: &str) -> String {
@@ -503,6 +572,56 @@ mod tests {
         assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
     }
 
+    #[test]
+    fn model_dir_hash_validates_included_xml_regardless_of_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("piper_no_gripper.xml"),
+            r#"<mujoco><include file="nested.inc"/></mujoco>"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("nested.inc"), r#"<mesh file="/abs.stl"/>"#).unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[test]
+    fn model_dir_hash_rejects_included_content_that_is_not_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("piper_no_gripper.xml"),
+            r#"<mujoco><include file="nested.inc"/></mujoco>"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("nested.inc"), b"not xml").unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[test]
+    fn model_dir_hash_rejects_dot_components_in_root_xml_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/root.xml"), "<mujoco/>").unwrap();
+
+        assert!(hash_model_dir(dir.path(), "sub/./root.xml").is_err());
+        assert!(hash_model_dir(dir.path(), "sub/.").is_err());
+    }
+
+    #[test]
+    fn model_dir_hash_rejects_dot_components_in_xml_file_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("piper_no_gripper.xml"),
+            r#"<mujoco><asset><mesh file="assets/./mesh.stl"/></asset></mujoco>"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("assets/mesh.stl"), b"mesh bytes").unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn model_dir_hash_rejects_non_utf8_paths() {
@@ -515,6 +634,18 @@ mod tests {
             b"x",
         )
         .unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_dir_hash_rejects_empty_non_utf8_directories() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("piper_no_gripper.xml"), "<mujoco/>").unwrap();
+        std::fs::create_dir(dir.path().join(std::ffi::OsString::from_vec(vec![0xff]))).unwrap();
 
         assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
     }
