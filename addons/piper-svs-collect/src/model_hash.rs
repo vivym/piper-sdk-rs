@@ -329,8 +329,10 @@ fn validate_xml_file_references(
             continue;
         }
         if remaining.starts_with("<?") {
-            position = find_after(xml, start, "?>", xml_path)?;
-            continue;
+            return Err(ModelHashError::InvalidXml {
+                path: xml_path.to_string(),
+                message: "unsupported XML processing instruction".to_string(),
+            });
         }
         if remaining.starts_with("</") {
             position = find_after(xml, start, ">", xml_path)?;
@@ -725,6 +727,18 @@ mod tests {
         std::fs::write(
             dir.path().join("piper_no_gripper.xml"),
             "<!DOCTYPE mujoco><mujoco/>",
+        )
+        .unwrap();
+
+        assert!(hash_model_dir(dir.path(), "piper_no_gripper.xml").is_err());
+    }
+
+    #[test]
+    fn model_dir_hash_rejects_xml_processing_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("piper_no_gripper.xml"),
+            r#"<?xml version="1.0"?><mujoco/>"#,
         )
         .unwrap();
 
