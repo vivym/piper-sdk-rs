@@ -69,12 +69,18 @@ pub trait ExperimentalRawClockTeleopBackend {
 
     fn capture_calibration(&self, map: JointMirrorMap) -> Result<DualArmCalibration>;
 
+    fn standby_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot>;
+
     /// Enables both arms in SoftRealtime MIT passthrough mode.
     ///
     /// If this returns `Err`, implementations are responsible for cleaning up any partially
     /// dispatched enable attempt before returning.
     fn enable_mit_passthrough(&mut self, master: MitModeConfig, slave: MitModeConfig)
     -> Result<()>;
+
+    fn active_snapshot(&self, policy: DualArmReadPolicy) -> Result<DualArmSnapshot>;
+
+    fn disable_active_passthrough(&mut self) -> Result<()>;
 
     fn run_master_follower_raw_clock(
         &mut self,
@@ -258,7 +264,7 @@ where
         bail!("operator confirmation declined");
     }
 
-    let standby_snapshot = backend.standby_snapshot(DualArmReadPolicy::default())?;
+    let standby_snapshot = TeleopBackend::standby_snapshot(backend, DualArmReadPolicy::default())?;
     check_snapshot_posture(
         &calibration,
         &standby_snapshot,
@@ -281,12 +287,13 @@ where
         return Ok(TeleopExitStatus::Success);
     }
 
-    let active_snapshot = match backend.active_snapshot(DualArmReadPolicy::default()) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return disable_active_after_error(backend, "active snapshot read failed", error);
-        },
-    };
+    let active_snapshot =
+        match TeleopBackend::active_snapshot(backend, DualArmReadPolicy::default()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return disable_active_after_error(backend, "active snapshot read failed", error);
+            },
+        };
     if let Err(error) = check_snapshot_posture(
         &calibration,
         &active_snapshot,
@@ -454,6 +461,15 @@ where
         bail!("operator confirmation declined");
     }
 
+    let standby_snapshot =
+        ExperimentalRawClockTeleopBackend::standby_snapshot(backend, DualArmReadPolicy::default())?;
+    check_snapshot_posture(
+        &calibration,
+        &standby_snapshot,
+        resolved.calibration.max_error_rad,
+    )
+    .context("pre-enable posture compatibility check failed")?;
+
     if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
         return Ok(TeleopExitStatus::Success);
     }
@@ -465,10 +481,48 @@ where
         .with_reflection_gain(resolved.control.reflection_gain)?;
     let settings_handle = RuntimeTeleopSettingsHandle::new(settings)?;
     let initial_mode = settings_handle.snapshot().mode;
-    let started_at = Instant::now();
-    let console_handle = io.start_console(settings_handle.clone(), started_at)?;
 
     backend.enable_mit_passthrough(MitModeConfig::default(), MitModeConfig::default())?;
+
+    if io.cancel_requested() || cancel_signal.load(Ordering::SeqCst) {
+        backend
+            .disable_active_passthrough()
+            .context("failed to disable experimental raw-clock teleop after cancellation")?;
+        return Ok(TeleopExitStatus::Success);
+    }
+
+    let active_snapshot = match ExperimentalRawClockTeleopBackend::active_snapshot(
+        backend,
+        DualArmReadPolicy::default(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return disable_experimental_after_error(backend, "active snapshot read failed", error);
+        },
+    };
+    if let Err(error) = check_snapshot_posture(
+        &calibration,
+        &active_snapshot,
+        resolved.calibration.max_error_rad,
+    ) {
+        backend
+            .disable_active_passthrough()
+            .context("failed to disable experimental raw-clock teleop after posture mismatch")?;
+        return Err(error).context("post-enable posture compatibility check failed");
+    }
+
+    let started_at = Instant::now();
+    let console_handle = match io.start_console(settings_handle.clone(), started_at) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return disable_experimental_after_error(
+                backend,
+                "failed to start teleop console",
+                error,
+            );
+        },
+    };
+
     let loop_exit = backend.run_master_follower_raw_clock(
         settings_handle.clone(),
         resolved.raw_clock.clone(),
@@ -544,10 +598,10 @@ fn report_timing_from_raw_clock(
         slave_residual_p95_us: health_residual_p95_us(&report.slave)
             .or(warmup.slave_residual_p95_us),
         max_estimated_inter_arm_skew_us: max_optional_u64(
-            Some(report.max_inter_arm_skew_us),
+            runtime_max_inter_arm_skew_us(report),
             warmup.max_estimated_inter_arm_skew_us,
         ),
-        estimated_inter_arm_skew_p95_us: Some(report.inter_arm_skew_p95_us)
+        estimated_inter_arm_skew_p95_us: runtime_inter_arm_skew_p95_us(report)
             .or(warmup.estimated_inter_arm_skew_p95_us),
         clock_health_failures: report
             .clock_health_failures
@@ -591,12 +645,40 @@ fn health_residual_p95_us(health: &RawClockHealth) -> Option<u64> {
     (health.sample_count > 0).then_some(health.residual_p95_us)
 }
 
+fn runtime_max_inter_arm_skew_us(report: &RawClockRuntimeReport) -> Option<u64> {
+    runtime_has_skew_evidence(report).then_some(report.max_inter_arm_skew_us)
+}
+
+fn runtime_inter_arm_skew_p95_us(report: &RawClockRuntimeReport) -> Option<u64> {
+    runtime_has_skew_evidence(report).then_some(report.inter_arm_skew_p95_us)
+}
+
+fn runtime_has_skew_evidence(report: &RawClockRuntimeReport) -> bool {
+    report.iterations > 0 || report.max_inter_arm_skew_us > 0 || report.inter_arm_skew_p95_us > 0
+}
+
 fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     }
+}
+
+fn disable_experimental_after_error<B, T>(
+    backend: &mut B,
+    context: &'static str,
+    error: anyhow::Error,
+) -> Result<T>
+where
+    B: ExperimentalRawClockTeleopBackend,
+{
+    if let Err(disable_error) = backend.disable_active_passthrough() {
+        return Err(error.context(format!(
+            "{context}; additionally failed to disable experimental raw-clock teleop: {disable_error:#}"
+        )));
+    }
+    Err(error.context(context))
 }
 
 fn disable_active_after_error<B, T>(
@@ -768,11 +850,23 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         bail!("experimental raw-clock hardware backend is not wired until Task 9")
     }
 
+    fn standby_snapshot(&self, _policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    }
+
     fn enable_mit_passthrough(
         &mut self,
         _master: MitModeConfig,
         _slave: MitModeConfig,
     ) -> Result<()> {
+        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    }
+
+    fn active_snapshot(&self, _policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+        bail!("experimental raw-clock hardware backend is not wired until Task 9")
+    }
+
+    fn disable_active_passthrough(&mut self) -> Result<()> {
         bail!("experimental raw-clock hardware backend is not wired until Task 9")
     }
 
@@ -1020,6 +1114,8 @@ mod tests {
     enum WorkflowCall {
         Connect,
         RuntimeHealth,
+        RawClockWarmup,
+        ConfirmStart,
         StandbySnapshot,
         CaptureCalibration,
         Enable,
@@ -1261,6 +1357,7 @@ mod tests {
             _settings: &TeleopRawClockSettings,
             cancel_signal: Arc<AtomicBool>,
         ) -> Result<RawClockWarmupSummary> {
+            self.trace.push(WorkflowCall::RawClockWarmup);
             if cancel_signal.load(Ordering::SeqCst) {
                 bail!("raw-clock warmup cancelled");
             }
@@ -1280,6 +1377,11 @@ mod tests {
             Ok(sample_calibration())
         }
 
+        fn standby_snapshot(&self, _policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+            self.trace.push(WorkflowCall::StandbySnapshot);
+            Ok(sample_snapshot(self.standby_mismatch))
+        }
+
         fn enable_mit_passthrough(
             &mut self,
             _master: MitModeConfig,
@@ -1289,6 +1391,20 @@ mod tests {
             if self.enable_error {
                 bail!("enable confirmation failed");
             }
+            Ok(())
+        }
+
+        fn active_snapshot(&self, _policy: DualArmReadPolicy) -> Result<DualArmSnapshot> {
+            self.trace.push(WorkflowCall::ActiveSnapshot);
+            if self.active_snapshot_error {
+                bail!("active snapshot read failed");
+            }
+            Ok(sample_snapshot(self.active_mismatch))
+        }
+
+        fn disable_active_passthrough(&mut self) -> Result<()> {
+            self.trace.push(WorkflowCall::DisableActive);
+            self.disabled_or_faulted.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1418,6 +1534,7 @@ mod tests {
         }
 
         fn confirm_start(&mut self, _summary: &StartupSummary) -> Result<bool> {
+            self.trace.push(WorkflowCall::ConfirmStart);
             if self.cancel_on_confirm {
                 self.cancel.store(true, Ordering::SeqCst);
             }
@@ -1754,14 +1871,30 @@ mod tests {
 
     #[test]
     fn experimental_raw_clock_uses_experimental_backend_path() {
-        let backend = FakeTeleopBackend::default().with_experimental_raw_clock_success();
+        let trace = WorkflowTrace::default();
+        let backend =
+            FakeTeleopBackend::with_trace(trace.clone()).with_experimental_raw_clock_success();
+        let io = FakeTeleopIo {
+            trace: trace.clone(),
+            ..FakeTeleopIo::default()
+        };
 
-        let status = run_workflow_for_test(experimental_args(), backend.clone())
+        let status = run_workflow_for_test_with_io(experimental_args(), backend.clone(), io)
             .expect("experimental raw-clock workflow should succeed");
 
         assert_eq!(status, TeleopExitStatus::Success);
         assert_eq!(backend.call_counts().experimental_raw_clock_runs, 1);
         assert_eq!(backend.call_counts().strict_runs, 0);
+        assert_call_order(
+            trace.calls(),
+            &[
+                WorkflowCall::Connect,
+                WorkflowCall::RawClockWarmup,
+                WorkflowCall::ConfirmStart,
+                WorkflowCall::Enable,
+                WorkflowCall::RunLoop,
+            ],
+        );
     }
 
     #[test]
@@ -1776,6 +1909,58 @@ mod tests {
         assert!(backend.call_counts().fault_shutdown_attempted);
         assert_eq!(backend.call_counts().master_stop_attempts, 1);
         assert_eq!(backend.call_counts().slave_stop_attempts, 1);
+    }
+
+    #[test]
+    fn experimental_raw_clock_pre_enable_posture_mismatch_fails_before_enable() {
+        let backend = FakeTeleopBackend::with_standby_snapshot_mismatch();
+
+        let err = run_workflow_for_test(experimental_args(), backend.clone())
+            .expect_err("pre-enable mismatch should stop experimental raw-clock workflow");
+
+        assert!(err.to_string().contains("posture"));
+        assert!(backend.calls().contains(&WorkflowCall::StandbySnapshot));
+        assert!(!backend.calls().contains(&WorkflowCall::Enable));
+        assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn experimental_raw_clock_post_enable_posture_mismatch_disables_without_run() {
+        let backend = FakeTeleopBackend::with_active_snapshot_mismatch();
+
+        let err = run_workflow_for_test(experimental_args(), backend.clone())
+            .expect_err("post-enable mismatch should stop experimental raw-clock workflow");
+
+        assert!(err.to_string().contains("posture"));
+        assert_call_order(
+            backend.calls(),
+            &[
+                WorkflowCall::Enable,
+                WorkflowCall::ActiveSnapshot,
+                WorkflowCall::DisableActive,
+            ],
+        );
+        assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn raw_clock_report_timing_uses_warmup_p95_when_runtime_has_no_skew_samples() {
+        let warmup = RawClockWarmupSummary {
+            estimated_inter_arm_skew_p95_us: Some(77),
+            max_estimated_inter_arm_skew_us: Some(100),
+            ..RawClockWarmupSummary::default()
+        };
+        let report = RawClockRuntimeReport {
+            iterations: 0,
+            max_inter_arm_skew_us: 0,
+            inter_arm_skew_p95_us: 0,
+            ..raw_clock_report_success()
+        };
+
+        let timing = report_timing_from_raw_clock(&warmup, &report);
+
+        assert_eq!(timing.estimated_inter_arm_skew_p95_us, Some(77));
+        assert_eq!(timing.max_estimated_inter_arm_skew_us, Some(100));
     }
 
     fn run_workflow_for_test(
