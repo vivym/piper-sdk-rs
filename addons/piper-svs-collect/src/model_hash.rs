@@ -804,9 +804,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_wrapper_requires_native_library_identity() {
-        let err = current_mujoco_runtime_identity().unwrap_err();
-        assert!(err.to_string().contains("runtime identity"));
+    fn runtime_identity_wrapper_records_native_library_hash() {
+        let identity = current_mujoco_runtime_identity().expect("runtime identity should resolve");
+
+        assert!(identity.version.is_some());
+        assert!(identity.build_string.is_some());
+        assert_eq!(
+            identity.native_library_sha256_hex.as_deref().map(str::len),
+            Some(64)
+        );
+        assert!(identity.static_build_identity.is_none());
     }
 
     fn append_expected_file(out: &mut Vec<u8>, path: &str, bytes: &[u8]) {

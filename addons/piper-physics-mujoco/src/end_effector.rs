@@ -2,7 +2,12 @@
 
 use crate::error::PhysicsError;
 use mujoco_rs::mujoco_c;
+use sha2::{Digest, Sha256};
 use std::ffi::CStr;
+use std::fs;
+#[cfg(unix)]
+use std::mem;
+use std::path::{Path, PathBuf};
 
 /// Explicit MuJoCo site selector for end-effector kinematics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,16 +66,81 @@ pub fn mujoco_runtime_version_string() -> String {
 }
 
 /// Returns reproducibility identity for the loaded MuJoCo native library.
-///
-/// This first implementation intentionally fails rather than guessing a library
-/// path or hash that may be wrong on some platforms. The collector can use this
-/// error to fail before enabling MIT mode.
 pub fn loaded_mujoco_library_identity() -> Result<MujocoRuntimeIdentity, PhysicsError> {
+    let runtime_version = mujoco_runtime_version_string();
+    let library_path = find_mujoco_library_path(&runtime_version)?;
+    let bytes = fs::read(&library_path).map_err(PhysicsError::IoError)?;
+
+    Ok(MujocoRuntimeIdentity {
+        runtime_version,
+        rust_binding_version: None,
+        native_library_sha256: Some(sha256_hex(&bytes)),
+        static_build_identity: None,
+    })
+}
+
+fn find_mujoco_library_path(runtime_version: &str) -> Result<PathBuf, PhysicsError> {
+    #[cfg(unix)]
+    if let Some(path) = find_mujoco_library_from_dladdr()? {
+        return Ok(path);
+    }
+
     Err(PhysicsError::CalculationFailed(format!(
-        "MuJoCo native shared-library identity hashing is not implemented; \
-         cannot prove reproducible runtime identity for MuJoCo {}",
-        mujoco_runtime_version_string()
+        "could not prove loaded MuJoCo native shared-library path for version {runtime_version}"
     )))
+}
+
+#[cfg(unix)]
+fn find_mujoco_library_from_dladdr() -> Result<Option<PathBuf>, PhysicsError> {
+    let mut info = mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    let symbol = mujoco_c::mj_versionString as *const libc::c_void;
+    let found = unsafe { libc::dladdr(symbol, info.as_mut_ptr()) };
+    if found == 0 {
+        return Ok(None);
+    }
+
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return Ok(None);
+    }
+    let path = unsafe { CStr::from_ptr(info.dli_fname) };
+    let path = PathBuf::from(path.to_string_lossy().as_ref());
+    if !is_mujoco_shared_library_path(&path) {
+        return Err(PhysicsError::CalculationFailed(format!(
+            "MuJoCo mj_versionString resolved to non-MuJoCo module {}",
+            path.display()
+        )));
+    }
+    Ok(Some(path))
+}
+
+fn is_mujoco_shared_library_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    file_name.contains("mujoco")
+        && (file_name.ends_with(".so")
+            || file_name.contains(".so.")
+            || file_name.ends_with(".dylib")
+            || file_name.ends_with(".dll"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(hex_nibble(byte >> 4));
+        out.push(hex_nibble(byte & 0x0f));
+    }
+    out
+}
+
+fn hex_nibble(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => unreachable!("nibble is always <= 15"),
+    }
 }
 
 pub(crate) fn condition_number_from_singular_values(values: [f64; 3]) -> f64 {
@@ -115,5 +185,15 @@ mod tests {
     fn singular_condition_number_is_infinite() {
         let values = [10.0, 2.0, 0.0];
         assert_eq!(condition_number_from_singular_values(values), f64::INFINITY);
+    }
+
+    #[test]
+    fn loaded_library_identity_returns_native_hash() {
+        let identity = loaded_mujoco_library_identity().expect("runtime identity should be proven");
+        let hash = identity.native_library_sha256.expect("dynamic MuJoCo runtime should be hashed");
+
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(identity.static_build_identity.is_none());
     }
 }

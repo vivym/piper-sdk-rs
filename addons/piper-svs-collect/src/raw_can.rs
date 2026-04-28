@@ -6,17 +6,28 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use {
     anyhow::{Context, anyhow},
-    serde::Serialize,
     std::ffi::CString,
-    std::fs::{File, OpenOptions},
-    std::io::{BufWriter, Write},
+    std::fs::{self, File, OpenOptions},
+    std::io::BufWriter,
     std::mem,
     std::os::fd::RawFd,
-    std::path::Path,
-    std::sync::atomic::AtomicBool,
+    std::path::{Path, PathBuf},
+    std::sync::atomic::{AtomicBool, AtomicU64},
     std::thread::{self, JoinHandle},
     std::time::Duration,
 };
+
+#[cfg(target_os = "linux")]
+use piper_tools::{
+    RecordedFrameDirection, RecordingMetadata, TimestampSource, TimestampedFrame,
+    recording::v3::StreamingRecordingWriter,
+};
+
+#[cfg(all(test, target_os = "linux"))]
+use piper_tools::PiperRecording;
+
+#[cfg(target_os = "linux")]
+static RAW_CAN_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(not(target_os = "linux"))]
 use {anyhow::anyhow, std::path::Path, std::sync::atomic::AtomicBool};
@@ -236,8 +247,8 @@ impl RawCanSide {
 
     fn file_name(self) -> &'static str {
         match self {
-            Self::Master => "raw_can_master.jsonl",
-            Self::Slave => "raw_can_slave.jsonl",
+            Self::Master => "raw_can/master.piperrec",
+            Self::Slave => "raw_can/slave.piperrec",
         }
     }
 }
@@ -246,25 +257,150 @@ impl RawCanSide {
 struct RawCanCapture {
     side: RawCanSide,
     socket: PacketCanSocket,
-    writer: BufWriter<File>,
+    writer: RawCanRecordingFile,
 }
 
 #[cfg(target_os = "linux")]
 impl RawCanCapture {
     fn open(side: RawCanSide, episode_dir: &Path, iface: &str) -> Result<Self> {
+        std::fs::create_dir_all(episode_dir.join("raw_can")).with_context(|| {
+            format!(
+                "failed to create raw CAN directory {}",
+                episode_dir.join("raw_can").display()
+            )
+        })?;
         let path = episode_dir.join(side.file_name());
-        let file =
-            OpenOptions::new().write(true).create_new(true).open(&path).with_context(|| {
-                format!("failed to create raw CAN recording {}", path.display())
-            })?;
         let socket = PacketCanSocket::open(iface)
             .with_context(|| format!("failed to open raw CAN packet capture on {iface}"))?;
+        let writer = RawCanRecordingFile::create(path, iface)?;
         Ok(Self {
             side,
             socket,
-            writer: BufWriter::new(file),
+            writer,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+struct RawCanRecordingFile {
+    output_path: PathBuf,
+    temp_path: PathBuf,
+    writer: Option<StreamingRecordingWriter<BufWriter<File>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl RawCanRecordingFile {
+    fn create(output_path: PathBuf, iface: &str) -> Result<Self> {
+        if output_path.try_exists().with_context(|| {
+            format!(
+                "failed to check raw CAN recording {}",
+                output_path.display()
+            )
+        })? {
+            return Err(anyhow!(
+                "raw CAN recording already exists: {}",
+                output_path.display()
+            ));
+        }
+
+        let temp_path = raw_can_temp_path(&output_path);
+        let file = OpenOptions::new().write(true).create_new(true).open(&temp_path).with_context(
+            || {
+                format!(
+                    "failed to create raw CAN recording temp file {}",
+                    temp_path.display()
+                )
+            },
+        )?;
+        let metadata = RecordingMetadata::new(iface.to_string(), 0);
+        let writer = match StreamingRecordingWriter::new(BufWriter::new(file), &metadata) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            },
+        };
+        Ok(Self {
+            output_path,
+            temp_path,
+            writer: Some(writer),
+        })
+    }
+
+    fn push_frame(&mut self, frame: &TimestampedFrame) -> Result<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("raw CAN recording already finalized"))?;
+        writer.push_frame(frame)
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let result = (|| {
+            let writer = self
+                .writer
+                .take()
+                .ok_or_else(|| anyhow!("raw CAN recording already finalized"))?;
+            let writer = writer.finish()?;
+            writer.get_ref().sync_all().with_context(|| {
+                format!(
+                    "failed to sync raw CAN temp recording {}",
+                    self.temp_path.display()
+                )
+            })?;
+            drop(writer);
+
+            persist_temp_no_overwrite(&self.temp_path, &self.output_path).with_context(|| {
+                format!(
+                    "failed to persist raw CAN recording {}",
+                    self.output_path.display()
+                )
+            })?;
+            fsync_parent(&self.output_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&self.temp_path);
+        }
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RawCanRecordingFile {
+    fn drop(&mut self) {
+        if self.writer.is_some() {
+            let _ = fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn raw_can_temp_path(path: &Path) -> PathBuf {
+    let counter = RAW_CAN_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("raw-can");
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn persist_temp_no_overwrite(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    fs::hard_link(temp_path, final_path)?;
+    fs::remove_file(temp_path)
+}
+
+#[cfg(target_os = "linux")]
+fn fsync_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)
+            .with_context(|| format!("failed to open raw CAN parent dir {}", parent.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("failed to sync raw CAN parent dir {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -288,23 +424,21 @@ fn run_capture_loop(
     external_cancel: Arc<AtomicBool>,
     status: Arc<RawCanStatusTracker>,
 ) {
-    let mut sequence = 0_u64;
     while !stop_signal.load(Ordering::Acquire) && !external_cancel.load(Ordering::Acquire) {
         match capture.socket.receive() {
-            Ok(Some(packet)) => {
-                let record = RawCanRecord::from_packet(capture.side, sequence, packet);
-                if serde_json::to_writer(&mut capture.writer, &record)
-                    .and_then(|_| capture.writer.write_all(b"\n").map_err(serde_json::Error::io))
-                    .is_err()
-                {
+            Ok(Some(packet)) => match timestamped_frame_from_packet(packet) {
+                Ok(Some(frame)) => {
+                    if capture.writer.push_frame(&frame).is_err() {
+                        status.mark_degraded();
+                        return;
+                    }
+                },
+                Ok(None) => {
                     status.mark_degraded();
-                    return;
-                }
-                sequence = sequence.saturating_add(1);
-                if sequence.is_multiple_of(256) && capture.writer.flush().is_err() {
+                },
+                Err(_) => {
                     status.mark_degraded();
-                    return;
-                }
+                },
             },
             Ok(None) => {},
             Err(_) => {
@@ -314,9 +448,35 @@ fn run_capture_loop(
         }
     }
 
-    if capture.writer.flush().is_err() {
+    if capture.writer.finish().is_err() {
         status.mark_degraded();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn timestamped_frame_from_packet(packet: RawCanPacket) -> Result<Option<TimestampedFrame>> {
+    if packet.error_frame || packet.remote_transmission_request {
+        return Ok(None);
+    }
+
+    let data = &packet.data[..usize::from(packet.dlc)];
+    let frame = if packet.extended {
+        piper_sdk::PiperFrame::new_extended(packet.id, data)
+    } else {
+        piper_sdk::PiperFrame::new_standard(packet.id, data)
+    }?
+    .with_timestamp_us(piper_driver::heartbeat::monotonic_micros());
+
+    let direction = if packet.packet_type == libc::PACKET_OUTGOING {
+        RecordedFrameDirection::Tx
+    } else {
+        RecordedFrameDirection::Rx
+    };
+    Ok(Some(TimestampedFrame::new(
+        frame,
+        direction,
+        Some(TimestampSource::Userspace),
+    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -504,43 +664,7 @@ impl RawCanPacket {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Serialize)]
-struct RawCanRecord {
-    schema_version: u32,
-    side: &'static str,
-    sequence: u64,
-    host_mono_us: u64,
-    packet_type: &'static str,
-    raw_can_id: u32,
-    id: u32,
-    extended: bool,
-    remote_transmission_request: bool,
-    error_frame: bool,
-    dlc: u8,
-    data: [u8; 8],
-}
-
-#[cfg(target_os = "linux")]
-impl RawCanRecord {
-    fn from_packet(side: RawCanSide, sequence: u64, packet: RawCanPacket) -> Self {
-        Self {
-            schema_version: 1,
-            side: side.label(),
-            sequence,
-            host_mono_us: piper_driver::heartbeat::monotonic_micros(),
-            packet_type: packet_type_label(packet.packet_type),
-            raw_can_id: packet.raw_can_id,
-            id: packet.id,
-            extended: packet.extended,
-            remote_transmission_request: packet.remote_transmission_request,
-            error_frame: packet.error_frame,
-            dlc: packet.dlc,
-            data: packet.data,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(test)]
 fn packet_type_label(packet_type: u8) -> &'static str {
     match packet_type {
         libc::PACKET_HOST => "host",
@@ -592,6 +716,52 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(status.raw_can_status(), RawCanCaptureStatus::Degraded);
+    }
+
+    #[test]
+    fn raw_can_side_paths_match_episode_layout() {
+        assert_eq!(RawCanSide::Master.file_name(), "raw_can/master.piperrec");
+        assert_eq!(RawCanSide::Slave.file_name(), "raw_can/slave.piperrec");
+    }
+
+    #[test]
+    fn writes_loadable_piper_recording_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_can_dir = dir.path().join("raw_can");
+        fs::create_dir(&raw_can_dir).unwrap();
+        let path = raw_can_dir.join("master.piperrec");
+        let frame = TimestampedFrame::new(
+            piper_sdk::PiperFrame::new_standard(0x123, [1, 2, 3])
+                .unwrap()
+                .with_timestamp_us(42),
+            RecordedFrameDirection::Rx,
+            Some(TimestampSource::Userspace),
+        );
+
+        let mut writer = RawCanRecordingFile::create(path.clone(), "vcan0").unwrap();
+        writer.push_frame(&frame).unwrap();
+        writer.finish().unwrap();
+        let loaded = PiperRecording::load(&path).unwrap();
+
+        assert_eq!(loaded.frame_count(), 1);
+        assert!(RawCanRecordingFile::create(path, "vcan0").is_err());
+    }
+
+    #[test]
+    fn unfinished_raw_can_recording_removes_temp_file_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_can_dir = dir.path().join("raw_can");
+        fs::create_dir(&raw_can_dir).unwrap();
+        let path = raw_can_dir.join("master.piperrec");
+
+        let writer = RawCanRecordingFile::create(path.clone(), "vcan0").unwrap();
+        let temp_path = writer.temp_path.clone();
+        assert!(temp_path.exists());
+
+        drop(writer);
+
+        assert!(!temp_path.exists());
+        assert!(!path.exists());
     }
 
     #[test]

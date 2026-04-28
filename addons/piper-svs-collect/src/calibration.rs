@@ -1,6 +1,7 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use piper_sdk::JointMirrorMap;
 use piper_sdk::client::types::Joint;
@@ -9,6 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const SCHEMA_VERSION: u32 = 1;
+static CALIBRATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum CalibrationError {
@@ -248,10 +250,53 @@ pub fn persist_calibration_no_overwrite(
     path: impl AsRef<Path>,
     bytes: &[u8],
 ) -> Result<(), CalibrationError> {
+    let path = path.as_ref();
+    let temp_path = calibration_temp_path(path);
+    let result = (|| {
+        write_temp_calibration_file(&temp_path, bytes)?;
+        persist_temp_no_overwrite(&temp_path, path)?;
+        fsync_parent(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_temp_calibration_file(path: &Path, bytes: &[u8]) -> Result<(), CalibrationError> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
-    file.flush()?;
     file.sync_all()?;
+    Ok(())
+}
+
+fn calibration_temp_path(path: &Path) -> PathBuf {
+    let counter = CALIBRATION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("calibration");
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ))
+}
+
+fn persist_temp_no_overwrite(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    fs::hard_link(temp_path, final_path)?;
+    fs::remove_file(temp_path)
+}
+
+#[cfg(unix)]
+fn fsync_parent(path: &Path) -> Result<(), CalibrationError> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)?;
+        dir.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn fsync_parent(_path: &Path) -> Result<(), CalibrationError> {
     Ok(())
 }
 
@@ -559,6 +604,19 @@ mod tests {
             )
             .is_err()
         );
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn save_calibration_persists_canonical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calibration.toml");
+        let calibration = CalibrationFile::identity_for_tests();
+        let bytes = calibration.to_canonical_toml_bytes().unwrap();
+
+        persist_calibration_no_overwrite(&path, &bytes).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

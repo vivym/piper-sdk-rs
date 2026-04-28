@@ -67,6 +67,7 @@ const STARTED_UNIX_NS: u64 = 1_777_292_523_000_000_000;
 const ENDED_UNIX_NS: u64 = 1_777_292_524_000_000_000;
 const EPISODE_START_HOST_MONO_US: u64 = 1_000_000;
 const DEFAULT_WRITER_CAPACITY: usize = 64;
+static METADATA_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const EMBEDDED_MUJOCO_XML: &[u8] =
     include_bytes!("../../piper-physics-mujoco/assets/piper_no_gripper.xml");
 
@@ -702,16 +703,6 @@ impl FakeCollectorHarness {
                 last_step_index: writer_stats.last_step_index,
             });
         let raw_finalizer_status = raw_can.finalizer_status();
-        write_manifest(FakeManifestWrite {
-            episode_dir: &episode_dir,
-            episode_id: &episode_id,
-            status,
-            ended_unix_ns: Some(ENDED_UNIX_NS),
-            summary: &summary,
-            artifacts: &artifacts,
-            raw_can_enabled: raw_can.raw_can_status() != RawCanCaptureStatus::Disabled,
-            raw_can_finalizer_status: raw_finalizer_status,
-        })?;
         write_report(FakeReportWrite {
             episode_dir: &episode_dir,
             episode_id: &episode_id,
@@ -724,6 +715,16 @@ impl FakeCollectorHarness {
             exit_reason: dual_arm_exit_reason,
             final_flush_result,
             writer_stats: &writer_stats,
+        })?;
+        write_manifest(FakeManifestWrite {
+            episode_dir: &episode_dir,
+            episode_id: &episode_id,
+            status,
+            ended_unix_ns: Some(ENDED_UNIX_NS),
+            summary: &summary,
+            artifacts: &artifacts,
+            raw_can_enabled: raw_can.raw_can_status() != RawCanCaptureStatus::Disabled,
+            raw_can_finalizer_status: raw_finalizer_status,
         })?;
 
         Ok(CollectorRunResult {
@@ -1012,6 +1013,13 @@ fn run_real_collector(args: Args, cancel: CollectorCancelToken) -> Result<Collec
         started_unix_ns / 1_000_000,
         resolved_profile.profile.calibration.calibration_max_error_rad,
     )?;
+    if let Some(path) = args.save_calibration.as_ref() {
+        crate::calibration::persist_calibration_no_overwrite(
+            path,
+            &resolved_calibration.resolved.canonical_bytes,
+        )
+        .with_context(|| format!("failed to save calibration to {}", path.display()))?;
+    }
 
     let reservation = EpisodeId::reserve_directory(
         &args.output_dir,
@@ -1031,13 +1039,6 @@ fn run_real_collector(args: Args, cancel: CollectorCancelToken) -> Result<Collec
         episode_dir.join("calibration.toml"),
         &resolved_calibration.resolved.canonical_bytes,
     )?;
-    if let Some(path) = args.save_calibration.as_ref() {
-        crate::calibration::persist_calibration_no_overwrite(
-            path,
-            &resolved_calibration.resolved.canonical_bytes,
-        )
-        .with_context(|| format!("failed to save calibration to {}", path.display()))?;
-    }
 
     let raw_can = Arc::new(if args.raw_can {
         RawCanStatusTracker::requested()
@@ -1642,7 +1643,7 @@ fn write_real_manifest(
     if create_new {
         write_new_file(path, text.as_bytes())
     } else {
-        fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))
+        write_replace_file(path, text.as_bytes())
     }
 }
 
@@ -1694,14 +1695,6 @@ fn finish_writer_and_finalize(
             last_step_index: writer_stats.last_step_index,
         });
     let ended_unix_ns = current_unix_ns().max(context.base.started_unix_ns);
-    write_real_manifest(
-        context,
-        status,
-        Some(ended_unix_ns),
-        &summary,
-        context.raw_can.finalizer_status(),
-        false,
-    )?;
     write_real_report(
         context,
         status,
@@ -1710,6 +1703,14 @@ fn finish_writer_and_finalize(
         report,
         final_flush_result,
         &writer_stats,
+    )?;
+    write_real_manifest(
+        context,
+        status,
+        Some(ended_unix_ns),
+        &summary,
+        context.raw_can.finalizer_status(),
+        false,
     )?;
 
     Ok(CollectorRunResult {
@@ -1788,7 +1789,7 @@ fn write_real_report(
     };
     report_json.validate()?;
     let text = serde_json::to_string_pretty(&report_json)?;
-    fs::write(context.episode_dir.join("report.json"), text)?;
+    write_replace_file(context.episode_dir.join("report.json"), text.as_bytes())?;
     Ok(())
 }
 
@@ -2318,7 +2319,7 @@ fn write_manifest(input: FakeManifestWrite<'_>) -> Result<()> {
     manifest.validate()?;
 
     let text = toml::to_string_pretty(&manifest)?;
-    fs::write(input.episode_dir.join("manifest.toml"), text)?;
+    write_replace_file(input.episode_dir.join("manifest.toml"), text.as_bytes())?;
     Ok(())
 }
 
@@ -2371,12 +2372,48 @@ fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
     };
     report.validate()?;
     let text = serde_json::to_string_pretty(&report)?;
-    fs::write(input.episode_dir.join("report.json"), text)?;
+    write_replace_file(input.episode_dir.join("report.json"), text.as_bytes())?;
     Ok(())
 }
 
 fn write_new_file(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
     let path = path.as_ref();
+    let temp_path = metadata_temp_path(path);
+    let result = (|| {
+        write_temp_file(&temp_path, bytes)?;
+        persist_temp_no_overwrite(&temp_path, path)
+            .with_context(|| format!("failed to persist {}", path.display()))?;
+        fsync_parent(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_replace_file(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
+    let path = path.as_ref();
+    let temp_path = metadata_temp_path(path);
+    let result = (|| {
+        write_temp_file(&temp_path, bytes)?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        fsync_parent(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_temp_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2384,7 +2421,37 @@ fn write_new_file(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    file.flush().with_context(|| format!("failed to flush {}", path.display()))?;
+    file.sync_all().with_context(|| format!("failed to sync {}", path.display()))
+}
+
+fn metadata_temp_path(path: &Path) -> PathBuf {
+    let counter = METADATA_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("metadata");
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ))
+}
+
+fn persist_temp_no_overwrite(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    fs::hard_link(temp_path, final_path)?;
+    fs::remove_file(temp_path)
+}
+
+#[cfg(unix)]
+fn fsync_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)
+            .with_context(|| format!("failed to open parent dir {}", parent.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("failed to sync parent dir {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn fsync_parent(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2638,4 +2705,30 @@ fn flatten3x6(values: [[f64; 6]; 3]) -> [f64; 18] {
         values[2][4],
         values[2][5],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_new_file_refuses_existing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.toml");
+        fs::write(&path, b"existing").unwrap();
+
+        assert!(write_new_file(&path, b"new").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn write_replace_file_replaces_existing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
+        fs::write(&path, b"old").unwrap();
+
+        write_replace_file(&path, b"new").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
 }

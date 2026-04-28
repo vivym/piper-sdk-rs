@@ -1908,10 +1908,12 @@ dependencies = [
 name = "piper-physics"
 version = "0.0.3"
 dependencies = [
+ "libc",
  "log",
  "mujoco-rs",
  "nalgebra",
  "piper-sdk",
+ "sha2",
  "thiserror 1.0.69",
 ]
 

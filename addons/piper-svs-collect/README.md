@@ -24,7 +24,7 @@ Each run creates:
 - `effective_profile.toml`: canonical resolved profile bytes used for this run.
 - `calibration.toml`: canonical calibration bytes used for this run.
 - `steps.bin`: binary `SvsEpisodeV1` dataset records.
-- `raw_can_master.jsonl` and `raw_can_slave.jsonl` when `--raw-can` is enabled and raw capture starts successfully.
+- `raw_can/master.piperrec` and `raw_can/slave.piperrec` when `--raw-can` is enabled and raw capture starts successfully.
 
 Episode directories are reserved under `<output-dir>/<task-slug>/<episode-id>` and are never overwritten.
 
