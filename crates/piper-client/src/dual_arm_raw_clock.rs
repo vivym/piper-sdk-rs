@@ -159,7 +159,17 @@ pub struct RawClockRuntimeReport {
     pub clock_health_failures: u64,
     pub read_faults: u32,
     pub submission_faults: u32,
+    pub last_submission_failed_side: Option<RawClockSide>,
+    pub peer_command_may_have_applied: bool,
     pub runtime_faults: u32,
+    pub master_tx_realtime_overwrites_total: u64,
+    pub slave_tx_realtime_overwrites_total: u64,
+    pub master_tx_frames_sent_total: u64,
+    pub slave_tx_frames_sent_total: u64,
+    pub master_tx_fault_aborts_total: u64,
+    pub slave_tx_fault_aborts_total: u64,
+    pub last_runtime_fault_master: Option<RuntimeFaultKind>,
+    pub last_runtime_fault_slave: Option<RuntimeFaultKind>,
     pub iterations: usize,
     pub exit_reason: Option<RawClockRuntimeExitReason>,
     pub master_stop_attempt: StopAttemptResult,
@@ -192,6 +202,46 @@ impl RawClockSide {
             Self::Master => "master",
             Self::Slave => "slave",
         }
+    }
+
+    fn from_str(side: &str) -> Option<Self> {
+        match side {
+            "master" => Some(Self::Master),
+            "slave" => Some(Self::Slave),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RawClockRuntimeTelemetry {
+    master_tx_realtime_overwrites_total: u64,
+    slave_tx_realtime_overwrites_total: u64,
+    master_tx_frames_sent_total: u64,
+    slave_tx_frames_sent_total: u64,
+    master_tx_fault_aborts_total: u64,
+    slave_tx_fault_aborts_total: u64,
+    last_runtime_fault_master: Option<RuntimeFaultKind>,
+    last_runtime_fault_slave: Option<RuntimeFaultKind>,
+}
+
+impl RawClockRuntimeReport {
+    fn apply_telemetry(&mut self, telemetry: RawClockRuntimeTelemetry) {
+        self.master_tx_realtime_overwrites_total = telemetry.master_tx_realtime_overwrites_total;
+        self.slave_tx_realtime_overwrites_total = telemetry.slave_tx_realtime_overwrites_total;
+        self.master_tx_frames_sent_total = telemetry.master_tx_frames_sent_total;
+        self.slave_tx_frames_sent_total = telemetry.slave_tx_frames_sent_total;
+        self.master_tx_fault_aborts_total = telemetry.master_tx_fault_aborts_total;
+        self.slave_tx_fault_aborts_total = telemetry.slave_tx_fault_aborts_total;
+        self.last_runtime_fault_master =
+            self.last_runtime_fault_master.or(telemetry.last_runtime_fault_master);
+        self.last_runtime_fault_slave =
+            self.last_runtime_fault_slave.or(telemetry.last_runtime_fault_slave);
+    }
+
+    fn with_telemetry(mut self, telemetry: RawClockRuntimeTelemetry) -> Self {
+        self.apply_telemetry(telemetry);
+        self
     }
 }
 
@@ -323,6 +373,8 @@ pub struct RawClockRuntimeTiming {
     clock_health_failures: u64,
     last_master_raw_us: Option<u64>,
     last_slave_raw_us: Option<u64>,
+    master_raw_timestamp_regressions: u64,
+    slave_raw_timestamp_regressions: u64,
 }
 
 impl RawClockRuntimeTiming {
@@ -335,6 +387,8 @@ impl RawClockRuntimeTiming {
             clock_health_failures: 0,
             last_master_raw_us: None,
             last_slave_raw_us: None,
+            master_raw_timestamp_regressions: 0,
+            slave_raw_timestamp_regressions: 0,
         }
     }
 
@@ -391,10 +445,7 @@ impl RawClockRuntimeTiming {
         match self.tick_from_snapshots(master, slave, now_host_us) {
             Ok(tick) => match RawClockRuntimeGate::new(thresholds).check_tick(tick) {
                 Ok(()) | Err(RawClockRuntimeError::InterArmSkew { .. }) => Ok(()),
-                Err(RawClockRuntimeError::ClockUnhealthy { .. }) => {
-                    self.record_clock_health_failure();
-                    Ok(())
-                },
+                Err(RawClockRuntimeError::ClockUnhealthy { .. }) => Ok(()),
                 Err(err) => Err(err),
             },
             Err(RawClockRuntimeError::EstimatorNotReady { .. }) => Ok(()),
@@ -434,6 +485,7 @@ impl RawClockRuntimeTiming {
 
         if let Some(previous_raw_us) = *previous {
             if raw_us < previous_raw_us {
+                self.record_raw_timestamp_regression(side);
                 return Err(RawClockRuntimeError::RawTimestampRegression {
                     side: side.as_str(),
                     previous_raw_us,
@@ -458,6 +510,14 @@ impl RawClockRuntimeTiming {
         Ok(())
     }
 
+    fn record_raw_timestamp_regression(&mut self, side: RawClockSide) {
+        let counter = match side {
+            RawClockSide::Master => &mut self.master_raw_timestamp_regressions,
+            RawClockSide::Slave => &mut self.slave_raw_timestamp_regressions,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
     fn record_clock_health_failure(&mut self) {
         self.clock_health_failures = self.clock_health_failures.saturating_add(1);
     }
@@ -477,20 +537,50 @@ impl RawClockRuntimeTiming {
         exit_reason: Option<RawClockRuntimeExitReason>,
     ) -> RawClockRuntimeReport {
         RawClockRuntimeReport {
-            master: self.master.health(now_host_us),
-            slave: self.slave.health(now_host_us),
+            master: self.report_health(RawClockSide::Master, now_host_us),
+            slave: self.report_health(RawClockSide::Slave, now_host_us),
             max_inter_arm_skew_us: self.max_inter_arm_skew_us,
             inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
             clock_health_failures: self.clock_health_failures,
             read_faults: 0,
             submission_faults: 0,
+            last_submission_failed_side: None,
+            peer_command_may_have_applied: false,
             runtime_faults: 0,
+            master_tx_realtime_overwrites_total: 0,
+            slave_tx_realtime_overwrites_total: 0,
+            master_tx_frames_sent_total: 0,
+            slave_tx_frames_sent_total: 0,
+            master_tx_fault_aborts_total: 0,
+            slave_tx_fault_aborts_total: 0,
+            last_runtime_fault_master: None,
+            last_runtime_fault_slave: None,
             iterations,
             exit_reason,
             master_stop_attempt: StopAttemptResult::NotAttempted,
             slave_stop_attempt: StopAttemptResult::NotAttempted,
             last_error: None,
         }
+    }
+
+    fn report_health(&self, side: RawClockSide, now_host_us: u64) -> RawClockHealth {
+        let (estimator, external_regressions) = match side {
+            RawClockSide::Master => (&self.master, self.master_raw_timestamp_regressions),
+            RawClockSide::Slave => (&self.slave, self.slave_raw_timestamp_regressions),
+        };
+        let mut health = estimator.health(now_host_us);
+        if external_regressions > 0 {
+            health.raw_timestamp_regressions =
+                health.raw_timestamp_regressions.saturating_add(external_regressions);
+            health.healthy = false;
+            if health.reason.is_none() {
+                health.reason = Some(format!(
+                    "raw timestamp regressions observed: {}",
+                    health.raw_timestamp_regressions
+                ));
+            }
+        }
+        health
     }
 }
 
@@ -615,6 +705,17 @@ struct RawClockRuntimeCore<I> {
     config: ExperimentalRawClockConfig,
 }
 
+struct RawClockStandbyExit<Arms> {
+    arms: Arms,
+    telemetry: RawClockRuntimeTelemetry,
+}
+
+struct RawClockFaultExit<Arms> {
+    arms: Arms,
+    shutdown: ExperimentalFaultShutdown,
+    telemetry: RawClockRuntimeTelemetry,
+}
+
 enum RawClockCoreExit<StandbyArms, ErrorArms> {
     Standby {
         arms: StandbyArms,
@@ -644,11 +745,18 @@ trait RawClockRuntimeIo: Sized {
 
     fn runtime_health(&mut self) -> ExperimentalRawClockRuntimeHealth;
 
-    fn submit_command(&mut self, command: &BilateralCommand, timeout: Duration) -> RobotResult<()>;
+    fn submit_command(
+        &mut self,
+        command: &BilateralCommand,
+        timeout: Duration,
+    ) -> Result<(), RawClockRuntimeError>;
 
-    fn disable_both(self, cfg: DisableConfig) -> Result<Self::StandbyArms, RawClockRuntimeError>;
+    fn disable_both(
+        self,
+        cfg: DisableConfig,
+    ) -> Result<RawClockStandbyExit<Self::StandbyArms>, RawClockRuntimeError>;
 
-    fn fault_shutdown(self, timeout: Duration) -> (Self::ErrorArms, ExperimentalFaultShutdown);
+    fn fault_shutdown(self, timeout: Duration) -> RawClockFaultExit<Self::ErrorArms>;
 }
 
 impl RawClockRuntimeIo for RealRawClockRuntimeIo {
@@ -676,15 +784,22 @@ impl RawClockRuntimeIo for RealRawClockRuntimeIo {
         }
     }
 
-    fn submit_command(&mut self, command: &BilateralCommand, timeout: Duration) -> RobotResult<()> {
-        submit_soft_realtime_command(&self.slave, &self.master, command, timeout)
+    fn submit_command(
+        &mut self,
+        command: &BilateralCommand,
+        timeout: Duration,
+    ) -> Result<(), RawClockRuntimeError> {
+        submit_soft_realtime_command_detailed(&self.slave, &self.master, command, timeout)
     }
 
-    fn disable_both(self, cfg: DisableConfig) -> Result<Self::StandbyArms, RawClockRuntimeError> {
+    fn disable_both(
+        self,
+        cfg: DisableConfig,
+    ) -> Result<RawClockStandbyExit<Self::StandbyArms>, RawClockRuntimeError> {
         disable_soft_realtime_both(self.master, self.slave, cfg)
     }
 
-    fn fault_shutdown(self, timeout: Duration) -> (Self::ErrorArms, ExperimentalFaultShutdown) {
+    fn fault_shutdown(self, timeout: Duration) -> RawClockFaultExit<Self::ErrorArms> {
         fault_shutdown_soft_realtime(self.master, self.slave, timeout)
     }
 }
@@ -773,7 +888,8 @@ impl ExperimentalRawClockDualArmActive {
         self,
         cfg: DisableConfig,
     ) -> Result<ExperimentalRawClockDualArmStandby, RawClockRuntimeError> {
-        let arms = disable_soft_realtime_both(self.master, self.slave, cfg)?;
+        let exit = disable_soft_realtime_both(self.master, self.slave, cfg)?;
+        let arms = exit.arms;
         Ok(ExperimentalRawClockDualArmStandby {
             master: arms.master,
             slave: arms.slave,
@@ -786,7 +902,8 @@ impl ExperimentalRawClockDualArmActive {
         self,
         timeout: Duration,
     ) -> (ExperimentalRawClockErrorState, ExperimentalFaultShutdown) {
-        fault_shutdown_soft_realtime(self.master, self.slave, timeout)
+        let exit = fault_shutdown_soft_realtime(self.master, self.slave, timeout);
+        (exit.arms, exit.shutdown)
     }
 }
 
@@ -887,9 +1004,10 @@ where
                 Some(RawClockRuntimeExitReason::MaxIterations),
             );
             report.iterations = iterations;
-            let arms = io.disable_both(cfg.disable_config.clone())?;
+            let standby = io.disable_both(cfg.disable_config.clone())?;
+            report.apply_telemetry(standby.telemetry);
             return Ok(RawClockCoreExit::Standby {
-                arms,
+                arms: standby.arms,
                 timing: Box::new(timing),
                 config: Box::new(config),
                 report,
@@ -903,9 +1021,10 @@ where
                 Some(RawClockRuntimeExitReason::Cancelled),
             );
             report.last_error = Some("raw-clock runtime cancelled".to_string());
-            let arms = io.disable_both(cfg.disable_config.clone())?;
+            let standby = io.disable_both(cfg.disable_config.clone())?;
+            report.apply_telemetry(standby.telemetry);
             return Ok(RawClockCoreExit::Standby {
-                arms,
+                arms: standby.arms,
                 timing: Box::new(timing),
                 config: Box::new(config),
                 report,
@@ -928,12 +1047,16 @@ where
                 iterations,
                 exit_reason,
                 err.to_string(),
-                |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
+                |report| {
+                    report.runtime_faults = report.runtime_faults.saturating_add(1);
+                    report.last_runtime_fault_master = health.master.fault;
+                    report.last_runtime_fault_slave = health.slave.fault;
+                },
             );
-            let (arms, shutdown) = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+            let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
             return Ok(RawClockCoreExit::Faulted {
-                arms,
-                report: report.with_shutdown(shutdown),
+                arms: fault.arms,
+                report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
             });
         }
 
@@ -947,10 +1070,10 @@ where
                     err.to_string(),
                     |report| report.read_faults = report.read_faults.saturating_add(1),
                 );
-                let (arms, shutdown) = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
                 return Ok(RawClockCoreExit::Faulted {
-                    arms,
-                    report: report.with_shutdown(shutdown),
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
                 });
             },
         };
@@ -964,10 +1087,10 @@ where
                     err.to_string(),
                     |report| report.read_faults = report.read_faults.saturating_add(1),
                 );
-                let (arms, shutdown) = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
                 return Ok(RawClockCoreExit::Faulted {
-                    arms,
-                    report: report.with_shutdown(shutdown),
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
                 });
             },
         };
@@ -983,10 +1106,10 @@ where
                     err.to_string(),
                     |_| {},
                 );
-                let (arms, shutdown) = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
                 return Ok(RawClockCoreExit::Faulted {
-                    arms,
-                    report: report.with_shutdown(shutdown),
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
                 });
             },
         };
@@ -1003,10 +1126,10 @@ where
             };
             let report =
                 fault_report_from_timing(&timing, iterations, exit_reason, err.to_string(), |_| {});
-            let (arms, shutdown) = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+            let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
             return Ok(RawClockCoreExit::Faulted {
-                arms,
-                report: report.with_shutdown(shutdown),
+                arms: fault.arms,
+                report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
             });
         }
 
@@ -1025,10 +1148,10 @@ where
                     err.to_string(),
                     |_| {},
                 );
-                let (arms, shutdown) = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
                 return Ok(RawClockCoreExit::Faulted {
-                    arms,
-                    report: report.with_shutdown(shutdown),
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
                 });
             },
         };
@@ -1039,12 +1162,23 @@ where
                 iterations,
                 RawClockRuntimeExitReason::SubmissionFault,
                 err.to_string(),
-                |report| report.submission_faults = report.submission_faults.saturating_add(1),
+                |report| {
+                    report.submission_faults = report.submission_faults.saturating_add(1);
+                    if let RawClockRuntimeError::SubmissionFault {
+                        side,
+                        peer_command_may_have_applied,
+                        ..
+                    } = &err
+                    {
+                        report.last_submission_failed_side = RawClockSide::from_str(side);
+                        report.peer_command_may_have_applied = *peer_command_may_have_applied;
+                    }
+                },
             );
-            let (arms, shutdown) = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+            let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
             return Ok(RawClockCoreExit::Faulted {
-                arms,
-                report: report.with_shutdown(shutdown),
+                arms: fault.arms,
+                report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
             });
         }
 
@@ -1071,22 +1205,48 @@ fn submit_soft_realtime_command(
     command: &BilateralCommand,
     timeout: Duration,
 ) -> RobotResult<()> {
-    slave.command_torques_confirmed(
+    submit_soft_realtime_command_detailed(slave, master, command, timeout).map_err(
+        |err| match err {
+            RawClockRuntimeError::SubmissionFault { source, .. } => source,
+            err => RobotError::ConfigError(err.to_string()),
+        },
+    )
+}
+
+fn submit_soft_realtime_command_detailed(
+    slave: &Piper<Active<MitPassthroughMode>, SoftRealtime>,
+    master: &Piper<Active<MitPassthroughMode>, SoftRealtime>,
+    command: &BilateralCommand,
+    timeout: Duration,
+) -> Result<(), RawClockRuntimeError> {
+    if let Err(source) = slave.command_torques_confirmed(
         &command.slave_position,
         &command.slave_velocity,
         &command.slave_kp,
         &command.slave_kd,
         &command.slave_feedforward_torque,
         timeout,
-    )?;
-    master.command_torques_confirmed(
+    ) {
+        return Err(RawClockRuntimeError::SubmissionFault {
+            side: RawClockSide::Slave.as_str(),
+            peer_command_may_have_applied: false,
+            source,
+        });
+    }
+    if let Err(source) = master.command_torques_confirmed(
         &command.master_position,
         &command.master_velocity,
         &command.master_kp,
         &command.master_kd,
         &JointArray::splat(NewtonMeter::ZERO),
         timeout,
-    )?;
+    ) {
+        return Err(RawClockRuntimeError::SubmissionFault {
+            side: RawClockSide::Master.as_str(),
+            peer_command_may_have_applied: true,
+            source,
+        });
+    }
     Ok(())
 }
 
@@ -1094,11 +1254,17 @@ fn disable_soft_realtime_both(
     master: Piper<Active<MitPassthroughMode>, SoftRealtime>,
     slave: Piper<Active<MitPassthroughMode>, SoftRealtime>,
     cfg: DisableConfig,
-) -> Result<RealRawClockStandbyArms, RawClockRuntimeError> {
+) -> Result<RawClockStandbyExit<RealRawClockStandbyArms>, RawClockRuntimeError> {
     let master_result = master.disable(cfg.clone());
     let slave_result = slave.disable(cfg);
     match (master_result, slave_result) {
-        (Ok(master), Ok(slave)) => Ok(RealRawClockStandbyArms { master, slave }),
+        (Ok(master), Ok(slave)) => {
+            let telemetry = telemetry_from_drivers(&master.driver, &slave.driver);
+            Ok(RawClockStandbyExit {
+                arms: RealRawClockStandbyArms { master, slave },
+                telemetry,
+            })
+        },
         (master, slave) => Err(RawClockRuntimeError::DisableBothFailed {
             master: master.err().map(|err| err.to_string()),
             slave: slave.err().map(|err| err.to_string()),
@@ -1110,8 +1276,10 @@ fn fault_shutdown_soft_realtime(
     master: Piper<Active<MitPassthroughMode>, SoftRealtime>,
     slave: Piper<Active<MitPassthroughMode>, SoftRealtime>,
     timeout: Duration,
-) -> (ExperimentalRawClockErrorState, ExperimentalFaultShutdown) {
+) -> RawClockFaultExit<ExperimentalRawClockErrorState> {
     let deadline = Instant::now() + timeout;
+    let pre_shutdown_master_fault = RuntimeHealthSnapshot::from(master.driver.health()).fault;
+    let pre_shutdown_slave_fault = RuntimeHealthSnapshot::from(slave.driver.health()).fault;
     master.driver.latch_fault();
     slave.driver.latch_fault();
     let master_pending = enqueue_experimental_stop_attempt(&master, deadline);
@@ -1120,16 +1288,40 @@ fn fault_shutdown_soft_realtime(
     let slave_stop_attempt = resolve_experimental_stop_attempt(slave_pending);
     master.driver.request_stop();
     slave.driver.request_stop();
-    (
-        ExperimentalRawClockErrorState {
+    let mut telemetry = telemetry_from_drivers(&master.driver, &slave.driver);
+    telemetry.last_runtime_fault_master = pre_shutdown_master_fault;
+    telemetry.last_runtime_fault_slave = pre_shutdown_slave_fault;
+    RawClockFaultExit {
+        arms: ExperimentalRawClockErrorState {
             master: force_soft_error_state(master),
             slave: force_soft_error_state(slave),
         },
-        ExperimentalFaultShutdown {
+        shutdown: ExperimentalFaultShutdown {
             master_stop_attempt,
             slave_stop_attempt,
         },
-    )
+        telemetry,
+    }
+}
+
+fn telemetry_from_drivers(
+    master: &piper_driver::Piper,
+    slave: &piper_driver::Piper,
+) -> RawClockRuntimeTelemetry {
+    let master_metrics = master.get_metrics();
+    let slave_metrics = slave.get_metrics();
+    let master_health = RuntimeHealthSnapshot::from(master.health());
+    let slave_health = RuntimeHealthSnapshot::from(slave.health());
+    RawClockRuntimeTelemetry {
+        master_tx_realtime_overwrites_total: master_metrics.tx_realtime_overwrites_total,
+        slave_tx_realtime_overwrites_total: slave_metrics.tx_realtime_overwrites_total,
+        master_tx_frames_sent_total: master_metrics.tx_frames_sent_total,
+        slave_tx_frames_sent_total: slave_metrics.tx_frames_sent_total,
+        master_tx_fault_aborts_total: master_metrics.tx_fault_aborts_total,
+        slave_tx_fault_aborts_total: slave_metrics.tx_fault_aborts_total,
+        last_runtime_fault_master: master_health.fault,
+        last_runtime_fault_slave: slave_health.fault,
+    }
 }
 
 fn read_experimental_snapshot_from_driver(
@@ -1935,6 +2127,7 @@ mod tests {
         pending_slave: Option<ExperimentalRawClockSnapshot>,
         command_failure: Option<FakeCommandFailure>,
         health: ExperimentalRawClockRuntimeHealth,
+        telemetry: RawClockRuntimeTelemetry,
     }
 
     impl FakeRuntimeIo {
@@ -1945,6 +2138,7 @@ mod tests {
                 pending_slave: None,
                 command_failure: None,
                 health: healthy_runtime_for_tests(),
+                telemetry: RawClockRuntimeTelemetry::default(),
             }
         }
 
@@ -1961,6 +2155,20 @@ mod tests {
         fn with_runtime_fault(mut self) -> Self {
             self.health.master.connected = false;
             self
+        }
+
+        fn with_telemetry(mut self, telemetry: RawClockRuntimeTelemetry) -> Self {
+            self.telemetry = telemetry;
+            self
+        }
+
+        fn telemetry(&self) -> RawClockRuntimeTelemetry {
+            let mut telemetry = self.telemetry;
+            telemetry.last_runtime_fault_master =
+                telemetry.last_runtime_fault_master.or(self.health.master.fault);
+            telemetry.last_runtime_fault_slave =
+                telemetry.last_runtime_fault_slave.or(self.health.slave.fault);
+            telemetry
         }
     }
 
@@ -2009,20 +2217,24 @@ mod tests {
             &mut self,
             command: &BilateralCommand,
             _timeout: Duration,
-        ) -> RobotResult<()> {
+        ) -> Result<(), RawClockRuntimeError> {
             self.state.commands.lock().expect("commands lock").push(command.clone());
             self.state.command_log.lock().expect("command log lock").push("slave");
             if matches!(self.command_failure, Some(FakeCommandFailure::Slave)) {
-                return Err(RobotError::ConfigError(
-                    "slave command submission failed".to_string(),
-                ));
+                return Err(RawClockRuntimeError::SubmissionFault {
+                    side: RawClockSide::Slave.as_str(),
+                    peer_command_may_have_applied: false,
+                    source: RobotError::ConfigError("slave command submission failed".to_string()),
+                });
             }
 
             self.state.command_log.lock().expect("command log lock").push("master");
             if matches!(self.command_failure, Some(FakeCommandFailure::Master)) {
-                return Err(RobotError::ConfigError(
-                    "master command submission failed".to_string(),
-                ));
+                return Err(RawClockRuntimeError::SubmissionFault {
+                    side: RawClockSide::Master.as_str(),
+                    peer_command_may_have_applied: true,
+                    source: RobotError::ConfigError("master command submission failed".to_string()),
+                });
             }
             Ok(())
         }
@@ -2030,25 +2242,26 @@ mod tests {
         fn disable_both(
             self,
             _cfg: DisableConfig,
-        ) -> Result<Self::StandbyArms, RawClockRuntimeError> {
+        ) -> Result<RawClockStandbyExit<Self::StandbyArms>, RawClockRuntimeError> {
             let mut attempts = self.state.disable_attempts.lock().expect("disable attempts lock");
             attempts.push("master");
             attempts.push("slave");
-            Ok(FakeStandbyArms)
+            Ok(RawClockStandbyExit {
+                arms: FakeStandbyArms,
+                telemetry: self.telemetry(),
+            })
         }
 
-        fn fault_shutdown(
-            self,
-            _timeout: Duration,
-        ) -> (Self::ErrorArms, ExperimentalFaultShutdown) {
+        fn fault_shutdown(self, _timeout: Duration) -> RawClockFaultExit<Self::ErrorArms> {
             self.state.fault_shutdowns.fetch_add(1, AtomicOrdering::SeqCst);
-            (
-                FakeErrorArms,
-                ExperimentalFaultShutdown {
+            RawClockFaultExit {
+                arms: FakeErrorArms,
+                shutdown: ExperimentalFaultShutdown {
                     master_stop_attempt: StopAttemptResult::ConfirmedSent,
                     slave_stop_attempt: StopAttemptResult::ConfirmedSent,
                 },
-            )
+                telemetry: self.telemetry(),
+            }
         }
     }
 
@@ -2380,6 +2593,8 @@ mod tests {
             report.exit_reason,
             Some(RawClockRuntimeExitReason::RawClockFault)
         );
+        assert_eq!(report.master.raw_timestamp_regressions, 1);
+        assert_eq!(report.slave.raw_timestamp_regressions, 0);
     }
 
     #[test]
@@ -2425,6 +2640,11 @@ mod tests {
         );
         assert_eq!(state.fault_shutdowns.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(report.submission_faults, 1);
+        assert_eq!(
+            report.last_submission_failed_side,
+            Some(RawClockSide::Master)
+        );
+        assert!(report.peer_command_may_have_applied);
         assert_eq!(report.master_stop_attempt, StopAttemptResult::ConfirmedSent);
         assert_eq!(report.slave_stop_attempt, StopAttemptResult::ConfirmedSent);
     }
@@ -2450,15 +2670,21 @@ mod tests {
             vec!["slave"]
         );
         assert_eq!(report.submission_faults, 1);
+        assert_eq!(
+            report.last_submission_failed_side,
+            Some(RawClockSide::Slave)
+        );
+        assert!(!report.peer_command_may_have_applied);
         assert_eq!(state.fault_shutdowns.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[test]
     fn runtime_transport_fault_calls_fault_shutdown_and_records_both_stop_attempts() {
-        let io = FakeRuntimeIo::new().with_runtime_fault().with_reads([FakeRead::pair(
+        let mut io = FakeRuntimeIo::new().with_runtime_fault().with_reads([FakeRead::pair(
             raw_clock_snapshot_for_tests(10_000, 110_000),
             raw_clock_snapshot_for_tests(20_000, 110_800),
         )]);
+        io.health.master.fault = Some(RuntimeFaultKind::TransportError);
 
         let (state, report) = run_fake_runtime(
             io,
@@ -2473,6 +2699,11 @@ mod tests {
         );
         assert_eq!(state.fault_shutdowns.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(report.runtime_faults, 1);
+        assert_eq!(
+            report.last_runtime_fault_master,
+            Some(RuntimeFaultKind::TransportError)
+        );
+        assert_eq!(report.last_runtime_fault_slave, None);
         assert_eq!(
             report.exit_reason,
             Some(RawClockRuntimeExitReason::RuntimeTransportFault)
@@ -2617,7 +2848,104 @@ mod tests {
             .unwrap();
 
         assert_eq!(timing.sample_counts_for_tests(), (2, 2));
-        assert_eq!(timing.clock_health_failures, 1);
+        assert_eq!(timing.clock_health_failures, 0);
+    }
+
+    #[test]
+    fn runtime_raw_timestamp_regression_is_reflected_in_report_health() {
+        let mut timing = ready_timing_for_tests();
+
+        let err = timing
+            .tick_from_snapshots(
+                &raw_clock_snapshot_for_tests(9_999, 111_000),
+                &raw_clock_snapshot_for_tests(20_000, 110_800),
+                111_100,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::RawTimestampRegression {
+                side: "master",
+                previous_raw_us: 10_000,
+                raw_us: 9_999
+            }
+        ));
+        let report = timing.report(111_100, 0, Some(RawClockRuntimeExitReason::RawClockFault));
+        assert_eq!(report.master.raw_timestamp_regressions, 1);
+        assert_eq!(report.slave.raw_timestamp_regressions, 0);
+    }
+
+    #[test]
+    fn duplicate_raw_timestamp_is_ignored_without_regression_counter() {
+        let mut timing = ready_timing_for_tests();
+
+        timing
+            .tick_from_snapshots(
+                &raw_clock_snapshot_for_tests(10_000, 111_000),
+                &raw_clock_snapshot_for_tests(20_000, 111_800),
+                111_900,
+            )
+            .expect("duplicate raw timestamp should reuse existing estimator sample");
+
+        let report = timing.report(111_900, 1, Some(RawClockRuntimeExitReason::MaxIterations));
+        assert_eq!(timing.sample_counts_for_tests(), (4, 4));
+        assert_eq!(report.master.raw_timestamp_regressions, 0);
+        assert_eq!(report.slave.raw_timestamp_regressions, 0);
+    }
+
+    #[test]
+    fn runtime_report_includes_transport_telemetry_from_io() {
+        let telemetry = RawClockRuntimeTelemetry {
+            master_tx_realtime_overwrites_total: 2,
+            slave_tx_realtime_overwrites_total: 3,
+            master_tx_frames_sent_total: 11,
+            slave_tx_frames_sent_total: 13,
+            master_tx_fault_aborts_total: 5,
+            slave_tx_fault_aborts_total: 7,
+            last_runtime_fault_master: None,
+            last_runtime_fault_slave: None,
+        };
+        let io = FakeRuntimeIo::new()
+            .with_reads([FakeRead::pair(
+                raw_clock_snapshot_for_tests(10_000, 110_000),
+                raw_clock_snapshot_for_tests(20_000, 110_800),
+            )])
+            .with_telemetry(telemetry);
+
+        let (_state, report) = run_fake_runtime(
+            io,
+            ready_timing_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+        );
+
+        assert_eq!(report.master_tx_realtime_overwrites_total, 2);
+        assert_eq!(report.slave_tx_realtime_overwrites_total, 3);
+        assert_eq!(report.master_tx_frames_sent_total, 11);
+        assert_eq!(report.slave_tx_frames_sent_total, 13);
+        assert_eq!(report.master_tx_fault_aborts_total, 5);
+        assert_eq!(report.slave_tx_fault_aborts_total, 7);
+    }
+
+    #[test]
+    fn telemetry_merge_preserves_runtime_fault_observed_before_shutdown_latch() {
+        let mut report = ready_timing_for_tests().report(
+            120_000,
+            0,
+            Some(RawClockRuntimeExitReason::RuntimeTransportFault),
+        );
+        report.last_runtime_fault_master = Some(RuntimeFaultKind::TransportError);
+
+        report.apply_telemetry(RawClockRuntimeTelemetry {
+            last_runtime_fault_master: Some(RuntimeFaultKind::ManualFault),
+            ..RawClockRuntimeTelemetry::default()
+        });
+
+        assert_eq!(
+            report.last_runtime_fault_master,
+            Some(RuntimeFaultKind::TransportError)
+        );
     }
 
     #[test]

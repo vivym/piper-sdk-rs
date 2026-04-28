@@ -9,7 +9,7 @@ use piper_client::dual_arm_raw_clock::{
     ExperimentalRawClockDualArmStandby, ExperimentalRawClockMasterFollowerGains,
     ExperimentalRawClockMode, ExperimentalRawClockRunConfig,
     ExperimentalRawClockRunExit as PiperRawClockRunExit, RawClockRuntimeExitReason,
-    RawClockRuntimeReport, RawClockRuntimeThresholds,
+    RawClockRuntimeReport, RawClockRuntimeThresholds, RawClockSide,
 };
 use piper_client::observer::{ControlSnapshotFull, Observer};
 use piper_client::state::{DisableConfig, MitModeConfig, Piper, SoftRealtime, Standby};
@@ -651,12 +651,31 @@ fn bilateral_report_from_raw_clock(report: &RawClockRuntimeReport) -> BilateralR
         iterations: report.iterations,
         read_faults: report.read_faults,
         submission_faults: report.submission_faults,
+        last_submission_failed_arm: report
+            .last_submission_failed_side
+            .map(map_raw_clock_submission_side),
+        peer_command_may_have_applied: report.peer_command_may_have_applied,
         max_inter_arm_skew: Duration::from_micros(report.max_inter_arm_skew_us),
+        left_tx_realtime_overwrites_total: report.master_tx_realtime_overwrites_total,
+        right_tx_realtime_overwrites_total: report.slave_tx_realtime_overwrites_total,
+        left_tx_frames_sent_total: report.master_tx_frames_sent_total,
+        right_tx_frames_sent_total: report.slave_tx_frames_sent_total,
+        left_tx_fault_aborts_total: report.master_tx_fault_aborts_total,
+        right_tx_fault_aborts_total: report.slave_tx_fault_aborts_total,
+        last_runtime_fault_left: report.last_runtime_fault_master,
+        last_runtime_fault_right: report.last_runtime_fault_slave,
         exit_reason: report.exit_reason.map(map_raw_clock_exit_reason),
         left_stop_attempt: report.master_stop_attempt,
         right_stop_attempt: report.slave_stop_attempt,
         last_error: report.last_error.clone(),
         ..BilateralRunReport::default()
+    }
+}
+
+fn map_raw_clock_submission_side(side: RawClockSide) -> piper_client::dual_arm::SubmissionArm {
+    match side {
+        RawClockSide::Master => piper_client::dual_arm::SubmissionArm::Left,
+        RawClockSide::Slave => piper_client::dual_arm::SubmissionArm::Right,
     }
 }
 
@@ -1321,7 +1340,17 @@ fn raw_clock_error_report(
         clock_health_failures: 0,
         read_faults: 0,
         submission_faults: 0,
+        last_submission_failed_side: None,
+        peer_command_may_have_applied: false,
         runtime_faults: 1,
+        master_tx_realtime_overwrites_total: 0,
+        slave_tx_realtime_overwrites_total: 0,
+        master_tx_frames_sent_total: 0,
+        slave_tx_frames_sent_total: 0,
+        master_tx_fault_aborts_total: 0,
+        slave_tx_fault_aborts_total: 0,
+        last_runtime_fault_master: None,
+        last_runtime_fault_slave: None,
         iterations: 0,
         exit_reason: Some(exit_reason),
         master_stop_attempt: StopAttemptResult::NotAttempted,
@@ -1568,9 +1597,10 @@ mod tests {
     use crate::teleop::report::TeleopExitStatus;
     use crate::teleop::target::{ConcreteTeleopTarget, TeleopPlatform};
     use anyhow::{Result, bail};
+    use piper_client::RuntimeFaultKind;
     use piper_client::dual_arm::{
         BilateralExitReason, BilateralLoopConfig, BilateralRunReport, DualArmCalibration,
-        DualArmReadPolicy, DualArmSnapshot, JointMirrorMap, StopAttemptResult,
+        DualArmReadPolicy, DualArmSnapshot, JointMirrorMap, StopAttemptResult, SubmissionArm,
     };
     use piper_client::observer::{ControlSnapshot, ControlSnapshotFull};
     use piper_client::state::MitModeConfig;
@@ -2593,6 +2623,70 @@ mod tests {
     }
 
     #[test]
+    fn raw_clock_bilateral_report_preserves_submission_fault_contract() {
+        let slave_failed = RawClockRuntimeReport {
+            submission_faults: 1,
+            last_submission_failed_side: Some(RawClockSide::Slave),
+            peer_command_may_have_applied: false,
+            exit_reason: Some(RawClockRuntimeExitReason::SubmissionFault),
+            ..raw_clock_report_success()
+        };
+        let converted = bilateral_report_from_raw_clock(&slave_failed);
+        assert_eq!(converted.submission_faults, 1);
+        assert_eq!(
+            converted.last_submission_failed_arm,
+            Some(SubmissionArm::Right)
+        );
+        assert!(!converted.peer_command_may_have_applied);
+
+        let master_failed = RawClockRuntimeReport {
+            submission_faults: 1,
+            last_submission_failed_side: Some(RawClockSide::Master),
+            peer_command_may_have_applied: true,
+            exit_reason: Some(RawClockRuntimeExitReason::SubmissionFault),
+            ..raw_clock_report_success()
+        };
+        let converted = bilateral_report_from_raw_clock(&master_failed);
+        assert_eq!(
+            converted.last_submission_failed_arm,
+            Some(SubmissionArm::Left)
+        );
+        assert!(converted.peer_command_may_have_applied);
+    }
+
+    #[test]
+    fn raw_clock_bilateral_report_preserves_transport_telemetry() {
+        let report = RawClockRuntimeReport {
+            master_tx_realtime_overwrites_total: 2,
+            slave_tx_realtime_overwrites_total: 3,
+            master_tx_frames_sent_total: 11,
+            slave_tx_frames_sent_total: 13,
+            master_tx_fault_aborts_total: 5,
+            slave_tx_fault_aborts_total: 7,
+            last_runtime_fault_master: Some(RuntimeFaultKind::ManualFault),
+            last_runtime_fault_slave: Some(RuntimeFaultKind::TransportError),
+            ..raw_clock_report_success()
+        };
+
+        let converted = bilateral_report_from_raw_clock(&report);
+
+        assert_eq!(converted.left_tx_realtime_overwrites_total, 2);
+        assert_eq!(converted.right_tx_realtime_overwrites_total, 3);
+        assert_eq!(converted.left_tx_frames_sent_total, 11);
+        assert_eq!(converted.right_tx_frames_sent_total, 13);
+        assert_eq!(converted.left_tx_fault_aborts_total, 5);
+        assert_eq!(converted.right_tx_fault_aborts_total, 7);
+        assert_eq!(
+            converted.last_runtime_fault_left,
+            Some(RuntimeFaultKind::ManualFault)
+        );
+        assert_eq!(
+            converted.last_runtime_fault_right,
+            Some(RuntimeFaultKind::TransportError)
+        );
+    }
+
+    #[test]
     fn experimental_raw_clock_settings_convert_to_runtime_thresholds() {
         let settings = TeleopRawClockSettings {
             experimental_calibrated_raw: true,
@@ -2719,7 +2813,17 @@ mod tests {
             clock_health_failures: 0,
             read_faults: 0,
             submission_faults: 0,
+            last_submission_failed_side: None,
+            peer_command_may_have_applied: false,
             runtime_faults: 0,
+            master_tx_realtime_overwrites_total: 0,
+            slave_tx_realtime_overwrites_total: 0,
+            master_tx_frames_sent_total: 0,
+            slave_tx_frames_sent_total: 0,
+            master_tx_fault_aborts_total: 0,
+            slave_tx_fault_aborts_total: 0,
+            last_runtime_fault_master: None,
+            last_runtime_fault_slave: None,
             iterations: 1,
             exit_reason: Some(RawClockRuntimeExitReason::MaxIterations),
             master_stop_attempt: StopAttemptResult::NotAttempted,

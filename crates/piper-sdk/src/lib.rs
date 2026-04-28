@@ -44,8 +44,9 @@ pub mod can {
     pub use piper_can::gs_usb::GsUsbCanAdapter;
     pub use piper_can::{
         BridgeTxAdapter, CanAdapter, CanData, CanDeviceError, CanDeviceErrorKind, CanError, CanId,
-        ExtendedCanId, FrameError, PiperFrame, RealtimeTxAdapter, ReceivedFrame, RxAdapter,
-        SplittableAdapter, StandardCanId, TimestampProvenance,
+        ExtendedCanId, FrameError, PiperFrame, RawTimestampInfo, RawTimestampSample,
+        RealtimeTxAdapter, ReceivedFrame, RxAdapter, SplittableAdapter, StandardCanId,
+        TimestampProvenance,
     };
 }
 
@@ -72,7 +73,7 @@ pub mod prelude;
 
 // CAN 层常用类型
 pub use can::{CanAdapter, CanError};
-pub use piper_can::{ReceivedFrame, TimestampProvenance};
+pub use piper_can::{RawTimestampInfo, RawTimestampSample, ReceivedFrame, TimestampProvenance};
 pub use piper_protocol::{
     CanData, CanId, ExtendedCanId, FrameError, JointIndex, PiperFrame, StandardCanId,
 };
@@ -308,6 +309,8 @@ macro_rules! init_logger {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn init_logger_disables_bridge_if_subscriber_race_is_lost() {
         super::init_logger_inner(|| {
@@ -326,5 +329,23 @@ mod tests {
             ::log::LevelFilter::Off,
             "losing the subscriber race should disable the SDK log fast path",
         );
+    }
+
+    #[test]
+    fn raw_timestamp_types_are_reexported_at_root_and_can_module() {
+        let info = can::RawTimestampInfo {
+            can_id: 0x251,
+            host_rx_mono_us: 123,
+            system_ts_us: Some(120),
+            hw_trans_us: None,
+            hw_raw_us: Some(99),
+        };
+        let sample = can::RawTimestampSample {
+            iface: "can0".to_string(),
+            info,
+        };
+
+        let _root_info: RawTimestampInfo = info;
+        let _root_sample: RawTimestampSample = sample;
     }
 }
