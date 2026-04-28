@@ -566,7 +566,9 @@ fn finish_maintenance_dispatch(
     dispatch: &MaintenanceLaneDispatch,
     result: Result<(), crate::DriverError>,
 ) {
-    let _ = dispatch.ack.send(MaintenanceSendPhase::Finished(result));
+    let _ = dispatch.ack.send(MaintenanceSendPhase::Finished(
+        result.map(|_| crate::command::DeliveryReceipt::none()),
+    ));
 }
 
 fn restore_state_transition_gate_after_dispatch(
@@ -1918,10 +1920,14 @@ pub(crate) fn tx_loop_mailbox(
                     | Some(crate::DriverError::ChannelClosed)
             );
             if let Some(ack) = ack.take() {
-                let result = match delivery_error {
-                    Some(err) => Err(err),
-                    None => Ok(()),
+                let receipt = if no_delivery_error && sent_count == total_frames {
+                    crate::command::DeliveryReceipt::finished_at(
+                        crate::heartbeat::monotonic_micros().max(1),
+                    )
+                } else {
+                    crate::command::DeliveryReceipt::none()
                 };
+                let result = delivery_error.map_or(Ok(receipt), Err);
                 let _ = ack.send(crate::command::DeliveryPhase::Finished(result));
             }
 
@@ -2284,7 +2290,16 @@ pub(crate) fn tx_loop_mailbox(
             let replay_paused_partial =
                 matches!(&send_result, Err(crate::DriverError::ReplayModeActive)) && sent_count > 0;
             if let Some(ack) = ack.take() {
-                let _ = ack.send(crate::command::DeliveryPhase::Finished(send_result));
+                let receipt = if send_succeeded && sent_count == total_frames {
+                    crate::command::DeliveryReceipt::finished_at(
+                        crate::heartbeat::monotonic_micros().max(1),
+                    )
+                } else {
+                    crate::command::DeliveryReceipt::none()
+                };
+                let _ = ack.send(crate::command::DeliveryPhase::Finished(
+                    send_result.map(|_| receipt),
+                ));
             }
 
             if let Some(soft_succeeded) = soft_outcome {

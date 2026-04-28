@@ -44,16 +44,31 @@ const _: () = {
 /// **确认**：`PiperFrame` 已实现 `Copy` Trait（见 `src/can/mod.rs:35`），满足性能要求。
 pub type FrameBuffer = SmallVec<[PiperFrame; 6]>;
 
-/// 实时命令类型（统一使用 FrameBuffer）
-///
-/// **设计决策**：不再区分 Single 和 Package，统一使用 FrameBuffer。
-/// - Single 只是 len=1 的 FrameBuffer
-/// - 简化 TX 线程逻辑（不需要 match 分支）
-/// - 消除 CPU 分支预测压力
+/// TX delivery completion metadata returned with final delivery acknowledgements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryReceipt {
+    pub host_finished_mono_us: Option<u64>,
+}
+
+impl DeliveryReceipt {
+    pub const fn none() -> Self {
+        Self {
+            host_finished_mono_us: None,
+        }
+    }
+
+    pub const fn finished_at(host_finished_mono_us: u64) -> Self {
+        Self {
+            host_finished_mono_us: Some(host_finished_mono_us),
+        }
+    }
+}
+
+/// Phased delivery acknowledgement from the TX worker.
 #[derive(Debug)]
 pub enum DeliveryPhase {
     Committed { host_commit_mono_us: u64 },
-    Finished(Result<(), DriverError>),
+    Finished(Result<DeliveryReceipt, DriverError>),
 }
 
 pub type RealtimeAck = Sender<DeliveryPhase>;
@@ -202,7 +217,9 @@ impl RealtimeCommand {
     #[inline]
     pub fn complete(mut self, result: Result<(), DriverError>) {
         if let Some(ack) = self.ack.take() {
-            let _ = ack.send(DeliveryPhase::Finished(result));
+            let _ = ack.send(DeliveryPhase::Finished(
+                result.map(|_| DeliveryReceipt::none()),
+            ));
         }
     }
 }
@@ -683,7 +700,9 @@ impl ReliableCommand {
     #[inline]
     pub fn complete(mut self, result: Result<(), DriverError>) {
         if let Some(ack) = self.ack.take() {
-            let _ = ack.send(DeliveryPhase::Finished(result));
+            let _ = ack.send(DeliveryPhase::Finished(
+                result.map(|_| DeliveryReceipt::none()),
+            ));
         }
     }
 }
