@@ -91,7 +91,9 @@ data as a successful run.
 
 This mode is for lab validation with Linux SocketCAN `gs_usb` interfaces that
 expose `hardware-raw-clock` but cannot satisfy the production StrictRealtime
-path. It is not StrictRealtime and must be enabled explicitly.
+path. It is not StrictRealtime and must be enabled explicitly. The experimental
+path is master-follower only; it does not support bilateral force reflection or
+runtime console switching with `mode bilateral`.
 
 First run the read-only probe:
 
@@ -119,13 +121,28 @@ piper-cli teleop dual-arm \
 The report must show `timing_source=calibrated_hw_raw`,
 `experimental=true`, and `strict_realtime=false`.
 
-### Manual Acceptance Checklist
+### Experimental Acceptance Checklist
 
-1. Probe runs for 5 minutes without raw timestamp regression.
-2. p95 residual and max skew are within configured thresholds.
-3. Bounded `master-follower` exits cleanly.
-4. Report marks run experimental and non-strict.
-5. Disconnecting one feedback path causes bounded shutdown.
+1. Probe completes the requested 300-second run and JSON shows `pass=true`.
+2. Probe JSON shows `left.health.healthy=true` and
+   `right.health.healthy=true`.
+3. Probe JSON shows `left.health.raw_timestamp_regressions=0` and
+   `right.health.raw_timestamp_regressions=0`.
+4. Probe JSON residuals are within the configured thresholds, including
+   `left.health.residual_p95_us`, `right.health.residual_p95_us`,
+   `left.health.residual_max_us`, and `right.health.residual_max_us`.
+5. Probe JSON shows `max_estimated_inter_arm_skew_us` within the configured
+   threshold.
+6. The bounded normal `master-follower` trial exits cleanly with
+   `exit.clean=true`, `exit.reason=max_iterations`, and `exit.faulted=false`.
+7. Teleop report marks the run experimental and non-strict with
+   `timing_source=calibrated_hw_raw`, `experimental=true`, and
+   `strict_realtime=false`.
+8. The bounded normal teleop report shows no clock-health, runtime, read, or
+   submission faults: `timing.clock_health_failures=0`, `exit.last_error=null`,
+   `metrics.read_faults=0`, and `metrics.submission_faults=0`.
+9. A separate disconnect trial with one feedback path removed causes bounded
+   shutdown instead of hanging.
 
 ## Manual Acceptance Checklist
 
