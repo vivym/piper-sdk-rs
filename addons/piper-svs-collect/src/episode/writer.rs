@@ -1,8 +1,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::{LockResult, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -65,6 +67,24 @@ pub struct WriterStats {
     pub flush_error: Option<String>,
 }
 
+struct AtomicWriterStats {
+    queue_full_stop_events: AtomicU64,
+    queue_full_stop_duration_ms: AtomicU64,
+    queue_full_events: AtomicU64,
+    dropped_step_count: AtomicU64,
+    first_queue_full_host_mono_us: AtomicU64,
+    latest_queue_full_host_mono_us: AtomicU64,
+    max_queue_depth: AtomicU32,
+    final_queue_depth: AtomicU32,
+    encoded_step_count: AtomicU64,
+    last_step_index: AtomicU64,
+    backpressure_threshold_tripped: AtomicBool,
+    flush_failed: AtomicBool,
+    flush_error: Mutex<Option<String>>,
+    #[cfg(test)]
+    lock_probe: Mutex<()>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterFlushSummary {
     pub path: PathBuf,
@@ -75,7 +95,7 @@ pub struct WriterFlushSummary {
 pub struct EpisodeWriter {
     sender: Option<Sender<SvsStepV1>>,
     pause_worker: Arc<AtomicBool>,
-    stats: Arc<Mutex<WriterStats>>,
+    stats: Arc<AtomicWriterStats>,
     worker: Option<JoinHandle<Result<WriterFlushSummary, WriterError>>>,
 }
 
@@ -131,7 +151,7 @@ impl EpisodeWriter {
     }
 
     pub fn stats(&self) -> WriterStats {
-        self.stats.lock().expect("writer stats lock poisoned").clone()
+        self.stats.snapshot()
     }
 
     pub fn pause_worker_for_test(&mut self) {
@@ -162,16 +182,10 @@ impl EpisodeWriter {
             return Err(WriterError::InvalidCapacity);
         }
 
-        std::fs::create_dir_all(output_dir)?;
-        let final_path = output_dir.join("steps.bin");
-        let temp_path = output_dir.join(format!(
-            ".steps.bin.{}.{}.tmp",
-            std::process::id(),
-            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let (file, temp_path, final_path) = prepare_steps_file(output_dir, &header)?;
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
         let pause_worker = Arc::new(AtomicBool::new(start_paused));
-        let stats = Arc::new(Mutex::new(WriterStats::default()));
+        let stats = Arc::new(AtomicWriterStats::default());
 
         let worker_pause = Arc::clone(&pause_worker);
         let worker_stats = Arc::clone(&stats);
@@ -180,7 +194,7 @@ impl EpisodeWriter {
                 receiver,
                 worker_pause,
                 worker_stats,
-                header,
+                file,
                 temp_path,
                 final_path,
             )
@@ -196,21 +210,24 @@ impl EpisodeWriter {
 
     fn update_queue_depth(&self, depth: usize) {
         let depth = saturating_u32(depth);
-        let mut stats = self.stats.lock().expect("writer stats lock poisoned");
-        stats.max_queue_depth = stats.max_queue_depth.max(depth);
-        stats.final_queue_depth = depth;
+        self.stats.max_queue_depth.fetch_max(depth, Ordering::Relaxed);
+        self.stats.final_queue_depth.store(depth, Ordering::Relaxed);
     }
 
     fn record_queue_full(&self, depth: usize) {
         let now_us = piper_driver::heartbeat::monotonic_micros().max(1);
         let depth = saturating_u32(depth);
-        let mut stats = self.stats.lock().expect("writer stats lock poisoned");
-        stats.queue_full_events = stats.queue_full_events.saturating_add(1);
-        stats.dropped_step_count = stats.dropped_step_count.saturating_add(1);
-        stats.first_queue_full_host_mono_us.get_or_insert(now_us);
-        stats.latest_queue_full_host_mono_us = Some(now_us);
-        stats.max_queue_depth = stats.max_queue_depth.max(depth);
-        stats.final_queue_depth = depth;
+        self.stats.queue_full_events.fetch_add(1, Ordering::Relaxed);
+        self.stats.dropped_step_count.fetch_add(1, Ordering::Relaxed);
+        let _ = self.stats.first_queue_full_host_mono_us.compare_exchange(
+            0,
+            now_us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.stats.latest_queue_full_host_mono_us.store(now_us, Ordering::Relaxed);
+        self.stats.max_queue_depth.fetch_max(depth, Ordering::Relaxed);
+        self.stats.final_queue_depth.store(depth, Ordering::Relaxed);
     }
 }
 
@@ -245,6 +262,63 @@ impl WriterStats {
 
     pub fn record_backpressure_threshold_tripped(&mut self) {
         self.backpressure_threshold_tripped = true;
+    }
+}
+
+impl Default for AtomicWriterStats {
+    fn default() -> Self {
+        Self {
+            queue_full_stop_events: AtomicU64::new(0),
+            queue_full_stop_duration_ms: AtomicU64::new(0),
+            queue_full_events: AtomicU64::new(0),
+            dropped_step_count: AtomicU64::new(0),
+            first_queue_full_host_mono_us: AtomicU64::new(0),
+            latest_queue_full_host_mono_us: AtomicU64::new(0),
+            max_queue_depth: AtomicU32::new(0),
+            final_queue_depth: AtomicU32::new(0),
+            encoded_step_count: AtomicU64::new(0),
+            last_step_index: AtomicU64::new(u64::MAX),
+            backpressure_threshold_tripped: AtomicBool::new(false),
+            flush_failed: AtomicBool::new(false),
+            flush_error: Mutex::new(None),
+            #[cfg(test)]
+            lock_probe: Mutex::new(()),
+        }
+    }
+}
+
+impl AtomicWriterStats {
+    fn snapshot(&self) -> WriterStats {
+        let first_queue_full = self.first_queue_full_host_mono_us.load(Ordering::Relaxed);
+        let latest_queue_full = self.latest_queue_full_host_mono_us.load(Ordering::Relaxed);
+        let last_step_index = self.last_step_index.load(Ordering::Relaxed);
+
+        WriterStats {
+            queue_full_stop_events: self.queue_full_stop_events.load(Ordering::Relaxed),
+            queue_full_stop_duration_ms: self.queue_full_stop_duration_ms.load(Ordering::Relaxed),
+            queue_full_events: self.queue_full_events.load(Ordering::Relaxed),
+            dropped_step_count: self.dropped_step_count.load(Ordering::Relaxed),
+            first_queue_full_host_mono_us: nonzero_to_option(first_queue_full),
+            latest_queue_full_host_mono_us: nonzero_to_option(latest_queue_full),
+            max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
+            final_queue_depth: self.final_queue_depth.load(Ordering::Relaxed),
+            encoded_step_count: self.encoded_step_count.load(Ordering::Relaxed),
+            last_step_index: if last_step_index == u64::MAX {
+                None
+            } else {
+                Some(last_step_index)
+            },
+            backpressure_threshold_tripped: self
+                .backpressure_threshold_tripped
+                .load(Ordering::Relaxed),
+            flush_failed: self.flush_failed.load(Ordering::Relaxed),
+            flush_error: self.flush_error.lock().expect("writer flush error lock poisoned").clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn lock(&self) -> LockResult<MutexGuard<'_, ()>> {
+        self.lock_probe.lock()
     }
 }
 
@@ -346,8 +420,8 @@ pub fn final_status_for_writer_stats(
 fn run_worker(
     receiver: Receiver<SvsStepV1>,
     pause_worker: Arc<AtomicBool>,
-    stats: Arc<Mutex<WriterStats>>,
-    header: SvsHeaderV1,
+    stats: Arc<AtomicWriterStats>,
+    file: File,
     temp_path: PathBuf,
     final_path: PathBuf,
 ) -> Result<WriterFlushSummary, WriterError> {
@@ -355,7 +429,7 @@ fn run_worker(
         receiver,
         pause_worker,
         Arc::clone(&stats),
-        header,
+        file,
         &temp_path,
         &final_path,
     );
@@ -369,18 +443,11 @@ fn run_worker(
 fn run_worker_inner(
     receiver: Receiver<SvsStepV1>,
     pause_worker: Arc<AtomicBool>,
-    stats: Arc<Mutex<WriterStats>>,
-    header: SvsHeaderV1,
+    stats: Arc<AtomicWriterStats>,
+    mut file: File,
     temp_path: &Path,
     final_path: &Path,
 ) -> Result<WriterFlushSummary, WriterError> {
-    if let Some(parent) = temp_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut file = OpenOptions::new().write(true).create_new(true).open(temp_path)?;
-    wire::write_header(&mut file, &header)?;
-
     let mut step_count = 0_u64;
     let mut last_step_index = None;
     loop {
@@ -394,10 +461,9 @@ fn run_worker_inner(
                 wire::write_step(&mut file, &step)?;
                 step_count = step_count.saturating_add(1);
                 last_step_index = Some(step.step_index);
-                let mut stats = stats.lock().expect("writer stats lock poisoned");
-                stats.encoded_step_count = step_count;
-                stats.last_step_index = last_step_index;
-                stats.final_queue_depth = saturating_u32(receiver.len());
+                stats.encoded_step_count.store(step_count, Ordering::Relaxed);
+                stats.last_step_index.store(step.step_index, Ordering::Relaxed);
+                stats.final_queue_depth.store(saturating_u32(receiver.len()), Ordering::Relaxed);
             },
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -407,7 +473,7 @@ fn run_worker_inner(
     file.flush()?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(temp_path, final_path)?;
+    persist_temp_no_overwrite(temp_path, final_path)?;
     fsync_parent(final_path)?;
 
     Ok(WriterFlushSummary {
@@ -419,7 +485,7 @@ fn run_worker_inner(
 
 fn join_worker(
     worker: JoinHandle<Result<WriterFlushSummary, WriterError>>,
-    stats: &Arc<Mutex<WriterStats>>,
+    stats: &Arc<AtomicWriterStats>,
 ) -> Result<WriterFlushSummary, WriterError> {
     match worker.join() {
         Ok(result) => result,
@@ -430,10 +496,60 @@ fn join_worker(
     }
 }
 
-fn mark_flush_failed(stats: &Arc<Mutex<WriterStats>>, error: String) {
-    let mut stats = stats.lock().expect("writer stats lock poisoned");
-    stats.flush_failed = true;
-    stats.flush_error = Some(error);
+fn mark_flush_failed(stats: &Arc<AtomicWriterStats>, error: String) {
+    stats.flush_failed.store(true, Ordering::Relaxed);
+    *stats.flush_error.lock().expect("writer flush error lock poisoned") = Some(error);
+}
+
+fn prepare_steps_file(
+    output_dir: &Path,
+    header: &SvsHeaderV1,
+) -> Result<(File, PathBuf, PathBuf), WriterError> {
+    header.validate()?;
+    std::fs::create_dir_all(output_dir)?;
+
+    let final_path = output_dir.join("steps.bin");
+    if final_path.try_exists()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "steps.bin already exists",
+        )
+        .into());
+    }
+
+    let temp_path = output_dir.join(format!(
+        ".steps.bin.{}.{}.tmp",
+        std::process::id(),
+        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
+
+    if let Err(err) = wire::write_header(&mut file, header) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err.into());
+    }
+    file.flush()?;
+
+    Ok((file, temp_path, final_path))
+}
+
+fn persist_temp_no_overwrite(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(temp_path, final_path) {
+        Ok(()) => {
+            std::fs::remove_file(temp_path)?;
+            Ok(())
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(err),
+        Err(_link_err) => {
+            let mut src = File::open(temp_path)?;
+            let mut dst = OpenOptions::new().write(true).create_new(true).open(final_path)?;
+            std::io::copy(&mut src, &mut dst)?;
+            dst.flush()?;
+            dst.sync_all()?;
+            drop(dst);
+            std::fs::remove_file(temp_path)
+        },
+    }
 }
 
 #[cfg(unix)]
@@ -454,8 +570,14 @@ fn saturating_u32(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
+fn nonzero_to_option(value: u64) -> Option<u64> {
+    if value == 0 { None } else { Some(value) }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -478,6 +600,64 @@ mod tests {
         assert_eq!(
             final_status_for_writer_stats(EpisodeStopReason::MaxIterations, &stats),
             EpisodeStatus::Faulted
+        );
+    }
+
+    #[test]
+    fn try_enqueue_does_not_wait_for_stats_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = EpisodeWriter::for_test_with_capacity(dir.path(), 2).unwrap();
+        writer.pause_worker_for_test();
+        let stats = Arc::clone(&writer.stats);
+        let stats_guard = stats.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        let recv_result = thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                tx.send(writer.try_enqueue(SvsStepV1::for_test(0))).unwrap();
+            });
+            let recv_result = rx.recv_timeout(Duration::from_millis(50));
+            drop(stats_guard);
+            handle.join().unwrap();
+            recv_result
+        });
+
+        assert!(matches!(recv_result, Ok(Ok(()))));
+    }
+
+    #[test]
+    fn startup_errors_are_reported_before_returning_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut header = SvsHeaderV1::for_test("20260428T010203Z-test-000000000000");
+        header.reserved = 1;
+
+        assert!(matches!(
+            EpisodeWriter::new(dir.path(), header, 1),
+            Err(WriterError::Wire(_))
+        ));
+    }
+
+    #[test]
+    fn writer_refuses_to_start_when_steps_file_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("steps.bin"), b"existing").unwrap();
+
+        assert!(matches!(
+            EpisodeWriter::for_test_with_capacity(dir.path(), 1),
+            Err(WriterError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn finish_does_not_overwrite_steps_file_created_after_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = EpisodeWriter::for_test_with_capacity(dir.path(), 1).unwrap();
+        std::fs::write(dir.path().join("steps.bin"), b"existing").unwrap();
+
+        assert!(matches!(writer.finish(), Err(WriterError::Io(_))));
+        assert_eq!(
+            std::fs::read(dir.path().join("steps.bin")).unwrap(),
+            b"existing"
         );
     }
 

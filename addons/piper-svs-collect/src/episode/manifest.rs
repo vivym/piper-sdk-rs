@@ -805,9 +805,9 @@ impl CollectorIdentityManifest {
 
 impl StepFileManifest {
     fn validate(&self) -> Result<(), ManifestError> {
-        if self.relative_path.as_os_str().is_empty() {
+        if self.relative_path != Path::new("steps.bin") {
             return Err(ManifestError::InvalidManifest(
-                "step_file.relative_path is required".to_string(),
+                "step_file.relative_path must be exactly steps.bin".to_string(),
             ));
         }
         if self.step_count == 0 && self.last_step_index.is_some() {
@@ -859,6 +859,18 @@ impl ReportJson {
         if self.dual_arm.iterations < self.step_count {
             return Err(ManifestError::InvalidReport(
                 "dual_arm.iterations must be >= step_count".to_string(),
+            ));
+        }
+        if self.status == EpisodeStatus::Complete
+            && (!self.final_flush_result.success
+                || self.final_flush_result.error.is_some()
+                || self.writer.flush_failed
+                || self.writer.queue_full_events > 0
+                || self.writer.dropped_step_count > 0
+                || self.writer.backpressure_threshold_tripped)
+        {
+            return Err(ManifestError::InvalidReport(
+                "complete report cannot contain writer fault indicators".to_string(),
             ));
         }
         Ok(())
@@ -1225,5 +1237,41 @@ mod tests {
         assert!(report.writer.max_queue_depth >= report.writer.final_queue_depth);
         assert_eq!(report.writer.queue_full_stop_events, 2);
         assert_eq!(report.writer.queue_full_stop_duration_ms, 100);
+    }
+
+    #[test]
+    fn complete_report_rejects_writer_fault_indicators() {
+        let mut report = ReportJson::for_test_faulted();
+        report.status = EpisodeStatus::Complete;
+
+        assert!(report.validate().is_err());
+
+        let mut report = ReportJson::for_test_faulted();
+        report.status = EpisodeStatus::Complete;
+        report.final_flush_result.success = true;
+        report.final_flush_result.error = None;
+        report.writer.flush_failed = false;
+        report.writer.queue_full_events = 0;
+        report.writer.dropped_step_count = 0;
+        report.writer.backpressure_threshold_tripped = false;
+        assert!(report.validate().is_ok());
+
+        report.writer.dropped_step_count = 1;
+        assert!(report.validate().is_err());
+    }
+
+    #[test]
+    fn step_file_manifest_rejects_absolute_or_traversal_paths() {
+        let mut manifest = ManifestV1::for_test_complete();
+        manifest.step_file.relative_path = PathBuf::from("/tmp/steps.bin");
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = ManifestV1::for_test_complete();
+        manifest.step_file.relative_path = PathBuf::from("../steps.bin");
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = ManifestV1::for_test_complete();
+        manifest.step_file.relative_path = PathBuf::from("nested/steps.bin");
+        assert!(manifest.validate().is_err());
     }
 }
