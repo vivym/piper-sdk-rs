@@ -31,8 +31,9 @@ gs_usb = [
     "piper-can/gs_usb",
     "target-gs-usb",
 ]
-# Internal markers used only by Cargo target `required-features`.
-target-socketcan = []
+# Target markers used by Cargo target `required-features`.
+# Keep backend deps attached so marker-only example builds have the expected adapter API.
+target-socketcan = ["piper-client/socketcan", "piper-driver/socketcan", "piper-can/socketcan"]
 target-gs-usb = []
 
 [dependencies]

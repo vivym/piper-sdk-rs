@@ -1,9 +1,9 @@
 #[cfg(target_os = "linux")]
 use clap::Parser;
 #[cfg(target_os = "linux")]
-use piper_can::{RawTimestampSample, monotonic_micros};
-#[cfg(target_os = "linux")]
-use piper_sdk::can::{CanAdapter, CanError, SocketCanAdapter, SplittableAdapter};
+use piper_can::{
+    CanAdapter, CanError, RawTimestampSample, SocketCanAdapter, SplittableAdapter, monotonic_micros,
+};
 #[cfg(target_os = "linux")]
 use piper_tools::raw_clock::{
     RawClockEstimator, RawClockHealth, RawClockSample, RawClockThresholds,
@@ -70,6 +70,7 @@ struct ProbeReport {
     left: ProbeSideReport,
     right: ProbeSideReport,
     raw_samples: Vec<ProbeRawFrameSample>,
+    raw_clock_push_errors: Vec<ProbeRawClockPushError>,
     estimated_inter_arm_skew_p95_us: Option<u64>,
     max_estimated_inter_arm_skew_us: Option<u64>,
 }
@@ -83,6 +84,7 @@ struct ProbeReportParts {
     left_timestamp_capabilities: TimestampCapabilitySummary,
     right_timestamp_capabilities: TimestampCapabilitySummary,
     raw_samples: Vec<ProbeRawFrameSample>,
+    raw_clock_push_errors: Vec<ProbeRawClockPushError>,
     skew_samples_us: Vec<u64>,
     left_health: RawClockHealth,
     right_health: RawClockHealth,
@@ -112,6 +114,7 @@ impl ProbeReport {
             left_timestamp_capabilities,
             right_timestamp_capabilities,
             raw_samples,
+            raw_clock_push_errors: Vec::new(),
             skew_samples_us,
             left_health,
             right_health,
@@ -139,14 +142,17 @@ impl ProbeReport {
                 &parts.left_interface,
                 parts.left_health,
                 &parts.raw_samples,
+                &parts.raw_clock_push_errors,
             ),
             right: ProbeSideReport::from_samples(
                 ProbeSide::Right,
                 &parts.right_interface,
                 parts.right_health,
                 &parts.raw_samples,
+                &parts.raw_clock_push_errors,
             ),
             raw_samples: parts.raw_samples,
+            raw_clock_push_errors: parts.raw_clock_push_errors,
             estimated_inter_arm_skew_p95_us,
             max_estimated_inter_arm_skew_us,
         }
@@ -179,6 +185,7 @@ struct ProbeSideReport {
     mapped_sample_count: usize,
     system_timestamp_sample_count: usize,
     hardware_transmit_sample_count: usize,
+    raw_clock_push_error_count: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -188,6 +195,7 @@ impl ProbeSideReport {
         interface: &str,
         health: RawClockHealth,
         samples: &[ProbeRawFrameSample],
+        raw_clock_push_errors: &[ProbeRawClockPushError],
     ) -> Self {
         let side_samples = samples.iter().filter(|sample| sample.side == side);
 
@@ -210,6 +218,10 @@ impl ProbeSideReport {
                 .count(),
             hardware_transmit_sample_count: side_samples
                 .filter(|sample| sample.hw_trans_us.is_some())
+                .count(),
+            raw_clock_push_error_count: raw_clock_push_errors
+                .iter()
+                .filter(|error| error.side == side)
                 .count(),
         }
     }
@@ -289,7 +301,20 @@ struct ProbeRawFrameSample {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Serialize)]
+struct ProbeRawClockPushError {
+    side: ProbeSide,
+    can_id: u32,
+    host_rx_mono_us: u64,
+    hw_raw_us: u64,
+    error: String,
+}
+
+#[cfg(target_os = "linux")]
 fn run_probe(args: &Args) -> Result<ProbeReport, Box<dyn std::error::Error>> {
+    validate_args(args)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+
     let left_metadata = read_interface_metadata(&args.left_interface);
     let right_metadata = read_interface_metadata(&args.right_interface);
     let mut left_timestamp_capabilities = read_timestamp_capabilities(&args.left_interface);
@@ -309,6 +334,7 @@ fn run_probe(args: &Args) -> Result<ProbeReport, Box<dyn std::error::Error>> {
     let mut left_estimator = RawClockEstimator::new(thresholds);
     let mut right_estimator = RawClockEstimator::new(thresholds);
     let mut raw_samples = Vec::new();
+    let mut raw_clock_push_errors = Vec::new();
     let mut skew_samples_us = Vec::new();
     let mut latest_left_mapped = None;
     let mut latest_right_mapped = None;
@@ -325,6 +351,7 @@ fn run_probe(args: &Args) -> Result<ProbeReport, Box<dyn std::error::Error>> {
                     sample,
                     &mut left_estimator,
                     &mut raw_samples,
+                    &mut raw_clock_push_errors,
                     &mut latest_left_mapped,
                 ) {
                     mapped_updated = true;
@@ -341,6 +368,7 @@ fn run_probe(args: &Args) -> Result<ProbeReport, Box<dyn std::error::Error>> {
                     sample,
                     &mut right_estimator,
                     &mut raw_samples,
+                    &mut raw_clock_push_errors,
                     &mut latest_right_mapped,
                 ) {
                     mapped_updated = true;
@@ -369,6 +397,7 @@ fn run_probe(args: &Args) -> Result<ProbeReport, Box<dyn std::error::Error>> {
         left_timestamp_capabilities,
         right_timestamp_capabilities,
         raw_samples,
+        raw_clock_push_errors,
         skew_samples_us,
         left_health,
         right_health,
@@ -381,17 +410,30 @@ fn record_sample(
     sample: RawTimestampSample,
     estimator: &mut RawClockEstimator,
     raw_samples: &mut Vec<ProbeRawFrameSample>,
+    raw_clock_push_errors: &mut Vec<ProbeRawClockPushError>,
     latest_mapped_host_us: &mut Option<u64>,
 ) -> bool {
     let mut mapped_host_us = None;
 
     if let Some(hw_raw_us) = sample.info.hw_raw_us {
-        let _ = estimator.push(RawClockSample {
+        match estimator.push(RawClockSample {
             raw_us: hw_raw_us,
             host_rx_mono_us: sample.info.host_rx_mono_us,
-        });
-        mapped_host_us = estimator.map_raw_us(hw_raw_us);
-        *latest_mapped_host_us = mapped_host_us;
+        }) {
+            Ok(()) => {
+                mapped_host_us = estimator.map_raw_us(hw_raw_us);
+                *latest_mapped_host_us = mapped_host_us;
+            },
+            Err(error) => {
+                raw_clock_push_errors.push(ProbeRawClockPushError {
+                    side,
+                    can_id: sample.info.can_id,
+                    host_rx_mono_us: sample.info.host_rx_mono_us,
+                    hw_raw_us,
+                    error: error.to_string(),
+                });
+            },
+        }
     }
 
     raw_samples.push(ProbeRawFrameSample {
@@ -405,6 +447,18 @@ fn record_sample(
     });
 
     mapped_host_us.is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn validate_args(args: &Args) -> Result<(), String> {
+    if args.left_interface == args.right_interface {
+        return Err(format!(
+            "--left-interface and --right-interface must differ; both were '{}'",
+            args.left_interface
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -652,6 +706,94 @@ mod tests {
         assert_eq!(report.raw_samples.len(), 2);
         assert_eq!(report.max_estimated_inter_arm_skew_us, Some(700));
         assert_eq!(report.estimated_inter_arm_skew_p95_us, Some(700));
+    }
+
+    #[test]
+    fn same_interface_validation_rejects() {
+        let args = Args::parse_from([
+            "socketcan_raw_clock_probe",
+            "--left-interface",
+            "can0",
+            "--right-interface",
+            "can0",
+        ]);
+
+        let err = validate_args(&args).unwrap_err();
+
+        assert!(err.contains("must differ"), "{err}");
+        assert!(err.contains("can0"), "{err}");
+    }
+
+    #[test]
+    fn regression_handling_does_not_update_mapped_or_skew_metrics() {
+        let thresholds = RawClockThresholds {
+            warmup_samples: 2,
+            warmup_window_us: 1_000,
+            residual_p95_us: 10,
+            residual_max_us: 20,
+            drift_abs_ppm: 100.0,
+            sample_gap_max_us: 10_000,
+            last_sample_age_us: 10_000,
+        };
+        let mut estimator = RawClockEstimator::new(thresholds);
+        estimator
+            .push(RawClockSample {
+                raw_us: 10_000,
+                host_rx_mono_us: 110_000,
+            })
+            .unwrap();
+        estimator
+            .push(RawClockSample {
+                raw_us: 11_000,
+                host_rx_mono_us: 111_000,
+            })
+            .unwrap();
+
+        let mut raw_samples = Vec::new();
+        let mut raw_clock_push_errors = Vec::new();
+        let mut latest_mapped_host_us = Some(111_000);
+
+        let mapped_updated = record_sample(
+            ProbeSide::Left,
+            RawTimestampSample {
+                iface: "can0".to_string(),
+                info: piper_can::RawTimestampInfo {
+                    can_id: 0x251,
+                    host_rx_mono_us: 111_500,
+                    system_ts_us: Some(111_510),
+                    hw_trans_us: None,
+                    hw_raw_us: Some(10_500),
+                },
+            },
+            &mut estimator,
+            &mut raw_samples,
+            &mut raw_clock_push_errors,
+            &mut latest_mapped_host_us,
+        );
+
+        assert!(!mapped_updated);
+        assert_eq!(latest_mapped_host_us, Some(111_000));
+        assert_eq!(raw_samples.len(), 1);
+        assert_eq!(raw_samples[0].mapped_host_us, None);
+        assert_eq!(raw_clock_push_errors.len(), 1);
+
+        let report = ProbeReport::from_parts(ProbeReportParts {
+            left_interface: "can0".to_string(),
+            right_interface: "can1".to_string(),
+            left_metadata: ProbeInterfaceMetadata::for_tests("can0"),
+            right_metadata: ProbeInterfaceMetadata::for_tests("can1"),
+            left_timestamp_capabilities: TimestampCapabilitySummary::unknown_for_tests(),
+            right_timestamp_capabilities: TimestampCapabilitySummary::unknown_for_tests(),
+            raw_samples,
+            raw_clock_push_errors,
+            skew_samples_us: Vec::new(),
+            left_health: estimator.health(111_500),
+            right_health: healthy_raw_clock_health(),
+        });
+
+        assert_eq!(report.max_estimated_inter_arm_skew_us, None);
+        assert_eq!(report.left.raw_clock_push_error_count, 1);
+        assert_eq!(report.raw_clock_push_errors.len(), 1);
     }
 
     fn healthy_raw_clock_health() -> RawClockHealth {
