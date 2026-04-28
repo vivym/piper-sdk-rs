@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bincode::Options;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,7 @@ const ENCODING_ID_BINCODE_FIXINT_LE: u16 = 1;
 const STEP_SCHEMA_VERSION: u16 = 1;
 const EPISODE_ID_CAPACITY: usize = 128;
 const TAU_RESIDUAL_TOLERANCE: f64 = 1.0e-9;
+static STEP_FILE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn bincode_options() -> impl bincode::Options {
     bincode::DefaultOptions::new().with_fixint_encoding().with_little_endian()
@@ -566,9 +568,11 @@ pub fn write_steps_file(
     let episode_id = header.episode_id()?.to_string();
     let path = path.as_ref();
     let temp_path = temp_path_for(path);
+    let mut temp_created = false;
 
     let result = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
+        temp_created = true;
         write_header(&mut file, header)?;
         for step in steps {
             write_step(&mut file, step)?;
@@ -580,7 +584,7 @@ pub fn write_steps_file(
         Ok(StepFileSummary::new(episode_id, steps))
     })();
 
-    if result.is_err() {
+    if result.is_err() && temp_created {
         let _ = std::fs::remove_file(&temp_path);
     }
     result
@@ -605,7 +609,7 @@ fn temp_path_for(path: &Path) -> PathBuf {
     path.with_file_name(format!(
         ".{file_name}.{}.{}.tmp",
         std::process::id(),
-        piper_driver::heartbeat::monotonic_micros().max(1)
+        STEP_FILE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
@@ -872,5 +876,13 @@ mod tests {
         assert!(persist_temp_no_overwrite(&temp_dir, &final_path).is_err());
         assert!(!final_path.exists());
         assert!(temp_dir.exists());
+    }
+
+    #[test]
+    fn temp_paths_use_process_local_counter_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("steps.bin");
+
+        assert_ne!(temp_path_for(&final_path), temp_path_for(&final_path));
     }
 }
