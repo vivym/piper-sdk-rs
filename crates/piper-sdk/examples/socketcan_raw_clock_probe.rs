@@ -415,11 +415,16 @@ fn record_sample(
 ) -> bool {
     let mut mapped_host_us = None;
 
-    if let Some(hw_raw_us) = sample.info.hw_raw_us {
-        match estimator.push(RawClockSample {
-            raw_us: hw_raw_us,
-            host_rx_mono_us: sample.info.host_rx_mono_us,
-        }) {
+    if let (Some(hw_raw_us), Some(anchor_us)) =
+        (sample.info.hw_raw_us, raw_clock_anchor_us(&sample.info))
+    {
+        match estimator.push_with_receive_mono_us(
+            RawClockSample {
+                raw_us: hw_raw_us,
+                host_rx_mono_us: anchor_us,
+            },
+            sample.info.host_rx_mono_us,
+        ) {
             Ok(()) => {
                 mapped_host_us = estimator.map_raw_us(hw_raw_us);
                 *latest_mapped_host_us = mapped_host_us;
@@ -450,6 +455,11 @@ fn record_sample(
 }
 
 #[cfg(target_os = "linux")]
+fn raw_clock_anchor_us(info: &piper_can::RawTimestampInfo) -> Option<u64> {
+    info.hw_trans_us.or(info.system_ts_us)
+}
+
+#[cfg(target_os = "linux")]
 fn validate_args(args: &Args) -> Result<(), String> {
     if args.left_interface == args.right_interface {
         return Err(format!(
@@ -471,7 +481,7 @@ fn default_estimator_thresholds(duration_secs: u64) -> RawClockThresholds {
         warmup_window_us,
         residual_p95_us: 500,
         residual_max_us: 2_000,
-        drift_abs_ppm: 100.0,
+        drift_abs_ppm: 500.0,
         sample_gap_max_us: 200_000,
         last_sample_age_us: 1_000_000,
     }
@@ -794,6 +804,58 @@ mod tests {
         assert_eq!(report.max_estimated_inter_arm_skew_us, None);
         assert_eq!(report.left.raw_clock_push_error_count, 1);
         assert_eq!(report.raw_clock_push_errors.len(), 1);
+    }
+
+    #[test]
+    fn record_sample_prefers_kernel_timestamp_anchor_over_userspace_receive_time() {
+        let thresholds = RawClockThresholds {
+            warmup_samples: 4,
+            warmup_window_us: 3_000,
+            residual_p95_us: 20,
+            residual_max_us: 50,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_us: 2_000,
+            last_sample_age_us: 2_000,
+        };
+        let mut estimator = RawClockEstimator::new(thresholds);
+        let mut raw_samples = Vec::new();
+        let mut raw_clock_push_errors = Vec::new();
+        let mut latest_mapped_host_us = None;
+        let mut mapped_updates = 0;
+
+        for (index, receive_delay_us) in [0, 5_000, 0, 5_000].into_iter().enumerate() {
+            let raw_us = 10_000 + index as u64 * 1_000;
+            let system_ts_us = 1_010_000 + index as u64 * 1_000;
+            let host_rx_mono_us = 110_000 + index as u64 * 1_000 + receive_delay_us;
+
+            if record_sample(
+                ProbeSide::Left,
+                RawTimestampSample {
+                    iface: "can0".to_string(),
+                    info: piper_can::RawTimestampInfo {
+                        can_id: 0x251,
+                        host_rx_mono_us,
+                        system_ts_us: Some(system_ts_us),
+                        hw_trans_us: None,
+                        hw_raw_us: Some(raw_us),
+                    },
+                },
+                &mut estimator,
+                &mut raw_samples,
+                &mut raw_clock_push_errors,
+                &mut latest_mapped_host_us,
+            ) {
+                mapped_updates += 1;
+            }
+        }
+
+        let health = estimator.health(118_100);
+        assert!(health.healthy, "{health:?}");
+        assert_eq!(health.residual_p95_us, 0);
+        assert_eq!(health.last_sample_age_us, 100);
+        assert_eq!(latest_mapped_host_us, Some(1_013_000));
+        assert!(mapped_updates > 0);
+        assert!(raw_clock_push_errors.is_empty());
     }
 
     fn healthy_raw_clock_health() -> RawClockHealth {

@@ -497,13 +497,20 @@ impl RawClockRuntimeTiming {
             }
         }
 
+        let anchor_us = raw_clock_anchor_us(side, snapshot)?;
         let sample = RawClockSample {
             raw_us,
-            host_rx_mono_us: snapshot.newest_raw_feedback_timing.host_rx_mono_us,
+            host_rx_mono_us: anchor_us,
         };
         let push_result = match side {
-            RawClockSide::Master => self.master.push(sample),
-            RawClockSide::Slave => self.slave.push(sample),
+            RawClockSide::Master => self.master.push_with_receive_mono_us(
+                sample,
+                snapshot.newest_raw_feedback_timing.host_rx_mono_us,
+            ),
+            RawClockSide::Slave => self.slave.push_with_receive_mono_us(
+                sample,
+                snapshot.newest_raw_feedback_timing.host_rx_mono_us,
+            ),
         };
         map_raw_clock_push_error(side, push_result)?;
         *previous = Some(raw_us);
@@ -1366,6 +1373,11 @@ fn experimental_snapshot_from_aligned(
             side: side.as_str(),
         });
     }
+    if raw_feedback_anchor_us(newest_raw_feedback_timing).is_none() {
+        return Err(RawClockRuntimeError::MissingRawFeedbackTiming {
+            side: side.as_str(),
+        });
+    }
 
     Ok(ExperimentalRawClockSnapshot {
         state: ControlSnapshot {
@@ -1395,6 +1407,21 @@ fn raw_hw_us(
             side: side.as_str(),
         },
     )
+}
+
+fn raw_clock_anchor_us(
+    side: RawClockSide,
+    snapshot: &ExperimentalRawClockSnapshot,
+) -> Result<u64, RawClockRuntimeError> {
+    raw_feedback_anchor_us(snapshot.newest_raw_feedback_timing).ok_or(
+        RawClockRuntimeError::MissingRawFeedbackTiming {
+            side: side.as_str(),
+        },
+    )
+}
+
+fn raw_feedback_anchor_us(timing: piper_driver::RawFeedbackTiming) -> Option<u64> {
+    timing.hw_trans_us.or(timing.system_ts_us)
 }
 
 fn map_raw_clock_push_error(
@@ -1626,12 +1653,20 @@ mod tests {
         raw_us: u64,
         host_rx_mono_us: u64,
     ) -> ExperimentalRawClockSnapshot {
+        raw_clock_snapshot_with_timing_for_tests(raw_us, host_rx_mono_us, host_rx_mono_us)
+    }
+
+    fn raw_clock_snapshot_with_timing_for_tests(
+        raw_us: u64,
+        host_rx_mono_us: u64,
+        system_ts_us: u64,
+    ) -> ExperimentalRawClockSnapshot {
         ExperimentalRawClockSnapshot {
             state: control_snapshot_for_tests(),
             newest_raw_feedback_timing: RawFeedbackTiming {
                 can_id: 0x251,
                 host_rx_mono_us,
-                system_ts_us: Some(host_rx_mono_us),
+                system_ts_us: Some(system_ts_us),
                 hw_trans_us: None,
                 hw_raw_us: Some(raw_us),
             },
@@ -2426,6 +2461,39 @@ mod tests {
         assert_eq!(tick.master_feedback_time_us, 110_000);
         assert_eq!(tick.slave_feedback_time_us, 110_800);
         assert_eq!(tick.inter_arm_skew_us, 800);
+    }
+
+    #[test]
+    fn timing_uses_kernel_timestamp_anchor_for_fit_health() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        timing.seed_ready_for_tests(
+            &[
+                raw_clock_snapshot_with_timing_for_tests(10_000, 110_000, 1_010_000),
+                raw_clock_snapshot_with_timing_for_tests(11_000, 116_000, 1_011_000),
+                raw_clock_snapshot_with_timing_for_tests(12_000, 117_000, 1_012_000),
+                raw_clock_snapshot_with_timing_for_tests(13_000, 118_000, 1_013_000),
+            ],
+            &[
+                raw_clock_snapshot_with_timing_for_tests(20_000, 110_500, 1_010_800),
+                raw_clock_snapshot_with_timing_for_tests(21_000, 116_500, 1_011_800),
+                raw_clock_snapshot_with_timing_for_tests(22_000, 117_500, 1_012_800),
+                raw_clock_snapshot_with_timing_for_tests(23_000, 118_500, 1_013_800),
+            ],
+        );
+        let master = raw_clock_snapshot_with_timing_for_tests(14_000, 119_000, 1_014_000);
+        let slave = raw_clock_snapshot_with_timing_for_tests(24_000, 119_500, 1_014_800);
+
+        let tick = timing.tick_from_snapshots(&master, &slave, 119_600).unwrap();
+
+        assert_eq!(tick.master_feedback_time_us, 1_014_000);
+        assert_eq!(tick.slave_feedback_time_us, 1_014_800);
+        assert_eq!(tick.inter_arm_skew_us, 800);
+        assert!(tick.master_health.healthy, "{:?}", tick.master_health);
+        assert!(tick.slave_health.healthy, "{:?}", tick.slave_health);
+        assert_eq!(tick.master_health.residual_p95_us, 0);
+        assert_eq!(tick.slave_health.residual_p95_us, 0);
+        assert_eq!(tick.master_health.last_sample_age_us, 600);
+        assert_eq!(tick.slave_health.last_sample_age_us, 100);
     }
 
     #[test]

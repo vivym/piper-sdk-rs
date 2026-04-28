@@ -5,6 +5,10 @@ use std::{error::Error, fmt};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawClockSample {
     pub raw_us: u64,
+    /// Timestamp on the common clock used as the fit target. Existing callers
+    /// may pass their receive monotonic timestamp here. SocketCAN raw-clock
+    /// callers should prefer kernel timestamps and pass receive monotonic time
+    /// separately via `push_with_receive_mono_us`.
     pub host_rx_mono_us: u64,
 }
 
@@ -73,10 +77,27 @@ impl Error for RawClockError {}
 
 pub struct RawClockEstimator {
     thresholds: RawClockThresholds,
-    samples: VecDeque<RawClockSample>,
+    samples: VecDeque<TimedRawClockSample>,
     raw_timestamp_regressions: u64,
     slope: Option<f64>,
     offset: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimedRawClockSample {
+    raw_us: u64,
+    host_rx_mono_us: u64,
+    receive_mono_us: u64,
+}
+
+impl TimedRawClockSample {
+    const fn new(sample: RawClockSample, receive_mono_us: u64) -> Self {
+        Self {
+            raw_us: sample.raw_us,
+            host_rx_mono_us: sample.host_rx_mono_us,
+            receive_mono_us,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,6 +124,15 @@ impl RawClockEstimator {
     }
 
     pub fn push(&mut self, sample: RawClockSample) -> Result<(), RawClockError> {
+        self.push_with_receive_mono_us(sample, sample.host_rx_mono_us)
+    }
+
+    pub fn push_with_receive_mono_us(
+        &mut self,
+        sample: RawClockSample,
+        receive_mono_us: u64,
+    ) -> Result<(), RawClockError> {
+        let sample = TimedRawClockSample::new(sample, receive_mono_us);
         if let Some(previous) = self.samples.back()
             && sample.raw_us <= previous.raw_us
         {
@@ -138,7 +168,7 @@ impl RawClockEstimator {
         let last_sample_age_us = self
             .samples
             .back()
-            .map(|sample| now_host_us.saturating_sub(sample.host_rx_mono_us))
+            .map(|sample| now_host_us.saturating_sub(sample.receive_mono_us))
             .unwrap_or(u64::MAX);
 
         let mut residuals = self.residuals();
@@ -202,14 +232,14 @@ impl RawClockEstimator {
         self.offset = Some(offset);
     }
 
-    fn filtered_lower_envelope_samples(&self) -> Vec<RawClockSample> {
+    fn filtered_lower_envelope_samples(&self) -> Vec<TimedRawClockSample> {
         let Some(first_raw_us) = self.samples.front().map(|sample| sample.raw_us) else {
             return Vec::new();
         };
         let bucket_width_us = (self.thresholds.warmup_window_us
             / self.thresholds.warmup_samples.max(1) as u64)
             .max(1);
-        let mut bucketed: Vec<(u64, RawClockSample)> = Vec::new();
+        let mut bucketed: Vec<(u64, TimedRawClockSample)> = Vec::new();
 
         for sample in &self.samples {
             let bucket = sample.raw_us.saturating_sub(first_raw_us) / bucket_width_us;
@@ -326,9 +356,9 @@ impl RawClockEstimator {
 }
 
 fn drop_high_receive_delay_outliers(
-    selected: &[RawClockSample],
+    selected: &[TimedRawClockSample],
     thresholds: RawClockThresholds,
-) -> Vec<RawClockSample> {
+) -> Vec<TimedRawClockSample> {
     let fit_outlier_us = thresholds.residual_p95_us.min(thresholds.residual_max_us).max(50) as f64;
 
     selected
@@ -361,7 +391,7 @@ fn drop_high_receive_delay_outliers(
         .collect()
 }
 
-fn fit_line(selected: &[RawClockSample]) -> Option<(f64, f64)> {
+fn fit_line(selected: &[TimedRawClockSample]) -> Option<(f64, f64)> {
     if selected.len() < 2 {
         return None;
     }
@@ -557,5 +587,30 @@ mod tests {
             (mapped as i64 - 112_500).abs() <= 20,
             "positive receive-delay outlier must not pull the fit upward: {mapped}"
         );
+    }
+
+    #[test]
+    fn receive_mono_age_is_separate_from_fit_anchor() {
+        let thresholds = RawClockThresholds {
+            warmup_samples: 4,
+            warmup_window_us: 3_000,
+            residual_p95_us: 20,
+            residual_max_us: 50,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_us: 2_000,
+            last_sample_age_us: 2_000,
+        };
+        let mut estimator = RawClockEstimator::new(thresholds);
+
+        estimator.push_with_receive_mono_us(sample(10_000, 1_010_000), 110_000).unwrap();
+        estimator.push_with_receive_mono_us(sample(11_000, 1_011_000), 115_000).unwrap();
+        estimator.push_with_receive_mono_us(sample(12_000, 1_012_000), 120_000).unwrap();
+        estimator.push_with_receive_mono_us(sample(13_000, 1_013_000), 123_000).unwrap();
+
+        let health = estimator.health(123_100);
+        assert!(health.healthy, "{health:?}");
+        assert_eq!(health.residual_p95_us, 0);
+        assert_eq!(health.last_sample_age_us, 100);
+        assert_eq!(estimator.map_raw_us(12_500), Some(1_012_500));
     }
 }
