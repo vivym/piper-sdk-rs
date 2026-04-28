@@ -31,6 +31,8 @@ pub enum CueError {
     InvalidDt,
     #[error("{field} produced a non-finite value")]
     NonFiniteOutput { field: &'static str },
+    #[error("invalid profile: {0}")]
+    InvalidProfile(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,10 +109,20 @@ impl FeedbackHistory {
             return;
         }
 
-        while self.entries.len() >= self.capacity {
-            self.entries.pop_front();
-        }
         self.entries.push_back(feedback);
+        while self.entries.len() > self.capacity {
+            if let Some(oldest_index) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.master_tx_finished_host_mono_us)
+                .map(|(index, _)| index)
+            {
+                self.entries.remove(oldest_index);
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn select_for_dynamic_rx(&self, master_dynamic_host_rx_mono_us: u64) -> [f64; 6] {
@@ -140,10 +152,8 @@ impl FeedbackHistory {
 
 impl SvsCueState {
     pub fn new(profile: &CueProfile, frames: &FramesProfile) -> Result<Self, CueError> {
-        validate_positive("cue.dls_lambda", profile.dls_lambda)?;
-        validate_positive("cue.max_jacobian_condition", profile.max_jacobian_condition)?;
-        validate_positive("cue.master_lpf_cutoff_hz", profile.master_lpf_cutoff_hz)?;
-        validate_positive("cue.slave_lpf_cutoff_hz", profile.slave_lpf_cutoff_hz)?;
+        profile.validate().map_err(|err| CueError::InvalidProfile(err.to_string()))?;
+        frames.validate().map_err(|err| CueError::InvalidProfile(err.to_string()))?;
 
         Ok(Self {
             profile: profile.clone(),
@@ -223,13 +233,13 @@ impl SvsCueState {
 
         let dt_sec = dt_us as f64 / 1_000_000.0;
         let u_ee = lpf_vec3(
-            &mut self.master_lpf_state,
+            self.master_lpf_state,
             u_ee_raw,
             self.profile.master_lpf_cutoff_hz,
             dt_sec,
         );
         let r_ee = lpf_vec3(
-            &mut self.slave_lpf_state,
+            self.slave_lpf_state,
             r_ee_raw,
             self.profile.slave_lpf_cutoff_hz,
             dt_sec,
@@ -237,6 +247,9 @@ impl SvsCueState {
 
         validate_finite_array3("u_ee", &u_ee)?;
         validate_finite_array3("r_ee", &r_ee)?;
+
+        self.master_lpf_state = u_ee;
+        self.slave_lpf_state = r_ee;
 
         Ok(SvsCueOutput {
             tau_master_effort_residual_nm,
@@ -350,20 +363,6 @@ fn validate_condition(field: &'static str, condition: f64, max: f64) -> Result<(
     Ok(())
 }
 
-fn validate_positive(field: &'static str, value: f64) -> Result<(), CueError> {
-    if !value.is_finite() {
-        return Err(CueError::NonFiniteInput { field });
-    }
-    if value <= 0.0 {
-        return Err(match field {
-            "cue.max_jacobian_condition" => CueError::InvalidJacobianConditionLimit,
-            "cue.dls_lambda" => CueError::InvalidDamping,
-            _ => CueError::NonFiniteInput { field },
-        });
-    }
-    Ok(())
-}
-
 fn validate_finite_array3(field: &'static str, values: &[f64; 3]) -> Result<(), CueError> {
     if values.iter().any(|value| !value.is_finite()) {
         return Err(CueError::NonFiniteInput { field });
@@ -404,11 +403,12 @@ fn subtract6(lhs: [f64; 6], rhs: [f64; 6]) -> [f64; 6] {
     ]
 }
 
-fn lpf_vec3(state: &mut [f64; 3], input: [f64; 3], cutoff_hz: f64, dt_sec: f64) -> [f64; 3] {
-    state[0] = lpf_update(state[0], input[0], cutoff_hz, dt_sec);
-    state[1] = lpf_update(state[1], input[1], cutoff_hz, dt_sec);
-    state[2] = lpf_update(state[2], input[2], cutoff_hz, dt_sec);
-    *state
+fn lpf_vec3(state: [f64; 3], input: [f64; 3], cutoff_hz: f64, dt_sec: f64) -> [f64; 3] {
+    [
+        lpf_update(state[0], input[0], cutoff_hz, dt_sec),
+        lpf_update(state[1], input[1], cutoff_hz, dt_sec),
+        lpf_update(state[2], input[2], cutoff_hz, dt_sec),
+    ]
 }
 
 fn lpf_update(y: f64, x: f64, cutoff_hz: f64, dt_sec: f64) -> f64 {
@@ -421,6 +421,35 @@ fn lpf_update(y: f64, x: f64, cutoff_hz: f64, dt_sec: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn ee_with_jacobian(translational_jacobian_base: [[f64; 6]; 3]) -> EndEffectorKinematics {
+        EndEffectorKinematics {
+            position_base_m: [0.0; 3],
+            rotation_base_from_ee: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translational_jacobian_base,
+            jacobian_condition: 1.0,
+        }
+    }
+
+    fn identity_jacobian() -> [[f64; 6]; 3] {
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ]
+    }
+
+    fn cue_input(master_tau_measured_nm: [f64; 6]) -> SvsCueInput {
+        SvsCueInput {
+            master_dynamic_host_rx_mono_us: 0,
+            master_tau_measured_nm,
+            master_tau_model_nm: [0.0; 6],
+            slave_tau_measured_nm: [0.0; 6],
+            slave_tau_model_nm: [0.0; 6],
+            master_ee: ee_with_jacobian(identity_jacobian()),
+            slave_ee: ee_with_jacobian(identity_jacobian()),
+        }
+    }
+
     #[test]
     fn dls_uses_lambda_squared() {
         let j = [
@@ -431,6 +460,21 @@ mod tests {
         let tau = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let cue = dls_task_space_proxy(&j, &tau, 2.0).unwrap();
         assert!((cue[0] - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dls_rejects_condition_above_limit() {
+        let j = [
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0e-6, 0.0, 0.0, 0.0],
+        ];
+        let tau = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        assert!(matches!(
+            dls_task_space_proxy_with_condition_limit(&j, &tau, 0.1, 10.0),
+            Err(CueError::JacobianCondition { .. })
+        ));
     }
 
     #[test]
@@ -446,5 +490,65 @@ mod tests {
             },
         ]);
         assert_eq!(history.select_for_dynamic_rx(150), [1.0; 6]);
+    }
+
+    #[test]
+    fn feedback_history_capacity_evicts_oldest_timestamp() {
+        let mut history = FeedbackHistory::new(2);
+        history.push(AppliedMasterFeedback {
+            master_tx_finished_host_mono_us: 200,
+            shaped_master_interaction_nm: [2.0; 6],
+        });
+        history.push(AppliedMasterFeedback {
+            master_tx_finished_host_mono_us: 100,
+            shaped_master_interaction_nm: [1.0; 6],
+        });
+        history.push(AppliedMasterFeedback {
+            master_tx_finished_host_mono_us: 300,
+            shaped_master_interaction_nm: [3.0; 6],
+        });
+
+        assert_eq!(history.select_for_dynamic_rx(250), [2.0; 6]);
+    }
+
+    #[test]
+    fn cue_state_rejects_non_orthonormal_master_to_slave_rotation() {
+        let frames = FramesProfile {
+            master_to_slave_rotation: [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+
+        assert!(SvsCueState::new(&CueProfile::default(), &frames).is_err());
+    }
+
+    #[test]
+    fn cue_update_failure_does_not_commit_lpf_state() {
+        let profile = CueProfile {
+            master_lpf_cutoff_hz: 1.0e300,
+            slave_lpf_cutoff_hz: 1.0e300,
+            ..CueProfile::default()
+        };
+        let mut state = SvsCueState::new(&profile, &FramesProfile::default()).unwrap();
+        let history = FeedbackHistory::default();
+
+        state
+            .update(
+                &cue_input([f64::MAX, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                &history,
+                5_000,
+            )
+            .unwrap();
+        let lpf_before_failure = state.master_lpf_state;
+
+        assert!(
+            state
+                .update(
+                    &cue_input([-f64::MAX, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                    &history,
+                    5_000,
+                )
+                .is_err()
+        );
+
+        assert_eq!(state.master_lpf_state, lpf_before_failure);
     }
 }

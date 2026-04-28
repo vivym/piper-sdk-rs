@@ -67,6 +67,9 @@ impl SvsStiffnessState {
     }
 
     pub fn from_effective_profile(profile: &EffectiveProfile) -> Result<Self, StiffnessError> {
+        profile
+            .validate()
+            .map_err(|err| StiffnessError::InvalidProfile(err.to_string()))?;
         Self::with_profiles(
             &profile.stiffness,
             &profile.contact,
@@ -81,10 +84,14 @@ impl SvsStiffnessState {
         cue: &CueProfile,
         loop_frequency_hz: f64,
     ) -> Result<Self, StiffnessError> {
-        validate_stiffness_profile(stiffness)?;
-        validate_contact_profile(contact)?;
-        validate_cue_profile(cue)?;
-        validate_positive("control.loop_frequency_hz", loop_frequency_hz)?;
+        stiffness
+            .validate()
+            .map_err(|err| StiffnessError::InvalidProfile(err.to_string()))?;
+        contact
+            .validate()
+            .map_err(|err| StiffnessError::InvalidProfile(err.to_string()))?;
+        cue.validate().map_err(|err| StiffnessError::InvalidProfile(err.to_string()))?;
+        validate_loop_frequency(loop_frequency_hz)?;
 
         let min_hold_ticks =
             ((contact.min_hold_ms as f64 * loop_frequency_hz) / 1000.0).ceil().max(1.0) as u64;
@@ -115,11 +122,11 @@ impl SvsStiffnessState {
         validate_finite_array3("u_ee", &u_ee)?;
         validate_finite_array3("r_ee", &r_ee)?;
 
-        self.update_contact_state(norm3(r_ee));
+        let (contact_state, enter_ticks, exit_ticks) = self.next_contact_state(norm3(r_ee));
 
         let phi_u = phi_vec3(u_ee, &self.cue.master_phi)?;
         let phi_r = phi_vec3(r_ee, &self.cue.slave_phi)?;
-        let base = match self.contact_state {
+        let base = match contact_state {
             SvsContactState::Free => self.stiffness.k_base_free,
             SvsContactState::Contact => self.stiffness.k_base_contact,
         };
@@ -139,11 +146,12 @@ impl SvsStiffnessState {
         );
         let dt_sec = dt_us as f64 / 1_000_000.0;
         let k_lpf = lpf_vec3(
-            &mut self.k_lpf_state_n_per_m,
+            self.k_lpf_state_n_per_m,
             k_state_clipped_n_per_m,
             self.stiffness.lpf_cutoff_hz,
             dt_sec,
         );
+        validate_finite_array3("k_lpf_n_per_m", &k_lpf)?;
         let k_tele_n_per_m = rate_limit_vec3(
             self.previous_k_tele_n_per_m,
             k_lpf,
@@ -153,184 +161,62 @@ impl SvsStiffnessState {
             self.stiffness.k_max,
         );
         validate_finite_array3("k_tele_n_per_m", &k_tele_n_per_m)?;
+        self.contact_state = contact_state;
+        self.enter_ticks = enter_ticks;
+        self.exit_ticks = exit_ticks;
+        self.k_lpf_state_n_per_m = k_lpf;
         self.previous_k_tele_n_per_m = k_tele_n_per_m;
 
         Ok(SvsStiffnessOutput {
-            contact_state: self.contact_state,
+            contact_state,
             k_state_raw_n_per_m,
             k_state_clipped_n_per_m,
             k_tele_n_per_m,
         })
     }
 
-    fn update_contact_state(&mut self, residual_norm: f64) {
+    fn next_contact_state(&self, residual_norm: f64) -> (SvsContactState, u64, u64) {
         match self.contact_state {
             SvsContactState::Free => {
+                let mut enter_ticks = self.enter_ticks;
                 if residual_norm >= self.contact.residual_enter {
-                    self.enter_ticks = self.enter_ticks.saturating_add(1);
+                    enter_ticks = enter_ticks.saturating_add(1);
                 } else {
-                    self.enter_ticks = 0;
+                    enter_ticks = 0;
                 }
 
-                if self.enter_ticks >= self.min_hold_ticks {
-                    self.contact_state = SvsContactState::Contact;
-                    self.enter_ticks = 0;
-                    self.exit_ticks = 0;
+                if enter_ticks >= self.min_hold_ticks {
+                    (SvsContactState::Contact, 0, 0)
+                } else {
+                    (SvsContactState::Free, enter_ticks, self.exit_ticks)
                 }
             },
             SvsContactState::Contact => {
+                let mut exit_ticks = self.exit_ticks;
                 if residual_norm <= self.contact.residual_exit {
-                    self.exit_ticks = self.exit_ticks.saturating_add(1);
+                    exit_ticks = exit_ticks.saturating_add(1);
                 } else {
-                    self.exit_ticks = 0;
+                    exit_ticks = 0;
                 }
 
-                if self.exit_ticks >= self.min_hold_ticks {
-                    self.contact_state = SvsContactState::Free;
-                    self.enter_ticks = 0;
-                    self.exit_ticks = 0;
+                if exit_ticks >= self.min_hold_ticks {
+                    (SvsContactState::Free, 0, 0)
+                } else {
+                    (SvsContactState::Contact, self.enter_ticks, exit_ticks)
                 }
             },
         }
     }
 }
 
-fn validate_stiffness_profile(profile: &StiffnessProfile) -> Result<(), StiffnessError> {
-    validate_finite_array3("stiffness.k_min", &profile.k_min)?;
-    validate_finite_array3("stiffness.k_max", &profile.k_max)?;
-    validate_finite_array3("stiffness.k_base_free", &profile.k_base_free)?;
-    validate_finite_array3("stiffness.k_base_contact", &profile.k_base_contact)?;
-    validate_finite_array3(
-        "stiffness.max_delta_per_second",
-        &profile.max_delta_per_second,
-    )?;
-    validate_positive("stiffness.lpf_cutoff_hz", profile.lpf_cutoff_hz)?;
-
-    for (axis, (&k_min, &k_max)) in profile.k_min.iter().zip(profile.k_max.iter()).enumerate() {
-        if k_min < 0.0 {
-            return Err(StiffnessError::InvalidProfile(format!(
-                "stiffness.k_min[{axis}] must be non-negative"
-            )));
-        }
-        if k_min >= k_max {
-            return Err(StiffnessError::InvalidProfile(format!(
-                "stiffness.k_min[{axis}] must be less than stiffness.k_max[{axis}]"
-            )));
-        }
-    }
-
-    validate_base_in_limits(
-        "stiffness.k_base_free",
-        profile.k_base_free,
-        profile.k_min,
-        profile.k_max,
-    )?;
-    validate_base_in_limits(
-        "stiffness.k_base_contact",
-        profile.k_base_contact,
-        profile.k_min,
-        profile.k_max,
-    )?;
-
-    for (axis, value) in profile.max_delta_per_second.iter().copied().enumerate() {
-        if value < 0.0 {
-            return Err(StiffnessError::InvalidProfile(format!(
-                "stiffness.max_delta_per_second[{axis}] must be non-negative"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_contact_profile(profile: &ContactProfile) -> Result<(), StiffnessError> {
-    validate_positive_or_zero("contact.residual_enter", profile.residual_enter)?;
-    validate_positive_or_zero("contact.residual_exit", profile.residual_exit)?;
-    if profile.residual_enter <= profile.residual_exit {
-        return Err(StiffnessError::InvalidProfile(
-            "contact.residual_enter must be greater than contact.residual_exit".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_cue_profile(profile: &CueProfile) -> Result<(), StiffnessError> {
-    validate_matrix3("cue.w_u", &profile.w_u)?;
-    validate_matrix3("cue.w_r", &profile.w_r)?;
-    validate_phi_profile("cue.master_phi", &profile.master_phi)?;
-    validate_phi_profile("cue.slave_phi", &profile.slave_phi)
-}
-
-fn validate_phi_profile(prefix: &'static str, profile: &PhiProfile) -> Result<(), StiffnessError> {
-    for (axis, mode) in profile.mode.iter().enumerate() {
-        if !matches!(
-            mode.as_str(),
-            PHI_MODE_SIGNED | PHI_MODE_ABSOLUTE | PHI_MODE_POSITIVE | PHI_MODE_NEGATIVE
-        ) {
-            return Err(StiffnessError::UnsupportedPhiMode(format!(
-                "{prefix}.mode[{axis}]={mode}"
-            )));
-        }
-    }
-    validate_finite_array3("phi.deadband", &profile.deadband)?;
-    validate_finite_array3("phi.scale", &profile.scale)?;
-    validate_finite_array3("phi.limit", &profile.limit)?;
-
-    for (axis, (&deadband, &limit)) in profile.deadband.iter().zip(profile.limit.iter()).enumerate()
-    {
-        if deadband < 0.0 {
-            return Err(StiffnessError::InvalidProfile(format!(
-                "{prefix}.deadband[{axis}] must be non-negative"
-            )));
-        }
-        if limit <= 0.0 {
-            return Err(StiffnessError::InvalidProfile(format!(
-                "{prefix}.limit[{axis}] must be positive"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_base_in_limits(
-    name: &str,
-    values: [f64; 3],
-    mins: [f64; 3],
-    maxes: [f64; 3],
-) -> Result<(), StiffnessError> {
-    for (axis, ((&value, &min), &max)) in
-        values.iter().zip(mins.iter()).zip(maxes.iter()).enumerate()
-    {
-        if value < min || value > max {
-            return Err(StiffnessError::InvalidProfile(format!(
-                "{name}[{axis}] must be within stiffness limits"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_positive(field: &'static str, value: f64) -> Result<(), StiffnessError> {
+fn validate_loop_frequency(value: f64) -> Result<(), StiffnessError> {
+    let field = "control.loop_frequency_hz";
     if !value.is_finite() {
         return Err(StiffnessError::NonFiniteInput { field });
     }
-    if value <= 0.0 {
+    if value.to_bits() != DEFAULT_LOOP_FREQUENCY_HZ.to_bits() {
         return Err(StiffnessError::InvalidProfile(format!(
-            "{field} must be positive"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_positive_or_zero(field: &'static str, value: f64) -> Result<(), StiffnessError> {
-    if !value.is_finite() {
-        return Err(StiffnessError::NonFiniteInput { field });
-    }
-    if value < 0.0 {
-        return Err(StiffnessError::InvalidProfile(format!(
-            "{field} must be non-negative"
+            "{field} must be exactly {DEFAULT_LOOP_FREQUENCY_HZ}"
         )));
     }
     Ok(())
@@ -338,13 +224,6 @@ fn validate_positive_or_zero(field: &'static str, value: f64) -> Result<(), Stif
 
 fn validate_finite_array3(field: &'static str, values: &[f64; 3]) -> Result<(), StiffnessError> {
     if values.iter().any(|value| !value.is_finite()) {
-        return Err(StiffnessError::NonFiniteInput { field });
-    }
-    Ok(())
-}
-
-fn validate_matrix3(field: &'static str, matrix: &[[f64; 3]; 3]) -> Result<(), StiffnessError> {
-    if matrix.iter().flat_map(|row| row.iter()).any(|value| !value.is_finite()) {
         return Err(StiffnessError::NonFiniteInput { field });
     }
     Ok(())
@@ -399,11 +278,12 @@ fn clip_vec3(values: [f64; 3], mins: [f64; 3], maxes: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-fn lpf_vec3(state: &mut [f64; 3], input: [f64; 3], cutoff_hz: f64, dt_sec: f64) -> [f64; 3] {
-    state[0] = lpf_update(state[0], input[0], cutoff_hz, dt_sec);
-    state[1] = lpf_update(state[1], input[1], cutoff_hz, dt_sec);
-    state[2] = lpf_update(state[2], input[2], cutoff_hz, dt_sec);
-    *state
+fn lpf_vec3(state: [f64; 3], input: [f64; 3], cutoff_hz: f64, dt_sec: f64) -> [f64; 3] {
+    [
+        lpf_update(state[0], input[0], cutoff_hz, dt_sec),
+        lpf_update(state[1], input[1], cutoff_hz, dt_sec),
+        lpf_update(state[2], input[2], cutoff_hz, dt_sec),
+    ]
 }
 
 fn lpf_update(y: f64, x: f64, cutoff_hz: f64, dt_sec: f64) -> f64 {
@@ -439,7 +319,9 @@ fn rate_limit_axis(previous: f64, target: f64, max_delta_per_second: f64, dt_sec
 mod tests {
     use super::*;
 
-    use crate::profile::{ContactProfile, CueProfile, StiffnessProfile};
+    use crate::profile::{
+        ContactProfile, CueProfile, EffectiveProfile, PhiProfile, StiffnessProfile,
+    };
 
     #[test]
     fn stiffness_clips_before_lpf_and_rate_limit() {
@@ -458,5 +340,137 @@ mod tests {
         assert!(output.k_state_raw_n_per_m[0] > profile.k_max[0]);
         assert_eq!(output.k_state_clipped_n_per_m[0], profile.k_max[0]);
         assert!(output.k_tele_n_per_m[0] <= profile.k_max[0]);
+    }
+
+    #[test]
+    fn from_effective_profile_rejects_negative_phi_scale() {
+        let mut profile = EffectiveProfile::default_for_tests();
+        profile.cue.master_phi.scale[0] = -1.0;
+
+        assert!(profile.validate().is_err());
+        assert!(SvsStiffnessState::from_effective_profile(&profile).is_err());
+    }
+
+    #[test]
+    fn from_effective_profile_rejects_stiffness_bounds_outside_profile_range() {
+        let mut profile = EffectiveProfile::default_for_tests();
+        profile.stiffness.k_max[0] = 5_000.1;
+
+        assert!(profile.validate().is_err());
+        assert!(SvsStiffnessState::from_effective_profile(&profile).is_err());
+    }
+
+    #[test]
+    fn from_effective_profile_rejects_non_profile_loop_frequency() {
+        let mut profile = EffectiveProfile::default_for_tests();
+        profile.control.loop_frequency_hz = 199.0;
+
+        assert!(profile.validate().is_err());
+        assert!(SvsStiffnessState::from_effective_profile(&profile).is_err());
+    }
+
+    #[test]
+    fn stiffness_update_failure_does_not_commit_contact_or_filter_state() {
+        let profile = StiffnessProfile::test_with_limits([50.0; 3], [100.0; 3]);
+        let contact = ContactProfile {
+            residual_enter: 1.0,
+            residual_exit: 0.5,
+            min_hold_ms: 1,
+        };
+        let mut cue = CueProfile {
+            w_u: [[f64::MAX, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ..CueProfile::default()
+        };
+        cue.master_phi.deadband = [0.0; 3];
+
+        let mut state = SvsStiffnessState::with_profiles(&profile, &contact, &cue, 200.0).unwrap();
+        let lpf_before_failure = state.k_lpf_state_n_per_m;
+        let previous_k_before_failure = state.previous_k_tele_n_per_m;
+
+        assert!(state.update([2.0, 0.0, 0.0], [1.0, 0.0, 0.0], 5_000).is_err());
+
+        assert_eq!(state.contact_state, SvsContactState::Free);
+        assert_eq!(state.enter_ticks, 0);
+        assert_eq!(state.exit_ticks, 0);
+        assert_eq!(state.k_lpf_state_n_per_m, lpf_before_failure);
+        assert_eq!(state.previous_k_tele_n_per_m, previous_k_before_failure);
+    }
+
+    #[test]
+    fn contact_hysteresis_uses_min_hold_ticks() {
+        let profile = StiffnessProfile::test_with_limits([50.0; 3], [100.0; 3]);
+        let contact = ContactProfile {
+            residual_enter: 1.0,
+            residual_exit: 0.5,
+            min_hold_ms: 10,
+        };
+        let mut state =
+            SvsStiffnessState::with_profiles(&profile, &contact, &CueProfile::default(), 200.0)
+                .unwrap();
+
+        assert_eq!(
+            state.update([0.0; 3], [1.0, 0.0, 0.0], 5_000).unwrap().contact_state,
+            SvsContactState::Free
+        );
+        assert_eq!(
+            state.update([0.0; 3], [1.0, 0.0, 0.0], 5_000).unwrap().contact_state,
+            SvsContactState::Contact
+        );
+        assert_eq!(
+            state.update([0.0; 3], [0.0; 3], 5_000).unwrap().contact_state,
+            SvsContactState::Contact
+        );
+        assert_eq!(
+            state.update([0.0; 3], [0.0; 3], 5_000).unwrap().contact_state,
+            SvsContactState::Free
+        );
+    }
+
+    #[test]
+    fn stiffness_lpf_uses_profile_formula_before_rate_limit() {
+        let mut profile = StiffnessProfile::test_with_limits([0.0; 3], [1_000.0; 3]);
+        profile.lpf_cutoff_hz = 10.0;
+        profile.max_delta_per_second = [1.0e9; 3];
+
+        let mut cue = CueProfile {
+            w_u: [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ..CueProfile::default()
+        };
+        cue.master_phi.deadband = [0.0; 3];
+        cue.master_phi.limit = [1_000.0; 3];
+
+        let mut state =
+            SvsStiffnessState::with_profiles(&profile, &ContactProfile::default(), &cue, 200.0)
+                .unwrap();
+        let output = state.update([100.0, 0.0, 0.0], [0.0; 3], 5_000).unwrap();
+        let dt_sec = 5_000.0 / 1_000_000.0;
+        let rc = 1.0 / (2.0 * std::f64::consts::PI * profile.lpf_cutoff_hz);
+        let alpha = dt_sec / (rc + dt_sec);
+
+        assert!((output.k_tele_n_per_m[0] - alpha * 100.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn phi_modes_apply_deadband_scale_and_limit() {
+        let mut phi = PhiProfile {
+            deadband: [1.0; 3],
+            scale: [2.0; 3],
+            limit: [10.0; 3],
+            ..PhiProfile::default()
+        };
+
+        phi.mode[0] = "signed".to_string();
+        assert_eq!(phi_axis(-3.0, &phi, 0).unwrap(), -4.0);
+
+        phi.mode[0] = "absolute".to_string();
+        assert_eq!(phi_axis(-3.0, &phi, 0).unwrap(), 4.0);
+
+        phi.mode[0] = "positive".to_string();
+        assert_eq!(phi_axis(3.0, &phi, 0).unwrap(), 4.0);
+        assert_eq!(phi_axis(-3.0, &phi, 0).unwrap(), 0.0);
+
+        phi.mode[0] = "negative".to_string();
+        assert_eq!(phi_axis(-3.0, &phi, 0).unwrap(), 4.0);
+        assert_eq!(phi_axis(3.0, &phi, 0).unwrap(), 0.0);
     }
 }

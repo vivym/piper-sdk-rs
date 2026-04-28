@@ -587,7 +587,7 @@ impl StiffnessProfile {
         }
     }
 
-    fn validate(&self) -> Result<(), ProfileError> {
+    pub(crate) fn validate(&self) -> Result<(), ProfileError> {
         for (axis, ((k_min, k_max), (k_base_free, k_base_contact))) in self
             .k_min
             .iter()
@@ -622,7 +622,7 @@ impl StiffnessProfile {
 }
 
 impl ContactProfile {
-    fn validate(&self) -> Result<(), ProfileError> {
+    pub(crate) fn validate(&self) -> Result<(), ProfileError> {
         validate_non_negative("contact.residual_enter", self.residual_enter)?;
         validate_non_negative("contact.residual_exit", self.residual_exit)?;
         if self.residual_enter <= self.residual_exit {
@@ -633,7 +633,7 @@ impl ContactProfile {
 }
 
 impl FramesProfile {
-    fn validate(&self) -> Result<(), ProfileError> {
+    pub(crate) fn validate(&self) -> Result<(), ProfileError> {
         validate_matrix_finite(
             "frames.master_to_slave_rotation",
             &self.master_to_slave_rotation,
@@ -713,7 +713,7 @@ impl MujocoProfile {
 }
 
 impl CueProfile {
-    fn validate(&self) -> Result<(), ProfileError> {
+    pub(crate) fn validate(&self) -> Result<(), ProfileError> {
         validate_positive("cue.dls_lambda", self.dls_lambda)?;
         validate_positive("cue.max_jacobian_condition", self.max_jacobian_condition)?;
         validate_positive("cue.master_lpf_cutoff_hz", self.master_lpf_cutoff_hz)?;
