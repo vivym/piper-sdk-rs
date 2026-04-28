@@ -2925,11 +2925,13 @@ fn parse_and_update_state(
                 }
 
                 let host_rx_mono_us = receive_host_rx_mono_us;
+                let alignment_timestamp_us =
+                    group_alignment_timestamp(frame, host_rx_mono_us, backend_capability);
                 state.pending_joint_dynamic.joint_vel[joint_index] = feedback.speed();
                 state.pending_joint_dynamic.joint_current[joint_index] = feedback.current();
-                state.pending_joint_dynamic.timestamps[joint_index] = frame.timestamp_us();
+                state.pending_joint_dynamic.timestamps[joint_index] = alignment_timestamp_us;
                 state.pending_joint_dynamic.group_host_rx_mono_us = host_rx_mono_us;
-                state.pending_joint_dynamic.group_timestamp_us = frame.timestamp_us();
+                state.pending_joint_dynamic.group_timestamp_us = alignment_timestamp_us;
                 state.pending_joint_dynamic.raw_feedback_timing = RawFeedbackTiming::newest(
                     state.pending_joint_dynamic.raw_feedback_timing,
                     raw_feedback,
@@ -2940,7 +2942,7 @@ fn parse_and_update_state(
                     state.pending_velocity_started_at = Some(now);
                 }
                 state.vel_update_mask |= 1 << joint_index;
-                state.last_vel_packet_time_us = frame.timestamp_us();
+                state.last_vel_packet_time_us = alignment_timestamp_us;
                 state.pending_joint_dynamic.valid_mask = state.vel_update_mask;
 
                 if state.vel_update_mask == 0b111111 {
@@ -2948,7 +2950,7 @@ fn parse_and_update_state(
                         ctx,
                         backend_capability,
                         state,
-                        frame.timestamp_us(),
+                        alignment_timestamp_us,
                         None,
                         true,
                         metrics,
@@ -4903,7 +4905,7 @@ mod tests {
                 &metrics,
                 &config,
                 BackendCapability::SoftRealtime,
-                received_with_hw_raw(frame, 10_000 + index as u64),
+                received_with_hw_raw(frame, 20_001 + index as u64),
             );
         }
 
@@ -4926,6 +4928,23 @@ mod tests {
         assert!(view.pair.dynamic_sequence > 0);
         assert!(view.pair.joint_position.raw_feedback_timing.is_some());
         assert!(view.pair.joint_dynamic.raw_feedback_timing.is_some());
+        assert_eq!(view.pair.joint_dynamic.group_timestamp_us, 20_006);
+        assert_eq!(view.pair.joint_dynamic.group_host_rx_mono_us, 20_006);
+        assert_eq!(
+            view.pair.joint_dynamic.timestamps,
+            [20_001, 20_002, 20_003, 20_004, 20_005, 20_006]
+        );
+        let time_diff = view
+            .pair
+            .joint_position
+            .hardware_timestamp_us
+            .abs_diff(view.pair.joint_dynamic.group_timestamp_us);
+        assert!(
+            time_diff <= 5_000,
+            "SoftRealtime raw-clock groups must share host epoch for get_aligned_motion(), diff={time_diff}, position_ts={}, dynamic_ts={}",
+            view.pair.joint_position.hardware_timestamp_us,
+            view.pair.joint_dynamic.group_timestamp_us
+        );
     }
 
     #[test]
