@@ -52,6 +52,7 @@ piper-control = { workspace = true }
 piper-tools = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 clap = { workspace = true }
 proptest = { workspace = true }
 ctrlc = { workspace = true }
@@ -75,6 +76,11 @@ required-features = ["target-gs-usb"]
 [[example]]
 name = "iface_check"
 path = "examples/iface_check.rs"
+required-features = ["target-socketcan"]
+
+[[example]]
+name = "socketcan_raw_clock_probe"
+path = "examples/socketcan_raw_clock_probe.rs"
 required-features = ["target-socketcan"]
 
 [[test]]

@@ -1286,6 +1286,7 @@ dependencies = [
  "proptest",
  "rand 0.8.6",
  "rusb",
+ "serde",
  "serde_json",
  "socketcan",
  "tokio",

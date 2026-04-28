@@ -97,6 +97,8 @@
 HIL 手册请参考：[docs/v0/piper_hil_handbook.md](/home/viv/projs/piper-sdk-rs/docs/v0/piper_hil_handbook.md)
 这两个 HIL 工具是手册支持入口，不是完整替代人工验收流程。
 
+- `socketcan_raw_clock_probe.rs` - read-only dual-interface raw timestamp calibration probe
+
 - **`client_monitor_hil_check`** - 只读客户端监控 HIL 辅助工具
   - 验证连接时间、首个完整 monitor snapshot 和只读观测窗口
   - 主要用于手册中的 Phase 1
