@@ -1328,46 +1328,49 @@ impl TeleopIo for RealTeleopIo {
 }
 
 fn print_startup_summary(summary: &StartupSummary) -> Result<()> {
-    let mut stderr = io::stderr().lock();
-    writeln!(stderr, "teleop dual-arm startup summary")?;
+    write_startup_summary(io::stderr().lock(), summary)
+}
+
+fn write_startup_summary<W: Write>(mut writer: W, summary: &StartupSummary) -> Result<()> {
+    writeln!(writer, "teleop dual-arm startup summary")?;
     writeln!(
-        stderr,
+        writer,
         "  master target: {}",
         format_target_for_operator(&summary.targets.master)
     )?;
     writeln!(
-        stderr,
+        writer,
         "  slave target: {}",
         format_target_for_operator(&summary.targets.slave)
     )?;
-    writeln!(stderr, "  mode: {}", format_mode_for_operator(summary.mode))?;
+    writeln!(writer, "  mode: {}", format_mode_for_operator(summary.mode))?;
     writeln!(
-        stderr,
+        writer,
         "  profile: {}",
         format_profile_for_operator(summary.profile)
     )?;
-    writeln!(stderr, "  frequency: {:.1} Hz", summary.frequency_hz)?;
+    writeln!(writer, "  frequency: {:.1} Hz", summary.frequency_hz)?;
     writeln!(
-        stderr,
+        writer,
         "  gains: track_kp={:.3}, track_kd={:.3}, master_damping={:.3}, reflection_gain={:.3}",
         summary.track_kp, summary.track_kd, summary.master_damping, summary.reflection_gain
     )?;
-    writeln!(stderr, "  calibration: {}", summary.calibration_source)?;
+    writeln!(writer, "  calibration: {}", summary.calibration_source)?;
     if let Some(path) = &summary.calibration_path {
-        writeln!(stderr, "  calibration path: {}", path.display())?;
+        writeln!(writer, "  calibration path: {}", path.display())?;
     }
-    writeln!(stderr, "  gripper mirror: {}", summary.gripper_mirror)?;
-    writeln!(stderr, "  experimental={}", summary.experimental)?;
-    writeln!(stderr, "  strict_realtime={}", summary.strict_realtime)?;
+    writeln!(writer, "  gripper mirror: {}", summary.gripper_mirror)?;
+    writeln!(writer, "  experimental={}", summary.experimental)?;
+    writeln!(writer, "  strict_realtime={}", summary.strict_realtime)?;
     if let Some(timing_source) = &summary.timing_source {
-        writeln!(stderr, "  timing_source={timing_source}")?;
+        writeln!(writer, "  timing_source={timing_source}")?;
     }
     if let Some(path) = &summary.report_path {
-        writeln!(stderr, "  report json: {}", path.display())?;
+        writeln!(writer, "  report json: {}", path.display())?;
     }
     if !summary.yes {
-        write!(stderr, "Type 'yes' or 'y' to enable MIT teleop: ")?;
-        stderr.flush()?;
+        write!(writer, "Type 'yes' or 'y' to enable MIT teleop: ")?;
+        writer.flush()?;
     }
     Ok(())
 }
@@ -2270,7 +2273,13 @@ mod tests {
         };
 
         let summary = StartupSummary::experimental_raw_clock_for_tests(targets);
+        let mut output = Vec::new();
 
+        write_startup_summary(&mut output, &summary).expect("startup summary should render");
+        let output = String::from_utf8(output).expect("startup summary should be UTF-8");
+
+        assert!(output.contains("master target: socketcan:can0"));
+        assert!(output.contains("slave target: socketcan:can1"));
         assert_eq!(summary.timing_source.as_deref(), Some("calibrated_hw_raw"));
         assert!(summary.experimental);
         assert!(!summary.strict_realtime);
