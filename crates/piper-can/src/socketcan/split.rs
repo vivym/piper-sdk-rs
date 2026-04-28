@@ -111,13 +111,12 @@ struct TimestampInfo {
     hw_raw_us: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct SocketCanReceivedFrame {
     frame: PiperFrame,
     timestamp_source: TimestampSource,
     timestamp_provenance: TimestampProvenance,
-    raw_timestamp: Option<RawTimestampInfo>,
-    raw_sample: RawTimestampSample,
+    raw_timestamp: RawTimestampInfo,
 }
 
 fn classify_startup_probe_frame(
@@ -297,7 +296,10 @@ impl SocketCanRxAdapter {
         timeout: Duration,
     ) -> Result<RawTimestampSample, CanError> {
         let received = self.receive_live(timeout)?;
-        Ok(received.raw_sample)
+        Ok(RawTimestampSample {
+            iface: self.iface.clone(),
+            info: received.raw_timestamp,
+        })
     }
 
     fn receive_live(&mut self, timeout: Duration) -> Result<SocketCanReceivedFrame, CanError> {
@@ -361,16 +363,11 @@ impl SocketCanRxAdapter {
                         hw_trans_us: timestamp_info.hw_trans_us,
                         hw_raw_us: timestamp_info.hw_raw_us,
                     };
-                    let raw_sample = RawTimestampSample {
-                        iface: self.iface.clone(),
-                        info: raw_timestamp,
-                    };
                     return Ok(SocketCanReceivedFrame {
                         frame: frame.with_timestamp_us(timestamp_info.timestamp_us),
                         timestamp_source: timestamp_info.source,
                         timestamp_provenance,
-                        raw_timestamp: Some(raw_timestamp),
-                        raw_sample,
+                        raw_timestamp,
                     });
                 },
                 ParsedSocketCanFrame::RecoverableNonData => continue,
@@ -397,11 +394,8 @@ impl RxAdapter for SocketCanRxAdapter {
         }
 
         self.receive_live(self.read_timeout).map(|received| {
-            let mut frame = ReceivedFrame::new(received.frame, received.timestamp_provenance);
-            if let Some(raw_timestamp) = received.raw_timestamp {
-                frame = frame.with_raw_timestamp(raw_timestamp);
-            }
-            frame
+            ReceivedFrame::new(received.frame, received.timestamp_provenance)
+                .with_raw_timestamp(received.raw_timestamp)
         })
     }
 
@@ -431,10 +425,8 @@ impl RxAdapter for SocketCanRxAdapter {
                 Ok(received) => {
                     let frame = received.frame;
                     if should_buffer_bootstrap_frame(&frame) {
-                        let mut buffered = ReceivedFrame::new(frame, received.timestamp_provenance);
-                        if let Some(raw_timestamp) = received.raw_timestamp {
-                            buffered = buffered.with_raw_timestamp(raw_timestamp);
-                        }
+                        let buffered = ReceivedFrame::new(frame, received.timestamp_provenance)
+                            .with_raw_timestamp(received.raw_timestamp);
                         self.bootstrap_frames.push_back(buffered);
                     }
                     let Some(capability) =
@@ -838,6 +830,30 @@ mod tests {
 
         assert_eq!(received.timestamp_provenance, TimestampProvenance::Kernel);
         assert_eq!(received.raw_timestamp, Some(raw));
+    }
+
+    #[test]
+    fn socketcan_received_frame_hot_path_carries_raw_info_without_probe_sample() {
+        fn copy_value<T: Copy>(value: T) -> T {
+            value
+        }
+
+        let frame = PiperFrame::new_standard(ID_JOINT_FEEDBACK_12.raw() as u32, [0; 8]).unwrap();
+        let raw = crate::RawTimestampInfo {
+            can_id: ID_JOINT_FEEDBACK_12.raw() as u32,
+            host_rx_mono_us: 123,
+            system_ts_us: Some(123),
+            hw_trans_us: None,
+            hw_raw_us: Some(100),
+        };
+        let received = SocketCanReceivedFrame {
+            frame,
+            timestamp_source: TimestampSource::Software,
+            timestamp_provenance: TimestampProvenance::Kernel,
+            raw_timestamp: raw,
+        };
+
+        assert_eq!(copy_value(received).raw_timestamp, raw);
     }
 
     #[test]

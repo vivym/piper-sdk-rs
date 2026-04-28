@@ -24,6 +24,7 @@ fn test_joint_position_state_concurrent_read() {
             let new_state = JointPositionState {
                 hardware_timestamp_us: i as u64 * 1000,
                 host_rx_mono_us: i as u64 * 2000,
+                raw_feedback_timing: None,
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
@@ -294,6 +295,7 @@ fn test_capture_motion_snapshot_concurrent() {
             let new_joint_pos = JointPositionState {
                 hardware_timestamp_us: i as u64 * 1000 + 1,
                 host_rx_mono_us: i as u64 * 2000,
+                raw_feedback_timing: None,
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
@@ -399,6 +401,7 @@ fn test_multiple_states_concurrent_read() {
             let new_joint_pos = JointPositionState {
                 hardware_timestamp_us: i as u64 * 1000,
                 host_rx_mono_us: i as u64 * 2000,
+                raw_feedback_timing: None,
                 joint_pos: [i as f64; 6],
                 frame_valid_mask: 0b111,
             };
@@ -500,6 +503,7 @@ fn test_no_deadlock() {
                     let new_state = JointPositionState {
                         hardware_timestamp_us: counter,
                         host_rx_mono_us: counter * 2,
+                        raw_feedback_timing: None,
                         joint_pos: [counter as f64; 6],
                         frame_valid_mask: 0b111,
                     };

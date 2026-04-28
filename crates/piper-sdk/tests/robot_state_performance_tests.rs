@@ -142,6 +142,7 @@ fn test_hot_snapshot_write_latency() {
     let initial_state = JointPositionState {
         hardware_timestamp_us: 0,
         host_rx_mono_us: 0,
+        raw_feedback_timing: None,
         joint_pos: [0.0; 6],
         frame_valid_mask: 0b111,
     };
@@ -155,6 +156,7 @@ fn test_hot_snapshot_write_latency() {
         let new_state = JointPositionState {
             hardware_timestamp_us: i as u64,
             host_rx_mono_us: i as u64 * 2,
+            raw_feedback_timing: None,
             joint_pos: [i as f64; 6],
             frame_valid_mask: 0b111,
         };
@@ -374,6 +376,7 @@ fn test_state_clone_performance() {
     let joint_pos = JointPositionState {
         hardware_timestamp_us: 1234567890,
         host_rx_mono_us: 1234567890 * 2,
+        raw_feedback_timing: None,
         joint_pos: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         frame_valid_mask: 0b111,
     };
