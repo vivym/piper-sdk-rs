@@ -11,6 +11,13 @@ use crate::commands::teleop::TeleopDualArmArgs;
 
 pub const DEFAULT_FREQUENCY_HZ: f64 = 200.0;
 pub const MAX_CALIBRATION_ERROR_RAD: f64 = 0.05;
+pub const DEFAULT_RAW_CLOCK_WARMUP_SECS: u64 = 10;
+pub const DEFAULT_RAW_CLOCK_RESIDUAL_P95_US: u64 = 500;
+pub const DEFAULT_RAW_CLOCK_RESIDUAL_MAX_US: u64 = 2000;
+pub const DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 100.0;
+pub const DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 20;
+pub const DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 20;
+pub const DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -40,6 +47,7 @@ pub struct TeleopConfigFile {
     pub control: Option<TeleopControlConfig>,
     pub safety: Option<TeleopSafetyConfig>,
     pub calibration: Option<TeleopCalibrationConfig>,
+    pub raw_clock: Option<TeleopRawClockConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -82,6 +90,18 @@ pub struct TeleopCalibrationConfig {
     pub max_error_rad: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TeleopRawClockConfig {
+    pub warmup_secs: Option<u64>,
+    pub residual_p95_us: Option<u64>,
+    pub residual_max_us: Option<u64>,
+    pub drift_abs_ppm: Option<f64>,
+    pub sample_gap_max_ms: Option<u64>,
+    pub last_sample_age_ms: Option<u64>,
+    pub inter_arm_skew_max_us: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TeleopControlSettings {
     pub mode: TeleopMode,
@@ -105,10 +125,23 @@ pub struct TeleopCalibrationSettings {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TeleopRawClockSettings {
+    pub experimental_calibrated_raw: bool,
+    pub warmup_secs: u64,
+    pub residual_p95_us: u64,
+    pub residual_max_us: u64,
+    pub drift_abs_ppm: f64,
+    pub sample_gap_max_ms: u64,
+    pub last_sample_age_ms: u64,
+    pub inter_arm_skew_max_us: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedTeleopConfig {
     pub control: TeleopControlSettings,
     pub safety: TeleopSafetySettings,
     pub calibration: TeleopCalibrationSettings,
+    pub raw_clock: TeleopRawClockSettings,
     pub max_iterations: Option<usize>,
     pub timing_mode: Option<TeleopTimingMode>,
 }
@@ -151,6 +184,7 @@ impl ResolvedTeleopConfig {
         let file_control = file.as_ref().and_then(|file| file.control.as_ref());
         let file_safety = file.as_ref().and_then(|file| file.safety.as_ref());
         let file_calibration = file.as_ref().and_then(|file| file.calibration.as_ref());
+        let file_raw_clock = file.as_ref().and_then(|file| file.raw_clock.as_ref());
 
         let control = TeleopControlSettings {
             mode: args
@@ -180,6 +214,42 @@ impl ResolvedTeleopConfig {
         };
         control.validate()?;
 
+        if args.experimental_calibrated_raw && control.mode != TeleopMode::MasterFollower {
+            bail!("experimental calibrated raw clock requires master-follower mode");
+        }
+
+        let raw_clock = TeleopRawClockSettings {
+            experimental_calibrated_raw: args.experimental_calibrated_raw,
+            warmup_secs: args
+                .raw_clock_warmup_secs
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.warmup_secs))
+                .unwrap_or(DEFAULT_RAW_CLOCK_WARMUP_SECS),
+            residual_p95_us: args
+                .raw_clock_residual_p95_us
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.residual_p95_us))
+                .unwrap_or(DEFAULT_RAW_CLOCK_RESIDUAL_P95_US),
+            residual_max_us: args
+                .raw_clock_residual_max_us
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.residual_max_us))
+                .unwrap_or(DEFAULT_RAW_CLOCK_RESIDUAL_MAX_US),
+            drift_abs_ppm: args
+                .raw_clock_drift_abs_ppm
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.drift_abs_ppm))
+                .unwrap_or(DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM),
+            sample_gap_max_ms: args
+                .raw_clock_sample_gap_max_ms
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.sample_gap_max_ms))
+                .unwrap_or(DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS),
+            last_sample_age_ms: args
+                .raw_clock_last_sample_age_ms
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.last_sample_age_ms))
+                .unwrap_or(DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS),
+            inter_arm_skew_max_us: args
+                .raw_clock_inter_arm_skew_max_us
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.inter_arm_skew_max_us))
+                .unwrap_or(DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US),
+        };
+
         let calibration_max_error_rad = args
             .calibration_max_error_rad
             .or_else(|| file_calibration.and_then(|calibration| calibration.max_error_rad))
@@ -205,6 +275,7 @@ impl ResolvedTeleopConfig {
                     .or_else(|| file_calibration.and_then(|calibration| calibration.file.clone())),
                 max_error_rad: calibration_max_error_rad,
             },
+            raw_clock,
             max_iterations: args
                 .max_iterations
                 .or_else(|| file_control.and_then(|control| control.max_iterations)),
@@ -328,6 +399,68 @@ mod tests {
             ResolvedTeleopConfig::resolve(TeleopDualArmArgs::default_for_tests(), None).unwrap();
 
         assert_eq!(resolved.control.mode, TeleopMode::MasterFollower);
+    }
+
+    #[test]
+    fn experimental_raw_clock_rejects_bilateral_mode() {
+        let args = TeleopDualArmArgs {
+            experimental_calibrated_raw: true,
+            mode: Some(TeleopMode::Bilateral),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+        assert!(err.to_string().contains("master-follower"));
+    }
+
+    #[test]
+    fn cli_raw_clock_values_override_file_values() {
+        let file = TeleopConfigFile {
+            raw_clock: Some(TeleopRawClockConfig {
+                warmup_secs: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let args = TeleopDualArmArgs {
+            experimental_calibrated_raw: true,
+            raw_clock_warmup_secs: Some(10),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
+        assert!(resolved.raw_clock.experimental_calibrated_raw);
+        assert_eq!(resolved.raw_clock.warmup_secs, 10);
+    }
+
+    #[test]
+    fn config_file_cannot_enable_experimental_raw_clock_without_cli_flag() {
+        let config_text = r#"
+        [raw_clock]
+        experimental_calibrated_raw = true
+        "#;
+
+        let err = toml::from_str::<TeleopConfigFile>(config_text).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn raw_clock_threshold_file_does_not_enable_experimental_mode() {
+        let file = TeleopConfigFile {
+            raw_clock: Some(TeleopRawClockConfig {
+                warmup_secs: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let args = TeleopDualArmArgs {
+            experimental_calibrated_raw: false,
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
+        assert!(!resolved.raw_clock.experimental_calibrated_raw);
+        assert_eq!(resolved.raw_clock.warmup_secs, 30);
     }
 
     #[test]

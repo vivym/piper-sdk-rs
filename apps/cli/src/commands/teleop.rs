@@ -70,6 +70,22 @@ pub struct TeleopDualArmArgs {
     pub max_iterations: Option<usize>,
     #[arg(long, value_enum)]
     pub timing_mode: Option<crate::teleop::config::TeleopTimingMode>,
+    #[arg(long)]
+    pub experimental_calibrated_raw: bool,
+    #[arg(long)]
+    pub raw_clock_warmup_secs: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_residual_p95_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_residual_max_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_drift_abs_ppm: Option<f64>,
+    #[arg(long)]
+    pub raw_clock_sample_gap_max_ms: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_last_sample_age_ms: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_inter_arm_skew_max_us: Option<u64>,
 }
 
 impl TeleopCommand {
@@ -109,6 +125,14 @@ impl TeleopDualArmArgs {
             yes: false,
             max_iterations: None,
             timing_mode: None,
+            experimental_calibrated_raw: false,
+            raw_clock_warmup_secs: None,
+            raw_clock_residual_p95_us: None,
+            raw_clock_residual_max_us: None,
+            raw_clock_drift_abs_ppm: None,
+            raw_clock_sample_gap_max_ms: None,
+            raw_clock_last_sample_age_ms: None,
+            raw_clock_inter_arm_skew_max_us: None,
         }
     }
 }
@@ -160,6 +184,34 @@ mod tests {
             TeleopAction::DualArm(args) => {
                 assert_eq!(args.master_target.as_deref(), Some("socketcan:can0"));
                 assert_eq!(args.slave_target.as_deref(), Some("socketcan:can1"));
+            },
+        }
+    }
+
+    #[test]
+    fn dual_arm_command_parses_experimental_calibrated_raw_options() {
+        let cmd = TeleopCommand::try_parse_from([
+            "teleop",
+            "dual-arm",
+            "--master-interface",
+            "can0",
+            "--slave-interface",
+            "can1",
+            "--mode",
+            "master-follower",
+            "--experimental-calibrated-raw",
+            "--raw-clock-warmup-secs",
+            "10",
+            "--raw-clock-inter-arm-skew-max-us",
+            "2000",
+        ])
+        .expect("experimental raw clock command should parse");
+
+        match cmd.action {
+            TeleopAction::DualArm(args) => {
+                assert!(args.experimental_calibrated_raw);
+                assert_eq!(args.raw_clock_warmup_secs, Some(10));
+                assert_eq!(args.raw_clock_inter_arm_skew_max_us, Some(2000));
             },
         }
     }
