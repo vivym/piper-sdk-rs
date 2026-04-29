@@ -24,6 +24,7 @@ FREQUENCY_HZ="${FREQUENCY_HZ:-100}"
 TRACK_KP="${TRACK_KP:-2.0}"
 TRACK_KD="${TRACK_KD:-0.4}"
 MASTER_DAMPING="${MASTER_DAMPING:-0.05}"
+REFLECTION_GAIN="${REFLECTION_GAIN:-0.05}"
 RAW_CLOCK_WARMUP_SECS="${RAW_CLOCK_WARMUP_SECS:-10}"
 # Observed SocketCAN raw-clock residual p95 can approach ~1.5ms during
 # longer smoke runs; keep p95 materially below isolated max-spike tolerance.
@@ -65,6 +66,7 @@ cmd=(
     --track-kp "${TRACK_KP}"
     --track-kd "${TRACK_KD}"
     --master-damping "${MASTER_DAMPING}"
+    --reflection-gain "${REFLECTION_GAIN}"
     --raw-clock-warmup-secs "${RAW_CLOCK_WARMUP_SECS}"
     --raw-clock-residual-p95-us "${RAW_CLOCK_RESIDUAL_P95_US}"
     --raw-clock-residual-max-us "${RAW_CLOCK_RESIDUAL_MAX_US}"
@@ -95,6 +97,7 @@ fi
     echo "track_kp=${TRACK_KP}"
     echo "track_kd=${TRACK_KD}"
     echo "master_damping=${MASTER_DAMPING}"
+    echo "reflection_gain=${REFLECTION_GAIN}"
     echo "raw_clock_warmup_secs=${RAW_CLOCK_WARMUP_SECS}"
     echo "raw_clock_residual_p95_us=${RAW_CLOCK_RESIDUAL_P95_US}"
     echo "raw_clock_residual_max_us=${RAW_CLOCK_RESIDUAL_MAX_US}"
@@ -127,8 +130,14 @@ echo "Build log: ${BUILD_LOG}"
 echo "Run log: ${RUN_LOG}"
 echo
 echo "Safety note: support both arms in the intended zero pose for joint map '${JOINT_MAP}' before typing yes."
-echo "Master-follower input is read from ${MASTER_IFACE}; move that physical arm."
-echo "If that is not the physical master arm, swap MASTER_IFACE/SLAVE_IFACE and rerun."
+if [[ "${MODE}" == "bilateral" ]]; then
+    echo "Bilateral mode: both arms may receive reflected torque."
+    echo "Start with low REFLECTION_GAIN; current REFLECTION_GAIN=${REFLECTION_GAIN}."
+    echo "Stop immediately if the master feels pulled, oscillatory, or unstable."
+else
+    echo "Master-follower input is read from ${MASTER_IFACE}; move that physical arm."
+    echo "If that is not the physical master arm, swap MASTER_IFACE/SLAVE_IFACE and rerun."
+fi
 echo "This script intentionally does not pass --yes; the CLI will require operator confirmation."
 echo "After yes, the CLI refreshes raw-clock timing before enabling the arms."
 echo
