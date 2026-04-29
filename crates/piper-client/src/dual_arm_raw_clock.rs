@@ -205,6 +205,11 @@ pub struct RawClockRuntimeReport {
     pub joint_motion: Option<RawClockJointMotionStats>,
     pub max_inter_arm_skew_us: u64,
     pub inter_arm_skew_p95_us: u64,
+    pub alignment_lag_us: u64,
+    pub latest_inter_arm_skew_max_us: u64,
+    pub latest_inter_arm_skew_p95_us: u64,
+    pub selected_inter_arm_skew_max_us: u64,
+    pub selected_inter_arm_skew_p95_us: u64,
     pub clock_health_failures: u64,
     pub alignment_buffer_misses: u64,
     pub alignment_buffer_miss_consecutive_max: u32,
@@ -699,6 +704,10 @@ pub struct RawClockRuntimeTiming {
     slave_alignment_buffer: RawClockSnapshotBuffer,
     skew_samples_us: VecDeque<u64>,
     max_inter_arm_skew_us: u64,
+    latest_skew_samples_us: VecDeque<u64>,
+    latest_inter_arm_skew_max_us: u64,
+    alignment_lag_us: u64,
+    alignment_buffer_miss_consecutive_failure_limit: u32,
     clock_health_failures: u64,
     alignment_buffer_misses: u64,
     alignment_buffer_miss_consecutive: u32,
@@ -731,6 +740,13 @@ impl RawClockRuntimeTiming {
             slave_alignment_buffer: RawClockSnapshotBuffer::new(alignment_retention_us),
             skew_samples_us: VecDeque::with_capacity(RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY),
             max_inter_arm_skew_us: 0,
+            latest_skew_samples_us: VecDeque::with_capacity(
+                RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY,
+            ),
+            latest_inter_arm_skew_max_us: 0,
+            alignment_lag_us: runtime_thresholds.alignment_lag_us,
+            alignment_buffer_miss_consecutive_failure_limit: runtime_thresholds
+                .alignment_buffer_miss_consecutive_failures,
             clock_health_failures: 0,
             alignment_buffer_misses: 0,
             alignment_buffer_miss_consecutive: 0,
@@ -753,6 +769,8 @@ impl RawClockRuntimeTiming {
         self.slave_alignment_buffer.clear();
         self.skew_samples_us.clear();
         self.max_inter_arm_skew_us = 0;
+        self.latest_skew_samples_us.clear();
+        self.latest_inter_arm_skew_max_us = 0;
         self.clock_health_failures = 0;
         self.alignment_buffer_misses = 0;
         self.alignment_buffer_miss_consecutive = 0;
@@ -826,6 +844,7 @@ impl RawClockRuntimeTiming {
                     side: RawClockSide::Slave.as_str(),
                 })?;
         let latest_inter_arm_skew_us = master_feedback_time_us.abs_diff(slave_feedback_time_us);
+        self.record_latest_skew_sample(latest_inter_arm_skew_us);
 
         Ok(RawClockLatestTiming {
             master_feedback_time_us,
@@ -1160,12 +1179,25 @@ impl RawClockRuntimeTiming {
         }
     }
 
-    fn record_skew_sample(&mut self, inter_arm_skew_us: u64) {
+    fn record_latest_skew_sample(&mut self, inter_arm_skew_us: u64) {
+        self.latest_inter_arm_skew_max_us =
+            self.latest_inter_arm_skew_max_us.max(inter_arm_skew_us);
+        if self.latest_skew_samples_us.len() == RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY {
+            self.latest_skew_samples_us.pop_front();
+        }
+        self.latest_skew_samples_us.push_back(inter_arm_skew_us);
+    }
+
+    fn record_selected_skew_sample(&mut self, inter_arm_skew_us: u64) {
         self.max_inter_arm_skew_us = self.max_inter_arm_skew_us.max(inter_arm_skew_us);
         if self.skew_samples_us.len() == RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY {
             self.skew_samples_us.pop_front();
         }
         self.skew_samples_us.push_back(inter_arm_skew_us);
+    }
+
+    fn record_skew_sample(&mut self, inter_arm_skew_us: u64) {
+        self.record_selected_skew_sample(inter_arm_skew_us);
     }
 
     fn report(
@@ -1180,10 +1212,25 @@ impl RawClockRuntimeTiming {
             joint_motion: None,
             max_inter_arm_skew_us: self.max_inter_arm_skew_us,
             inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
+            alignment_lag_us: self.alignment_lag_us,
+            latest_inter_arm_skew_max_us: self.latest_inter_arm_skew_max_us,
+            latest_inter_arm_skew_p95_us: percentile(
+                self.latest_skew_samples_us.iter().copied(),
+                95,
+            ),
+            selected_inter_arm_skew_max_us: self.max_inter_arm_skew_us,
+            selected_inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
             clock_health_failures: self.clock_health_failures,
             alignment_buffer_misses: self.alignment_buffer_misses,
             alignment_buffer_miss_consecutive_max: self.alignment_buffer_miss_consecutive_max,
-            alignment_buffer_miss_consecutive_failures: self.alignment_buffer_miss_consecutive,
+            alignment_buffer_miss_consecutive_failures: if self.alignment_buffer_miss_consecutive
+                == 0
+            {
+                0
+            } else {
+                self.alignment_buffer_miss_consecutive
+                    .max(self.alignment_buffer_miss_consecutive_failure_limit)
+            },
             master_residual_max_spikes: self.master_residual_max_spikes,
             slave_residual_max_spikes: self.slave_residual_max_spikes,
             master_residual_max_consecutive_failures: self.master_residual_max_consecutive_failures,
@@ -5011,6 +5058,29 @@ mod tests {
 
         assert_eq!(report.max_inter_arm_skew_us, 100);
         assert_eq!(report.inter_arm_skew_p95_us, 95);
+    }
+
+    #[test]
+    fn runtime_report_includes_alignment_diagnostics() {
+        let mut timing = RawClockRuntimeTiming::new_with_runtime_thresholds(
+            thresholds_for_tests(),
+            RawClockRuntimeThresholds {
+                alignment_lag_us: 5_000,
+                ..RawClockRuntimeThresholds::default()
+            },
+        );
+        timing.record_latest_skew_sample(9_000);
+        timing.record_selected_skew_sample(800);
+        timing.record_alignment_buffer_miss_for_tests(AlignmentBufferMissKind::Slave);
+
+        let report = timing.report(120_000, 0, None);
+
+        assert_eq!(report.alignment_lag_us, 5_000);
+        assert_eq!(report.latest_inter_arm_skew_max_us, 9_000);
+        assert_eq!(report.selected_inter_arm_skew_max_us, 800);
+        assert_eq!(report.max_inter_arm_skew_us, 800);
+        assert_eq!(report.alignment_buffer_misses, 1);
+        assert_eq!(report.alignment_buffer_miss_consecutive_failures, 3);
     }
 
     #[test]

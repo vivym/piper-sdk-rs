@@ -81,6 +81,14 @@ pub struct ReportTiming {
     pub max_estimated_inter_arm_skew_us: Option<u64>,
     pub estimated_inter_arm_skew_p95_us: Option<u64>,
     pub clock_health_failures: u64,
+    pub alignment_lag_us: Option<u64>,
+    pub latest_inter_arm_skew_max_us: Option<u64>,
+    pub latest_inter_arm_skew_p95_us: Option<u64>,
+    pub selected_inter_arm_skew_max_us: Option<u64>,
+    pub selected_inter_arm_skew_p95_us: Option<u64>,
+    pub alignment_buffer_misses: u64,
+    pub alignment_buffer_miss_consecutive_max: u32,
+    pub alignment_buffer_miss_consecutive_failures: u32,
     pub master_residual_max_spikes: u64,
     pub slave_residual_max_spikes: u64,
     pub master_residual_max_consecutive_failures: u32,
@@ -288,6 +296,19 @@ pub fn write_human_report<W: Write>(
             "raw_clock max_skew_us={} p95_skew_us={}",
             max_skew_us, p95_skew_us
         )?;
+        if let Some(alignment_lag_us) = timing.alignment_lag_us {
+            writeln!(
+                writer,
+                "raw_clock alignment lag_us={} selected_skew max={} p95={} latest_skew max={} p95={} misses={} consecutive_max={}",
+                alignment_lag_us,
+                format_optional_u64(timing.selected_inter_arm_skew_max_us),
+                format_optional_u64(timing.selected_inter_arm_skew_p95_us),
+                format_optional_u64(timing.latest_inter_arm_skew_max_us),
+                format_optional_u64(timing.latest_inter_arm_skew_p95_us),
+                timing.alignment_buffer_misses,
+                timing.alignment_buffer_miss_consecutive_max,
+            )?;
+        }
         if timing.master_residual_max_spikes > 0
             || timing.slave_residual_max_spikes > 0
             || timing.master_residual_max_consecutive_failures > 0
@@ -626,6 +647,14 @@ mod tests {
             max_estimated_inter_arm_skew_us: Some(900),
             estimated_inter_arm_skew_p95_us: Some(400),
             clock_health_failures: 0,
+            alignment_lag_us: None,
+            latest_inter_arm_skew_max_us: None,
+            latest_inter_arm_skew_p95_us: None,
+            selected_inter_arm_skew_max_us: None,
+            selected_inter_arm_skew_p95_us: None,
+            alignment_buffer_misses: 0,
+            alignment_buffer_miss_consecutive_max: 0,
+            alignment_buffer_miss_consecutive_failures: 0,
             master_residual_max_spikes: 2,
             slave_residual_max_spikes: 1,
             master_residual_max_consecutive_failures: 0,
@@ -642,6 +671,40 @@ mod tests {
             value["timing"]["slave_residual_max_consecutive_failures"],
             1
         );
+    }
+
+    #[test]
+    fn report_serializes_raw_clock_alignment_diagnostics() {
+        let sdk_report = BilateralRunReport::default();
+        let mut input = sample_input(false, &sdk_report);
+        input.timing = Some(ReportTiming {
+            timing_source: "calibrated_hw_raw".to_string(),
+            experimental: true,
+            strict_realtime: false,
+            master_clock_drift_ppm: None,
+            slave_clock_drift_ppm: None,
+            master_residual_p95_us: None,
+            slave_residual_p95_us: None,
+            max_estimated_inter_arm_skew_us: Some(800),
+            estimated_inter_arm_skew_p95_us: Some(500),
+            clock_health_failures: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
+            alignment_lag_us: Some(5_000),
+            latest_inter_arm_skew_max_us: Some(9_000),
+            latest_inter_arm_skew_p95_us: Some(4_000),
+            selected_inter_arm_skew_max_us: Some(800),
+            selected_inter_arm_skew_p95_us: Some(500),
+            alignment_buffer_misses: 2,
+            alignment_buffer_miss_consecutive_max: 1,
+            alignment_buffer_miss_consecutive_failures: 3,
+        });
+        let value = serde_json::to_value(TeleopJsonReport::from_run(input)).unwrap();
+        assert_eq!(value["timing"]["alignment_lag_us"], 5_000);
+        assert_eq!(value["timing"]["latest_inter_arm_skew_max_us"], 9_000);
+        assert_eq!(value["timing"]["selected_inter_arm_skew_max_us"], 800);
     }
 
     #[test]
@@ -698,6 +761,14 @@ mod tests {
             max_estimated_inter_arm_skew_us: Some(900),
             estimated_inter_arm_skew_p95_us: Some(400),
             clock_health_failures: 0,
+            alignment_lag_us: None,
+            latest_inter_arm_skew_max_us: None,
+            latest_inter_arm_skew_p95_us: None,
+            selected_inter_arm_skew_max_us: None,
+            selected_inter_arm_skew_p95_us: None,
+            alignment_buffer_misses: 0,
+            alignment_buffer_miss_consecutive_max: 0,
+            alignment_buffer_miss_consecutive_failures: 0,
             master_residual_max_spikes: 0,
             slave_residual_max_spikes: 0,
             master_residual_max_consecutive_failures: 0,
@@ -711,6 +782,44 @@ mod tests {
         assert!(output.contains("experimental=true"));
         assert!(output.contains("strict_realtime=false"));
         assert!(output.contains("raw_clock max_skew_us=900 p95_skew_us=400"));
+    }
+
+    #[test]
+    fn human_report_includes_raw_clock_alignment_diagnostics() {
+        let mut output = Vec::new();
+        let mut report = sample_json_report();
+        report.timing = Some(ReportTiming {
+            timing_source: "calibrated_hw_raw".to_string(),
+            experimental: true,
+            strict_realtime: false,
+            master_clock_drift_ppm: None,
+            slave_clock_drift_ppm: None,
+            master_residual_p95_us: None,
+            slave_residual_p95_us: None,
+            max_estimated_inter_arm_skew_us: Some(800),
+            estimated_inter_arm_skew_p95_us: Some(500),
+            clock_health_failures: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
+            alignment_lag_us: Some(5_000),
+            latest_inter_arm_skew_max_us: Some(9_000),
+            latest_inter_arm_skew_p95_us: Some(4_000),
+            selected_inter_arm_skew_max_us: Some(800),
+            selected_inter_arm_skew_p95_us: Some(500),
+            alignment_buffer_misses: 2,
+            alignment_buffer_miss_consecutive_max: 1,
+            alignment_buffer_miss_consecutive_failures: 3,
+        });
+
+        write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("raw_clock alignment lag_us=5000"));
+        assert!(output.contains("selected_skew max=800 p95=500"));
+        assert!(output.contains("latest_skew max=9000 p95=4000"));
+        assert!(output.contains("misses=2 consecutive_max=1"));
     }
 
     #[test]
@@ -728,6 +837,14 @@ mod tests {
             max_estimated_inter_arm_skew_us: None,
             estimated_inter_arm_skew_p95_us: None,
             clock_health_failures: 0,
+            alignment_lag_us: None,
+            latest_inter_arm_skew_max_us: None,
+            latest_inter_arm_skew_p95_us: None,
+            selected_inter_arm_skew_max_us: None,
+            selected_inter_arm_skew_p95_us: None,
+            alignment_buffer_misses: 0,
+            alignment_buffer_miss_consecutive_max: 0,
+            alignment_buffer_miss_consecutive_failures: 0,
             master_residual_max_spikes: 0,
             slave_residual_max_spikes: 0,
             master_residual_max_consecutive_failures: 0,
@@ -757,6 +874,14 @@ mod tests {
             max_estimated_inter_arm_skew_us: Some(900),
             estimated_inter_arm_skew_p95_us: Some(400),
             clock_health_failures: 0,
+            alignment_lag_us: None,
+            latest_inter_arm_skew_max_us: None,
+            latest_inter_arm_skew_p95_us: None,
+            selected_inter_arm_skew_max_us: None,
+            selected_inter_arm_skew_p95_us: None,
+            alignment_buffer_misses: 0,
+            alignment_buffer_miss_consecutive_max: 0,
+            alignment_buffer_miss_consecutive_failures: 0,
             master_residual_max_spikes: 2,
             slave_residual_max_spikes: 0,
             master_residual_max_consecutive_failures: 1,
