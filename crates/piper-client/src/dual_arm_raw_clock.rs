@@ -707,7 +707,6 @@ pub struct RawClockRuntimeTiming {
     latest_skew_samples_us: VecDeque<u64>,
     latest_inter_arm_skew_max_us: u64,
     alignment_lag_us: u64,
-    alignment_buffer_miss_consecutive_failure_limit: u32,
     clock_health_failures: u64,
     alignment_buffer_misses: u64,
     alignment_buffer_miss_consecutive: u32,
@@ -745,8 +744,6 @@ impl RawClockRuntimeTiming {
             ),
             latest_inter_arm_skew_max_us: 0,
             alignment_lag_us: runtime_thresholds.alignment_lag_us,
-            alignment_buffer_miss_consecutive_failure_limit: runtime_thresholds
-                .alignment_buffer_miss_consecutive_failures,
             clock_health_failures: 0,
             alignment_buffer_misses: 0,
             alignment_buffer_miss_consecutive: 0,
@@ -1223,14 +1220,7 @@ impl RawClockRuntimeTiming {
             clock_health_failures: self.clock_health_failures,
             alignment_buffer_misses: self.alignment_buffer_misses,
             alignment_buffer_miss_consecutive_max: self.alignment_buffer_miss_consecutive_max,
-            alignment_buffer_miss_consecutive_failures: if self.alignment_buffer_miss_consecutive
-                == 0
-            {
-                0
-            } else {
-                self.alignment_buffer_miss_consecutive
-                    .max(self.alignment_buffer_miss_consecutive_failure_limit)
-            },
+            alignment_buffer_miss_consecutive_failures: self.alignment_buffer_miss_consecutive,
             master_residual_max_spikes: self.master_residual_max_spikes,
             slave_residual_max_spikes: self.slave_residual_max_spikes,
             master_residual_max_consecutive_failures: self.master_residual_max_consecutive_failures,
@@ -5080,7 +5070,7 @@ mod tests {
         assert_eq!(report.selected_inter_arm_skew_max_us, 800);
         assert_eq!(report.max_inter_arm_skew_us, 800);
         assert_eq!(report.alignment_buffer_misses, 1);
-        assert_eq!(report.alignment_buffer_miss_consecutive_failures, 3);
+        assert_eq!(report.alignment_buffer_miss_consecutive_failures, 1);
     }
 
     #[test]
