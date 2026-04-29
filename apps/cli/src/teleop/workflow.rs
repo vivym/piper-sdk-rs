@@ -861,7 +861,12 @@ fn raw_clock_warmup_sample_threshold(raw_clock: &TeleopRawClockSettings) -> usiz
 }
 
 fn experimental_raw_clock_control_read_policy() -> ControlReadPolicy {
-    ControlReadPolicy::default()
+    ControlReadPolicy {
+        max_feedback_age: Duration::from_millis(
+            crate::teleop::config::DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS,
+        ),
+        ..ControlReadPolicy::default()
+    }
 }
 
 fn experimental_raw_clock_dual_arm_read_policy() -> DualArmReadPolicy {
@@ -3154,6 +3159,10 @@ mod tests {
         let policy = experimental_raw_clock_control_read_policy();
 
         assert_eq!(policy.max_state_skew_us, 5_000);
+        assert_eq!(
+            policy.max_feedback_age,
+            Duration::from_millis(crate::teleop::config::DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS)
+        );
         assert!(policy.max_state_skew_us > DualArmReadPolicy::default().per_arm.max_state_skew_us);
         assert!(2_063 <= policy.max_state_skew_us);
     }
