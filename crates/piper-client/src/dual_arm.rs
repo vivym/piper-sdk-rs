@@ -207,7 +207,8 @@ impl DualArmActiveMit {
         let max_dt_us = duration_micros_u64(max_dt);
         let active = self;
         let mut report = BilateralRunReport::default();
-        let mut shaping_state = OutputShapingState::default();
+        let shaping_cfg = BilateralOutputShapingConfig::from_loop_config(&cfg);
+        let mut shaping_state: OutputShapingState = BilateralOutputShapingState::default();
         // Delay the first bilateral tick by one nominal period so startup dt is
         // close to the configured loop period instead of near zero.
         let mut scheduler = CycleScheduler::new(
@@ -502,7 +503,7 @@ impl DualArmActiveMit {
             let collect_telemetry = cfg.telemetry_sink.is_some();
             let controller_command = collect_telemetry.then(|| command.clone());
             apply_output_shaping(
-                &cfg,
+                &shaping_cfg,
                 &frame.snapshot,
                 control_dt,
                 &mut shaping_state,
@@ -1080,6 +1081,42 @@ impl Default for BilateralLoopConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BilateralOutputShapingConfig {
+    pub master_interaction_lpf_cutoff_hz: f64,
+    pub master_interaction_limit: JointArray<NewtonMeter>,
+    pub slave_feedforward_limit: JointArray<NewtonMeter>,
+    pub master_interaction_slew_limit_nm_per_s: JointArray<NewtonMeter>,
+    pub master_passivity_enabled: bool,
+    pub master_passivity_max_damping: JointArray<f64>,
+}
+
+impl Default for BilateralOutputShapingConfig {
+    fn default() -> Self {
+        Self {
+            master_interaction_lpf_cutoff_hz: 20.0,
+            master_interaction_limit: JointArray::splat(NewtonMeter(1.5)),
+            slave_feedforward_limit: JointArray::splat(NewtonMeter(4.0)),
+            master_interaction_slew_limit_nm_per_s: JointArray::splat(NewtonMeter(50.0)),
+            master_passivity_enabled: true,
+            master_passivity_max_damping: JointArray::splat(1.0),
+        }
+    }
+}
+
+impl BilateralOutputShapingConfig {
+    pub fn from_loop_config(cfg: &BilateralLoopConfig) -> Self {
+        Self {
+            master_interaction_lpf_cutoff_hz: cfg.master_interaction_lpf_cutoff_hz,
+            master_interaction_limit: cfg.master_interaction_limit,
+            slave_feedforward_limit: cfg.slave_feedforward_limit,
+            master_interaction_slew_limit_nm_per_s: cfg.master_interaction_slew_limit_nm_per_s,
+            master_passivity_enabled: cfg.master_passivity_enabled,
+            master_passivity_max_damping: cfg.master_passivity_max_damping,
+        }
+    }
+}
+
 /// 双臂运行统计
 #[derive(Debug, Clone, PartialEq)]
 pub struct BilateralRunReport {
@@ -1531,13 +1568,13 @@ where
 }
 
 #[derive(Debug)]
-struct OutputShapingState {
+pub(crate) struct BilateralOutputShapingState {
     master_interaction_filtered: JointArray<NewtonMeter>,
     last_master_interaction: JointArray<NewtonMeter>,
     passivity_energy: f64,
 }
 
-impl Default for OutputShapingState {
+impl Default for BilateralOutputShapingState {
     fn default() -> Self {
         Self {
             master_interaction_filtered: JointArray::splat(NewtonMeter::ZERO),
@@ -1546,6 +1583,8 @@ impl Default for OutputShapingState {
         }
     }
 }
+
+pub(crate) type OutputShapingState = BilateralOutputShapingState;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DualArmHoldAnchor {
@@ -1668,15 +1707,15 @@ fn classify_runtime_fault_exit_reason(health: DualArmRuntimeHealth) -> Option<Bi
     }
 }
 
-fn duration_micros_u64(duration: Duration) -> u64 {
+pub(crate) fn duration_micros_u64(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-fn clamp_control_dt_us(raw_dt_us: u64, max_dt_us: u64) -> u64 {
+pub(crate) fn clamp_control_dt_us(raw_dt_us: u64, max_dt_us: u64) -> u64 {
     raw_dt_us.clamp(1, max_dt_us.max(1))
 }
 
-fn deadline_missed_after_submission(
+pub(crate) fn deadline_missed_after_submission(
     submission_deadline_mono_us: u64,
     master_tx_finished_host_mono_us: Option<u64>,
     slave_tx_finished_host_mono_us: Option<u64>,
@@ -1773,7 +1812,7 @@ fn unavailable_gripper_sample() -> GripperTelemetrySample {
     }
 }
 
-fn build_gripper_telemetry(
+pub(crate) fn build_gripper_telemetry(
     cfg: &GripperTeleopConfig,
     mirror_enabled: bool,
     master: crate::observer::GripperState,
@@ -1866,7 +1905,7 @@ fn force_error_state(
     }
 }
 
-fn assemble_final_torques(
+pub(crate) fn assemble_final_torques(
     command: &BilateralCommand,
     compensation: Option<BilateralDynamicsCompensation>,
 ) -> BilateralFinalTorques {
@@ -1880,11 +1919,11 @@ fn assemble_final_torques(
     BilateralFinalTorques { master, slave }
 }
 
-fn apply_output_shaping(
-    cfg: &BilateralLoopConfig,
+pub(crate) fn apply_output_shaping(
+    cfg: &BilateralOutputShapingConfig,
     snapshot: &DualArmSnapshot,
     dt: Duration,
-    state: &mut OutputShapingState,
+    state: &mut BilateralOutputShapingState,
     command: &mut BilateralCommand,
 ) {
     let dt_sec = dt.as_secs_f64().max(f64::EPSILON);
@@ -3517,6 +3556,37 @@ mod tests {
     }
 
     #[test]
+    fn bilateral_output_shaping_config_copies_loop_limits() {
+        let cfg = BilateralLoopConfig {
+            master_interaction_lpf_cutoff_hz: 11.0,
+            master_interaction_limit: JointArray::splat(NewtonMeter(1.2)),
+            slave_feedforward_limit: JointArray::splat(NewtonMeter(3.4)),
+            master_interaction_slew_limit_nm_per_s: JointArray::splat(NewtonMeter(5.6)),
+            master_passivity_enabled: false,
+            master_passivity_max_damping: JointArray::splat(0.7),
+            ..BilateralLoopConfig::default()
+        };
+
+        let shaping = BilateralOutputShapingConfig::from_loop_config(&cfg);
+
+        assert_eq!(shaping.master_interaction_lpf_cutoff_hz, 11.0);
+        assert_eq!(
+            shaping.master_interaction_limit,
+            JointArray::splat(NewtonMeter(1.2))
+        );
+        assert_eq!(
+            shaping.slave_feedforward_limit,
+            JointArray::splat(NewtonMeter(3.4))
+        );
+        assert_eq!(
+            shaping.master_interaction_slew_limit_nm_per_s,
+            JointArray::splat(NewtonMeter(5.6))
+        );
+        assert!(!shaping.master_passivity_enabled);
+        assert_eq!(shaping.master_passivity_max_damping, JointArray::splat(0.7));
+    }
+
+    #[test]
     fn deadline_missed_after_submission_considers_tx_finished_and_post_sample() {
         assert!(deadline_missed_after_submission(100, Some(101), None, 99));
         assert!(deadline_missed_after_submission(100, None, Some(101), 99));
@@ -3718,10 +3788,11 @@ mod tests {
             ..BilateralLoopConfig::default()
         };
         let mut state = OutputShapingState::default();
+        let shaping_cfg = BilateralOutputShapingConfig::from_loop_config(&cfg);
         let mut command = command_with_master_interaction(NewtonMeter(10.0));
 
         apply_output_shaping(
-            &cfg,
+            &shaping_cfg,
             &zero_snapshot(),
             Duration::from_millis(5),
             &mut state,
@@ -4146,6 +4217,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = OutputShapingState::default();
+        let shaping_cfg = BilateralOutputShapingConfig::from_loop_config(&cfg);
         let mut command = BilateralCommand {
             slave_position: JointArray::splat(Rad(0.0)),
             slave_velocity: JointArray::splat(0.0),
@@ -4160,7 +4232,7 @@ mod tests {
         };
 
         apply_output_shaping(
-            &cfg,
+            &shaping_cfg,
             &snapshot,
             Duration::from_millis(5),
             &mut state,
@@ -4177,7 +4249,7 @@ mod tests {
 
         command.master_interaction_torque = JointArray::splat(NewtonMeter(2.0));
         apply_output_shaping(
-            &cfg,
+            &shaping_cfg,
             &snapshot,
             Duration::from_millis(5),
             &mut state,
@@ -4205,6 +4277,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = OutputShapingState::default();
+        let shaping_cfg = BilateralOutputShapingConfig::from_loop_config(&cfg);
         let mut command = BilateralCommand {
             slave_position: JointArray::splat(Rad(0.0)),
             slave_velocity: JointArray::splat(0.0),
@@ -4219,7 +4292,7 @@ mod tests {
         };
 
         apply_output_shaping(
-            &cfg,
+            &shaping_cfg,
             &snapshot,
             Duration::from_secs(1),
             &mut state,
@@ -4249,6 +4322,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = OutputShapingState::default();
+        let shaping_cfg = BilateralOutputShapingConfig::from_loop_config(&cfg);
         let mut command = BilateralCommand {
             slave_position: JointArray::splat(Rad(0.0)),
             slave_velocity: JointArray::splat(0.0),
@@ -4263,7 +4337,7 @@ mod tests {
         };
 
         apply_output_shaping(
-            &cfg,
+            &shaping_cfg,
             &snapshot,
             Duration::from_millis(5),
             &mut state,
