@@ -2957,7 +2957,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raw_clock_default_alignment_is_internally_valid() {
+    fn experimental_raw_clock_config_default_alignment_is_internally_valid() {
         let config = ExperimentalRawClockConfig::default();
 
         assert_eq!(config.thresholds.alignment_lag_us, 5_000);
@@ -2970,6 +2970,32 @@ mod tests {
             config.thresholds.alignment_lag_us < config.estimator_thresholds.last_sample_age_us
         );
         config.validate().expect("default raw-clock config should validate");
+    }
+
+    #[test]
+    fn experimental_raw_clock_config_rejects_zero_alignment_lag() {
+        let config = ExperimentalRawClockConfig {
+            thresholds: RawClockRuntimeThresholds {
+                alignment_lag_us: 0,
+                ..RawClockRuntimeThresholds::default()
+            },
+            ..ExperimentalRawClockConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn experimental_raw_clock_config_rejects_zero_alignment_buffer_miss_limit() {
+        let config = ExperimentalRawClockConfig {
+            thresholds: RawClockRuntimeThresholds {
+                alignment_buffer_miss_consecutive_failures: 0,
+                ..RawClockRuntimeThresholds::default()
+            },
+            ..ExperimentalRawClockConfig::default()
+        };
+
+        assert!(config.validate().is_err());
     }
 
     #[test]
