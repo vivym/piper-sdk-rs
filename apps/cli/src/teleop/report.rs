@@ -299,7 +299,7 @@ pub fn write_human_report<W: Write>(
         if let Some(alignment_lag_us) = timing.alignment_lag_us {
             writeln!(
                 writer,
-                "raw_clock alignment lag_us={} selected_skew max={} p95={} latest_skew max={} p95={} misses={} consecutive_max={}",
+                "raw_clock alignment lag_us={} selected_skew max={} p95={} latest_skew max={} p95={} misses={} consecutive_max={} current={}",
                 alignment_lag_us,
                 format_optional_u64(timing.selected_inter_arm_skew_max_us),
                 format_optional_u64(timing.selected_inter_arm_skew_p95_us),
@@ -307,6 +307,7 @@ pub fn write_human_report<W: Write>(
                 format_optional_u64(timing.latest_inter_arm_skew_p95_us),
                 timing.alignment_buffer_misses,
                 timing.alignment_buffer_miss_consecutive_max,
+                timing.alignment_buffer_miss_consecutive_failures,
             )?;
         }
         if timing.master_residual_max_spikes > 0
@@ -819,7 +820,7 @@ mod tests {
         assert!(output.contains("raw_clock alignment lag_us=5000"));
         assert!(output.contains("selected_skew max=800 p95=500"));
         assert!(output.contains("latest_skew max=9000 p95=4000"));
-        assert!(output.contains("misses=2 consecutive_max=1"));
+        assert!(output.contains("misses=2 consecutive_max=1 current=3"));
     }
 
     #[test]

@@ -707,6 +707,7 @@ fn report_timing_from_raw_clock(
     warmup: &RawClockWarmupSummary,
     report: &RawClockRuntimeReport,
 ) -> ReportTiming {
+    let alignment_diagnostics_known = runtime_has_alignment_evidence(report);
     ReportTiming {
         timing_source: CALIBRATED_HW_RAW_TIMING_SOURCE.to_string(),
         experimental: true,
@@ -726,11 +727,15 @@ fn report_timing_from_raw_clock(
         clock_health_failures: report
             .clock_health_failures
             .saturating_add(warmup.clock_health_failures),
-        alignment_lag_us: Some(report.alignment_lag_us),
-        latest_inter_arm_skew_max_us: Some(report.latest_inter_arm_skew_max_us),
-        latest_inter_arm_skew_p95_us: Some(report.latest_inter_arm_skew_p95_us),
-        selected_inter_arm_skew_max_us: Some(report.selected_inter_arm_skew_max_us),
-        selected_inter_arm_skew_p95_us: Some(report.selected_inter_arm_skew_p95_us),
+        alignment_lag_us: alignment_diagnostics_known.then_some(report.alignment_lag_us),
+        latest_inter_arm_skew_max_us: alignment_diagnostics_known
+            .then_some(report.latest_inter_arm_skew_max_us),
+        latest_inter_arm_skew_p95_us: alignment_diagnostics_known
+            .then_some(report.latest_inter_arm_skew_p95_us),
+        selected_inter_arm_skew_max_us: alignment_diagnostics_known
+            .then_some(report.selected_inter_arm_skew_max_us),
+        selected_inter_arm_skew_p95_us: alignment_diagnostics_known
+            .then_some(report.selected_inter_arm_skew_p95_us),
         alignment_buffer_misses: report.alignment_buffer_misses,
         alignment_buffer_miss_consecutive_max: report.alignment_buffer_miss_consecutive_max,
         alignment_buffer_miss_consecutive_failures: report
@@ -822,6 +827,17 @@ fn runtime_inter_arm_skew_p95_us(report: &RawClockRuntimeReport) -> Option<u64> 
 
 fn runtime_has_skew_evidence(report: &RawClockRuntimeReport) -> bool {
     report.iterations > 0 || report.max_inter_arm_skew_us > 0 || report.inter_arm_skew_p95_us > 0
+}
+
+fn runtime_has_alignment_evidence(report: &RawClockRuntimeReport) -> bool {
+    report.iterations > 0
+        || report.latest_inter_arm_skew_max_us > 0
+        || report.latest_inter_arm_skew_p95_us > 0
+        || report.selected_inter_arm_skew_max_us > 0
+        || report.selected_inter_arm_skew_p95_us > 0
+        || report.alignment_buffer_misses > 0
+        || report.alignment_buffer_miss_consecutive_max > 0
+        || report.alignment_buffer_miss_consecutive_failures > 0
 }
 
 fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -3012,6 +3028,24 @@ mod tests {
             report.last_error.as_deref(),
             Some("runtime API returned before report")
         );
+    }
+
+    #[test]
+    fn raw_clock_error_report_timing_keeps_alignment_diagnostics_unknown() {
+        let report = raw_clock_error_report(
+            RawClockRuntimeExitReason::RuntimeTransportFault,
+            "runtime API returned before report".to_string(),
+        );
+
+        let timing = report_timing_from_raw_clock(&RawClockWarmupSummary::default(), &report);
+
+        assert_eq!(timing.alignment_lag_us, None);
+        assert_eq!(timing.latest_inter_arm_skew_max_us, None);
+        assert_eq!(timing.latest_inter_arm_skew_p95_us, None);
+        assert_eq!(timing.selected_inter_arm_skew_max_us, None);
+        assert_eq!(timing.selected_inter_arm_skew_p95_us, None);
+        assert_eq!(timing.alignment_buffer_misses, 0);
+        assert_eq!(timing.alignment_buffer_miss_consecutive_failures, 0);
     }
 
     #[test]
