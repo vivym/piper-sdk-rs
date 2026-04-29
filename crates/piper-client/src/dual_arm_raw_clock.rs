@@ -503,6 +503,63 @@ pub struct ExperimentalRawClockSnapshot {
     pub feedback_age: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct RawClockAlignedSnapshot {
+    feedback_time_us: u64,
+    snapshot: ExperimentalRawClockSnapshot,
+}
+
+#[allow(dead_code)]
+impl RawClockAlignedSnapshot {
+    fn new(feedback_time_us: u64, snapshot: ExperimentalRawClockSnapshot) -> Self {
+        Self {
+            feedback_time_us,
+            snapshot,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct RawClockSnapshotBuffer {
+    samples: VecDeque<RawClockAlignedSnapshot>,
+    retention_us: u64,
+}
+
+#[allow(dead_code)]
+impl RawClockSnapshotBuffer {
+    fn new(retention_us: u64) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            retention_us,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    fn push(&mut self, sample: RawClockAlignedSnapshot) {
+        let newest = sample.feedback_time_us;
+        self.samples.push_back(sample);
+        while self
+            .samples
+            .front()
+            .is_some_and(|front| newest.saturating_sub(front.feedback_time_us) > self.retention_us)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    fn latest_before_or_at(&self, target_time_us: u64) -> Option<&RawClockAlignedSnapshot> {
+        self.samples
+            .iter()
+            .rev()
+            .find(|sample| sample.feedback_time_us <= target_time_us)
+    }
+}
+
 pub struct RawClockRuntimeTiming {
     master: RawClockEstimator,
     slave: RawClockEstimator,
@@ -2084,6 +2141,59 @@ mod tests {
             },
             feedback_age: Duration::from_micros(100),
         }
+    }
+
+    #[test]
+    fn snapshot_buffer_selects_latest_before_target_time() {
+        let mut buffer = RawClockSnapshotBuffer::new(20_000);
+        buffer.push(RawClockAlignedSnapshot::new(
+            100_000,
+            raw_clock_snapshot_for_tests(10_000, 100_000),
+        ));
+        buffer.push(RawClockAlignedSnapshot::new(
+            105_000,
+            raw_clock_snapshot_for_tests(15_000, 105_000),
+        ));
+        buffer.push(RawClockAlignedSnapshot::new(
+            110_000,
+            raw_clock_snapshot_for_tests(20_000, 110_000),
+        ));
+
+        let selected = buffer
+            .latest_before_or_at(107_000)
+            .expect("sample before target should be selected");
+
+        assert_eq!(selected.feedback_time_us, 105_000);
+    }
+
+    #[test]
+    fn snapshot_buffer_never_selects_future_sample() {
+        let mut buffer = RawClockSnapshotBuffer::new(20_000);
+        buffer.push(RawClockAlignedSnapshot::new(
+            105_000,
+            raw_clock_snapshot_for_tests(15_000, 105_000),
+        ));
+
+        assert!(buffer.latest_before_or_at(104_999).is_none());
+    }
+
+    #[test]
+    fn snapshot_buffer_prunes_by_retention_window() {
+        let mut buffer = RawClockSnapshotBuffer::new(10_000);
+        buffer.push(RawClockAlignedSnapshot::new(
+            100_000,
+            raw_clock_snapshot_for_tests(10_000, 100_000),
+        ));
+        buffer.push(RawClockAlignedSnapshot::new(
+            111_000,
+            raw_clock_snapshot_for_tests(21_000, 111_000),
+        ));
+
+        assert!(buffer.latest_before_or_at(100_000).is_none());
+        assert_eq!(
+            buffer.latest_before_or_at(111_000).map(|sample| sample.feedback_time_us),
+            Some(111_000)
+        );
     }
 
     fn ready_timing_for_tests() -> RawClockRuntimeTiming {
