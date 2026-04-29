@@ -307,10 +307,12 @@ impl TeleopRawClockSettings {
             MAX_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES,
         )?;
         if self.alignment_lag_us >= self.last_sample_age_ms.saturating_mul(1_000) {
+            let last_sample_age_limit_us = self.last_sample_age_ms.saturating_mul(1_000);
             bail!(
-                "alignment_lag_us must be less than last_sample_age_ms; got alignment_lag_us={} and last_sample_age_ms={}",
+                "alignment_lag_us must be less than last_sample_age_ms * 1000; got alignment_lag_us={} and last_sample_age_ms={} ({} us)",
                 self.alignment_lag_us,
-                self.last_sample_age_ms
+                self.last_sample_age_ms,
+                last_sample_age_limit_us
             );
         }
         Ok(())
@@ -755,6 +757,8 @@ mod tests {
 
         assert!(err.to_string().contains("alignment_lag_us"));
         assert!(err.to_string().contains("last_sample_age_ms"));
+        assert!(err.to_string().contains("last_sample_age_ms * 1000"));
+        assert!(err.to_string().contains("20000 us"));
     }
 
     #[test]
