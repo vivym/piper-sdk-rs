@@ -503,19 +503,23 @@ impl RawClockRuntimeGate {
 
     pub fn check_tick(&self, tick: RawClockTickTiming) -> Result<(), RawClockRuntimeError> {
         if tick.master_selected_sample_age_us > self.thresholds.last_sample_age_us {
-            let mut health = tick.master_health.clone();
-            health.last_sample_age_us = tick.master_selected_sample_age_us;
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: "master",
-                health: Box::new(health),
+                health: Box::new(selected_age_error_health(
+                    &tick.master_health,
+                    tick.master_selected_sample_age_us,
+                    self.thresholds.last_sample_age_us,
+                )),
             });
         }
         if tick.slave_selected_sample_age_us > self.thresholds.last_sample_age_us {
-            let mut health = tick.slave_health.clone();
-            health.last_sample_age_us = tick.slave_selected_sample_age_us;
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: "slave",
-                health: Box::new(health),
+                health: Box::new(selected_age_error_health(
+                    &tick.slave_health,
+                    tick.slave_selected_sample_age_us,
+                    self.thresholds.last_sample_age_us,
+                )),
             });
         }
         if !tick.master_health.healthy {
@@ -550,6 +554,21 @@ impl RawClockRuntimeGate {
         }
         Ok(())
     }
+}
+
+fn selected_age_error_health(
+    latest_health: &RawClockHealth,
+    selected_age_us: u64,
+    threshold_us: u64,
+) -> RawClockHealth {
+    let mut health = latest_health.clone();
+    health.last_sample_age_us = selected_age_us;
+    health.healthy = false;
+    health.failure_kind = Some(RawClockUnhealthyKind::LastSampleAge);
+    health.reason = Some(format!(
+        "selected sample age {selected_age_us}us exceeds runtime threshold {threshold_us}us"
+    ));
+    health
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -855,20 +874,24 @@ impl RawClockRuntimeTiming {
     ) -> Result<(), RawClockRuntimeError> {
         if tick.master_selected_sample_age_us > thresholds.last_sample_age_us {
             self.reset_residual_max_consecutive_failures(RawClockSide::Master);
-            let mut health = tick.master_health.clone();
-            health.last_sample_age_us = tick.master_selected_sample_age_us;
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: RawClockSide::Master.as_str(),
-                health: Box::new(health),
+                health: Box::new(selected_age_error_health(
+                    &tick.master_health,
+                    tick.master_selected_sample_age_us,
+                    thresholds.last_sample_age_us,
+                )),
             });
         }
         if tick.slave_selected_sample_age_us > thresholds.last_sample_age_us {
             self.reset_residual_max_consecutive_failures(RawClockSide::Slave);
-            let mut health = tick.slave_health.clone();
-            health.last_sample_age_us = tick.slave_selected_sample_age_us;
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: RawClockSide::Slave.as_str(),
-                health: Box::new(health),
+                health: Box::new(selected_age_error_health(
+                    &tick.slave_health,
+                    tick.slave_selected_sample_age_us,
+                    thresholds.last_sample_age_us,
+                )),
             });
         }
 
@@ -3198,6 +3221,11 @@ mod tests {
         match err {
             RawClockRuntimeError::ClockUnhealthy { side, health } => {
                 assert_eq!(side, "master");
+                assert!(!health.healthy);
+                assert_eq!(
+                    health.failure_kind,
+                    Some(RawClockUnhealthyKind::LastSampleAge)
+                );
                 assert_eq!(health.last_sample_age_us, 12_000);
             },
             other => panic!("expected master ClockUnhealthy, got {other:?}"),
@@ -3626,6 +3654,11 @@ mod tests {
         match err {
             RawClockRuntimeError::ClockUnhealthy { side, health } => {
                 assert_eq!(side, "master");
+                assert!(!health.healthy);
+                assert_eq!(
+                    health.failure_kind,
+                    Some(RawClockUnhealthyKind::LastSampleAge)
+                );
                 assert_eq!(health.last_sample_age_us, 12_000);
             },
             other => panic!("expected master ClockUnhealthy, got {other:?}"),
