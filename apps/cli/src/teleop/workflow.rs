@@ -841,6 +841,7 @@ fn experimental_raw_clock_config_from_settings(
         inter_arm_skew_max_us: raw_clock.inter_arm_skew_max_us,
         last_sample_age_us: raw_clock.last_sample_age_ms * 1_000,
         residual_max_consecutive_failures: raw_clock.residual_max_consecutive_failures,
+        ..RawClockRuntimeThresholds::default()
     };
 
     ExperimentalRawClockConfig {
