@@ -764,6 +764,14 @@ impl RawClockRuntimeTiming {
     fn reset_for_warmup(&mut self) {
         self.master.reset();
         self.slave.reset();
+        self.reset_for_active_runtime();
+        self.last_master_raw_us = None;
+        self.last_slave_raw_us = None;
+        self.master_raw_timestamp_regressions = 0;
+        self.slave_raw_timestamp_regressions = 0;
+    }
+
+    fn reset_for_active_runtime(&mut self) {
         self.master_alignment_buffer.clear();
         self.slave_alignment_buffer.clear();
         self.skew_samples_us.clear();
@@ -774,10 +782,6 @@ impl RawClockRuntimeTiming {
         self.alignment_buffer_misses = 0;
         self.alignment_buffer_miss_consecutive = 0;
         self.alignment_buffer_miss_consecutive_max = 0;
-        self.last_master_raw_us = None;
-        self.last_slave_raw_us = None;
-        self.master_raw_timestamp_regressions = 0;
-        self.slave_raw_timestamp_regressions = 0;
         self.reset_runtime_residual_max_counters();
     }
 
@@ -1369,7 +1373,7 @@ impl ExperimentalRawClockDualArmStandby {
                 Err(err) => return Err(err),
             }
         }
-        self.timing.reset_runtime_residual_max_counters();
+        self.timing.reset_for_active_runtime();
         Ok(self)
     }
 
@@ -1402,6 +1406,7 @@ impl ExperimentalRawClockDualArmStandby {
             },
         };
 
+        self.timing.reset_for_active_runtime();
         Ok(ExperimentalRawClockDualArmActive {
             master,
             slave,
@@ -4897,6 +4902,70 @@ mod tests {
         let report = timing.report(112_000, 0, None);
         assert_eq!(report.max_inter_arm_skew_us, 800);
         assert_eq!(report.inter_arm_skew_p95_us, 800);
+    }
+
+    #[test]
+    fn active_runtime_reset_drops_warmup_alignment_samples() {
+        let mut timing = ready_timing_for_tests();
+        timing
+            .warmup_tick_from_snapshots(
+                &raw_clock_snapshot_for_tests(11_000, 111_000),
+                &raw_clock_snapshot_for_tests(21_000, 111_800),
+                112_000,
+                RawClockRuntimeThresholds {
+                    inter_arm_skew_max_us: 20_000,
+                    ..RawClockRuntimeThresholds::for_tests()
+                },
+            )
+            .unwrap();
+
+        timing.reset_for_active_runtime();
+
+        assert_eq!(timing.sample_counts_for_tests(), (5, 5));
+        let master = raw_clock_snapshot_for_tests(17_000, 117_000);
+        let slave = raw_clock_snapshot_for_tests(27_000, 117_800);
+        let latest = timing.ingest_latest_snapshots(&master, &slave, 118_000).unwrap();
+        timing.push_latest_alignment_snapshots(&latest, &master, &slave);
+
+        let miss = timing
+            .select_aligned_snapshots(
+                &latest,
+                RawClockRuntimeThresholds::for_tests().alignment_lag_us,
+            )
+            .unwrap_err();
+
+        assert_eq!(miss.kind, AlignmentBufferMissKind::Both);
+        assert_eq!(miss.target_time_us, Some(112_000));
+    }
+
+    #[test]
+    fn active_runtime_reset_clears_warmup_skew_report_state() {
+        let mut timing = ready_timing_for_tests();
+        timing
+            .warmup_tick_from_snapshots(
+                &raw_clock_snapshot_for_tests(11_000, 111_000),
+                &raw_clock_snapshot_for_tests(21_000, 111_800),
+                112_000,
+                RawClockRuntimeThresholds {
+                    inter_arm_skew_max_us: 20_000,
+                    ..RawClockRuntimeThresholds::for_tests()
+                },
+            )
+            .unwrap();
+
+        let warmup_report = timing.report(112_000, 0, None);
+        assert_eq!(warmup_report.latest_inter_arm_skew_max_us, 800);
+        assert_eq!(warmup_report.selected_inter_arm_skew_max_us, 800);
+
+        timing.reset_for_active_runtime();
+        let active_report = timing.report(112_000, 0, None);
+
+        assert_eq!(active_report.max_inter_arm_skew_us, 0);
+        assert_eq!(active_report.inter_arm_skew_p95_us, 0);
+        assert_eq!(active_report.latest_inter_arm_skew_max_us, 0);
+        assert_eq!(active_report.latest_inter_arm_skew_p95_us, 0);
+        assert_eq!(active_report.selected_inter_arm_skew_max_us, 0);
+        assert_eq!(active_report.selected_inter_arm_skew_p95_us, 0);
     }
 
     #[test]
