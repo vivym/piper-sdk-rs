@@ -3177,6 +3177,34 @@ mod tests {
     }
 
     #[test]
+    fn selected_sample_age_above_threshold_fails_runtime_gate_with_selected_age() {
+        let gate = RawClockRuntimeGate::new(RawClockRuntimeThresholds {
+            last_sample_age_us: 5_000,
+            ..RawClockRuntimeThresholds::for_tests()
+        });
+
+        let err = gate
+            .check_tick(RawClockTickTiming {
+                master_feedback_time_us: 100_000,
+                slave_feedback_time_us: 100_800,
+                inter_arm_skew_us: 800,
+                master_selected_sample_age_us: 12_000,
+                slave_selected_sample_age_us: 200,
+                master_health: healthy_for_tests(),
+                slave_health: healthy_for_tests(),
+            })
+            .unwrap_err();
+
+        match err {
+            RawClockRuntimeError::ClockUnhealthy { side, health } => {
+                assert_eq!(side, "master");
+                assert_eq!(health.last_sample_age_us, 12_000);
+            },
+            other => panic!("expected master ClockUnhealthy, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn residual_max_single_spike_is_counted_without_faulting_before_limit() {
         let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
         let thresholds = RawClockRuntimeThresholds {
@@ -3595,10 +3623,13 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(matches!(
-            err,
-            RawClockRuntimeError::ClockUnhealthy { side: "master", .. }
-        ));
+        match err {
+            RawClockRuntimeError::ClockUnhealthy { side, health } => {
+                assert_eq!(side, "master");
+                assert_eq!(health.last_sample_age_us, 12_000);
+            },
+            other => panic!("expected master ClockUnhealthy, got {other:?}"),
+        }
     }
 
     #[test]
