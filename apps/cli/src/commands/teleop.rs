@@ -89,9 +89,13 @@ pub struct TeleopDualArmArgs {
     #[arg(long)]
     pub raw_clock_inter_arm_skew_max_us: Option<u64>,
     #[arg(long)]
+    pub raw_clock_selected_sample_age_ms: Option<u64>,
+    #[arg(long)]
     pub raw_clock_residual_max_consecutive_failures: Option<u32>,
     #[arg(long)]
     pub raw_clock_alignment_lag_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_alignment_search_window_us: Option<u64>,
     #[arg(long)]
     pub raw_clock_alignment_buffer_miss_consecutive_failures: Option<u32>,
 }
@@ -142,8 +146,10 @@ impl TeleopDualArmArgs {
             raw_clock_sample_gap_max_ms: None,
             raw_clock_last_sample_age_ms: None,
             raw_clock_inter_arm_skew_max_us: None,
+            raw_clock_selected_sample_age_ms: None,
             raw_clock_residual_max_consecutive_failures: None,
             raw_clock_alignment_lag_us: None,
+            raw_clock_alignment_search_window_us: None,
             raw_clock_alignment_buffer_miss_consecutive_failures: None,
         }
     }
@@ -220,6 +226,10 @@ mod tests {
             "5",
             "--raw-clock-alignment-lag-us",
             "5000",
+            "--raw-clock-selected-sample-age-ms",
+            "50",
+            "--raw-clock-alignment-search-window-us",
+            "25000",
             "--raw-clock-alignment-buffer-miss-consecutive-failures",
             "3",
         ])
@@ -232,6 +242,8 @@ mod tests {
                 assert_eq!(args.raw_clock_inter_arm_skew_max_us, Some(2000));
                 assert_eq!(args.raw_clock_residual_max_consecutive_failures, Some(5));
                 assert_eq!(args.raw_clock_alignment_lag_us, Some(5_000));
+                assert_eq!(args.raw_clock_selected_sample_age_ms, Some(50));
+                assert_eq!(args.raw_clock_alignment_search_window_us, Some(25_000));
                 assert_eq!(
                     args.raw_clock_alignment_buffer_miss_consecutive_failures,
                     Some(3)

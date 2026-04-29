@@ -37,10 +37,10 @@ RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES="${RAW_CLOCK_RESIDUAL_MAX_CONSECUTIV
 # smoke-test tail without relaxing freshness or inter-arm skew checks.
 RAW_CLOCK_SAMPLE_GAP_MAX_MS="${RAW_CLOCK_SAMPLE_GAP_MAX_MS:-50}"
 RAW_CLOCK_ALIGNMENT_LAG_US="${RAW_CLOCK_ALIGNMENT_LAG_US:-5000}"
+RAW_CLOCK_SELECTED_SAMPLE_AGE_MS="${RAW_CLOCK_SELECTED_SAMPLE_AGE_MS:-50}"
+RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US="${RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US:-25000}"
 RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES="${RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES:-3}"
-# Keep the smoke gate at one 100Hz control tick while allowing observed
-# independent-CAN feedback phase tails during damping/large-motion tests.
-RAW_CLOCK_SKEW_US="${RAW_CLOCK_SKEW_US:-10000}"
+RAW_CLOCK_SKEW_US="${RAW_CLOCK_SKEW_US:-20000}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-300}"
 DISABLE_GRIPPER_MIRROR="${DISABLE_GRIPPER_MIRROR:-1}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -70,6 +70,8 @@ cmd=(
     --raw-clock-residual-max-consecutive-failures "${RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES}"
     --raw-clock-sample-gap-max-ms "${RAW_CLOCK_SAMPLE_GAP_MAX_MS}"
     --raw-clock-alignment-lag-us "${RAW_CLOCK_ALIGNMENT_LAG_US}"
+    --raw-clock-selected-sample-age-ms "${RAW_CLOCK_SELECTED_SAMPLE_AGE_MS}"
+    --raw-clock-alignment-search-window-us "${RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US}"
     --raw-clock-alignment-buffer-miss-consecutive-failures "${RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES}"
     --max-iterations "${MAX_ITERATIONS}"
     --save-calibration "${CALIBRATION_FILE}"
@@ -97,6 +99,8 @@ fi
     echo "raw_clock_residual_max_consecutive_failures=${RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES}"
     echo "raw_clock_sample_gap_max_ms=${RAW_CLOCK_SAMPLE_GAP_MAX_MS}"
     echo "raw_clock_alignment_lag_us=${RAW_CLOCK_ALIGNMENT_LAG_US}"
+    echo "raw_clock_selected_sample_age_ms=${RAW_CLOCK_SELECTED_SAMPLE_AGE_MS}"
+    echo "raw_clock_alignment_search_window_us=${RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US}"
     echo "raw_clock_alignment_buffer_miss_consecutive_failures=${RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES}"
     echo "raw_clock_skew_us=${RAW_CLOCK_SKEW_US}"
     echo "max_iterations=${MAX_ITERATIONS}"

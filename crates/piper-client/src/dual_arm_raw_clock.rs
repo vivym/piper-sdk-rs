@@ -103,21 +103,38 @@ impl ExperimentalRawClockConfig {
                 "alignment_lag_us must be greater than 0".to_string(),
             ));
         }
+        if self.thresholds.alignment_search_window_us == 0 {
+            return Err(RawClockRuntimeError::Config(
+                "alignment_search_window_us must be greater than 0".to_string(),
+            ));
+        }
         if self.thresholds.alignment_buffer_miss_consecutive_failures == 0 {
             return Err(RawClockRuntimeError::Config(
                 "alignment_buffer_miss_consecutive_failures must be greater than 0".to_string(),
             ));
         }
-        if self.thresholds.alignment_lag_us >= self.thresholds.last_sample_age_us {
+        if self.thresholds.selected_sample_age_us < self.thresholds.last_sample_age_us {
             return Err(RawClockRuntimeError::Config(format!(
-                "alignment_lag_us {} must be less than runtime last_sample_age_us {}",
-                self.thresholds.alignment_lag_us, self.thresholds.last_sample_age_us
+                "selected_sample_age_us {} must be at least runtime last_sample_age_us {}",
+                self.thresholds.selected_sample_age_us, self.thresholds.last_sample_age_us
+            )));
+        }
+        if self.thresholds.alignment_lag_us >= self.thresholds.selected_sample_age_us {
+            return Err(RawClockRuntimeError::Config(format!(
+                "alignment_lag_us {} must be less than selected_sample_age_us {}",
+                self.thresholds.alignment_lag_us, self.thresholds.selected_sample_age_us
             )));
         }
         if self.thresholds.alignment_lag_us >= self.estimator_thresholds.last_sample_age_us {
             return Err(RawClockRuntimeError::Config(format!(
                 "alignment_lag_us {} must be less than estimator last_sample_age_us {}",
                 self.thresholds.alignment_lag_us, self.estimator_thresholds.last_sample_age_us
+            )));
+        }
+        if self.thresholds.inter_arm_skew_max_us > self.thresholds.alignment_search_window_us {
+            return Err(RawClockRuntimeError::Config(format!(
+                "inter_arm_skew_max_us {} must be <= alignment_search_window_us {}",
+                self.thresholds.inter_arm_skew_max_us, self.thresholds.alignment_search_window_us
             )));
         }
         Ok(())
@@ -145,18 +162,22 @@ impl Default for ExperimentalRawClockMasterFollowerGains {
 pub struct RawClockRuntimeThresholds {
     pub inter_arm_skew_max_us: u64,
     pub last_sample_age_us: u64,
+    pub selected_sample_age_us: u64,
     pub residual_max_consecutive_failures: u32,
     pub alignment_lag_us: u64,
+    pub alignment_search_window_us: u64,
     pub alignment_buffer_miss_consecutive_failures: u32,
 }
 
 impl Default for RawClockRuntimeThresholds {
     fn default() -> Self {
         Self {
-            inter_arm_skew_max_us: 2_000,
+            inter_arm_skew_max_us: 20_000,
             last_sample_age_us: 20_000,
+            selected_sample_age_us: 50_000,
             residual_max_consecutive_failures: 1,
             alignment_lag_us: 5_000,
+            alignment_search_window_us: 25_000,
             alignment_buffer_miss_consecutive_failures: 3,
         }
     }
@@ -170,8 +191,10 @@ impl RawClockRuntimeThresholds {
             // Fake runtime tests use synthetic receive timestamps with the real
             // monotonic clock; dedicated gate tests cover age rejection.
             last_sample_age_us: u64::MAX,
+            selected_sample_age_us: u64::MAX,
             residual_max_consecutive_failures: 1,
             alignment_lag_us: 5_000,
+            alignment_search_window_us: 25_000,
             alignment_buffer_miss_consecutive_failures: 3,
         }
     }
@@ -519,23 +542,23 @@ impl RawClockRuntimeGate {
     }
 
     pub fn check_tick(&self, tick: RawClockTickTiming) -> Result<(), RawClockRuntimeError> {
-        if tick.master_selected_sample_age_us > self.thresholds.last_sample_age_us {
+        if tick.master_selected_sample_age_us > self.thresholds.selected_sample_age_us {
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: "master",
                 health: Box::new(selected_age_error_health(
                     &tick.master_health,
                     tick.master_selected_sample_age_us,
-                    self.thresholds.last_sample_age_us,
+                    self.thresholds.selected_sample_age_us,
                 )),
             });
         }
-        if tick.slave_selected_sample_age_us > self.thresholds.last_sample_age_us {
+        if tick.slave_selected_sample_age_us > self.thresholds.selected_sample_age_us {
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: "slave",
                 health: Box::new(selected_age_error_health(
                     &tick.slave_health,
                     tick.slave_selected_sample_age_us,
-                    self.thresholds.last_sample_age_us,
+                    self.thresholds.selected_sample_age_us,
                 )),
             });
         }
@@ -648,15 +671,33 @@ struct RawClockAlignedSelection {
     target_time_us: u64,
 }
 
+fn alignment_pair_score(
+    master: &RawClockAlignedSnapshot,
+    slave: &RawClockAlignedSnapshot,
+    target_time_us: u64,
+) -> (u64, u64, u64) {
+    let skew_us = master.feedback_time_us.abs_diff(slave.feedback_time_us);
+    let midpoint_twice = master.feedback_time_us as i128 + slave.feedback_time_us as i128;
+    let target_twice = (target_time_us as i128) * 2;
+    let center_distance_us = ((midpoint_twice - target_twice).abs() / 2) as u64;
+    let per_side_target_error_us = master
+        .feedback_time_us
+        .abs_diff(target_time_us)
+        .saturating_add(slave.feedback_time_us.abs_diff(target_time_us));
+    (skew_us, center_distance_us, per_side_target_error_us)
+}
+
 fn raw_clock_alignment_retention_us(
     estimator: RawClockThresholds,
     runtime: RawClockRuntimeThresholds,
 ) -> u64 {
     runtime
         .alignment_lag_us
+        .saturating_add(runtime.alignment_search_window_us)
         .saturating_add(estimator.sample_gap_max_us.saturating_mul(2))
         .max(estimator.last_sample_age_us)
         .max(runtime.last_sample_age_us)
+        .max(runtime.selected_sample_age_us)
 }
 
 #[derive(Debug, Clone)]
@@ -696,6 +737,22 @@ impl RawClockSnapshotBuffer {
             .iter()
             .rev()
             .find(|sample| sample.feedback_time_us <= target_time_us)
+    }
+
+    fn has_sample_in_window(&self, start_time_us: u64, end_time_us: u64) -> bool {
+        self.samples
+            .iter()
+            .any(|sample| (start_time_us..=end_time_us).contains(&sample.feedback_time_us))
+    }
+
+    fn samples_in_window(
+        &self,
+        start_time_us: u64,
+        end_time_us: u64,
+    ) -> impl Iterator<Item = &RawClockAlignedSnapshot> {
+        self.samples
+            .iter()
+            .filter(move |sample| (start_time_us..=end_time_us).contains(&sample.feedback_time_us))
     }
 }
 
@@ -902,6 +959,7 @@ impl RawClockRuntimeTiming {
         &self,
         latest: &RawClockLatestTiming,
         alignment_lag_us: u64,
+        alignment_search_window_us: u64,
     ) -> Result<RawClockAlignedSelection, AlignmentBufferMiss> {
         let latest_common_time = latest.master_feedback_time_us.min(latest.slave_feedback_time_us);
         let Some(target_time_us) = latest_common_time.checked_sub(alignment_lag_us) else {
@@ -912,32 +970,56 @@ impl RawClockRuntimeTiming {
                 slave_latest_time_us: Some(latest.slave_feedback_time_us),
             });
         };
-        let master = self.master_alignment_buffer.latest_before_or_at(target_time_us);
-        let slave = self.slave_alignment_buffer.latest_before_or_at(target_time_us);
-        match (master, slave) {
-            (Some(master), Some(slave)) => Ok(RawClockAlignedSelection {
-                master: master.clone(),
-                slave: slave.clone(),
-                target_time_us,
-            }),
-            (None, None) => Err(AlignmentBufferMiss {
+        let window_start_us = target_time_us.saturating_sub(alignment_search_window_us);
+        let window_end_us = target_time_us
+            .saturating_add(alignment_search_window_us)
+            .min(latest_common_time);
+        let master_has_sample = self
+            .master_alignment_buffer
+            .has_sample_in_window(window_start_us, window_end_us);
+        let slave_has_sample =
+            self.slave_alignment_buffer.has_sample_in_window(window_start_us, window_end_us);
+        match (master_has_sample, slave_has_sample) {
+            (false, false) => Err(AlignmentBufferMiss {
                 kind: AlignmentBufferMissKind::Both,
                 target_time_us: Some(target_time_us),
                 master_latest_time_us: Some(latest.master_feedback_time_us),
                 slave_latest_time_us: Some(latest.slave_feedback_time_us),
             }),
-            (None, Some(_)) => Err(AlignmentBufferMiss {
+            (false, true) => Err(AlignmentBufferMiss {
                 kind: AlignmentBufferMissKind::Master,
                 target_time_us: Some(target_time_us),
                 master_latest_time_us: Some(latest.master_feedback_time_us),
                 slave_latest_time_us: Some(latest.slave_feedback_time_us),
             }),
-            (Some(_), None) => Err(AlignmentBufferMiss {
+            (true, false) => Err(AlignmentBufferMiss {
                 kind: AlignmentBufferMissKind::Slave,
                 target_time_us: Some(target_time_us),
                 master_latest_time_us: Some(latest.master_feedback_time_us),
                 slave_latest_time_us: Some(latest.slave_feedback_time_us),
             }),
+            (true, true) => {
+                let mut best: Option<((u64, u64, u64), RawClockAlignedSelection)> = None;
+                for master in
+                    self.master_alignment_buffer.samples_in_window(window_start_us, window_end_us)
+                {
+                    for slave in self
+                        .slave_alignment_buffer
+                        .samples_in_window(window_start_us, window_end_us)
+                    {
+                        let score = alignment_pair_score(master, slave, target_time_us);
+                        let selection = RawClockAlignedSelection {
+                            master: master.clone(),
+                            slave: slave.clone(),
+                            target_time_us,
+                        };
+                        if best.as_ref().is_none_or(|(best_score, _)| score < *best_score) {
+                            best = Some((score, selection));
+                        }
+                    }
+                }
+                Ok(best.expect("sample presence checked above").1)
+            },
         }
     }
 
@@ -1068,25 +1150,25 @@ impl RawClockRuntimeTiming {
         tick: RawClockTickTiming,
         thresholds: RawClockRuntimeThresholds,
     ) -> Result<(), RawClockRuntimeError> {
-        if tick.master_selected_sample_age_us > thresholds.last_sample_age_us {
+        if tick.master_selected_sample_age_us > thresholds.selected_sample_age_us {
             self.reset_residual_max_consecutive_failures(RawClockSide::Master);
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: RawClockSide::Master.as_str(),
                 health: Box::new(selected_age_error_health(
                     &tick.master_health,
                     tick.master_selected_sample_age_us,
-                    thresholds.last_sample_age_us,
+                    thresholds.selected_sample_age_us,
                 )),
             });
         }
-        if tick.slave_selected_sample_age_us > thresholds.last_sample_age_us {
+        if tick.slave_selected_sample_age_us > thresholds.selected_sample_age_us {
             self.reset_residual_max_consecutive_failures(RawClockSide::Slave);
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: RawClockSide::Slave.as_str(),
                 health: Box::new(selected_age_error_health(
                     &tick.slave_health,
                     tick.slave_selected_sample_age_us,
-                    thresholds.last_sample_age_us,
+                    thresholds.selected_sample_age_us,
                 )),
             });
         }
@@ -1864,9 +1946,11 @@ where
 
         timing.push_latest_alignment_snapshots(&latest, &master, &slave);
 
-        let selection = match timing
-            .select_aligned_snapshots(&latest, config.thresholds.alignment_lag_us)
-        {
+        let selection = match timing.select_aligned_snapshots(
+            &latest,
+            config.thresholds.alignment_lag_us,
+            config.thresholds.alignment_search_window_us,
+        ) {
             Ok(selection) => {
                 timing.record_alignment_selection_success();
                 selection
@@ -2670,7 +2754,7 @@ mod tests {
             )
             .unwrap();
 
-        let err = timing.select_aligned_snapshots(&latest, 200_000).unwrap_err();
+        let err = timing.select_aligned_snapshots(&latest, 200_000, 25_000).unwrap_err();
 
         assert_eq!(err.kind, AlignmentBufferMissKind::TargetUnderflow);
     }
@@ -2690,9 +2774,47 @@ mod tests {
             raw_clock_snapshot_for_tests(10_000, 110_000),
         ));
 
-        let err = timing.select_aligned_snapshots(&latest, 500).unwrap_err();
+        let err = timing.select_aligned_snapshots(&latest, 500, 600).unwrap_err();
 
         assert_eq!(err.kind, AlignmentBufferMissKind::Slave);
+    }
+
+    #[test]
+    fn alignment_selector_prefers_lowest_skew_pair_within_search_window() {
+        let mut timing = ready_timing_for_tests();
+        let latest = RawClockLatestTiming {
+            master_feedback_time_us: 130_000,
+            slave_feedback_time_us: 130_800,
+            latest_inter_arm_skew_us: 800,
+            master_health: healthy_for_tests(),
+            slave_health: healthy_for_tests(),
+        };
+        timing.master_alignment_buffer.clear();
+        timing.slave_alignment_buffer.clear();
+        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            120_000,
+            raw_clock_snapshot_for_tests(10_000, 120_000),
+        ));
+        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            124_000,
+            raw_clock_snapshot_for_tests(14_000, 124_000),
+        ));
+        timing.slave_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            120_500,
+            raw_clock_snapshot_for_tests(20_500, 120_500),
+        ));
+        timing.slave_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            135_000,
+            raw_clock_snapshot_for_tests(35_000, 135_000),
+        ));
+
+        let selection = timing
+            .select_aligned_snapshots(&latest, 5_000, 25_000)
+            .expect("best pair should be found");
+
+        assert_eq!(selection.target_time_us, 125_000);
+        assert_eq!(selection.master.feedback_time_us, 120_000);
+        assert_eq!(selection.slave.feedback_time_us, 120_500);
     }
 
     #[test]
@@ -3549,11 +3671,12 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raw_clock_config_rejects_alignment_lag_at_runtime_freshness() {
+    fn experimental_raw_clock_config_rejects_alignment_lag_at_selected_freshness() {
         let config = ExperimentalRawClockConfig {
             thresholds: RawClockRuntimeThresholds {
                 alignment_lag_us: 20_000,
-                last_sample_age_us: 20_000,
+                last_sample_age_us: 10_000,
+                selected_sample_age_us: 20_000,
                 ..RawClockRuntimeThresholds::default()
             },
             estimator_thresholds: RawClockThresholds {
@@ -3641,7 +3764,7 @@ mod tests {
     #[test]
     fn selected_sample_age_above_threshold_fails_runtime_gate_with_selected_age() {
         let gate = RawClockRuntimeGate::new(RawClockRuntimeThresholds {
-            last_sample_age_us: 5_000,
+            selected_sample_age_us: 5_000,
             ..RawClockRuntimeThresholds::for_tests()
         });
 
@@ -3668,6 +3791,66 @@ mod tests {
                 assert_eq!(health.last_sample_age_us, 12_000);
             },
             other => panic!("expected master ClockUnhealthy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selected_sample_age_uses_selected_threshold_not_latest_threshold() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let tick = RawClockTickTiming {
+            master_feedback_time_us: 100_000,
+            slave_feedback_time_us: 100_800,
+            inter_arm_skew_us: 800,
+            master_selected_sample_age_us: 23_160,
+            slave_selected_sample_age_us: 23_160,
+            master_health: healthy_for_tests(),
+            slave_health: healthy_for_tests(),
+        };
+
+        timing
+            .check_tick_with_debounce(
+                tick,
+                RawClockRuntimeThresholds {
+                    last_sample_age_us: 20_000,
+                    selected_sample_age_us: 50_000,
+                    ..RawClockRuntimeThresholds::for_tests()
+                },
+            )
+            .expect("selected sample age below selected threshold should pass");
+    }
+
+    #[test]
+    fn latest_sample_age_still_uses_latest_threshold() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let mut master_health = healthy_for_tests();
+        master_health.last_sample_age_us = 20_001;
+        let tick = RawClockTickTiming {
+            master_feedback_time_us: 100_000,
+            slave_feedback_time_us: 100_800,
+            inter_arm_skew_us: 800,
+            master_selected_sample_age_us: 23_160,
+            slave_selected_sample_age_us: 23_160,
+            master_health,
+            slave_health: healthy_for_tests(),
+        };
+
+        let err = timing
+            .check_tick_with_debounce(
+                tick,
+                RawClockRuntimeThresholds {
+                    last_sample_age_us: 20_000,
+                    selected_sample_age_us: 50_000,
+                    ..RawClockRuntimeThresholds::for_tests()
+                },
+            )
+            .unwrap_err();
+
+        match err {
+            RawClockRuntimeError::ClockUnhealthy { side, health } => {
+                assert_eq!(side, "master");
+                assert_eq!(health.last_sample_age_us, 20_001);
+            },
+            other => panic!("expected master latest-age failure, got {other:?}"),
         }
     }
 
@@ -4084,7 +4267,7 @@ mod tests {
             .check_tick_with_debounce(
                 selected,
                 RawClockRuntimeThresholds {
-                    last_sample_age_us: 5_000,
+                    selected_sample_age_us: 5_000,
                     ..RawClockRuntimeThresholds::default()
                 },
             )
@@ -4139,6 +4322,7 @@ mod tests {
                 selected,
                 RawClockRuntimeThresholds {
                     last_sample_age_us: 50_000,
+                    selected_sample_age_us: 50_000,
                     ..RawClockRuntimeThresholds::default()
                 },
             )
@@ -4400,14 +4584,14 @@ mod tests {
             ready_timing_with_alignment_sample_for_tests(104_200, 105_000),
             2,
             RawClockRuntimeThresholds {
-                inter_arm_skew_max_us: 1_000,
+                inter_arm_skew_max_us: 700,
                 ..RawClockRuntimeThresholds::for_tests()
             },
         );
 
         assert_eq!(
             *state.command_log.lock().expect("command log lock"),
-            vec!["slave", "master"]
+            Vec::<&'static str>::new()
         );
         assert!(matches!(
             report.exit_reason,
@@ -4618,6 +4802,7 @@ mod tests {
                     alignment_lag_us: 50_000,
                     alignment_buffer_miss_consecutive_failures: 3,
                     last_sample_age_us: u64::MAX,
+                    selected_sample_age_us: u64::MAX,
                     ..RawClockRuntimeThresholds::default()
                 },
                 estimator_thresholds: thresholds_for_tests(),
@@ -4679,6 +4864,7 @@ mod tests {
                     alignment_lag_us: 50_000,
                     alignment_buffer_miss_consecutive_failures: 3,
                     last_sample_age_us: 100_000,
+                    selected_sample_age_us: 100_000,
                     ..RawClockRuntimeThresholds::default()
                 },
                 estimator_thresholds: thresholds_for_tests(),
@@ -4712,56 +4898,57 @@ mod tests {
 
     #[test]
     fn alignment_buffer_misses_recover_before_threshold_and_reset_consecutive_count() {
-        let io = FakeRuntimeIo::new().with_reads([
-            FakeRead::pair(
-                raw_clock_snapshot_for_tests(11_000, 111_000),
-                raw_clock_snapshot_for_tests(21_000, 111_800),
-            ),
-            FakeRead::pair(
-                raw_clock_snapshot_for_tests(12_000, 112_000),
-                raw_clock_snapshot_for_tests(22_000, 112_800),
-            ),
-            FakeRead::pair(
-                raw_clock_snapshot_for_tests(13_000, 113_000),
-                raw_clock_snapshot_for_tests(23_000, 113_800),
-            ),
-            FakeRead::pair(
-                raw_clock_snapshot_for_tests(14_000, 114_000),
-                raw_clock_snapshot_for_tests(24_000, 114_800),
-            ),
-            FakeRead::pair(
-                raw_clock_snapshot_for_tests(15_000, 115_000),
-                raw_clock_snapshot_for_tests(25_000, 115_800),
-            ),
-            FakeRead::pair(
-                raw_clock_snapshot_for_tests(16_000, 116_000),
-                raw_clock_snapshot_for_tests(26_000, 116_800),
-            ),
-            FakeRead::pair(
-                raw_clock_snapshot_for_tests(17_000, 117_000),
-                raw_clock_snapshot_for_tests(27_000, 117_800),
-            ),
-        ]);
+        let mut timing = ready_timing_for_tests();
+        timing.master_alignment_buffer.clear();
+        timing.slave_alignment_buffer.clear();
+        let latest = RawClockLatestTiming {
+            master_feedback_time_us: 130_000,
+            slave_feedback_time_us: 130_800,
+            latest_inter_arm_skew_us: 800,
+            master_health: healthy_for_tests(),
+            slave_health: healthy_for_tests(),
+        };
 
-        let (state, report) = run_fake_runtime(
-            io,
-            ready_timing_for_tests(),
-            1,
-            RawClockRuntimeThresholds {
-                alignment_buffer_miss_consecutive_failures: 7,
-                inter_arm_skew_max_us: 20_000,
-                last_sample_age_us: 100_000,
-                ..RawClockRuntimeThresholds::for_tests()
-            },
-        );
+        let miss = timing.select_aligned_snapshots(&latest, 5_000, 25_000).unwrap_err();
+        timing.record_alignment_buffer_miss(miss);
+        assert_eq!(timing.alignment_buffer_miss_consecutive_for_tests(), 1);
 
-        assert_eq!(
-            *state.command_log.lock().expect("command log lock"),
-            vec!["slave", "master"]
-        );
-        assert_eq!(report.iterations, 1);
-        assert_eq!(report.alignment_buffer_misses, 6);
-        assert_eq!(report.alignment_buffer_miss_consecutive_max, 6);
+        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            120_000,
+            raw_clock_snapshot_for_tests(10_000, 120_000),
+        ));
+        timing.slave_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            120_200,
+            raw_clock_snapshot_for_tests(20_200, 120_200),
+        ));
+        let selection = timing
+            .select_aligned_snapshots(&latest, 5_000, 25_000)
+            .expect("fresh best-pair samples should recover before miss threshold");
+        timing.record_alignment_selection_success();
+        let tick = timing
+            .selected_tick_from_buffered_times(
+                &latest,
+                selection.master.feedback_time_us,
+                selection.master.host_rx_mono_us,
+                selection.slave.feedback_time_us,
+                selection.slave.host_rx_mono_us,
+                130_900,
+            )
+            .unwrap();
+        timing.record_skew_sample(tick.inter_arm_skew_us);
+        timing
+            .check_tick_with_debounce(
+                tick,
+                RawClockRuntimeThresholds {
+                    inter_arm_skew_max_us: 20_000,
+                    ..RawClockRuntimeThresholds::for_tests()
+                },
+            )
+            .unwrap();
+        let report = timing.report(130_900, 1, None);
+
+        assert_eq!(report.alignment_buffer_misses, 1);
+        assert_eq!(report.alignment_buffer_miss_consecutive_max, 1);
         assert_eq!(report.alignment_buffer_miss_consecutive_failures, 0);
         assert_eq!(report.max_inter_arm_skew_us, 200);
         assert_eq!(report.inter_arm_skew_p95_us, 200);
@@ -4931,10 +5118,11 @@ mod tests {
             .select_aligned_snapshots(
                 &latest,
                 RawClockRuntimeThresholds::for_tests().alignment_lag_us,
+                RawClockRuntimeThresholds::for_tests().alignment_search_window_us,
             )
             .unwrap_err();
 
-        assert_eq!(miss.kind, AlignmentBufferMissKind::Both);
+        assert_eq!(miss.kind, AlignmentBufferMissKind::Slave);
         assert_eq!(miss.target_time_us, Some(112_000));
     }
 

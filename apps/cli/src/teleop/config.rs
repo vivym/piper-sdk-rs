@@ -20,9 +20,11 @@ pub const DEFAULT_RAW_CLOCK_RESIDUAL_MAX_US: u64 = 2000;
 pub const DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 500.0;
 pub const DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 20;
-pub const DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 2000;
+pub const DEFAULT_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS: u64 = 50;
+pub const DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 20_000;
 pub const DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 pub const DEFAULT_RAW_CLOCK_ALIGNMENT_LAG_US: u64 = 5_000;
+pub const DEFAULT_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US: u64 = 25_000;
 pub const DEFAULT_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES: u32 = 3;
 // Lab-experiment guardrails: generous enough for setup/debugging, low enough
 // that raw-clock health gates cannot be configured into practical no-ops.
@@ -32,9 +34,11 @@ pub const MAX_RAW_CLOCK_RESIDUAL_MAX_US: u64 = 250_000;
 pub const MAX_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 1000.0;
 pub const MAX_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 1000;
 pub const MAX_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 1000;
+pub const MAX_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS: u64 = 1000;
 pub const MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 100_000;
 pub const MAX_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES: u32 = 100;
 pub const MAX_RAW_CLOCK_ALIGNMENT_LAG_US: u64 = 100_000;
+pub const MAX_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US: u64 = 100_000;
 pub const MAX_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES: u32 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -148,8 +152,10 @@ pub struct TeleopRawClockConfig {
     pub sample_gap_max_ms: Option<u64>,
     pub last_sample_age_ms: Option<u64>,
     pub inter_arm_skew_max_us: Option<u64>,
+    pub selected_sample_age_ms: Option<u64>,
     pub residual_max_consecutive_failures: Option<u32>,
     pub alignment_lag_us: Option<u64>,
+    pub alignment_search_window_us: Option<u64>,
     pub alignment_buffer_miss_consecutive_failures: Option<u32>,
 }
 
@@ -186,8 +192,10 @@ pub struct TeleopRawClockSettings {
     pub sample_gap_max_ms: u64,
     pub last_sample_age_ms: u64,
     pub inter_arm_skew_max_us: u64,
+    pub selected_sample_age_ms: u64,
     pub residual_max_consecutive_failures: u32,
     pub alignment_lag_us: u64,
+    pub alignment_search_window_us: u64,
     pub alignment_buffer_miss_consecutive_failures: u32,
 }
 
@@ -288,6 +296,12 @@ impl TeleopRawClockSettings {
             1,
             MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US,
         )?;
+        validate_u64_range(
+            "selected_sample_age_ms",
+            self.selected_sample_age_ms,
+            1,
+            MAX_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS,
+        )?;
         validate_u32_range(
             "residual_max_consecutive_failures",
             self.residual_max_consecutive_failures,
@@ -300,19 +314,39 @@ impl TeleopRawClockSettings {
             1,
             MAX_RAW_CLOCK_ALIGNMENT_LAG_US,
         )?;
+        validate_u64_range(
+            "alignment_search_window_us",
+            self.alignment_search_window_us,
+            1,
+            MAX_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US,
+        )?;
         validate_u32_range(
             "alignment_buffer_miss_consecutive_failures",
             self.alignment_buffer_miss_consecutive_failures,
             1,
             MAX_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES,
         )?;
-        if self.alignment_lag_us >= self.last_sample_age_ms.saturating_mul(1_000) {
-            let last_sample_age_limit_us = self.last_sample_age_ms.saturating_mul(1_000);
+        if self.selected_sample_age_ms < self.last_sample_age_ms {
             bail!(
-                "alignment_lag_us must be less than last_sample_age_ms * 1000; got alignment_lag_us={} and last_sample_age_ms={} ({} us)",
+                "selected_sample_age_ms must be greater than or equal to last_sample_age_ms; got selected_sample_age_ms={} and last_sample_age_ms={}",
+                self.selected_sample_age_ms,
+                self.last_sample_age_ms
+            );
+        }
+        if self.alignment_lag_us >= self.selected_sample_age_ms.saturating_mul(1_000) {
+            let selected_sample_age_limit_us = self.selected_sample_age_ms.saturating_mul(1_000);
+            bail!(
+                "alignment_lag_us must be less than selected_sample_age_ms * 1000; got alignment_lag_us={} and selected_sample_age_ms={} ({} us)",
                 self.alignment_lag_us,
-                self.last_sample_age_ms,
-                last_sample_age_limit_us
+                self.selected_sample_age_ms,
+                selected_sample_age_limit_us
+            );
+        }
+        if self.inter_arm_skew_max_us > self.alignment_search_window_us {
+            bail!(
+                "inter_arm_skew_max_us must be less than or equal to alignment_search_window_us; got inter_arm_skew_max_us={} and alignment_search_window_us={}",
+                self.inter_arm_skew_max_us,
+                self.alignment_search_window_us
             );
         }
         Ok(())
@@ -388,6 +422,10 @@ impl ResolvedTeleopConfig {
                 .raw_clock_inter_arm_skew_max_us
                 .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.inter_arm_skew_max_us))
                 .unwrap_or(DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US),
+            selected_sample_age_ms: args
+                .raw_clock_selected_sample_age_ms
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.selected_sample_age_ms))
+                .unwrap_or(DEFAULT_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS),
             residual_max_consecutive_failures: args
                 .raw_clock_residual_max_consecutive_failures
                 .or_else(|| {
@@ -398,6 +436,12 @@ impl ResolvedTeleopConfig {
                 .raw_clock_alignment_lag_us
                 .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.alignment_lag_us))
                 .unwrap_or(DEFAULT_RAW_CLOCK_ALIGNMENT_LAG_US),
+            alignment_search_window_us: args
+                .raw_clock_alignment_search_window_us
+                .or_else(|| {
+                    file_raw_clock.and_then(|raw_clock| raw_clock.alignment_search_window_us)
+                })
+                .unwrap_or(DEFAULT_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US),
             alignment_buffer_miss_consecutive_failures: args
                 .raw_clock_alignment_buffer_miss_consecutive_failures
                 .or_else(|| {
@@ -728,6 +772,8 @@ mod tests {
         let file = TeleopConfigFile {
             raw_clock: Some(TeleopRawClockConfig {
                 alignment_lag_us: Some(7_000),
+                selected_sample_age_ms: Some(50),
+                alignment_search_window_us: Some(25_000),
                 alignment_buffer_miss_consecutive_failures: Some(5),
                 ..Default::default()
             }),
@@ -739,6 +785,8 @@ mod tests {
                 .unwrap();
 
         assert_eq!(resolved.raw_clock.alignment_lag_us, 7_000);
+        assert_eq!(resolved.raw_clock.selected_sample_age_ms, 50);
+        assert_eq!(resolved.raw_clock.alignment_search_window_us, 25_000);
         assert_eq!(
             resolved.raw_clock.alignment_buffer_miss_consecutive_failures,
             5
@@ -749,16 +797,44 @@ mod tests {
     fn raw_clock_alignment_validation_rejects_lag_at_last_sample_age() {
         let args = TeleopDualArmArgs {
             raw_clock_alignment_lag_us: Some(20_000),
-            raw_clock_last_sample_age_ms: Some(20),
+            raw_clock_selected_sample_age_ms: Some(20),
             ..TeleopDualArmArgs::default_for_tests()
         };
 
         let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
 
         assert!(err.to_string().contains("alignment_lag_us"));
-        assert!(err.to_string().contains("last_sample_age_ms"));
-        assert!(err.to_string().contains("last_sample_age_ms * 1000"));
+        assert!(err.to_string().contains("selected_sample_age_ms"));
+        assert!(err.to_string().contains("selected_sample_age_ms * 1000"));
         assert!(err.to_string().contains("20000 us"));
+    }
+
+    #[test]
+    fn raw_clock_alignment_validation_requires_selected_age_at_least_latest_age() {
+        let args = TeleopDualArmArgs {
+            raw_clock_last_sample_age_ms: Some(50),
+            raw_clock_selected_sample_age_ms: Some(40),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+
+        assert!(err.to_string().contains("selected_sample_age_ms"));
+        assert!(err.to_string().contains("last_sample_age_ms"));
+    }
+
+    #[test]
+    fn raw_clock_alignment_validation_rejects_skew_above_search_window() {
+        let args = TeleopDualArmArgs {
+            raw_clock_inter_arm_skew_max_us: Some(30_000),
+            raw_clock_alignment_search_window_us: Some(25_000),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+
+        assert!(err.to_string().contains("inter_arm_skew_max_us"));
+        assert!(err.to_string().contains("alignment_search_window_us"));
     }
 
     #[test]

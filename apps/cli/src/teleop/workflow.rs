@@ -865,8 +865,10 @@ fn experimental_raw_clock_config_from_settings(
     let thresholds = RawClockRuntimeThresholds {
         inter_arm_skew_max_us: raw_clock.inter_arm_skew_max_us,
         last_sample_age_us: raw_clock.last_sample_age_ms * 1_000,
+        selected_sample_age_us: raw_clock.selected_sample_age_ms * 1_000,
         residual_max_consecutive_failures: raw_clock.residual_max_consecutive_failures,
         alignment_lag_us: raw_clock.alignment_lag_us,
+        alignment_search_window_us: raw_clock.alignment_search_window_us,
         alignment_buffer_miss_consecutive_failures: raw_clock
             .alignment_buffer_miss_consecutive_failures,
     };
@@ -3172,6 +3174,8 @@ mod tests {
             inter_arm_skew_max_us: 1500,
             residual_max_consecutive_failures: 5,
             alignment_lag_us: 4_000,
+            selected_sample_age_ms: 50,
+            alignment_search_window_us: 25_000,
             alignment_buffer_miss_consecutive_failures: 6,
         };
 
@@ -3190,6 +3194,8 @@ mod tests {
         assert_eq!(config.thresholds.last_sample_age_us, 9_000);
         assert_eq!(config.thresholds.residual_max_consecutive_failures, 5);
         assert_eq!(config.thresholds.alignment_lag_us, 4_000);
+        assert_eq!(config.thresholds.selected_sample_age_us, 50_000);
+        assert_eq!(config.thresholds.alignment_search_window_us, 25_000);
         assert_eq!(
             config.thresholds.alignment_buffer_miss_consecutive_failures,
             6
@@ -3207,8 +3213,10 @@ mod tests {
             sample_gap_max_ms: 20,
             last_sample_age_ms: 20,
             inter_arm_skew_max_us: 5000,
+            selected_sample_age_ms: 50,
             residual_max_consecutive_failures: 3,
             alignment_lag_us: 5_000,
+            alignment_search_window_us: 25_000,
             alignment_buffer_miss_consecutive_failures: 3,
         };
 
