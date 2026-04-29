@@ -398,10 +398,6 @@ impl ResolvedTeleopConfig {
         };
         control.validate()?;
 
-        if args.experimental_calibrated_raw && control.mode != TeleopMode::MasterFollower {
-            bail!("experimental calibrated raw clock requires master-follower mode");
-        }
-
         let raw_clock = TeleopRawClockSettings {
             experimental_calibrated_raw: args.experimental_calibrated_raw,
             warmup_secs: args
@@ -639,15 +635,18 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raw_clock_rejects_bilateral_mode() {
+    fn experimental_raw_clock_accepts_bilateral_mode() {
         let args = TeleopDualArmArgs {
             experimental_calibrated_raw: true,
             mode: Some(TeleopMode::Bilateral),
             ..TeleopDualArmArgs::default_for_tests()
         };
 
-        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
-        assert!(err.to_string().contains("master-follower"));
+        let resolved = ResolvedTeleopConfig::resolve(args, None)
+            .expect("experimental raw-clock should accept bilateral mode");
+
+        assert_eq!(resolved.control.mode, TeleopMode::Bilateral);
+        assert!(resolved.raw_clock.experimental_calibrated_raw);
     }
 
     #[test]

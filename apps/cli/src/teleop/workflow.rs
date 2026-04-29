@@ -80,6 +80,7 @@ pub trait ExperimentalRawClockTeleopBackend {
     fn warmup_raw_clock(
         &mut self,
         settings: &TeleopRawClockSettings,
+        mode: TeleopMode,
         frequency_hz: f64,
         max_iterations: Option<usize>,
         cancel_signal: Arc<AtomicBool>,
@@ -450,6 +451,7 @@ where
     backend.connect_soft(&targets, args.baud_rate)?;
     match backend.warmup_raw_clock(
         &resolved.raw_clock,
+        resolved.control.mode,
         resolved.control.frequency_hz,
         resolved.max_iterations,
         cancel_signal.clone(),
@@ -508,6 +510,7 @@ where
     })?;
     let warmup = match backend.warmup_raw_clock(
         &resolved.raw_clock,
+        resolved.control.mode,
         resolved.control.frequency_hz,
         resolved.max_iterations,
         cancel_signal.clone(),
@@ -848,8 +851,16 @@ fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+fn experimental_raw_clock_mode_from_teleop_mode(mode: TeleopMode) -> ExperimentalRawClockMode {
+    match mode {
+        TeleopMode::MasterFollower => ExperimentalRawClockMode::MasterFollower,
+        TeleopMode::Bilateral => ExperimentalRawClockMode::Bilateral,
+    }
+}
+
 fn experimental_raw_clock_config_from_settings(
     raw_clock: &TeleopRawClockSettings,
+    mode: TeleopMode,
     frequency_hz: f64,
     max_iterations: Option<usize>,
 ) -> ExperimentalRawClockConfig {
@@ -874,7 +885,7 @@ fn experimental_raw_clock_config_from_settings(
     };
 
     ExperimentalRawClockConfig {
-        mode: ExperimentalRawClockMode::MasterFollower,
+        mode: experimental_raw_clock_mode_from_teleop_mode(mode),
         frequency_hz,
         max_iterations,
         thresholds,
@@ -1236,12 +1247,17 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
     fn warmup_raw_clock(
         &mut self,
         settings: &TeleopRawClockSettings,
+        mode: TeleopMode,
         frequency_hz: f64,
         max_iterations: Option<usize>,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<RawClockWarmupSummary> {
-        let config =
-            experimental_raw_clock_config_from_settings(settings, frequency_hz, max_iterations);
+        let config = experimental_raw_clock_config_from_settings(
+            settings,
+            mode,
+            frequency_hz,
+            max_iterations,
+        );
         config.validate()?;
         if !matches!(
             self.experimental_phase,
@@ -2155,6 +2171,7 @@ mod tests {
         fn warmup_raw_clock(
             &mut self,
             _settings: &TeleopRawClockSettings,
+            _mode: TeleopMode,
             _frequency_hz: f64,
             _max_iterations: Option<usize>,
             cancel_signal: Arc<AtomicBool>,
@@ -3182,7 +3199,12 @@ mod tests {
             alignment_buffer_miss_consecutive_failures: 6,
         };
 
-        let config = experimental_raw_clock_config_from_settings(&settings, 333.0, Some(12));
+        let config = experimental_raw_clock_config_from_settings(
+            &settings,
+            TeleopMode::MasterFollower,
+            333.0,
+            Some(12),
+        );
 
         assert_eq!(config.frequency_hz, 333.0);
         assert_eq!(config.max_iterations, Some(12));
@@ -3206,6 +3228,35 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raw_clock_config_maps_bilateral_mode() {
+        let settings = TeleopRawClockSettings {
+            experimental_calibrated_raw: true,
+            warmup_secs: 10,
+            residual_p95_us: 500,
+            residual_max_us: 2000,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_ms: 20,
+            last_sample_age_ms: 20,
+            inter_arm_skew_max_us: 20_000,
+            state_skew_max_us: 10_000,
+            selected_sample_age_ms: 50,
+            residual_max_consecutive_failures: 3,
+            alignment_lag_us: 5_000,
+            alignment_search_window_us: 25_000,
+            alignment_buffer_miss_consecutive_failures: 3,
+        };
+
+        let config = experimental_raw_clock_config_from_settings(
+            &settings,
+            TeleopMode::Bilateral,
+            100.0,
+            None,
+        );
+
+        assert_eq!(config.mode, ExperimentalRawClockMode::Bilateral);
+    }
+
+    #[test]
     fn experimental_raw_clock_warmup_sample_threshold_uses_sample_gap() {
         let settings = TeleopRawClockSettings {
             experimental_calibrated_raw: true,
@@ -3224,7 +3275,12 @@ mod tests {
             alignment_buffer_miss_consecutive_failures: 3,
         };
 
-        let config = experimental_raw_clock_config_from_settings(&settings, 100.0, Some(300));
+        let config = experimental_raw_clock_config_from_settings(
+            &settings,
+            TeleopMode::MasterFollower,
+            100.0,
+            Some(300),
+        );
 
         assert_eq!(config.estimator_thresholds.warmup_samples, 500);
     }
