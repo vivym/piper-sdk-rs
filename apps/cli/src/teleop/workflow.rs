@@ -523,7 +523,7 @@ where
         io.startup_status(StartupStage::CheckingPreEnablePosture)?;
         let standby_snapshot = ExperimentalRawClockTeleopBackend::standby_snapshot(
             backend,
-            experimental_raw_clock_dual_arm_read_policy(),
+            experimental_raw_clock_dual_arm_read_policy(&resolved.raw_clock),
         )?;
         check_snapshot_posture(
             calibration,
@@ -550,7 +550,7 @@ where
     io.startup_status(StartupStage::ReadingActiveSnapshot)?;
     let active_snapshot = match ExperimentalRawClockTeleopBackend::active_snapshot(
         backend,
-        experimental_raw_clock_dual_arm_read_policy(),
+        experimental_raw_clock_dual_arm_read_policy(&resolved.raw_clock),
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -890,18 +890,20 @@ fn raw_clock_warmup_sample_threshold(raw_clock: &TeleopRawClockSettings) -> usiz
     usize::try_from(samples.max(4)).unwrap_or(usize::MAX)
 }
 
-fn experimental_raw_clock_control_read_policy() -> ControlReadPolicy {
+fn experimental_raw_clock_control_read_policy(
+    raw_clock: &TeleopRawClockSettings,
+) -> ControlReadPolicy {
     ControlReadPolicy {
-        max_feedback_age: Duration::from_millis(
-            crate::teleop::config::DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS,
-        ),
-        ..ControlReadPolicy::default()
+        max_state_skew_us: raw_clock.state_skew_max_us,
+        max_feedback_age: Duration::from_millis(raw_clock.last_sample_age_ms),
     }
 }
 
-fn experimental_raw_clock_dual_arm_read_policy() -> DualArmReadPolicy {
+fn experimental_raw_clock_dual_arm_read_policy(
+    raw_clock: &TeleopRawClockSettings,
+) -> DualArmReadPolicy {
     DualArmReadPolicy {
-        per_arm: experimental_raw_clock_control_read_policy(),
+        per_arm: experimental_raw_clock_control_read_policy(raw_clock),
         max_inter_arm_skew: DualArmReadPolicy::default().max_inter_arm_skew,
     }
 }
@@ -1268,7 +1270,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         };
 
         let warmed = match standby.warmup(
-            experimental_raw_clock_control_read_policy(),
+            experimental_raw_clock_control_read_policy(settings),
             Duration::from_secs(settings.warmup_secs),
             cancel_signal.as_ref(),
         ) {
@@ -1361,7 +1363,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
     fn run_master_follower_raw_clock(
         &mut self,
         settings: RuntimeTeleopSettingsHandle,
-        _raw_clock: TeleopRawClockSettings,
+        raw_clock: TeleopRawClockSettings,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<ExperimentalRawClockRunExit> {
         let runtime_settings = settings.snapshot();
@@ -1375,7 +1377,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             .take()
             .context("experimental raw-clock backend is not active")?;
         let run_config = ExperimentalRawClockRunConfig {
-            read_policy: experimental_raw_clock_control_read_policy(),
+            read_policy: experimental_raw_clock_control_read_policy(&raw_clock),
             command_timeout: Duration::from_millis(20),
             disable_config: DisableConfig::default(),
             cancel_signal: Some(cancel_signal),
@@ -3172,6 +3174,7 @@ mod tests {
             sample_gap_max_ms: 7,
             last_sample_age_ms: 9,
             inter_arm_skew_max_us: 1500,
+            state_skew_max_us: 10_000,
             residual_max_consecutive_failures: 5,
             alignment_lag_us: 4_000,
             selected_sample_age_ms: 50,
@@ -3213,6 +3216,7 @@ mod tests {
             sample_gap_max_ms: 20,
             last_sample_age_ms: 20,
             inter_arm_skew_max_us: 5000,
+            state_skew_max_us: 10_000,
             selected_sample_age_ms: 50,
             residual_max_consecutive_failures: 3,
             alignment_lag_us: 5_000,
@@ -3226,16 +3230,35 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raw_clock_read_policy_allows_observed_warmup_state_skew() {
-        let policy = experimental_raw_clock_control_read_policy();
+    fn experimental_raw_clock_read_policy_allows_one_control_tick_state_skew() {
+        let settings = TeleopRawClockSettings {
+            experimental_calibrated_raw: true,
+            warmup_secs: 10,
+            residual_p95_us: 500,
+            residual_max_us: 2000,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_ms: 20,
+            last_sample_age_ms: 35,
+            inter_arm_skew_max_us: 20_000,
+            state_skew_max_us: 10_000,
+            selected_sample_age_ms: 50,
+            residual_max_consecutive_failures: 3,
+            alignment_lag_us: 5_000,
+            alignment_search_window_us: 25_000,
+            alignment_buffer_miss_consecutive_failures: 3,
+        };
+        let policy = experimental_raw_clock_control_read_policy(&settings);
 
-        assert_eq!(policy.max_state_skew_us, 5_000);
+        assert_eq!(
+            policy.max_state_skew_us,
+            crate::teleop::config::DEFAULT_RAW_CLOCK_STATE_SKEW_MAX_US
+        );
         assert_eq!(
             policy.max_feedback_age,
-            Duration::from_millis(crate::teleop::config::DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS)
+            Duration::from_millis(settings.last_sample_age_ms)
         );
         assert!(policy.max_state_skew_us > DualArmReadPolicy::default().per_arm.max_state_skew_us);
-        assert!(2_063 <= policy.max_state_skew_us);
+        assert!(5_471 <= policy.max_state_skew_us);
     }
 
     #[test]

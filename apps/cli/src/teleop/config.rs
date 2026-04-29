@@ -21,6 +21,7 @@ pub const DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 500.0;
 pub const DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS: u64 = 50;
+pub const DEFAULT_RAW_CLOCK_STATE_SKEW_MAX_US: u64 = 10_000;
 pub const DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 20_000;
 pub const DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 pub const DEFAULT_RAW_CLOCK_ALIGNMENT_LAG_US: u64 = 5_000;
@@ -34,6 +35,7 @@ pub const MAX_RAW_CLOCK_RESIDUAL_MAX_US: u64 = 250_000;
 pub const MAX_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 1000.0;
 pub const MAX_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 1000;
 pub const MAX_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 1000;
+pub const MAX_RAW_CLOCK_STATE_SKEW_MAX_US: u64 = 100_000;
 pub const MAX_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS: u64 = 1000;
 pub const MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 100_000;
 pub const MAX_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES: u32 = 100;
@@ -152,6 +154,7 @@ pub struct TeleopRawClockConfig {
     pub sample_gap_max_ms: Option<u64>,
     pub last_sample_age_ms: Option<u64>,
     pub inter_arm_skew_max_us: Option<u64>,
+    pub state_skew_max_us: Option<u64>,
     pub selected_sample_age_ms: Option<u64>,
     pub residual_max_consecutive_failures: Option<u32>,
     pub alignment_lag_us: Option<u64>,
@@ -192,6 +195,7 @@ pub struct TeleopRawClockSettings {
     pub sample_gap_max_ms: u64,
     pub last_sample_age_ms: u64,
     pub inter_arm_skew_max_us: u64,
+    pub state_skew_max_us: u64,
     pub selected_sample_age_ms: u64,
     pub residual_max_consecutive_failures: u32,
     pub alignment_lag_us: u64,
@@ -295,6 +299,12 @@ impl TeleopRawClockSettings {
             self.inter_arm_skew_max_us,
             1,
             MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US,
+        )?;
+        validate_u64_range(
+            "state_skew_max_us",
+            self.state_skew_max_us,
+            1,
+            MAX_RAW_CLOCK_STATE_SKEW_MAX_US,
         )?;
         validate_u64_range(
             "selected_sample_age_ms",
@@ -422,6 +432,10 @@ impl ResolvedTeleopConfig {
                 .raw_clock_inter_arm_skew_max_us
                 .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.inter_arm_skew_max_us))
                 .unwrap_or(DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US),
+            state_skew_max_us: args
+                .raw_clock_state_skew_max_us
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.state_skew_max_us))
+                .unwrap_or(DEFAULT_RAW_CLOCK_STATE_SKEW_MAX_US),
             selected_sample_age_ms: args
                 .raw_clock_selected_sample_age_ms
                 .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.selected_sample_age_ms))
@@ -772,6 +786,7 @@ mod tests {
         let file = TeleopConfigFile {
             raw_clock: Some(TeleopRawClockConfig {
                 alignment_lag_us: Some(7_000),
+                state_skew_max_us: Some(10_000),
                 selected_sample_age_ms: Some(50),
                 alignment_search_window_us: Some(25_000),
                 alignment_buffer_miss_consecutive_failures: Some(5),
@@ -785,6 +800,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(resolved.raw_clock.alignment_lag_us, 7_000);
+        assert_eq!(resolved.raw_clock.state_skew_max_us, 10_000);
         assert_eq!(resolved.raw_clock.selected_sample_age_ms, 50);
         assert_eq!(resolved.raw_clock.alignment_search_window_us, 25_000);
         assert_eq!(
