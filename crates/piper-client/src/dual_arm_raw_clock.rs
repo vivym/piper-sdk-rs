@@ -182,8 +182,20 @@ pub struct RawClockTickTiming {
     pub master_feedback_time_us: u64,
     pub slave_feedback_time_us: u64,
     pub inter_arm_skew_us: u64,
+    pub master_selected_sample_age_us: u64,
+    pub slave_selected_sample_age_us: u64,
     pub master_health: RawClockHealth,
     pub slave_health: RawClockHealth,
+}
+
+#[derive(Debug, Clone)]
+struct RawClockLatestTiming {
+    master_feedback_time_us: u64,
+    slave_feedback_time_us: u64,
+    #[allow(dead_code)]
+    latest_inter_arm_skew_us: u64,
+    master_health: RawClockHealth,
+    slave_health: RawClockHealth,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -490,6 +502,22 @@ impl RawClockRuntimeGate {
     }
 
     pub fn check_tick(&self, tick: RawClockTickTiming) -> Result<(), RawClockRuntimeError> {
+        if tick.master_selected_sample_age_us > self.thresholds.last_sample_age_us {
+            let mut health = tick.master_health.clone();
+            health.last_sample_age_us = tick.master_selected_sample_age_us;
+            return Err(RawClockRuntimeError::ClockUnhealthy {
+                side: "master",
+                health: Box::new(health),
+            });
+        }
+        if tick.slave_selected_sample_age_us > self.thresholds.last_sample_age_us {
+            let mut health = tick.slave_health.clone();
+            health.last_sample_age_us = tick.slave_selected_sample_age_us;
+            return Err(RawClockRuntimeError::ClockUnhealthy {
+                side: "slave",
+                health: Box::new(health),
+            });
+        }
         if !tick.master_health.healthy {
             return Err(RawClockRuntimeError::ClockUnhealthy {
                 side: "master",
@@ -664,6 +692,21 @@ impl RawClockRuntimeTiming {
         slave: &ExperimentalRawClockSnapshot,
         now_host_us: u64,
     ) -> Result<RawClockTickTiming, RawClockRuntimeError> {
+        let latest = self.ingest_latest_snapshots(master, slave, now_host_us)?;
+        self.selected_tick_from_buffered_times(
+            &latest,
+            latest.master_feedback_time_us,
+            latest.slave_feedback_time_us,
+            now_host_us,
+        )
+    }
+
+    fn ingest_latest_snapshots(
+        &mut self,
+        master: &ExperimentalRawClockSnapshot,
+        slave: &ExperimentalRawClockSnapshot,
+        now_host_us: u64,
+    ) -> Result<RawClockLatestTiming, RawClockRuntimeError> {
         self.ingest_snapshots(master, slave)?;
 
         let master_raw_us = raw_hw_us(RawClockSide::Master, master)?;
@@ -679,15 +722,35 @@ impl RawClockRuntimeTiming {
                 .ok_or(RawClockRuntimeError::EstimatorNotReady {
                     side: RawClockSide::Slave.as_str(),
                 })?;
-        let inter_arm_skew_us = master_feedback_time_us.abs_diff(slave_feedback_time_us);
-        self.record_skew_sample(inter_arm_skew_us);
+        let latest_inter_arm_skew_us = master_feedback_time_us.abs_diff(slave_feedback_time_us);
+        self.record_latest_skew_sample(latest_inter_arm_skew_us);
 
-        Ok(RawClockTickTiming {
+        Ok(RawClockLatestTiming {
             master_feedback_time_us,
             slave_feedback_time_us,
-            inter_arm_skew_us,
+            latest_inter_arm_skew_us,
             master_health: self.master.health(now_host_us),
             slave_health: self.slave.health(now_host_us),
+        })
+    }
+
+    fn selected_tick_from_buffered_times(
+        &self,
+        latest: &RawClockLatestTiming,
+        selected_master_time_us: u64,
+        selected_slave_time_us: u64,
+        now_host_us: u64,
+    ) -> Result<RawClockTickTiming, RawClockRuntimeError> {
+        let master_age = now_host_us.saturating_sub(selected_master_time_us);
+        let slave_age = now_host_us.saturating_sub(selected_slave_time_us);
+        Ok(RawClockTickTiming {
+            master_feedback_time_us: selected_master_time_us,
+            slave_feedback_time_us: selected_slave_time_us,
+            inter_arm_skew_us: selected_master_time_us.abs_diff(selected_slave_time_us),
+            master_selected_sample_age_us: master_age,
+            slave_selected_sample_age_us: slave_age,
+            master_health: latest.master_health.clone(),
+            slave_health: latest.slave_health.clone(),
         })
     }
 
@@ -790,6 +853,25 @@ impl RawClockRuntimeTiming {
         tick: RawClockTickTiming,
         thresholds: RawClockRuntimeThresholds,
     ) -> Result<(), RawClockRuntimeError> {
+        if tick.master_selected_sample_age_us > thresholds.last_sample_age_us {
+            self.reset_residual_max_consecutive_failures(RawClockSide::Master);
+            let mut health = tick.master_health.clone();
+            health.last_sample_age_us = tick.master_selected_sample_age_us;
+            return Err(RawClockRuntimeError::ClockUnhealthy {
+                side: RawClockSide::Master.as_str(),
+                health: Box::new(health),
+            });
+        }
+        if tick.slave_selected_sample_age_us > thresholds.last_sample_age_us {
+            self.reset_residual_max_consecutive_failures(RawClockSide::Slave);
+            let mut health = tick.slave_health.clone();
+            health.last_sample_age_us = tick.slave_selected_sample_age_us;
+            return Err(RawClockRuntimeError::ClockUnhealthy {
+                side: RawClockSide::Slave.as_str(),
+                health: Box::new(health),
+            });
+        }
+
         if tick.inter_arm_skew_us > thresholds.inter_arm_skew_max_us {
             return Err(RawClockRuntimeError::InterArmSkew {
                 inter_arm_skew_us: tick.inter_arm_skew_us,
@@ -891,6 +973,10 @@ impl RawClockRuntimeTiming {
             self.skew_samples_us.pop_front();
         }
         self.skew_samples_us.push_back(inter_arm_skew_us);
+    }
+
+    fn record_latest_skew_sample(&mut self, latest_inter_arm_skew_us: u64) {
+        self.record_skew_sample(latest_inter_arm_skew_us);
     }
 
     fn report(
@@ -2099,6 +2185,8 @@ mod tests {
             master_feedback_time_us: 100_000,
             slave_feedback_time_us: 100_500,
             inter_arm_skew_us: 500,
+            master_selected_sample_age_us: 100,
+            slave_selected_sample_age_us: 100,
             master_health,
             slave_health,
         }
@@ -3078,6 +3166,8 @@ mod tests {
                 master_feedback_time_us: 100_000,
                 slave_feedback_time_us: 103_000,
                 inter_arm_skew_us: 3_000,
+                master_selected_sample_age_us: 100,
+                slave_selected_sample_age_us: 100,
                 master_health: healthy_for_tests(),
                 slave_health: healthy_for_tests(),
             })
@@ -3361,6 +3451,8 @@ mod tests {
                     master_feedback_time_us: 100_000,
                     slave_feedback_time_us: 103_001,
                     inter_arm_skew_us: 3_001,
+                    master_selected_sample_age_us: 100,
+                    slave_selected_sample_age_us: 100,
                     master_health: healthy_for_tests(),
                     slave_health: healthy_for_tests(),
                 },
@@ -3444,6 +3536,69 @@ mod tests {
         assert_eq!(tick.master_feedback_time_us, 110_000);
         assert_eq!(tick.slave_feedback_time_us, 110_800);
         assert_eq!(tick.inter_arm_skew_us, 800);
+    }
+
+    #[test]
+    fn selected_tick_uses_selected_skew_without_reingesting_raw_timestamps() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        timing.seed_ready_for_tests(
+            &[
+                raw_clock_snapshot_for_tests(7_000, 107_000),
+                raw_clock_snapshot_for_tests(8_000, 108_000),
+                raw_clock_snapshot_for_tests(9_000, 109_000),
+                raw_clock_snapshot_for_tests(10_000, 110_000),
+            ],
+            &[
+                raw_clock_snapshot_for_tests(17_000, 107_800),
+                raw_clock_snapshot_for_tests(18_000, 108_800),
+                raw_clock_snapshot_for_tests(19_000, 109_800),
+                raw_clock_snapshot_for_tests(20_000, 110_800),
+            ],
+        );
+        let latest = timing
+            .ingest_latest_snapshots(
+                &raw_clock_snapshot_for_tests(11_000, 111_000),
+                &raw_clock_snapshot_for_tests(21_000, 111_800),
+                112_000,
+            )
+            .unwrap();
+        let selected = timing
+            .selected_tick_from_buffered_times(&latest, 109_000, 109_800, 112_000)
+            .unwrap();
+
+        assert_eq!(selected.inter_arm_skew_us, 800);
+        assert_eq!(selected.master_health.raw_timestamp_regressions, 0);
+        assert_eq!(selected.slave_health.raw_timestamp_regressions, 0);
+    }
+
+    #[test]
+    fn selected_tick_uses_selected_sample_age_for_runtime_gate() {
+        let mut timing = ready_timing_for_tests();
+        let latest = timing
+            .ingest_latest_snapshots(
+                &raw_clock_snapshot_for_tests(11_000, 111_000),
+                &raw_clock_snapshot_for_tests(21_000, 111_800),
+                112_000,
+            )
+            .unwrap();
+        let selected = timing
+            .selected_tick_from_buffered_times(&latest, 100_000, 111_800, 112_000)
+            .unwrap();
+
+        let err = timing
+            .check_tick_with_debounce(
+                selected,
+                RawClockRuntimeThresholds {
+                    last_sample_age_us: 5_000,
+                    ..RawClockRuntimeThresholds::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "master", .. }
+        ));
     }
 
     #[test]
