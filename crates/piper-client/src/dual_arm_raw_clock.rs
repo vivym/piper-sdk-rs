@@ -793,12 +793,14 @@ impl RawClockRuntimeTiming {
         now_host_us: u64,
     ) -> Result<RawClockTickTiming, RawClockRuntimeError> {
         let latest = self.ingest_latest_snapshots(master, slave, now_host_us)?;
-        self.selected_tick_from_buffered_times(
+        let tick = self.selected_tick_from_buffered_times(
             &latest,
             latest.master_feedback_time_us,
             latest.slave_feedback_time_us,
             now_host_us,
-        )
+        )?;
+        self.record_skew_sample(tick.inter_arm_skew_us);
+        Ok(tick)
     }
 
     fn ingest_latest_snapshots(
@@ -823,7 +825,6 @@ impl RawClockRuntimeTiming {
                     side: RawClockSide::Slave.as_str(),
                 })?;
         let latest_inter_arm_skew_us = master_feedback_time_us.abs_diff(slave_feedback_time_us);
-        self.record_latest_skew_sample(latest_inter_arm_skew_us);
 
         Ok(RawClockLatestTiming {
             master_feedback_time_us,
@@ -1148,10 +1149,6 @@ impl RawClockRuntimeTiming {
             self.skew_samples_us.pop_front();
         }
         self.skew_samples_us.push_back(inter_arm_skew_us);
-    }
-
-    fn record_latest_skew_sample(&mut self, latest_inter_arm_skew_us: u64) {
-        self.record_skew_sample(latest_inter_arm_skew_us);
     }
 
     fn report(
@@ -1843,6 +1840,7 @@ where
         };
 
         let inter_arm_skew_us = tick.inter_arm_skew_us;
+        timing.record_skew_sample(inter_arm_skew_us);
         if let Err(err) = timing.check_tick_with_debounce(tick, config.thresholds) {
             if matches!(err, RawClockRuntimeError::ClockUnhealthy { .. }) {
                 timing.record_clock_health_failure();
@@ -4500,6 +4498,8 @@ mod tests {
         assert_eq!(report.alignment_buffer_misses, 3);
         assert_eq!(report.alignment_buffer_miss_consecutive_max, 3);
         assert_eq!(report.alignment_buffer_miss_consecutive_failures, 3);
+        assert_eq!(report.max_inter_arm_skew_us, 0);
+        assert_eq!(report.inter_arm_skew_p95_us, 0);
         assert!(
             report
                 .last_error
@@ -4572,6 +4572,28 @@ mod tests {
             *seen_skew.lock().expect("seen skew lock"),
             vec![Duration::from_micros(600)]
         );
+    }
+
+    #[test]
+    fn runtime_report_records_selected_skew_not_latest_ingest_skew() {
+        let io = FakeRuntimeIo::new().with_reads([FakeRead::pair(
+            raw_clock_snapshot_for_tests(10_000, 999_000),
+            raw_clock_snapshot_for_tests(20_000, 999_000),
+        )]);
+
+        let (_state, report) = run_fake_runtime(
+            io,
+            ready_timing_with_alignment_sample_for_tests(104_400, 105_000),
+            1,
+            RawClockRuntimeThresholds {
+                inter_arm_skew_max_us: 20_000,
+                ..RawClockRuntimeThresholds::for_tests()
+            },
+        );
+
+        assert_eq!(report.iterations, 1);
+        assert_eq!(report.max_inter_arm_skew_us, 600);
+        assert_eq!(report.inter_arm_skew_p95_us, 600);
     }
 
     #[test]
