@@ -6,8 +6,7 @@ use piper_client::dual_arm::{
 };
 use piper_client::dual_arm_raw_clock::{
     ExperimentalRawClockConfig, ExperimentalRawClockDualArmActive,
-    ExperimentalRawClockDualArmStandby, ExperimentalRawClockMasterFollowerGains,
-    ExperimentalRawClockMode, ExperimentalRawClockRunConfig,
+    ExperimentalRawClockDualArmStandby, ExperimentalRawClockMode, ExperimentalRawClockRunConfig,
     ExperimentalRawClockRunExit as PiperRawClockRunExit, RawClockRuntimeExitReason,
     RawClockRuntimeReport, RawClockRuntimeThresholds, RawClockSide,
 };
@@ -99,7 +98,7 @@ pub trait ExperimentalRawClockTeleopBackend {
 
     fn disable_active_passthrough(&mut self) -> Result<()>;
 
-    fn run_master_follower_raw_clock(
+    fn run_raw_clock(
         &mut self,
         settings: RuntimeTeleopSettingsHandle,
         raw_clock: TeleopRawClockSettings,
@@ -645,7 +644,7 @@ where
     let console_handle = None;
 
     io.startup_status(StartupStage::StartingControlLoop)?;
-    let loop_exit = backend.run_master_follower_raw_clock(
+    let loop_exit = backend.run_raw_clock(
         settings_handle.clone(),
         resolved.raw_clock.clone(),
         cancel_signal,
@@ -966,16 +965,6 @@ fn is_retryable_experimental_soft_snapshot_error(error: &anyhow::Error) -> bool 
         error.downcast_ref::<RobotError>(),
         Some(RobotError::ControlStateIncomplete { .. } | RobotError::StateMisaligned { .. })
     )
-}
-
-fn experimental_raw_clock_master_follower_gains(
-    settings: &RuntimeTeleopSettings,
-) -> ExperimentalRawClockMasterFollowerGains {
-    ExperimentalRawClockMasterFollowerGains {
-        track_kp: JointArray::splat(settings.track_kp),
-        track_kd: JointArray::splat(settings.track_kd),
-        master_damping: JointArray::splat(settings.master_damping),
-    }
 }
 
 fn disable_experimental_after_error<B, T>(
@@ -1376,16 +1365,13 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         Ok(())
     }
 
-    fn run_master_follower_raw_clock(
+    fn run_raw_clock(
         &mut self,
         settings: RuntimeTeleopSettingsHandle,
         raw_clock: TeleopRawClockSettings,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<ExperimentalRawClockRunExit> {
-        let runtime_settings = settings.snapshot();
-        if runtime_settings.mode != TeleopMode::MasterFollower {
-            bail!("experimental calibrated raw clock currently supports master-follower mode only");
-        }
+        let controller = RuntimeTeleopController::new(settings.clone());
 
         self.require_experimental_phase(ExperimentalBackendPhase::Active, "active")?;
         let active = self
@@ -1399,9 +1385,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             cancel_signal: Some(cancel_signal),
         };
 
-        let gains = experimental_raw_clock_master_follower_gains(&runtime_settings);
-        match active.run_master_follower_with_gains(runtime_settings.calibration, gains, run_config)
-        {
+        match active.run_with_controller(controller, run_config) {
             Ok(PiperRawClockRunExit::Standby { arms, report }) => {
                 self.experimental_standby = Some(*arms);
                 self.experimental_phase = ExperimentalBackendPhase::WarmedStandby;
@@ -2222,7 +2206,7 @@ mod tests {
             Ok(())
         }
 
-        fn run_master_follower_raw_clock(
+        fn run_raw_clock(
             &mut self,
             settings: RuntimeTeleopSettingsHandle,
             _raw_clock: TeleopRawClockSettings,
@@ -2856,6 +2840,43 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raw_clock_bilateral_run_reports_bilateral_mode_and_gain() {
+        let trace = WorkflowTrace::default();
+        let backend =
+            FakeTeleopBackend::with_trace(trace.clone()).with_experimental_raw_clock_success();
+        let io = FakeTeleopIo {
+            trace: trace.clone(),
+            ..FakeTeleopIo::default()
+        };
+        let report_slot = io.last_report.clone();
+        let args = TeleopDualArmArgs {
+            mode: Some(TeleopMode::Bilateral),
+            reflection_gain: Some(0.05),
+            report_json: Some(PathBuf::from("report.json")),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test_with_io(args, backend.clone(), io).unwrap();
+
+        assert_eq!(status, TeleopExitStatus::Success);
+
+        let settings = backend
+            .experimental_run_settings()
+            .expect("experimental raw-clock run settings should be captured");
+        assert_eq!(settings.mode, TeleopMode::Bilateral);
+        assert_eq!(settings.reflection_gain, 0.05);
+
+        let report = report_slot
+            .lock()
+            .expect("report lock poisoned")
+            .clone()
+            .expect("report should be written");
+        assert_eq!(report.mode.initial, "bilateral");
+        assert_eq!(report.mode.final_, "bilateral");
+        assert_eq!(report.control.reflection_gain, 0.05);
+    }
+
+    #[test]
     fn experimental_raw_clock_does_not_report_console_bilateral_mode_update() {
         let trace = WorkflowTrace::default();
         let backend =
@@ -3398,21 +3419,6 @@ mod tests {
             sample_snapshot(false).left.state.position
         );
         assert_eq!(*attempts.lock().unwrap(), 3);
-    }
-
-    #[test]
-    fn experimental_raw_clock_settings_convert_to_client_controller_gains() {
-        let settings = RuntimeTeleopSettings::production(sample_calibration())
-            .with_track_gains(9.25, 1.75)
-            .unwrap()
-            .with_master_damping(0.65)
-            .unwrap();
-
-        let gains = experimental_raw_clock_master_follower_gains(&settings);
-
-        assert_eq!(gains.track_kp, JointArray::splat(9.25));
-        assert_eq!(gains.track_kd, JointArray::splat(1.75));
-        assert_eq!(gains.master_damping, JointArray::splat(0.65));
     }
 
     fn run_workflow_for_test(

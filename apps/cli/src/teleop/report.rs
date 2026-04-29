@@ -748,6 +748,21 @@ mod tests {
     }
 
     #[test]
+    fn human_report_includes_bilateral_mode_transition() {
+        let mut output = Vec::new();
+        let mut report = sample_json_report();
+        report.mode = ReportMode {
+            initial: "bilateral".to_string(),
+            final_: "bilateral".to_string(),
+        };
+
+        write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("mode: bilateral -> bilateral profile=production"));
+    }
+
+    #[test]
     fn human_report_includes_experimental_timing_when_present() {
         let mut output = Vec::new();
         let mut report = sample_json_report();
