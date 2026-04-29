@@ -639,6 +639,7 @@ fn healthy_raw_clock_health_for_tests() -> RawClockHealth {
         sample_gap_max_us: 1_000,
         last_sample_age_us: 0,
         raw_timestamp_regressions: 0,
+        failure_kind: None,
         reason: None,
     }
 }
@@ -681,6 +682,7 @@ mod tests {
             healthy_raw_clock_health(),
             RawClockHealth {
                 healthy: false,
+                failure_kind: None,
                 reason: Some("no hw_raw".to_string()),
                 ..empty_raw_clock_health()
             },
@@ -871,6 +873,7 @@ mod tests {
             sample_gap_max_us: 1_000,
             last_sample_age_us: 0,
             raw_timestamp_regressions: 0,
+            failure_kind: None,
             reason: None,
         }
     }
@@ -888,6 +891,7 @@ mod tests {
             sample_gap_max_us: 0,
             last_sample_age_us: 0,
             raw_timestamp_regressions: 0,
+            failure_kind: None,
             reason: None,
         }
     }

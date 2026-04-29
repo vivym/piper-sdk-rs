@@ -23,6 +23,19 @@ pub struct RawClockThresholds {
     pub last_sample_age_us: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RawClockUnhealthyKind {
+    FitUnavailable,
+    WarmupSamples,
+    WarmupWindow,
+    ResidualP95,
+    ResidualMax,
+    Drift,
+    SampleGap,
+    LastSampleAge,
+    RawTimestampRegression,
+}
+
 #[cfg(test)]
 impl RawClockThresholds {
     const fn for_tests() -> Self {
@@ -51,6 +64,7 @@ pub struct RawClockHealth {
     pub sample_gap_max_us: u64,
     pub last_sample_age_us: u64,
     pub raw_timestamp_regressions: u64,
+    pub failure_kind: Option<RawClockUnhealthyKind>,
     pub reason: Option<String>,
 }
 
@@ -111,6 +125,12 @@ struct HealthMetrics {
     residual_max_us: u64,
     sample_gap_max_us: u64,
     last_sample_age_us: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawClockUnhealthyState {
+    kind: RawClockUnhealthyKind,
+    reason: String,
 }
 
 impl RawClockEstimator {
@@ -203,10 +223,10 @@ impl RawClockEstimator {
             sample_gap_max_us,
             last_sample_age_us,
         };
-        let reason = self.unhealthy_reason(metrics);
+        let unhealthy = self.unhealthy_state(metrics);
 
         RawClockHealth {
-            healthy: reason.is_none(),
+            healthy: unhealthy.is_none(),
             sample_count,
             window_duration_us,
             drift_ppm,
@@ -217,7 +237,8 @@ impl RawClockEstimator {
             sample_gap_max_us,
             last_sample_age_us,
             raw_timestamp_regressions: self.raw_timestamp_regressions,
-            reason,
+            failure_kind: unhealthy.as_ref().map(|state| state.kind),
+            reason: unhealthy.map(|state| state.reason),
         }
     }
 
@@ -320,57 +341,84 @@ impl RawClockEstimator {
         (slope - 1.0) * 1_000_000.0
     }
 
-    fn unhealthy_reason(&self, metrics: HealthMetrics) -> Option<String> {
+    fn unhealthy_state(&self, metrics: HealthMetrics) -> Option<RawClockUnhealthyState> {
         if !metrics.fit_ready {
-            return Some("line fit unavailable".to_string());
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::FitUnavailable,
+                reason: "line fit unavailable".to_string(),
+            });
         }
         if metrics.sample_count < self.thresholds.warmup_samples {
-            return Some(format!(
-                "sample count {} below warmup threshold {}",
-                metrics.sample_count, self.thresholds.warmup_samples
-            ));
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::WarmupSamples,
+                reason: format!(
+                    "sample count {} below warmup threshold {}",
+                    metrics.sample_count, self.thresholds.warmup_samples
+                ),
+            });
         }
         if metrics.window_duration_us < self.thresholds.warmup_window_us {
-            return Some(format!(
-                "window duration {}us below warmup threshold {}us",
-                metrics.window_duration_us, self.thresholds.warmup_window_us
-            ));
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::WarmupWindow,
+                reason: format!(
+                    "window duration {}us below warmup threshold {}us",
+                    metrics.window_duration_us, self.thresholds.warmup_window_us
+                ),
+            });
         }
         if metrics.residual_p95_us > self.thresholds.residual_p95_us {
-            return Some(format!(
-                "residual p95 {}us exceeds threshold {}us",
-                metrics.residual_p95_us, self.thresholds.residual_p95_us
-            ));
-        }
-        if metrics.residual_max_us > self.thresholds.residual_max_us {
-            return Some(format!(
-                "residual max {}us exceeds threshold {}us",
-                metrics.residual_max_us, self.thresholds.residual_max_us
-            ));
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::ResidualP95,
+                reason: format!(
+                    "residual p95 {}us exceeds threshold {}us",
+                    metrics.residual_p95_us, self.thresholds.residual_p95_us
+                ),
+            });
         }
         if metrics.drift_ppm.abs() > self.thresholds.drift_abs_ppm {
-            return Some(format!(
-                "drift {:.3}ppm exceeds threshold {:.3}ppm",
-                metrics.drift_ppm, self.thresholds.drift_abs_ppm
-            ));
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::Drift,
+                reason: format!(
+                    "drift {:.3}ppm exceeds threshold {:.3}ppm",
+                    metrics.drift_ppm, self.thresholds.drift_abs_ppm
+                ),
+            });
         }
         if metrics.sample_gap_max_us > self.thresholds.sample_gap_max_us {
-            return Some(format!(
-                "sample gap {}us exceeds threshold {}us",
-                metrics.sample_gap_max_us, self.thresholds.sample_gap_max_us
-            ));
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::SampleGap,
+                reason: format!(
+                    "sample gap {}us exceeds threshold {}us",
+                    metrics.sample_gap_max_us, self.thresholds.sample_gap_max_us
+                ),
+            });
         }
         if metrics.last_sample_age_us > self.thresholds.last_sample_age_us {
-            return Some(format!(
-                "last sample age {}us exceeds threshold {}us",
-                metrics.last_sample_age_us, self.thresholds.last_sample_age_us
-            ));
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::LastSampleAge,
+                reason: format!(
+                    "last sample age {}us exceeds threshold {}us",
+                    metrics.last_sample_age_us, self.thresholds.last_sample_age_us
+                ),
+            });
         }
         if self.raw_timestamp_regressions > 0 {
-            return Some(format!(
-                "raw timestamp regressions observed: {}",
-                self.raw_timestamp_regressions
-            ));
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::RawTimestampRegression,
+                reason: format!(
+                    "raw timestamp regressions observed: {}",
+                    self.raw_timestamp_regressions
+                ),
+            });
+        }
+        if metrics.residual_max_us > self.thresholds.residual_max_us {
+            return Some(RawClockUnhealthyState {
+                kind: RawClockUnhealthyKind::ResidualMax,
+                reason: format!(
+                    "residual max {}us exceeds threshold {}us",
+                    metrics.residual_max_us, self.thresholds.residual_max_us
+                ),
+            });
         }
         None
     }
@@ -584,6 +632,78 @@ mod tests {
         let health = estimator.health(120_000);
         assert!(!health.healthy);
         assert!(health.residual_max_us > 100);
+    }
+
+    #[test]
+    fn health_reports_residual_max_failure_kind_when_only_max_exceeds_threshold() {
+        let mut estimator = RawClockEstimator::new(RawClockThresholds {
+            residual_p95_us: 10_000,
+            residual_max_us: 100,
+            drift_abs_ppm: 1_000_000.0,
+            ..RawClockThresholds::for_tests()
+        });
+
+        for i in 0..8 {
+            estimator
+                .push(RawClockSample {
+                    raw_us: 10_000 + i * 1_000,
+                    host_rx_mono_us: 110_000 + i * 1_000,
+                })
+                .unwrap();
+        }
+        estimator
+            .push(RawClockSample {
+                raw_us: 18_500,
+                host_rx_mono_us: 118_800,
+            })
+            .unwrap();
+
+        let health = estimator.health(118_800);
+
+        assert!(!health.healthy);
+        assert_eq!(
+            health.failure_kind,
+            Some(RawClockUnhealthyKind::ResidualMax)
+        );
+        assert!(health.reason.as_deref().unwrap().contains("residual max"));
+    }
+
+    #[test]
+    fn health_reports_residual_p95_failure_kind_before_residual_max() {
+        let mut estimator = RawClockEstimator::new(RawClockThresholds {
+            residual_p95_us: 10,
+            residual_max_us: 20,
+            drift_abs_ppm: 1_000_000.0,
+            ..RawClockThresholds::for_tests()
+        });
+
+        for i in 0..8 {
+            let raw_base = 10_000 + i * 1_000;
+            let host_base = 110_000 + i * 1_000;
+            estimator
+                .push(RawClockSample {
+                    raw_us: raw_base,
+                    host_rx_mono_us: host_base,
+                })
+                .unwrap();
+            estimator
+                .push(RawClockSample {
+                    raw_us: raw_base + 100,
+                    host_rx_mono_us: host_base + 500,
+                })
+                .unwrap();
+        }
+
+        let health = estimator.health(118_500);
+
+        assert!(!health.healthy);
+        assert!(health.residual_p95_us > 10);
+        assert!(health.residual_max_us > 20);
+        assert_eq!(
+            health.failure_kind,
+            Some(RawClockUnhealthyKind::ResidualP95)
+        );
+        assert!(health.reason.as_deref().unwrap().contains("residual p95"));
     }
 
     #[test]

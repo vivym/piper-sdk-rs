@@ -1564,6 +1564,7 @@ fn empty_raw_clock_health_for_error() -> RawClockHealth {
         sample_gap_max_us: 0,
         last_sample_age_us: u64::MAX,
         raw_timestamp_regressions: 0,
+        failure_kind: None,
         reason: Some("runtime did not produce raw-clock health".to_string()),
     }
 }
@@ -3378,6 +3379,7 @@ mod tests {
             sample_gap_max_us: 1_000,
             last_sample_age_us: 100,
             raw_timestamp_regressions: 0,
+            failure_kind: None,
             reason: None,
         }
     }

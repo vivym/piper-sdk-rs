@@ -1797,6 +1797,7 @@ mod tests {
             sample_gap_max_us: 1_000,
             last_sample_age_us: 100,
             raw_timestamp_regressions: 0,
+            failure_kind: None,
             reason: None,
         }
     }
