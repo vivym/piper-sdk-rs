@@ -793,6 +793,7 @@ impl RawClockRuntimeTiming {
         now_host_us: u64,
     ) -> Result<RawClockTickTiming, RawClockRuntimeError> {
         let latest = self.ingest_latest_snapshots(master, slave, now_host_us)?;
+        self.push_latest_alignment_snapshots(&latest, master, slave);
         let tick = self.selected_tick_from_buffered_times(
             &latest,
             latest.master_feedback_time_us,
@@ -833,6 +834,22 @@ impl RawClockRuntimeTiming {
             master_health: self.master.health(now_host_us),
             slave_health: self.slave.health(now_host_us),
         })
+    }
+
+    fn push_latest_alignment_snapshots(
+        &mut self,
+        latest: &RawClockLatestTiming,
+        master: &ExperimentalRawClockSnapshot,
+        slave: &ExperimentalRawClockSnapshot,
+    ) {
+        self.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            latest.master_feedback_time_us,
+            *master,
+        ));
+        self.slave_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            latest.slave_feedback_time_us,
+            *slave,
+        ));
     }
 
     fn selected_tick_from_buffered_times(
@@ -1776,14 +1793,7 @@ where
             },
         };
 
-        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
-            latest.master_feedback_time_us,
-            master,
-        ));
-        timing.slave_alignment_buffer.push(RawClockAlignedSnapshot::new(
-            latest.slave_feedback_time_us,
-            slave,
-        ));
+        timing.push_latest_alignment_snapshots(&latest, &master, &slave);
 
         let selection = match timing
             .select_aligned_snapshots(&latest, config.thresholds.alignment_lag_us)
@@ -4510,6 +4520,63 @@ mod tests {
     }
 
     #[test]
+    fn alignment_buffer_misses_recover_before_threshold_and_reset_consecutive_count() {
+        let io = FakeRuntimeIo::new().with_reads([
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(11_000, 111_000),
+                raw_clock_snapshot_for_tests(21_000, 111_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(12_000, 112_000),
+                raw_clock_snapshot_for_tests(22_000, 112_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(13_000, 113_000),
+                raw_clock_snapshot_for_tests(23_000, 113_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(14_000, 114_000),
+                raw_clock_snapshot_for_tests(24_000, 114_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(15_000, 115_000),
+                raw_clock_snapshot_for_tests(25_000, 115_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(16_000, 116_000),
+                raw_clock_snapshot_for_tests(26_000, 116_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(17_000, 117_000),
+                raw_clock_snapshot_for_tests(27_000, 117_800),
+            ),
+        ]);
+
+        let (state, report) = run_fake_runtime(
+            io,
+            ready_timing_for_tests(),
+            1,
+            RawClockRuntimeThresholds {
+                alignment_buffer_miss_consecutive_failures: 7,
+                inter_arm_skew_max_us: 20_000,
+                last_sample_age_us: 100_000,
+                ..RawClockRuntimeThresholds::for_tests()
+            },
+        );
+
+        assert_eq!(
+            *state.command_log.lock().expect("command log lock"),
+            vec!["slave", "master"]
+        );
+        assert_eq!(report.iterations, 1);
+        assert_eq!(report.alignment_buffer_misses, 6);
+        assert_eq!(report.alignment_buffer_miss_consecutive_max, 6);
+        assert_eq!(report.alignment_buffer_miss_consecutive_failures, 0);
+        assert_eq!(report.max_inter_arm_skew_us, 200);
+        assert_eq!(report.inter_arm_skew_p95_us, 200);
+    }
+
+    #[test]
     fn per_tick_skew_is_mapped_from_raw_feedback_not_host_receive_or_command_time() {
         let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
         timing.seed_ready_for_tests(
@@ -4609,6 +4676,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(timing.sample_counts_for_tests(), (1, 1));
+    }
+
+    #[test]
+    fn warmup_tick_populates_alignment_buffers_after_mapping_latest_samples() {
+        let mut timing = ready_timing_for_tests();
+
+        timing
+            .warmup_tick_from_snapshots(
+                &raw_clock_snapshot_for_tests(11_000, 111_000),
+                &raw_clock_snapshot_for_tests(21_000, 111_800),
+                112_000,
+                RawClockRuntimeThresholds {
+                    inter_arm_skew_max_us: 20_000,
+                    ..RawClockRuntimeThresholds::for_tests()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            timing
+                .master_alignment_buffer
+                .latest_before_or_at(111_000)
+                .map(|sample| sample.feedback_time_us),
+            Some(111_000)
+        );
+        assert_eq!(
+            timing
+                .slave_alignment_buffer
+                .latest_before_or_at(111_800)
+                .map(|sample| sample.feedback_time_us),
+            Some(111_800)
+        );
+        let report = timing.report(112_000, 0, None);
+        assert_eq!(report.max_inter_arm_skew_us, 800);
+        assert_eq!(report.inter_arm_skew_p95_us, 800);
     }
 
     #[test]
