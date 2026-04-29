@@ -25,13 +25,17 @@ TRACK_KP="${TRACK_KP:-2.0}"
 TRACK_KD="${TRACK_KD:-0.4}"
 MASTER_DAMPING="${MASTER_DAMPING:-0.8}"
 RAW_CLOCK_WARMUP_SECS="${RAW_CLOCK_WARMUP_SECS:-10}"
-# Observed SocketCAN raw-clock residual p95 can briefly reach ~1ms during
+# Observed SocketCAN raw-clock residual p95 can approach ~1.5ms during
 # longer smoke runs; keep p95 materially below isolated max-spike tolerance.
-RAW_CLOCK_RESIDUAL_P95_US="${RAW_CLOCK_RESIDUAL_P95_US:-1500}"
+RAW_CLOCK_RESIDUAL_P95_US="${RAW_CLOCK_RESIDUAL_P95_US:-2000}"
 # Long smoke runs can see isolated residual spikes just above 2ms while p95
 # remains healthy; keep the max gate below the 6ms inter-arm skew guardrail.
 RAW_CLOCK_RESIDUAL_MAX_US="${RAW_CLOCK_RESIDUAL_MAX_US:-3000}"
 RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES="${RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES:-3}"
+# A single missed raw-feedback period can produce an observed ~30ms gap while
+# the latest sample remains fresh. Keep this fail-fast gate above that one-gap
+# smoke-test tail without relaxing freshness or inter-arm skew checks.
+RAW_CLOCK_SAMPLE_GAP_MAX_MS="${RAW_CLOCK_SAMPLE_GAP_MAX_MS:-50}"
 # Keep the smoke gate below one 100Hz control tick while allowing the observed
 # independent-CAN feedback phase tail around 5ms.
 RAW_CLOCK_SKEW_US="${RAW_CLOCK_SKEW_US:-6000}"
@@ -62,6 +66,7 @@ cmd=(
     --raw-clock-residual-p95-us "${RAW_CLOCK_RESIDUAL_P95_US}"
     --raw-clock-residual-max-us "${RAW_CLOCK_RESIDUAL_MAX_US}"
     --raw-clock-residual-max-consecutive-failures "${RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES}"
+    --raw-clock-sample-gap-max-ms "${RAW_CLOCK_SAMPLE_GAP_MAX_MS}"
     --max-iterations "${MAX_ITERATIONS}"
     --save-calibration "${CALIBRATION_FILE}"
     --report-json "${REPORT_JSON}"
@@ -86,6 +91,7 @@ fi
     echo "raw_clock_residual_p95_us=${RAW_CLOCK_RESIDUAL_P95_US}"
     echo "raw_clock_residual_max_us=${RAW_CLOCK_RESIDUAL_MAX_US}"
     echo "raw_clock_residual_max_consecutive_failures=${RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES}"
+    echo "raw_clock_sample_gap_max_ms=${RAW_CLOCK_SAMPLE_GAP_MAX_MS}"
     echo "raw_clock_skew_us=${RAW_CLOCK_SKEW_US}"
     echo "max_iterations=${MAX_ITERATIONS}"
     echo "disable_gripper_mirror=${DISABLE_GRIPPER_MIRROR}"
@@ -108,6 +114,8 @@ echo "Build log: ${BUILD_LOG}"
 echo "Run log: ${RUN_LOG}"
 echo
 echo "Safety note: support both arms in the intended zero pose for joint map '${JOINT_MAP}' before typing yes."
+echo "Master-follower input is read from ${MASTER_IFACE}; move that physical arm."
+echo "If that is not the physical master arm, swap MASTER_IFACE/SLAVE_IFACE and rerun."
 echo "This script intentionally does not pass --yes; the CLI will require operator confirmation."
 echo "After yes, the CLI refreshes raw-clock timing before enabling the arms."
 echo

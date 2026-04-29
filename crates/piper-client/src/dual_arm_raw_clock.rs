@@ -33,6 +33,8 @@ use crate::types::{JointArray, NewtonMeter, Rad, RadPerSecond, Result as RobotRe
 
 const FAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(20);
 const RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY: usize = 4096;
+const RAW_CLOCK_WARMUP_FINAL_GRACE_MIN_US: u64 = 100_000;
+const RAW_CLOCK_WARMUP_FINAL_GRACE_MAX_US: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExperimentalRawClockMode {
@@ -910,12 +912,33 @@ impl ExperimentalRawClockDualArmStandby {
             std::thread::sleep(Duration::from_millis(1));
         }
 
-        let master = self.read_master_experimental_snapshot(policy)?;
-        let slave = self.read_slave_experimental_snapshot(policy)?;
-        let final_tick =
-            self.timing
-                .tick_from_snapshots(&master, &slave, piper_can::monotonic_micros())?;
-        RawClockRuntimeGate::new(self.config.thresholds).check_tick(final_tick)?;
+        let final_grace_deadline =
+            Instant::now() + raw_clock_warmup_final_grace(self.config.estimator_thresholds);
+        loop {
+            if cancel_signal.load(Ordering::Acquire) {
+                return Err(RawClockRuntimeError::Cancelled);
+            }
+
+            let master = self.read_master_experimental_snapshot(policy)?;
+            let slave = self.read_slave_experimental_snapshot(policy)?;
+            let final_result = self
+                .timing
+                .tick_from_snapshots(&master, &slave, piper_can::monotonic_micros())
+                .and_then(|final_tick| {
+                    RawClockRuntimeGate::new(self.config.thresholds).check_tick(final_tick)
+                });
+
+            match final_result {
+                Ok(()) => break,
+                Err(err)
+                    if warmup_final_error_is_retryable(&err)
+                        && Instant::now() < final_grace_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                },
+                Err(err) => return Err(err),
+            }
+        }
         self.timing.reset_runtime_residual_max_counters();
         Ok(self)
     }
@@ -1884,6 +1907,29 @@ fn percentile(samples: impl IntoIterator<Item = u64>, percentile: u64) -> u64 {
     sorted.sort_unstable();
     let rank = (percentile as usize * (sorted.len() - 1)).div_ceil(100);
     sorted[rank.min(sorted.len() - 1)]
+}
+
+fn raw_clock_warmup_final_grace(thresholds: RawClockThresholds) -> Duration {
+    let grace_us = thresholds.sample_gap_max_us.saturating_mul(2).clamp(
+        RAW_CLOCK_WARMUP_FINAL_GRACE_MIN_US,
+        RAW_CLOCK_WARMUP_FINAL_GRACE_MAX_US,
+    );
+    Duration::from_micros(grace_us)
+}
+
+fn warmup_final_error_is_retryable(error: &RawClockRuntimeError) -> bool {
+    match error {
+        RawClockRuntimeError::EstimatorNotReady { .. } => true,
+        RawClockRuntimeError::ClockUnhealthy { health, .. } => matches!(
+            health.failure_kind,
+            Some(
+                RawClockUnhealthyKind::FitUnavailable
+                    | RawClockUnhealthyKind::WarmupSamples
+                    | RawClockUnhealthyKind::WarmupWindow
+            )
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -3787,6 +3833,39 @@ mod tests {
 
         assert_eq!(timing.sample_counts_for_tests(), (2, 2));
         assert_eq!(timing.clock_health_failures, 0);
+    }
+
+    #[test]
+    fn warmup_final_retry_is_limited_to_collection_incomplete_errors() {
+        let estimator_not_ready = RawClockRuntimeError::EstimatorNotReady { side: "master" };
+        assert!(warmup_final_error_is_retryable(&estimator_not_ready));
+
+        for kind in [
+            RawClockUnhealthyKind::FitUnavailable,
+            RawClockUnhealthyKind::WarmupSamples,
+            RawClockUnhealthyKind::WarmupWindow,
+        ] {
+            let error = RawClockRuntimeError::ClockUnhealthy {
+                side: "slave",
+                health: Box::new(unhealthy_for_tests(kind, "warmup incomplete")),
+            };
+            assert!(warmup_final_error_is_retryable(&error));
+        }
+
+        let residual_p95 = RawClockRuntimeError::ClockUnhealthy {
+            side: "slave",
+            health: Box::new(unhealthy_for_tests(
+                RawClockUnhealthyKind::ResidualP95,
+                "residual p95",
+            )),
+        };
+        assert!(!warmup_final_error_is_retryable(&residual_p95));
+
+        let inter_arm_skew = RawClockRuntimeError::InterArmSkew {
+            inter_arm_skew_us: 6_001,
+            max_us: 6_000,
+        };
+        assert!(!warmup_final_error_is_retryable(&inter_arm_skew));
     }
 
     #[test]
