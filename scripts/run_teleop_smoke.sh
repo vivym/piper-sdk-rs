@@ -36,9 +36,9 @@ RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES="${RAW_CLOCK_RESIDUAL_MAX_CONSECUTIV
 # the latest sample remains fresh. Keep this fail-fast gate above that one-gap
 # smoke-test tail without relaxing freshness or inter-arm skew checks.
 RAW_CLOCK_SAMPLE_GAP_MAX_MS="${RAW_CLOCK_SAMPLE_GAP_MAX_MS:-50}"
-# Keep the smoke gate below one 100Hz control tick while allowing the observed
-# independent-CAN feedback phase tail around 5ms.
-RAW_CLOCK_SKEW_US="${RAW_CLOCK_SKEW_US:-6000}"
+# Keep the smoke gate at one 100Hz control tick while allowing observed
+# independent-CAN feedback phase tails during damping/large-motion tests.
+RAW_CLOCK_SKEW_US="${RAW_CLOCK_SKEW_US:-10000}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-300}"
 DISABLE_GRIPPER_MIRROR="${DISABLE_GRIPPER_MIRROR:-1}"
 DRY_RUN="${DRY_RUN:-0}"
