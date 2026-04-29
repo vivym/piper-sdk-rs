@@ -854,12 +854,11 @@ impl RawClockRuntimeTiming {
             health.raw_timestamp_regressions =
                 health.raw_timestamp_regressions.saturating_add(external_regressions);
             health.healthy = false;
-            if health.reason.is_none() {
-                health.reason = Some(format!(
-                    "raw timestamp regressions observed: {}",
-                    health.raw_timestamp_regressions
-                ));
-            }
+            health.failure_kind = Some(RawClockUnhealthyKind::RawTimestampRegression);
+            health.reason = Some(format!(
+                "raw timestamp regressions observed: {}",
+                health.raw_timestamp_regressions
+            ));
         }
         health
     }
@@ -3812,7 +3811,61 @@ mod tests {
         ));
         let report = timing.report(111_100, 0, Some(RawClockRuntimeExitReason::RawClockFault));
         assert_eq!(report.master.raw_timestamp_regressions, 1);
+        assert_eq!(
+            report.master.failure_kind,
+            Some(RawClockUnhealthyKind::RawTimestampRegression)
+        );
+        assert!(
+            report
+                .master
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("raw timestamp regression"))
+        );
         assert_eq!(report.slave.raw_timestamp_regressions, 0);
+    }
+
+    #[test]
+    fn runtime_raw_timestamp_regression_overrides_residual_max_report_health() {
+        let mut timing = RawClockRuntimeTiming::new(RawClockThresholds {
+            residual_p95_us: 10_000,
+            residual_max_us: 100,
+            drift_abs_ppm: 1_000_000.0,
+            ..thresholds_for_tests()
+        });
+
+        for i in 0..8 {
+            timing
+                .master
+                .push(RawClockSample {
+                    raw_us: 10_000 + i * 1_000,
+                    host_rx_mono_us: 110_000 + i * 1_000,
+                })
+                .unwrap();
+        }
+        timing
+            .master
+            .push(RawClockSample {
+                raw_us: 18_500,
+                host_rx_mono_us: 118_800,
+            })
+            .unwrap();
+        timing.master_raw_timestamp_regressions = 1;
+
+        let health = timing.report_health(RawClockSide::Master, 118_800);
+
+        assert!(!health.healthy);
+        assert_eq!(health.raw_timestamp_regressions, 1);
+        assert_eq!(
+            health.failure_kind,
+            Some(RawClockUnhealthyKind::RawTimestampRegression)
+        );
+        assert!(
+            health
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("raw timestamp regression"))
+        );
     }
 
     #[test]
