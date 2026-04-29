@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use piper_driver::{AlignmentResult, DriverError, RuntimeFaultKind};
 use piper_tools::raw_clock::{
     RawClockError, RawClockEstimator, RawClockHealth, RawClockSample, RawClockThresholds,
+    RawClockUnhealthyKind,
 };
 use thiserror::Error;
 
@@ -120,6 +121,7 @@ impl Default for ExperimentalRawClockMasterFollowerGains {
 pub struct RawClockRuntimeThresholds {
     pub inter_arm_skew_max_us: u64,
     pub last_sample_age_us: u64,
+    pub residual_max_consecutive_failures: u32,
 }
 
 impl Default for RawClockRuntimeThresholds {
@@ -127,6 +129,7 @@ impl Default for RawClockRuntimeThresholds {
         Self {
             inter_arm_skew_max_us: 2_000,
             last_sample_age_us: 5_000,
+            residual_max_consecutive_failures: 1,
         }
     }
 }
@@ -139,6 +142,7 @@ impl RawClockRuntimeThresholds {
             // Fake runtime tests use synthetic receive timestamps with the real
             // monotonic clock; dedicated gate tests cover age rejection.
             last_sample_age_us: u64::MAX,
+            residual_max_consecutive_failures: 1,
         }
     }
 }
@@ -160,6 +164,10 @@ pub struct RawClockRuntimeReport {
     pub max_inter_arm_skew_us: u64,
     pub inter_arm_skew_p95_us: u64,
     pub clock_health_failures: u64,
+    pub master_residual_max_spikes: u64,
+    pub slave_residual_max_spikes: u64,
+    pub master_residual_max_consecutive_failures: u32,
+    pub slave_residual_max_consecutive_failures: u32,
     pub read_faults: u32,
     pub submission_faults: u32,
     pub last_submission_failed_side: Option<RawClockSide>,
@@ -341,6 +349,18 @@ struct RawClockRuntimeTelemetry {
     last_runtime_fault_slave: Option<RuntimeFaultKind>,
 }
 
+#[derive(Debug)]
+struct RawClockDebouncedHealthError {
+    error: RawClockRuntimeError,
+    priority: RawClockDebouncedHealthErrorPriority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawClockDebouncedHealthErrorPriority {
+    FailFast,
+    ResidualMaxThreshold,
+}
+
 impl RawClockRuntimeReport {
     fn apply_telemetry(&mut self, telemetry: RawClockRuntimeTelemetry) {
         self.master_tx_realtime_overwrites_total = telemetry.master_tx_realtime_overwrites_total;
@@ -491,6 +511,10 @@ pub struct RawClockRuntimeTiming {
     last_slave_raw_us: Option<u64>,
     master_raw_timestamp_regressions: u64,
     slave_raw_timestamp_regressions: u64,
+    master_residual_max_spikes: u64,
+    slave_residual_max_spikes: u64,
+    master_residual_max_consecutive_failures: u32,
+    slave_residual_max_consecutive_failures: u32,
 }
 
 impl RawClockRuntimeTiming {
@@ -505,6 +529,10 @@ impl RawClockRuntimeTiming {
             last_slave_raw_us: None,
             master_raw_timestamp_regressions: 0,
             slave_raw_timestamp_regressions: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
         }
     }
 
@@ -518,6 +546,14 @@ impl RawClockRuntimeTiming {
         self.last_slave_raw_us = None;
         self.master_raw_timestamp_regressions = 0;
         self.slave_raw_timestamp_regressions = 0;
+        self.reset_runtime_residual_max_counters();
+    }
+
+    fn reset_runtime_residual_max_counters(&mut self) {
+        self.master_residual_max_spikes = 0;
+        self.slave_residual_max_spikes = 0;
+        self.master_residual_max_consecutive_failures = 0;
+        self.slave_residual_max_consecutive_failures = 0;
     }
 
     fn mark_continuity_boundary(&mut self) {
@@ -662,6 +698,106 @@ impl RawClockRuntimeTiming {
         self.clock_health_failures = self.clock_health_failures.saturating_add(1);
     }
 
+    fn check_tick_with_debounce(
+        &mut self,
+        tick: RawClockTickTiming,
+        thresholds: RawClockRuntimeThresholds,
+    ) -> Result<(), RawClockRuntimeError> {
+        if tick.inter_arm_skew_us > thresholds.inter_arm_skew_max_us {
+            return Err(RawClockRuntimeError::InterArmSkew {
+                inter_arm_skew_us: tick.inter_arm_skew_us,
+                max_us: thresholds.inter_arm_skew_max_us,
+            });
+        }
+
+        let master_error =
+            self.apply_health_with_debounce(RawClockSide::Master, &tick.master_health, thresholds);
+        let slave_error =
+            self.apply_health_with_debounce(RawClockSide::Slave, &tick.slave_health, thresholds);
+
+        match (master_error, slave_error) {
+            (Some(master_error), Some(slave_error))
+                if master_error.priority
+                    == RawClockDebouncedHealthErrorPriority::ResidualMaxThreshold
+                    && slave_error.priority == RawClockDebouncedHealthErrorPriority::FailFast =>
+            {
+                Err(slave_error.error)
+            },
+            (Some(master_error), _) => Err(master_error.error),
+            (None, Some(slave_error)) => Err(slave_error.error),
+            (None, None) => Ok(()),
+        }
+    }
+
+    fn apply_health_with_debounce(
+        &mut self,
+        side: RawClockSide,
+        health: &RawClockHealth,
+        thresholds: RawClockRuntimeThresholds,
+    ) -> Option<RawClockDebouncedHealthError> {
+        if health.last_sample_age_us > thresholds.last_sample_age_us {
+            self.reset_residual_max_consecutive_failures(side);
+            return Some(RawClockDebouncedHealthError {
+                error: RawClockRuntimeError::ClockUnhealthy {
+                    side: side.as_str(),
+                    health: Box::new(health.clone()),
+                },
+                priority: RawClockDebouncedHealthErrorPriority::FailFast,
+            });
+        }
+
+        if health.healthy {
+            self.reset_residual_max_consecutive_failures(side);
+            return None;
+        }
+
+        if health.failure_kind == Some(RawClockUnhealthyKind::ResidualMax) {
+            let consecutive_failures = self.record_residual_max_failure(side);
+            if consecutive_failures >= thresholds.residual_max_consecutive_failures {
+                return Some(RawClockDebouncedHealthError {
+                    error: RawClockRuntimeError::ClockUnhealthy {
+                        side: side.as_str(),
+                        health: Box::new(health.clone()),
+                    },
+                    priority: RawClockDebouncedHealthErrorPriority::ResidualMaxThreshold,
+                });
+            }
+            return None;
+        }
+
+        self.reset_residual_max_consecutive_failures(side);
+        Some(RawClockDebouncedHealthError {
+            error: RawClockRuntimeError::ClockUnhealthy {
+                side: side.as_str(),
+                health: Box::new(health.clone()),
+            },
+            priority: RawClockDebouncedHealthErrorPriority::FailFast,
+        })
+    }
+
+    fn record_residual_max_failure(&mut self, side: RawClockSide) -> u32 {
+        let (spikes, consecutive_failures) = match side {
+            RawClockSide::Master => (
+                &mut self.master_residual_max_spikes,
+                &mut self.master_residual_max_consecutive_failures,
+            ),
+            RawClockSide::Slave => (
+                &mut self.slave_residual_max_spikes,
+                &mut self.slave_residual_max_consecutive_failures,
+            ),
+        };
+        *spikes = spikes.saturating_add(1);
+        *consecutive_failures = consecutive_failures.saturating_add(1);
+        *consecutive_failures
+    }
+
+    fn reset_residual_max_consecutive_failures(&mut self, side: RawClockSide) {
+        match side {
+            RawClockSide::Master => self.master_residual_max_consecutive_failures = 0,
+            RawClockSide::Slave => self.slave_residual_max_consecutive_failures = 0,
+        }
+    }
+
     fn record_skew_sample(&mut self, inter_arm_skew_us: u64) {
         self.max_inter_arm_skew_us = self.max_inter_arm_skew_us.max(inter_arm_skew_us);
         if self.skew_samples_us.len() == RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY {
@@ -683,6 +819,10 @@ impl RawClockRuntimeTiming {
             max_inter_arm_skew_us: self.max_inter_arm_skew_us,
             inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
             clock_health_failures: self.clock_health_failures,
+            master_residual_max_spikes: self.master_residual_max_spikes,
+            slave_residual_max_spikes: self.slave_residual_max_spikes,
+            master_residual_max_consecutive_failures: self.master_residual_max_consecutive_failures,
+            slave_residual_max_consecutive_failures: self.slave_residual_max_consecutive_failures,
             read_faults: 0,
             submission_faults: 0,
             last_submission_failed_side: None,
@@ -777,6 +917,7 @@ impl ExperimentalRawClockDualArmStandby {
             self.timing
                 .tick_from_snapshots(&master, &slave, piper_can::monotonic_micros())?;
         RawClockRuntimeGate::new(self.config.thresholds).check_tick(final_tick)?;
+        self.timing.reset_runtime_residual_max_counters();
         Ok(self)
     }
 
@@ -1265,7 +1406,7 @@ where
         };
 
         let inter_arm_skew_us = tick.inter_arm_skew_us;
-        if let Err(err) = RawClockRuntimeGate::new(config.thresholds).check_tick(tick) {
+        if let Err(err) = timing.check_tick_with_debounce(tick, config.thresholds) {
             if matches!(err, RawClockRuntimeError::ClockUnhealthy { .. }) {
                 timing.record_clock_health_failure();
             }
@@ -1762,7 +1903,7 @@ mod tests {
     };
     use piper_protocol::feedback::{ControlMode, MotionStatus, MoveMode, RobotStatus, TeachStatus};
     use piper_protocol::ids::{ID_JOINT_DRIVER_LOW_SPEED_1, ID_ROBOT_STATUS};
-    use piper_tools::raw_clock::{RawClockHealth, RawClockThresholds};
+    use piper_tools::raw_clock::{RawClockHealth, RawClockThresholds, RawClockUnhealthyKind};
     use semver::Version;
     use std::collections::VecDeque;
     use std::convert::Infallible;
@@ -1799,6 +1940,37 @@ mod tests {
             raw_timestamp_regressions: 0,
             failure_kind: None,
             reason: None,
+        }
+    }
+
+    fn unhealthy_for_tests(kind: RawClockUnhealthyKind, reason: &str) -> RawClockHealth {
+        RawClockHealth {
+            healthy: false,
+            failure_kind: Some(kind),
+            reason: Some(reason.to_string()),
+            ..healthy_for_tests()
+        }
+    }
+
+    fn unhealthy_without_kind_for_tests(reason: &str) -> RawClockHealth {
+        RawClockHealth {
+            healthy: false,
+            failure_kind: None,
+            reason: Some(reason.to_string()),
+            ..healthy_for_tests()
+        }
+    }
+
+    fn tick_for_health(
+        master_health: RawClockHealth,
+        slave_health: RawClockHealth,
+    ) -> RawClockTickTiming {
+        RawClockTickTiming {
+            master_feedback_time_us: 100_000,
+            slave_feedback_time_us: 100_500,
+            inter_arm_skew_us: 500,
+            master_health,
+            slave_health,
         }
     }
 
@@ -2654,6 +2826,339 @@ mod tests {
     }
 
     #[test]
+    fn residual_max_single_spike_is_counted_without_faulting_before_limit() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 3,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        let result = timing.check_tick_with_debounce(
+            tick_for_health(
+                unhealthy_for_tests(
+                    RawClockUnhealthyKind::ResidualMax,
+                    "residual max 3001us exceeds threshold 3000us",
+                ),
+                healthy_for_tests(),
+            ),
+            thresholds,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(timing.master_residual_max_spikes, 1);
+        assert_eq!(timing.master_residual_max_consecutive_failures, 1);
+    }
+
+    #[test]
+    fn residual_max_faults_after_configured_consecutive_failures() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 2,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        let first = timing.check_tick_with_debounce(
+            tick_for_health(
+                unhealthy_for_tests(
+                    RawClockUnhealthyKind::ResidualMax,
+                    "residual max 3001us exceeds threshold 3000us",
+                ),
+                healthy_for_tests(),
+            ),
+            thresholds,
+        );
+        assert!(first.is_ok());
+
+        let err = timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(
+                        RawClockUnhealthyKind::ResidualMax,
+                        "residual max 3002us exceeds threshold 3000us",
+                    ),
+                    healthy_for_tests(),
+                ),
+                thresholds,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "master", .. }
+        ));
+        assert_eq!(timing.master_residual_max_spikes, 2);
+        assert_eq!(timing.master_residual_max_consecutive_failures, 2);
+    }
+
+    #[test]
+    fn healthy_tick_resets_residual_max_consecutive_counter() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 2,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "residual max"),
+                    healthy_for_tests(),
+                ),
+                thresholds,
+            )
+            .unwrap();
+        timing
+            .check_tick_with_debounce(
+                tick_for_health(healthy_for_tests(), healthy_for_tests()),
+                thresholds,
+            )
+            .unwrap();
+
+        assert_eq!(timing.master_residual_max_consecutive_failures, 0);
+        assert_eq!(timing.master_residual_max_spikes, 1);
+    }
+
+    #[test]
+    fn non_residual_max_failure_resets_counter_and_fails_immediately() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 3,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "residual max"),
+                    healthy_for_tests(),
+                ),
+                thresholds,
+            )
+            .unwrap();
+
+        let err = timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualP95, "residual p95"),
+                    healthy_for_tests(),
+                ),
+                thresholds,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "master", .. }
+        ));
+        assert_eq!(timing.master_residual_max_consecutive_failures, 0);
+    }
+
+    #[test]
+    fn mixed_same_tick_failure_counts_residual_max_side_before_fault() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 3,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        let err = timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "residual max"),
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualP95, "residual p95"),
+                ),
+                thresholds,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "slave", .. }
+        ));
+        assert_eq!(timing.master_residual_max_spikes, 1);
+        assert_eq!(timing.master_residual_max_consecutive_failures, 1);
+    }
+
+    #[test]
+    fn mixed_same_tick_failure_prefers_fail_fast_error_over_residual_max_threshold() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 1,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        let err = timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "residual max"),
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualP95, "residual p95"),
+                ),
+                thresholds,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "slave", .. }
+        ));
+        assert_eq!(timing.master_residual_max_spikes, 1);
+        assert_eq!(timing.master_residual_max_consecutive_failures, 1);
+    }
+
+    #[test]
+    fn dual_residual_max_tick_updates_both_sides_before_threshold_error() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 1,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        let err = timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "master residual max"),
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "slave residual max"),
+                ),
+                thresholds,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, RawClockRuntimeError::ClockUnhealthy { .. }));
+        assert_eq!(timing.master_residual_max_spikes, 1);
+        assert_eq!(timing.slave_residual_max_spikes, 1);
+        assert_eq!(timing.master_residual_max_consecutive_failures, 1);
+        assert_eq!(timing.slave_residual_max_consecutive_failures, 1);
+    }
+
+    #[test]
+    fn final_pre_run_gate_bypasses_residual_max_debounce() {
+        let gate = RawClockRuntimeGate::new(RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 3,
+            ..RawClockRuntimeThresholds::for_tests()
+        });
+
+        let err = gate
+            .check_tick(tick_for_health(
+                unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "residual max"),
+                healthy_for_tests(),
+            ))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "master", .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_unhealthy_kind_fails_immediately_and_resets_counter() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 3,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "residual max"),
+                    healthy_for_tests(),
+                ),
+                thresholds,
+            )
+            .unwrap();
+
+        let err = timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_without_kind_for_tests("legacy unknown unhealthy reason"),
+                    healthy_for_tests(),
+                ),
+                thresholds,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "master", .. }
+        ));
+        assert_eq!(timing.master_residual_max_consecutive_failures, 0);
+    }
+
+    #[test]
+    fn inter_arm_skew_remains_fail_fast_with_debounce_gate() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            inter_arm_skew_max_us: 2_000,
+            residual_max_consecutive_failures: 3,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        let err = timing
+            .check_tick_with_debounce(
+                RawClockTickTiming {
+                    master_feedback_time_us: 100_000,
+                    slave_feedback_time_us: 103_001,
+                    inter_arm_skew_us: 3_001,
+                    master_health: healthy_for_tests(),
+                    slave_health: healthy_for_tests(),
+                },
+                thresholds,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, RawClockRuntimeError::InterArmSkew { .. }));
+    }
+
+    #[test]
+    fn stale_sample_age_remains_fail_fast_even_when_health_is_otherwise_healthy() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            last_sample_age_us: 20,
+            residual_max_consecutive_failures: 3,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+        let mut stale_master = healthy_for_tests();
+        stale_master.last_sample_age_us = 21;
+
+        let err = timing
+            .check_tick_with_debounce(
+                tick_for_health(stale_master, healthy_for_tests()),
+                thresholds,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "master", .. }
+        ));
+        assert_eq!(timing.master_residual_max_consecutive_failures, 0);
+    }
+
+    #[test]
+    fn reset_runtime_residual_max_counters_clears_warmup_state() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let thresholds = RawClockRuntimeThresholds {
+            residual_max_consecutive_failures: 3,
+            ..RawClockRuntimeThresholds::for_tests()
+        };
+
+        timing
+            .check_tick_with_debounce(
+                tick_for_health(
+                    unhealthy_for_tests(RawClockUnhealthyKind::ResidualMax, "residual max"),
+                    healthy_for_tests(),
+                ),
+                thresholds,
+            )
+            .unwrap();
+        timing.reset_runtime_residual_max_counters();
+
+        assert_eq!(timing.master_residual_max_spikes, 0);
+        assert_eq!(timing.master_residual_max_consecutive_failures, 0);
+    }
+
+    #[test]
     fn tick_timing_uses_newest_raw_feedback_from_control_snapshots() {
         let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
         let master = raw_clock_snapshot_for_tests(10_000, 110_000);
@@ -3150,6 +3655,7 @@ mod tests {
                 thresholds: RawClockRuntimeThresholds {
                     inter_arm_skew_max_us: 20_000,
                     last_sample_age_us: u64::MAX,
+                    residual_max_consecutive_failures: 1,
                 },
                 estimator_thresholds: thresholds_for_tests(),
             },

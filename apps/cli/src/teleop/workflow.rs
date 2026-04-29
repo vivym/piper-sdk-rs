@@ -836,6 +836,7 @@ fn experimental_raw_clock_config_from_settings(
     let thresholds = RawClockRuntimeThresholds {
         inter_arm_skew_max_us: raw_clock.inter_arm_skew_max_us,
         last_sample_age_us: raw_clock.last_sample_age_ms * 1_000,
+        residual_max_consecutive_failures: 1,
     };
 
     ExperimentalRawClockConfig {
@@ -1530,6 +1531,10 @@ fn raw_clock_error_report(
         max_inter_arm_skew_us: 0,
         inter_arm_skew_p95_us: 0,
         clock_health_failures: 0,
+        master_residual_max_spikes: 0,
+        slave_residual_max_spikes: 0,
+        master_residual_max_consecutive_failures: 0,
+        slave_residual_max_consecutive_failures: 0,
         read_faults: 0,
         submission_faults: 0,
         last_submission_failed_side: None,
@@ -3334,6 +3339,10 @@ mod tests {
             max_inter_arm_skew_us: 100,
             inter_arm_skew_p95_us: 80,
             clock_health_failures: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
             read_faults: 0,
             submission_faults: 0,
             last_submission_failed_side: None,
