@@ -88,6 +88,8 @@ pub struct TeleopDualArmArgs {
     pub raw_clock_last_sample_age_ms: Option<u64>,
     #[arg(long)]
     pub raw_clock_inter_arm_skew_max_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_residual_max_consecutive_failures: Option<u32>,
 }
 
 impl TeleopCommand {
@@ -136,6 +138,7 @@ impl TeleopDualArmArgs {
             raw_clock_sample_gap_max_ms: None,
             raw_clock_last_sample_age_ms: None,
             raw_clock_inter_arm_skew_max_us: None,
+            raw_clock_residual_max_consecutive_failures: None,
         }
     }
 }
@@ -207,6 +210,8 @@ mod tests {
             "10",
             "--raw-clock-inter-arm-skew-max-us",
             "2000",
+            "--raw-clock-residual-max-consecutive-failures",
+            "5",
         ])
         .expect("experimental raw clock command should parse");
 
@@ -215,6 +220,7 @@ mod tests {
                 assert!(args.experimental_calibrated_raw);
                 assert_eq!(args.raw_clock_warmup_secs, Some(10));
                 assert_eq!(args.raw_clock_inter_arm_skew_max_us, Some(2000));
+                assert_eq!(args.raw_clock_residual_max_consecutive_failures, Some(5));
             },
         }
     }

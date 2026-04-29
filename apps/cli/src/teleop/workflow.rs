@@ -836,7 +836,7 @@ fn experimental_raw_clock_config_from_settings(
     let thresholds = RawClockRuntimeThresholds {
         inter_arm_skew_max_us: raw_clock.inter_arm_skew_max_us,
         last_sample_age_us: raw_clock.last_sample_age_ms * 1_000,
-        residual_max_consecutive_failures: 1,
+        residual_max_consecutive_failures: raw_clock.residual_max_consecutive_failures,
     };
 
     ExperimentalRawClockConfig {
@@ -3107,6 +3107,7 @@ mod tests {
             sample_gap_max_ms: 7,
             last_sample_age_ms: 9,
             inter_arm_skew_max_us: 1500,
+            residual_max_consecutive_failures: 5,
         };
 
         let config = experimental_raw_clock_config_from_settings(&settings, 333.0, Some(12));
@@ -3122,6 +3123,7 @@ mod tests {
         assert_eq!(config.estimator_thresholds.last_sample_age_us, 9_000);
         assert_eq!(config.thresholds.inter_arm_skew_max_us, 1500);
         assert_eq!(config.thresholds.last_sample_age_us, 9_000);
+        assert_eq!(config.thresholds.residual_max_consecutive_failures, 5);
     }
 
     #[test]
@@ -3135,6 +3137,7 @@ mod tests {
             sample_gap_max_ms: 20,
             last_sample_age_ms: 20,
             inter_arm_skew_max_us: 5000,
+            residual_max_consecutive_failures: 3,
         };
 
         let config = experimental_raw_clock_config_from_settings(&settings, 100.0, Some(300));

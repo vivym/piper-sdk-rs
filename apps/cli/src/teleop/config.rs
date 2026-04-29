@@ -21,6 +21,7 @@ pub const DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 500.0;
 pub const DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 2000;
+pub const DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 // Lab-experiment guardrails: generous enough for setup/debugging, low enough
 // that raw-clock health gates cannot be configured into practical no-ops.
 pub const MAX_RAW_CLOCK_WARMUP_SECS: u64 = 3600;
@@ -30,6 +31,7 @@ pub const MAX_RAW_CLOCK_DRIFT_ABS_PPM: f64 = 1000.0;
 pub const MAX_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 1000;
 pub const MAX_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 1000;
 pub const MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 100_000;
+pub const MAX_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES: u32 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -142,6 +144,7 @@ pub struct TeleopRawClockConfig {
     pub sample_gap_max_ms: Option<u64>,
     pub last_sample_age_ms: Option<u64>,
     pub inter_arm_skew_max_us: Option<u64>,
+    pub residual_max_consecutive_failures: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +180,7 @@ pub struct TeleopRawClockSettings {
     pub sample_gap_max_ms: u64,
     pub last_sample_age_ms: u64,
     pub inter_arm_skew_max_us: u64,
+    pub residual_max_consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -276,6 +280,12 @@ impl TeleopRawClockSettings {
             1,
             MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US,
         )?;
+        validate_u32_range(
+            "residual_max_consecutive_failures",
+            self.residual_max_consecutive_failures,
+            1,
+            MAX_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES,
+        )?;
         Ok(())
     }
 }
@@ -349,6 +359,12 @@ impl ResolvedTeleopConfig {
                 .raw_clock_inter_arm_skew_max_us
                 .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.inter_arm_skew_max_us))
                 .unwrap_or(DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US),
+            residual_max_consecutive_failures: args
+                .raw_clock_residual_max_consecutive_failures
+                .or_else(|| {
+                    file_raw_clock.and_then(|raw_clock| raw_clock.residual_max_consecutive_failures)
+                })
+                .unwrap_or(DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES),
         };
         raw_clock.validate()?;
 
@@ -421,6 +437,13 @@ fn validate_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
 
 fn validate_u64_range(name: &str, value: u64, min: u64, max: u64) -> Result<()> {
     if value < min || value > max {
+        bail!("{name} must be between {min} and {max}; got {value}");
+    }
+    Ok(())
+}
+
+fn validate_u32_range(name: &str, value: u32, min: u32, max: u32) -> Result<()> {
+    if !(min..=max).contains(&value) {
         bail!("{name} must be between {min} and {max}; got {value}");
     }
     Ok(())
@@ -620,6 +643,64 @@ mod tests {
         let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
         assert!(err.to_string().contains("residual_p95_us"));
         assert!(err.to_string().contains("residual_max_us"));
+    }
+
+    #[test]
+    fn cli_residual_max_consecutive_failures_overrides_file_value() {
+        let file = TeleopConfigFile {
+            raw_clock: Some(TeleopRawClockConfig {
+                residual_max_consecutive_failures: Some(9),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let args = TeleopDualArmArgs {
+            raw_clock_residual_max_consecutive_failures: Some(3),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
+
+        assert_eq!(resolved.raw_clock.residual_max_consecutive_failures, 3);
+    }
+
+    #[test]
+    fn file_residual_max_consecutive_failures_is_used_when_cli_missing() {
+        let file = TeleopConfigFile {
+            raw_clock: Some(TeleopRawClockConfig {
+                residual_max_consecutive_failures: Some(4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved =
+            ResolvedTeleopConfig::resolve(TeleopDualArmArgs::default_for_tests(), Some(file))
+                .unwrap();
+
+        assert_eq!(resolved.raw_clock.residual_max_consecutive_failures, 4);
+    }
+
+    #[test]
+    fn raw_clock_validation_rejects_zero_residual_max_consecutive_failures() {
+        let args = TeleopDualArmArgs {
+            raw_clock_residual_max_consecutive_failures: Some(0),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+        assert!(err.to_string().contains("residual_max_consecutive_failures"));
+    }
+
+    #[test]
+    fn raw_clock_validation_rejects_large_residual_max_consecutive_failures() {
+        let args = TeleopDualArmArgs {
+            raw_clock_residual_max_consecutive_failures: Some(101),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+        assert!(err.to_string().contains("residual_max_consecutive_failures"));
     }
 
     #[test]
