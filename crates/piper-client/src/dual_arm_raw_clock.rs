@@ -65,7 +65,7 @@ impl Default for ExperimentalRawClockConfig {
                 residual_max_us: 250,
                 drift_abs_ppm: 500.0,
                 sample_gap_max_us: 5_000,
-                last_sample_age_us: 5_000,
+                last_sample_age_us: 20_000,
             },
         }
     }
@@ -98,6 +98,28 @@ impl ExperimentalRawClockConfig {
                 "frequency_hz must be finite and > 0".to_string(),
             ));
         }
+        if self.thresholds.alignment_lag_us == 0 {
+            return Err(RawClockRuntimeError::Config(
+                "alignment_lag_us must be greater than 0".to_string(),
+            ));
+        }
+        if self.thresholds.alignment_buffer_miss_consecutive_failures == 0 {
+            return Err(RawClockRuntimeError::Config(
+                "alignment_buffer_miss_consecutive_failures must be greater than 0".to_string(),
+            ));
+        }
+        if self.thresholds.alignment_lag_us >= self.thresholds.last_sample_age_us {
+            return Err(RawClockRuntimeError::Config(format!(
+                "alignment_lag_us {} must be less than runtime last_sample_age_us {}",
+                self.thresholds.alignment_lag_us, self.thresholds.last_sample_age_us
+            )));
+        }
+        if self.thresholds.alignment_lag_us >= self.estimator_thresholds.last_sample_age_us {
+            return Err(RawClockRuntimeError::Config(format!(
+                "alignment_lag_us {} must be less than estimator last_sample_age_us {}",
+                self.thresholds.alignment_lag_us, self.estimator_thresholds.last_sample_age_us
+            )));
+        }
         Ok(())
     }
 }
@@ -124,14 +146,18 @@ pub struct RawClockRuntimeThresholds {
     pub inter_arm_skew_max_us: u64,
     pub last_sample_age_us: u64,
     pub residual_max_consecutive_failures: u32,
+    pub alignment_lag_us: u64,
+    pub alignment_buffer_miss_consecutive_failures: u32,
 }
 
 impl Default for RawClockRuntimeThresholds {
     fn default() -> Self {
         Self {
             inter_arm_skew_max_us: 2_000,
-            last_sample_age_us: 5_000,
+            last_sample_age_us: 20_000,
             residual_max_consecutive_failures: 1,
+            alignment_lag_us: 5_000,
+            alignment_buffer_miss_consecutive_failures: 3,
         }
     }
 }
@@ -145,6 +171,8 @@ impl RawClockRuntimeThresholds {
             // monotonic clock; dedicated gate tests cover age rejection.
             last_sample_age_us: u64::MAX,
             residual_max_consecutive_failures: 1,
+            alignment_lag_us: 5_000,
+            alignment_buffer_miss_consecutive_failures: 3,
         }
     }
 }
@@ -2929,6 +2957,58 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raw_clock_default_alignment_is_internally_valid() {
+        let config = ExperimentalRawClockConfig::default();
+
+        assert_eq!(config.thresholds.alignment_lag_us, 5_000);
+        assert_eq!(
+            config.thresholds.alignment_buffer_miss_consecutive_failures,
+            3
+        );
+        assert!(config.thresholds.alignment_lag_us < config.thresholds.last_sample_age_us);
+        assert!(
+            config.thresholds.alignment_lag_us < config.estimator_thresholds.last_sample_age_us
+        );
+        config.validate().expect("default raw-clock config should validate");
+    }
+
+    #[test]
+    fn experimental_raw_clock_config_rejects_alignment_lag_at_runtime_freshness() {
+        let config = ExperimentalRawClockConfig {
+            thresholds: RawClockRuntimeThresholds {
+                alignment_lag_us: 20_000,
+                last_sample_age_us: 20_000,
+                ..RawClockRuntimeThresholds::default()
+            },
+            estimator_thresholds: RawClockThresholds {
+                last_sample_age_us: 25_000,
+                ..thresholds_for_tests()
+            },
+            ..ExperimentalRawClockConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn experimental_raw_clock_config_rejects_alignment_lag_at_estimator_freshness() {
+        let config = ExperimentalRawClockConfig {
+            thresholds: RawClockRuntimeThresholds {
+                alignment_lag_us: 20_000,
+                last_sample_age_us: 25_000,
+                ..RawClockRuntimeThresholds::default()
+            },
+            estimator_thresholds: RawClockThresholds {
+                last_sample_age_us: 20_000,
+                ..thresholds_for_tests()
+            },
+            ..ExperimentalRawClockConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn raw_clock_master_follower_runtime_uses_configured_gains() {
         let gains = ExperimentalRawClockMasterFollowerGains {
             track_kp: JointArray::splat(9.25),
@@ -3809,8 +3889,7 @@ mod tests {
                 max_iterations: Some(1),
                 thresholds: RawClockRuntimeThresholds {
                     inter_arm_skew_max_us: 20_000,
-                    last_sample_age_us: u64::MAX,
-                    residual_max_consecutive_failures: 1,
+                    ..RawClockRuntimeThresholds::for_tests()
                 },
                 estimator_thresholds: thresholds_for_tests(),
             },
