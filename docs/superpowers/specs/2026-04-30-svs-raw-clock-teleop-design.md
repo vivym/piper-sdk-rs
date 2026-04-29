@@ -26,13 +26,14 @@ the SoftRealtime path:
 - raw-clock alignment, estimator health, residual debouncing, state skew, and
   selected-sample-age gates are now part of the teleop CLI path
 
-The raw-clock bilateral teleop implementation plan is tracked separately:
+The raw-clock bilateral teleop implementation plan was tracked separately:
 
 - `docs/superpowers/plans/2026-04-30-raw-clock-bilateral-teleop.md`
 
-SVS raw-clock implementation should wait until that plan is executed, reviewed,
-and merged. This spec may be written now because it defines the next integration
-step and explicitly treats raw-clock bilateral runtime support as a prerequisite.
+That prerequisite is now satisfied on `main`. The current raw-clock runtime
+accepts bilateral mode and the main teleop CLI can run raw-clock bilateral
+without gravity compensation. SVS raw-clock integration should build on that
+runtime rather than reintroducing a separate control loop.
 
 ## Goal
 
@@ -58,15 +59,19 @@ UX, and safety gates explored in the main teleop CLI.
 - Do not implement a new gravity compensation algorithm. Reuse the existing SVS
   MuJoCo bridge.
 
-## Prerequisite
+## Prerequisite Status
 
-Before implementation starts, the raw-clock bilateral teleop plan must be
-complete and merged:
+The raw-clock bilateral teleop prerequisite is complete and merged:
 
 - `docs/superpowers/plans/2026-04-30-raw-clock-bilateral-teleop.md`
+- `6e49aba Allow raw-clock bilateral runtime mode`
+- `8552c66 Thread raw-clock teleop mode through CLI config`
+- `453dc23 Run raw-clock teleop through runtime controller`
+- `08c3d12 Add bilateral smoke reflection gain`
+- `1455b9e Apply raw-clock master interaction torque`
 
-That prerequisite is expected to provide a stable raw-clock runtime that can run
-bilateral mode without gravity compensation. SVS then adds the compensation and
+Those changes provide a stable raw-clock runtime that can run bilateral mode
+without gravity compensation. SVS now adds the compensation, telemetry, and
 episode-recording layer on top of that runtime boundary.
 
 ## Architecture Boundary
@@ -115,6 +120,12 @@ raw-clock bilateral link validation. SVS does not reimplement these CLI modes.
 The raw-clock runtime needs a compensation-capable entry point analogous to
 StrictRealtime `run_bilateral_with_compensation()`.
 
+The current raw-clock active runner already exposes
+`ExperimentalRawClockDualArmActive::run_with_controller()` and accepts
+`ExperimentalRawClockMode::Bilateral`. The missing SDK work is not mode
+selection; it is compensation, telemetry, and gripper telemetry support for the
+same raw-clock runtime core.
+
 The new path should reuse the existing raw-clock runtime core instead of
 creating a second control loop. The runtime core should optionally accept:
 
@@ -122,6 +133,7 @@ creating a second control loop. The runtime core should optionally accept:
 - a `BilateralDynamicsCompensator`
 - a raw-clock run/config object
 - an optional telemetry sink
+- gripper telemetry/mirroring settings compatible with `BilateralLoopConfig`
 
 For each aligned tick:
 
@@ -130,20 +142,53 @@ For each aligned tick:
    `BilateralDynamicsCompensator::compute(&snapshot, nominal_period)`.
 3. Build `BilateralControlFrame { snapshot, compensation }`.
 4. Call `controller.tick_with_compensation(&frame, nominal_period)`.
-5. Apply the raw-clock runtime's normal command shaping, torque assembly, submit,
-   timing accounting, and fault handling.
-6. Emit loop telemetry after command submission when a telemetry sink is present.
+5. Assemble final torques including model compensation.
+6. Submit both arms through the SoftRealtime confirmed-finished command path so
+   per-tick tx-finished timestamps are available.
+7. Collect gripper telemetry and, if enabled, perform gripper mirroring with the
+   same bounded semantics as the StrictRealtime bilateral loop.
+8. Emit loop telemetry after arm command submission and gripper handling when a
+   telemetry sink is present.
+9. Apply the raw-clock runtime's normal timing accounting and fault handling.
 
 The existing raw-clock master-follower and bilateral wrappers should continue to
 work without a compensator.
 
 ### Telemetry Shape
 
-The preferred first-stage design is to emit the existing
+The first-stage design must emit the existing
 `piper_client::dual_arm::BilateralLoopTelemetry` from the raw-clock runtime.
 That structure is already consumed by `SvsTelemetrySink`, and it contains the
 control frame, compensation, controller command, shaped command, final torques,
 and tx completion timestamps that SVS uses to write `SvsEpisodeV1` steps.
+
+Raw-clock telemetry emitted to `SvsTelemetrySink` must populate the fields SVS
+requires to build a step:
+
+- `control_frame.snapshot`
+- `control_frame.compensation`
+- `controller_command`
+- `shaped_command`
+- `compensation`
+- `final_torques`
+- `master_t_ref_nm`
+- `slave_t_ref_nm`
+- `master_tx_finished_host_mono_us`
+- `slave_tx_finished_host_mono_us`
+- `timing.control_frame_host_mono_us`
+- `timing.clamped_dt_us`
+- `timing.deadline_missed`
+- `gripper`
+
+`master_tx_finished_host_mono_us` and `slave_tx_finished_host_mono_us` must be
+`Some(nonzero)`. The existing SVS sink treats missing tx-finished timestamps as
+a telemetry sink fault.
+
+Raw-clock gripper telemetry must be valid for the existing `SvsGripperStepV1`
+schema. If gripper mirroring is enabled in the SVS profile, the raw-clock
+runtime must either implement the same mirror semantics as the StrictRealtime
+loop or reject the raw-clock SVS configuration before enabling the arms. It must
+not silently emit incomplete gripper fields.
 
 Raw-clock-specific diagnostics should remain in raw-clock reports during this
 phase, not per-step SVS episode rows.
@@ -159,6 +204,16 @@ phase, not per-step SVS episode rows.
 - compensation faults
 - controller faults
 - telemetry sink faults
+
+The SDK should add explicit raw-clock exit reasons and counters for
+compensation and telemetry sink failures rather than relying only on
+`last_error` strings:
+
+- `RawClockRuntimeExitReason::CompensationFault`
+- `RawClockRuntimeExitReason::TelemetrySinkFault`
+- `RawClockRuntimeReport::compensation_faults`
+- `RawClockRuntimeReport::controller_faults`
+- `RawClockRuntimeReport::telemetry_sink_faults`
 
 Compensation, controller, or telemetry sink errors should fault the run. The
 first implementation should fail closed rather than attempting a complex hold
@@ -252,12 +307,17 @@ behavior.
 Do not change the `SvsEpisodeV1` per-step schema in this phase.
 
 Raw-clock metadata and diagnostics should be added as optional manifest/report
-sections, for example:
+sections with precise schema locations:
 
 ```text
-manifest.runtime.raw_clock = Some(...)
-report.raw_clock = Some(...)
+ManifestV1.raw_clock: Option<RawClockManifest>
+ReportJson.raw_clock: Option<RawClockReportJson>
 ```
+
+The fields should use `#[serde(skip_serializing_if = "Option::is_none")]` where
+appropriate so StrictRealtime SVS manifests and reports stay compact. Missing
+optional fields must deserialize as `None` for compatibility with previously
+written episodes.
 
 The optional raw-clock section should include:
 
@@ -274,6 +334,8 @@ The optional raw-clock section should include:
 - alignment buffer miss counts
 - residual max spike/consecutive-failure counters
 - clock health failure count
+- read/submission/runtime fault counters
+- compensation/controller/telemetry sink fault counters
 - final failure kind when present
 
 This keeps old episode readers compatible while allowing analysis tools to
@@ -307,10 +369,16 @@ Add unit coverage for the raw-clock compensation-capable runtime:
 - compensator receives the aligned `DualArmSnapshot`
 - compensation is included in `BilateralControlFrame`
 - controller receives the compensation frame
-- telemetry sink receives the same logical fields used by StrictRealtime SVS
+- telemetry sink receives the same logical fields used by StrictRealtime SVS,
+  including nonzero tx-finished timestamps and `master_t_ref_nm`/`slave_t_ref_nm`
+- raw-clock telemetry contains valid gripper telemetry when gripper mirroring is
+  disabled
+- raw-clock gripper mirroring either behaves like StrictRealtime or rejects the
+  configuration before enable if unsupported
 - compensation faults produce a faulted raw-clock report
 - controller faults produce a faulted raw-clock report
 - telemetry sink faults produce a faulted raw-clock report
+- raw-clock compensation/controller/telemetry fault counters are set correctly
 - existing raw-clock master-follower and bilateral tests continue to pass
 
 ### `piper-svs-collect`
@@ -321,7 +389,11 @@ Add fake/harness tests for the collector:
 - `--experimental-calibrated-raw` selects the raw-clock backend
 - raw-clock backend writes a complete `SvsEpisodeV1` without changing step schema
 - raw-clock manifest/report sections are present only for raw-clock runs
+- StrictRealtime manifest/report validation still passes with no raw-clock section
 - raw-clock compensation data flows through the existing `SvsTelemetrySink`
+- raw-clock telemetry missing tx-finished timestamps faults the run before
+  writing an invalid step
+- raw-clock gripper telemetry maps into `SvsGripperStepV1`
 - calibration capture/check behavior matches the StrictRealtime path
 - compensation fault finalizes a faulted episode
 - writer/telemetry fault finalizes a faulted episode
@@ -370,10 +442,10 @@ Pass criteria:
 
 ## Implementation Sequence
 
-1. Wait for `2026-04-30-raw-clock-bilateral-teleop.md` to be executed, reviewed,
-   and merged.
-2. Extend `piper-client::dual_arm_raw_clock` with compensation and telemetry
-   hooks.
+1. Treat `2026-04-30-raw-clock-bilateral-teleop.md` as satisfied and build on
+   the merged raw-clock bilateral runtime.
+2. Extend `piper-client::dual_arm_raw_clock` with compensation, gripper, and
+   telemetry hooks.
 3. Add raw-clock runtime selection and settings to `piper-svs-collect`.
 4. Wire SVS raw-clock backend to `SvsController`, `SvsMujocoBridge`, and
    `SvsTelemetrySink`.
