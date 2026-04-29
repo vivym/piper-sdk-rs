@@ -135,6 +135,31 @@ creating a second control loop. The runtime core should optionally accept:
 - an optional telemetry sink
 - gripper telemetry/mirroring settings compatible with `BilateralLoopConfig`
 
+The existing raw-clock CLI smoke path must remain low risk. Compensation,
+confirmed-finished telemetry submission, and gripper telemetry/mirroring should
+be enabled only through the new compensation/telemetry-capable raw-clock entry
+point or equivalent explicit config. Existing raw-clock runs with no telemetry
+sink and no compensator should keep their current command-submission and gripper
+behavior.
+
+The compensation-capable entry point must also preserve the lifecycle semantics
+used by the StrictRealtime bilateral loop:
+
+- reset the compensator before entering the runtime loop
+- keep generic `run_with_controller()` controller lifecycle unchanged unless an
+  explicit reset-capable wrapper is added
+- if elapsed control-frame time exceeds the configured dt clamp, call
+  `controller.on_time_jump(raw_dt)`
+- if a compensator is present and the same time jump occurs, call
+  `compensator.on_time_jump(raw_dt)`
+- map controller time-jump failures to controller faults
+- map compensator reset/time-jump failures to compensation faults
+
+SVS should either construct a fresh `SvsController` for each run, as it does
+today, or explicitly reset it before handing it to the raw-clock runtime. The SDK
+runtime must not silently skip compensator reset because `SvsMujocoBridge`
+contains stateful MuJoCo compensation.
+
 For each aligned tick:
 
 1. Select an aligned `DualArmSnapshot` through the raw-clock alignment path.
@@ -143,10 +168,13 @@ For each aligned tick:
 3. Build `BilateralControlFrame { snapshot, compensation }`.
 4. Call `controller.tick_with_compensation(&frame, nominal_period)`.
 5. Assemble final torques including model compensation.
-6. Submit both arms through the SoftRealtime confirmed-finished command path so
-   per-tick tx-finished timestamps are available.
-7. Collect gripper telemetry and, if enabled, perform gripper mirroring with the
-   same bounded semantics as the StrictRealtime bilateral loop.
+6. When telemetry is enabled, submit both arms through the SoftRealtime
+   confirmed-finished command path so per-tick tx-finished timestamps are
+   available. Non-telemetry raw-clock callers may keep the current confirmed
+   submission behavior.
+7. When telemetry or gripper mirroring is enabled, collect gripper telemetry and,
+   if enabled, perform gripper mirroring with the same bounded semantics as the
+   StrictRealtime bilateral loop.
 8. Emit loop telemetry after arm command submission and gripper handling when a
    telemetry sink is present.
 9. Apply the raw-clock runtime's normal timing accounting and fault handling.
@@ -367,6 +395,10 @@ designed later if hardware evidence shows it is needed.
 Add unit coverage for the raw-clock compensation-capable runtime:
 
 - compensator receives the aligned `DualArmSnapshot`
+- compensator `reset()` is called before the first tick, and reset failure maps
+  to a compensation fault
+- controller and compensator `on_time_jump()` are called when raw dt exceeds the
+  configured clamp, and their failures map to controller/compensation faults
 - compensation is included in `BilateralControlFrame`
 - controller receives the compensation frame
 - telemetry sink receives the same logical fields used by StrictRealtime SVS,
@@ -379,6 +411,8 @@ Add unit coverage for the raw-clock compensation-capable runtime:
 - controller faults produce a faulted raw-clock report
 - telemetry sink faults produce a faulted raw-clock report
 - raw-clock compensation/controller/telemetry fault counters are set correctly
+- no-telemetry, no-compensator raw-clock runs preserve the existing CLI smoke
+  submission/gripper behavior
 - existing raw-clock master-follower and bilateral tests continue to pass
 
 ### `piper-svs-collect`
