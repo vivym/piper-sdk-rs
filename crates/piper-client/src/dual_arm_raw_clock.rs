@@ -206,6 +206,9 @@ pub struct RawClockRuntimeReport {
     pub max_inter_arm_skew_us: u64,
     pub inter_arm_skew_p95_us: u64,
     pub clock_health_failures: u64,
+    pub alignment_buffer_misses: u64,
+    pub alignment_buffer_miss_consecutive_max: u32,
+    pub alignment_buffer_miss_consecutive_failures: u32,
     pub master_residual_max_spikes: u64,
     pub slave_residual_max_spikes: u64,
     pub master_residual_max_consecutive_failures: u32,
@@ -456,6 +459,15 @@ pub enum RawClockRuntimeError {
     },
     #[error("inter-arm raw-clock skew {inter_arm_skew_us}us exceeds {max_us}us")]
     InterArmSkew { inter_arm_skew_us: u64, max_us: u64 },
+    #[error(
+        "alignment buffer miss kind={kind:?} target_time_us={target_time_us:?} master_latest_time_us={master_latest_time_us:?} slave_latest_time_us={slave_latest_time_us:?}"
+    )]
+    AlignmentBufferMiss {
+        kind: AlignmentBufferMissKind,
+        target_time_us: Option<u64>,
+        master_latest_time_us: Option<u64>,
+        slave_latest_time_us: Option<u64>,
+    },
     #[error("snapshot read failed on {side}: {source}")]
     ReadFault {
         side: &'static str,
@@ -595,6 +607,51 @@ impl RawClockAlignedSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignmentBufferMissKind {
+    TargetUnderflow,
+    Master,
+    Slave,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlignmentBufferMiss {
+    kind: AlignmentBufferMissKind,
+    target_time_us: Option<u64>,
+    master_latest_time_us: Option<u64>,
+    slave_latest_time_us: Option<u64>,
+}
+
+impl AlignmentBufferMiss {
+    fn into_runtime_error(self) -> RawClockRuntimeError {
+        RawClockRuntimeError::AlignmentBufferMiss {
+            kind: self.kind,
+            target_time_us: self.target_time_us,
+            master_latest_time_us: self.master_latest_time_us,
+            slave_latest_time_us: self.slave_latest_time_us,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RawClockAlignedSelection {
+    master: RawClockAlignedSnapshot,
+    slave: RawClockAlignedSnapshot,
+    target_time_us: u64,
+}
+
+fn raw_clock_alignment_retention_us(
+    estimator: RawClockThresholds,
+    runtime: RawClockRuntimeThresholds,
+) -> u64 {
+    runtime
+        .alignment_lag_us
+        .saturating_add(estimator.sample_gap_max_us.saturating_mul(2))
+        .max(estimator.last_sample_age_us)
+        .max(runtime.last_sample_age_us)
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct RawClockSnapshotBuffer {
@@ -638,9 +695,14 @@ impl RawClockSnapshotBuffer {
 pub struct RawClockRuntimeTiming {
     master: RawClockEstimator,
     slave: RawClockEstimator,
+    master_alignment_buffer: RawClockSnapshotBuffer,
+    slave_alignment_buffer: RawClockSnapshotBuffer,
     skew_samples_us: VecDeque<u64>,
     max_inter_arm_skew_us: u64,
     clock_health_failures: u64,
+    alignment_buffer_misses: u64,
+    alignment_buffer_miss_consecutive: u32,
+    alignment_buffer_miss_consecutive_max: u32,
     last_master_raw_us: Option<u64>,
     last_slave_raw_us: Option<u64>,
     master_raw_timestamp_regressions: u64,
@@ -653,12 +715,26 @@ pub struct RawClockRuntimeTiming {
 
 impl RawClockRuntimeTiming {
     pub fn new(thresholds: RawClockThresholds) -> Self {
+        Self::new_with_runtime_thresholds(thresholds, RawClockRuntimeThresholds::default())
+    }
+
+    pub fn new_with_runtime_thresholds(
+        estimator_thresholds: RawClockThresholds,
+        runtime_thresholds: RawClockRuntimeThresholds,
+    ) -> Self {
+        let alignment_retention_us =
+            raw_clock_alignment_retention_us(estimator_thresholds, runtime_thresholds);
         Self {
-            master: RawClockEstimator::new(thresholds),
-            slave: RawClockEstimator::new(thresholds),
+            master: RawClockEstimator::new(estimator_thresholds),
+            slave: RawClockEstimator::new(estimator_thresholds),
+            master_alignment_buffer: RawClockSnapshotBuffer::new(alignment_retention_us),
+            slave_alignment_buffer: RawClockSnapshotBuffer::new(alignment_retention_us),
             skew_samples_us: VecDeque::with_capacity(RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY),
             max_inter_arm_skew_us: 0,
             clock_health_failures: 0,
+            alignment_buffer_misses: 0,
+            alignment_buffer_miss_consecutive: 0,
+            alignment_buffer_miss_consecutive_max: 0,
             last_master_raw_us: None,
             last_slave_raw_us: None,
             master_raw_timestamp_regressions: 0,
@@ -673,9 +749,14 @@ impl RawClockRuntimeTiming {
     fn reset_for_warmup(&mut self) {
         self.master.reset();
         self.slave.reset();
+        self.master_alignment_buffer.clear();
+        self.slave_alignment_buffer.clear();
         self.skew_samples_us.clear();
         self.max_inter_arm_skew_us = 0;
         self.clock_health_failures = 0;
+        self.alignment_buffer_misses = 0;
+        self.alignment_buffer_miss_consecutive = 0;
+        self.alignment_buffer_miss_consecutive_max = 0;
         self.last_master_raw_us = None;
         self.last_slave_raw_us = None;
         self.master_raw_timestamp_regressions = 0;
@@ -773,6 +854,49 @@ impl RawClockRuntimeTiming {
         })
     }
 
+    fn select_aligned_snapshots(
+        &self,
+        latest: &RawClockLatestTiming,
+        alignment_lag_us: u64,
+    ) -> Result<RawClockAlignedSelection, AlignmentBufferMiss> {
+        let latest_common_time = latest.master_feedback_time_us.min(latest.slave_feedback_time_us);
+        let Some(target_time_us) = latest_common_time.checked_sub(alignment_lag_us) else {
+            return Err(AlignmentBufferMiss {
+                kind: AlignmentBufferMissKind::TargetUnderflow,
+                target_time_us: None,
+                master_latest_time_us: Some(latest.master_feedback_time_us),
+                slave_latest_time_us: Some(latest.slave_feedback_time_us),
+            });
+        };
+        let master = self.master_alignment_buffer.latest_before_or_at(target_time_us);
+        let slave = self.slave_alignment_buffer.latest_before_or_at(target_time_us);
+        match (master, slave) {
+            (Some(master), Some(slave)) => Ok(RawClockAlignedSelection {
+                master: master.clone(),
+                slave: slave.clone(),
+                target_time_us,
+            }),
+            (None, None) => Err(AlignmentBufferMiss {
+                kind: AlignmentBufferMissKind::Both,
+                target_time_us: Some(target_time_us),
+                master_latest_time_us: Some(latest.master_feedback_time_us),
+                slave_latest_time_us: Some(latest.slave_feedback_time_us),
+            }),
+            (None, Some(_)) => Err(AlignmentBufferMiss {
+                kind: AlignmentBufferMissKind::Master,
+                target_time_us: Some(target_time_us),
+                master_latest_time_us: Some(latest.master_feedback_time_us),
+                slave_latest_time_us: Some(latest.slave_feedback_time_us),
+            }),
+            (Some(_), None) => Err(AlignmentBufferMiss {
+                kind: AlignmentBufferMissKind::Slave,
+                target_time_us: Some(target_time_us),
+                master_latest_time_us: Some(latest.master_feedback_time_us),
+                slave_latest_time_us: Some(latest.slave_feedback_time_us),
+            }),
+        }
+    }
+
     fn warmup_tick_from_snapshots(
         &mut self,
         master: &ExperimentalRawClockSnapshot,
@@ -865,6 +989,34 @@ impl RawClockRuntimeTiming {
 
     fn record_clock_health_failure(&mut self) {
         self.clock_health_failures = self.clock_health_failures.saturating_add(1);
+    }
+
+    fn record_alignment_buffer_miss(&mut self, _miss: AlignmentBufferMiss) {
+        self.alignment_buffer_misses = self.alignment_buffer_misses.saturating_add(1);
+        self.alignment_buffer_miss_consecutive =
+            self.alignment_buffer_miss_consecutive.saturating_add(1);
+        self.alignment_buffer_miss_consecutive_max = self
+            .alignment_buffer_miss_consecutive_max
+            .max(self.alignment_buffer_miss_consecutive);
+    }
+
+    fn record_alignment_selection_success(&mut self) {
+        self.alignment_buffer_miss_consecutive = 0;
+    }
+
+    #[cfg(test)]
+    fn record_alignment_buffer_miss_for_tests(&mut self, kind: AlignmentBufferMissKind) {
+        self.record_alignment_buffer_miss(AlignmentBufferMiss {
+            kind,
+            target_time_us: Some(100_000),
+            master_latest_time_us: Some(105_000),
+            slave_latest_time_us: Some(105_800),
+        });
+    }
+
+    #[cfg(test)]
+    fn alignment_buffer_miss_consecutive_for_tests(&self) -> u32 {
+        self.alignment_buffer_miss_consecutive
     }
 
     fn check_tick_with_debounce(
@@ -1015,6 +1167,9 @@ impl RawClockRuntimeTiming {
             max_inter_arm_skew_us: self.max_inter_arm_skew_us,
             inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
             clock_health_failures: self.clock_health_failures,
+            alignment_buffer_misses: self.alignment_buffer_misses,
+            alignment_buffer_miss_consecutive_max: self.alignment_buffer_miss_consecutive_max,
+            alignment_buffer_miss_consecutive_failures: self.alignment_buffer_miss_consecutive,
             master_residual_max_spikes: self.master_residual_max_spikes,
             slave_residual_max_spikes: self.slave_residual_max_spikes,
             master_residual_max_consecutive_failures: self.master_residual_max_consecutive_failures,
@@ -1077,7 +1232,10 @@ impl ExperimentalRawClockDualArmStandby {
         Ok(Self {
             master,
             slave,
-            timing: RawClockRuntimeTiming::new(config.estimator_thresholds),
+            timing: RawClockRuntimeTiming::new_with_runtime_thresholds(
+                config.estimator_thresholds,
+                config.thresholds,
+            ),
             config,
         })
     }
@@ -1601,8 +1759,71 @@ where
             },
         };
 
-        let tick = match timing.tick_from_snapshots(&master, &slave, piper_can::monotonic_micros())
+        let now_host_us = piper_can::monotonic_micros();
+        let latest = match timing.ingest_latest_snapshots(&master, &slave, now_host_us) {
+            Ok(latest) => latest,
+            Err(err) => {
+                let report = fault_report_from_timing(
+                    &timing,
+                    iterations,
+                    &joint_motion,
+                    RawClockRuntimeExitReason::RawClockFault,
+                    err.to_string(),
+                    |_| {},
+                );
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                return Ok(RawClockCoreExit::Faulted {
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+                });
+            },
+        };
+
+        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            latest.master_feedback_time_us,
+            master,
+        ));
+        timing.slave_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            latest.slave_feedback_time_us,
+            slave,
+        ));
+
+        let selection = match timing
+            .select_aligned_snapshots(&latest, config.thresholds.alignment_lag_us)
         {
+            Ok(selection) => {
+                timing.record_alignment_selection_success();
+                selection
+            },
+            Err(miss) => {
+                let threshold = config.thresholds.alignment_buffer_miss_consecutive_failures;
+                timing.record_alignment_buffer_miss(miss.clone());
+                if timing.alignment_buffer_miss_consecutive < threshold {
+                    continue;
+                }
+                let err = miss.into_runtime_error();
+                let report = fault_report_from_timing(
+                    &timing,
+                    iterations,
+                    &joint_motion,
+                    RawClockRuntimeExitReason::RawClockFault,
+                    err.to_string(),
+                    |_| {},
+                );
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                return Ok(RawClockCoreExit::Faulted {
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+                });
+            },
+        };
+
+        let tick = match timing.selected_tick_from_buffered_times(
+            &latest,
+            selection.master.feedback_time_us,
+            selection.slave.feedback_time_us,
+            now_host_us,
+        ) {
             Ok(tick) => tick,
             Err(err) => {
                 let report = fault_report_from_timing(
@@ -1646,7 +1867,11 @@ where
             });
         }
 
-        let snapshot = raw_dual_arm_snapshot(&master, &slave, inter_arm_skew_us);
+        let snapshot = raw_dual_arm_snapshot(
+            &selection.master.snapshot,
+            &selection.slave.snapshot,
+            inter_arm_skew_us,
+        );
         let frame = BilateralControlFrame {
             snapshot,
             compensation: None,
@@ -2335,6 +2560,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn alignment_selector_reports_target_underflow() {
+        let mut timing = ready_timing_for_tests();
+        let latest = timing
+            .ingest_latest_snapshots(
+                &raw_clock_snapshot_for_tests(11_000, 111_000),
+                &raw_clock_snapshot_for_tests(21_000, 111_800),
+                112_000,
+            )
+            .unwrap();
+
+        let err = timing.select_aligned_snapshots(&latest, 200_000).unwrap_err();
+
+        assert_eq!(err.kind, AlignmentBufferMissKind::TargetUnderflow);
+    }
+
+    #[test]
+    fn alignment_selector_reports_one_side_miss() {
+        let mut timing = ready_timing_for_tests();
+        let latest = timing
+            .ingest_latest_snapshots(
+                &raw_clock_snapshot_for_tests(11_000, 111_000),
+                &raw_clock_snapshot_for_tests(21_000, 111_800),
+                112_000,
+            )
+            .unwrap();
+        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            110_000,
+            raw_clock_snapshot_for_tests(10_000, 110_000),
+        ));
+
+        let err = timing.select_aligned_snapshots(&latest, 500).unwrap_err();
+
+        assert_eq!(err.kind, AlignmentBufferMissKind::Slave);
+    }
+
+    #[test]
+    fn alignment_buffer_retention_uses_resolved_runtime_lag() {
+        let estimator = RawClockThresholds {
+            sample_gap_max_us: 5_000,
+            last_sample_age_us: 20_000,
+            ..thresholds_for_tests()
+        };
+        let runtime = RawClockRuntimeThresholds {
+            alignment_lag_us: 60_000,
+            last_sample_age_us: 70_000,
+            ..RawClockRuntimeThresholds::default()
+        };
+        let mut timing = RawClockRuntimeTiming::new_with_runtime_thresholds(estimator, runtime);
+
+        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            100_000,
+            raw_clock_snapshot_for_tests(10_000, 100_000),
+        ));
+        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            160_000,
+            raw_clock_snapshot_for_tests(70_000, 160_000),
+        ));
+
+        assert_eq!(
+            timing
+                .master_alignment_buffer
+                .latest_before_or_at(100_000)
+                .map(|sample| sample.feedback_time_us),
+            Some(100_000)
+        );
+    }
+
+    #[test]
+    fn alignment_selection_success_resets_consecutive_misses() {
+        let mut timing = RawClockRuntimeTiming::new_with_runtime_thresholds(
+            thresholds_for_tests(),
+            RawClockRuntimeThresholds::default(),
+        );
+
+        timing.record_alignment_buffer_miss_for_tests(AlignmentBufferMissKind::Both);
+        timing.record_alignment_buffer_miss_for_tests(AlignmentBufferMissKind::Master);
+        assert_eq!(timing.alignment_buffer_miss_consecutive_for_tests(), 2);
+
+        timing.record_alignment_selection_success();
+
+        assert_eq!(timing.alignment_buffer_miss_consecutive_for_tests(), 0);
+    }
+
     fn ready_timing_for_tests() -> RawClockRuntimeTiming {
         let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
         timing.seed_ready_for_tests(
@@ -2350,6 +2659,37 @@ mod tests {
                 raw_clock_snapshot_for_tests(19_000, 109_800),
                 raw_clock_snapshot_for_tests(20_000, 110_800),
             ],
+        );
+        timing
+    }
+
+    fn push_alignment_sample_for_tests(
+        timing: &mut RawClockRuntimeTiming,
+        master_feedback_time_us: u64,
+        master: ExperimentalRawClockSnapshot,
+        slave_feedback_time_us: u64,
+        slave: ExperimentalRawClockSnapshot,
+    ) {
+        timing.master_alignment_buffer.push(RawClockAlignedSnapshot::new(
+            master_feedback_time_us,
+            master,
+        ));
+        timing
+            .slave_alignment_buffer
+            .push(RawClockAlignedSnapshot::new(slave_feedback_time_us, slave));
+    }
+
+    fn ready_timing_with_alignment_sample_for_tests(
+        master_feedback_time_us: u64,
+        slave_feedback_time_us: u64,
+    ) -> RawClockRuntimeTiming {
+        let mut timing = ready_timing_for_tests();
+        push_alignment_sample_for_tests(
+            &mut timing,
+            master_feedback_time_us,
+            raw_clock_snapshot_for_tests(5_000, master_feedback_time_us),
+            slave_feedback_time_us,
+            raw_clock_snapshot_for_tests(15_000, slave_feedback_time_us),
         );
         timing
     }
@@ -3161,7 +3501,7 @@ mod tests {
 
         let (state, report) = run_fake_runtime_with_controller(
             io,
-            ready_timing_for_tests(),
+            ready_timing_with_alignment_sample_for_tests(104_200, 105_000),
             1,
             RawClockRuntimeThresholds::for_tests(),
             controller,
@@ -3786,17 +4126,32 @@ mod tests {
 
     #[test]
     fn raw_clock_runtime_report_includes_joint_motion_stats() {
-        let (timing, first_host_us) = ready_timing_near_now_for_tests();
+        let (mut timing, first_host_us) = ready_timing_near_now_for_tests();
+        push_alignment_sample_for_tests(
+            &mut timing,
+            first_host_us - 1_000,
+            raw_clock_snapshot_with_positions_for_tests(
+                10_000,
+                first_host_us - 1_000,
+                [0.0, 0.0, 0.0, -1.2, 0.0, 0.0],
+            ),
+            first_host_us - 1_000,
+            raw_clock_snapshot_with_positions_for_tests(
+                20_000,
+                first_host_us - 1_000,
+                [0.0, 0.0, 0.0, -1.1, 0.0, 0.0],
+            ),
+        );
         let io = FakeRuntimeIo::new().with_reads([
             FakeRead::pair(
                 raw_clock_snapshot_with_positions_for_tests(
                     11_000,
                     first_host_us,
-                    [0.0, 0.0, 0.0, -1.2, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, -0.7, 0.0, 0.0],
                 ),
                 raw_clock_snapshot_with_positions_for_tests(
-                    21_000,
-                    first_host_us + 500,
+                    20_500,
+                    first_host_us,
                     [0.0, 0.0, 0.0, -1.1, 0.0, 0.0],
                 ),
             ),
@@ -3807,8 +4162,8 @@ mod tests {
                     [0.0, 0.0, 0.0, -0.7, 0.0, 0.0],
                 ),
                 raw_clock_snapshot_with_positions_for_tests(
-                    22_000,
-                    first_host_us + 1_500,
+                    21_500,
+                    first_host_us + 1_000,
                     [0.0, 0.0, 0.0, -1.1, 0.0, 0.0],
                 ),
             ),
@@ -3818,7 +4173,10 @@ mod tests {
             io,
             timing,
             2,
-            RawClockRuntimeThresholds::for_tests(),
+            RawClockRuntimeThresholds {
+                alignment_lag_us: 1_000,
+                ..RawClockRuntimeThresholds::for_tests()
+            },
             MirrorJ4CommandController,
         );
 
@@ -3884,18 +4242,18 @@ mod tests {
     fn runtime_gate_failure_prevents_another_normal_command() {
         let io = FakeRuntimeIo::new().with_reads([
             FakeRead::pair(
-                raw_clock_snapshot_for_tests(10_000, 110_000),
-                raw_clock_snapshot_for_tests(20_000, 110_800),
+                raw_clock_snapshot_for_tests(11_000, 111_000),
+                raw_clock_snapshot_for_tests(22_200, 113_000),
             ),
             FakeRead::pair(
-                raw_clock_snapshot_for_tests(11_000, 111_000),
-                raw_clock_snapshot_for_tests(21_000, 113_000),
+                raw_clock_snapshot_for_tests(18_000, 118_000),
+                raw_clock_snapshot_for_tests(27_200, 118_000),
             ),
         ]);
 
         let (state, report) = run_fake_runtime(
             io,
-            ready_timing_for_tests(),
+            ready_timing_with_alignment_sample_for_tests(104_200, 105_000),
             2,
             RawClockRuntimeThresholds {
                 inter_arm_skew_max_us: 1_000,
@@ -3978,7 +4336,7 @@ mod tests {
 
         let (state, report) = run_fake_runtime(
             io,
-            ready_timing_for_tests(),
+            ready_timing_with_alignment_sample_for_tests(104_200, 105_000),
             1,
             RawClockRuntimeThresholds::for_tests(),
         );
@@ -4009,7 +4367,7 @@ mod tests {
 
         let (state, report) = run_fake_runtime(
             io,
-            ready_timing_for_tests(),
+            ready_timing_with_alignment_sample_for_tests(104_200, 105_000),
             1,
             RawClockRuntimeThresholds::for_tests(),
         );
@@ -4087,6 +4445,71 @@ mod tests {
     }
 
     #[test]
+    fn alignment_buffer_misses_skip_commands_until_threshold() {
+        let io = FakeRuntimeIo::new().with_reads([
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(31_000, 131_000),
+                raw_clock_snapshot_for_tests(41_000, 131_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(32_000, 132_000),
+                raw_clock_snapshot_for_tests(42_000, 132_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(33_000, 133_000),
+                raw_clock_snapshot_for_tests(43_000, 133_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(34_000, 134_000),
+                raw_clock_snapshot_for_tests(44_000, 134_800),
+            ),
+        ]);
+        let core = RawClockRuntimeCore {
+            io,
+            timing: ready_timing_for_tests(),
+            config: ExperimentalRawClockConfig {
+                frequency_hz: 100.0,
+                max_iterations: Some(1),
+                thresholds: RawClockRuntimeThresholds {
+                    alignment_lag_us: 50_000,
+                    alignment_buffer_miss_consecutive_failures: 3,
+                    last_sample_age_us: 100_000,
+                    ..RawClockRuntimeThresholds::default()
+                },
+                estimator_thresholds: RawClockThresholds {
+                    last_sample_age_us: 100_000,
+                    ..thresholds_for_tests()
+                },
+                ..ExperimentalRawClockConfig::default()
+            },
+        };
+        let seen_skew = Arc::new(Mutex::new(Vec::new()));
+        let controller = RecordingSkewController {
+            seen_skew: seen_skew.clone(),
+        };
+
+        let exit =
+            run_raw_clock_runtime_core(core, controller, ExperimentalRawClockRunConfig::default())
+                .expect("runtime should return a faulted exit");
+
+        let report = match exit {
+            RawClockCoreExit::Faulted { report, .. } => report,
+            RawClockCoreExit::Standby { report, .. } => panic!("expected fault, got {report:?}"),
+        };
+        assert_eq!(report.iterations, 0);
+        assert_eq!(report.alignment_buffer_misses, 3);
+        assert_eq!(report.alignment_buffer_miss_consecutive_max, 3);
+        assert_eq!(report.alignment_buffer_miss_consecutive_failures, 3);
+        assert!(
+            report
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains("alignment buffer miss"))
+        );
+        assert!(seen_skew.lock().expect("seen skew lock").is_empty());
+    }
+
+    #[test]
     fn per_tick_skew_is_mapped_from_raw_feedback_not_host_receive_or_command_time() {
         let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
         timing.seed_ready_for_tests(
@@ -4127,7 +4550,7 @@ mod tests {
         )]);
         let core = RawClockRuntimeCore {
             io,
-            timing: ready_timing_for_tests(),
+            timing: ready_timing_with_alignment_sample_for_tests(104_400, 105_000),
             config: ExperimentalRawClockConfig {
                 mode: ExperimentalRawClockMode::MasterFollower,
                 frequency_hz: 10_000.0,
@@ -4147,7 +4570,7 @@ mod tests {
 
         assert_eq!(
             *seen_skew.lock().expect("seen skew lock"),
-            vec![Duration::from_micros(800)]
+            vec![Duration::from_micros(600)]
         );
     }
 
