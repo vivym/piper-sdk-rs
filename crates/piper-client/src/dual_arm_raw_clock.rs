@@ -2159,7 +2159,7 @@ fn submit_soft_realtime_command_detailed(
         &command.master_velocity,
         &command.master_kp,
         &command.master_kd,
-        &JointArray::splat(NewtonMeter::ZERO),
+        &command.master_interaction_torque,
         timeout,
     ) {
         return Err(RawClockRuntimeError::SubmissionFault {
@@ -4384,7 +4384,7 @@ mod tests {
     }
 
     #[test]
-    fn slave_command_submits_before_master_command() {
+    fn slave_command_submits_before_master_command_and_preserves_master_torque() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let active = build_active_runtime_for_tests(events.clone());
         let mut command = test_command();
@@ -4399,11 +4399,11 @@ mod tests {
         assert_eq!(&labels[0..6], &["slave"; 6]);
         assert_eq!(&labels[6..12], &["master"; 6]);
 
-        let expected_master_zero = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.0)
-            .expect("zero master command should be valid")
+        let expected_master_torque = MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 3.0)
+            .expect("master torque command should be valid")
             .to_frame();
-        assert_eq!(events[6].1.id(), expected_master_zero.id());
-        assert_eq!(events[6].1.data(), expected_master_zero.data());
+        assert_eq!(events[6].1.id(), expected_master_torque.id());
+        assert_eq!(events[6].1.data(), expected_master_torque.data());
     }
 
     #[test]
