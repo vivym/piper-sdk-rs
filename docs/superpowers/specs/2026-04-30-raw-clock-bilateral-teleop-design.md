@@ -55,7 +55,8 @@ architecture can be extended without rewriting the runtime loop.
 
 Permit `ExperimentalRawClockMode::Bilateral` in `ExperimentalRawClockConfig`.
 
-Expose a public raw-clock active run method that accepts any `BilateralController`, for example:
+Make the existing private `ExperimentalRawClockDualArmActive::run_with_controller` method public so
+callers can run any `BilateralController` without duplicating runtime-core plumbing:
 
 ```rust
 pub fn run_with_controller<C>(
@@ -81,6 +82,16 @@ The real backend should:
 3. Build `ExperimentalRawClockRunConfig` from the raw-clock settings.
 4. Build `RuntimeTeleopController::new(settings_handle.clone())`.
 5. Call the new client-layer controller-based raw-clock run method.
+
+Remove the real backend guard that rejects modes other than `MasterFollower`. The backend may still
+snapshot settings for config construction and reporting, but command generation must be delegated to
+`RuntimeTeleopController`.
+
+Change `experimental_raw_clock_config_from_settings` to accept the resolved `TeleopMode` or the
+resolved runtime settings, map it to `ExperimentalRawClockMode`, and pass that mode into
+`ExperimentalRawClockConfig`. Tests must assert that bilateral produces
+`ExperimentalRawClockMode::Bilateral`; otherwise an implementation could remove the CLI guard while
+still running the raw-clock runtime with a hard-coded master-follower config.
 
 This keeps mode selection in one place: `RuntimeTeleopController` reads `settings.mode` and emits
 master-follower or bilateral commands.
@@ -120,12 +131,18 @@ Shutdown behavior remains the existing raw-clock fault path:
 - read, timing, clock health, controller, and submission faults all attempt bounded fault shutdown
 - clean max-iteration and cancellation exits disable both arms
 
-Reports continue to use the existing raw-clock report conversion. The JSON `control.mode` and human
-report should reflect `bilateral` when that mode was selected.
+Reports continue to use the existing raw-clock report conversion. The JSON top-level
+`mode.initial` and `mode.final`, and the human `mode: ... -> ...` line, should reflect `bilateral`
+when selected. Do not add `control.mode` unless intentionally changing the report schema.
 
 ### Script UX
 
 `scripts/run_teleop_smoke.sh` should keep `TELEOP_MODE=master-follower` by default.
+
+The script must define `REFLECTION_GAIN`, pass `--reflection-gain "${REFLECTION_GAIN}"`, and record
+`reflection_gain=${REFLECTION_GAIN}` in `environment.txt`. For bilateral smoke runs, operators must
+set `REFLECTION_GAIN=0.05`; otherwise the CLI default would remain `0.25`, which is too aggressive
+for the first raw-clock bilateral validation.
 
 When `TELEOP_MODE=master-follower`, print the current master-arm guidance.
 
@@ -144,10 +161,15 @@ Automated tests:
 
 - CLI config resolves `experimental_calibrated_raw + bilateral`.
 - Client raw-clock config accepts `ExperimentalRawClockMode::Bilateral`.
+- Existing tests that currently assert bilateral rejection are inverted into accepting tests.
+- Raw-clock config conversion maps `TeleopMode::Bilateral` to `ExperimentalRawClockMode::Bilateral`.
 - Raw-clock workflow enters the experimental backend for bilateral instead of failing in config.
 - Fake backend records that the raw-clock run was invoked with `TeleopMode::Bilateral`.
 - Existing master-follower raw-clock tests continue to pass.
 - Script dry-run output uses bilateral-specific safety text when `TELEOP_MODE=bilateral`.
+- Script dry-run output contains `--reflection-gain 0.05` when `REFLECTION_GAIN=0.05`.
+- Report tests assert `mode.initial == "bilateral"`, `mode.final == "bilateral"`, and
+  `control.reflection_gain == 0.05`.
 
 Verification commands:
 
@@ -173,10 +195,10 @@ TELEOP_MODE=bilateral MASTER_IFACE=can1 SLAVE_IFACE=can0 REFLECTION_GAIN=0.05 MA
 
 Pass criteria:
 
-- `exit_reason=max_iterations`
-- `read_faults=0`
-- `submission_faults=0`
-- `clock_health_failures=0`
+- `exit.reason == "max_iterations"`
+- `metrics.read_faults == 0`
+- `metrics.submission_faults == 0`
+- `timing.clock_health_failures == 0`
 - no oscillation or uncomfortable pull at the master arm
 - joint motion report shows expected follower response
 
