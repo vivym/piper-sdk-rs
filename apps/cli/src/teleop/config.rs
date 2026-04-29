@@ -22,6 +22,8 @@ pub const DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 20;
 pub const DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 2000;
 pub const DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+pub const DEFAULT_RAW_CLOCK_ALIGNMENT_LAG_US: u64 = 5_000;
+pub const DEFAULT_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES: u32 = 3;
 // Lab-experiment guardrails: generous enough for setup/debugging, low enough
 // that raw-clock health gates cannot be configured into practical no-ops.
 pub const MAX_RAW_CLOCK_WARMUP_SECS: u64 = 3600;
@@ -32,6 +34,8 @@ pub const MAX_RAW_CLOCK_SAMPLE_GAP_MAX_MS: u64 = 1000;
 pub const MAX_RAW_CLOCK_LAST_SAMPLE_AGE_MS: u64 = 1000;
 pub const MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US: u64 = 100_000;
 pub const MAX_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES: u32 = 100;
+pub const MAX_RAW_CLOCK_ALIGNMENT_LAG_US: u64 = 100_000;
+pub const MAX_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES: u32 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -145,6 +149,8 @@ pub struct TeleopRawClockConfig {
     pub last_sample_age_ms: Option<u64>,
     pub inter_arm_skew_max_us: Option<u64>,
     pub residual_max_consecutive_failures: Option<u32>,
+    pub alignment_lag_us: Option<u64>,
+    pub alignment_buffer_miss_consecutive_failures: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +187,8 @@ pub struct TeleopRawClockSettings {
     pub last_sample_age_ms: u64,
     pub inter_arm_skew_max_us: u64,
     pub residual_max_consecutive_failures: u32,
+    pub alignment_lag_us: u64,
+    pub alignment_buffer_miss_consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +294,25 @@ impl TeleopRawClockSettings {
             1,
             MAX_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES,
         )?;
+        validate_u64_range(
+            "alignment_lag_us",
+            self.alignment_lag_us,
+            1,
+            MAX_RAW_CLOCK_ALIGNMENT_LAG_US,
+        )?;
+        validate_u32_range(
+            "alignment_buffer_miss_consecutive_failures",
+            self.alignment_buffer_miss_consecutive_failures,
+            1,
+            MAX_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES,
+        )?;
+        if self.alignment_lag_us >= self.last_sample_age_ms.saturating_mul(1_000) {
+            bail!(
+                "alignment_lag_us must be less than last_sample_age_ms; got alignment_lag_us={} and last_sample_age_ms={}",
+                self.alignment_lag_us,
+                self.last_sample_age_ms
+            );
+        }
         Ok(())
     }
 }
@@ -365,6 +392,17 @@ impl ResolvedTeleopConfig {
                     file_raw_clock.and_then(|raw_clock| raw_clock.residual_max_consecutive_failures)
                 })
                 .unwrap_or(DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES),
+            alignment_lag_us: args
+                .raw_clock_alignment_lag_us
+                .or_else(|| file_raw_clock.and_then(|raw_clock| raw_clock.alignment_lag_us))
+                .unwrap_or(DEFAULT_RAW_CLOCK_ALIGNMENT_LAG_US),
+            alignment_buffer_miss_consecutive_failures: args
+                .raw_clock_alignment_buffer_miss_consecutive_failures
+                .or_else(|| {
+                    file_raw_clock
+                        .and_then(|raw_clock| raw_clock.alignment_buffer_miss_consecutive_failures)
+                })
+                .unwrap_or(DEFAULT_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES),
         };
         raw_clock.validate()?;
 
@@ -662,6 +700,73 @@ mod tests {
         let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
 
         assert_eq!(resolved.raw_clock.residual_max_consecutive_failures, 3);
+    }
+
+    #[test]
+    fn raw_clock_alignment_cli_lag_overrides_file_value() {
+        let file = TeleopConfigFile {
+            raw_clock: Some(TeleopRawClockConfig {
+                alignment_lag_us: Some(8_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let args = TeleopDualArmArgs {
+            raw_clock_alignment_lag_us: Some(5_000),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
+
+        assert_eq!(resolved.raw_clock.alignment_lag_us, 5_000);
+    }
+
+    #[test]
+    fn raw_clock_alignment_file_settings_are_used_when_cli_missing() {
+        let file = TeleopConfigFile {
+            raw_clock: Some(TeleopRawClockConfig {
+                alignment_lag_us: Some(7_000),
+                alignment_buffer_miss_consecutive_failures: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved =
+            ResolvedTeleopConfig::resolve(TeleopDualArmArgs::default_for_tests(), Some(file))
+                .unwrap();
+
+        assert_eq!(resolved.raw_clock.alignment_lag_us, 7_000);
+        assert_eq!(
+            resolved.raw_clock.alignment_buffer_miss_consecutive_failures,
+            5
+        );
+    }
+
+    #[test]
+    fn raw_clock_alignment_validation_rejects_lag_at_last_sample_age() {
+        let args = TeleopDualArmArgs {
+            raw_clock_alignment_lag_us: Some(20_000),
+            raw_clock_last_sample_age_ms: Some(20),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+
+        assert!(err.to_string().contains("alignment_lag_us"));
+        assert!(err.to_string().contains("last_sample_age_ms"));
+    }
+
+    #[test]
+    fn raw_clock_alignment_validation_rejects_zero_buffer_miss_failures() {
+        let args = TeleopDualArmArgs {
+            raw_clock_alignment_buffer_miss_consecutive_failures: Some(0),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let err = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+
+        assert!(err.to_string().contains("alignment_buffer_miss_consecutive_failures"));
     }
 
     #[test]

@@ -90,6 +90,10 @@ pub struct TeleopDualArmArgs {
     pub raw_clock_inter_arm_skew_max_us: Option<u64>,
     #[arg(long)]
     pub raw_clock_residual_max_consecutive_failures: Option<u32>,
+    #[arg(long)]
+    pub raw_clock_alignment_lag_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_alignment_buffer_miss_consecutive_failures: Option<u32>,
 }
 
 impl TeleopCommand {
@@ -139,6 +143,8 @@ impl TeleopDualArmArgs {
             raw_clock_last_sample_age_ms: None,
             raw_clock_inter_arm_skew_max_us: None,
             raw_clock_residual_max_consecutive_failures: None,
+            raw_clock_alignment_lag_us: None,
+            raw_clock_alignment_buffer_miss_consecutive_failures: None,
         }
     }
 }
@@ -212,6 +218,10 @@ mod tests {
             "2000",
             "--raw-clock-residual-max-consecutive-failures",
             "5",
+            "--raw-clock-alignment-lag-us",
+            "5000",
+            "--raw-clock-alignment-buffer-miss-consecutive-failures",
+            "3",
         ])
         .expect("experimental raw clock command should parse");
 
@@ -221,6 +231,11 @@ mod tests {
                 assert_eq!(args.raw_clock_warmup_secs, Some(10));
                 assert_eq!(args.raw_clock_inter_arm_skew_max_us, Some(2000));
                 assert_eq!(args.raw_clock_residual_max_consecutive_failures, Some(5));
+                assert_eq!(args.raw_clock_alignment_lag_us, Some(5_000));
+                assert_eq!(
+                    args.raw_clock_alignment_buffer_miss_consecutive_failures,
+                    Some(3)
+                );
             },
         }
     }
