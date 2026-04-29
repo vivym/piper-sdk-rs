@@ -726,6 +726,10 @@ fn report_timing_from_raw_clock(
         clock_health_failures: report
             .clock_health_failures
             .saturating_add(warmup.clock_health_failures),
+        master_residual_max_spikes: report.master_residual_max_spikes,
+        slave_residual_max_spikes: report.slave_residual_max_spikes,
+        master_residual_max_consecutive_failures: report.master_residual_max_consecutive_failures,
+        slave_residual_max_consecutive_failures: report.slave_residual_max_consecutive_failures,
     }
 }
 

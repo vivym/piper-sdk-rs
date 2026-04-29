@@ -81,6 +81,10 @@ pub struct ReportTiming {
     pub max_estimated_inter_arm_skew_us: Option<u64>,
     pub estimated_inter_arm_skew_p95_us: Option<u64>,
     pub clock_health_failures: u64,
+    pub master_residual_max_spikes: u64,
+    pub slave_residual_max_spikes: u64,
+    pub master_residual_max_consecutive_failures: u32,
+    pub slave_residual_max_consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -284,6 +288,20 @@ pub fn write_human_report<W: Write>(
             "raw_clock max_skew_us={} p95_skew_us={}",
             max_skew_us, p95_skew_us
         )?;
+        if timing.master_residual_max_spikes > 0
+            || timing.slave_residual_max_spikes > 0
+            || timing.master_residual_max_consecutive_failures > 0
+            || timing.slave_residual_max_consecutive_failures > 0
+        {
+            writeln!(
+                writer,
+                "raw_clock residual_max_spikes master={} slave={} consecutive master={} slave={}",
+                timing.master_residual_max_spikes,
+                timing.slave_residual_max_spikes,
+                timing.master_residual_max_consecutive_failures,
+                timing.slave_residual_max_consecutive_failures
+            )?;
+        }
     }
     writeln!(
         writer,
@@ -608,12 +626,22 @@ mod tests {
             max_estimated_inter_arm_skew_us: Some(900),
             estimated_inter_arm_skew_p95_us: Some(400),
             clock_health_failures: 0,
+            master_residual_max_spikes: 2,
+            slave_residual_max_spikes: 1,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 1,
         });
 
         let value = serde_json::to_value(TeleopJsonReport::from_run(input)).unwrap();
         assert_eq!(value["timing"]["timing_source"], "calibrated_hw_raw");
         assert_eq!(value["timing"]["experimental"], true);
         assert_eq!(value["timing"]["strict_realtime"], false);
+        assert_eq!(value["timing"]["master_residual_max_spikes"], 2);
+        assert_eq!(value["timing"]["slave_residual_max_spikes"], 1);
+        assert_eq!(
+            value["timing"]["slave_residual_max_consecutive_failures"],
+            1
+        );
     }
 
     #[test]
@@ -670,6 +698,10 @@ mod tests {
             max_estimated_inter_arm_skew_us: Some(900),
             estimated_inter_arm_skew_p95_us: Some(400),
             clock_health_failures: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
         });
 
         write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
@@ -696,6 +728,10 @@ mod tests {
             max_estimated_inter_arm_skew_us: None,
             estimated_inter_arm_skew_p95_us: None,
             clock_health_failures: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
         });
 
         write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
@@ -704,6 +740,34 @@ mod tests {
         assert!(!output.contains("max_skew_us=0"));
         assert!(!output.contains("p95_skew_us=0"));
         assert!(output.contains("raw_clock max_skew_us=unknown p95_skew_us=unknown"));
+    }
+
+    #[test]
+    fn human_report_prints_nonzero_residual_max_spikes() {
+        let mut output = Vec::new();
+        let mut report = sample_json_report();
+        report.timing = Some(ReportTiming {
+            timing_source: "calibrated_hw_raw".to_string(),
+            experimental: true,
+            strict_realtime: false,
+            master_clock_drift_ppm: None,
+            slave_clock_drift_ppm: None,
+            master_residual_p95_us: Some(100),
+            slave_residual_p95_us: Some(120),
+            max_estimated_inter_arm_skew_us: Some(900),
+            estimated_inter_arm_skew_p95_us: Some(400),
+            clock_health_failures: 0,
+            master_residual_max_spikes: 2,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 1,
+            slave_residual_max_consecutive_failures: 0,
+        });
+
+        write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("raw_clock residual_max_spikes master=2 slave=0"));
+        assert!(output.contains("consecutive master=1 slave=0"));
     }
 
     #[test]
