@@ -76,23 +76,11 @@ impl ExperimentalRawClockConfig {
         mut self,
         mode: ExperimentalRawClockMode,
     ) -> Result<Self, RawClockRuntimeError> {
-        if matches!(mode, ExperimentalRawClockMode::Bilateral) {
-            return Err(RawClockRuntimeError::Config(
-                "experimental raw-clock runtime currently supports master-follower mode only"
-                    .to_string(),
-            ));
-        }
         self.mode = mode;
         Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), RawClockRuntimeError> {
-        if matches!(self.mode, ExperimentalRawClockMode::Bilateral) {
-            return Err(RawClockRuntimeError::Config(
-                "experimental raw-clock runtime currently supports master-follower mode only"
-                    .to_string(),
-            ));
-        }
         if !self.frequency_hz.is_finite() || self.frequency_hz <= 0.0 {
             return Err(RawClockRuntimeError::Config(
                 "frequency_hz must be finite and > 0".to_string(),
@@ -1663,7 +1651,7 @@ impl ExperimentalRawClockDualArmActive {
         )
     }
 
-    fn run_with_controller<C>(
+    pub fn run_with_controller<C>(
         self,
         controller: C,
         cfg: ExperimentalRawClockRunConfig,
@@ -3620,12 +3608,13 @@ mod tests {
     }
 
     #[test]
-    fn experimental_config_rejects_bilateral_mode() {
-        let err = ExperimentalRawClockConfig::default()
+    fn experimental_config_accepts_bilateral_mode() {
+        let config = ExperimentalRawClockConfig::default()
             .with_mode(ExperimentalRawClockMode::Bilateral)
-            .unwrap_err();
+            .expect("bilateral should be accepted for experimental raw-clock runtime");
 
-        assert!(err.to_string().contains("master-follower"));
+        assert_eq!(config.mode, ExperimentalRawClockMode::Bilateral);
+        config.validate().expect("bilateral raw-clock config should validate");
     }
 
     #[test]
