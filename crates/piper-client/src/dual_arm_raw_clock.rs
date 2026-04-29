@@ -599,6 +599,7 @@ pub struct ExperimentalRawClockSnapshot {
 #[allow(dead_code)]
 struct RawClockAlignedSnapshot {
     feedback_time_us: u64,
+    host_rx_mono_us: u64,
     snapshot: ExperimentalRawClockSnapshot,
 }
 
@@ -607,6 +608,7 @@ impl RawClockAlignedSnapshot {
     fn new(feedback_time_us: u64, snapshot: ExperimentalRawClockSnapshot) -> Self {
         Self {
             feedback_time_us,
+            host_rx_mono_us: snapshot.newest_raw_feedback_timing.host_rx_mono_us,
             snapshot,
         }
     }
@@ -812,7 +814,9 @@ impl RawClockRuntimeTiming {
         let tick = self.selected_tick_from_buffered_times(
             &latest,
             latest.master_feedback_time_us,
+            master.newest_raw_feedback_timing.host_rx_mono_us,
             latest.slave_feedback_time_us,
+            slave.newest_raw_feedback_timing.host_rx_mono_us,
             now_host_us,
         )?;
         self.record_skew_sample(tick.inter_arm_skew_us);
@@ -872,11 +876,13 @@ impl RawClockRuntimeTiming {
         &self,
         latest: &RawClockLatestTiming,
         selected_master_time_us: u64,
+        selected_master_host_rx_mono_us: u64,
         selected_slave_time_us: u64,
+        selected_slave_host_rx_mono_us: u64,
         now_host_us: u64,
     ) -> Result<RawClockTickTiming, RawClockRuntimeError> {
-        let master_age = now_host_us.saturating_sub(selected_master_time_us);
-        let slave_age = now_host_us.saturating_sub(selected_slave_time_us);
+        let master_age = now_host_us.saturating_sub(selected_master_host_rx_mono_us);
+        let slave_age = now_host_us.saturating_sub(selected_slave_host_rx_mono_us);
         Ok(RawClockTickTiming {
             master_feedback_time_us: selected_master_time_us,
             slave_feedback_time_us: selected_slave_time_us,
@@ -1088,10 +1094,31 @@ impl RawClockRuntimeTiming {
             });
         }
 
+        self.check_health_pair_with_debounce(&tick.master_health, &tick.slave_health, thresholds)
+    }
+
+    fn check_latest_health_with_debounce(
+        &mut self,
+        latest: &RawClockLatestTiming,
+        thresholds: RawClockRuntimeThresholds,
+    ) -> Result<(), RawClockRuntimeError> {
+        self.check_health_pair_with_debounce(
+            &latest.master_health,
+            &latest.slave_health,
+            thresholds,
+        )
+    }
+
+    fn check_health_pair_with_debounce(
+        &mut self,
+        master_health: &RawClockHealth,
+        slave_health: &RawClockHealth,
+        thresholds: RawClockRuntimeThresholds,
+    ) -> Result<(), RawClockRuntimeError> {
         let master_error =
-            self.apply_health_with_debounce(RawClockSide::Master, &tick.master_health, thresholds);
+            self.apply_health_with_debounce(RawClockSide::Master, master_health, thresholds);
         let slave_error =
-            self.apply_health_with_debounce(RawClockSide::Slave, &tick.slave_health, thresholds);
+            self.apply_health_with_debounce(RawClockSide::Slave, slave_health, thresholds);
 
         match (master_error, slave_error) {
             (Some(master_error), Some(slave_error))
@@ -1842,6 +1869,26 @@ where
             Err(miss) => {
                 let threshold = config.thresholds.alignment_buffer_miss_consecutive_failures;
                 timing.record_alignment_buffer_miss(miss.clone());
+                if let Err(err) =
+                    timing.check_latest_health_with_debounce(&latest, config.thresholds)
+                {
+                    timing.record_clock_health_failure();
+                    let report = fault_report_from_timing(
+                        &timing,
+                        iterations,
+                        &joint_motion,
+                        RawClockRuntimeExitReason::ClockHealthFault,
+                        err.to_string(),
+                        |_| {},
+                    );
+                    let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                    return Ok(RawClockCoreExit::Faulted {
+                        arms: fault.arms,
+                        report: report
+                            .with_shutdown(fault.shutdown)
+                            .with_telemetry(fault.telemetry),
+                    });
+                }
                 if timing.alignment_buffer_miss_consecutive < threshold {
                     continue;
                 }
@@ -1865,7 +1912,9 @@ where
         let tick = match timing.selected_tick_from_buffered_times(
             &latest,
             selection.master.feedback_time_us,
+            selection.master.host_rx_mono_us,
             selection.slave.feedback_time_us,
+            selection.slave.host_rx_mono_us,
             now_host_us,
         ) {
             Ok(tick) => tick,
@@ -4004,7 +4053,7 @@ mod tests {
             )
             .unwrap();
         let selected = timing
-            .selected_tick_from_buffered_times(&latest, 109_000, 109_800, 112_000)
+            .selected_tick_from_buffered_times(&latest, 109_000, 109_000, 109_800, 109_800, 112_000)
             .unwrap();
 
         assert_eq!(selected.inter_arm_skew_us, 800);
@@ -4023,7 +4072,7 @@ mod tests {
             )
             .unwrap();
         let selected = timing
-            .selected_tick_from_buffered_times(&latest, 100_000, 111_800, 112_000)
+            .selected_tick_from_buffered_times(&latest, 100_000, 100_000, 111_800, 111_800, 112_000)
             .unwrap();
 
         let err = timing
@@ -4048,6 +4097,51 @@ mod tests {
             },
             other => panic!("expected master ClockUnhealthy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn selected_sample_age_uses_selected_host_receive_time_not_mapped_time() {
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        let latest = RawClockLatestTiming {
+            master_feedback_time_us: 1_010_000,
+            slave_feedback_time_us: 1_010_800,
+            latest_inter_arm_skew_us: 800,
+            master_health: healthy_for_tests(),
+            slave_health: healthy_for_tests(),
+        };
+        let selected_master =
+            RawClockAlignedSnapshot::new(1_000_000, raw_clock_snapshot_for_tests(10_000, 100_000));
+        let selected_slave =
+            RawClockAlignedSnapshot::new(1_000_800, raw_clock_snapshot_for_tests(20_000, 100_500));
+        timing.master_alignment_buffer.push(selected_master.clone());
+        timing.slave_alignment_buffer.push(selected_slave.clone());
+
+        let selected = timing
+            .selected_tick_from_buffered_times(
+                &latest,
+                selected_master.feedback_time_us,
+                selected_master.host_rx_mono_us,
+                selected_slave.feedback_time_us,
+                selected_slave.host_rx_mono_us,
+                200_000,
+            )
+            .unwrap();
+
+        assert_eq!(selected.master_selected_sample_age_us, 100_000);
+        assert_eq!(selected.slave_selected_sample_age_us, 99_500);
+        let err = timing
+            .check_tick_with_debounce(
+                selected,
+                RawClockRuntimeThresholds {
+                    last_sample_age_us: 50_000,
+                    ..RawClockRuntimeThresholds::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RawClockRuntimeError::ClockUnhealthy { side: "master", .. }
+        ));
     }
 
     #[test]
@@ -4493,20 +4587,20 @@ mod tests {
     fn alignment_buffer_misses_skip_commands_until_threshold() {
         let io = FakeRuntimeIo::new().with_reads([
             FakeRead::pair(
-                raw_clock_snapshot_for_tests(31_000, 131_000),
-                raw_clock_snapshot_for_tests(41_000, 131_800),
+                raw_clock_snapshot_for_tests(11_000, 111_000),
+                raw_clock_snapshot_for_tests(21_000, 111_800),
             ),
             FakeRead::pair(
-                raw_clock_snapshot_for_tests(32_000, 132_000),
-                raw_clock_snapshot_for_tests(42_000, 132_800),
+                raw_clock_snapshot_for_tests(12_000, 112_000),
+                raw_clock_snapshot_for_tests(22_000, 112_800),
             ),
             FakeRead::pair(
-                raw_clock_snapshot_for_tests(33_000, 133_000),
-                raw_clock_snapshot_for_tests(43_000, 133_800),
+                raw_clock_snapshot_for_tests(13_000, 113_000),
+                raw_clock_snapshot_for_tests(23_000, 113_800),
             ),
             FakeRead::pair(
-                raw_clock_snapshot_for_tests(34_000, 134_000),
-                raw_clock_snapshot_for_tests(44_000, 134_800),
+                raw_clock_snapshot_for_tests(14_000, 114_000),
+                raw_clock_snapshot_for_tests(24_000, 114_800),
             ),
         ]);
         let core = RawClockRuntimeCore {
@@ -4518,13 +4612,10 @@ mod tests {
                 thresholds: RawClockRuntimeThresholds {
                     alignment_lag_us: 50_000,
                     alignment_buffer_miss_consecutive_failures: 3,
-                    last_sample_age_us: 100_000,
+                    last_sample_age_us: u64::MAX,
                     ..RawClockRuntimeThresholds::default()
                 },
-                estimator_thresholds: RawClockThresholds {
-                    last_sample_age_us: 100_000,
-                    ..thresholds_for_tests()
-                },
+                estimator_thresholds: thresholds_for_tests(),
                 ..ExperimentalRawClockConfig::default()
             },
         };
@@ -4554,6 +4645,64 @@ mod tests {
                 .is_some_and(|message| message.contains("alignment buffer miss"))
         );
         assert!(seen_skew.lock().expect("seen skew lock").is_empty());
+    }
+
+    #[test]
+    fn tolerated_alignment_buffer_miss_checks_latest_health_before_skip() {
+        let io = FakeRuntimeIo::new().with_reads([
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(31_000, 131_000),
+                raw_clock_snapshot_for_tests(41_000, 131_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(32_000, 132_000),
+                raw_clock_snapshot_for_tests(42_000, 132_800),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(33_000, 133_000),
+                raw_clock_snapshot_for_tests(43_000, 133_800),
+            ),
+        ]);
+        let state = io.state.clone();
+        let core = RawClockRuntimeCore {
+            io,
+            timing: ready_timing_for_tests(),
+            config: ExperimentalRawClockConfig {
+                frequency_hz: 100.0,
+                max_iterations: Some(1),
+                thresholds: RawClockRuntimeThresholds {
+                    alignment_lag_us: 50_000,
+                    alignment_buffer_miss_consecutive_failures: 3,
+                    last_sample_age_us: 100_000,
+                    ..RawClockRuntimeThresholds::default()
+                },
+                estimator_thresholds: thresholds_for_tests(),
+                ..ExperimentalRawClockConfig::default()
+            },
+        };
+
+        let exit = run_raw_clock_runtime_core(
+            core,
+            TestCommandController,
+            ExperimentalRawClockRunConfig::default(),
+        )
+        .expect("runtime should return a clock-health fault");
+
+        let report = match exit {
+            RawClockCoreExit::Faulted { report, .. } => report,
+            RawClockCoreExit::Standby { report, .. } => panic!("expected fault, got {report:?}"),
+        };
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::ClockHealthFault)
+        );
+        assert_eq!(report.clock_health_failures, 1);
+        assert_eq!(report.alignment_buffer_misses, 1);
+        assert_eq!(
+            *state.command_log.lock().expect("command log lock"),
+            Vec::<&'static str>::new()
+        );
+        assert_eq!(state.fault_shutdowns.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[test]
