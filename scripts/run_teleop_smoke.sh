@@ -23,7 +23,7 @@ JOINT_MAP="${JOINT_MAP:-identity}"
 FREQUENCY_HZ="${FREQUENCY_HZ:-100}"
 TRACK_KP="${TRACK_KP:-2.0}"
 TRACK_KD="${TRACK_KD:-0.4}"
-MASTER_DAMPING="${MASTER_DAMPING:-0.8}"
+MASTER_DAMPING="${MASTER_DAMPING:-0.05}"
 RAW_CLOCK_WARMUP_SECS="${RAW_CLOCK_WARMUP_SECS:-10}"
 # Observed SocketCAN raw-clock residual p95 can approach ~1.5ms during
 # longer smoke runs; keep p95 materially below isolated max-spike tolerance.
