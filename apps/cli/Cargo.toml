@@ -44,6 +44,7 @@ thiserror = { workspace = true }
 # ✅ 序列化
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0"
+sha2 = { workspace = true }
 
 # ✅ 日志
 tracing = "0.1"

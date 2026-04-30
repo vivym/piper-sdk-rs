@@ -1,8 +1,28 @@
 use crate::commands::gravity::GravityReplaySampleArgs;
-use crate::gravity::artifact::{LoadedPath, PathHeader, read_path};
-use anyhow::{Result, anyhow, bail};
+use crate::connection::{client_builder, wait_for_initial_monitor_snapshot};
+use crate::gravity::artifact::{
+    LoadedPath, PassDirection, PathHeader, QuasiStaticSampleRow, SamplesHeader, read_path,
+    write_jsonl_row,
+};
+use anyhow::{Context, Result, anyhow, bail};
+use piper_client::observer::Observer;
+use piper_client::state::{
+    Active, CapabilityMarker, DisableConfig, MitMode, MitModeConfig, MitPassthroughMode, Piper,
+    SoftRealtime, Standby, StrictCapability, StrictRealtime,
+};
+use piper_client::types::{JointArray, NewtonMeter, Rad};
+use piper_client::{ConnectedPiper, MotionConnectedState};
 use piper_control::TargetSpec;
-use std::time::Duration;
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
+use tokio::task::spawn_blocking;
 
 const MAX_SAFE_STEP_RAD: f64 = 0.2;
 const MIN_SAFE_STEP_RAD: f64 = 1e-6;
@@ -11,19 +31,74 @@ const MAX_SAFE_VELOCITY_RAD_S: f64 = 1.0;
 const DEFAULT_SIMPLIFICATION_TOLERANCE_RAD: f64 = 0.005;
 const MAX_SIMPLIFICATION_TOLERANCE_RAD: f64 = 0.01;
 const COMPLETE_JOINT_MASK: u8 = 0x3f;
+const SAMPLE_ROW_TYPE: &str = "quasi-static-sample";
+const SAMPLE_HEADER_ROW_TYPE: &str = "header";
+const SAMPLE_ARTIFACT_KIND: &str = "quasi-static-samples";
+const SAMPLE_SCHEMA_VERSION: u32 = 1;
+const REPLAY_SAMPLE_PERIOD_MS: u64 = 10;
+const REPLAY_SAMPLE_FREQUENCY_HZ: f64 = 100.0;
+const DEFAULT_STABLE_VELOCITY_RAD_S: f64 = 0.01;
+const DEFAULT_STABLE_TRACKING_ERROR_RAD: f64 = 0.03;
+const DEFAULT_STABLE_TORQUE_STD_NM: f64 = 0.08;
+const CONSERVATIVE_MIT_SPEED_PERCENT: u8 = 10;
+const CONSERVATIVE_KP: f64 = 8.0;
+const CONSERVATIVE_KD: f64 = 1.0;
+const ACTIVE_COMMAND_TIMEOUT: Duration = Duration::from_millis(200);
+const ACTIVE_MAX_FEEDBACK_AGE: Duration = Duration::from_millis(200);
+const ACTIVE_TRACKING_ERROR_LIMIT_RAD: f64 = 0.15;
+const ACTIVE_TORQUE_LIMIT_NM: f64 = 25.0;
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub async fn run(args: GravityReplaySampleArgs) -> Result<()> {
     validate_replay_args(&args)?;
+    let loaded = read_path(&args.path)?;
 
-    if !args.dry_run {
-        bail!(
-            "active hardware gravity replay is implemented in Task 10; rerun with --dry-run to inspect the replay plan"
-        );
+    if args.dry_run {
+        let report = build_dry_run_plan(&args, &loaded)?;
+        print_dry_run_report(&args, &loaded.header, &report);
+        return Ok(());
     }
 
-    let loaded = read_path(&args.path)?;
-    let report = build_dry_run_plan(&args, &loaded)?;
-    print_dry_run_report(&args, &loaded.header, &report);
+    let plan = build_replay_plan(&args, &loaded)?;
+    ensure_output_path_available(&args.out)?;
+    print_startup_summary(&args, &plan);
+    if !confirm_operator()? {
+        bail!("operator confirmation not received; aborted before connecting");
+    }
+
+    let target_spec = resolve_replay_target_spec(&args)?;
+    let running = Arc::new(AtomicBool::new(true));
+    let signal_running = Arc::clone(&running);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            println!();
+            println!("Ctrl-C received; disabling gravity replay...");
+            signal_running.store(false, Ordering::SeqCst);
+        }
+    });
+
+    let source_sha256 = sha256_file_hex(&args.path)?;
+    let task = spawn_blocking(move || {
+        replay_sample_sync(
+            args,
+            loaded.header,
+            plan,
+            target_spec,
+            source_sha256,
+            running,
+        )
+    });
+    let stats = task
+        .await
+        .map_err(|error| anyhow!("gravity replay-sample task failed: {error}"))??;
+
+    println!();
+    println!(
+        "Saved gravity samples: {} (accepted {}, rejected {})",
+        stats.output_path.display(),
+        stats.accepted_waypoint_count,
+        stats.rejected_waypoint_count
+    );
 
     Ok(())
 }
@@ -42,6 +117,55 @@ pub(crate) struct DryRunReport {
     pub joint_min_rad: [f64; 6],
     pub joint_max_rad: [f64; 6],
     pub estimated_duration: Duration,
+}
+
+impl DryRunReport {
+    fn from_plan(plan: &ReplayPlan) -> Self {
+        Self {
+            role: plan.role.clone(),
+            target: plan.target.clone(),
+            joint_map: plan.joint_map.clone(),
+            load_profile: plan.load_profile.clone(),
+            raw_sample_count: plan.raw_sample_count,
+            simplified_count: plan.simplified_count,
+            simplification_tolerance_rad: plan.simplification_tolerance_rad,
+            max_simplification_deviation_rad: plan.max_simplification_deviation_rad,
+            waypoint_count: plan.waypoints.len(),
+            joint_min_rad: plan.joint_min_rad,
+            joint_max_rad: plan.joint_max_rad,
+            estimated_duration: plan.estimated_duration,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayPlan {
+    pub role: String,
+    pub target: String,
+    pub joint_map: String,
+    pub load_profile: String,
+    pub raw_sample_count: usize,
+    pub simplified_count: usize,
+    pub simplification_tolerance_rad: f64,
+    pub max_simplification_deviation_rad: f64,
+    pub waypoints: Vec<ReplayWaypoint>,
+    pub joint_min_rad: [f64; 6],
+    pub joint_max_rad: [f64; 6],
+    pub estimated_duration: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplayWaypoint {
+    pub waypoint_id: u64,
+    pub q_rad: [f64; 6],
+    pub pass_direction: PassDirection,
+}
+
+#[derive(Debug, Clone)]
+struct ReplaySampleStats {
+    output_path: PathBuf,
+    accepted_waypoint_count: usize,
+    rejected_waypoint_count: usize,
 }
 
 #[allow(dead_code)]
@@ -171,6 +295,13 @@ pub(crate) fn build_dry_run_plan(
     args: &GravityReplaySampleArgs,
     loaded: &LoadedPath,
 ) -> Result<DryRunReport> {
+    Ok(DryRunReport::from_plan(&build_replay_plan(args, loaded)?))
+}
+
+pub(crate) fn build_replay_plan(
+    args: &GravityReplaySampleArgs,
+    loaded: &LoadedPath,
+) -> Result<ReplayPlan> {
     validate_replay_args(args)?;
     let target = resolve_replay_target(args)?;
     validate_path_header_matches_args(args, &target, &loaded.header)?;
@@ -186,11 +317,10 @@ pub(crate) fn build_dry_run_plan(
     let max_simplification_deviation_rad =
         max_simplification_deviation(&raw_samples, &simplified_indices)?;
     let simplified = simplified_indices.iter().map(|&index| raw_samples[index]).collect::<Vec<_>>();
-    let mut waypoints = waypoint_plan_from_simplified_path(&simplified, args.max_step_rad)?;
-    if args.bidirectional {
-        append_reverse_pass(&mut waypoints);
-    }
-    let (joint_min_rad, joint_max_rad) = joint_ranges(&waypoints)?;
+    let forward_waypoints = waypoint_plan_from_simplified_path(&simplified, args.max_step_rad)?;
+    let waypoints = replay_waypoints_from_forward_plan(forward_waypoints, args.bidirectional)?;
+    let waypoint_positions = waypoints.iter().map(|waypoint| waypoint.q_rad).collect::<Vec<_>>();
+    let (joint_min_rad, joint_max_rad) = joint_ranges(&waypoint_positions)?;
     let estimated_duration = estimate_duration(
         waypoints.len(),
         args.max_velocity_rad_s,
@@ -198,7 +328,7 @@ pub(crate) fn build_dry_run_plan(
         args.sample_ms,
     )?;
 
-    Ok(DryRunReport {
+    Ok(ReplayPlan {
         role: loaded.header.role.clone(),
         target,
         joint_map: loaded.header.joint_map.clone(),
@@ -207,7 +337,7 @@ pub(crate) fn build_dry_run_plan(
         simplified_count: simplified.len(),
         simplification_tolerance_rad,
         max_simplification_deviation_rad,
-        waypoint_count: waypoints.len(),
+        waypoints,
         joint_min_rad,
         joint_max_rad,
         estimated_duration,
@@ -249,23 +379,236 @@ fn validate_path_header_matches_args(
     Ok(())
 }
 
+fn replay_sample_sync(
+    args: GravityReplaySampleArgs,
+    path_header: PathHeader,
+    plan: ReplayPlan,
+    target_spec: TargetSpec,
+    source_sha256: String,
+    running: Arc<AtomicBool>,
+) -> Result<ReplaySampleStats> {
+    let target = target_spec.clone().into_connection_target();
+    let connected = client_builder(&target)
+        .build()
+        .context("failed to connect to robot for active gravity replay sampling")?;
+
+    let criteria = stable_sample_criteria_from_args(&args)?;
+    let settle_duration = Duration::from_millis(args.settle_ms);
+    let rows = match connected {
+        ConnectedPiper::Strict(MotionConnectedState::Standby(standby)) => {
+            run_strict_replay(standby, &plan, criteria, &args, settle_duration, running)?
+        },
+        ConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => {
+            run_soft_replay(standby, &plan, criteria, &args, settle_duration, running)?
+        },
+        ConnectedPiper::Monitor(_) => bail!("monitor-only connections cannot run active replay"),
+        ConnectedPiper::Strict(MotionConnectedState::Maintenance(_))
+        | ConnectedPiper::Soft(MotionConnectedState::Maintenance(_)) => {
+            bail!("robot is not in confirmed Standby; run stop before active replay sampling")
+        },
+    };
+
+    let accepted_waypoint_count = rows.len();
+    let rejected_waypoint_count = plan.waypoints.len().saturating_sub(accepted_waypoint_count);
+    let header = build_samples_header(
+        &args,
+        &path_header,
+        &plan,
+        source_sha256,
+        accepted_waypoint_count,
+        rejected_waypoint_count,
+        criteria,
+    );
+    write_samples_artifact(&args.out, &header, &rows)?;
+
+    Ok(ReplaySampleStats {
+        output_path: args.out,
+        accepted_waypoint_count,
+        rejected_waypoint_count,
+    })
+}
+
+fn run_strict_replay(
+    standby: Piper<Standby, StrictRealtime>,
+    plan: &ReplayPlan,
+    criteria: StableSampleCriteria,
+    args: &GravityReplaySampleArgs,
+    settle_duration: Duration,
+    running: Arc<AtomicBool>,
+) -> Result<Vec<QuasiStaticSampleRow>> {
+    wait_for_initial_monitor_snapshot(|| standby.observer().joint_positions())
+        .context("timed out waiting for initial joint position feedback")?;
+    let active = standby
+        .enable_mit_mode(conservative_mit_config())
+        .context("failed to enable strict MIT mode for active replay sampling")?;
+    let mut stepper = HardwareReplayStepper::new(active, args, running);
+    let rows =
+        replay_quasi_static_samples(&mut stepper, &plan.waypoints, criteria, settle_duration)?;
+    stepper.disable().context("failed to disable robot after replay sampling")?;
+    Ok(rows)
+}
+
+fn run_soft_replay(
+    standby: Piper<Standby, SoftRealtime>,
+    plan: &ReplayPlan,
+    criteria: StableSampleCriteria,
+    args: &GravityReplaySampleArgs,
+    settle_duration: Duration,
+    running: Arc<AtomicBool>,
+) -> Result<Vec<QuasiStaticSampleRow>> {
+    wait_for_initial_monitor_snapshot(|| standby.observer().joint_positions())
+        .context("timed out waiting for initial joint position feedback")?;
+    let active = standby
+        .enable_mit_passthrough(conservative_mit_config())
+        .context("failed to enable soft MIT passthrough mode for active replay sampling")?;
+    let mut stepper = HardwareReplayStepper::new(active, args, running);
+    let rows =
+        replay_quasi_static_samples(&mut stepper, &plan.waypoints, criteria, settle_duration)?;
+    stepper.disable().context("failed to disable robot after replay sampling")?;
+    Ok(rows)
+}
+
+fn conservative_mit_config() -> MitModeConfig {
+    MitModeConfig {
+        speed_percent: CONSERVATIVE_MIT_SPEED_PERCENT,
+        ..Default::default()
+    }
+}
+
+fn stable_sample_criteria_from_args(
+    args: &GravityReplaySampleArgs,
+) -> Result<StableSampleCriteria> {
+    Ok(StableSampleCriteria {
+        stable_velocity_rad_s: DEFAULT_STABLE_VELOCITY_RAD_S,
+        stable_tracking_error_rad: DEFAULT_STABLE_TRACKING_ERROR_RAD,
+        stable_torque_std_nm: DEFAULT_STABLE_TORQUE_STD_NM,
+        sample_count: sample_count_from_sample_ms(args.sample_ms)?,
+    })
+}
+
+fn sample_count_from_sample_ms(sample_ms: u64) -> Result<usize> {
+    if sample_ms == 0 {
+        bail!("sample_ms must be positive");
+    }
+    let count = sample_ms.div_ceil(REPLAY_SAMPLE_PERIOD_MS).max(1);
+    usize::try_from(count).map_err(|_| anyhow!("sample_count overflows usize"))
+}
+
+fn build_samples_header(
+    args: &GravityReplaySampleArgs,
+    path_header: &PathHeader,
+    plan: &ReplayPlan,
+    source_sha256: String,
+    accepted_waypoint_count: usize,
+    rejected_waypoint_count: usize,
+    criteria: StableSampleCriteria,
+) -> SamplesHeader {
+    SamplesHeader {
+        row_type: SAMPLE_HEADER_ROW_TYPE.to_string(),
+        artifact_kind: SAMPLE_ARTIFACT_KIND.to_string(),
+        schema_version: SAMPLE_SCHEMA_VERSION,
+        source_path: args.path.display().to_string(),
+        source_sha256,
+        role: plan.role.clone(),
+        target: plan.target.clone(),
+        joint_map: plan.joint_map.clone(),
+        load_profile: plan.load_profile.clone(),
+        torque_convention: path_header.torque_convention.clone(),
+        frequency_hz: REPLAY_SAMPLE_FREQUENCY_HZ,
+        max_velocity_rad_s: args.max_velocity_rad_s,
+        max_step_rad: args.max_step_rad,
+        settle_ms: args.settle_ms,
+        sample_ms: args.sample_ms,
+        stable_velocity_rad_s: criteria.stable_velocity_rad_s,
+        stable_tracking_error_rad: criteria.stable_tracking_error_rad,
+        stable_torque_std_nm: criteria.stable_torque_std_nm,
+        waypoint_count: plan.waypoints.len(),
+        accepted_waypoint_count,
+        rejected_waypoint_count,
+    }
+}
+
+fn write_samples_artifact(
+    path: &Path,
+    header: &SamplesHeader,
+    rows: &[QuasiStaticSampleRow],
+) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+
+    write_jsonl_row(&mut writer, header)?;
+    for row in rows {
+        write_jsonl_row(&mut writer, row)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn ensure_output_path_available(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("--out must not be empty");
+    }
+    if path.exists() {
+        bail!(
+            "{} already exists; refusing to overwrite before connecting",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn confirm_operator() -> Result<bool> {
+    print!("Enable robot and run active gravity replay sampling? Type yes to continue: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read operator confirmation")?;
+    let normalized = input.trim().to_ascii_lowercase();
+    Ok(matches!(normalized.as_str(), "yes" | "y"))
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn resolve_replay_target(args: &GravityReplaySampleArgs) -> Result<String> {
+    Ok(resolve_replay_target_spec(args)?.to_string())
+}
+
+fn resolve_replay_target_spec(args: &GravityReplaySampleArgs) -> Result<TargetSpec> {
     match (args.target.as_deref(), args.interface.as_deref()) {
         (Some(_), Some(_)) => bail!("use either --target or --interface, not both"),
-        (Some(target), None) => {
-            let target_spec = target
-                .parse::<TargetSpec>()
-                .map_err(|error| anyhow!("invalid --target {target:?}: {error}"))?;
-            Ok(target_spec.to_string())
-        },
+        (Some(target), None) => target
+            .parse::<TargetSpec>()
+            .map_err(|error| anyhow!("invalid --target {target:?}: {error}")),
         (None, Some(interface)) => {
             if interface.trim().is_empty() {
                 bail!("--interface must not be empty");
             }
             Ok(TargetSpec::SocketCan {
                 iface: interface.to_string(),
-            }
-            .to_string())
+            })
         },
         (None, None) => bail!("pass --target or --interface for gravity replay"),
     }
@@ -298,12 +641,40 @@ fn append_segment_waypoints(plan: &mut Vec<[f64; 6]>, segment: Vec<[f64; 6]>) {
     plan.extend(segment.into_iter().skip(skip_count));
 }
 
-fn append_reverse_pass(plan: &mut Vec<[f64; 6]>) {
-    if plan.len() <= 1 {
-        return;
+fn replay_waypoints_from_forward_plan(
+    forward: Vec<[f64; 6]>,
+    bidirectional: bool,
+) -> Result<Vec<ReplayWaypoint>> {
+    if forward.is_empty() {
+        bail!("waypoint plan must contain at least one waypoint");
     }
-    let reverse = plan.iter().rev().copied().skip(1).collect::<Vec<_>>();
-    plan.extend(reverse);
+
+    let mut plan = Vec::with_capacity(if bidirectional {
+        forward.len().saturating_mul(2).saturating_sub(1)
+    } else {
+        forward.len()
+    });
+
+    for (index, q_rad) in forward.iter().copied().enumerate() {
+        plan.push(ReplayWaypoint {
+            waypoint_id: u64::try_from(index).map_err(|_| anyhow!("waypoint_id overflows u64"))?,
+            q_rad,
+            pass_direction: PassDirection::Forward,
+        });
+    }
+
+    if bidirectional {
+        for (index, q_rad) in forward.iter().copied().enumerate().rev().skip(1) {
+            plan.push(ReplayWaypoint {
+                waypoint_id: u64::try_from(index)
+                    .map_err(|_| anyhow!("waypoint_id overflows u64"))?,
+                q_rad,
+                pass_direction: PassDirection::Backward,
+            });
+        }
+    }
+
+    Ok(plan)
 }
 
 fn joint_ranges(waypoints: &[[f64; 6]]) -> Result<([f64; 6], [f64; 6])> {
@@ -358,6 +729,16 @@ fn max_simplification_deviation(samples: &[[f64; 6]], keep_indices: &[usize]) ->
     Ok(max_deviation)
 }
 
+fn print_startup_summary(args: &GravityReplaySampleArgs, plan: &ReplayPlan) {
+    println!("gravity replay-sample startup summary");
+    println!("  target: {}", plan.target);
+    println!("  role: {}", plan.role);
+    println!("  load_profile: {}", plan.load_profile);
+    println!("  max_velocity_rad_s: {}", args.max_velocity_rad_s);
+    println!("  waypoint_count: {}", plan.waypoints.len());
+    println!("  output: {}", args.out.display());
+}
+
 fn print_dry_run_report(
     args: &GravityReplaySampleArgs,
     header: &PathHeader,
@@ -407,6 +788,8 @@ fn format_joint_array(values: [f64; 6]) -> String {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ReplaySnapshot {
+    pub host_mono_us: u64,
+    pub raw_timestamp_us: Option<u64>,
     pub q_rad: [f64; 6],
     pub dq_rad_s: [f64; 6],
     pub tau_nm: [f64; 6],
@@ -426,7 +809,350 @@ pub(crate) struct StableSampleCriteria {
 #[allow(dead_code)]
 pub(crate) trait ReplayStepper {
     fn move_toward(&mut self, target: [f64; 6]) -> Result<()>;
+    fn hold(&mut self, duration: Duration) -> Result<()> {
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+        Ok(())
+    }
+    fn wait_between_samples(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn snapshot(&mut self) -> Result<ReplaySnapshot>;
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct StabilityMetrics {
+    pub stable_velocity_rad_s: f64,
+    pub stable_tracking_error_rad: f64,
+    pub stable_torque_std_nm: f64,
+}
+
+struct StableSampleWindow {
+    latest: ReplaySnapshot,
+    metrics: StabilityMetrics,
+}
+
+trait ActiveMitArm {
+    fn command_torques_confirmed(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> Result<()>;
+    fn snapshot(&self) -> Result<ReplaySnapshot>;
+    fn disable_arm(self, config: DisableConfig) -> Result<()>;
+}
+
+impl<Capability> ActiveMitArm for Piper<Active<MitMode>, Capability>
+where
+    Capability: StrictCapability,
+{
+    fn command_torques_confirmed(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> Result<()> {
+        Piper::<Active<MitMode>, Capability>::command_torques_confirmed(
+            self, positions, velocities, kp, kd, torques, timeout,
+        )
+        .map_err(Into::into)
+    }
+
+    fn snapshot(&self) -> Result<ReplaySnapshot> {
+        replay_snapshot_from_observer(self.observer())
+    }
+
+    fn disable_arm(self, config: DisableConfig) -> Result<()> {
+        self.disable(config).map(|_| ()).map_err(Into::into)
+    }
+}
+
+impl ActiveMitArm for Piper<Active<MitPassthroughMode>, SoftRealtime> {
+    fn command_torques_confirmed(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> Result<()> {
+        Piper::<Active<MitPassthroughMode>, SoftRealtime>::command_torques_confirmed(
+            self, positions, velocities, kp, kd, torques, timeout,
+        )
+        .map_err(Into::into)
+    }
+
+    fn snapshot(&self) -> Result<ReplaySnapshot> {
+        replay_snapshot_from_observer(self.observer())
+    }
+
+    fn disable_arm(self, config: DisableConfig) -> Result<()> {
+        self.disable(config).map(|_| ()).map_err(Into::into)
+    }
+}
+
+struct HardwareReplayStepper<A>
+where
+    A: ActiveMitArm,
+{
+    active: Option<A>,
+    running: Arc<AtomicBool>,
+    max_step_rad: f64,
+    max_velocity_rad_s: f64,
+    command_timeout: Duration,
+    sample_period: Duration,
+    velocities: JointArray<f64>,
+    kp: JointArray<f64>,
+    kd: JointArray<f64>,
+    torques: JointArray<NewtonMeter>,
+    last_target: Option<[f64; 6]>,
+}
+
+impl<A> HardwareReplayStepper<A>
+where
+    A: ActiveMitArm,
+{
+    fn new(active: A, args: &GravityReplaySampleArgs, running: Arc<AtomicBool>) -> Self {
+        Self {
+            active: Some(active),
+            running,
+            max_step_rad: args.max_step_rad,
+            max_velocity_rad_s: args.max_velocity_rad_s,
+            command_timeout: ACTIVE_COMMAND_TIMEOUT,
+            sample_period: Duration::from_millis(REPLAY_SAMPLE_PERIOD_MS),
+            velocities: JointArray::splat(0.0),
+            kp: JointArray::splat(CONSERVATIVE_KP),
+            kd: JointArray::splat(CONSERVATIVE_KD),
+            torques: JointArray::splat(NewtonMeter::ZERO),
+            last_target: None,
+        }
+    }
+
+    fn disable(mut self) -> Result<()> {
+        if let Some(active) = self.active.take() {
+            active.disable_arm(DisableConfig::default())?;
+        }
+        Ok(())
+    }
+
+    fn active(&self) -> Result<&A> {
+        self.active
+            .as_ref()
+            .ok_or_else(|| anyhow!("active replay stepper is already disabled"))
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if !self.running.load(Ordering::SeqCst) {
+            bail!("gravity replay sampling cancelled");
+        }
+        Ok(())
+    }
+
+    fn command_target(&self, target: [f64; 6]) -> Result<()> {
+        self.ensure_running()?;
+        validate_joint_vector("target", &target)?;
+        let positions = JointArray::new(target.map(Rad));
+        self.active()?
+            .command_torques_confirmed(
+                &positions,
+                &self.velocities,
+                &self.kp,
+                &self.kd,
+                &self.torques,
+                self.command_timeout,
+            )
+            .context("failed to submit zero-feedforward MIT hold command")
+    }
+
+    fn require_complete_snapshot(&self) -> Result<ReplaySnapshot> {
+        let snapshot = self.active()?.snapshot()?;
+        ensure_snapshot_complete(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn check_active_safety(&self, snapshot: &ReplaySnapshot, target: &[f64; 6]) -> Result<()> {
+        if (snapshot.position_valid_mask & COMPLETE_JOINT_MASK) == COMPLETE_JOINT_MASK {
+            let tracking_error = max_abs_delta(&snapshot.q_rad, target);
+            if tracking_error > ACTIVE_TRACKING_ERROR_LIMIT_RAD {
+                bail!(
+                    "active replay tracking error {tracking_error:.6} rad exceeds {:.6}",
+                    ACTIVE_TRACKING_ERROR_LIMIT_RAD
+                );
+            }
+        }
+
+        if (snapshot.dynamic_valid_mask & COMPLETE_JOINT_MASK) == COMPLETE_JOINT_MASK {
+            let max_torque =
+                snapshot.tau_nm.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+            if max_torque > ACTIVE_TORQUE_LIMIT_NM {
+                bail!(
+                    "active replay observed torque {max_torque:.6} Nm exceeds {:.6}",
+                    ACTIVE_TORQUE_LIMIT_NM
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sleep_or_cancelled(&self, duration: Duration) -> Result<()> {
+        let started_at = Instant::now();
+        while started_at.elapsed() < duration {
+            self.ensure_running()?;
+            let remaining = duration.saturating_sub(started_at.elapsed());
+            std::thread::sleep(remaining.min(CANCEL_POLL_INTERVAL));
+        }
+        self.ensure_running()
+    }
+
+    fn rate_limit_duration(&self, delta_rad: f64) -> Result<Duration> {
+        if delta_rad <= 0.0 {
+            return Ok(Duration::ZERO);
+        }
+        let seconds = delta_rad / self.max_velocity_rad_s;
+        Duration::try_from_secs_f64(seconds)
+            .map_err(|_| anyhow!("rate-limit duration is invalid for delta {delta_rad:.6} rad"))
+    }
+
+    fn hold_last_target_for(&mut self, duration: Duration) -> Result<()> {
+        let target = self
+            .last_target
+            .ok_or_else(|| anyhow!("cannot hold before a replay target has been commanded"))?;
+        let started_at = Instant::now();
+        while started_at.elapsed() < duration {
+            self.command_target(target)?;
+            let remaining = duration.saturating_sub(started_at.elapsed());
+            self.sleep_or_cancelled(remaining.min(self.sample_period))?;
+            let snapshot = self.active()?.snapshot()?;
+            self.check_active_safety(&snapshot, &target)?;
+        }
+        Ok(())
+    }
+}
+
+impl<A> Drop for HardwareReplayStepper<A>
+where
+    A: ActiveMitArm,
+{
+    fn drop(&mut self) {
+        if let Some(active) = self.active.take() {
+            let _ = active.disable_arm(DisableConfig::default());
+        }
+    }
+}
+
+impl<A> ReplayStepper for HardwareReplayStepper<A>
+where
+    A: ActiveMitArm,
+{
+    fn move_toward(&mut self, target: [f64; 6]) -> Result<()> {
+        self.ensure_running()?;
+        let current = self.require_complete_snapshot()?.q_rad;
+        let increments = interpolate_waypoints(current, target, self.max_step_rad)?;
+
+        if increments.len() <= 1 {
+            self.command_target(target)?;
+            self.last_target = Some(target);
+            let snapshot = self.require_complete_snapshot()?;
+            self.check_active_safety(&snapshot, &target)?;
+            return Ok(());
+        }
+
+        let mut previous = current;
+        for increment in increments.into_iter().skip(1) {
+            let delta_rad = max_abs_delta(&previous, &increment);
+            self.command_target(increment)?;
+            self.last_target = Some(increment);
+            self.sleep_or_cancelled(self.rate_limit_duration(delta_rad)?)?;
+            let snapshot = self.require_complete_snapshot()?;
+            self.check_active_safety(&snapshot, &increment)?;
+            previous = increment;
+        }
+
+        Ok(())
+    }
+
+    fn hold(&mut self, duration: Duration) -> Result<()> {
+        self.hold_last_target_for(duration)
+    }
+
+    fn wait_between_samples(&mut self) -> Result<()> {
+        let target = self
+            .last_target
+            .ok_or_else(|| anyhow!("cannot sample before a replay target has been commanded"))?;
+        self.command_target(target)?;
+        self.sleep_or_cancelled(self.sample_period)?;
+        let snapshot = self.active()?.snapshot()?;
+        self.check_active_safety(&snapshot, &target)?;
+        Ok(())
+    }
+
+    fn snapshot(&mut self) -> Result<ReplaySnapshot> {
+        self.ensure_running()?;
+        self.active()?.snapshot()
+    }
+}
+
+fn replay_snapshot_from_observer<Capability>(
+    observer: &Observer<Capability>,
+) -> Result<ReplaySnapshot>
+where
+    Capability: CapabilityMarker,
+{
+    let position = observer.raw_joint_position_state();
+    let dynamic = observer.raw_joint_dynamic_state();
+    let latest_host_mono_us = position.host_rx_mono_us.max(dynamic.group_host_rx_mono_us);
+    if latest_host_mono_us == 0 {
+        bail!("joint feedback is not available yet");
+    }
+
+    let now_us = piper_sdk::driver::heartbeat::monotonic_micros();
+    let age_us = now_us.saturating_sub(latest_host_mono_us);
+    if age_us > ACTIVE_MAX_FEEDBACK_AGE.as_micros() as u64 {
+        bail!(
+            "stale joint feedback age {:.3}ms exceeds {:.3}ms",
+            age_us as f64 / 1000.0,
+            ACTIVE_MAX_FEEDBACK_AGE.as_secs_f64() * 1000.0
+        );
+    }
+
+    let latest_raw_timestamp_us = position.hardware_timestamp_us.max(dynamic.group_timestamp_us);
+
+    Ok(ReplaySnapshot {
+        host_mono_us: latest_host_mono_us,
+        raw_timestamp_us: (latest_raw_timestamp_us != 0).then_some(latest_raw_timestamp_us),
+        q_rad: position.joint_pos,
+        dq_rad_s: dynamic.joint_vel,
+        tau_nm: dynamic.get_all_torques(),
+        position_valid_mask: position.frame_valid_mask,
+        dynamic_valid_mask: dynamic.valid_mask,
+    })
+}
+
+fn ensure_snapshot_complete(snapshot: &ReplaySnapshot) -> Result<()> {
+    if (snapshot.position_valid_mask & COMPLETE_JOINT_MASK) != COMPLETE_JOINT_MASK {
+        bail!(
+            "position feedback incomplete: mask={:#04x}",
+            snapshot.position_valid_mask
+        );
+    }
+    if (snapshot.dynamic_valid_mask & COMPLETE_JOINT_MASK) != COMPLETE_JOINT_MASK {
+        bail!(
+            "dynamic feedback incomplete: mask={:#04x}",
+            snapshot.dynamic_valid_mask
+        );
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -442,16 +1168,102 @@ where
     validate_stable_sample_criteria(criteria)?;
 
     stepper.move_toward(target)?;
+    let window = sample_stable_window(stepper, target, criteria)?;
+    Ok(window.latest)
+}
 
+pub(crate) fn replay_quasi_static_samples<S>(
+    stepper: &mut S,
+    waypoints: &[ReplayWaypoint],
+    criteria: StableSampleCriteria,
+    settle_duration: Duration,
+) -> Result<Vec<QuasiStaticSampleRow>>
+where
+    S: ReplayStepper,
+{
+    if waypoints.is_empty() {
+        bail!("waypoint plan must contain at least one waypoint");
+    }
+    validate_stable_sample_criteria(criteria)?;
+
+    let mut rows = Vec::new();
+    for waypoint in waypoints {
+        validate_joint_vector("waypoint q_rad", &waypoint.q_rad)?;
+        stepper.move_toward(waypoint.q_rad)?;
+        stepper.hold(settle_duration)?;
+
+        let snapshots = collect_sample_window(stepper, criteria)?;
+        if let Ok(window) = stable_window_from_snapshots(snapshots, waypoint.q_rad, criteria) {
+            rows.push(row_from_stable_window(waypoint, window));
+        }
+    }
+
+    Ok(rows)
+}
+
+fn row_from_stable_window(
+    waypoint: &ReplayWaypoint,
+    window: StableSampleWindow,
+) -> QuasiStaticSampleRow {
+    QuasiStaticSampleRow {
+        row_type: SAMPLE_ROW_TYPE.to_string(),
+        waypoint_id: waypoint.waypoint_id,
+        segment_id: None,
+        pass_direction: waypoint.pass_direction.clone(),
+        host_mono_us: window.latest.host_mono_us,
+        raw_timestamp_us: window.latest.raw_timestamp_us,
+        q_rad: window.latest.q_rad,
+        dq_rad_s: window.latest.dq_rad_s,
+        tau_nm: window.latest.tau_nm,
+        position_valid_mask: window.latest.position_valid_mask,
+        dynamic_valid_mask: window.latest.dynamic_valid_mask,
+        stable_velocity_rad_s: window.metrics.stable_velocity_rad_s,
+        stable_tracking_error_rad: window.metrics.stable_tracking_error_rad,
+        stable_torque_std_nm: window.metrics.stable_torque_std_nm,
+    }
+}
+
+fn sample_stable_window<S>(
+    stepper: &mut S,
+    target: [f64; 6],
+    criteria: StableSampleCriteria,
+) -> Result<StableSampleWindow>
+where
+    S: ReplayStepper,
+{
+    let snapshots = collect_sample_window(stepper, criteria)?;
+    stable_window_from_snapshots(snapshots, target, criteria)
+}
+
+fn collect_sample_window<S>(
+    stepper: &mut S,
+    criteria: StableSampleCriteria,
+) -> Result<Vec<ReplaySnapshot>>
+where
+    S: ReplayStepper,
+{
     let mut snapshots = Vec::with_capacity(criteria.sample_count);
-    for _ in 0..criteria.sample_count {
+    for index in 0..criteria.sample_count {
+        if index > 0 {
+            stepper.wait_between_samples()?;
+        }
         let snapshot = stepper.snapshot()?;
         validate_snapshot(&snapshot)?;
         snapshots.push(snapshot);
     }
+    Ok(snapshots)
+}
 
-    validate_stable_snapshots(&snapshots, &target, criteria)?;
-    Ok(*snapshots.last().expect("sample_count is positive"))
+fn stable_window_from_snapshots(
+    snapshots: Vec<ReplaySnapshot>,
+    target: [f64; 6],
+    criteria: StableSampleCriteria,
+) -> Result<StableSampleWindow> {
+    let metrics = evaluate_stable_snapshots(&snapshots, &target, criteria)?;
+    Ok(StableSampleWindow {
+        latest: *snapshots.last().expect("sample_count is positive"),
+        metrics,
+    })
 }
 
 fn validate_stable_sample_criteria(criteria: StableSampleCriteria) -> Result<()> {
@@ -474,11 +1286,14 @@ fn validate_snapshot(snapshot: &ReplaySnapshot) -> Result<()> {
     Ok(())
 }
 
-fn validate_stable_snapshots(
+fn evaluate_stable_snapshots(
     snapshots: &[ReplaySnapshot],
     target: &[f64; 6],
     criteria: StableSampleCriteria,
-) -> Result<()> {
+) -> Result<StabilityMetrics> {
+    let mut observed_max_velocity: f64 = 0.0;
+    let mut observed_max_tracking_error: f64 = 0.0;
+
     for snapshot in snapshots {
         if (snapshot.position_valid_mask & COMPLETE_JOINT_MASK) != COMPLETE_JOINT_MASK {
             bail!(
@@ -495,6 +1310,7 @@ fn validate_stable_snapshots(
 
         let max_velocity =
             snapshot.dq_rad_s.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        observed_max_velocity = observed_max_velocity.max(max_velocity);
         if max_velocity > criteria.stable_velocity_rad_s {
             bail!(
                 "unstable velocity {max_velocity:.6} rad/s exceeds {:.6}",
@@ -503,6 +1319,7 @@ fn validate_stable_snapshots(
         }
 
         let tracking_error = max_abs_delta(&snapshot.q_rad, target);
+        observed_max_tracking_error = observed_max_tracking_error.max(tracking_error);
         if tracking_error > criteria.stable_tracking_error_rad {
             bail!(
                 "tracking error {tracking_error:.6} rad exceeds {:.6}",
@@ -519,7 +1336,11 @@ fn validate_stable_snapshots(
         );
     }
 
-    Ok(())
+    Ok(StabilityMetrics {
+        stable_velocity_rad_s: observed_max_velocity,
+        stable_tracking_error_rad: observed_max_tracking_error,
+        stable_torque_std_nm: max_torque_std,
+    })
 }
 
 fn max_torque_std_nm(snapshots: &[ReplaySnapshot]) -> f64 {
@@ -779,6 +1600,98 @@ mod tests {
     }
 
     #[test]
+    fn replay_records_only_stable_hold_samples() {
+        let criteria = StableSampleCriteria {
+            stable_velocity_rad_s: 0.02,
+            stable_tracking_error_rad: 0.005,
+            stable_torque_std_nm: 0.05,
+            sample_count: 3,
+        };
+        let waypoints = vec![
+            ReplayWaypoint {
+                waypoint_id: 0,
+                q_rad: [0.0; 6],
+                pass_direction: PassDirection::Forward,
+            },
+            ReplayWaypoint {
+                waypoint_id: 1,
+                q_rad: [0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+                pass_direction: PassDirection::Forward,
+            },
+            ReplayWaypoint {
+                waypoint_id: 0,
+                q_rad: [0.0; 6],
+                pass_direction: PassDirection::Backward,
+            },
+        ];
+        let mut stepper = FakeStepper::new(vec![
+            stable_snapshot(waypoints[0].q_rad, [1.00; 6]),
+            stable_snapshot(waypoints[0].q_rad, [1.01; 6]),
+            stable_snapshot(waypoints[0].q_rad, [0.99; 6]),
+            snapshot_with(
+                [0.075, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.03, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [2.0; 6],
+                0x3f,
+                0x3f,
+            ),
+            snapshot_with(
+                [0.09, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.025, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [2.2; 6],
+                0x3f,
+                0x3f,
+            ),
+            snapshot_with(
+                [0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.021, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [1.8; 6],
+                0x3f,
+                0x3f,
+            ),
+            stable_snapshot(waypoints[2].q_rad, [-0.50; 6]),
+            stable_snapshot(waypoints[2].q_rad, [-0.49; 6]),
+            stable_snapshot(waypoints[2].q_rad, [-0.51; 6]),
+        ]);
+
+        let rows = replay_quasi_static_samples(
+            &mut stepper,
+            &waypoints,
+            criteria,
+            Duration::from_millis(0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            stepper.moved_targets,
+            vec![waypoints[0].q_rad, waypoints[1].q_rad, waypoints[2].q_rad,]
+        );
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(rows[0].waypoint_id, 0);
+        assert_eq!(rows[0].pass_direction, PassDirection::Forward);
+        assert_eq!(rows[0].q_rad, waypoints[0].q_rad);
+        assert_eq!(rows[0].dq_rad_s, [0.0; 6]);
+        assert_eq!(rows[0].tau_nm, [0.99; 6]);
+        assert_eq!(rows[0].position_valid_mask, 0x3f);
+        assert_eq!(rows[0].dynamic_valid_mask, 0x3f);
+        assert_eq!(rows[0].stable_velocity_rad_s, 0.0);
+        assert_eq!(rows[0].stable_tracking_error_rad, 0.0);
+        assert!(rows[0].stable_torque_std_nm > 0.0);
+
+        assert_eq!(rows[1].waypoint_id, 0);
+        assert_eq!(rows[1].pass_direction, PassDirection::Backward);
+        assert_eq!(rows[1].q_rad, waypoints[2].q_rad);
+        assert_eq!(rows[1].dq_rad_s, [0.0; 6]);
+        assert_eq!(rows[1].tau_nm, [-0.51; 6]);
+        assert_eq!(rows[1].position_valid_mask, 0x3f);
+        assert_eq!(rows[1].dynamic_valid_mask, 0x3f);
+        assert_eq!(rows[1].stable_velocity_rad_s, 0.0);
+        assert_eq!(rows[1].stable_tracking_error_rad, 0.0);
+        assert!(rows[1].stable_torque_std_nm > 0.0);
+    }
+
+    #[test]
     fn dry_run_plan_validates_header_and_summarizes_waypoints() {
         let args = replay_args("slave", Some("socketcan:can0"), None);
         let loaded = loaded_path(vec![
@@ -903,6 +1816,8 @@ mod tests {
         dynamic_valid_mask: u8,
     ) -> ReplaySnapshot {
         ReplaySnapshot {
+            host_mono_us: 1,
+            raw_timestamp_us: Some(1),
             q_rad,
             dq_rad_s,
             tau_nm,
