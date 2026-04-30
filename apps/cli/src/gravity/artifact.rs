@@ -474,6 +474,13 @@ fn validate_path_row(row: &PathSampleRow, path: &Path, line_number: usize) -> Re
         path,
         line_number,
     )?;
+    if row.position_valid_mask != VALID_JOINT_MASK {
+        bail!(
+            "{} row {line_number} position_valid_mask must be {VALID_JOINT_MASK:#04x}, got {:#04x}",
+            path.display(),
+            row.position_valid_mask
+        );
+    }
     validate_joint_mask(
         "dynamic_valid_mask",
         row.dynamic_valid_mask,
@@ -635,6 +642,24 @@ mod tests {
         )
         .unwrap();
         assert!(read_path(&mask_path).unwrap_err().to_string().contains("mask"));
+    }
+
+    #[test]
+    fn path_reader_rejects_incomplete_position_masks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("incomplete-position-mask.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"path\",\"schema_version\":1,\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\"}\n",
+                "{\"type\":\"path-sample\",\"sample_index\":0,\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":31,\"dynamic_valid_mask\":0}\n"
+            ),
+        )
+        .unwrap();
+
+        let err = read_path(&path).unwrap_err();
+
+        assert!(err.to_string().contains("position_valid_mask"), "{err:#}");
     }
 
     #[test]

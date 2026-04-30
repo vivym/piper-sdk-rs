@@ -5,7 +5,11 @@ use piper_control::TargetSpec;
 use std::time::Duration;
 
 const MAX_SAFE_STEP_RAD: f64 = 0.2;
+const MIN_SAFE_STEP_RAD: f64 = 1e-6;
+const MAX_INTERPOLATED_WAYPOINTS: usize = 100_000;
 const MAX_SAFE_VELOCITY_RAD_S: f64 = 1.0;
+const DEFAULT_SIMPLIFICATION_TOLERANCE_RAD: f64 = 0.005;
+const MAX_SIMPLIFICATION_TOLERANCE_RAD: f64 = 0.01;
 const COMPLETE_JOINT_MASK: u8 = 0x3f;
 
 pub async fn run(args: GravityReplaySampleArgs) -> Result<()> {
@@ -32,18 +36,26 @@ pub(crate) struct DryRunReport {
     pub load_profile: String,
     pub raw_sample_count: usize,
     pub simplified_count: usize,
+    pub simplification_tolerance_rad: f64,
+    pub max_simplification_deviation_rad: f64,
     pub waypoint_count: usize,
     pub joint_min_rad: [f64; 6],
     pub joint_max_rad: [f64; 6],
     pub estimated_duration: Duration,
 }
 
+#[allow(dead_code)]
 pub(crate) fn simplify_path(samples: &[[f64; 6]], max_deviation_rad: f64) -> Result<Vec<[f64; 6]>> {
+    let keep_indices = simplify_path_indices(samples, max_deviation_rad)?;
+    Ok(keep_indices.into_iter().map(|index| samples[index]).collect())
+}
+
+fn simplify_path_indices(samples: &[[f64; 6]], max_deviation_rad: f64) -> Result<Vec<usize>> {
     validate_path(samples)?;
     validate_positive_finite("max_deviation_rad", max_deviation_rad)?;
 
     if samples.len() <= 2 {
-        return Ok(samples.to_vec());
+        return Ok((0..samples.len()).collect());
     }
 
     let mut keep = vec![false; samples.len()];
@@ -51,10 +63,10 @@ pub(crate) fn simplify_path(samples: &[[f64; 6]], max_deviation_rad: f64) -> Res
     keep[samples.len() - 1] = true;
     simplify_segment(samples, 0, samples.len() - 1, max_deviation_rad, &mut keep);
 
-    Ok(samples
-        .iter()
-        .zip(keep)
-        .filter_map(|(sample, keep)| keep.then_some(*sample))
+    Ok(keep
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, keep)| keep.then_some(index))
         .collect())
 }
 
@@ -65,18 +77,31 @@ pub(crate) fn interpolate_waypoints(
 ) -> Result<Vec<[f64; 6]>> {
     validate_joint_vector("start", &start)?;
     validate_joint_vector("end", &end)?;
-    validate_positive_finite("max_step_rad", max_step_rad)?;
-    if max_step_rad > MAX_SAFE_STEP_RAD {
-        bail!("max_step_rad must be <= {MAX_SAFE_STEP_RAD}");
-    }
+    validate_max_step_rad(max_step_rad)?;
 
     let max_delta = max_abs_delta(&start, &end);
     if max_delta == 0.0 {
         return Ok(vec![start]);
     }
 
-    let segment_count = (max_delta / max_step_rad).ceil() as usize;
-    let mut waypoints = Vec::with_capacity(segment_count + 1);
+    let segment_count_f64 = (max_delta / max_step_rad).ceil();
+    if !segment_count_f64.is_finite() {
+        bail!("waypoint count must be finite");
+    }
+    let waypoint_count_f64 = segment_count_f64 + 1.0;
+    if !waypoint_count_f64.is_finite() || waypoint_count_f64 > MAX_INTERPOLATED_WAYPOINTS as f64 {
+        bail!("waypoint count must be <= {MAX_INTERPOLATED_WAYPOINTS}");
+    }
+
+    let segment_count = segment_count_f64 as usize;
+    let waypoint_count = segment_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("waypoint count overflows"))?;
+    if waypoint_count > MAX_INTERPOLATED_WAYPOINTS {
+        bail!("waypoint count must be <= {MAX_INTERPOLATED_WAYPOINTS}");
+    }
+
+    let mut waypoints = Vec::with_capacity(waypoint_count);
     for index in 0..=segment_count {
         let ratio = index as f64 / segment_count as f64;
         let mut waypoint = [0.0; 6];
@@ -131,10 +156,7 @@ pub(crate) fn validate_replay_args(args: &GravityReplaySampleArgs) -> Result<()>
     if args.max_velocity_rad_s > MAX_SAFE_VELOCITY_RAD_S {
         bail!("max_velocity_rad_s must be <= {MAX_SAFE_VELOCITY_RAD_S}");
     }
-    validate_positive_finite("max_step_rad", args.max_step_rad)?;
-    if args.max_step_rad > MAX_SAFE_STEP_RAD {
-        bail!("max_step_rad must be <= {MAX_SAFE_STEP_RAD}");
-    }
+    validate_max_step_rad(args.max_step_rad)?;
     if args.settle_ms == 0 {
         bail!("settle_ms must be positive");
     }
@@ -156,9 +178,14 @@ pub(crate) fn build_dry_run_plan(
     if loaded.rows.is_empty() {
         bail!("path must contain at least one sample");
     }
+    validate_replay_path_rows(loaded)?;
 
     let raw_samples = loaded.rows.iter().map(|row| row.q_rad).collect::<Vec<_>>();
-    let simplified = simplify_path(&raw_samples, args.max_step_rad)?;
+    let simplification_tolerance_rad = replay_simplification_tolerance_rad()?;
+    let simplified_indices = simplify_path_indices(&raw_samples, simplification_tolerance_rad)?;
+    let max_simplification_deviation_rad =
+        max_simplification_deviation(&raw_samples, &simplified_indices)?;
+    let simplified = simplified_indices.iter().map(|&index| raw_samples[index]).collect::<Vec<_>>();
     let mut waypoints = waypoint_plan_from_simplified_path(&simplified, args.max_step_rad)?;
     if args.bidirectional {
         append_reverse_pass(&mut waypoints);
@@ -178,11 +205,26 @@ pub(crate) fn build_dry_run_plan(
         load_profile: loaded.header.load_profile.clone(),
         raw_sample_count: loaded.rows.len(),
         simplified_count: simplified.len(),
+        simplification_tolerance_rad,
+        max_simplification_deviation_rad,
         waypoint_count: waypoints.len(),
         joint_min_rad,
         joint_max_rad,
         estimated_duration,
     })
+}
+
+fn validate_replay_path_rows(loaded: &LoadedPath) -> Result<()> {
+    for row in &loaded.rows {
+        if row.position_valid_mask != COMPLETE_JOINT_MASK {
+            bail!(
+                "path row {} position_valid_mask must be {COMPLETE_JOINT_MASK:#04x}, got {:#04x}",
+                row.sample_index,
+                row.position_valid_mask
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_path_header_matches_args(
@@ -279,6 +321,43 @@ fn joint_ranges(waypoints: &[[f64; 6]]) -> Result<([f64; 6], [f64; 6])> {
     Ok((min_values, max_values))
 }
 
+fn replay_simplification_tolerance_rad() -> Result<f64> {
+    let tolerance = DEFAULT_SIMPLIFICATION_TOLERANCE_RAD.min(MAX_SIMPLIFICATION_TOLERANCE_RAD);
+    validate_positive_finite("simplification_tolerance_rad", tolerance)?;
+    Ok(tolerance)
+}
+
+fn max_simplification_deviation(samples: &[[f64; 6]], keep_indices: &[usize]) -> Result<f64> {
+    validate_path(samples)?;
+    if keep_indices.is_empty() {
+        bail!("simplified path must contain at least one sample");
+    }
+    if keep_indices[0] != 0 {
+        bail!("simplified path must keep the first sample");
+    }
+    if *keep_indices.last().expect("checked non-empty") != samples.len() - 1 {
+        bail!("simplified path must keep the last sample");
+    }
+
+    let mut previous = 0;
+    let mut max_deviation: f64 = 0.0;
+    for &index in keep_indices.iter().skip(1) {
+        if index <= previous || index >= samples.len() {
+            bail!("simplified path indices must be strictly increasing");
+        }
+        for sample in &samples[previous..=index] {
+            max_deviation = max_deviation.max(point_segment_deviation(
+                sample,
+                &samples[previous],
+                &samples[index],
+            ));
+        }
+        previous = index;
+    }
+
+    Ok(max_deviation)
+}
+
 fn print_dry_run_report(
     args: &GravityReplaySampleArgs,
     header: &PathHeader,
@@ -295,6 +374,14 @@ fn print_dry_run_report(
     println!("  bidirectional: {}", args.bidirectional);
     println!("  raw samples: {}", report.raw_sample_count);
     println!("  simplified keypoints: {}", report.simplified_count);
+    println!(
+        "  simplification tolerance rad: {:.6}",
+        report.simplification_tolerance_rad
+    );
+    println!(
+        "  max simplification deviation rad: {:.6}",
+        report.max_simplification_deviation_rad
+    );
     println!("  waypoints: {}", report.waypoint_count);
     println!(
         "  joint min rad: {}",
@@ -538,6 +625,17 @@ fn validate_positive_finite(name: &str, value: f64) -> Result<()> {
     Ok(())
 }
 
+fn validate_max_step_rad(max_step_rad: f64) -> Result<()> {
+    validate_positive_finite("max_step_rad", max_step_rad)?;
+    if max_step_rad < MIN_SAFE_STEP_RAD {
+        bail!("max_step_rad must be >= {MIN_SAFE_STEP_RAD}");
+    }
+    if max_step_rad > MAX_SAFE_STEP_RAD {
+        bail!("max_step_rad must be <= {MAX_SAFE_STEP_RAD}");
+    }
+    Ok(())
+}
+
 fn max_abs_delta(left: &[f64; 6], right: &[f64; 6]) -> f64 {
     left.iter()
         .zip(right.iter())
@@ -579,6 +677,33 @@ mod tests {
                 .map(|(left, right)| (right - left).abs())
                 .fold(0.0_f64, f64::max);
             assert!(max_delta <= 0.0200001, "{max_delta}");
+        }
+    }
+
+    #[test]
+    fn interpolate_waypoints_rejects_tiny_step_without_panicking() {
+        let result = std::panic::catch_unwind(|| {
+            interpolate_waypoints([0.0; 6], [1.0, 0.0, 0.0, 0.0, 0.0, 0.0], f64::MIN_POSITIVE)
+        });
+
+        assert!(
+            result.is_ok(),
+            "tiny max_step_rad must return Err, not panic"
+        );
+        let err = result.unwrap().unwrap_err();
+        assert!(err.to_string().contains("max_step_rad"), "{err:#}");
+    }
+
+    #[test]
+    fn interpolate_waypoints_rejects_excessive_waypoint_count() {
+        let result = interpolate_waypoints([0.0; 6], [100.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.001);
+
+        match result {
+            Ok(waypoints) => panic!(
+                "expected excessive waypoint count error, got {} waypoints",
+                waypoints.len()
+            ),
+            Err(err) => assert!(err.to_string().contains("waypoint"), "{err:#}"),
         }
     }
 
@@ -671,9 +796,28 @@ mod tests {
         assert_eq!(report.raw_sample_count, 3);
         assert_eq!(report.simplified_count, 2);
         assert_eq!(report.waypoint_count, 7);
+        assert!(report.max_simplification_deviation_rad <= 1e-12);
+        assert!(report.simplification_tolerance_rad <= 0.005);
         assert_eq!(report.joint_min_rad[0], 0.0);
         assert_eq!(report.joint_max_rad[0], 0.05);
         assert_eq!(report.estimated_duration.as_millis(), 5_600);
+    }
+
+    #[test]
+    fn dry_run_simplification_preserves_corners_independent_of_max_step() {
+        let mut args = replay_args("slave", Some("socketcan:can0"), None);
+        args.max_step_rad = MAX_SAFE_STEP_RAD;
+        args.bidirectional = false;
+        let loaded = loaded_path(vec![
+            path_row(0, [0.0; 6]),
+            path_row(1, [0.05, 0.05, 0.0, 0.0, 0.0, 0.0]),
+            path_row(2, [0.1, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ]);
+
+        let report = build_dry_run_plan(&args, &loaded).unwrap();
+
+        assert_eq!(report.simplified_count, 3);
+        assert!(report.max_simplification_deviation_rad <= report.simplification_tolerance_rad);
     }
 
     #[test]
@@ -687,6 +831,18 @@ mod tests {
         let target_args = replay_args("slave", Some("socketcan:can1"), None);
         let target_err = build_dry_run_plan(&target_args, &loaded).unwrap_err();
         assert!(target_err.to_string().contains("target"));
+    }
+
+    #[test]
+    fn dry_run_plan_rejects_incomplete_position_masks() {
+        let args = replay_args("slave", Some("socketcan:can0"), None);
+        let mut row = path_row(0, [0.0; 6]);
+        row.position_valid_mask = 0x1f;
+        let loaded = loaded_path(vec![row]);
+
+        let err = build_dry_run_plan(&args, &loaded).unwrap_err();
+
+        assert!(err.to_string().contains("position_valid_mask"), "{err:#}");
     }
 
     #[test]
