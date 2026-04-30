@@ -1,5 +1,7 @@
 use piper_client::dual_arm::StopAttemptResult;
-use piper_client::dual_arm_raw_clock::{RawClockRuntimeExitReason, RawClockRuntimeReport};
+use piper_client::dual_arm_raw_clock::{
+    RawClockRuntimeExitReason, RawClockRuntimeReport, RawClockSide,
+};
 use piper_sdk::BilateralExitReason;
 use piper_svs_collect::collector::{
     FakeCollectorHarness, FakeMujocoFrame, GripperTiming, read_manifest_toml, read_report_json,
@@ -364,6 +366,8 @@ fn raw_clock_fake_workflow_writes_optional_raw_clock_sections() {
     assert!(result.disable_called);
     let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
     assert!(manifest.raw_clock.is_some());
+    assert!(!manifest.gripper.mirror_enabled);
+    assert!(manifest.gripper.disable_gripper_effective);
     let report = read_report_json(&result.path.join("report.json")).unwrap();
     assert!(report.raw_clock.is_some());
     assert_eq!(
@@ -517,7 +521,7 @@ fn raw_clock_missing_tx_finished_finalizes_faulted_episode() {
 #[test]
 fn raw_clock_compensation_fault_finalizes_faulted_episode() {
     let out = tempfile::tempdir().unwrap();
-    let mut report = raw_clock_report_for_fake_tests(0);
+    let mut report = raw_clock_report_for_fake_tests(2);
     report.exit_reason = Some(RawClockRuntimeExitReason::CompensationFault);
     report.compensation_faults = 1;
     report.last_error = Some("compensation fault".to_string());
@@ -541,9 +545,19 @@ fn raw_clock_compensation_fault_finalizes_faulted_episode() {
 #[test]
 fn raw_clock_telemetry_sink_fault_finalizes_faulted_episode() {
     let out = tempfile::tempdir().unwrap();
-    let mut report = raw_clock_report_for_fake_tests(1);
+    let mut report = raw_clock_report_for_fake_tests(2);
     report.exit_reason = Some(RawClockRuntimeExitReason::TelemetrySinkFault);
     report.telemetry_sink_faults = 1;
+    report.submission_faults = 2;
+    report.last_submission_failed_side = Some(RawClockSide::Slave);
+    report.peer_command_may_have_applied = true;
+    report.max_inter_arm_skew_us = 1_234;
+    report.master_tx_frames_sent_total = 7;
+    report.slave_tx_frames_sent_total = 8;
+    report.master_tx_fault_aborts_total = 3;
+    report.slave_tx_fault_aborts_total = 4;
+    report.master_stop_attempt = StopAttemptResult::Timeout;
+    report.slave_stop_attempt = StopAttemptResult::QueueRejected;
     report.last_error = Some("sink failed".to_string());
 
     let harness = FakeCollectorHarness::new()
@@ -556,6 +570,20 @@ fn raw_clock_telemetry_sink_fault_finalizes_faulted_episode() {
     assert_eq!(result.status, EpisodeStatus::Faulted);
     let report = read_report_json(&result.path.join("report.json")).unwrap();
     assert_eq!(report.raw_clock.as_ref().unwrap().telemetry_sink_faults, 1);
+    assert_eq!(report.dual_arm.submission_faults, 2);
+    assert_eq!(
+        report.dual_arm.last_submission_failed_arm.as_deref(),
+        Some("Right")
+    );
+    assert!(report.dual_arm.peer_command_may_have_applied);
+    assert_eq!(report.dual_arm.max_inter_arm_skew_ns, 1_234_000);
+    assert_eq!(report.dual_arm.left_tx_frames_sent_total, 7);
+    assert_eq!(report.dual_arm.right_tx_frames_sent_total, 8);
+    assert_eq!(report.dual_arm.left_tx_fault_aborts_total, 3);
+    assert_eq!(report.dual_arm.right_tx_fault_aborts_total, 4);
+    assert_eq!(report.dual_arm.left_stop_attempt, "Timeout");
+    assert_eq!(report.dual_arm.right_stop_attempt, "QueueRejected");
+    assert_eq!(report.dual_arm.last_error.as_deref(), Some("sink failed"));
 }
 
 #[test]

@@ -662,8 +662,16 @@ impl FakeCollectorHarness {
         let episode_id = reservation.id.episode_id.clone();
         let episode_dir = reservation.absolute_dir;
 
+        let fake_profile = fake_effective_profile_for_harness(
+            self.runtime_kind,
+            self.raw_clock_gripper_mirror_enabled,
+        );
+        let fake_disable_gripper_requested = self.runtime_kind
+            == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock
+            && !self.raw_clock_gripper_mirror_enabled;
         let mut artifacts = persist_episode_inputs(
             &episode_dir,
+            &fake_profile,
             (self.runtime_kind == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock)
                 .then_some(self.raw_clock_startup_positions.unwrap_or(([0.0; 6], [0.0; 6]))),
         )?;
@@ -677,7 +685,6 @@ impl FakeCollectorHarness {
             STARTED_UNIX_NS / 1_000_000,
             EPISODE_START_HOST_MONO_US,
         )?;
-        let fake_profile = fake_effective_profile();
         let fake_raw_clock_settings = (self.runtime_kind
             == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock)
             .then(|| fake_raw_clock_settings_from_profile(&fake_profile));
@@ -731,6 +738,8 @@ impl FakeCollectorHarness {
                     ended_unix_ns: Some(ENDED_UNIX_NS),
                     summary: &initial_summary,
                     artifacts: &artifacts,
+                    profile: &fake_profile,
+                    disable_gripper_requested: fake_disable_gripper_requested,
                     raw_can_enabled: raw_can.raw_can_status() != RawCanCaptureStatus::Disabled,
                     raw_can_finalizer_status: raw_can.finalizer_status(),
                     raw_clock: fake_raw_clock_manifest,
@@ -752,6 +761,8 @@ impl FakeCollectorHarness {
             ended_unix_ns: None,
             summary: &initial_summary,
             artifacts: &artifacts,
+            profile: &fake_profile,
+            disable_gripper_requested: fake_disable_gripper_requested,
             raw_can_enabled: self.raw_can_requested(),
             raw_can_finalizer_status: "running".to_string(),
             raw_clock: fake_raw_clock_manifest.clone(),
@@ -782,7 +793,7 @@ impl FakeCollectorHarness {
         );
         let writer_flush_timeout = Duration::from_millis(fake_profile.writer.flush_timeout_ms);
         let controller = SvsController::with_shared(
-            fake_profile,
+            fake_profile.clone(),
             fake_dual_arm_calibration(),
             Arc::clone(&stager),
             Arc::clone(&dynamics_slot),
@@ -838,6 +849,8 @@ impl FakeCollectorHarness {
                         ended_unix_ns: None,
                         summary: &initial_summary,
                         artifacts: &artifacts,
+                        profile: &fake_profile,
+                        disable_gripper_requested: fake_disable_gripper_requested,
                         raw_can_enabled: self.raw_can_requested(),
                         raw_can_finalizer_status: "running".to_string(),
                         raw_clock: fake_raw_clock_manifest.clone(),
@@ -946,6 +959,8 @@ impl FakeCollectorHarness {
             ended_unix_ns: Some(ENDED_UNIX_NS),
             summary: &summary,
             artifacts: &artifacts,
+            profile: &fake_profile,
+            disable_gripper_requested: fake_disable_gripper_requested,
             raw_can_enabled: raw_can.raw_can_status() != RawCanCaptureStatus::Disabled,
             raw_can_finalizer_status: raw_finalizer_status,
             raw_clock: fake_raw_clock_manifest,
@@ -2627,15 +2642,7 @@ fn build_real_manifest_base(inputs: RealManifestInputs<'_>) -> Result<RealEpisod
             hash_algorithm: "sha256".to_string(),
             sha256_hex: inputs.effective_profile_hash,
         },
-        gripper: GripperMirrorManifest {
-            mirror_enabled: profile.gripper.mirror_enabled,
-            disable_gripper_requested: inputs.disable_gripper_requested,
-            disable_gripper_effective: !profile.gripper.mirror_enabled,
-            update_divider: profile.gripper.update_divider,
-            position_deadband: profile.gripper.position_deadband,
-            effort_scale: profile.gripper.effort_scale,
-            max_feedback_age_ms: profile.gripper.max_feedback_age_ms,
-        },
+        gripper: gripper_manifest_from_profile(profile, inputs.disable_gripper_requested),
         calibration: CalibrationManifest {
             source_path: Some(PathBuf::from("calibration.toml")),
             hash_algorithm: "sha256".to_string(),
@@ -2906,41 +2913,39 @@ fn write_real_report(
         step_count: summary.step_count,
         last_step_index: summary.last_step_index,
         raw_clock: raw_clock_json,
-        dual_arm: DualArmReportJson {
-            iterations: report.iterations as u64,
-            read_faults: report.read_faults,
-            submission_faults: report.submission_faults,
-            last_submission_failed_arm: report
-                .last_submission_failed_arm
-                .map(|arm| format!("{arm:?}")),
-            peer_command_may_have_applied: report.peer_command_may_have_applied,
-            deadline_misses: report.deadline_misses,
-            max_inter_arm_skew_ns: duration_nanos_u64(report.max_inter_arm_skew),
-            max_real_dt_ns: duration_nanos_u64(report.max_real_dt),
-            max_cycle_lag_ns: duration_nanos_u64(report.max_cycle_lag),
-            left_tx_realtime_overwrites_total: report.left_tx_realtime_overwrites_total,
-            right_tx_realtime_overwrites_total: report.right_tx_realtime_overwrites_total,
-            left_tx_frames_sent_total: report.left_tx_frames_sent_total,
-            right_tx_frames_sent_total: report.right_tx_frames_sent_total,
-            left_tx_fault_aborts_total: report.left_tx_fault_aborts_total,
-            right_tx_fault_aborts_total: report.right_tx_fault_aborts_total,
-            last_runtime_fault_left: report
-                .last_runtime_fault_left
-                .map(|fault| format!("{fault:?}")),
-            last_runtime_fault_right: report
-                .last_runtime_fault_right
-                .map(|fault| format!("{fault:?}")),
-            exit_reason: report.exit_reason.map(|reason| format!("{reason:?}")),
-            left_stop_attempt: format!("{:?}", report.left_stop_attempt),
-            right_stop_attempt: format!("{:?}", report.right_stop_attempt),
-            last_error: report.last_error.clone(),
-        },
+        dual_arm: dual_arm_report_json_from_bilateral(report),
         writer: WriterReportJson::from(writer_stats),
     };
     report_json.validate()?;
     let text = serde_json::to_string_pretty(&report_json)?;
     write_new_file(context.episode_dir.join("report.json"), text.as_bytes())?;
     Ok(())
+}
+
+fn dual_arm_report_json_from_bilateral(report: &BilateralRunReport) -> DualArmReportJson {
+    DualArmReportJson {
+        iterations: report.iterations as u64,
+        read_faults: report.read_faults,
+        submission_faults: report.submission_faults,
+        last_submission_failed_arm: report.last_submission_failed_arm.map(|arm| format!("{arm:?}")),
+        peer_command_may_have_applied: report.peer_command_may_have_applied,
+        deadline_misses: report.deadline_misses,
+        max_inter_arm_skew_ns: duration_nanos_u64(report.max_inter_arm_skew),
+        max_real_dt_ns: duration_nanos_u64(report.max_real_dt),
+        max_cycle_lag_ns: duration_nanos_u64(report.max_cycle_lag),
+        left_tx_realtime_overwrites_total: report.left_tx_realtime_overwrites_total,
+        right_tx_realtime_overwrites_total: report.right_tx_realtime_overwrites_total,
+        left_tx_frames_sent_total: report.left_tx_frames_sent_total,
+        right_tx_frames_sent_total: report.right_tx_frames_sent_total,
+        left_tx_fault_aborts_total: report.left_tx_fault_aborts_total,
+        right_tx_fault_aborts_total: report.right_tx_fault_aborts_total,
+        last_runtime_fault_left: report.last_runtime_fault_left.map(|fault| format!("{fault:?}")),
+        last_runtime_fault_right: report.last_runtime_fault_right.map(|fault| format!("{fault:?}")),
+        exit_reason: report.exit_reason.map(|reason| format!("{reason:?}")),
+        left_stop_attempt: format!("{:?}", report.left_stop_attempt),
+        right_stop_attempt: format!("{:?}", report.right_stop_attempt),
+        last_error: report.last_error.clone(),
+    }
 }
 
 fn raw_clock_startup_final_failure_kind(report: &BilateralRunReport) -> Option<String> {
@@ -3486,6 +3491,8 @@ struct FakeManifestWrite<'a> {
     ended_unix_ns: Option<u64>,
     summary: &'a crate::episode::wire::StepFileSummary,
     artifacts: &'a PersistedArtifacts,
+    profile: &'a EffectiveProfile,
+    disable_gripper_requested: bool,
     raw_can_enabled: bool,
     raw_can_finalizer_status: String,
     raw_clock: Option<RawClockManifest>,
@@ -3657,9 +3664,9 @@ fn raw_clock_reason_from_fake_loop(
 
 fn persist_episode_inputs(
     episode_dir: &Path,
+    profile: &EffectiveProfile,
     raw_clock_startup_positions: Option<([f64; 6], [f64; 6])>,
 ) -> Result<PersistedArtifacts> {
-    let profile = fake_effective_profile();
     let effective_profile_bytes = profile.to_canonical_toml_bytes()?;
     let effective_profile_hash = sha256_hex(&effective_profile_bytes);
     write_new_file(
@@ -3692,6 +3699,8 @@ fn write_manifest(input: FakeManifestWrite<'_>) -> Result<()> {
     manifest.calibration.sha256_hex = input.artifacts.calibration_hash.clone();
     manifest.calibration.master_zero_rad = input.artifacts.calibration.master_zero_rad;
     manifest.calibration.slave_zero_rad = input.artifacts.calibration.slave_zero_rad;
+    manifest.gripper =
+        gripper_manifest_from_profile(input.profile, input.disable_gripper_requested);
     manifest.raw_can.enabled = input.raw_can_enabled;
     manifest.raw_can.finalizer_status = Some(input.raw_can_finalizer_status);
     manifest.raw_clock = input.raw_clock;
@@ -3705,6 +3714,8 @@ fn write_manifest(input: FakeManifestWrite<'_>) -> Result<()> {
 }
 
 fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
+    let raw_clock_bilateral_report =
+        input.raw_clock_report.as_ref().map(bilateral_report_from_raw_clock_for_svs);
     let raw_clock = match (
         input.raw_clock_report.as_ref(),
         input.raw_clock_settings.as_ref(),
@@ -3749,29 +3760,32 @@ fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
         step_count: input.summary.step_count,
         last_step_index: input.summary.last_step_index,
         raw_clock,
-        dual_arm: DualArmReportJson {
-            iterations: input.attempted_iterations.max(input.summary.step_count),
-            read_faults: 0,
-            submission_faults: 0,
-            last_submission_failed_arm: None,
-            peer_command_may_have_applied: false,
-            deadline_misses: 0,
-            max_inter_arm_skew_ns: 0,
-            max_real_dt_ns: 0,
-            max_cycle_lag_ns: 0,
-            left_tx_realtime_overwrites_total: 0,
-            right_tx_realtime_overwrites_total: 0,
-            left_tx_frames_sent_total: input.summary.step_count,
-            right_tx_frames_sent_total: input.summary.step_count,
-            left_tx_fault_aborts_total: 0,
-            right_tx_fault_aborts_total: 0,
-            last_runtime_fault_left: None,
-            last_runtime_fault_right: None,
-            exit_reason: input.exit_reason.map(|reason| format!("{reason:?}")),
-            left_stop_attempt: "ConfirmedSent".to_string(),
-            right_stop_attempt: "ConfirmedSent".to_string(),
-            last_error: input.last_error.clone(),
-        },
+        dual_arm: raw_clock_bilateral_report
+            .as_ref()
+            .map(dual_arm_report_json_from_bilateral)
+            .unwrap_or_else(|| DualArmReportJson {
+                iterations: input.attempted_iterations.max(input.summary.step_count),
+                read_faults: 0,
+                submission_faults: 0,
+                last_submission_failed_arm: None,
+                peer_command_may_have_applied: false,
+                deadline_misses: 0,
+                max_inter_arm_skew_ns: 0,
+                max_real_dt_ns: 0,
+                max_cycle_lag_ns: 0,
+                left_tx_realtime_overwrites_total: 0,
+                right_tx_realtime_overwrites_total: 0,
+                left_tx_frames_sent_total: input.summary.step_count,
+                right_tx_frames_sent_total: input.summary.step_count,
+                left_tx_fault_aborts_total: 0,
+                right_tx_fault_aborts_total: 0,
+                last_runtime_fault_left: None,
+                last_runtime_fault_right: None,
+                exit_reason: input.exit_reason.map(|reason| format!("{reason:?}")),
+                left_stop_attempt: "ConfirmedSent".to_string(),
+                right_stop_attempt: "ConfirmedSent".to_string(),
+                last_error: input.last_error.clone(),
+            }),
         writer: WriterReportJson::from(input.writer_stats),
     };
     report.validate()?;
@@ -4049,6 +4063,34 @@ fn fake_effective_profile() -> EffectiveProfile {
     profile.cue.w_u = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     profile.cue.w_r = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     profile
+}
+
+fn fake_effective_profile_for_harness(
+    runtime_kind: crate::raw_clock::SvsRuntimeKind,
+    raw_clock_gripper_mirror_enabled: bool,
+) -> EffectiveProfile {
+    let mut profile = fake_effective_profile();
+    if runtime_kind == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock
+        && !raw_clock_gripper_mirror_enabled
+    {
+        profile.gripper.mirror_enabled = false;
+    }
+    profile
+}
+
+fn gripper_manifest_from_profile(
+    profile: &EffectiveProfile,
+    disable_gripper_requested: bool,
+) -> GripperMirrorManifest {
+    GripperMirrorManifest {
+        mirror_enabled: profile.gripper.mirror_enabled,
+        disable_gripper_requested,
+        disable_gripper_effective: !profile.gripper.mirror_enabled,
+        update_divider: profile.gripper.update_divider,
+        position_deadband: profile.gripper.position_deadband,
+        effort_scale: profile.gripper.effort_scale,
+        max_feedback_age_ms: profile.gripper.max_feedback_age_ms,
+    }
 }
 
 fn merge_writer_stats(mut first: WriterStats, second: WriterStats) -> WriterStats {
