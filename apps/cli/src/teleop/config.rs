@@ -3,7 +3,8 @@
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use piper_client::dual_arm::{
-    BilateralLoopConfig, BilateralSubmissionMode, JointMirrorMap, LoopTimingMode,
+    BilateralLoopConfig, BilateralSubmissionMode, GripperMasterInputMode, JointMirrorMap,
+    LoopTimingMode,
 };
 use piper_client::types::{Joint, JointArray, NewtonMeter};
 use serde::{Deserialize, Serialize};
@@ -187,6 +188,10 @@ pub struct TeleopControlSettings {
 pub struct TeleopSafetySettings {
     pub profile: TeleopProfile,
     pub gripper_mirror: bool,
+    pub gripper_teach: bool,
+    pub gripper_effort: f64,
+    pub gripper_deadband: f64,
+    pub gripper_update_divider: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -532,6 +537,22 @@ impl ResolvedTeleopConfig {
             .or_else(|| file_calibration.and_then(|calibration| calibration.max_error_rad))
             .unwrap_or(MAX_CALIBRATION_ERROR_RAD);
         validate_calibration_max_error_rad(calibration_max_error_rad)?;
+        if args.gripper_teach && args.disable_gripper_mirror {
+            bail!("--gripper-teach cannot be combined with --disable-gripper-mirror");
+        }
+        if args.gripper_teach && !args.experimental_calibrated_raw {
+            bail!("--gripper-teach currently requires --experimental-calibrated-raw");
+        }
+        let gripper_defaults = piper_client::dual_arm::GripperTeleopConfig::default();
+        let gripper_effort = args.gripper_effort.unwrap_or(gripper_defaults.command_effort);
+        validate_range("gripper_effort", gripper_effort, 0.0, 1.0)?;
+        let gripper_deadband = args.gripper_deadband.unwrap_or(gripper_defaults.position_deadband);
+        validate_range("gripper_deadband", gripper_deadband, 0.0, 1.0)?;
+        let gripper_update_divider =
+            args.gripper_update_divider.unwrap_or(gripper_defaults.update_divider);
+        if gripper_update_divider == 0 {
+            bail!("gripper_update_divider must be >= 1");
+        }
 
         Ok(Self {
             control,
@@ -540,11 +561,15 @@ impl ResolvedTeleopConfig {
                     .profile
                     .or_else(|| file_safety.and_then(|safety| safety.profile))
                     .unwrap_or(TeleopProfile::Production),
-                gripper_mirror: if args.disable_gripper_mirror {
+                gripper_mirror: if args.gripper_teach || args.disable_gripper_mirror {
                     false
                 } else {
                     file_safety.and_then(|safety| safety.gripper_mirror).unwrap_or(true)
                 },
+                gripper_teach: args.gripper_teach,
+                gripper_effort,
+                gripper_deadband,
+                gripper_update_divider,
             },
             calibration: TeleopCalibrationSettings {
                 file: args
@@ -583,7 +608,13 @@ impl ResolvedTeleopConfig {
                 TeleopTimingMode::Spin => LoopTimingMode::Spin,
             };
         }
-        config.gripper.enabled = self.safety.gripper_mirror;
+        config.gripper.enabled = self.safety.gripper_mirror || self.safety.gripper_teach;
+        config.gripper.position_deadband = self.safety.gripper_deadband;
+        config.gripper.update_divider = self.safety.gripper_update_divider;
+        config.gripper.command_effort = self.safety.gripper_effort;
+        if self.safety.gripper_teach {
+            config.gripper.master_input_mode = GripperMasterInputMode::DisabledFeedback;
+        }
         config
     }
 }
@@ -1155,5 +1186,48 @@ mod tests {
         assert!(!loop_config.gripper.enabled);
         assert!(!cancel_signal.load(Ordering::Relaxed));
         assert!(loop_config.cancel_signal.is_some());
+    }
+
+    #[test]
+    fn loop_config_enables_disabled_feedback_gripper_teaching() {
+        let args = TeleopDualArmArgs {
+            gripper_teach: true,
+            experimental_calibrated_raw: true,
+            gripper_effort: Some(0.30),
+            gripper_deadband: Some(0.01),
+            gripper_update_divider: Some(2),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+        let resolved = ResolvedTeleopConfig::resolve(args, None).unwrap();
+        let cancel_signal = Arc::new(AtomicBool::new(false));
+
+        let loop_config = resolved.loop_config(cancel_signal);
+
+        assert!(loop_config.gripper.enabled);
+        assert!(!resolved.safety.gripper_mirror);
+        assert!(resolved.safety.gripper_teach);
+        assert_eq!(
+            loop_config.gripper.master_input_mode,
+            GripperMasterInputMode::DisabledFeedback
+        );
+        assert_eq!(loop_config.gripper.command_effort, 0.30);
+        assert_eq!(loop_config.gripper.position_deadband, 0.01);
+        assert_eq!(loop_config.gripper.update_divider, 2);
+    }
+
+    #[test]
+    fn gripper_teach_requires_experimental_raw_clock() {
+        let args = TeleopDualArmArgs {
+            gripper_teach: true,
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let error = ResolvedTeleopConfig::resolve(args, None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--gripper-teach currently requires --experimental-calibrated-raw")
+        );
     }
 }

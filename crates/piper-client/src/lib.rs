@@ -55,9 +55,9 @@ pub use dual_arm::{
     BilateralDynamicsCompensator, BilateralExitReason, BilateralLoopConfig, BilateralRunReport,
     DualArmActiveMit, DualArmBuilder, DualArmCalibration, DualArmError, DualArmErrorState,
     DualArmHoldAnchor, DualArmLoopExit, DualArmObserver, DualArmReadPolicy, DualArmRuntimeHealth,
-    DualArmSafetyConfig, DualArmSnapshot, GripperTeleopConfig, JointMirrorMap,
-    JointSpaceBilateralController, LoopTimingMode, MasterFollowerController, StopAttemptResult,
-    SubmissionArm,
+    DualArmSafetyConfig, DualArmSnapshot, GripperMasterInputMode, GripperTeleopConfig,
+    JointMirrorMap, JointSpaceBilateralController, LoopTimingMode, MasterFollowerController,
+    StopAttemptResult, SubmissionArm,
 };
 pub use dual_arm_raw_clock::{
     ExperimentalRawClockConfig, ExperimentalRawClockDualArmActive,

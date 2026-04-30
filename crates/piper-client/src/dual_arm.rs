@@ -956,12 +956,21 @@ impl Default for DualArmSafetyConfig {
 }
 
 /// 夹爪镜像策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GripperMasterInputMode {
+    #[default]
+    Feedback,
+    DisabledFeedback,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GripperTeleopConfig {
     pub enabled: bool,
     pub update_divider: usize,
     pub position_deadband: f64,
     pub effort_scale: f64,
+    pub command_effort: f64,
+    pub master_input_mode: GripperMasterInputMode,
     pub max_feedback_age: Duration,
 }
 
@@ -972,6 +981,8 @@ impl Default for GripperTeleopConfig {
             update_divider: 4,
             position_deadband: 0.02,
             effort_scale: 1.0,
+            command_effort: 0.3,
+            master_input_mode: GripperMasterInputMode::Feedback,
             max_feedback_age: Duration::from_millis(100),
         }
     }
@@ -3747,6 +3758,7 @@ mod tests {
             position_deadband: 0.02,
             effort_scale: 1.0,
             max_feedback_age: Duration::from_secs(1),
+            ..GripperTeleopConfig::default()
         };
 
         let exit = arms

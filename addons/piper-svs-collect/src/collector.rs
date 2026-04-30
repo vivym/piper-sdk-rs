@@ -2983,6 +2983,7 @@ fn bilateral_loop_config_from_profile(
             position_deadband: profile.gripper.position_deadband,
             effort_scale: profile.gripper.effort_scale,
             max_feedback_age: Duration::from_millis(profile.gripper.max_feedback_age_ms),
+            ..GripperTeleopConfig::default()
         },
         master_interaction_lpf_cutoff_hz: profile.control.master_interaction_lpf_cutoff_hz,
         master_interaction_limit: JointArray::new(

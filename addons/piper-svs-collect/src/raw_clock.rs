@@ -679,6 +679,7 @@ mod tests {
                 position_deadband: 0.03,
                 effort_scale: 1.25,
                 max_feedback_age: Duration::from_millis(250),
+                ..GripperTeleopConfig::default()
             },
             master_interaction_lpf_cutoff_hz: 11.0,
             master_interaction_limit: JointArray::splat(NewtonMeter(1.2)),

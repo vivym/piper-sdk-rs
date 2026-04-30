@@ -45,6 +45,10 @@ RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES="${RAW_CLOCK_ALIGNMENT_BUFF
 RAW_CLOCK_SKEW_US="${RAW_CLOCK_SKEW_US:-20000}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-300}"
 DISABLE_GRIPPER_MIRROR="${DISABLE_GRIPPER_MIRROR:-1}"
+GRIPPER_TEACH="${GRIPPER_TEACH:-0}"
+GRIPPER_EFFORT="${GRIPPER_EFFORT:-0.30}"
+GRIPPER_DEADBAND="${GRIPPER_DEADBAND:-0.02}"
+GRIPPER_UPDATE_DIVIDER="${GRIPPER_UPDATE_DIVIDER:-4}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 MASTER_GRAVITY_MODEL="${MASTER_GRAVITY_MODEL:-}"
@@ -87,7 +91,14 @@ cmd=(
     --report-json "${REPORT_JSON}"
 )
 
-if [[ "${DISABLE_GRIPPER_MIRROR}" == "1" ]]; then
+if [[ "${GRIPPER_TEACH}" == "1" ]]; then
+    cmd+=(
+        --gripper-teach
+        --gripper-effort "${GRIPPER_EFFORT}"
+        --gripper-deadband "${GRIPPER_DEADBAND}"
+        --gripper-update-divider "${GRIPPER_UPDATE_DIVIDER}"
+    )
+elif [[ "${DISABLE_GRIPPER_MIRROR}" == "1" ]]; then
     cmd+=(--disable-gripper-mirror)
 fi
 
@@ -136,6 +147,10 @@ fi
     echo "raw_clock_skew_us=${RAW_CLOCK_SKEW_US}"
     echo "max_iterations=${MAX_ITERATIONS}"
     echo "disable_gripper_mirror=${DISABLE_GRIPPER_MIRROR}"
+    echo "gripper_teach=${GRIPPER_TEACH}"
+    echo "gripper_effort=${GRIPPER_EFFORT}"
+    echo "gripper_deadband=${GRIPPER_DEADBAND}"
+    echo "gripper_update_divider=${GRIPPER_UPDATE_DIVIDER}"
     echo "skip_build=${SKIP_BUILD}"
     echo "master_gravity_model=${MASTER_GRAVITY_MODEL}"
     echo "slave_gravity_model=${SLAVE_GRAVITY_MODEL}"
@@ -167,6 +182,10 @@ if [[ "${MODE}" == "bilateral" ]]; then
 else
     echo "Master-follower input is read from ${MASTER_IFACE}; move that physical arm."
     echo "If that is not the physical master arm, swap MASTER_IFACE/SLAVE_IFACE and rerun."
+fi
+if [[ "${GRIPPER_TEACH}" == "1" ]]; then
+    echo "Gripper teach: master gripper is kept disabled and its feedback drives the follower gripper."
+    echo "Current GRIPPER_EFFORT=${GRIPPER_EFFORT}; stop if the follower gripper motion is unsafe."
 fi
 echo "This script intentionally does not pass --yes; the CLI will require operator confirmation."
 echo "After yes, the CLI refreshes raw-clock timing before enabling the arms."

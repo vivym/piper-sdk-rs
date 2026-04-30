@@ -67,6 +67,14 @@ pub struct TeleopDualArmArgs {
     #[arg(long)]
     pub disable_gripper_mirror: bool,
     #[arg(long)]
+    pub gripper_teach: bool,
+    #[arg(long)]
+    pub gripper_effort: Option<f64>,
+    #[arg(long)]
+    pub gripper_deadband: Option<f64>,
+    #[arg(long)]
+    pub gripper_update_divider: Option<usize>,
+    #[arg(long)]
     pub calibration_file: Option<PathBuf>,
     #[arg(long)]
     pub calibration_max_error_rad: Option<f64>,
@@ -147,6 +155,10 @@ impl TeleopDualArmArgs {
             master_gravity_assist_ratio: None,
             slave_gravity_assist_ratio: None,
             disable_gripper_mirror: false,
+            gripper_teach: false,
+            gripper_effort: None,
+            gripper_deadband: None,
+            gripper_update_divider: None,
             calibration_file: None,
             calibration_max_error_rad: None,
             joint_map: None,

@@ -132,18 +132,19 @@ impl<'a> RawCommander<'a> {
 
     /// 控制夹爪（无锁）
     pub(crate) fn send_gripper_command(&self, position: f64, effort: f64) -> Result<()> {
-        // ✅ 移除 state_tracker 检查（Type State 已保证状态正确）
+        self.send_gripper_command_with_enable(position, effort, true)
+    }
 
+    pub(crate) fn send_gripper_command_with_enable(
+        &self,
+        position: f64,
+        effort: f64,
+        enable: bool,
+    ) -> Result<()> {
         let position_mm = position * GRIPPER_POSITION_SCALE;
         let torque_nm = effort * GRIPPER_FORCE_SCALE;
-        let enable = true;
-
         let cmd = GripperControlCommand::new(position_mm, torque_nm, enable);
-        let frame = cmd.to_frame();
-
-        // ✅ 直接调用，无锁
-        self.driver.send_reliable(frame)?;
-
+        self.driver.send_reliable(cmd.to_frame())?;
         Ok(())
     }
 

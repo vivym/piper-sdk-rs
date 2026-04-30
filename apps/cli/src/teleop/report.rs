@@ -61,6 +61,10 @@ pub struct ReportControl {
     pub master_damping: f64,
     pub reflection_gain: f64,
     pub gripper_mirror: bool,
+    pub gripper_teach: bool,
+    pub gripper_effort: f64,
+    pub gripper_deadband: f64,
+    pub gripper_update_divider: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -237,6 +241,10 @@ impl TeleopJsonReport {
                 master_damping: input.control.master_damping,
                 reflection_gain: input.control.reflection_gain,
                 gripper_mirror: input.safety.gripper_mirror,
+                gripper_teach: input.safety.gripper_teach,
+                gripper_effort: input.safety.gripper_effort,
+                gripper_deadband: input.safety.gripper_deadband,
+                gripper_update_divider: input.safety.gripper_update_divider,
             },
             calibration: input.calibration,
             gravity: input.gravity,
@@ -1231,6 +1239,10 @@ mod tests {
             safety: TeleopSafetySettings {
                 profile: TeleopProfile::Production,
                 gripper_mirror: true,
+                gripper_teach: false,
+                gripper_effort: 0.3,
+                gripper_deadband: 0.02,
+                gripper_update_divider: 4,
             },
             calibration: ReportCalibration {
                 source: "file".to_string(),

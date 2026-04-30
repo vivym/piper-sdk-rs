@@ -17,12 +17,12 @@ use thiserror::Error;
 
 use crate::dual_arm::{
     BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
-    BilateralDynamicsCompensator, BilateralFinalTorques, BilateralLoopTelemetrySink,
-    BilateralLoopTimingTelemetry, BilateralOutputShapingConfig, BilateralOutputShapingState,
-    DualArmCalibration, DualArmSafetyConfig, DualArmSnapshot, GripperTeleopConfig,
-    MasterFollowerController, StopAttemptResult, apply_output_shaping, assemble_final_torques,
-    build_gripper_telemetry, clamp_control_dt_us, deadline_missed_after_submission,
-    duration_micros_u64,
+    BilateralDynamicsCompensator, BilateralFinalTorques, BilateralGripperCommandStatus,
+    BilateralLoopTelemetrySink, BilateralLoopTimingTelemetry, BilateralOutputShapingConfig,
+    BilateralOutputShapingState, DualArmCalibration, DualArmSafetyConfig, DualArmSnapshot,
+    GripperMasterInputMode, GripperTeleopConfig, MasterFollowerController, StopAttemptResult,
+    apply_output_shaping, assemble_final_torques, build_gripper_telemetry, clamp_control_dt_us,
+    deadline_missed_after_submission, duration_micros_u64,
 };
 use crate::observer::{
     ControlReadPolicy, ControlSnapshot, ControlSnapshotFull, DEFAULT_CONTROL_MAX_FEEDBACK_AGE,
@@ -1779,6 +1779,19 @@ trait RawClockRuntimeIo: Sized {
         )
     }
 
+    fn disable_master_gripper(&mut self, _timeout: Duration) -> RobotResult<()> {
+        Ok(())
+    }
+
+    fn command_slave_gripper(
+        &mut self,
+        _position: f64,
+        _effort: f64,
+        _timeout: Duration,
+    ) -> RobotResult<()> {
+        Ok(())
+    }
+
     fn submit_command_with_receipt(
         &mut self,
         command: &BilateralCommand,
@@ -1940,6 +1953,20 @@ impl RawClockRuntimeIo for RealRawClockRuntimeIo {
             self.master.observer().gripper_state(),
             self.slave.observer().gripper_state(),
         )
+    }
+
+    fn disable_master_gripper(&mut self, _timeout: Duration) -> RobotResult<()> {
+        RawCommander::new(&self.master.driver).send_gripper_command_with_enable(0.0, 0.0, false)
+    }
+
+    fn command_slave_gripper(
+        &mut self,
+        position: f64,
+        effort: f64,
+        _timeout: Duration,
+    ) -> RobotResult<()> {
+        RawCommander::new(&self.slave.driver)
+            .send_gripper_command_with_enable(position, effort, true)
     }
 
     fn submit_command(
@@ -2440,15 +2467,49 @@ where
             report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
         });
     }
-    if cfg.gripper.enabled {
+    if cfg.gripper.update_divider == 0 {
         let report = fault_report_from_timing(
             &timing,
             0,
             &RawClockJointMotionAccumulator::default(),
             &RawClockTorqueDiagnosticsAccumulator::default(),
             RawClockRuntimeExitReason::RuntimeConfigFault,
-            "raw-clock gripper mirroring is not implemented; pass disabled gripper config"
-                .to_string(),
+            "raw-clock gripper.update_divider must be >= 1".to_string(),
+            |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
+        );
+        let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+        return Ok(RawClockCoreExit::Faulted {
+            arms: fault.arms,
+            report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+        });
+    }
+    if cfg.gripper.enabled
+        && cfg.gripper.master_input_mode != GripperMasterInputMode::DisabledFeedback
+    {
+        let report = fault_report_from_timing(
+            &timing,
+            0,
+            &RawClockJointMotionAccumulator::default(),
+            &RawClockTorqueDiagnosticsAccumulator::default(),
+            RawClockRuntimeExitReason::RuntimeConfigFault,
+            "raw-clock gripper mirroring requires master_input_mode=disabled-feedback".to_string(),
+            |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
+        );
+        let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+        return Ok(RawClockCoreExit::Faulted {
+            arms: fault.arms,
+            report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+        });
+    }
+    if !cfg.gripper.command_effort.is_finite() || !(0.0..=1.0).contains(&cfg.gripper.command_effort)
+    {
+        let report = fault_report_from_timing(
+            &timing,
+            0,
+            &RawClockJointMotionAccumulator::default(),
+            &RawClockTorqueDiagnosticsAccumulator::default(),
+            RawClockRuntimeExitReason::RuntimeConfigFault,
+            "raw-clock gripper.command_effort must be finite and in [0, 1]".to_string(),
             |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
         );
         let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
@@ -2469,6 +2530,26 @@ where
     let mut torque_diagnostics = RawClockTorqueDiagnosticsAccumulator::default();
     let mut previous_control_frame_host_mono_us: Option<u64> = None;
     let mut shaping_state = BilateralOutputShapingState::default();
+    let mut gripper_counter = 0usize;
+
+    if cfg.gripper.enabled
+        && let Err(error) = io.disable_master_gripper(cfg.command_timeout)
+    {
+        let report = fault_report_from_timing(
+            &timing,
+            0,
+            &RawClockJointMotionAccumulator::default(),
+            &RawClockTorqueDiagnosticsAccumulator::default(),
+            RawClockRuntimeExitReason::RuntimeTransportFault,
+            format!("failed to disable master gripper before teleop: {error}"),
+            |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
+        );
+        let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+        return Ok(RawClockCoreExit::Faulted {
+            arms: fault.arms,
+            report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+        });
+    }
 
     if let Some(compensator) = compensator.as_deref_mut()
         && let Err(error) = compensator.reset()
@@ -2937,19 +3018,13 @@ where
                 .saturating_add(nominal_period_us),
             deadline_missed: raw_dt_us > max_dt_us,
         };
-        let gripper = if collect_telemetry {
-            let (master_gripper, slave_gripper) = io.gripper_states();
-            Some(build_gripper_telemetry(
-                &cfg.gripper,
-                false,
-                master_gripper,
-                slave_gripper,
-                control_frame_host_mono_us,
-            ))
+        let gripper_states = if cfg.gripper.enabled || collect_telemetry {
+            let states = io.gripper_states();
+            let reference_host_mono_us = piper_can::monotonic_micros();
+            Some((states, reference_host_mono_us))
         } else {
             None
         };
-
         let receipt_result = if collect_telemetry {
             io.submit_command_with_receipt(&command, &final_torques, cfg.command_timeout)
         } else {
@@ -2985,6 +3060,63 @@ where
                     report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
                 });
             },
+        };
+
+        gripper_counter += 1;
+        let mirror_enabled =
+            cfg.gripper.enabled && gripper_counter.is_multiple_of(cfg.gripper.update_divider);
+        let gripper = if let Some(((master_gripper, slave_gripper), reference_host_mono_us)) =
+            gripper_states
+        {
+            let mut gripper = build_gripper_telemetry(
+                &cfg.gripper,
+                mirror_enabled,
+                master_gripper,
+                slave_gripper,
+                reference_host_mono_us,
+            );
+            if mirror_enabled {
+                if let Err(error) = io.disable_master_gripper(cfg.command_timeout) {
+                    let report = fault_report_from_timing(
+                        &timing,
+                        iterations,
+                        &joint_motion,
+                        &torque_diagnostics,
+                        RawClockRuntimeExitReason::RuntimeTransportFault,
+                        format!("failed to keep master gripper disabled: {error}"),
+                        |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
+                    );
+                    let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                    return Ok(RawClockCoreExit::Faulted {
+                        arms: fault.arms,
+                        report: report
+                            .with_shutdown(fault.shutdown)
+                            .with_telemetry(fault.telemetry),
+                    });
+                }
+                gripper.command_status = BilateralGripperCommandStatus::Skipped;
+                if gripper.master_available && gripper.slave_available {
+                    gripper.command_position = gripper.master_position;
+                    gripper.command_effort = cfg.gripper.command_effort;
+                    if (gripper.master_position - gripper.slave_position).abs()
+                        < cfg.gripper.position_deadband
+                    {
+                        gripper.command_status = BilateralGripperCommandStatus::Skipped;
+                    } else {
+                        gripper.command_status = match io.command_slave_gripper(
+                            gripper.command_position,
+                            gripper.command_effort,
+                            cfg.command_timeout,
+                        ) {
+                            Ok(()) => BilateralGripperCommandStatus::Sent,
+                            Err(_) => BilateralGripperCommandStatus::Failed,
+                        };
+                    }
+                }
+            }
+            Some(gripper)
+        } else {
+            None
         };
 
         previous_control_frame_host_mono_us = Some(control_frame_host_mono_us);
@@ -4865,6 +4997,7 @@ mod tests {
         command_log: Mutex<Vec<&'static str>>,
         commands: Mutex<Vec<BilateralCommand>>,
         submitted_final_torques: Mutex<Vec<BilateralFinalTorques>>,
+        slave_gripper_commands: Mutex<Vec<(f64, f64)>>,
         disable_attempts: Mutex<Vec<&'static str>>,
         fault_shutdowns: AtomicUsize,
     }
@@ -4994,6 +5127,30 @@ mod tests {
 
         fn gripper_states(&self) -> (crate::observer::GripperState, crate::observer::GripperState) {
             (self.master_gripper, self.slave_gripper)
+        }
+
+        fn disable_master_gripper(&mut self, _timeout: Duration) -> RobotResult<()> {
+            self.state
+                .command_log
+                .lock()
+                .expect("command log lock")
+                .push("master_gripper_disable");
+            Ok(())
+        }
+
+        fn command_slave_gripper(
+            &mut self,
+            position: f64,
+            effort: f64,
+            _timeout: Duration,
+        ) -> RobotResult<()> {
+            self.state.command_log.lock().expect("command log lock").push("slave_gripper");
+            self.state
+                .slave_gripper_commands
+                .lock()
+                .expect("slave gripper commands lock")
+                .push((position, effort));
+            Ok(())
         }
 
         fn submit_command(
@@ -5735,6 +5892,177 @@ mod tests {
         );
         assert!(report.last_error.as_deref().unwrap_or_default().contains("gripper"));
         assert!(state.commands.lock().expect("commands lock").is_empty());
+    }
+
+    #[test]
+    fn raw_clock_gripper_teaching_disables_master_and_commands_slave() {
+        let sink = Arc::new(RecordingRawClockTelemetrySink::default());
+        while piper_can::monotonic_micros() < 10_000 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let gripper_host_us = piper_can::monotonic_micros().saturating_sub(1_000);
+        let io = FakeRuntimeIo::new()
+            .with_reads(ready_reads_for_iterations(1))
+            .with_gripper_states(
+                crate::observer::GripperState {
+                    position: 0.42,
+                    effort: 0.01,
+                    enabled: false,
+                    hardware_timestamp_us: gripper_host_us,
+                    host_rx_mono_us: gripper_host_us,
+                },
+                crate::observer::GripperState {
+                    position: 0.20,
+                    effort: 0.08,
+                    enabled: true,
+                    hardware_timestamp_us: gripper_host_us,
+                    host_rx_mono_us: gripper_host_us,
+                },
+            );
+        let state = io.state.clone();
+        let mut run_config = ExperimentalRawClockRunConfig {
+            telemetry_sink: Some(sink.clone()),
+            ..ExperimentalRawClockRunConfig::default()
+        };
+        run_config.gripper.enabled = true;
+        run_config.gripper.master_input_mode = GripperMasterInputMode::DisabledFeedback;
+        run_config.gripper.command_effort = 0.30;
+        run_config.gripper.update_divider = 1;
+
+        let (_state, report) = run_fake_runtime_with_controller_and_config(
+            io,
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            run_config,
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        assert_eq!(
+            state.command_log.lock().expect("command log lock").as_slice(),
+            &[
+                "master_gripper_disable",
+                "slave",
+                "master",
+                "master_gripper_disable",
+                "slave_gripper",
+            ]
+        );
+        assert_eq!(
+            state
+                .slave_gripper_commands
+                .lock()
+                .expect("slave gripper commands lock")
+                .as_slice(),
+            &[(0.42, 0.30)]
+        );
+        let rows = sink.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].gripper.mirror_enabled);
+        assert_eq!(
+            rows[0].gripper.command_status,
+            BilateralGripperCommandStatus::Sent
+        );
+        assert_eq!(rows[0].gripper.command_position, 0.42);
+        assert_eq!(rows[0].gripper.command_effort, 0.30);
+    }
+
+    #[test]
+    fn raw_clock_gripper_teaching_accepts_feedback_newer_than_aligned_control_frame() {
+        let sink = Arc::new(RecordingRawClockTelemetrySink::default());
+        while piper_can::monotonic_micros() < 100_000 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let base_host_us = piper_can::monotonic_micros().saturating_sub(50_000);
+        let mut timing = RawClockRuntimeTiming::new(thresholds_for_tests());
+        timing.seed_ready_for_tests(
+            &[
+                raw_clock_snapshot_for_tests(7_000, base_host_us + 7_000),
+                raw_clock_snapshot_for_tests(8_000, base_host_us + 8_000),
+                raw_clock_snapshot_for_tests(9_000, base_host_us + 9_000),
+                raw_clock_snapshot_for_tests(10_000, base_host_us + 10_000),
+            ],
+            &[
+                raw_clock_snapshot_for_tests(17_000, base_host_us + 7_800),
+                raw_clock_snapshot_for_tests(18_000, base_host_us + 8_800),
+                raw_clock_snapshot_for_tests(19_000, base_host_us + 9_800),
+                raw_clock_snapshot_for_tests(20_000, base_host_us + 10_800),
+            ],
+        );
+        for index in 0..4 {
+            let offset = index as u64 * 1_000;
+            push_alignment_sample_for_tests(
+                &mut timing,
+                base_host_us + 7_000 + offset,
+                raw_clock_snapshot_for_tests(7_000 + offset, base_host_us + 7_000 + offset),
+                base_host_us + 7_800 + offset,
+                raw_clock_snapshot_for_tests(17_000 + offset, base_host_us + 7_800 + offset),
+            );
+        }
+        let io = FakeRuntimeIo::new()
+            .with_reads(vec![FakeRead::pair(
+                raw_clock_snapshot_for_tests(12_000, base_host_us + 12_000),
+                raw_clock_snapshot_for_tests(22_000, base_host_us + 12_800),
+            )])
+            .with_gripper_states(
+                crate::observer::GripperState {
+                    position: 0.65,
+                    effort: 0.01,
+                    enabled: false,
+                    hardware_timestamp_us: base_host_us + 16_000,
+                    host_rx_mono_us: base_host_us + 16_000,
+                },
+                crate::observer::GripperState {
+                    position: 0.10,
+                    effort: 0.08,
+                    enabled: true,
+                    hardware_timestamp_us: base_host_us + 16_800,
+                    host_rx_mono_us: base_host_us + 16_800,
+                },
+            );
+        let state = io.state.clone();
+        let mut run_config = ExperimentalRawClockRunConfig {
+            telemetry_sink: Some(sink.clone()),
+            ..ExperimentalRawClockRunConfig::default()
+        };
+        run_config.gripper.enabled = true;
+        run_config.gripper.master_input_mode = GripperMasterInputMode::DisabledFeedback;
+        run_config.gripper.command_effort = 0.25;
+        run_config.gripper.update_divider = 1;
+
+        let (_state, report) = run_fake_runtime_with_controller_and_config(
+            io,
+            timing,
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            run_config,
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        assert_eq!(
+            state
+                .slave_gripper_commands
+                .lock()
+                .expect("slave gripper commands lock")
+                .as_slice(),
+            &[(0.65, 0.25)]
+        );
+        let rows = sink.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].gripper.master_available);
+        assert!(rows[0].gripper.slave_available);
+        assert_eq!(
+            rows[0].gripper.command_status,
+            BilateralGripperCommandStatus::Sent
+        );
     }
 
     #[test]

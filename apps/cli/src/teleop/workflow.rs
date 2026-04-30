@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use piper_client::dual_arm::{
     BilateralExitReason, BilateralLoopConfig, BilateralRunReport, DualArmActiveMit, DualArmBuilder,
     DualArmCalibration, DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby,
-    JointMirrorMap, StopAttemptResult,
+    GripperTeleopConfig, JointMirrorMap, StopAttemptResult,
 };
 use piper_client::dual_arm_raw_clock::{
     ExperimentalRawClockConfig, ExperimentalRawClockDualArmActive,
@@ -107,6 +107,7 @@ pub trait ExperimentalRawClockTeleopBackend {
         &mut self,
         settings: RuntimeTeleopSettingsHandle,
         raw_clock: TeleopRawClockSettings,
+        gripper: GripperTeleopConfig,
         compensator: Option<GravityCompensator>,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<ExperimentalRawClockRunExit>;
@@ -180,6 +181,7 @@ pub struct StartupSummary {
     pub calibration_path: Option<PathBuf>,
     pub calibration_joint_map: Option<TeleopJointMap>,
     pub gripper_mirror: bool,
+    pub gripper_teach: bool,
     pub experimental: bool,
     pub strict_realtime: bool,
     pub timing_source: Option<String>,
@@ -225,6 +227,7 @@ impl StartupSummary {
             calibration_path: None,
             calibration_joint_map: Some(TeleopJointMap::LeftRightMirror),
             gripper_mirror: false,
+            gripper_teach: false,
             experimental: true,
             strict_realtime: false,
             timing_source: Some(CALIBRATED_HW_RAW_TIMING_SOURCE.to_string()),
@@ -346,6 +349,7 @@ where
         calibration_joint_map: (report_calibration.source == "captured")
             .then_some(resolved.calibration.joint_map),
         gripper_mirror: resolved.safety.gripper_mirror,
+        gripper_teach: resolved.safety.gripper_teach,
         experimental: false,
         strict_realtime: true,
         timing_source: None,
@@ -535,6 +539,7 @@ where
         calibration_path: summary_calibration_path,
         calibration_joint_map: summary_calibration_joint_map,
         gripper_mirror: resolved.safety.gripper_mirror,
+        gripper_teach: resolved.safety.gripper_teach,
         experimental: true,
         strict_realtime: false,
         timing_source: Some(CALIBRATED_HW_RAW_TIMING_SOURCE.to_string()),
@@ -692,6 +697,7 @@ where
     let loop_exit = backend.run_raw_clock(
         settings_handle.clone(),
         resolved.raw_clock.clone(),
+        resolved.loop_config(cancel_signal.clone()).gripper,
         loaded_gravity.compensator,
         cancel_signal,
     )?;
@@ -1638,6 +1644,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         &mut self,
         settings: RuntimeTeleopSettingsHandle,
         raw_clock: TeleopRawClockSettings,
+        gripper: GripperTeleopConfig,
         compensator: Option<GravityCompensator>,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<ExperimentalRawClockRunExit> {
@@ -1653,6 +1660,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             command_timeout: Duration::from_millis(20),
             disable_config: DisableConfig::default(),
             cancel_signal: Some(cancel_signal),
+            gripper,
             ..ExperimentalRawClockRunConfig::default()
         };
 
@@ -2064,6 +2072,9 @@ fn write_startup_summary<W: Write>(mut writer: W, summary: &StartupSummary) -> R
         )?;
     }
     writeln!(writer, "  gripper mirror: {}", summary.gripper_mirror)?;
+    if summary.gripper_teach {
+        writeln!(writer, "  gripper teach: disabled-feedback")?;
+    }
     writeln!(writer, "  experimental={}", summary.experimental)?;
     writeln!(writer, "  strict_realtime={}", summary.strict_realtime)?;
     if let Some(timing_source) = &summary.timing_source {
@@ -2533,6 +2544,7 @@ mod tests {
             &mut self,
             settings: RuntimeTeleopSettingsHandle,
             _raw_clock: TeleopRawClockSettings,
+            _gripper: GripperTeleopConfig,
             compensator: Option<GravityCompensator>,
             _cancel_signal: Arc<AtomicBool>,
         ) -> Result<ExperimentalRawClockRunExit> {
