@@ -1404,36 +1404,7 @@ fn resolve_profile_from_args(args: &Args) -> Result<ResolvedProfile> {
 }
 
 fn load_effective_profile_overlay(overlay_text: &str) -> Result<EffectiveProfile> {
-    let default_text = String::from_utf8(EffectiveProfile::default().to_canonical_toml_bytes()?)
-        .context("default effective profile is not UTF-8")?;
-    let mut merged: toml::Value = toml::from_str(&default_text)?;
-    let overlay: toml::Value = toml::from_str(overlay_text)?;
-    merge_toml_overlay(&mut merged, overlay)?;
-    let profile: EffectiveProfile = merged.try_into()?;
-    Ok(profile)
-}
-
-fn merge_toml_overlay(base: &mut toml::Value, overlay: toml::Value) -> Result<()> {
-    match (base, overlay) {
-        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
-            for (key, value) in overlay_table {
-                match base_table.get_mut(&key) {
-                    Some(base_value) => merge_toml_overlay(base_value, value)
-                        .with_context(|| format!("invalid task profile override at {key}"))?,
-                    None => {
-                        return Err(anyhow!(
-                            "task profile override contains unknown key {key:?}"
-                        ));
-                    },
-                }
-            }
-            Ok(())
-        },
-        (base_value, overlay_value) => {
-            *base_value = overlay_value;
-            Ok(())
-        },
-    }
+    EffectiveProfile::from_overlay_toml(overlay_text).map_err(anyhow::Error::from)
 }
 
 fn apply_mirror_map_override(

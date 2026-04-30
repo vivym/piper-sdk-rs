@@ -4,6 +4,23 @@ use piper_sdk::JointMirrorMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::raw_clock::{
+    DEFAULT_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES,
+    DEFAULT_RAW_CLOCK_ALIGNMENT_LAG_US, DEFAULT_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US,
+    DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM, DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US,
+    DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS, DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES,
+    DEFAULT_RAW_CLOCK_RESIDUAL_MAX_US, DEFAULT_RAW_CLOCK_RESIDUAL_P95_US,
+    DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS, DEFAULT_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS,
+    DEFAULT_RAW_CLOCK_STATE_SKEW_MAX_US, DEFAULT_RAW_CLOCK_WARMUP_SECS,
+    MAX_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES, MAX_RAW_CLOCK_ALIGNMENT_LAG_US,
+    MAX_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US, MAX_RAW_CLOCK_DRIFT_ABS_PPM,
+    MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US, MAX_RAW_CLOCK_LAST_SAMPLE_AGE_MS,
+    MAX_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES, MAX_RAW_CLOCK_RESIDUAL_MAX_US,
+    MAX_RAW_CLOCK_RESIDUAL_P95_US, MAX_RAW_CLOCK_SAMPLE_GAP_MAX_MS,
+    MAX_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS, MAX_RAW_CLOCK_STATE_SKEW_MAX_US,
+    MAX_RAW_CLOCK_WARMUP_SECS,
+};
+
 const EPSILON_ORTHONORMAL: f64 = 1e-6;
 const MIRROR_MAP_KIND_LEFT_RIGHT: &str = "left-right";
 const MIRROR_MAP_KIND_CUSTOM: &str = "custom";
@@ -32,6 +49,8 @@ pub struct EffectiveProfile {
     pub dynamics: DynamicsProfile,
     pub control: ControlProfile,
     pub gripper: GripperProfile,
+    #[serde(default)]
+    pub raw_clock: RawClockProfile,
     pub writer: WriterProfile,
 }
 
@@ -149,6 +168,36 @@ pub struct GripperProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawClockProfile {
+    #[serde(default = "default_raw_clock_warmup_secs")]
+    pub warmup_secs: u64,
+    #[serde(default = "default_raw_clock_residual_p95_us")]
+    pub residual_p95_us: u64,
+    #[serde(default = "default_raw_clock_residual_max_us")]
+    pub residual_max_us: u64,
+    #[serde(default = "default_raw_clock_drift_abs_ppm")]
+    pub drift_abs_ppm: f64,
+    #[serde(default = "default_raw_clock_sample_gap_max_ms")]
+    pub sample_gap_max_ms: u64,
+    #[serde(default = "default_raw_clock_last_sample_age_ms")]
+    pub last_sample_age_ms: u64,
+    #[serde(default = "default_raw_clock_selected_sample_age_ms")]
+    pub selected_sample_age_ms: u64,
+    #[serde(default = "default_raw_clock_inter_arm_skew_max_us")]
+    pub inter_arm_skew_max_us: u64,
+    #[serde(default = "default_raw_clock_state_skew_max_us")]
+    pub state_skew_max_us: u64,
+    #[serde(default = "default_raw_clock_residual_max_consecutive_failures")]
+    pub residual_max_consecutive_failures: u32,
+    #[serde(default = "default_raw_clock_alignment_lag_us")]
+    pub alignment_lag_us: u64,
+    #[serde(default = "default_raw_clock_alignment_search_window_us")]
+    pub alignment_search_window_us: u64,
+    #[serde(default = "default_raw_clock_alignment_buffer_miss_consecutive_failures")]
+    pub alignment_buffer_miss_consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriterProfile {
     pub queue_capacity: usize,
     pub queue_full_stop_events: usize,
@@ -171,8 +220,24 @@ impl EffectiveProfile {
         self.dynamics.validate()?;
         self.control.validate()?;
         self.gripper.validate()?;
+        self.raw_clock.validate()?;
         self.writer.validate()?;
         Ok(())
+    }
+
+    pub fn from_overlay_toml(overlay_text: &str) -> Result<Self, ProfileError> {
+        let default_text = String::from_utf8(Self::default().to_canonical_toml_bytes()?)
+            .map_err(|error| ProfileError::Invalid(error.to_string()))?;
+        let mut merged: toml::Value = toml::from_str(&default_text)
+            .map_err(|error| ProfileError::Invalid(error.to_string()))?;
+        let overlay: toml::Value = toml::from_str(overlay_text)
+            .map_err(|error| ProfileError::Invalid(error.to_string()))?;
+        merge_toml_overlay(&mut merged, overlay)?;
+        let profile: Self = merged
+            .try_into()
+            .map_err(|error: toml::de::Error| ProfileError::Invalid(error.to_string()))?;
+        profile.validate()?;
+        Ok(profile)
     }
 
     pub fn to_canonical_toml_bytes(&self) -> Result<Vec<u8>, ProfileError> {
@@ -390,6 +455,57 @@ impl EffectiveProfile {
             self.gripper.max_feedback_age_ms,
         );
 
+        push_table(&mut out, "raw_clock");
+        push_u64_line(&mut out, "warmup_secs", self.raw_clock.warmup_secs);
+        push_u64_line(&mut out, "residual_p95_us", self.raw_clock.residual_p95_us);
+        push_u64_line(&mut out, "residual_max_us", self.raw_clock.residual_max_us);
+        push_f64_line(&mut out, "drift_abs_ppm", self.raw_clock.drift_abs_ppm);
+        push_u64_line(
+            &mut out,
+            "sample_gap_max_ms",
+            self.raw_clock.sample_gap_max_ms,
+        );
+        push_u64_line(
+            &mut out,
+            "last_sample_age_ms",
+            self.raw_clock.last_sample_age_ms,
+        );
+        push_u64_line(
+            &mut out,
+            "selected_sample_age_ms",
+            self.raw_clock.selected_sample_age_ms,
+        );
+        push_u64_line(
+            &mut out,
+            "inter_arm_skew_max_us",
+            self.raw_clock.inter_arm_skew_max_us,
+        );
+        push_u64_line(
+            &mut out,
+            "state_skew_max_us",
+            self.raw_clock.state_skew_max_us,
+        );
+        push_u32_line(
+            &mut out,
+            "residual_max_consecutive_failures",
+            self.raw_clock.residual_max_consecutive_failures,
+        );
+        push_u64_line(
+            &mut out,
+            "alignment_lag_us",
+            self.raw_clock.alignment_lag_us,
+        );
+        push_u64_line(
+            &mut out,
+            "alignment_search_window_us",
+            self.raw_clock.alignment_search_window_us,
+        );
+        push_u32_line(
+            &mut out,
+            "alignment_buffer_miss_consecutive_failures",
+            self.raw_clock.alignment_buffer_miss_consecutive_failures,
+        );
+
         push_table(&mut out, "writer");
         push_usize_line(&mut out, "queue_capacity", self.writer.queue_capacity);
         push_usize_line(
@@ -561,6 +677,79 @@ impl Default for GripperProfile {
             position_deadband: 0.02,
             effort_scale: 1.0,
             max_feedback_age_ms: 100,
+        }
+    }
+}
+
+fn default_raw_clock_warmup_secs() -> u64 {
+    DEFAULT_RAW_CLOCK_WARMUP_SECS
+}
+
+fn default_raw_clock_residual_p95_us() -> u64 {
+    DEFAULT_RAW_CLOCK_RESIDUAL_P95_US
+}
+
+fn default_raw_clock_residual_max_us() -> u64 {
+    DEFAULT_RAW_CLOCK_RESIDUAL_MAX_US
+}
+
+fn default_raw_clock_drift_abs_ppm() -> f64 {
+    DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM
+}
+
+fn default_raw_clock_sample_gap_max_ms() -> u64 {
+    DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS
+}
+
+fn default_raw_clock_last_sample_age_ms() -> u64 {
+    DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS
+}
+
+fn default_raw_clock_selected_sample_age_ms() -> u64 {
+    DEFAULT_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS
+}
+
+fn default_raw_clock_inter_arm_skew_max_us() -> u64 {
+    DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US
+}
+
+fn default_raw_clock_state_skew_max_us() -> u64 {
+    DEFAULT_RAW_CLOCK_STATE_SKEW_MAX_US
+}
+
+fn default_raw_clock_residual_max_consecutive_failures() -> u32 {
+    DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES
+}
+
+fn default_raw_clock_alignment_lag_us() -> u64 {
+    DEFAULT_RAW_CLOCK_ALIGNMENT_LAG_US
+}
+
+fn default_raw_clock_alignment_search_window_us() -> u64 {
+    DEFAULT_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US
+}
+
+fn default_raw_clock_alignment_buffer_miss_consecutive_failures() -> u32 {
+    DEFAULT_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES
+}
+
+impl Default for RawClockProfile {
+    fn default() -> Self {
+        Self {
+            warmup_secs: DEFAULT_RAW_CLOCK_WARMUP_SECS,
+            residual_p95_us: DEFAULT_RAW_CLOCK_RESIDUAL_P95_US,
+            residual_max_us: DEFAULT_RAW_CLOCK_RESIDUAL_MAX_US,
+            drift_abs_ppm: DEFAULT_RAW_CLOCK_DRIFT_ABS_PPM,
+            sample_gap_max_ms: DEFAULT_RAW_CLOCK_SAMPLE_GAP_MAX_MS,
+            last_sample_age_ms: DEFAULT_RAW_CLOCK_LAST_SAMPLE_AGE_MS,
+            selected_sample_age_ms: DEFAULT_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS,
+            inter_arm_skew_max_us: DEFAULT_RAW_CLOCK_INTER_ARM_SKEW_MAX_US,
+            state_skew_max_us: DEFAULT_RAW_CLOCK_STATE_SKEW_MAX_US,
+            residual_max_consecutive_failures: DEFAULT_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES,
+            alignment_lag_us: DEFAULT_RAW_CLOCK_ALIGNMENT_LAG_US,
+            alignment_search_window_us: DEFAULT_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US,
+            alignment_buffer_miss_consecutive_failures:
+                DEFAULT_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES,
         }
     }
 }
@@ -886,6 +1075,107 @@ impl GripperProfile {
     }
 }
 
+impl RawClockProfile {
+    fn validate(&self) -> Result<(), ProfileError> {
+        validate_u64_range(
+            "raw_clock.warmup_secs",
+            self.warmup_secs,
+            1,
+            MAX_RAW_CLOCK_WARMUP_SECS,
+        )?;
+        validate_u64_range(
+            "raw_clock.residual_p95_us",
+            self.residual_p95_us,
+            1,
+            MAX_RAW_CLOCK_RESIDUAL_P95_US,
+        )?;
+        validate_u64_range(
+            "raw_clock.residual_max_us",
+            self.residual_max_us,
+            1,
+            MAX_RAW_CLOCK_RESIDUAL_MAX_US,
+        )?;
+        validate_u64_range(
+            "raw_clock.sample_gap_max_ms",
+            self.sample_gap_max_ms,
+            1,
+            MAX_RAW_CLOCK_SAMPLE_GAP_MAX_MS,
+        )?;
+        validate_u64_range(
+            "raw_clock.last_sample_age_ms",
+            self.last_sample_age_ms,
+            1,
+            MAX_RAW_CLOCK_LAST_SAMPLE_AGE_MS,
+        )?;
+        validate_u64_range(
+            "raw_clock.selected_sample_age_ms",
+            self.selected_sample_age_ms,
+            1,
+            MAX_RAW_CLOCK_SELECTED_SAMPLE_AGE_MS,
+        )?;
+        validate_u64_range(
+            "raw_clock.inter_arm_skew_max_us",
+            self.inter_arm_skew_max_us,
+            1,
+            MAX_RAW_CLOCK_INTER_ARM_SKEW_MAX_US,
+        )?;
+        validate_u64_range(
+            "raw_clock.state_skew_max_us",
+            self.state_skew_max_us,
+            1,
+            MAX_RAW_CLOCK_STATE_SKEW_MAX_US,
+        )?;
+        validate_u64_range(
+            "raw_clock.alignment_lag_us",
+            self.alignment_lag_us,
+            1,
+            MAX_RAW_CLOCK_ALIGNMENT_LAG_US,
+        )?;
+        validate_u64_range(
+            "raw_clock.alignment_search_window_us",
+            self.alignment_search_window_us,
+            1,
+            MAX_RAW_CLOCK_ALIGNMENT_SEARCH_WINDOW_US,
+        )?;
+        if self.residual_p95_us > self.residual_max_us {
+            return invalid("raw_clock.residual_p95_us must be <= raw_clock.residual_max_us");
+        }
+        validate_positive("raw_clock.drift_abs_ppm", self.drift_abs_ppm)?;
+        if self.drift_abs_ppm > MAX_RAW_CLOCK_DRIFT_ABS_PPM {
+            return invalid("raw_clock.drift_abs_ppm is above supported maximum");
+        }
+        validate_u32_range(
+            "raw_clock.residual_max_consecutive_failures",
+            self.residual_max_consecutive_failures,
+            1,
+            MAX_RAW_CLOCK_RESIDUAL_MAX_CONSECUTIVE_FAILURES,
+        )?;
+        validate_u32_range(
+            "raw_clock.alignment_buffer_miss_consecutive_failures",
+            self.alignment_buffer_miss_consecutive_failures,
+            1,
+            MAX_RAW_CLOCK_ALIGNMENT_BUFFER_MISS_CONSECUTIVE_FAILURES,
+        )?;
+        if self.selected_sample_age_ms < self.last_sample_age_ms {
+            return invalid(
+                "raw_clock.selected_sample_age_ms must be >= raw_clock.last_sample_age_ms",
+            );
+        }
+        if self.alignment_lag_us >= self.selected_sample_age_ms.saturating_mul(1_000) {
+            return invalid("raw_clock.alignment_lag_us must be less than selected_sample_age_ms");
+        }
+        if self.alignment_lag_us >= self.last_sample_age_ms.saturating_mul(1_000) {
+            return invalid("raw_clock.alignment_lag_us must be less than last_sample_age_ms");
+        }
+        if self.inter_arm_skew_max_us > self.alignment_search_window_us {
+            return invalid(
+                "raw_clock.inter_arm_skew_max_us must be <= raw_clock.alignment_search_window_us",
+            );
+        }
+        Ok(())
+    }
+}
+
 impl WriterProfile {
     fn validate(&self) -> Result<(), ProfileError> {
         if self.queue_capacity == 0 {
@@ -940,6 +1230,22 @@ fn validate_range(name: &str, value: f64, min: f64, max: f64) -> Result<(), Prof
         Ok(())
     } else {
         invalid(format!("{name} must be in [{min}, {max}]"))
+    }
+}
+
+fn validate_u64_range(name: &str, value: u64, min: u64, max: u64) -> Result<(), ProfileError> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        invalid(format!("{name} must be in {min}..={max}"))
+    }
+}
+
+fn validate_u32_range(name: &str, value: u32, min: u32, max: u32) -> Result<(), ProfileError> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        invalid(format!("{name} must be in {min}..={max}"))
     }
 }
 
@@ -1033,6 +1339,32 @@ fn validate_dynamics_mode(name: &str, value: &str) -> Result<(), ProfileError> {
         Ok(())
     } else {
         invalid(format!("{name} is unsupported"))
+    }
+}
+
+fn merge_toml_overlay(base: &mut toml::Value, overlay: toml::Value) -> Result<(), ProfileError> {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, value) in overlay_table {
+                match base_table.get_mut(&key) {
+                    Some(base_value) => merge_toml_overlay(base_value, value).map_err(|error| {
+                        ProfileError::Invalid(format!(
+                            "invalid task profile override at {key}: {error}"
+                        ))
+                    })?,
+                    None => {
+                        return invalid(format!(
+                            "task profile override contains unknown key {key:?}"
+                        ));
+                    },
+                }
+            }
+            Ok(())
+        },
+        (base_value, overlay_value) => {
+            *base_value = overlay_value;
+            Ok(())
+        },
     }
 }
 
@@ -1220,5 +1552,31 @@ mod tests {
         profile.control.slave_feedforward_limit_nm[0] = 8.1;
 
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn raw_clock_profile_defaults_match_lab_settings() {
+        let profile = EffectiveProfile::default_for_tests();
+
+        assert_eq!(profile.raw_clock.warmup_secs, 10);
+        assert_eq!(profile.raw_clock.residual_p95_us, 2000);
+        assert_eq!(profile.raw_clock.residual_max_us, 3000);
+        assert_eq!(profile.raw_clock.sample_gap_max_ms, 50);
+        assert_eq!(profile.raw_clock.inter_arm_skew_max_us, 20_000);
+        assert_eq!(profile.raw_clock.state_skew_max_us, 10_000);
+        assert_eq!(profile.raw_clock.alignment_lag_us, 5_000);
+        assert_eq!(profile.raw_clock.alignment_search_window_us, 25_000);
+    }
+
+    #[test]
+    fn raw_clock_profile_rejects_alignment_lag_at_estimator_last_sample_age() {
+        let mut profile = EffectiveProfile::default_for_tests();
+        profile.raw_clock.last_sample_age_ms = 20;
+        profile.raw_clock.selected_sample_age_ms = 50;
+        profile.raw_clock.alignment_lag_us = 20_000;
+
+        let err = profile.validate().unwrap_err();
+
+        assert!(err.to_string().contains("last_sample_age_ms"));
     }
 }

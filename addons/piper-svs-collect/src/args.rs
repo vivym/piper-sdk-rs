@@ -45,6 +45,34 @@ pub struct Args {
     pub timing_mode: String,
     #[arg(long)]
     pub yes: bool,
+    #[arg(long)]
+    pub experimental_calibrated_raw: bool,
+    #[arg(long)]
+    pub raw_clock_warmup_secs: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_residual_p95_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_residual_max_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_drift_abs_ppm: Option<f64>,
+    #[arg(long)]
+    pub raw_clock_sample_gap_max_ms: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_last_sample_age_ms: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_selected_sample_age_ms: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_inter_arm_skew_max_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_state_skew_max_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_residual_max_consecutive_failures: Option<u32>,
+    #[arg(long)]
+    pub raw_clock_alignment_lag_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_alignment_search_window_us: Option<u64>,
+    #[arg(long)]
+    pub raw_clock_alignment_buffer_miss_consecutive_failures: Option<u32>,
 }
 
 #[cfg(test)]
@@ -69,6 +97,33 @@ mod tests {
             "wiping",
             "--operator",
             "viv",
+            "--experimental-calibrated-raw",
+            "--raw-clock-warmup-secs",
+            "12",
+            "--raw-clock-residual-p95-us",
+            "2100",
+            "--raw-clock-residual-max-us",
+            "3200",
+            "--raw-clock-drift-abs-ppm",
+            "750",
+            "--raw-clock-residual-max-consecutive-failures",
+            "4",
+            "--raw-clock-sample-gap-max-ms",
+            "60",
+            "--raw-clock-last-sample-age-ms",
+            "25",
+            "--raw-clock-selected-sample-age-ms",
+            "55",
+            "--raw-clock-inter-arm-skew-max-us",
+            "22000",
+            "--raw-clock-state-skew-max-us",
+            "11000",
+            "--raw-clock-alignment-lag-us",
+            "6000",
+            "--raw-clock-alignment-search-window-us",
+            "26000",
+            "--raw-clock-alignment-buffer-miss-consecutive-failures",
+            "5",
             "--yes",
         ])
         .expect("args should parse");
@@ -80,6 +135,23 @@ mod tests {
         assert_eq!(args.operator.as_deref(), Some("viv"));
         assert_eq!(args.task.as_deref(), Some("wiping"));
         assert_eq!(args.timing_mode, "spin");
+        assert!(args.experimental_calibrated_raw);
+        assert_eq!(args.raw_clock_warmup_secs, Some(12));
+        assert_eq!(args.raw_clock_residual_p95_us, Some(2100));
+        assert_eq!(args.raw_clock_residual_max_us, Some(3200));
+        assert_eq!(args.raw_clock_drift_abs_ppm, Some(750.0));
+        assert_eq!(args.raw_clock_residual_max_consecutive_failures, Some(4));
+        assert_eq!(args.raw_clock_sample_gap_max_ms, Some(60));
+        assert_eq!(args.raw_clock_last_sample_age_ms, Some(25));
+        assert_eq!(args.raw_clock_selected_sample_age_ms, Some(55));
+        assert_eq!(args.raw_clock_inter_arm_skew_max_us, Some(22_000));
+        assert_eq!(args.raw_clock_state_skew_max_us, Some(11_000));
+        assert_eq!(args.raw_clock_alignment_lag_us, Some(6_000));
+        assert_eq!(args.raw_clock_alignment_search_window_us, Some(26_000));
+        assert_eq!(
+            args.raw_clock_alignment_buffer_miss_consecutive_failures,
+            Some(5)
+        );
         assert!(args.yes);
     }
 }

@@ -35,3 +35,41 @@ fn starter_profiles_parse_and_validate() {
             .unwrap_or_else(|error| panic!("invalid profile {}: {error}", path.display()));
     }
 }
+
+#[test]
+fn profile_canonical_toml_accepts_raw_clock_table() {
+    let mut profile = piper_svs_collect::profile::EffectiveProfile::default_for_tests();
+    profile.raw_clock.warmup_secs = 11;
+    profile.raw_clock.residual_p95_us = 2_100;
+    profile.raw_clock.residual_max_us = 3_200;
+    let bytes = profile.to_canonical_toml_bytes().expect("profile should serialize");
+    let text = String::from_utf8(bytes).expect("canonical profile should be utf8");
+
+    assert!(text.contains("[raw_clock]"));
+    assert!(text.contains("warmup_secs = 11"));
+
+    let parsed: piper_svs_collect::profile::EffectiveProfile =
+        toml::from_str(&text).expect("profile should parse");
+    parsed.validate().expect("profile should validate");
+    assert_eq!(parsed.raw_clock.warmup_secs, 11);
+}
+
+#[test]
+fn profile_partial_raw_clock_table_uses_field_defaults() {
+    let text = r#"
+[raw_clock]
+warmup_secs = 12
+residual_p95_us = 2200
+"#;
+
+    let parsed: piper_svs_collect::profile::EffectiveProfile =
+        piper_svs_collect::profile::EffectiveProfile::from_overlay_toml(text)
+            .expect("partial raw_clock overlay should parse");
+
+    parsed.validate().expect("partial profile should validate");
+    assert_eq!(parsed.raw_clock.warmup_secs, 12);
+    assert_eq!(parsed.raw_clock.residual_p95_us, 2_200);
+    assert_eq!(parsed.raw_clock.residual_max_us, 3_000);
+    assert_eq!(parsed.raw_clock.alignment_lag_us, 5_000);
+    assert_eq!(parsed.raw_clock.alignment_search_window_us, 25_000);
+}

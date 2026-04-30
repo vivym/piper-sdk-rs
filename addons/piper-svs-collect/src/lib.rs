@@ -9,6 +9,7 @@ pub mod model_hash;
 pub mod mujoco_bridge;
 pub mod profile;
 pub mod raw_can;
+pub mod raw_clock;
 pub mod stiffness;
 pub mod target;
 pub mod tick_frame;
