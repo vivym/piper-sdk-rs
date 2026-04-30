@@ -1386,6 +1386,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             command_timeout: Duration::from_millis(20),
             disable_config: DisableConfig::default(),
             cancel_signal: Some(cancel_signal),
+            ..ExperimentalRawClockRunConfig::default()
         };
 
         match active.run_with_controller(controller, run_config) {

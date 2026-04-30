@@ -16,8 +16,11 @@ use piper_tools::raw_clock::{
 use thiserror::Error;
 
 use crate::dual_arm::{
-    BilateralCommand, BilateralControlFrame, BilateralController, DualArmCalibration,
-    DualArmSnapshot, MasterFollowerController, StopAttemptResult,
+    BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
+    BilateralDynamicsCompensator, BilateralFinalTorques, BilateralLoopTelemetrySink,
+    BilateralOutputShapingConfig, BilateralOutputShapingState, DualArmCalibration, DualArmSnapshot,
+    GripperTeleopConfig, MasterFollowerController, StopAttemptResult, apply_output_shaping,
+    assemble_final_torques, clamp_control_dt_us, duration_micros_u64,
 };
 use crate::observer::{
     ControlReadPolicy, ControlSnapshot, ControlSnapshotFull, DEFAULT_CONTROL_MAX_FEEDBACK_AGE,
@@ -32,6 +35,7 @@ use crate::state::{
 use crate::types::{JointArray, NewtonMeter, Rad, RadPerSecond, Result as RobotResult, RobotError};
 
 const FAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(20);
+const RAW_CLOCK_STATE_TRANSITION_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 const RAW_CLOCK_SKEW_RETAINED_SAMPLE_CAPACITY: usize = 4096;
 const RAW_CLOCK_WARMUP_FINAL_GRACE_MIN_US: u64 = 100_000;
 const RAW_CLOCK_WARMUP_FINAL_GRACE_MAX_US: u64 = 1_000_000;
@@ -507,6 +511,10 @@ pub enum RawClockRuntimeError {
     RuntimeTransportFault { details: String },
     #[error("controller fault: {0}")]
     Controller(String),
+    #[error("compensation fault: {0}")]
+    Compensation(String),
+    #[error("raw-clock telemetry sink fault: {0}")]
+    TelemetrySink(String),
     #[error("raw-clock runtime cancelled")]
     Cancelled,
     #[error(
@@ -1536,6 +1544,14 @@ struct RawClockFaultExit<Arms> {
     telemetry: RawClockRuntimeTelemetry,
 }
 
+enum RawClockDisableOutcome<StandbyArms, ErrorArms> {
+    Standby(RawClockStandbyExit<StandbyArms>),
+    Faulted {
+        error: RawClockRuntimeError,
+        fault: RawClockFaultExit<ErrorArms>,
+    },
+}
+
 enum RawClockCoreExit<StandbyArms, ErrorArms> {
     Standby {
         arms: StandbyArms,
@@ -1568,15 +1584,60 @@ trait RawClockRuntimeIo: Sized {
     fn submit_command(
         &mut self,
         command: &BilateralCommand,
+        final_torques: &BilateralFinalTorques,
         timeout: Duration,
     ) -> Result<(), RawClockRuntimeError>;
 
     fn disable_both(
         self,
         cfg: DisableConfig,
-    ) -> Result<RawClockStandbyExit<Self::StandbyArms>, RawClockRuntimeError>;
+        fault_timeout: Duration,
+    ) -> RawClockDisableOutcome<Self::StandbyArms, Self::ErrorArms>;
 
     fn fault_shutdown(self, timeout: Duration) -> RawClockFaultExit<Self::ErrorArms>;
+}
+
+trait RawClockDynamicsCompensator {
+    fn compute(
+        &mut self,
+        snapshot: &DualArmSnapshot,
+        dt: Duration,
+    ) -> std::result::Result<BilateralDynamicsCompensation, String>;
+
+    fn on_time_jump(&mut self, dt: Duration) -> std::result::Result<(), String>;
+
+    fn reset(&mut self) -> std::result::Result<(), String>;
+}
+
+struct RawClockCompensatorAdapter<C> {
+    inner: C,
+}
+
+impl<C> RawClockCompensatorAdapter<C> {
+    fn new(inner: C) -> Self {
+        Self { inner }
+    }
+}
+
+impl<C> RawClockDynamicsCompensator for RawClockCompensatorAdapter<C>
+where
+    C: BilateralDynamicsCompensator,
+{
+    fn compute(
+        &mut self,
+        snapshot: &DualArmSnapshot,
+        dt: Duration,
+    ) -> std::result::Result<BilateralDynamicsCompensation, String> {
+        self.inner.compute(snapshot, dt).map_err(|error| error.to_string())
+    }
+
+    fn on_time_jump(&mut self, dt: Duration) -> std::result::Result<(), String> {
+        self.inner.on_time_jump(dt).map_err(|error| error.to_string())
+    }
+
+    fn reset(&mut self) -> std::result::Result<(), String> {
+        self.inner.reset().map_err(|error| error.to_string())
+    }
 }
 
 impl RawClockRuntimeIo for RealRawClockRuntimeIo {
@@ -1607,16 +1668,24 @@ impl RawClockRuntimeIo for RealRawClockRuntimeIo {
     fn submit_command(
         &mut self,
         command: &BilateralCommand,
+        final_torques: &BilateralFinalTorques,
         timeout: Duration,
     ) -> Result<(), RawClockRuntimeError> {
-        submit_soft_realtime_command_detailed(&self.slave, &self.master, command, timeout)
+        submit_soft_realtime_command_detailed(
+            &self.slave,
+            &self.master,
+            command,
+            final_torques,
+            timeout,
+        )
     }
 
     fn disable_both(
         self,
         cfg: DisableConfig,
-    ) -> Result<RawClockStandbyExit<Self::StandbyArms>, RawClockRuntimeError> {
-        disable_soft_realtime_both(self.master, self.slave, cfg)
+        fault_timeout: Duration,
+    ) -> RawClockDisableOutcome<Self::StandbyArms, Self::ErrorArms> {
+        disable_soft_realtime_both_or_fault(self.master, self.slave, cfg, fault_timeout)
     }
 
     fn fault_shutdown(self, timeout: Duration) -> RawClockFaultExit<Self::ErrorArms> {
@@ -1668,6 +1737,56 @@ impl ExperimentalRawClockDualArmActive {
     where
         C: BilateralController,
     {
+        self.run_with_controller_and_optional_compensation(controller, None, cfg)
+    }
+
+    pub fn run_with_controller_and_compensation<C, D>(
+        self,
+        controller: C,
+        compensator: D,
+        cfg: ExperimentalRawClockRunConfig,
+    ) -> Result<ExperimentalRawClockRunExit, RawClockRuntimeError>
+    where
+        C: BilateralController,
+        D: BilateralDynamicsCompensator,
+    {
+        let mut compensator = RawClockCompensatorAdapter::new(compensator);
+        self.run_with_controller_and_optional_compensation(controller, Some(&mut compensator), cfg)
+    }
+
+    fn run_with_controller_and_optional_compensation<C>(
+        self,
+        controller: C,
+        compensator: Option<&mut dyn RawClockDynamicsCompensator>,
+        cfg: ExperimentalRawClockRunConfig,
+    ) -> Result<ExperimentalRawClockRunExit, RawClockRuntimeError>
+    where
+        C: BilateralController,
+    {
+        if let Err(error) = cfg.validate() {
+            let ExperimentalRawClockDualArmActive {
+                master,
+                slave,
+                timing,
+                config: _,
+            } = self;
+            let fault = fault_shutdown_soft_realtime(master, slave, FAULT_SHUTDOWN_TIMEOUT);
+            let mut report = timing
+                .report(
+                    piper_can::monotonic_micros(),
+                    0,
+                    Some(RawClockRuntimeExitReason::RuntimeConfigFault),
+                )
+                .with_shutdown(fault.shutdown)
+                .with_telemetry(fault.telemetry);
+            report.runtime_faults = report.runtime_faults.saturating_add(1);
+            report.last_error = Some(error.to_string());
+            return Ok(ExperimentalRawClockRunExit::Faulted {
+                arms: Box::new(fault.arms),
+                report,
+            });
+        }
+
         let ExperimentalRawClockDualArmActive {
             master,
             slave,
@@ -1680,7 +1799,7 @@ impl ExperimentalRawClockDualArmActive {
             config,
         };
 
-        match run_raw_clock_runtime_core(core, controller, cfg)? {
+        match run_raw_clock_runtime_core(core, controller, compensator, cfg)? {
             RawClockCoreExit::Standby {
                 arms,
                 timing,
@@ -1736,12 +1855,37 @@ fn master_follower_controller_with_gains(
         .with_master_damping(gains.master_damping)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExperimentalRawClockRunConfig {
     pub read_policy: ControlReadPolicy,
     pub command_timeout: Duration,
     pub disable_config: DisableConfig,
     pub cancel_signal: Option<Arc<AtomicBool>>,
+    pub dt_clamp_multiplier: f64,
+    pub telemetry_sink: Option<Arc<dyn BilateralLoopTelemetrySink>>,
+    pub gripper: GripperTeleopConfig,
+    pub output_shaping: Option<BilateralOutputShapingConfig>,
+}
+
+impl std::fmt::Debug for ExperimentalRawClockRunConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExperimentalRawClockRunConfig")
+            .field("read_policy", &self.read_policy)
+            .field("command_timeout", &self.command_timeout)
+            .field("disable_config", &self.disable_config)
+            .field(
+                "cancel_signal",
+                &self.cancel_signal.as_ref().map(|_| "<set>"),
+            )
+            .field("dt_clamp_multiplier", &self.dt_clamp_multiplier)
+            .field(
+                "telemetry_sink",
+                &self.telemetry_sink.as_ref().map(|_| "<set>"),
+            )
+            .field("gripper", &self.gripper)
+            .field("output_shaping", &self.output_shaping)
+            .finish()
+    }
 }
 
 impl Default for ExperimentalRawClockRunConfig {
@@ -1754,8 +1898,112 @@ impl Default for ExperimentalRawClockRunConfig {
             command_timeout: Duration::from_millis(20),
             disable_config: DisableConfig::default(),
             cancel_signal: None,
+            dt_clamp_multiplier: 2.0,
+            telemetry_sink: None,
+            gripper: GripperTeleopConfig {
+                enabled: false,
+                ..GripperTeleopConfig::default()
+            },
+            output_shaping: None,
         }
     }
+}
+
+impl ExperimentalRawClockRunConfig {
+    pub fn validate(&self) -> Result<(), RawClockRuntimeError> {
+        if self.command_timeout.is_zero() {
+            return Err(RawClockRuntimeError::Config(
+                "raw-clock command_timeout must be positive".to_string(),
+            ));
+        }
+        if !self.dt_clamp_multiplier.is_finite() || self.dt_clamp_multiplier <= 0.0 {
+            return Err(RawClockRuntimeError::Config(
+                "raw-clock dt_clamp_multiplier must be finite and positive".to_string(),
+            ));
+        }
+        if self.read_policy.max_state_skew_us == 0 {
+            return Err(RawClockRuntimeError::Config(
+                "raw-clock read_policy.max_state_skew_us must be positive".to_string(),
+            ));
+        }
+        if self.read_policy.max_feedback_age.is_zero() {
+            return Err(RawClockRuntimeError::Config(
+                "raw-clock read_policy.max_feedback_age must be positive".to_string(),
+            ));
+        }
+        if let Some(output_shaping) = &self.output_shaping {
+            validate_output_shaping_config(output_shaping)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_output_shaping_config(
+    cfg: &BilateralOutputShapingConfig,
+) -> Result<(), RawClockRuntimeError> {
+    validate_nonnegative_finite_f64(
+        cfg.master_interaction_lpf_cutoff_hz,
+        "raw-clock output_shaping.master_interaction_lpf_cutoff_hz",
+    )?;
+    validate_nonnegative_finite_newton_meter_array(
+        &cfg.master_interaction_limit,
+        "raw-clock output_shaping.master_interaction_limit",
+    )?;
+    validate_nonnegative_finite_newton_meter_array(
+        &cfg.slave_feedforward_limit,
+        "raw-clock output_shaping.slave_feedforward_limit",
+    )?;
+    validate_nonnegative_finite_newton_meter_array(
+        &cfg.master_interaction_slew_limit_nm_per_s,
+        "raw-clock output_shaping.master_interaction_slew_limit_nm_per_s",
+    )?;
+    validate_nonnegative_finite_f64_array(
+        &cfg.master_passivity_max_damping,
+        "raw-clock output_shaping.master_passivity_max_damping",
+    )?;
+    Ok(())
+}
+
+fn validate_nonnegative_finite_newton_meter_array(
+    values: &JointArray<NewtonMeter>,
+    name: &'static str,
+) -> Result<(), RawClockRuntimeError> {
+    for (index, value) in values.iter().copied().enumerate() {
+        validate_nonnegative_finite_f64(value.0, name).map_err(|_| {
+            RawClockRuntimeError::Config(format!(
+                "{name}[{}] must be finite and nonnegative",
+                index + 1
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_nonnegative_finite_f64_array(
+    values: &JointArray<f64>,
+    name: &'static str,
+) -> Result<(), RawClockRuntimeError> {
+    for (index, value) in values.iter().copied().enumerate() {
+        validate_nonnegative_finite_f64(value, name).map_err(|_| {
+            RawClockRuntimeError::Config(format!(
+                "{name}[{}] must be finite and nonnegative",
+                index + 1
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_nonnegative_finite_f64(
+    value: f64,
+    name: &'static str,
+) -> Result<(), RawClockRuntimeError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(RawClockRuntimeError::Config(format!(
+            "{name} must be finite and nonnegative"
+        )));
+    }
+    Ok(())
 }
 
 pub enum ExperimentalRawClockRunExit {
@@ -1798,6 +2046,7 @@ impl ReportShutdownExt for RawClockRuntimeReport {
 fn run_raw_clock_runtime_core<I, C>(
     core: RawClockRuntimeCore<I>,
     mut controller: C,
+    mut compensator: Option<&mut dyn RawClockDynamicsCompensator>,
     cfg: ExperimentalRawClockRunConfig,
 ) -> Result<RawClockCoreExit<I::StandbyArms, I::ErrorArms>, RawClockRuntimeError>
 where
@@ -1809,11 +2058,81 @@ where
         mut timing,
         config,
     } = core;
-    config.validate()?;
+    if let Err(error) = config.validate() {
+        let report = fault_report_from_timing(
+            &timing,
+            0,
+            &RawClockJointMotionAccumulator::default(),
+            RawClockRuntimeExitReason::RuntimeConfigFault,
+            error.to_string(),
+            |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
+        );
+        let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+        return Ok(RawClockCoreExit::Faulted {
+            arms: fault.arms,
+            report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+        });
+    }
+    if let Err(error) = cfg.validate() {
+        let report = fault_report_from_timing(
+            &timing,
+            0,
+            &RawClockJointMotionAccumulator::default(),
+            RawClockRuntimeExitReason::RuntimeConfigFault,
+            error.to_string(),
+            |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
+        );
+        let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+        return Ok(RawClockCoreExit::Faulted {
+            arms: fault.arms,
+            report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+        });
+    }
+    if cfg.gripper.enabled {
+        let report = fault_report_from_timing(
+            &timing,
+            0,
+            &RawClockJointMotionAccumulator::default(),
+            RawClockRuntimeExitReason::RuntimeConfigFault,
+            "raw-clock gripper mirroring is not implemented; pass disabled gripper config"
+                .to_string(),
+            |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
+        );
+        let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+        return Ok(RawClockCoreExit::Faulted {
+            arms: fault.arms,
+            report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+        });
+    }
     let nominal_period = Duration::from_secs_f64(1.0 / config.frequency_hz);
+    let nominal_period_us = duration_micros_u64(nominal_period).max(1);
+    let max_dt_us = ((nominal_period_us as f64) * cfg.dt_clamp_multiplier)
+        .ceil()
+        .max(1.0)
+        .min(u64::MAX as f64) as u64;
     let mut iterations = 0usize;
     let mut next_tick = Instant::now();
     let mut joint_motion = RawClockJointMotionAccumulator::default();
+    let mut previous_control_frame_host_mono_us: Option<u64> = None;
+    let mut shaping_state = BilateralOutputShapingState::default();
+
+    if let Some(compensator) = compensator.as_deref_mut()
+        && let Err(error) = compensator.reset()
+    {
+        let report = fault_report_from_timing(
+            &timing,
+            0,
+            &joint_motion,
+            RawClockRuntimeExitReason::CompensationFault,
+            error,
+            |report| report.compensation_faults = report.compensation_faults.saturating_add(1),
+        );
+        let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+        return Ok(RawClockCoreExit::Faulted {
+            arms: fault.arms,
+            report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+        });
+    }
 
     loop {
         if let Some(max_iterations) = config.max_iterations
@@ -1826,14 +2145,28 @@ where
             );
             report.iterations = iterations;
             attach_joint_motion(&mut report, &joint_motion);
-            let standby = io.disable_both(cfg.disable_config.clone())?;
-            report.apply_telemetry(standby.telemetry);
-            return Ok(RawClockCoreExit::Standby {
-                arms: standby.arms,
-                timing: Box::new(timing),
-                config: Box::new(config),
-                report,
-            });
+            return match io.disable_both(cfg.disable_config.clone(), FAULT_SHUTDOWN_TIMEOUT) {
+                RawClockDisableOutcome::Standby(standby) => {
+                    report.apply_telemetry(standby.telemetry);
+                    Ok(RawClockCoreExit::Standby {
+                        arms: standby.arms,
+                        timing: Box::new(timing),
+                        config: Box::new(config),
+                        report,
+                    })
+                },
+                RawClockDisableOutcome::Faulted { error, fault } => {
+                    report.exit_reason = Some(RawClockRuntimeExitReason::RuntimeTransportFault);
+                    report.last_error = Some(error.to_string());
+                    report.runtime_faults = report.runtime_faults.saturating_add(1);
+                    Ok(RawClockCoreExit::Faulted {
+                        arms: fault.arms,
+                        report: report
+                            .with_shutdown(fault.shutdown)
+                            .with_telemetry(fault.telemetry),
+                    })
+                },
+            };
         }
 
         if cfg.cancel_signal.as_ref().is_some_and(|signal| signal.load(Ordering::Acquire)) {
@@ -1844,14 +2177,28 @@ where
             );
             report.last_error = Some("raw-clock runtime cancelled".to_string());
             attach_joint_motion(&mut report, &joint_motion);
-            let standby = io.disable_both(cfg.disable_config.clone())?;
-            report.apply_telemetry(standby.telemetry);
-            return Ok(RawClockCoreExit::Standby {
-                arms: standby.arms,
-                timing: Box::new(timing),
-                config: Box::new(config),
-                report,
-            });
+            return match io.disable_both(cfg.disable_config.clone(), FAULT_SHUTDOWN_TIMEOUT) {
+                RawClockDisableOutcome::Standby(standby) => {
+                    report.apply_telemetry(standby.telemetry);
+                    Ok(RawClockCoreExit::Standby {
+                        arms: standby.arms,
+                        timing: Box::new(timing),
+                        config: Box::new(config),
+                        report,
+                    })
+                },
+                RawClockDisableOutcome::Faulted { error, fault } => {
+                    report.exit_reason = Some(RawClockRuntimeExitReason::RuntimeTransportFault);
+                    report.last_error = Some(error.to_string());
+                    report.runtime_faults = report.runtime_faults.saturating_add(1);
+                    Ok(RawClockCoreExit::Faulted {
+                        arms: fault.arms,
+                        report: report
+                            .with_shutdown(fault.shutdown)
+                            .with_telemetry(fault.telemetry),
+                    })
+                },
+            };
         }
 
         let now = Instant::now();
@@ -2052,11 +2399,83 @@ where
             &selection.slave.snapshot,
             inter_arm_skew_us,
         );
+        let control_frame_host_mono_us =
+            selection.master.host_rx_mono_us.max(selection.slave.host_rx_mono_us);
+        let raw_dt_us = previous_control_frame_host_mono_us
+            .map(|previous| control_frame_host_mono_us.saturating_sub(previous))
+            .unwrap_or(nominal_period_us);
+        let clamped_dt_us = clamp_control_dt_us(raw_dt_us, max_dt_us);
+        let control_dt = Duration::from_micros(clamped_dt_us);
+        if raw_dt_us > max_dt_us {
+            let raw_dt = Duration::from_micros(raw_dt_us);
+            if let Err(err) = controller.on_time_jump(raw_dt) {
+                let report = fault_report_from_timing(
+                    &timing,
+                    iterations,
+                    &joint_motion,
+                    RawClockRuntimeExitReason::ControllerFault,
+                    err.to_string(),
+                    |report| {
+                        report.controller_faults = report.controller_faults.saturating_add(1);
+                    },
+                );
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                return Ok(RawClockCoreExit::Faulted {
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+                });
+            }
+            if let Some(compensator) = compensator.as_deref_mut()
+                && let Err(error) = compensator.on_time_jump(raw_dt)
+            {
+                let report = fault_report_from_timing(
+                    &timing,
+                    iterations,
+                    &joint_motion,
+                    RawClockRuntimeExitReason::CompensationFault,
+                    error,
+                    |report| {
+                        report.compensation_faults = report.compensation_faults.saturating_add(1);
+                    },
+                );
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                return Ok(RawClockCoreExit::Faulted {
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+                });
+            }
+        }
+        let compensation = match compensator.as_deref_mut() {
+            Some(compensator) => match compensator.compute(&snapshot, control_dt) {
+                Ok(compensation) => Some(compensation),
+                Err(error) => {
+                    let report = fault_report_from_timing(
+                        &timing,
+                        iterations,
+                        &joint_motion,
+                        RawClockRuntimeExitReason::CompensationFault,
+                        error,
+                        |report| {
+                            report.compensation_faults =
+                                report.compensation_faults.saturating_add(1);
+                        },
+                    );
+                    let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                    return Ok(RawClockCoreExit::Faulted {
+                        arms: fault.arms,
+                        report: report
+                            .with_shutdown(fault.shutdown)
+                            .with_telemetry(fault.telemetry),
+                    });
+                },
+            },
+            None => None,
+        };
         let frame = BilateralControlFrame {
             snapshot,
-            compensation: None,
+            compensation,
         };
-        let command = match controller.tick_with_compensation(&frame, nominal_period) {
+        let mut command = match controller.tick_with_compensation(&frame, control_dt) {
             Ok(command) => command,
             Err(err) => {
                 let report = fault_report_from_timing(
@@ -2076,9 +2495,22 @@ where
                 });
             },
         };
-        joint_motion.record(&snapshot, &command);
+        let collect_telemetry = cfg.telemetry_sink.is_some();
+        let _controller_command = collect_telemetry.then(|| command.clone());
+        if let Some(shaping_cfg) = &cfg.output_shaping {
+            apply_output_shaping(
+                shaping_cfg,
+                &frame.snapshot,
+                control_dt,
+                &mut shaping_state,
+                &mut command,
+            );
+        }
+        let _shaped_command = collect_telemetry.then(|| command.clone());
+        let final_torques = assemble_final_torques(&command, frame.compensation);
+        joint_motion.record(&frame.snapshot, &command);
 
-        if let Err(err) = io.submit_command(&command, cfg.command_timeout) {
+        if let Err(err) = io.submit_command(&command, &final_torques, cfg.command_timeout) {
             let report = fault_report_from_timing(
                 &timing,
                 iterations,
@@ -2105,6 +2537,7 @@ where
             });
         }
 
+        previous_control_frame_host_mono_us = Some(control_frame_host_mono_us);
         iterations = iterations.saturating_add(1);
     }
 }
@@ -2137,7 +2570,8 @@ fn submit_soft_realtime_command(
     command: &BilateralCommand,
     timeout: Duration,
 ) -> RobotResult<()> {
-    submit_soft_realtime_command_detailed(slave, master, command, timeout).map_err(
+    let final_torques = assemble_final_torques(command, None);
+    submit_soft_realtime_command_detailed(slave, master, command, &final_torques, timeout).map_err(
         |err| match err {
             RawClockRuntimeError::SubmissionFault { source, .. } => source,
             err => RobotError::ConfigError(err.to_string()),
@@ -2149,6 +2583,7 @@ fn submit_soft_realtime_command_detailed(
     slave: &Piper<Active<MitPassthroughMode>, SoftRealtime>,
     master: &Piper<Active<MitPassthroughMode>, SoftRealtime>,
     command: &BilateralCommand,
+    final_torques: &BilateralFinalTorques,
     timeout: Duration,
 ) -> Result<(), RawClockRuntimeError> {
     if let Err(source) = slave.command_torques_confirmed(
@@ -2156,7 +2591,7 @@ fn submit_soft_realtime_command_detailed(
         &command.slave_velocity,
         &command.slave_kp,
         &command.slave_kd,
-        &command.slave_feedforward_torque,
+        &final_torques.slave,
         timeout,
     ) {
         return Err(RawClockRuntimeError::SubmissionFault {
@@ -2170,7 +2605,7 @@ fn submit_soft_realtime_command_detailed(
         &command.master_velocity,
         &command.master_kp,
         &command.master_kd,
-        &command.master_interaction_torque,
+        &final_torques.master,
         timeout,
     ) {
         return Err(RawClockRuntimeError::SubmissionFault {
@@ -2201,6 +2636,100 @@ fn disable_soft_realtime_both(
             master: master.err().map(|err| err.to_string()),
             slave: slave.err().map(|err| err.to_string()),
         }),
+    }
+}
+
+fn disable_soft_realtime_both_or_fault(
+    master: Piper<Active<MitPassthroughMode>, SoftRealtime>,
+    slave: Piper<Active<MitPassthroughMode>, SoftRealtime>,
+    cfg: DisableConfig,
+    fault_timeout: Duration,
+) -> RawClockDisableOutcome<RealRawClockStandbyArms, ExperimentalRawClockErrorState> {
+    let master_commit = send_soft_realtime_disable_request(&master);
+    let slave_commit = send_soft_realtime_disable_request(&slave);
+    let master_result =
+        master_commit.and_then(|commit| wait_soft_realtime_disabled(&master, commit, &cfg));
+    let slave_result =
+        slave_commit.and_then(|commit| wait_soft_realtime_disabled(&slave, commit, &cfg));
+
+    match (master_result, slave_result) {
+        (Ok(()), Ok(())) => {
+            let telemetry = telemetry_from_drivers(&master.driver, &slave.driver);
+            RawClockDisableOutcome::Standby(RawClockStandbyExit {
+                arms: RealRawClockStandbyArms {
+                    master: force_soft_standby_state(master),
+                    slave: force_soft_standby_state(slave),
+                },
+                telemetry,
+            })
+        },
+        (master_result, slave_result) => {
+            let error = RawClockRuntimeError::DisableBothFailed {
+                master: master_result.err().map(|err| err.to_string()),
+                slave: slave_result.err().map(|err| err.to_string()),
+            };
+            let fault = fault_shutdown_soft_realtime(master, slave, fault_timeout);
+            RawClockDisableOutcome::Faulted { error, fault }
+        },
+    }
+}
+
+fn send_soft_realtime_disable_request(
+    piper: &Piper<Active<MitPassthroughMode>, SoftRealtime>,
+) -> RobotResult<u64> {
+    use piper_protocol::control::MotorEnableCommand;
+
+    piper
+        .driver
+        .send_local_state_transition_frame_confirmed_commit_marker(
+            MotorEnableCommand::disable_all().to_frame(),
+            RAW_CLOCK_STATE_TRANSITION_SEND_TIMEOUT,
+        )
+        .map_err(Into::into)
+}
+
+fn wait_soft_realtime_disabled(
+    piper: &Piper<Active<MitPassthroughMode>, SoftRealtime>,
+    commit_host_mono_us: u64,
+    cfg: &DisableConfig,
+) -> RobotResult<()> {
+    let start = Instant::now();
+    let mut stable_count = 0usize;
+
+    loop {
+        let health = piper.observer().runtime_health();
+        if health.fault.is_some() || !health.rx_alive || !health.tx_alive {
+            return Err(RobotError::runtime_health_unhealthy(
+                health.rx_alive,
+                health.tx_alive,
+                health.fault,
+            ));
+        }
+        if start.elapsed() > cfg.timeout {
+            return Err(RobotError::Timeout {
+                timeout_ms: cfg.timeout.as_millis() as u64,
+            });
+        }
+
+        let confirmed_mask =
+            piper.driver.confirmed_driver_enabled_mask_after_host_mono(commit_host_mono_us);
+        if confirmed_mask == Some(0) {
+            stable_count = stable_count.saturating_add(1);
+            if stable_count >= cfg.debounce_threshold && piper.driver.normal_control_path_open() {
+                return Ok(());
+            }
+        } else {
+            stable_count = 0;
+        }
+
+        let remaining = cfg.timeout.saturating_sub(start.elapsed());
+        let sleep_duration = cfg.poll_interval.min(remaining);
+        if sleep_duration.is_zero() {
+            return Err(RobotError::Timeout {
+                timeout_ms: cfg.timeout.as_millis() as u64,
+            });
+        }
+        std::thread::sleep(sleep_duration);
     }
 }
 
@@ -2499,6 +3028,24 @@ fn force_soft_error_state(
     }
 }
 
+fn force_soft_standby_state(
+    piper: Piper<Active<MitPassthroughMode>, SoftRealtime>,
+) -> Piper<Standby, SoftRealtime> {
+    let piper = std::mem::ManuallyDrop::new(piper);
+
+    Piper {
+        // SAFETY: each field is moved exactly once into the replacement state wrapper.
+        driver: unsafe { std::ptr::read(&piper.driver) },
+        // SAFETY: each field is moved exactly once into the replacement state wrapper.
+        observer: unsafe { std::ptr::read(&piper.observer) },
+        // SAFETY: each field is moved exactly once into the replacement state wrapper.
+        quirks: unsafe { std::ptr::read(&piper.quirks) },
+        drop_policy: DropPolicy::Noop,
+        driver_mode_drop_policy: DriverModeDropPolicy::Preserve,
+        _state: Standby,
+    }
+}
+
 fn percentile(samples: impl IntoIterator<Item = u64>, percentile: u64) -> u64 {
     let mut sorted: Vec<_> = samples.into_iter().collect();
     if sorted.is_empty() {
@@ -2536,7 +3083,10 @@ fn warmup_final_error_is_retryable(error: &RawClockRuntimeError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dual_arm::JointMirrorMap;
+    use crate::dual_arm::{
+        BilateralDynamicsCompensation, BilateralDynamicsCompensator, BilateralFinalTorques,
+        JointMirrorMap,
+    };
     use crate::observer::{ControlSnapshot, Observer};
     use crate::types::{DeviceQuirks, JointArray, NewtonMeter, Rad, RadPerSecond};
     use piper_can::{
@@ -2687,6 +3237,18 @@ mod tests {
             },
             feedback_age: Duration::from_micros(100),
         }
+    }
+
+    fn ready_reads_for_iterations(iterations: usize) -> Vec<FakeRead> {
+        (0..iterations)
+            .map(|index| {
+                let offset = index as u64 * 1_000;
+                FakeRead::pair(
+                    raw_clock_snapshot_for_tests(12_000 + offset, 112_000 + offset),
+                    raw_clock_snapshot_for_tests(22_000 + offset, 112_800 + offset),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -2880,6 +3442,36 @@ mod tests {
                 raw_clock_snapshot_for_tests(20_000, 110_800),
             ],
         );
+        timing
+    }
+
+    fn ready_timing_with_seeded_alignment_for_tests() -> RawClockRuntimeTiming {
+        let mut timing = ready_timing_for_tests();
+        for index in 0..4 {
+            let offset = index as u64 * 1_000;
+            push_alignment_sample_for_tests(
+                &mut timing,
+                107_000 + offset,
+                raw_clock_snapshot_for_tests(7_000 + offset, 107_000 + offset),
+                107_800 + offset,
+                raw_clock_snapshot_for_tests(17_000 + offset, 107_800 + offset),
+            );
+        }
+        timing
+    }
+
+    fn ready_timing_with_time_jump_alignment_for_tests() -> RawClockRuntimeTiming {
+        let mut timing = ready_timing_for_tests();
+        for index in 0..4 {
+            let offset = index as u64 * 1_000;
+            push_alignment_sample_for_tests(
+                &mut timing,
+                107_000 + offset,
+                raw_clock_snapshot_for_tests(7_000 + offset, 107_000 + offset),
+                107_000 + offset,
+                raw_clock_snapshot_for_tests(17_000 + offset, 107_000 + offset),
+            );
+        }
         timing
     }
 
@@ -3354,6 +3946,127 @@ mod tests {
         }
     }
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct FakeCompensatorError(&'static str);
+
+    struct RecordingCompensator {
+        reset_calls: Arc<AtomicUsize>,
+        compute_calls: Arc<AtomicUsize>,
+        time_jump_calls: Arc<AtomicUsize>,
+        seen_snapshots: Arc<Mutex<Vec<DualArmSnapshot>>>,
+        fail_reset: bool,
+        fail_compute: bool,
+        fail_time_jump: bool,
+        compensation: BilateralDynamicsCompensation,
+    }
+
+    impl Default for RecordingCompensator {
+        fn default() -> Self {
+            Self {
+                reset_calls: Arc::new(AtomicUsize::new(0)),
+                compute_calls: Arc::new(AtomicUsize::new(0)),
+                time_jump_calls: Arc::new(AtomicUsize::new(0)),
+                seen_snapshots: Arc::new(Mutex::new(Vec::new())),
+                fail_reset: false,
+                fail_compute: false,
+                fail_time_jump: false,
+                compensation: BilateralDynamicsCompensation::default(),
+            }
+        }
+    }
+
+    impl BilateralDynamicsCompensator for RecordingCompensator {
+        type Error = FakeCompensatorError;
+
+        fn compute(
+            &mut self,
+            snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralDynamicsCompensation, Self::Error> {
+            self.compute_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.seen_snapshots.lock().expect("snapshot lock").push(*snapshot);
+            if self.fail_compute {
+                return Err(FakeCompensatorError("compensator compute failed"));
+            }
+            Ok(self.compensation)
+        }
+
+        fn on_time_jump(&mut self, _dt: Duration) -> std::result::Result<(), Self::Error> {
+            self.time_jump_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_time_jump {
+                return Err(FakeCompensatorError("compensator time jump failed"));
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) -> std::result::Result<(), Self::Error> {
+            self.reset_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_reset {
+                return Err(FakeCompensatorError("compensator reset failed"));
+            }
+            Ok(())
+        }
+    }
+
+    struct RecordingCompensationController {
+        seen_compensation: Arc<Mutex<Vec<Option<BilateralDynamicsCompensation>>>>,
+        fail_tick: bool,
+    }
+
+    impl BilateralController for RecordingCompensationController {
+        type Error = FakeControllerError;
+
+        fn tick(
+            &mut self,
+            _snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            unreachable!("raw-clock compensation path should call tick_with_compensation")
+        }
+
+        fn tick_with_compensation(
+            &mut self,
+            frame: &BilateralControlFrame,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            if self.fail_tick {
+                return Err(FakeControllerError("controller tick failed"));
+            }
+            self.seen_compensation.lock().expect("seen comp lock").push(frame.compensation);
+            Ok(test_command())
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct FakeControllerError(&'static str);
+
+    struct RecordingTimeJumpController {
+        time_jump_calls: Arc<AtomicUsize>,
+        fail_time_jump: bool,
+    }
+
+    impl BilateralController for RecordingTimeJumpController {
+        type Error = FakeControllerError;
+
+        fn tick(
+            &mut self,
+            _snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            Ok(test_command())
+        }
+
+        fn on_time_jump(&mut self, _dt: Duration) -> std::result::Result<(), Self::Error> {
+            self.time_jump_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_time_jump {
+                return Err(FakeControllerError("controller time jump failed"));
+            }
+            Ok(())
+        }
+    }
+
     struct FailingController;
 
     impl BilateralController for FailingController {
@@ -3411,6 +4124,7 @@ mod tests {
     struct FakeIoState {
         command_log: Mutex<Vec<&'static str>>,
         commands: Mutex<Vec<BilateralCommand>>,
+        submitted_final_torques: Mutex<Vec<BilateralFinalTorques>>,
         disable_attempts: Mutex<Vec<&'static str>>,
         fault_shutdowns: AtomicUsize,
     }
@@ -3420,6 +4134,7 @@ mod tests {
         reads: VecDeque<FakeRead>,
         pending_slave: Option<ExperimentalRawClockSnapshot>,
         command_failure: Option<FakeCommandFailure>,
+        disable_failure: bool,
         health: ExperimentalRawClockRuntimeHealth,
         telemetry: RawClockRuntimeTelemetry,
     }
@@ -3431,6 +4146,7 @@ mod tests {
                 reads: VecDeque::new(),
                 pending_slave: None,
                 command_failure: None,
+                disable_failure: false,
                 health: healthy_runtime_for_tests(),
                 telemetry: RawClockRuntimeTelemetry::default(),
             }
@@ -3443,6 +4159,11 @@ mod tests {
 
         fn with_command_failure(mut self, failure: FakeCommandFailure) -> Self {
             self.command_failure = Some(failure);
+            self
+        }
+
+        fn with_disable_failure(mut self) -> Self {
+            self.disable_failure = true;
             self
         }
 
@@ -3510,9 +4231,15 @@ mod tests {
         fn submit_command(
             &mut self,
             command: &BilateralCommand,
+            final_torques: &BilateralFinalTorques,
             _timeout: Duration,
         ) -> Result<(), RawClockRuntimeError> {
             self.state.commands.lock().expect("commands lock").push(command.clone());
+            self.state
+                .submitted_final_torques
+                .lock()
+                .expect("submitted torques lock")
+                .push(*final_torques);
             self.state.command_log.lock().expect("command log lock").push("slave");
             if matches!(self.command_failure, Some(FakeCommandFailure::Slave)) {
                 return Err(RawClockRuntimeError::SubmissionFault {
@@ -3536,11 +4263,23 @@ mod tests {
         fn disable_both(
             self,
             _cfg: DisableConfig,
-        ) -> Result<RawClockStandbyExit<Self::StandbyArms>, RawClockRuntimeError> {
+            fault_timeout: Duration,
+        ) -> RawClockDisableOutcome<Self::StandbyArms, Self::ErrorArms> {
             let mut attempts = self.state.disable_attempts.lock().expect("disable attempts lock");
             attempts.push("master");
             attempts.push("slave");
-            Ok(RawClockStandbyExit {
+            drop(attempts);
+
+            if self.disable_failure {
+                let error = RawClockRuntimeError::DisableBothFailed {
+                    master: Some("master disable failed".to_string()),
+                    slave: Some("slave disable failed".to_string()),
+                };
+                let fault = self.fault_shutdown(fault_timeout);
+                return RawClockDisableOutcome::Faulted { error, fault };
+            }
+
+            RawClockDisableOutcome::Standby(RawClockStandbyExit {
                 arms: FakeStandbyArms,
                 telemetry: self.telemetry(),
             })
@@ -3603,6 +4342,75 @@ mod tests {
     where
         C: BilateralController,
     {
+        run_fake_runtime_with_controller_and_config(
+            io,
+            timing,
+            max_iterations,
+            thresholds,
+            controller,
+            ExperimentalRawClockRunConfig::default(),
+        )
+    }
+
+    fn run_fake_runtime_with_controller_and_config<C>(
+        io: FakeRuntimeIo,
+        timing: RawClockRuntimeTiming,
+        max_iterations: usize,
+        thresholds: RawClockRuntimeThresholds,
+        controller: C,
+        run_config: ExperimentalRawClockRunConfig,
+    ) -> (Arc<FakeIoState>, RawClockRuntimeReport)
+    where
+        C: BilateralController,
+    {
+        run_fake_runtime_with_optional_compensation(
+            io,
+            timing,
+            max_iterations,
+            thresholds,
+            controller,
+            None,
+            run_config,
+        )
+    }
+
+    fn run_fake_runtime_with_controller_and_compensation<C, D>(
+        io: FakeRuntimeIo,
+        timing: RawClockRuntimeTiming,
+        max_iterations: usize,
+        thresholds: RawClockRuntimeThresholds,
+        controller: C,
+        compensator: D,
+        run_config: ExperimentalRawClockRunConfig,
+    ) -> (Arc<FakeIoState>, RawClockRuntimeReport)
+    where
+        C: BilateralController,
+        D: BilateralDynamicsCompensator,
+    {
+        let mut compensator = RawClockCompensatorAdapter::new(compensator);
+        run_fake_runtime_with_optional_compensation(
+            io,
+            timing,
+            max_iterations,
+            thresholds,
+            controller,
+            Some(&mut compensator),
+            run_config,
+        )
+    }
+
+    fn run_fake_runtime_with_optional_compensation<C>(
+        io: FakeRuntimeIo,
+        timing: RawClockRuntimeTiming,
+        max_iterations: usize,
+        thresholds: RawClockRuntimeThresholds,
+        controller: C,
+        compensator: Option<&mut dyn RawClockDynamicsCompensator>,
+        run_config: ExperimentalRawClockRunConfig,
+    ) -> (Arc<FakeIoState>, RawClockRuntimeReport)
+    where
+        C: BilateralController,
+    {
         let state = io.state.clone();
         let core = RawClockRuntimeCore {
             io,
@@ -3615,15 +4423,490 @@ mod tests {
                 estimator_thresholds: thresholds_for_tests(),
             },
         };
-        let exit =
-            run_raw_clock_runtime_core(core, controller, ExperimentalRawClockRunConfig::default())
-                .expect("fake runtime core should not return outer error");
+        let exit = run_raw_clock_runtime_core(core, controller, compensator, run_config)
+            .expect("fake runtime core should not return outer error");
         let report = match exit {
             RawClockCoreExit::Standby { report, .. } | RawClockCoreExit::Faulted { report, .. } => {
                 report
             },
         };
         (state, report)
+    }
+
+    #[test]
+    fn raw_clock_compensation_path_resets_computes_and_reaches_controller() {
+        let compensation = BilateralDynamicsCompensation {
+            master_model_torque: JointArray::splat(NewtonMeter(0.1)),
+            slave_model_torque: JointArray::splat(NewtonMeter(0.2)),
+            master_external_torque_est: JointArray::splat(NewtonMeter(0.3)),
+            slave_external_torque_est: JointArray::splat(NewtonMeter(0.4)),
+        };
+        let reset_calls = Arc::new(AtomicUsize::new(0));
+        let compute_calls = Arc::new(AtomicUsize::new(0));
+        let compensator = RecordingCompensator {
+            reset_calls: reset_calls.clone(),
+            compute_calls: compute_calls.clone(),
+            compensation,
+            ..RecordingCompensator::default()
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let controller = RecordingCompensationController {
+            seen_compensation: seen.clone(),
+            fail_tick: false,
+        };
+
+        let (_state, report) = run_fake_runtime_with_controller_and_compensation(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1)),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            controller,
+            compensator,
+            ExperimentalRawClockRunConfig::default(),
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        assert_eq!(reset_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(compute_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            seen.lock().expect("seen comp lock").as_slice(),
+            &[Some(compensation)]
+        );
+    }
+
+    #[test]
+    fn raw_clock_compensator_receives_aligned_selected_snapshot() {
+        let seen_snapshots = Arc::new(Mutex::new(Vec::new()));
+        let master_positions = [0.11, 0.12, 0.13, 0.14, 0.15, 0.16];
+        let slave_positions = [0.21, 0.22, 0.23, 0.24, 0.25, 0.26];
+        let compensator = RecordingCompensator {
+            seen_snapshots: seen_snapshots.clone(),
+            ..RecordingCompensator::default()
+        };
+        let mut timing = ready_timing_for_tests();
+        timing.master_alignment_buffer.clear();
+        timing.slave_alignment_buffer.clear();
+        push_alignment_sample_for_tests(
+            &mut timing,
+            107_000,
+            raw_clock_snapshot_with_positions_for_tests(7_000, 107_000, master_positions),
+            107_800,
+            raw_clock_snapshot_with_positions_for_tests(17_000, 107_800, slave_positions),
+        );
+
+        let (_state, report) = run_fake_runtime_with_controller_and_compensation(
+            FakeRuntimeIo::new().with_reads(vec![FakeRead::pair(
+                raw_clock_snapshot_for_tests(12_000, 112_000),
+                raw_clock_snapshot_for_tests(22_000, 112_800),
+            )]),
+            timing,
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            compensator,
+            ExperimentalRawClockRunConfig::default(),
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        let snapshots = seen_snapshots.lock().expect("snapshot lock");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].left.state.position,
+            JointArray::new(master_positions.map(Rad))
+        );
+        assert_eq!(
+            snapshots[0].right.state.position,
+            JointArray::new(slave_positions.map(Rad))
+        );
+        assert!(
+            u64::try_from(snapshots[0].inter_arm_skew.as_micros()).unwrap_or(u64::MAX)
+                <= RawClockRuntimeThresholds::for_tests().inter_arm_skew_max_us
+        );
+    }
+
+    #[test]
+    fn raw_clock_controller_tick_failure_faults_report() {
+        let controller = RecordingCompensationController {
+            seen_compensation: Arc::new(Mutex::new(Vec::new())),
+            fail_tick: true,
+        };
+
+        let (_state, report) = run_fake_runtime_with_controller_and_config(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1)),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            controller,
+            ExperimentalRawClockRunConfig::default(),
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::ControllerFault)
+        );
+        assert_eq!(report.controller_faults, 1);
+    }
+
+    #[test]
+    fn raw_clock_compensator_reset_failure_faults_before_first_iteration() {
+        let compensator = RecordingCompensator {
+            fail_reset: true,
+            ..RecordingCompensator::default()
+        };
+        let (_state, report) = run_fake_runtime_with_controller_and_compensation(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1)),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            compensator,
+            ExperimentalRawClockRunConfig::default(),
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::CompensationFault)
+        );
+        assert_eq!(report.compensation_faults, 1);
+        assert_eq!(report.iterations, 0);
+    }
+
+    #[test]
+    fn raw_clock_time_jump_notifies_controller_and_compensator() {
+        let controller_calls = Arc::new(AtomicUsize::new(0));
+        let compensator_calls = Arc::new(AtomicUsize::new(0));
+        let compensator = RecordingCompensator {
+            time_jump_calls: compensator_calls.clone(),
+            ..RecordingCompensator::default()
+        };
+        let controller = RecordingTimeJumpController {
+            time_jump_calls: controller_calls.clone(),
+            fail_time_jump: false,
+        };
+
+        let (_state, report) = run_fake_runtime_with_controller_and_compensation(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(2)),
+            ready_timing_with_time_jump_alignment_for_tests(),
+            2,
+            RawClockRuntimeThresholds::for_tests(),
+            controller,
+            compensator,
+            ExperimentalRawClockRunConfig {
+                dt_clamp_multiplier: 1.0,
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        assert_eq!(controller_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(compensator_calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn raw_clock_controller_time_jump_failure_faults_report() {
+        let controller = RecordingTimeJumpController {
+            time_jump_calls: Arc::new(AtomicUsize::new(0)),
+            fail_time_jump: true,
+        };
+
+        let (_state, report) = run_fake_runtime_with_controller_and_config(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(2)),
+            ready_timing_with_time_jump_alignment_for_tests(),
+            2,
+            RawClockRuntimeThresholds::for_tests(),
+            controller,
+            ExperimentalRawClockRunConfig {
+                dt_clamp_multiplier: 1.0,
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::ControllerFault)
+        );
+        assert_eq!(report.controller_faults, 1);
+    }
+
+    #[test]
+    fn raw_clock_compensator_time_jump_failure_faults_report() {
+        let compensator = RecordingCompensator {
+            fail_time_jump: true,
+            ..RecordingCompensator::default()
+        };
+
+        let (_state, report) = run_fake_runtime_with_controller_and_compensation(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(2)),
+            ready_timing_with_time_jump_alignment_for_tests(),
+            2,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            compensator,
+            ExperimentalRawClockRunConfig {
+                dt_clamp_multiplier: 1.0,
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::CompensationFault)
+        );
+        assert_eq!(report.compensation_faults, 1);
+    }
+
+    #[test]
+    fn raw_clock_no_telemetry_no_compensator_preserves_submission_order_and_default_gripper() {
+        let (state, report) = run_fake_runtime_with_controller_and_config(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1)),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            ExperimentalRawClockRunConfig::default(),
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        assert_eq!(
+            state.command_log.lock().expect("command log lock").as_slice(),
+            &["slave", "master"]
+        );
+        let commands = state.commands.lock().expect("commands lock");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].master_interaction_torque,
+            JointArray::splat(NewtonMeter::ZERO)
+        );
+        assert_eq!(
+            commands[0].slave_feedforward_torque,
+            JointArray::splat(NewtonMeter::ZERO)
+        );
+    }
+
+    #[test]
+    fn raw_clock_compensation_final_torques_are_submitted_without_telemetry() {
+        let compensation = BilateralDynamicsCompensation {
+            master_model_torque: JointArray::splat(NewtonMeter(0.7)),
+            slave_model_torque: JointArray::splat(NewtonMeter(0.9)),
+            master_external_torque_est: JointArray::splat(NewtonMeter::ZERO),
+            slave_external_torque_est: JointArray::splat(NewtonMeter::ZERO),
+        };
+        let compensator = RecordingCompensator {
+            compensation,
+            ..RecordingCompensator::default()
+        };
+
+        let (state, report) = run_fake_runtime_with_controller_and_compensation(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1)),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            compensator,
+            ExperimentalRawClockRunConfig::default(),
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        let submitted = state.submitted_final_torques.lock().expect("submitted torques lock");
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].master, JointArray::splat(NewtonMeter(0.7)));
+        assert_eq!(submitted[0].slave, JointArray::splat(NewtonMeter(0.9)));
+    }
+
+    #[test]
+    fn raw_clock_gripper_mirroring_config_is_rejected_by_sdk_runtime() {
+        let io = FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1));
+        let state = io.state.clone();
+        let core = RawClockRuntimeCore {
+            io,
+            timing: ready_timing_with_seeded_alignment_for_tests(),
+            config: ExperimentalRawClockConfig {
+                mode: ExperimentalRawClockMode::Bilateral,
+                frequency_hz: 10_000.0,
+                max_iterations: Some(1),
+                thresholds: RawClockRuntimeThresholds::for_tests(),
+                estimator_thresholds: thresholds_for_tests(),
+            },
+        };
+        let mut run_config = ExperimentalRawClockRunConfig::default();
+        run_config.gripper.enabled = true;
+
+        let exit = run_raw_clock_runtime_core(core, TestCommandController, None, run_config)
+            .expect("gripper rejection should return a faulted exit, not drop active arms");
+
+        let report = match exit {
+            RawClockCoreExit::Faulted { report, .. } => report,
+            RawClockCoreExit::Standby { .. } => panic!("gripper rejection should fault"),
+        };
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::RuntimeConfigFault)
+        );
+        assert!(report.last_error.as_deref().unwrap_or_default().contains("gripper"));
+        assert!(state.commands.lock().expect("commands lock").is_empty());
+    }
+
+    #[test]
+    fn raw_clock_invalid_output_shaping_faults_before_command_submission() {
+        let (state, report) = run_fake_runtime_with_controller_and_config(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1)),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            ExperimentalRawClockRunConfig {
+                output_shaping: Some(BilateralOutputShapingConfig {
+                    master_interaction_limit: JointArray::splat(NewtonMeter(f64::NAN)),
+                    ..BilateralOutputShapingConfig::default()
+                }),
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::RuntimeConfigFault)
+        );
+        assert_eq!(report.runtime_faults, 1);
+        assert!(report.last_error.as_deref().unwrap_or_default().contains("output_shaping"));
+        assert!(state.commands.lock().expect("commands lock").is_empty());
+    }
+
+    #[test]
+    fn active_invalid_raw_clock_run_config_fault_includes_shutdown_telemetry() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_runtime_for_tests(events);
+
+        let exit = active
+            .run_with_controller(
+                TestCommandController,
+                ExperimentalRawClockRunConfig {
+                    dt_clamp_multiplier: 0.0,
+                    ..ExperimentalRawClockRunConfig::default()
+                },
+            )
+            .expect("invalid run config should become a faulted run exit");
+
+        let report = match exit {
+            ExperimentalRawClockRunExit::Faulted { report, .. } => report,
+            ExperimentalRawClockRunExit::Standby { .. } => panic!("invalid config should fault"),
+        };
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::RuntimeConfigFault)
+        );
+        assert_eq!(report.runtime_faults, 1);
+        assert_eq!(report.master_stop_attempt, StopAttemptResult::ConfirmedSent);
+        assert_eq!(report.slave_stop_attempt, StopAttemptResult::ConfirmedSent);
+        assert!(report.master_tx_frames_sent_total > 0);
+        assert!(report.slave_tx_frames_sent_total > 0);
+    }
+
+    #[test]
+    fn raw_clock_core_invalid_config_faults_instead_of_outer_error() {
+        let io = FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1));
+        let state = io.state.clone();
+        let core = RawClockRuntimeCore {
+            io,
+            timing: ready_timing_with_seeded_alignment_for_tests(),
+            config: ExperimentalRawClockConfig {
+                mode: ExperimentalRawClockMode::Bilateral,
+                frequency_hz: 0.0,
+                max_iterations: Some(1),
+                thresholds: RawClockRuntimeThresholds::for_tests(),
+                estimator_thresholds: thresholds_for_tests(),
+            },
+        };
+
+        let exit = run_raw_clock_runtime_core(
+            core,
+            TestCommandController,
+            None,
+            ExperimentalRawClockRunConfig::default(),
+        )
+        .expect("invalid config should be converted to a faulted exit, not an outer error");
+
+        let report = match exit {
+            RawClockCoreExit::Faulted { report, .. } => report,
+            RawClockCoreExit::Standby { .. } => panic!("invalid config should fault"),
+        };
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::RuntimeConfigFault)
+        );
+        assert!(report.last_error.as_deref().unwrap_or_default().contains("frequency_hz"));
+        assert_eq!(report.runtime_faults, 1);
+        assert!(state.commands.lock().expect("commands lock").is_empty());
+    }
+
+    #[test]
+    fn raw_clock_max_iterations_disable_failure_faults_instead_of_outer_error() {
+        let (state, report) = run_fake_runtime_with_controller_and_config(
+            FakeRuntimeIo::new().with_disable_failure(),
+            ready_timing_with_seeded_alignment_for_tests(),
+            0,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            ExperimentalRawClockRunConfig::default(),
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::RuntimeTransportFault)
+        );
+        assert_eq!(report.runtime_faults, 1);
+        assert!(report.last_error.as_deref().unwrap_or_default().contains("disable_both failed"));
+        assert_eq!(state.fault_shutdowns.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            state.disable_attempts.lock().expect("disable attempts lock").as_slice(),
+            &["master", "slave"]
+        );
+    }
+
+    #[test]
+    fn raw_clock_cancel_disable_failure_faults_instead_of_outer_error() {
+        let cancel_signal = Arc::new(AtomicBool::new(true));
+        let (state, report) = run_fake_runtime_with_controller_and_config(
+            FakeRuntimeIo::new().with_disable_failure(),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            ExperimentalRawClockRunConfig {
+                cancel_signal: Some(cancel_signal),
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::RuntimeTransportFault)
+        );
+        assert_eq!(report.runtime_faults, 1);
+        assert!(report.last_error.as_deref().unwrap_or_default().contains("disable_both failed"));
+        assert_eq!(state.fault_shutdowns.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            state.disable_attempts.lock().expect("disable attempts lock").as_slice(),
+            &["master", "slave"]
+        );
     }
 
     fn calibration_for_raw_clock_gains_test() -> DualArmCalibration {
@@ -4866,9 +6149,13 @@ mod tests {
             seen_skew: seen_skew.clone(),
         };
 
-        let exit =
-            run_raw_clock_runtime_core(core, controller, ExperimentalRawClockRunConfig::default())
-                .expect("runtime should return a faulted exit");
+        let exit = run_raw_clock_runtime_core(
+            core,
+            controller,
+            None,
+            ExperimentalRawClockRunConfig::default(),
+        )
+        .expect("runtime should return a faulted exit");
 
         let report = match exit {
             RawClockCoreExit::Faulted { report, .. } => report,
@@ -4927,6 +6214,7 @@ mod tests {
         let exit = run_raw_clock_runtime_core(
             core,
             TestCommandController,
+            None,
             ExperimentalRawClockRunConfig::default(),
         )
         .expect("runtime should return a clock-health fault");
@@ -5060,9 +6348,13 @@ mod tests {
             },
         };
 
-        let exit =
-            run_raw_clock_runtime_core(core, controller, ExperimentalRawClockRunConfig::default())
-                .expect("fake runtime core should run");
+        let exit = run_raw_clock_runtime_core(
+            core,
+            controller,
+            None,
+            ExperimentalRawClockRunConfig::default(),
+        )
+        .expect("fake runtime core should run");
         assert!(matches!(exit, RawClockCoreExit::Standby { .. }));
 
         assert_eq!(
