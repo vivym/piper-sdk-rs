@@ -47,6 +47,13 @@ pub fn run(args: GravityFitArgs) -> Result<()> {
         bail!("ridge_lambda must be finite and > 0.0");
     }
 
+    if args.out.exists() {
+        bail!(
+            "{} already exists; refusing to overwrite",
+            args.out.display()
+        );
+    }
+
     let loaded = read_quasi_static_samples(&args.samples)?;
     let options = FitOptions {
         ridge_lambda: args.ridge_lambda,
@@ -55,12 +62,6 @@ pub fn run(args: GravityFitArgs) -> Result<()> {
     };
     let model = fit_from_rows(loaded.header, loaded.rows, options)?;
 
-    if args.out.exists() {
-        bail!(
-            "{} already exists; refusing to overwrite",
-            args.out.display()
-        );
-    }
     if let Some(parent) = args.out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -96,6 +97,9 @@ fn fit_from_rows(
     validate_fit_inputs(&header, &rows, options)?;
 
     let group_split = split_train_holdout_groups(&rows, options.holdout_ratio)?;
+    if group_split.train_group_ids.len() < 2 {
+        bail!("expected at least 2 training groups");
+    }
     let holdout_groups: BTreeSet<&str> =
         group_split.holdout_group_ids.iter().map(String::as_str).collect();
 
@@ -111,6 +115,12 @@ fn fit_from_rows(
     }
     if train_count == 0 {
         bail!("holdout split left no training samples");
+    }
+    if train_count < TRIG_V1_FEATURE_COUNT {
+        bail!(
+            "expected at least {} training samples, got {train_count}",
+            TRIG_V1_FEATURE_COUNT
+        );
     }
 
     normal.add_ridge(options);
@@ -243,7 +253,10 @@ fn split_train_holdout_groups(
     }
 
     let mut holdout_groups = BTreeSet::new();
-    if holdout_ratio > 0.0 && all_groups.len() > 1 {
+    if holdout_ratio > 0.0 {
+        if all_groups.len() < 2 {
+            bail!("holdout requires at least 2 distinct groups");
+        }
         let stride = (1.0 / holdout_ratio).round().max(1.0) as usize;
         for (index, group_id) in all_groups.iter().enumerate() {
             if index % stride == 0 {
@@ -289,7 +302,7 @@ fn solve_normal_equations(
             let solution = svd
                 .solve(&normal.b, 1e-12)
                 .map_err(|err| anyhow::anyhow!("SVD solve failed: {err}"))?;
-            Ok((solution, "svd".to_string(), Some("cholesky".to_string())))
+            Ok((solution, "cholesky".to_string(), Some("svd".to_string())))
         },
     }
 }
@@ -481,6 +494,90 @@ mod tests {
         assert!((fitted.model.coefficients_nm[1][3] + 1.25).abs() < 1e-6);
         assert!(fitted.fit_quality.condition_number.is_finite());
         assert!(!fitted.fit.holdout_group_ids.is_empty());
+    }
+
+    #[test]
+    fn fitter_rejects_fewer_training_samples_than_feature_count() {
+        let truth = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
+        let rows = synthetic_rows_from_coefficients(&truth, TRIG_V1_FEATURE_COUNT - 1);
+
+        let err = fit_from_rows(sample_header_for_tests(), rows, no_holdout_options()).unwrap_err();
+
+        assert!(err.to_string().contains("training samples"), "{err:#}");
+    }
+
+    #[test]
+    fn fitter_rejects_single_training_group_without_holdout() {
+        let truth = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
+        let mut rows = synthetic_rows_from_coefficients(&truth, 120);
+        force_single_segment(&mut rows);
+
+        let err = fit_from_rows(sample_header_for_tests(), rows, no_holdout_options()).unwrap_err();
+
+        assert!(err.to_string().contains("training groups"), "{err:#}");
+    }
+
+    #[test]
+    fn fitter_rejects_requested_holdout_when_only_one_group_exists() {
+        let truth = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
+        let mut rows = synthetic_rows_from_coefficients(&truth, 120);
+        force_single_segment(&mut rows);
+        let options = FitOptions {
+            holdout_ratio: 0.2,
+            ..no_holdout_options()
+        };
+
+        let err = fit_from_rows(sample_header_for_tests(), rows, options).unwrap_err();
+
+        assert!(err.to_string().contains("holdout"), "{err:#}");
+    }
+
+    #[test]
+    fn run_refuses_existing_output_before_loading_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("model.toml");
+        std::fs::write(&out, "existing").unwrap();
+        let missing_samples = dir.path().join("missing.samples.jsonl");
+        let args = GravityFitArgs {
+            samples: vec![missing_samples],
+            out,
+            basis: Some(crate::gravity::BASIS_TRIG_V1.to_string()),
+            ridge_lambda: 1e-4,
+            holdout_ratio: 0.2,
+        };
+
+        let err = run(args).unwrap_err();
+
+        assert!(err.to_string().contains("already exists"), "{err:#}");
+    }
+
+    #[test]
+    fn svd_fallback_records_primary_solver_and_fallback_used() {
+        let mut g = nalgebra::DMatrix::identity(TRIG_V1_FEATURE_COUNT, TRIG_V1_FEATURE_COUNT);
+        g[(0, 0)] = -1.0;
+        let normal = NormalEquations {
+            g,
+            b: nalgebra::DMatrix::zeros(TRIG_V1_FEATURE_COUNT, 6),
+        };
+
+        let (_solution, solver, fallback_solver) = solve_normal_equations(&normal).unwrap();
+
+        assert_eq!(solver, "cholesky");
+        assert_eq!(fallback_solver.as_deref(), Some("svd"));
+    }
+
+    fn no_holdout_options() -> FitOptions {
+        FitOptions {
+            ridge_lambda: 1e-8,
+            holdout_ratio: 0.0,
+            regularize_bias: false,
+        }
+    }
+
+    fn force_single_segment(rows: &mut [QuasiStaticSampleRow]) {
+        for row in rows {
+            row.segment_id = Some("single-segment".to_string());
+        }
     }
 
     fn synthetic_rows_from_coefficients(
