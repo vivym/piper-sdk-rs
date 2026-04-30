@@ -302,7 +302,7 @@ fn solve_normal_equations(
             let solution = svd
                 .solve(&normal.b, 1e-12)
                 .map_err(|err| anyhow::anyhow!("SVD solve failed: {err}"))?;
-            Ok((solution, "cholesky".to_string(), Some("svd".to_string())))
+            Ok((solution, "svd".to_string(), Some("svd".to_string())))
         },
     }
 }
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn svd_fallback_records_primary_solver_and_fallback_used() {
+    fn svd_fallback_records_actual_solver_used() {
         let mut g = nalgebra::DMatrix::identity(TRIG_V1_FEATURE_COUNT, TRIG_V1_FEATURE_COUNT);
         g[(0, 0)] = -1.0;
         let normal = NormalEquations {
@@ -619,7 +619,7 @@ mod tests {
 
         let (_solution, solver, fallback_solver) = solve_normal_equations(&normal).unwrap();
 
-        assert_eq!(solver, "cholesky");
+        assert_eq!(solver, "svd");
         assert_eq!(fallback_solver.as_deref(), Some("svd"));
     }
 
