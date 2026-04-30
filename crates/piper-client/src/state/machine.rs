@@ -4414,7 +4414,7 @@ mod tests {
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
         let active = standby
             .enable_mit_mode(MitModeConfig {
-                timeout: Duration::from_millis(50),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 100,
@@ -4445,7 +4445,7 @@ mod tests {
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
         let active = standby
             .enable_position_mode(PositionModeConfig {
-                timeout: Duration::from_millis(50),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 10,
@@ -4481,7 +4481,7 @@ mod tests {
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames);
         let active = standby
             .enable_position_mode(PositionModeConfig {
-                timeout: Duration::from_millis(50),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 10,
@@ -4705,7 +4705,7 @@ mod tests {
         let standby = build_standby_piper(PacedRxAdapter::new(frames), sent_frames.clone());
         let active = standby
             .enable_position_mode(PositionModeConfig {
-                timeout: Duration::from_millis(50),
+                timeout: TEST_EVENTUALLY_TIMEOUT,
                 debounce_threshold: 1,
                 poll_interval: Duration::from_millis(1),
                 speed_percent: 10,
