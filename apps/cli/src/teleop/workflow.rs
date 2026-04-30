@@ -802,10 +802,13 @@ fn map_raw_clock_exit_reason(reason: RawClockRuntimeExitReason) -> BilateralExit
         RawClockRuntimeExitReason::MaxIterations => BilateralExitReason::MaxIterations,
         RawClockRuntimeExitReason::Cancelled => BilateralExitReason::Cancelled,
         RawClockRuntimeExitReason::ReadFault => BilateralExitReason::ReadFault,
+        RawClockRuntimeExitReason::CompensationFault => BilateralExitReason::CompensationFault,
         RawClockRuntimeExitReason::ControllerFault => BilateralExitReason::ControllerFault,
         RawClockRuntimeExitReason::SubmissionFault => BilateralExitReason::SubmissionFault,
         RawClockRuntimeExitReason::RuntimeManualFault => BilateralExitReason::RuntimeManualFault,
-        RawClockRuntimeExitReason::RuntimeTransportFault
+        RawClockRuntimeExitReason::TelemetrySinkFault => BilateralExitReason::TelemetrySinkFault,
+        RawClockRuntimeExitReason::RuntimeConfigFault
+        | RawClockRuntimeExitReason::RuntimeTransportFault
         | RawClockRuntimeExitReason::RawClockFault
         | RawClockRuntimeExitReason::ClockHealthFault => BilateralExitReason::RuntimeTransportFault,
     }
@@ -1577,6 +1580,9 @@ fn raw_clock_error_report(
         selected_inter_arm_skew_max_us: 0,
         selected_inter_arm_skew_p95_us: 0,
         clock_health_failures: 0,
+        compensation_faults: 0,
+        controller_faults: 0,
+        telemetry_sink_faults: 0,
         alignment_buffer_misses: 0,
         alignment_buffer_miss_consecutive_max: 0,
         alignment_buffer_miss_consecutive_failures: 0,
@@ -3516,6 +3522,9 @@ mod tests {
             selected_inter_arm_skew_max_us: 100,
             selected_inter_arm_skew_p95_us: 80,
             clock_health_failures: 0,
+            compensation_faults: 0,
+            controller_faults: 0,
+            telemetry_sink_faults: 0,
             alignment_buffer_misses: 0,
             alignment_buffer_miss_consecutive_max: 0,
             alignment_buffer_miss_consecutive_failures: 0,

@@ -222,6 +222,9 @@ pub struct RawClockRuntimeReport {
     pub selected_inter_arm_skew_max_us: u64,
     pub selected_inter_arm_skew_p95_us: u64,
     pub clock_health_failures: u64,
+    pub compensation_faults: u32,
+    pub controller_faults: u32,
+    pub telemetry_sink_faults: u32,
     pub alignment_buffer_misses: u64,
     pub alignment_buffer_miss_consecutive_max: u32,
     pub alignment_buffer_miss_consecutive_failures: u32,
@@ -369,10 +372,13 @@ pub enum RawClockRuntimeExitReason {
     ReadFault,
     RawClockFault,
     ClockHealthFault,
+    CompensationFault,
     ControllerFault,
     SubmissionFault,
+    RuntimeConfigFault,
     RuntimeTransportFault,
     RuntimeManualFault,
+    TelemetrySinkFault,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1319,6 +1325,9 @@ impl RawClockRuntimeTiming {
             selected_inter_arm_skew_max_us: self.max_inter_arm_skew_us,
             selected_inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
             clock_health_failures: self.clock_health_failures,
+            compensation_faults: 0,
+            controller_faults: 0,
+            telemetry_sink_faults: 0,
             alignment_buffer_misses: self.alignment_buffer_misses,
             alignment_buffer_miss_consecutive_max: self.alignment_buffer_miss_consecutive_max,
             alignment_buffer_miss_consecutive_failures: self.alignment_buffer_miss_consecutive,
@@ -2056,7 +2065,9 @@ where
                     &joint_motion,
                     RawClockRuntimeExitReason::ControllerFault,
                     err.to_string(),
-                    |_| {},
+                    |report| {
+                        report.controller_faults = report.controller_faults.saturating_add(1);
+                    },
                 );
                 let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
                 return Ok(RawClockCoreExit::Faulted {
@@ -3343,6 +3354,22 @@ mod tests {
         }
     }
 
+    struct FailingController;
+
+    impl BilateralController for FailingController {
+        type Error = RawClockRuntimeError;
+
+        fn tick(
+            &mut self,
+            _snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            Err(RawClockRuntimeError::Controller(
+                "test controller failure".to_string(),
+            ))
+        }
+    }
+
     struct RecordingSkewController {
         seen_skew: Arc<Mutex<Vec<Duration>>>,
     }
@@ -4504,6 +4531,42 @@ mod tests {
     }
 
     #[test]
+    fn controller_tick_failure_increments_controller_faults() {
+        let (mut timing, first_host_us) = ready_timing_near_now_for_tests();
+        push_alignment_sample_for_tests(
+            &mut timing,
+            first_host_us - 1_000,
+            raw_clock_snapshot_for_tests(10_000, first_host_us - 1_000),
+            first_host_us - 1_000,
+            raw_clock_snapshot_for_tests(20_000, first_host_us - 1_000),
+        );
+        let io = FakeRuntimeIo::new().with_reads([
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(11_000, first_host_us),
+                raw_clock_snapshot_for_tests(20_500, first_host_us),
+            ),
+            FakeRead::pair(
+                raw_clock_snapshot_for_tests(12_000, first_host_us + 1_000),
+                raw_clock_snapshot_for_tests(21_500, first_host_us + 1_000),
+            ),
+        ]);
+
+        let (_state, report) = run_fake_runtime_with_controller(
+            io,
+            timing,
+            2,
+            RawClockRuntimeThresholds::for_tests(),
+            FailingController,
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::ControllerFault)
+        );
+        assert_eq!(report.controller_faults, 1);
+    }
+
+    #[test]
     fn dual_wrapper_slave_enable_failure_stops_already_enabled_master() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let master = build_soft_standby_piper(
@@ -5376,6 +5439,19 @@ mod tests {
         assert_eq!(timing.sample_counts_for_tests(), (4, 4));
         assert_eq!(report.master.raw_timestamp_regressions, 0);
         assert_eq!(report.slave.raw_timestamp_regressions, 0);
+    }
+
+    #[test]
+    fn raw_clock_report_defaults_include_generic_fault_counters() {
+        let report = RawClockRuntimeTiming::new(thresholds_for_tests()).report(
+            120_000,
+            0,
+            Some(RawClockRuntimeExitReason::MaxIterations),
+        );
+
+        assert_eq!(report.compensation_faults, 0);
+        assert_eq!(report.controller_faults, 0);
+        assert_eq!(report.telemetry_sink_faults, 0);
     }
 
     #[test]
