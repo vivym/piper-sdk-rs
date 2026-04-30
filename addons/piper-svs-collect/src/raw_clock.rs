@@ -432,6 +432,13 @@ pub(crate) fn apply_cli_profile_overrides(args: &Args, profile: &mut EffectivePr
     }
 }
 
+pub(crate) fn effective_gripper_mirror_enabled(
+    args: &Args,
+    profile: &EffectiveProfile,
+) -> bool {
+    profile.gripper.mirror_enabled && !args.disable_gripper_mirror
+}
+
 pub fn raw_clock_warmup_sample_threshold(settings: &SvsRawClockSettings) -> usize {
     let warmup_ms = settings.warmup_secs.saturating_mul(1_000);
     let sample_gap_max_ms = settings.sample_gap_max_ms.max(1);
@@ -560,6 +567,18 @@ mod tests {
 
         args.experimental_calibrated_raw = true;
 
+        assert_eq!(
+            SvsRuntimeKind::from_args(&args),
+            SvsRuntimeKind::CalibratedRawClock
+        );
+    }
+
+    #[test]
+    fn runtime_kind_requires_explicit_raw_clock_opt_in() {
+        let mut args = args_for_raw_clock_resolve_tests();
+        args.experimental_calibrated_raw = false;
+        assert_eq!(SvsRuntimeKind::from_args(&args), SvsRuntimeKind::StrictRealtime);
+        args.experimental_calibrated_raw = true;
         assert_eq!(
             SvsRuntimeKind::from_args(&args),
             SvsRuntimeKind::CalibratedRawClock

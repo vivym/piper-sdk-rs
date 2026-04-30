@@ -1475,6 +1475,27 @@ impl ExperimentalRawClockDualArmStandby {
         Ok(self)
     }
 
+    pub fn snapshot(
+        &self,
+        policy: ControlReadPolicy,
+    ) -> Result<DualArmSnapshot, RawClockRuntimeError> {
+        let master = read_experimental_snapshot_from_driver(
+            &self.master.driver,
+            RawClockSide::Master,
+            policy,
+        )?;
+        let slave = read_experimental_snapshot_from_driver(
+            &self.slave.driver,
+            RawClockSide::Slave,
+            policy,
+        )?;
+        let inter_arm_skew_us = master
+            .newest_raw_feedback_timing
+            .host_rx_mono_us
+            .abs_diff(slave.newest_raw_feedback_timing.host_rx_mono_us);
+        Ok(raw_dual_arm_snapshot(&master, &slave, inter_arm_skew_us))
+    }
+
     pub fn enable_mit_passthrough(
         mut self,
         master_cfg: MitModeConfig,
@@ -1853,6 +1874,27 @@ pub struct ExperimentalRawClockDualArmActive {
 impl ExperimentalRawClockDualArmActive {
     pub fn submit_command(&self, command: &BilateralCommand, timeout: Duration) -> RobotResult<()> {
         submit_soft_realtime_command(&self.slave, &self.master, command, timeout)
+    }
+
+    pub fn snapshot(
+        &self,
+        policy: ControlReadPolicy,
+    ) -> Result<DualArmSnapshot, RawClockRuntimeError> {
+        let master = read_experimental_snapshot_from_driver(
+            &self.master.driver,
+            RawClockSide::Master,
+            policy,
+        )?;
+        let slave = read_experimental_snapshot_from_driver(
+            &self.slave.driver,
+            RawClockSide::Slave,
+            policy,
+        )?;
+        let inter_arm_skew_us = master
+            .newest_raw_feedback_timing
+            .host_rx_mono_us
+            .abs_diff(slave.newest_raw_feedback_timing.host_rx_mono_us);
+        Ok(raw_dual_arm_snapshot(&master, &slave, inter_arm_skew_us))
     }
 
     pub fn run_master_follower(
@@ -3323,7 +3365,10 @@ mod tests {
         MitMode as ProtocolMitMode,
     };
     use piper_protocol::feedback::{ControlMode, MotionStatus, MoveMode, RobotStatus, TeachStatus};
-    use piper_protocol::ids::{ID_JOINT_DRIVER_LOW_SPEED_1, ID_ROBOT_STATUS};
+    use piper_protocol::ids::{
+        ID_JOINT_DRIVER_HIGH_SPEED_1, ID_JOINT_DRIVER_LOW_SPEED_1, ID_JOINT_FEEDBACK_12,
+        ID_JOINT_FEEDBACK_34, ID_JOINT_FEEDBACK_56, ID_ROBOT_STATUS,
+    };
     use piper_tools::raw_clock::{RawClockHealth, RawClockThresholds, RawClockUnhealthyKind};
     use semver::Version;
     use std::collections::VecDeque;
@@ -3769,7 +3814,18 @@ mod tests {
     type TxEvent = (&'static str, PiperFrame);
 
     fn received(frame: PiperFrame) -> ReceivedFrame {
-        ReceivedFrame::new(frame, TimestampProvenance::None)
+        let can_id = frame.raw_id() & 0x1FFF_FFFF;
+        let host_rx_mono_us = piper_can::monotonic_micros().max(1);
+        let raw_us = frame.timestamp_us().max(1);
+        ReceivedFrame::new(frame, TimestampProvenance::Kernel).with_raw_timestamp(
+            piper_can::RawTimestampInfo {
+                can_id,
+                host_rx_mono_us,
+                system_ts_us: Some(host_rx_mono_us),
+                hw_trans_us: None,
+                hw_raw_us: Some(raw_us),
+            },
+        )
     }
 
     struct TxCountGate {
@@ -3948,6 +4004,64 @@ mod tests {
         PiperFrame::new_standard(id, data).unwrap().with_timestamp_us(timestamp_us)
     }
 
+    fn joint_feedback_frame(
+        standard_id: u32,
+        first_deg_milli: i32,
+        second_deg_milli: i32,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&first_deg_milli.to_be_bytes());
+        data[4..8].copy_from_slice(&second_deg_milli.to_be_bytes());
+        PiperFrame::new_standard(standard_id, data)
+            .unwrap()
+            .with_timestamp_us(timestamp_us)
+    }
+
+    fn joint_dynamic_frame(
+        joint_index: u8,
+        speed_millirad_per_sec: i16,
+        current_milliamp: i16,
+        timestamp_us: u64,
+    ) -> PiperFrame {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&speed_millirad_per_sec.to_be_bytes());
+        data[2..4].copy_from_slice(&current_milliamp.to_be_bytes());
+        data[4..8].copy_from_slice(&0i32.to_be_bytes());
+        PiperFrame::new_standard(
+            u32::from(ID_JOINT_DRIVER_HIGH_SPEED_1.raw()) + u32::from(joint_index - 1),
+            data,
+        )
+        .unwrap()
+        .with_timestamp_us(timestamp_us)
+    }
+
+    fn complete_snapshot_frames(timestamp_us: u64) -> Vec<TimedFrame> {
+        [
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us),
+            joint_dynamic_frame(1, 0, 0, timestamp_us),
+            joint_dynamic_frame(2, 0, 0, timestamp_us),
+            joint_dynamic_frame(3, 0, 0, timestamp_us),
+            joint_dynamic_frame(4, 0, 0, timestamp_us),
+            joint_dynamic_frame(5, 0, 0, timestamp_us),
+            joint_dynamic_frame(6, 0, 0, timestamp_us),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_12.raw().into(), 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_34.raw().into(), 0, 0, timestamp_us + 1),
+            joint_feedback_frame(ID_JOINT_FEEDBACK_56.raw().into(), 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(1, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(2, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(3, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(4, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(5, 0, 0, timestamp_us + 1),
+            joint_dynamic_frame(6, 0, 0, timestamp_us + 1),
+        ]
+        .into_iter()
+        .map(|frame| TimedFrame::new(Duration::ZERO, frame))
+        .collect()
+    }
+
     fn enabled_joint_frames_after_gate(gate: TxCountGate) -> Vec<TimedFrame> {
         let mut frames = vec![TimedFrame::gated(
             gate,
@@ -4012,6 +4126,10 @@ mod tests {
             DriverPiper::new_dual_thread_parts(SoftCapabilityRx::new(rx_adapter), tx_adapter, None)
                 .expect("driver should start"),
         );
+        driver
+            .wait_for_feedback(Duration::from_millis(200))
+            .expect("feedback should arrive");
+        std::thread::sleep(Duration::from_millis(30));
         let observer = Observer::<SoftRealtime>::new(driver.clone());
 
         Piper {
@@ -4045,7 +4163,15 @@ mod tests {
                 101,
             ),
         ));
+        frames.extend(complete_snapshot_frames(200));
         frames
+    }
+
+    fn ready_snapshot_script(
+        _label: &'static str,
+        _events: Arc<Mutex<Vec<TxEvent>>>,
+    ) -> Vec<TimedFrame> {
+        complete_snapshot_frames(100)
     }
 
     fn build_active_raw_clock_piper(
@@ -4092,6 +4218,51 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for tx events");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn raw_clock_active_snapshot_reads_dual_arm_snapshot() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let active = build_active_runtime_for_tests(events);
+        std::thread::sleep(Duration::from_millis(20));
+
+        let snapshot = active
+            .snapshot(ControlReadPolicy {
+                max_state_skew_us: 10_000,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .expect("active raw-clock snapshot should be readable");
+
+        assert_eq!(snapshot.left.state.position.as_array().len(), 6);
+        assert_eq!(snapshot.right.state.position.as_array().len(), 6);
+    }
+
+    #[test]
+    fn raw_clock_standby_snapshot_reads_dual_arm_snapshot() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let standby = ExperimentalRawClockDualArmStandby {
+            master: build_soft_standby_piper(
+                PacedRxAdapter::new(ready_snapshot_script("master", events.clone())),
+                LabeledRecordingTxAdapter::new("master", events.clone()),
+            ),
+            slave: build_soft_standby_piper(
+                PacedRxAdapter::new(ready_snapshot_script("slave", events.clone())),
+                LabeledRecordingTxAdapter::new("slave", events),
+            ),
+            timing: ready_timing_for_tests(),
+            config: ExperimentalRawClockConfig::default(),
+        };
+        std::thread::sleep(Duration::from_millis(20));
+
+        let snapshot = standby
+            .snapshot(ControlReadPolicy {
+                max_state_skew_us: 10_000,
+                max_feedback_age: Duration::from_millis(200),
+            })
+            .expect("standby raw-clock snapshot should be readable");
+
+        assert_eq!(snapshot.left.state.position.as_array().len(), 6);
+        assert_eq!(snapshot.right.state.position.as_array().len(), 6);
     }
 
     #[test]

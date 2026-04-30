@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use piper_client::PiperBuilder;
+use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
 use piper_client::dual_arm::{
     BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
     BilateralExitReason, BilateralFinalTorques, BilateralGripperCommandStatus, BilateralLoopConfig,
@@ -18,9 +18,13 @@ use piper_client::dual_arm::{
     DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby, GripperTeleopConfig,
     JointMirrorMap, LoopTimingMode,
 };
-use piper_client::dual_arm_raw_clock::RawClockRuntimeReport;
+use piper_client::dual_arm_raw_clock::{
+    ExperimentalRawClockDualArmActive, ExperimentalRawClockDualArmStandby,
+    ExperimentalRawClockRunExit, RawClockRuntimeError, RawClockRuntimeExitReason,
+    RawClockRuntimeReport,
+};
 use piper_client::observer::{ControlSnapshot, ControlSnapshotFull};
-use piper_client::state::{DisableConfig, MitModeConfig};
+use piper_client::state::{DisableConfig, MitModeConfig, Piper, SoftRealtime, Standby};
 use piper_client::types::{Joint, JointArray, NewtonMeter, Rad, RadPerSecond};
 use piper_physics::{
     DualArmMujocoCompensatorConfig, DynamicsMode, EndEffectorKinematics, PayloadSpec,
@@ -1054,6 +1058,20 @@ pub fn run_from_args(args: Args) -> Result<CollectorRunResult> {
 }
 
 fn run_real_collector(args: Args, cancel: CollectorCancelToken) -> Result<CollectorRunResult> {
+    match crate::raw_clock::SvsRuntimeKind::from_args(&args) {
+        crate::raw_clock::SvsRuntimeKind::StrictRealtime => {
+            run_strict_realtime_collector(args, cancel)
+        },
+        crate::raw_clock::SvsRuntimeKind::CalibratedRawClock => {
+            run_raw_clock_collector(args, cancel)
+        },
+    }
+}
+
+fn run_strict_realtime_collector(
+    args: Args,
+    cancel: CollectorCancelToken,
+) -> Result<CollectorRunResult> {
     let (master_target, slave_target) = validate_targets(&args.master_target, &args.slave_target)?;
     let resolved_profile = resolve_profile_from_args(&args)?;
     let started_unix_ns = current_unix_ns();
@@ -1359,6 +1377,609 @@ fn run_real_collector(args: Args, cancel: CollectorCancelToken) -> Result<Collec
     )
 }
 
+fn run_raw_clock_collector(args: Args, cancel: CollectorCancelToken) -> Result<CollectorRunResult> {
+    let (master_target, slave_target) = validate_targets(&args.master_target, &args.slave_target)?;
+    let resolved_profile = resolve_profile_from_args(&args)?;
+    let raw_clock_settings =
+        crate::raw_clock::SvsRawClockSettings::resolve(&args, &resolved_profile.profile)?;
+    let gripper_mirror_effective =
+        crate::raw_clock::effective_gripper_mirror_enabled(&args, &resolved_profile.profile);
+    let started_unix_ns = current_unix_ns();
+    let timestamp = utc_timestamp_from_unix_ns(started_unix_ns)?;
+    let episode_start_host_mono_us = piper_driver::heartbeat::monotonic_micros();
+    let task_name = args.task.clone().unwrap_or_else(|| DEFAULT_TASK_NAME.to_string());
+    validate_static_startup_inputs(&args, &task_name)?;
+
+    let stager = Arc::new(SvsTickStager::new());
+    let dynamics_slot = Arc::new(SvsDynamicsSlot::new());
+    let feedback_history = Arc::new(Mutex::new(AppliedMasterFeedbackHistory::default()));
+    let resolved_mujoco = resolve_mujoco_from_args(&args, &resolved_profile.profile)?;
+    let bridge = SvsMujocoBridge::new(
+        SvsMujocoBridgeConfig {
+            model_source: resolved_mujoco.bridge_source.clone(),
+            compensator: resolved_mujoco.compensator.clone(),
+            master_ee_site: resolved_profile.profile.mujoco.master_ee_site.clone(),
+            slave_ee_site: resolved_profile.profile.mujoco.slave_ee_site.clone(),
+        },
+        Arc::clone(&dynamics_slot),
+    )
+    .context("failed to initialize MuJoCo bridge before MIT enable")?;
+
+    let master = connect_soft_socketcan_standby("master", &master_target, args.baud_rate)?;
+    let slave = connect_soft_socketcan_standby("slave", &slave_target, args.baud_rate)?;
+    let master_quirks = master.quirks();
+    let slave_quirks = slave.quirks();
+    tracing::info!(
+        master_firmware = %master_quirks.firmware_version,
+        slave_firmware = %slave_quirks.firmware_version,
+        "SVS raw-clock firmware/profile context"
+    );
+    let raw_config = raw_clock_settings.to_experimental_config(
+        resolved_profile.profile.control.loop_frequency_hz,
+        args.max_iterations
+            .map(|value| usize::try_from(value).unwrap_or(usize::MAX)),
+    );
+    raw_config.validate()?;
+    let standby = ExperimentalRawClockDualArmStandby::new(master, slave, raw_config)?;
+
+    let loaded_calibration =
+        load_raw_clock_calibration_if_present(&args, resolved_profile.runtime_mirror_map)?;
+    let startup_snapshot = standby.snapshot(raw_clock_settings.read_policy())?;
+    let startup_calibration = match &loaded_calibration {
+        Some(loaded) => loaded.clone(),
+        None => provisional_raw_clock_startup_calibration(
+            &startup_snapshot,
+            resolved_profile.runtime_mirror_map,
+            started_unix_ns / 1_000_000,
+        )?,
+    };
+
+    let reservation = EpisodeId::reserve_directory(
+        &args.output_dir,
+        &task_name,
+        timestamp,
+        &OsEpisodeRng,
+        EPISODE_ID_ATTEMPTS,
+    )?;
+    let episode_id = reservation.id.episode_id.clone();
+    let episode_dir = reservation.absolute_dir;
+
+    write_new_file(
+        episode_dir.join("effective_profile.toml"),
+        &resolved_profile.effective_profile_bytes,
+    )?;
+    write_new_file(
+        episode_dir.join("calibration.toml"),
+        &startup_calibration.resolved.canonical_bytes,
+    )?;
+
+    let raw_can = Arc::new(if args.raw_can {
+        RawCanStatusTracker::requested()
+    } else {
+        RawCanStatusTracker::disabled()
+    });
+    let writer_flush_timeout =
+        Duration::from_millis(resolved_profile.profile.writer.flush_timeout_ms);
+    let base = build_real_manifest_base(RealManifestInputs {
+        episode_id: episode_id.clone(),
+        task_raw_name: task_name,
+        task_slug: reservation.id.task_slug,
+        operator: args.operator.clone(),
+        notes: args.notes.clone(),
+        started_unix_ns,
+        episode_start_host_mono_us,
+        master_requested: args.master_target.clone(),
+        slave_requested: args.slave_target.clone(),
+        master_target: master_target.clone(),
+        slave_target: slave_target.clone(),
+        mujoco: resolved_mujoco.manifest,
+        profile: &resolved_profile.profile,
+        task_profile: resolved_profile.task_profile,
+        effective_profile_hash: resolved_profile.effective_profile_hash,
+        mirror_map: resolved_profile.mirror_map,
+        calibration: &startup_calibration.resolved.calibration,
+        calibration_hash: startup_calibration.resolved.sha256_hex.clone(),
+        raw_can_enabled: args.raw_can,
+        disable_gripper_requested: args.disable_gripper_mirror,
+    })?;
+    let mut context = RealRunContext {
+        episode_id: episode_id.clone(),
+        episode_dir: episode_dir.clone(),
+        base: RealEpisodeBase {
+            raw_clock: Some(raw_clock_settings.to_manifest()),
+            ..base
+        },
+        raw_can: Arc::clone(&raw_can),
+        writer_flush_timeout,
+        raw_clock_report: None,
+        raw_clock_settings: Some(raw_clock_settings),
+    };
+    let initial_summary = crate::episode::wire::StepFileSummary {
+        episode_id: episode_id.clone(),
+        step_count: 0,
+        last_step_index: None,
+    };
+
+    let header = SvsHeaderV1::new(
+        &episode_id,
+        started_unix_ns / 1_000_000,
+        episode_start_host_mono_us,
+    )?;
+    let writer_monitor = writer_backpressure_monitor_from_profile(&resolved_profile.profile);
+    let writer = match EpisodeWriter::new_with_backpressure_thresholds(
+        &episode_dir,
+        header,
+        resolved_profile.profile.writer.queue_capacity,
+        &writer_monitor,
+    ) {
+        Ok(writer) => Arc::new(SharedEpisodeWriter::new(writer)),
+        Err(error) => return finalize_writer_startup_failure(&context, &writer_monitor, error),
+    };
+    write_real_manifest(
+        &context,
+        EpisodeStatus::Running,
+        None,
+        &initial_summary,
+        "running".to_string(),
+        true,
+    )?;
+
+    let raw_can_recording = match start_raw_can_side_recording(
+        args.raw_can,
+        &episode_dir,
+        &master_target,
+        &slave_target,
+        cancel.loop_signal(),
+        Arc::clone(&raw_can),
+    ) {
+        Ok(recording) => recording,
+        Err(error) => {
+            let mut report = BilateralRunReport {
+                last_error: Some(error.to_string()),
+                ..BilateralRunReport::default()
+            };
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                0,
+                false,
+                None,
+            );
+        },
+    };
+
+    print_raw_clock_startup_stage("startup: refreshing raw-clock timing (~10s)...");
+    let cancel_signal = cancel.loop_signal();
+    let standby = match standby.warmup(
+        raw_clock_settings.read_policy(),
+        Duration::from_secs(raw_clock_settings.warmup_secs),
+        cancel_signal.as_ref(),
+    ) {
+        Ok(standby) => standby,
+        Err(error) => {
+            let status = if matches!(&error, RawClockRuntimeError::Cancelled) {
+                EpisodeStatus::Cancelled
+            } else {
+                EpisodeStatus::Faulted
+            };
+            let mut report = BilateralRunReport {
+                exit_reason: Some(if status == EpisodeStatus::Cancelled {
+                    BilateralExitReason::Cancelled
+                } else {
+                    BilateralExitReason::RuntimeTransportFault
+                }),
+                last_error: Some(error.to_string()),
+                ..BilateralRunReport::default()
+            };
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                status,
+                &mut report,
+                0,
+                false,
+                raw_can_recording,
+            );
+        },
+    };
+
+    if gripper_mirror_effective {
+        let mut report = BilateralRunReport {
+            exit_reason: Some(BilateralExitReason::RuntimeTransportFault),
+            last_error: Some(
+                "SVS raw-clock gripper mirroring is not implemented yet; pass --disable-gripper-mirror"
+                    .to_string(),
+            ),
+            ..BilateralRunReport::default()
+        };
+        return finish_writer_and_finalize(
+            &context,
+            &writer,
+            EpisodeStatus::Faulted,
+            &mut report,
+            0,
+            false,
+            raw_can_recording,
+        );
+    }
+
+    if let Some(loaded) = &loaded_calibration {
+        let standby_snapshot = match standby.snapshot(raw_clock_settings.read_policy()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let mut report = BilateralRunReport {
+                    exit_reason: Some(BilateralExitReason::RuntimeTransportFault),
+                    last_error: Some(error.to_string()),
+                    ..BilateralRunReport::default()
+                };
+                return finish_writer_and_finalize(
+                    &context,
+                    &writer,
+                    EpisodeStatus::Faulted,
+                    &mut report,
+                    0,
+                    false,
+                    raw_can_recording,
+                );
+            },
+        };
+        if let Err(error) = validate_raw_clock_calibration_posture(
+            "pre-enable",
+            &loaded.resolved.calibration,
+            &standby_snapshot,
+            resolved_profile
+                .profile
+                .calibration
+                .calibration_max_error_rad,
+        ) {
+            let mut report = BilateralRunReport {
+                exit_reason: Some(BilateralExitReason::RuntimeTransportFault),
+                last_error: Some(error.to_string()),
+                ..BilateralRunReport::default()
+            };
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                0,
+                false,
+                raw_can_recording,
+            );
+        }
+    }
+
+    print_raw_clock_startup_summary(
+        &master_target,
+        &slave_target,
+        &resolved_profile.profile,
+        &raw_clock_settings,
+        gripper_mirror_effective,
+        if args.calibration_file.is_some() {
+            "loaded"
+        } else {
+            "captured-after-enable"
+        },
+        &episode_dir,
+    );
+
+    let operator_confirmed = match confirm_start_if_needed(&args, &cancel) {
+        Ok(confirmed) => confirmed,
+        Err(error) => {
+            let mut report = BilateralRunReport {
+                last_error: Some(error.to_string()),
+                ..BilateralRunReport::default()
+            };
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                0,
+                false,
+                raw_can_recording,
+            );
+        },
+    };
+
+    if cancel.is_cancelled() || !operator_confirmed {
+        let mut report = BilateralRunReport {
+            exit_reason: Some(BilateralExitReason::Cancelled),
+            last_error: Some("collector cancelled before MIT enable".to_string()),
+            ..BilateralRunReport::default()
+        };
+        return finish_writer_and_finalize(
+            &context,
+            &writer,
+            EpisodeStatus::Cancelled,
+            &mut report,
+            0,
+            false,
+            raw_can_recording,
+        );
+    }
+
+    print_raw_clock_startup_stage("startup: refreshing raw-clock timing (~10s)...");
+    let cancel_signal = cancel.loop_signal();
+    let standby = match standby.warmup(
+        raw_clock_settings.read_policy(),
+        Duration::from_secs(raw_clock_settings.warmup_secs),
+        cancel_signal.as_ref(),
+    ) {
+        Ok(standby) => standby,
+        Err(error) => {
+            let status = if matches!(&error, RawClockRuntimeError::Cancelled) {
+                EpisodeStatus::Cancelled
+            } else {
+                EpisodeStatus::Faulted
+            };
+            let mut report = BilateralRunReport {
+                exit_reason: Some(if status == EpisodeStatus::Cancelled {
+                    BilateralExitReason::Cancelled
+                } else {
+                    BilateralExitReason::RuntimeTransportFault
+                }),
+                last_error: Some(error.to_string()),
+                ..BilateralRunReport::default()
+            };
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                status,
+                &mut report,
+                0,
+                false,
+                raw_can_recording,
+            );
+        },
+    };
+
+    print_raw_clock_startup_stage("startup: enabling MIT passthrough...");
+    let active =
+        match standby.enable_mit_passthrough(MitModeConfig::default(), MitModeConfig::default()) {
+            Ok(active) => active,
+            Err(error) => {
+                return finalize_raw_clock_startup_fault(
+                    &context,
+                    &writer,
+                    raw_can_recording,
+                    error,
+                    false,
+                );
+            },
+        };
+
+    print_raw_clock_startup_stage("startup: reading active snapshot...");
+    let active_snapshot = match read_raw_clock_active_snapshot(&active, &raw_clock_settings) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
+            let mut report = raw_clock_startup_fault_report(error);
+            report.left_stop_attempt = shutdown.master_stop_attempt;
+            report.right_stop_attempt = shutdown.slave_stop_attempt;
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                1,
+                true,
+                raw_can_recording,
+            );
+        },
+    };
+
+    print_raw_clock_startup_stage("startup: capturing active-zero calibration...");
+    let resolved_calibration = match resolve_raw_clock_active_calibration(
+        &args,
+        &active_snapshot,
+        loaded_calibration.as_ref(),
+        resolved_profile.runtime_mirror_map,
+        started_unix_ns / 1_000_000,
+        resolved_profile
+            .profile
+            .calibration
+            .calibration_max_error_rad,
+    ) {
+        Ok(calibration) => calibration,
+        Err(error) => {
+            let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
+            let mut report = raw_clock_startup_fault_report(error);
+            report.left_stop_attempt = shutdown.master_stop_attempt;
+            report.right_stop_attempt = shutdown.slave_stop_attempt;
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                1,
+                true,
+                raw_can_recording,
+            );
+        },
+    };
+
+    if loaded_calibration.is_none() {
+        if let Err(error) = replace_raw_clock_capture_calibration(&mut context, &resolved_calibration)
+        {
+            let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
+            let mut report = raw_clock_startup_fault_report(error);
+            report.left_stop_attempt = shutdown.master_stop_attempt;
+            report.right_stop_attempt = shutdown.slave_stop_attempt;
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                1,
+                true,
+                raw_can_recording,
+            );
+        }
+        if let Err(error) = write_real_manifest(
+            &context,
+            EpisodeStatus::Running,
+            None,
+            &initial_summary,
+            "running".to_string(),
+            false,
+        ) {
+            let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
+            let mut report = raw_clock_startup_fault_report(error);
+            report.left_stop_attempt = shutdown.master_stop_attempt;
+            report.right_stop_attempt = shutdown.slave_stop_attempt;
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                1,
+                true,
+                raw_can_recording,
+            );
+        }
+    }
+    if let Some(path) = args.save_calibration.as_ref() {
+        if let Err(error) = crate::calibration::persist_calibration_no_overwrite(
+            path,
+            &resolved_calibration.resolved.canonical_bytes,
+        )
+        .with_context(|| format!("failed to save calibration to {}", path.display()))
+        {
+            let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
+            let mut report = raw_clock_startup_fault_report(error);
+            report.left_stop_attempt = shutdown.master_stop_attempt;
+            report.right_stop_attempt = shutdown.slave_stop_attempt;
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                1,
+                true,
+                raw_can_recording,
+            );
+        }
+    }
+
+    let sink = Arc::new(SvsTelemetrySink::new(
+        Arc::clone(&stager),
+        Arc::clone(&feedback_history),
+        Arc::clone(&writer),
+        raw_can.clone(),
+        writer_backpressure_monitor_from_profile(&resolved_profile.profile),
+        episode_start_host_mono_us,
+    ));
+    let controller = match SvsController::with_shared(
+        resolved_profile.profile.clone(),
+        resolved_calibration.runtime,
+        stager,
+        dynamics_slot,
+        feedback_history,
+    ) {
+        Ok(controller) => controller,
+        Err(error) => {
+            let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
+            let mut report = raw_clock_startup_fault_report(error);
+            report.left_stop_attempt = shutdown.master_stop_attempt;
+            report.right_stop_attempt = shutdown.slave_stop_attempt;
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                1,
+                true,
+                raw_can_recording,
+            );
+        },
+    };
+    let telemetry_sink: Arc<dyn BilateralLoopTelemetrySink> = sink;
+    let loop_config = match bilateral_loop_config_from_profile(
+        &resolved_profile.profile,
+        &args,
+        &cancel,
+        telemetry_sink,
+    ) {
+        Ok(loop_config) => loop_config,
+        Err(error) => {
+            let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
+            let mut report = raw_clock_startup_fault_report(error);
+            report.left_stop_attempt = shutdown.master_stop_attempt;
+            report.right_stop_attempt = shutdown.slave_stop_attempt;
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                1,
+                true,
+                raw_can_recording,
+            );
+        },
+    };
+    let run_config = raw_clock_settings.to_run_config(&loop_config);
+    if let Err(error) = run_config.validate() {
+        let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
+        let mut report = raw_clock_startup_fault_report(error);
+        report.left_stop_attempt = shutdown.master_stop_attempt;
+        report.right_stop_attempt = shutdown.slave_stop_attempt;
+        return finish_writer_and_finalize(
+            &context,
+            &writer,
+            EpisodeStatus::Faulted,
+            &mut report,
+            1,
+            true,
+            raw_can_recording,
+        );
+    }
+
+    print_raw_clock_startup_stage("startup: starting SVS raw-clock bilateral loop...");
+    let loop_exit = match active.run_with_controller_and_compensation(controller, bridge, run_config)
+    {
+        Ok(exit) => exit,
+        Err(error) => {
+            debug_assert!(
+                false,
+                "raw-clock runtime returned an outer error after the collector pre-validated run_config"
+            );
+            let message = error.to_string();
+            let mut report = raw_clock_startup_fault_report(&message);
+            report.last_error = Some(format!(
+                "raw-clock runtime returned an outer error after MIT enable: {message}"
+            ));
+            return finish_writer_and_finalize(
+                &context,
+                &writer,
+                EpisodeStatus::Faulted,
+                &mut report,
+                1,
+                false,
+                raw_can_recording,
+            );
+        },
+    };
+
+    let raw_report = match loop_exit {
+        ExperimentalRawClockRunExit::Standby { report, .. }
+        | ExperimentalRawClockRunExit::Faulted { report, .. } => report,
+    };
+    context.raw_clock_report = Some(raw_report.clone());
+    let mut outcome = loop_outcome_from_raw_clock(raw_report);
+    finish_writer_and_finalize(
+        &context,
+        &writer,
+        outcome.status,
+        &mut outcome.report,
+        1,
+        outcome.disable_called,
+        raw_can_recording,
+    )
+}
+
 fn resolve_profile_from_args(args: &Args) -> Result<ResolvedProfile> {
     let (mut profile, task_profile) = if let Some(path) = args.task_profile.as_ref() {
         let bytes = fs::read(path)
@@ -1578,6 +2199,208 @@ fn resolve_real_calibration(
     )?;
 
     Ok(ResolvedRealCalibration { resolved, runtime })
+}
+
+fn load_raw_clock_calibration_if_present(
+    args: &Args,
+    runtime_map: JointMirrorMap,
+) -> Result<Option<ResolvedRealCalibration>> {
+    let Some(path) = args.calibration_file.as_ref() else {
+        return Ok(None);
+    };
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read calibration {}", path.display()))?;
+    let loaded = CalibrationFile::from_canonical_bytes(&bytes)
+        .with_context(|| format!("failed to parse calibration {}", path.display()))?;
+    let resolved = resolve_episode_calibration(Some(loaded), runtime_map, None)?;
+    let runtime = DualArmCalibration {
+        master_zero: JointArray::new(resolved.calibration.master_zero_rad.map(Rad)),
+        slave_zero: JointArray::new(resolved.calibration.slave_zero_rad.map(Rad)),
+        map: runtime_map,
+    };
+    Ok(Some(ResolvedRealCalibration { resolved, runtime }))
+}
+
+fn provisional_raw_clock_startup_calibration(
+    startup_snapshot: &DualArmSnapshot,
+    runtime_map: JointMirrorMap,
+    created_unix_ms: u64,
+) -> Result<ResolvedRealCalibration> {
+    let calibration = DualArmCalibration {
+        master_zero: startup_snapshot.left.state.position,
+        slave_zero: startup_snapshot.right.state.position,
+        map: runtime_map,
+    };
+    let captured = calibration_file_from_dual_arm(&calibration, created_unix_ms);
+    let resolved = resolve_episode_calibration(None, runtime_map, Some(captured))?;
+    Ok(ResolvedRealCalibration {
+        resolved,
+        runtime: calibration,
+    })
+}
+
+fn validate_raw_clock_calibration_posture(
+    stage: &str,
+    calibration: &CalibrationFile,
+    snapshot: &DualArmSnapshot,
+    max_error_rad: f64,
+) -> Result<()> {
+    validate_current_posture(
+        calibration,
+        snapshot.left.state.position.into_array().map(|value| value.0),
+        snapshot.right.state.position.into_array().map(|value| value.0),
+        max_error_rad,
+    )
+    .with_context(|| format!("raw-clock calibration posture validation failed at {stage}"))
+}
+
+fn read_raw_clock_active_snapshot(
+    active: &ExperimentalRawClockDualArmActive,
+    settings: &crate::raw_clock::SvsRawClockSettings,
+) -> Result<DualArmSnapshot> {
+    active
+        .snapshot(settings.read_policy())
+        .context("failed to read raw-clock active snapshot")
+}
+
+fn resolve_raw_clock_active_calibration(
+    args: &Args,
+    active_snapshot: &DualArmSnapshot,
+    loaded_calibration: Option<&ResolvedRealCalibration>,
+    runtime_map: JointMirrorMap,
+    created_unix_ms: u64,
+    calibration_max_error_rad: f64,
+) -> Result<ResolvedRealCalibration> {
+    if let Some(loaded) = loaded_calibration {
+        validate_raw_clock_calibration_posture(
+            "post-enable",
+            &loaded.resolved.calibration,
+            active_snapshot,
+            calibration_max_error_rad,
+        )?;
+        return Ok(loaded.clone());
+    }
+
+    if args.calibration_file.is_some() {
+        return Err(anyhow!(
+            "raw-clock loaded calibration was requested but no loaded calibration is available"
+        ));
+    }
+
+    let calibration = DualArmCalibration {
+        master_zero: active_snapshot.left.state.position,
+        slave_zero: active_snapshot.right.state.position,
+        map: runtime_map,
+    };
+    let captured = calibration_file_from_dual_arm(&calibration, created_unix_ms);
+    let resolved = resolve_episode_calibration(None, runtime_map, Some(captured))?;
+    Ok(ResolvedRealCalibration {
+        resolved,
+        runtime: calibration,
+    })
+}
+
+fn replace_raw_clock_capture_calibration(
+    context: &mut RealRunContext,
+    calibration: &ResolvedRealCalibration,
+) -> Result<()> {
+    write_replace_file(
+        context.episode_dir.join("calibration.toml"),
+        &calibration.resolved.canonical_bytes,
+    )?;
+    context.base.manifest.calibration = CalibrationManifest {
+        source_path: Some(PathBuf::from("calibration.toml")),
+        hash_algorithm: "sha256".to_string(),
+        sha256_hex: calibration.resolved.sha256_hex.clone(),
+        master_zero_rad: calibration.resolved.calibration.master_zero_rad,
+        slave_zero_rad: calibration.resolved.calibration.slave_zero_rad,
+        effective_mirror_map: context.base.manifest.calibration.effective_mirror_map,
+    };
+    Ok(())
+}
+
+fn raw_clock_startup_fault_report(error: impl std::fmt::Display) -> BilateralRunReport {
+    BilateralRunReport {
+        exit_reason: Some(BilateralExitReason::RuntimeTransportFault),
+        last_error: Some(error.to_string()),
+        ..BilateralRunReport::default()
+    }
+}
+
+fn finalize_raw_clock_startup_fault(
+    context: &RealRunContext,
+    writer: &Arc<SharedEpisodeWriter>,
+    raw_can_recording: Option<RawCanRecordingHandle>,
+    error: impl std::fmt::Display,
+    disable_called: bool,
+) -> Result<CollectorRunResult> {
+    let mut report = raw_clock_startup_fault_report(error);
+    finish_writer_and_finalize(
+        context,
+        writer,
+        EpisodeStatus::Faulted,
+        &mut report,
+        0,
+        disable_called,
+        raw_can_recording,
+    )
+}
+
+fn loop_outcome_from_raw_clock(report: RawClockRuntimeReport) -> LoopOutcome {
+    let status = match report.exit_reason {
+        Some(RawClockRuntimeExitReason::MaxIterations) | None => EpisodeStatus::Complete,
+        Some(RawClockRuntimeExitReason::Cancelled) => EpisodeStatus::Cancelled,
+        Some(_) => EpisodeStatus::Faulted,
+    };
+    LoopOutcome {
+        status,
+        attempted_iterations: report.iterations as u64,
+        loop_stopped_before_requested_iterations: status != EpisodeStatus::Complete,
+        report: bilateral_report_from_raw_clock_for_svs(&report),
+        disable_called: true,
+    }
+}
+
+fn bilateral_report_from_raw_clock_for_svs(report: &RawClockRuntimeReport) -> BilateralRunReport {
+    BilateralRunReport {
+        iterations: report.iterations,
+        read_faults: report.read_faults,
+        submission_faults: report.submission_faults,
+        peer_command_may_have_applied: report.peer_command_may_have_applied,
+        max_inter_arm_skew: Duration::from_micros(report.max_inter_arm_skew_us),
+        left_tx_realtime_overwrites_total: report.master_tx_realtime_overwrites_total,
+        right_tx_realtime_overwrites_total: report.slave_tx_realtime_overwrites_total,
+        left_tx_frames_sent_total: report.master_tx_frames_sent_total,
+        right_tx_frames_sent_total: report.slave_tx_frames_sent_total,
+        left_tx_fault_aborts_total: report.master_tx_fault_aborts_total,
+        right_tx_fault_aborts_total: report.slave_tx_fault_aborts_total,
+        last_runtime_fault_left: report.last_runtime_fault_master,
+        last_runtime_fault_right: report.last_runtime_fault_slave,
+        exit_reason: report.exit_reason.map(raw_clock_exit_to_bilateral_exit),
+        left_stop_attempt: report.master_stop_attempt,
+        right_stop_attempt: report.slave_stop_attempt,
+        last_error: report.last_error.clone(),
+        ..BilateralRunReport::default()
+    }
+}
+
+fn raw_clock_exit_to_bilateral_exit(reason: RawClockRuntimeExitReason) -> BilateralExitReason {
+    match reason {
+        RawClockRuntimeExitReason::MaxIterations => BilateralExitReason::MaxIterations,
+        RawClockRuntimeExitReason::Cancelled => BilateralExitReason::Cancelled,
+        RawClockRuntimeExitReason::ReadFault => BilateralExitReason::ReadFault,
+        RawClockRuntimeExitReason::CompensationFault => BilateralExitReason::CompensationFault,
+        RawClockRuntimeExitReason::ControllerFault => BilateralExitReason::ControllerFault,
+        RawClockRuntimeExitReason::SubmissionFault => BilateralExitReason::SubmissionFault,
+        RawClockRuntimeExitReason::TelemetrySinkFault => BilateralExitReason::TelemetrySinkFault,
+        RawClockRuntimeExitReason::RuntimeManualFault => BilateralExitReason::RuntimeManualFault,
+        RawClockRuntimeExitReason::RawClockFault
+        | RawClockRuntimeExitReason::ClockHealthFault
+        | RawClockRuntimeExitReason::RuntimeConfigFault
+        | RawClockRuntimeExitReason::RuntimeTransportFault => {
+            BilateralExitReason::RuntimeTransportFault
+        },
+    }
 }
 
 fn build_real_manifest_base(inputs: RealManifestInputs<'_>) -> Result<RealEpisodeBase> {
@@ -2043,6 +2866,68 @@ fn piper_builder_for_target(target: &SocketCanTarget, baud_rate: Option<u32>) ->
     } else {
         builder
     }
+}
+
+fn connect_soft_socketcan_standby(
+    role: &'static str,
+    target: &SocketCanTarget,
+    baud_rate: Option<u32>,
+) -> Result<Piper<Standby, SoftRealtime>> {
+    let mut builder = PiperBuilder::new().socketcan(target.iface.clone());
+    if let Some(baud_rate) = baud_rate {
+        builder = builder.baud_rate(baud_rate);
+    }
+    let connected = builder.build().with_context(|| {
+        format!(
+            "failed to connect raw-clock {role} target socketcan:{}",
+            target.iface
+        )
+    })?;
+
+    match connected.require_motion()? {
+        MotionConnectedPiper::Soft(MotionConnectedState::Standby(standby)) => Ok(standby),
+        MotionConnectedPiper::Soft(MotionConnectedState::Maintenance(_))
+        | MotionConnectedPiper::Strict(MotionConnectedState::Maintenance(_)) => {
+            Err(anyhow!("maintenance required before SVS raw-clock teleop"))
+        },
+        MotionConnectedPiper::Strict(MotionConnectedState::Standby(_)) => Err(anyhow!(
+            "SVS raw-clock expected SoftRealtime; use normal SVS StrictRealtime backend"
+        )),
+    }
+}
+
+fn print_raw_clock_startup_stage(message: &str) {
+    eprintln!("{message}");
+}
+
+fn print_raw_clock_startup_summary(
+    master_target: &SocketCanTarget,
+    slave_target: &SocketCanTarget,
+    profile: &EffectiveProfile,
+    raw_clock: &crate::raw_clock::SvsRawClockSettings,
+    gripper_mirror_effective: bool,
+    calibration_source: &str,
+    output_dir: &Path,
+) {
+    eprintln!("svs raw-clock startup summary");
+    eprintln!("  master target: socketcan:{}", master_target.iface);
+    eprintln!("  slave target: socketcan:{}", slave_target.iface);
+    eprintln!("  mode: bilateral");
+    eprintln!("  frequency: {:.1} Hz", profile.control.loop_frequency_hz);
+    eprintln!("  timing_source=calibrated_hw_raw");
+    eprintln!("  experimental=true");
+    eprintln!("  strict_realtime=false");
+    eprintln!("  raw-clock warmup: {}s", raw_clock.warmup_secs);
+    eprintln!(
+        "  raw-clock gates: skew={}us state_skew={}us residual_p95={}us residual_max={}us",
+        raw_clock.inter_arm_skew_max_us,
+        raw_clock.state_skew_max_us,
+        raw_clock.residual_p95_us,
+        raw_clock.residual_max_us,
+    );
+    eprintln!("  calibration: {calibration_source}");
+    eprintln!("  gripper mirror: {gripper_mirror_effective}");
+    eprintln!("  output dir: {}", output_dir.display());
 }
 
 fn confirm_start_if_needed(args: &Args, cancel: &CollectorCancelToken) -> Result<bool> {
