@@ -861,6 +861,15 @@ impl FakeCollectorHarness {
                         raw_clock_reason_from_fake_loop(outcome.status, outcome.report.exit_reason),
                     ));
                 }
+                let outcome =
+                    if self.runtime_kind == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock {
+                        raw_clock_runtime_report
+                            .as_ref()
+                            .map(|report| loop_outcome_from_raw_clock(report.clone()))
+                            .unwrap_or(outcome)
+                    } else {
+                        outcome
+                    };
                 status = outcome.status;
                 dual_arm_exit_reason = outcome.report.exit_reason;
                 loop_stopped_before_requested_iterations =
@@ -4248,6 +4257,19 @@ mod tests {
         };
 
         assert!(raw_clock_startup_final_failure_kind(&report).is_none());
+    }
+
+    #[test]
+    fn svs_sink_rejects_missing_or_zero_tx_finished_timestamps() {
+        assert!(matches!(
+            required_tx_finished("master", None),
+            Err(SvsTelemetrySinkFault::MissingTxFinished { arm: "master" })
+        ));
+        assert!(matches!(
+            required_tx_finished("slave", Some(0)),
+            Err(SvsTelemetrySinkFault::MissingTxFinished { arm: "slave" })
+        ));
+        assert_eq!(required_tx_finished("master", Some(1)).unwrap(), 1);
     }
 
     #[test]
