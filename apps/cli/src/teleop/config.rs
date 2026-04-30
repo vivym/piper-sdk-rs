@@ -100,6 +100,7 @@ pub struct TeleopConfigFile {
     pub control: Option<TeleopControlConfig>,
     pub safety: Option<TeleopSafetyConfig>,
     pub calibration: Option<TeleopCalibrationConfig>,
+    pub gravity: Option<TeleopGravityConfig>,
     pub raw_clock: Option<TeleopRawClockConfig>,
 }
 
@@ -146,6 +147,16 @@ pub struct TeleopCalibrationConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+pub struct TeleopGravityConfig {
+    pub master_model: Option<PathBuf>,
+    pub slave_model: Option<PathBuf>,
+    pub reflection_compensation: Option<bool>,
+    pub master_assist_ratio: Option<f64>,
+    pub slave_assist_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TeleopRawClockConfig {
     pub warmup_secs: Option<u64>,
     pub residual_p95_us: Option<u64>,
@@ -186,6 +197,15 @@ pub struct TeleopCalibrationSettings {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TeleopGravitySettings {
+    pub master_model: Option<PathBuf>,
+    pub slave_model: Option<PathBuf>,
+    pub reflection_compensation: bool,
+    pub master_assist_ratio: f64,
+    pub slave_assist_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TeleopRawClockSettings {
     pub experimental_calibrated_raw: bool,
     pub warmup_secs: u64,
@@ -208,6 +228,7 @@ pub struct ResolvedTeleopConfig {
     pub control: TeleopControlSettings,
     pub safety: TeleopSafetySettings,
     pub calibration: TeleopCalibrationSettings,
+    pub gravity: TeleopGravitySettings,
     pub raw_clock: TeleopRawClockSettings,
     pub max_iterations: Option<usize>,
     pub timing_mode: Option<TeleopTimingMode>,
@@ -242,6 +263,24 @@ impl TeleopControlSettings {
         validate_range("track_kd", self.track_kd, 0.0, 5.0)?;
         validate_range("master_damping", self.master_damping, 0.0, 2.0)?;
         validate_range("reflection_gain", self.reflection_gain, 0.0, 0.5)?;
+        Ok(())
+    }
+}
+
+impl TeleopGravitySettings {
+    pub fn validate(&self) -> Result<()> {
+        validate_range(
+            "master_gravity_assist_ratio",
+            self.master_assist_ratio,
+            0.0,
+            0.6,
+        )?;
+        validate_range(
+            "slave_gravity_assist_ratio",
+            self.slave_assist_ratio,
+            0.0,
+            0.6,
+        )?;
         Ok(())
     }
 }
@@ -368,6 +407,7 @@ impl ResolvedTeleopConfig {
         let file_control = file.as_ref().and_then(|file| file.control.as_ref());
         let file_safety = file.as_ref().and_then(|file| file.safety.as_ref());
         let file_calibration = file.as_ref().and_then(|file| file.calibration.as_ref());
+        let file_gravity = file.as_ref().and_then(|file| file.gravity.as_ref());
         let file_raw_clock = file.as_ref().and_then(|file| file.raw_clock.as_ref());
 
         let control = TeleopControlSettings {
@@ -462,6 +502,31 @@ impl ResolvedTeleopConfig {
         };
         raw_clock.validate()?;
 
+        let gravity = TeleopGravitySettings {
+            master_model: args
+                .master_gravity_model
+                .or_else(|| file_gravity.and_then(|gravity| gravity.master_model.clone())),
+            slave_model: args
+                .slave_gravity_model
+                .or_else(|| file_gravity.and_then(|gravity| gravity.slave_model.clone())),
+            reflection_compensation: if args.gravity_reflection_compensation {
+                true
+            } else {
+                file_gravity
+                    .and_then(|gravity| gravity.reflection_compensation)
+                    .unwrap_or(false)
+            },
+            master_assist_ratio: args
+                .master_gravity_assist_ratio
+                .or_else(|| file_gravity.and_then(|gravity| gravity.master_assist_ratio))
+                .unwrap_or(0.0),
+            slave_assist_ratio: args
+                .slave_gravity_assist_ratio
+                .or_else(|| file_gravity.and_then(|gravity| gravity.slave_assist_ratio))
+                .unwrap_or(0.0),
+        };
+        gravity.validate()?;
+
         let calibration_max_error_rad = args
             .calibration_max_error_rad
             .or_else(|| file_calibration.and_then(|calibration| calibration.max_error_rad))
@@ -491,6 +556,7 @@ impl ResolvedTeleopConfig {
                     .or_else(|| file_calibration.and_then(|calibration| calibration.joint_map))
                     .unwrap_or_default(),
             },
+            gravity,
             raw_clock,
             max_iterations: args
                 .max_iterations
@@ -579,6 +645,86 @@ mod tests {
 
         assert_eq!(resolved.control.mode, TeleopMode::MasterFollower);
         assert_eq!(resolved.control.frequency_hz, 200.0);
+    }
+
+    #[test]
+    fn gravity_assist_ratio_above_hard_limit_is_rejected() {
+        let err = ResolvedTeleopConfig::resolve(
+            TeleopDualArmArgs {
+                master_gravity_assist_ratio: Some(0.61),
+                ..TeleopDualArmArgs::default_for_tests()
+            },
+            None,
+        )
+        .expect_err("master gravity assist above hard cap must fail");
+
+        assert!(err.to_string().contains("master_gravity_assist_ratio"));
+    }
+
+    #[test]
+    fn cli_gravity_values_override_file_values() {
+        let file = TeleopConfigFile {
+            gravity: Some(TeleopGravityConfig {
+                master_model: Some(PathBuf::from("config/master.model.toml")),
+                slave_model: Some(PathBuf::from("config/slave.model.toml")),
+                reflection_compensation: Some(false),
+                master_assist_ratio: Some(0.4),
+                slave_assist_ratio: Some(0.3),
+            }),
+            ..Default::default()
+        };
+        let args = TeleopDualArmArgs {
+            master_gravity_model: Some(PathBuf::from("cli/master.model.toml")),
+            slave_gravity_model: Some(PathBuf::from("cli/slave.model.toml")),
+            gravity_reflection_compensation: true,
+            master_gravity_assist_ratio: Some(0.2),
+            slave_gravity_assist_ratio: Some(0.1),
+            ..TeleopDualArmArgs::default_for_tests()
+        };
+
+        let resolved = ResolvedTeleopConfig::resolve(args, Some(file)).unwrap();
+
+        assert_eq!(
+            resolved.gravity.master_model,
+            Some(PathBuf::from("cli/master.model.toml"))
+        );
+        assert_eq!(
+            resolved.gravity.slave_model,
+            Some(PathBuf::from("cli/slave.model.toml"))
+        );
+        assert!(resolved.gravity.reflection_compensation);
+        assert_eq!(resolved.gravity.master_assist_ratio, 0.2);
+        assert_eq!(resolved.gravity.slave_assist_ratio, 0.1);
+    }
+
+    #[test]
+    fn config_file_gravity_values_are_used_when_cli_missing() {
+        let file = TeleopConfigFile {
+            gravity: Some(TeleopGravityConfig {
+                master_model: Some(PathBuf::from("config/master.model.toml")),
+                slave_model: Some(PathBuf::from("config/slave.model.toml")),
+                reflection_compensation: Some(true),
+                master_assist_ratio: Some(0.2),
+                slave_assist_ratio: Some(0.1),
+            }),
+            ..Default::default()
+        };
+
+        let resolved =
+            ResolvedTeleopConfig::resolve(TeleopDualArmArgs::default_for_tests(), Some(file))
+                .unwrap();
+
+        assert_eq!(
+            resolved.gravity.master_model,
+            Some(PathBuf::from("config/master.model.toml"))
+        );
+        assert_eq!(
+            resolved.gravity.slave_model,
+            Some(PathBuf::from("config/slave.model.toml"))
+        );
+        assert!(resolved.gravity.reflection_compensation);
+        assert_eq!(resolved.gravity.master_assist_ratio, 0.2);
+        assert_eq!(resolved.gravity.slave_assist_ratio, 0.1);
     }
 
     #[test]

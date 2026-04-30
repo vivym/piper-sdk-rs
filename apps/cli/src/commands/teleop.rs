@@ -55,6 +55,16 @@ pub struct TeleopDualArmArgs {
     #[arg(long)]
     pub reflection_gain: Option<f64>,
     #[arg(long)]
+    pub master_gravity_model: Option<PathBuf>,
+    #[arg(long)]
+    pub slave_gravity_model: Option<PathBuf>,
+    #[arg(long)]
+    pub gravity_reflection_compensation: bool,
+    #[arg(long)]
+    pub master_gravity_assist_ratio: Option<f64>,
+    #[arg(long)]
+    pub slave_gravity_assist_ratio: Option<f64>,
+    #[arg(long)]
     pub disable_gripper_mirror: bool,
     #[arg(long)]
     pub calibration_file: Option<PathBuf>,
@@ -131,6 +141,11 @@ impl TeleopDualArmArgs {
             track_kd: None,
             master_damping: None,
             reflection_gain: None,
+            master_gravity_model: None,
+            slave_gravity_model: None,
+            gravity_reflection_compensation: false,
+            master_gravity_assist_ratio: None,
+            slave_gravity_assist_ratio: None,
             disable_gripper_mirror: false,
             calibration_file: None,
             calibration_max_error_rad: None,
@@ -278,6 +293,34 @@ mod tests {
                     args.joint_map,
                     Some(crate::teleop::config::TeleopJointMap::Identity)
                 );
+            },
+        }
+    }
+
+    #[test]
+    fn dual_arm_command_parses_gravity_model_flags() {
+        let cmd = TeleopCommand::try_parse_from([
+            "teleop",
+            "dual-arm",
+            "--master-interface",
+            "can1",
+            "--slave-interface",
+            "can0",
+            "--slave-gravity-model",
+            "artifacts/gravity/slave.model.toml",
+            "--gravity-reflection-compensation",
+            "--master-gravity-assist-ratio",
+            "0.2",
+            "--slave-gravity-assist-ratio",
+            "0.1",
+        ])
+        .unwrap();
+
+        match cmd.action {
+            TeleopAction::DualArm(args) => {
+                assert!(args.gravity_reflection_compensation);
+                assert_eq!(args.master_gravity_assist_ratio, Some(0.2));
+                assert_eq!(args.slave_gravity_assist_ratio, Some(0.1));
             },
         }
     }
