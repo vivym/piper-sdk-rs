@@ -2,6 +2,7 @@
 
 pub mod collision_protection;
 pub mod config;
+pub mod gravity;
 pub mod home;
 pub mod r#move;
 pub mod park;
@@ -15,6 +16,7 @@ pub mod teleop;
 
 pub use collision_protection::CollisionProtectionCommand;
 pub use config::ConfigCommand;
+pub use gravity::{GravityAction, GravityCommand};
 pub use home::HomeCommand;
 pub use r#move::MoveCommand;
 pub use park::ParkCommand;

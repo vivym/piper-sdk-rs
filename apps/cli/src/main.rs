@@ -30,6 +30,7 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod connection;
+mod gravity;
 mod modes;
 mod parsing;
 mod safety;
@@ -40,9 +41,9 @@ mod validation;
 
 use commands::config::CliConfig;
 use commands::{
-    CollisionProtectionCommand, ConfigCommand, HomeCommand, MoveCommand, ParkCommand,
-    PositionCommand, RecordCommand, ReplayCommand, RunCommand, SetZeroCommand, StopCommand,
-    TeleopAction, TeleopCommand,
+    CollisionProtectionCommand, ConfigCommand, GravityAction, GravityCommand, HomeCommand,
+    MoveCommand, ParkCommand, PositionCommand, RecordCommand, ReplayCommand, RunCommand,
+    SetZeroCommand, StopCommand, TeleopAction, TeleopCommand,
 };
 use connection::TargetArgs;
 use modes::oneshot::OneShotMode;
@@ -142,6 +143,12 @@ enum Commands {
         #[command(subcommand)]
         action: Box<TeleopAction>,
     },
+
+    /// Empirical quasi-static torque model collection and fitting
+    Gravity {
+        #[command(subcommand)]
+        action: GravityAction,
+    },
 }
 
 #[tokio::main]
@@ -223,6 +230,8 @@ async fn main() -> Result<()> {
         },
 
         Commands::Teleop { action } => TeleopCommand { action: *action }.execute().await,
+
+        Commands::Gravity { action } => GravityCommand { action }.execute().await,
 
         Commands::Shell => {
             // REPL 模式：交互式 Shell
