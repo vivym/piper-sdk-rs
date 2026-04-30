@@ -89,6 +89,22 @@ piper-cli gravity fit ...
 piper-cli gravity eval ...
 ```
 
+Gravity commands should reuse the same target grammar as the rest of
+`piper-cli`: `--target socketcan:can0`, `--target gs-usb-serial:...`, and the
+configured default target. A short `--interface can0` convenience may be added
+for lab ergonomics, but persisted metadata should store the resolved canonical
+target string.
+
+All collected and fitted values must use the same physical sign convention and
+units as `DualArmSnapshot` and `BilateralDynamicsCompensation`:
+
+- joint positions are radians in SDK joint order
+- joint velocities are rad/s in SDK joint order
+- measured torque is Nm after firmware quirk scaling/sign normalization
+- model torque is emitted in the local arm's joint frame
+- `slave_external_torque_est` is computed in the slave frame before the
+  bilateral calibration maps it to the master frame
+
 The teleop command then consumes fitted models:
 
 ```bash
@@ -109,7 +125,7 @@ Example:
 ```bash
 piper-cli gravity record-path \
   --role slave \
-  --interface can0 \
+  --target socketcan:can0 \
   --joint-map identity \
   --load-profile normal-gripper-d405 \
   --out artifacts/gravity/slave-d405.path.jsonl
@@ -118,15 +134,33 @@ piper-cli gravity record-path \
 The path file is not used directly for fitting. It is a safety and coverage
 input for `replay-sample`.
 
-Each JSONL row should include:
+Torque in the path file is diagnostic only. During manual path recording the arm
+may be disabled or otherwise manually guided, so torque samples may be zero,
+invalid, or contaminated by operator handling. `fit` must reject path files and
+accept only `replay-sample` output.
 
+The JSONL file should use explicit row types. The first row is a header:
+
+- `type = "header"`
+- `artifact_kind = "path"`
+- schema version
+- role
+- resolved target
+- joint map
+- load profile
+- operator notes
+- SDK/git version where available
+
+Subsequent rows are samples:
+
+- `type = "path-sample"`
 - host monotonic timestamp
 - optional hardware/raw timestamp where available
 - `q_rad[6]`
 - `dq_rad_s[6]`
 - `tau_nm[6]`
 - dynamic/position valid masks
-- role, target, joint map, and load profile metadata in a header row
+- optional operator segment label
 
 ### replay-sample
 
@@ -138,21 +172,27 @@ Example:
 ```bash
 piper-cli gravity replay-sample \
   --role slave \
-  --interface can0 \
+  --target socketcan:can0 \
   --path artifacts/gravity/slave-d405.path.jsonl \
   --out artifacts/gravity/slave-d405.samples.jsonl \
   --max-velocity-rad-s 0.08 \
   --settle-ms 500 \
-  --sample-ms 300
+  --sample-ms 300 \
+  --bidirectional
 ```
 
 Replay behavior:
 
 1. Load the recorded path.
+   - the path header role, joint map, and load profile must match CLI args
+   - the resolved target should match unless the operator passes an explicit
+     unsafe `--allow-target-mismatch` override
 2. Smooth and simplify the path into waypoints while preserving the operator's
    safe envelope.
-3. Move through waypoints using bounded joint velocity, bounded joint step, and
-   conservative acceleration behavior.
+3. Move through waypoints using a dedicated low-speed MIT joint-space stepper.
+   The first implementation should not use the opaque firmware PositionMode
+   trajectory planner for this command because fitting needs explicit velocity,
+   step, gain, and hold-window control.
 4. At each accepted waypoint, wait for stable conditions:
    - joint velocity below threshold
    - tracking error below threshold
@@ -162,9 +202,55 @@ Replay behavior:
 6. Stop on operator interrupt, feedback staleness, excessive torque, excessive
    tracking error, or path/limit violation.
 
-The first implementation should prefer low-speed joint-space moves over any
-automatic Cartesian planner. The key safety property is that replay follows an
-operator-proven path rather than inventing new large motions.
+The default sampling pass should be bidirectional: traverse the simplified path
+forward and then backward unless the operator disables that behavior. This helps
+expose friction/hysteresis residuals instead of letting the fitter mistake
+one-direction friction for gravity.
+
+Path simplification must be conservative. It may remove redundant adjacent
+samples, but it must preserve waypoint order, enforce a max joint-space
+deviation from the recorded path, and avoid creating long shortcut segments
+through unrecorded space. The dry run should report removed waypoint count and
+max simplification deviation.
+
+The MIT stepper should command small joint-space increments with zero model
+feedforward, conservative `kp/kd`, explicit velocity limits, and a stable hold
+at each waypoint. Samples collected while the target is still moving must be
+discarded. Only hold-window samples are valid for fitting. The key safety
+property is that replay follows an operator-proven path rather than inventing new
+large motions.
+
+`replay-sample` must require operator confirmation before enabling the arm. The
+confirmation text should include the target, role, load profile, maximum joint
+velocity, waypoint count, and output path.
+
+`replay-sample --dry-run` should print waypoint count, min/max joint range, and
+estimated duration without enabling the arm. This gives the operator a chance to
+reject an unsafe path before active replay.
+
+Initial lab defaults should be conservative and CLI-configurable:
+
+```text
+max_velocity_rad_s = 0.08
+max_step_rad = 0.02
+settle_ms = 500
+sample_ms = 300
+stable_velocity_rad_s = 0.01
+stable_tracking_error_rad = 0.03
+stable_torque_std_nm = 0.08
+```
+
+The replay output JSONL must have its own header:
+
+- `type = "header"`
+- `artifact_kind = "quasi-static-samples"`
+- source path file and content hash
+- role, resolved target, joint map, and load profile
+- replay parameters and stability thresholds
+- waypoint count, accepted waypoint count, and rejected waypoint count
+
+Replay sample rows should use `type = "quasi-static-sample"` so `fit` can
+reject manual path rows unambiguously.
 
 ### fit
 
@@ -181,17 +267,44 @@ piper-cli gravity fit \
   --holdout-ratio 0.2
 ```
 
+`--samples` may be passed more than once to merge multiple safe replay
+segments. All input files must have `artifact_kind = "quasi-static-samples"` and
+matching role, joint map, load profile, and torque convention. Mismatches must
+be rejected unless a future explicit merge/retarget command exists.
+
 The first basis should be compact and explainable:
 
 ```text
 1
 sin(q_i), cos(q_i)
-sin(q_i + q_j), cos(q_i + q_j) for selected coupled joints
+sin(q_i + q_{i+1}), cos(q_i + q_{i+1}) for adjacent joint pairs
+```
+
+`trig-v1` should use one shared feature vector for all six output joints:
+
+```text
+1 bias feature
+12 single-joint sin/cos features
+10 adjacent-pair sum sin/cos features
+23 total features
 ```
 
 The fitted model stores one linear coefficient vector per output joint. This is
 data-driven but not unconstrained: the feature basis encodes the physical prior
 that gravity-like torques vary smoothly and periodically with joint angles.
+
+The holdout split must be path/segment based, not random row based. Adjacent
+stable-window samples are strongly correlated; random row holdout would
+overstate generalization. The fitter should reject models with too few
+independent waypoints per coefficient, with a first-version default of at least
+10 independent accepted waypoints per feature. It should report the feature
+matrix condition number or an equivalent conditioning metric.
+
+The fitter should report forward/backward residual differences when samples were
+collected bidirectionally. The first model does not attempt to identify a
+friction model; large direction-dependent residuals should be surfaced as a
+quality warning and may require slower replay, more settle time, or future
+friction modeling.
 
 ### eval
 
@@ -214,6 +327,7 @@ It should report at least:
 - number of samples
 - training envelope violations
 - nearest-neighbor/coverage distance summary
+- per-segment residual summary when segment labels are available
 
 ## Model File
 
@@ -228,6 +342,7 @@ basis = "trig-v1"
 role = "slave"
 joint_map = "identity"
 load_profile = "normal-gripper-d405"
+torque_convention = "piper-sdk-normalized-nm-v1"
 created_at_unix_ms = 1770000000000
 sample_count = 120000
 frequency_hz = 100.0
@@ -242,6 +357,8 @@ q_max_rad = [...]
 dq_abs_p95_rad_s = [...]
 tau_min_nm = [...]
 tau_max_nm = [...]
+waypoint_count = 640
+segment_count = 8
 
 [fit_quality]
 rms_residual_nm = [...]
@@ -249,6 +366,7 @@ p95_residual_nm = [...]
 max_residual_nm = [...]
 holdout_rms_residual_nm = [...]
 holdout_p95_residual_nm = [...]
+condition_number = 123.4
 ```
 
 Required model section:
@@ -264,6 +382,13 @@ coefficients_nm = [
   [...], # J5
   [...], # J6
 ]
+
+[coverage]
+# Optional decimated training anchors used for runtime distance/confidence
+# checks. If omitted, runtime must fall back to range-only gating.
+anchor_q_rad = [
+  [...],
+]
 ```
 
 ## Teleop Integration
@@ -277,6 +402,11 @@ The teleop CLI should add explicit model and enable flags:
 --master-gravity-assist-ratio <0.0..0.6>
 --slave-gravity-assist-ratio <0.0..0.6>
 ```
+
+The first runtime integration target is the calibrated raw-clock teleop path
+used by the current hardware experiments. StrictRealtime teleop may use the same
+model and compensator later, but raw-clock support is the acceptance target for
+the first implementation.
 
 Runtime compensation should compute:
 
@@ -295,6 +425,17 @@ slave_model_torque  = slave_hat  * slave_gravity_assist_ratio
 ```
 
 This maps directly onto `BilateralDynamicsCompensation`.
+
+`slave_hat` must not be mapped to the master frame inside the compensator. The
+compensator emits `slave_external_torque_est` in the slave frame, and the
+bilateral controller's existing calibration maps slave-frame external torque to
+master-frame reflected torque. `master_hat` is used only for
+`master_model_torque` in the master frame.
+
+Compensation uses the current snapshot and affects commands submitted for the
+next cycle. This avoids an algebraic loop: any assist torque sent in this cycle
+will influence measured torque only in later feedback, where the same model
+subtraction remains valid.
 
 The first recommended validation sequence is:
 
@@ -319,6 +460,8 @@ Startup validation:
 - model joint map must match `--joint-map`
 - model load profile should be printed in startup summary
 - model fit quality should be printed in startup summary
+- model schema version and basis must be supported
+- model torque sign convention must match the current SDK schema version
 - operator confirmation should name any enabled assist ratios
 
 Runtime validation:
@@ -331,6 +474,10 @@ Runtime validation:
 - Assist ratio changes should be slew-limited.
 - Any model evaluation fault is a compensation fault and should follow existing
   bounded shutdown behavior.
+- Runtime confidence should be computed from range and, when present, nearest
+  training-anchor distance. Effective reflection compensation may be scaled by
+  confidence. Effective gravity assist must be zero when confidence reaches
+  zero.
 
 Suggested first-version hard limits:
 
@@ -348,8 +495,6 @@ poor generalization:
 - record multiple operator-safe paths, not one path
 - cover the actual teleop workspace, not the full robot workspace
 - use `replay-sample` to sample stable points along those paths
-- optionally add small local perturbations around safe waypoints in a later
-  version
 - store range and fit metrics in the model
 - add runtime confidence/range gating
 
@@ -368,6 +513,8 @@ Teleop reports should add gravity model diagnostics when enabled:
 - range violations
 - compensation confidence / active scaling
 - compensation fault count
+- model path, role, load profile, fit RMS/p95, and assist ratios
+- out-of-range sample count and max range violation
 
 The existing torque diagnostics should remain, and new fields should clarify
 whether final master torque came from reflection, gravity assist, or both.
@@ -418,17 +565,19 @@ Validation:
 - Unit tests cover feature evaluation, TOML round trip, fit on synthetic data,
   range gating, and compensation mapping.
 - CLI parser tests cover new commands and teleop flags.
+- Replay tests use a fake MIT stepper to verify that samples are recorded only
+  after velocity/tracking/variance stability gates pass.
+- Fit tests use segment-based holdout and verify random-row leakage is not the
+  implemented default.
 - A hardware runbook validates:
   - raw torque decreases after reflection compensation in free-space replay
   - assist ratio 0.2 is stable before higher ratios are tried
   - combined mode is only tested after separate master/slave validation
 
-## Open Questions
+## Deferred Work
 
-- Whether replay-sample should use existing blocking joint-position moves first
-  or a dedicated low-speed MIT joint-space stepper.
-- Whether local waypoint perturbation belongs in the first implementation or a
-  follow-up.
-- What default sample stability thresholds should be used on the current
-  hardware.
-
+- Local waypoint perturbation around safe waypoints. This is useful for expanding
+  coverage from a path into a local tube, but it should wait until the base
+  record/replay/fit/eval loop is validated on hardware.
+- Explicit friction modeling. The first version should detect and report
+  direction-dependent residuals but not compensate them.
