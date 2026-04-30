@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 const SAMPLE_ARTIFACT_KIND: &str = "quasi-static-samples";
 const PATH_ARTIFACT_KIND: &str = "path";
 const SAMPLE_ROW_TYPE: &str = "quasi-static-sample";
+const PATH_SAMPLE_ROW_TYPE: &str = "path-sample";
 const HEADER_ROW_TYPE: &str = "header";
 const SCHEMA_VERSION: u32 = 1;
+const VALID_JOINT_MASK: u8 = 0x3f;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -106,11 +108,23 @@ pub struct LoadedSamples {
     pub rows: Vec<QuasiStaticSampleRow>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LoadedPath {
+    pub header: PathHeader,
+    pub rows: Vec<PathSampleRow>,
+}
+
 #[derive(Debug, Deserialize)]
 struct HeaderProbe {
     #[serde(rename = "type")]
     row_type: String,
     artifact_kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RowTypeProbe {
+    #[serde(rename = "type")]
+    row_type: String,
 }
 
 impl PathHeader {
@@ -165,6 +179,77 @@ pub fn read_quasi_static_samples(paths: &[PathBuf]) -> Result<LoadedSamples> {
         header: loaded_header.expect("paths is non-empty"),
         rows,
     })
+}
+
+pub fn read_path(path: &Path) -> Result<LoadedPath> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let header_line = match lines.next() {
+        Some(line) => {
+            line.with_context(|| format!("failed to read header from {}", path.display()))?
+        },
+        None => bail!("{} is empty; expected path header", path.display()),
+    };
+
+    let probe: HeaderProbe = serde_json::from_str(&header_line)
+        .with_context(|| format!("failed to parse header in {}", path.display()))?;
+    if probe.row_type != HEADER_ROW_TYPE {
+        bail!(
+            "{} first row type must be {HEADER_ROW_TYPE:?}, got {:?}",
+            path.display(),
+            probe.row_type
+        );
+    }
+    if probe.artifact_kind != PATH_ARTIFACT_KIND {
+        bail!(
+            "{} artifact_kind must be {PATH_ARTIFACT_KIND:?}, got {:?}",
+            path.display(),
+            probe.artifact_kind
+        );
+    }
+
+    let header: PathHeader = serde_json::from_str(&header_line)
+        .with_context(|| format!("failed to parse path header in {}", path.display()))?;
+    validate_path_header(&header, path)?;
+
+    let mut rows = Vec::new();
+    for (index, line) in lines.enumerate() {
+        let line_number = index + 2;
+        let line = line.with_context(|| {
+            format!(
+                "failed to read path-sample row {line_number} from {}",
+                path.display()
+            )
+        })?;
+        let row_probe: RowTypeProbe = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "failed to parse path-sample row {line_number} type in {}",
+                path.display()
+            )
+        })?;
+        if row_probe.row_type != PATH_SAMPLE_ROW_TYPE {
+            bail!(
+                "{} row {line_number} type must be {PATH_SAMPLE_ROW_TYPE:?}, got {:?}",
+                path.display(),
+                row_probe.row_type
+            );
+        }
+
+        let row: PathSampleRow = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "failed to parse path-sample row {line_number} in {}; arrays must be finite JSON numbers",
+                path.display()
+            )
+        })?;
+        validate_path_row(&row, path, line_number)?;
+        rows.push(row);
+    }
+
+    if rows.is_empty() {
+        bail!("{} contains no path-sample rows", path.display());
+    }
+
+    Ok(LoadedPath { header, rows })
 }
 
 fn read_quasi_static_samples_file(
@@ -250,6 +335,51 @@ fn validate_samples_header(header: &SamplesHeader, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_path_header(header: &PathHeader, path: &Path) -> Result<()> {
+    if header.row_type != HEADER_ROW_TYPE {
+        bail!(
+            "{} header type must be {HEADER_ROW_TYPE:?}, got {:?}",
+            path.display(),
+            header.row_type
+        );
+    }
+    if header.artifact_kind != PATH_ARTIFACT_KIND {
+        bail!(
+            "{} artifact_kind must be {PATH_ARTIFACT_KIND:?}, got {:?}",
+            path.display(),
+            header.artifact_kind
+        );
+    }
+    if header.schema_version != SCHEMA_VERSION {
+        bail!(
+            "{} schema_version must be {SCHEMA_VERSION}, got {}",
+            path.display(),
+            header.schema_version
+        );
+    }
+    if header.role.trim().is_empty() {
+        bail!("{} role must not be empty", path.display());
+    }
+    if header.target.trim().is_empty() {
+        bail!("{} target must not be empty", path.display());
+    }
+    if header.joint_map.trim().is_empty() {
+        bail!("{} joint_map must not be empty", path.display());
+    }
+    if header.load_profile.trim().is_empty() {
+        bail!("{} load_profile must not be empty", path.display());
+    }
+    if header.torque_convention != crate::gravity::TORQUE_CONVENTION {
+        bail!(
+            "{} torque_convention must be {:?}, got {:?}",
+            path.display(),
+            crate::gravity::TORQUE_CONVENTION,
+            header.torque_convention
+        );
+    }
+    Ok(())
+}
+
 fn validate_header_matches(
     loaded_header: Option<&SamplesHeader>,
     header: &SamplesHeader,
@@ -318,6 +448,51 @@ fn validate_sample_row(row: &QuasiStaticSampleRow, path: &Path, line_number: usi
     Ok(())
 }
 
+fn validate_path_row(row: &PathSampleRow, path: &Path, line_number: usize) -> Result<()> {
+    if row.row_type != PATH_SAMPLE_ROW_TYPE {
+        bail!(
+            "{} row {line_number} type must be {PATH_SAMPLE_ROW_TYPE:?}, got {:?}",
+            path.display(),
+            row.row_type
+        );
+    }
+    if row.q_rad.iter().any(|value| !value.is_finite()) {
+        bail!("{} row {line_number} q_rad must be finite", path.display());
+    }
+    if row.dq_rad_s.iter().any(|value| !value.is_finite()) {
+        bail!(
+            "{} row {line_number} dq_rad_s must be finite",
+            path.display()
+        );
+    }
+    if row.tau_nm.iter().any(|value| !value.is_finite()) {
+        bail!("{} row {line_number} tau_nm must be finite", path.display());
+    }
+    validate_joint_mask(
+        "position_valid_mask",
+        row.position_valid_mask,
+        path,
+        line_number,
+    )?;
+    validate_joint_mask(
+        "dynamic_valid_mask",
+        row.dynamic_valid_mask,
+        path,
+        line_number,
+    )?;
+    Ok(())
+}
+
+fn validate_joint_mask(name: &str, mask: u8, path: &Path, line_number: usize) -> Result<()> {
+    if (mask & !VALID_JOINT_MASK) != 0 {
+        bail!(
+            "{} row {line_number} {name} has bits outside {VALID_JOINT_MASK:#04x}: {mask:#04x}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +552,89 @@ mod tests {
         assert_eq!(value["sample_index"], 7);
         assert_eq!(value["q_rad"].as_array().unwrap().len(), 6);
         assert_eq!(value["dynamic_valid_mask"], 0b0011_1111);
+    }
+
+    #[test]
+    fn path_reader_loads_header_and_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("path.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"path\",\"schema_version\":1,\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\"}\n",
+                "{\"type\":\"path-sample\",\"sample_index\":0,\"host_mono_us\":1,\"raw_timestamp_us\":2,\"q_rad\":[0,0.1,0.2,0.3,0.4,0.5],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":63,\"dynamic_valid_mask\":63,\"segment_id\":\"seg-a\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let loaded = read_path(&path).unwrap();
+
+        assert_eq!(loaded.header.role, "slave");
+        assert_eq!(loaded.header.target, "socketcan:can0");
+        assert_eq!(loaded.rows.len(), 1);
+        assert_eq!(loaded.rows[0].sample_index, 0);
+        assert_eq!(loaded.rows[0].segment_id.as_deref(), Some("seg-a"));
+    }
+
+    #[test]
+    fn path_reader_rejects_schema_and_torque_convention_mismatch() {
+        let dir = tempdir().unwrap();
+        let schema_path = dir.path().join("schema.jsonl");
+        std::fs::write(
+            &schema_path,
+            "{\"type\":\"header\",\"artifact_kind\":\"path\",\"schema_version\":2,\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\"}\n",
+        )
+        .unwrap();
+
+        let schema_err = read_path(&schema_path).unwrap_err();
+        assert!(schema_err.to_string().contains("schema_version"));
+
+        let torque_path = dir.path().join("torque.jsonl");
+        std::fs::write(
+            &torque_path,
+            "{\"type\":\"header\",\"artifact_kind\":\"path\",\"schema_version\":1,\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"legacy\"}\n",
+        )
+        .unwrap();
+
+        let torque_err = read_path(&torque_path).unwrap_err();
+        assert!(torque_err.to_string().contains("torque_convention"));
+    }
+
+    #[test]
+    fn path_reader_rejects_bad_row_type_nonfinite_arrays_and_invalid_masks() {
+        let dir = tempdir().unwrap();
+        let bad_type_path = dir.path().join("bad-type.jsonl");
+        std::fs::write(
+            &bad_type_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"path\",\"schema_version\":1,\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\"}\n",
+                "{\"type\":\"quasi-static-sample\",\"sample_index\":0,\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":63,\"dynamic_valid_mask\":63}\n"
+            ),
+        )
+        .unwrap();
+        assert!(read_path(&bad_type_path).unwrap_err().to_string().contains("path-sample"));
+
+        let nonfinite_path = dir.path().join("nonfinite.jsonl");
+        std::fs::write(
+            &nonfinite_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"path\",\"schema_version\":1,\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\"}\n",
+                "{\"type\":\"path-sample\",\"sample_index\":0,\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,1e999],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":63,\"dynamic_valid_mask\":63}\n"
+            ),
+        )
+        .unwrap();
+        assert!(read_path(&nonfinite_path).unwrap_err().to_string().contains("finite"));
+
+        let mask_path = dir.path().join("mask.jsonl");
+        std::fs::write(
+            &mask_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"path\",\"schema_version\":1,\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\"}\n",
+                "{\"type\":\"path-sample\",\"sample_index\":0,\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":64,\"dynamic_valid_mask\":63}\n"
+            ),
+        )
+        .unwrap();
+        assert!(read_path(&mask_path).unwrap_err().to_string().contains("mask"));
     }
 
     #[test]
