@@ -213,6 +213,16 @@ impl QuasiStaticTorqueModel {
             coverage: None,
         }
     }
+
+    pub(crate) fn for_tests_with_training_range(
+        q_min_rad: [f64; JOINT_COUNT],
+        q_max_rad: [f64; JOINT_COUNT],
+    ) -> Self {
+        let mut model = Self::for_tests_with_constant_output([0.0; JOINT_COUNT]);
+        model.training_range.q_min_rad = q_min_rad;
+        model.training_range.q_max_rad = q_max_rad;
+        model
+    }
 }
 
 #[cfg(test)]
