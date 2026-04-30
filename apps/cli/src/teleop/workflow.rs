@@ -12,7 +12,7 @@ use piper_client::dual_arm_raw_clock::{
 };
 use piper_client::observer::{ControlReadPolicy, ControlSnapshotFull, Observer};
 use piper_client::state::{DisableConfig, MitModeConfig, Piper, SoftRealtime, Standby};
-use piper_client::types::{JointArray, NewtonMeter, Rad, RadPerSecond, RobotError};
+use piper_client::types::{Joint, JointArray, NewtonMeter, Rad, RadPerSecond, RobotError};
 use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
 use piper_tools::raw_clock::{RawClockHealth, RawClockThresholds};
 use std::io::{self, Write};
@@ -263,6 +263,12 @@ where
         );
     }
 
+    if !resolved.raw_clock.experimental_calibrated_raw
+        && gravity_compensation_enabled(&resolved.gravity)
+    {
+        bail!("gravity compensation currently requires --experimental-calibrated-raw");
+    }
+
     let targets = resolve_role_targets(&args, config_file.as_ref(), platform)?;
     let cancel_signal = io.cancel_signal();
 
@@ -494,8 +500,12 @@ where
 
     let loaded_calibration =
         resolved.calibration.file.as_deref().map(load_calibration).transpose()?;
-    let loaded_gravity =
-        load_gravity_compensation(&resolved.gravity, resolved.calibration.joint_map)?;
+    let gravity_joint_map = gravity_compensation_joint_map(
+        &resolved.gravity,
+        loaded_calibration.as_ref().map(|(_, calibration)| &calibration.map),
+        resolved.calibration.joint_map,
+    )?;
+    let loaded_gravity = load_gravity_compensation(&resolved.gravity, gravity_joint_map)?;
     let summary_calibration_source = if loaded_calibration.is_some() {
         "file"
     } else {
@@ -724,14 +734,50 @@ struct LoadedGravityCompensation {
     summary: Option<StartupGravitySummary>,
 }
 
+fn gravity_compensation_enabled(settings: &TeleopGravitySettings) -> bool {
+    settings.reflection_compensation
+        || settings.master_assist_ratio > 0.0
+        || settings.slave_assist_ratio > 0.0
+}
+
+fn gravity_compensation_joint_map(
+    settings: &TeleopGravitySettings,
+    loaded_calibration_map: Option<&JointMirrorMap>,
+    captured_joint_map: TeleopJointMap,
+) -> Result<TeleopJointMap> {
+    if !gravity_compensation_enabled(settings) {
+        return Ok(captured_joint_map);
+    }
+
+    match loaded_calibration_map {
+        Some(map) => teleop_joint_map_from_joint_mirror_map(map).context(
+            "gravity compensation with a calibration file requires a canonical identity or left-right-mirror joint map",
+        ),
+        None => Ok(captured_joint_map),
+    }
+}
+
+fn teleop_joint_map_from_joint_mirror_map(map: &JointMirrorMap) -> Result<TeleopJointMap> {
+    if map.permutation == Joint::ALL
+        && map.position_sign == [1.0; 6]
+        && map.velocity_sign == [1.0; 6]
+        && map.torque_sign == [1.0; 6]
+    {
+        return Ok(TeleopJointMap::Identity);
+    }
+
+    if *map == JointMirrorMap::left_right_mirror() {
+        return Ok(TeleopJointMap::LeftRightMirror);
+    }
+
+    bail!("unsupported calibration joint map for gravity compensation")
+}
+
 fn load_gravity_compensation(
     settings: &TeleopGravitySettings,
     calibration_joint_map: TeleopJointMap,
 ) -> Result<LoadedGravityCompensation> {
-    let enabled = settings.reflection_compensation
-        || settings.master_assist_ratio > 0.0
-        || settings.slave_assist_ratio > 0.0;
-    if !enabled {
+    if !gravity_compensation_enabled(settings) {
         return Ok(LoadedGravityCompensation {
             compensator: None,
             summary: None,
@@ -3039,6 +3085,84 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raw_clock_loaded_calibration_map_controls_gravity_model_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let cal_path = temp.path().join("calibration.toml");
+        write_calibration_file_with_map(&cal_path, JointMirrorMap::left_right_mirror());
+        let slave_model = temp.path().join("slave.model.toml");
+        write_gravity_model_file(&slave_model, "slave", "identity", "empty");
+        let backend = FakeTeleopBackend::default();
+        let args = TeleopDualArmArgs {
+            calibration_file: Some(cal_path),
+            slave_gravity_model: Some(slave_model),
+            gravity_reflection_compensation: true,
+            joint_map: Some(TeleopJointMap::Identity),
+            ..experimental_args()
+        };
+
+        let err = run_workflow_for_test(args, backend.clone())
+            .expect_err("identity gravity model must not match loaded left-right calibration");
+
+        assert!(err.to_string().contains("calibration joint map left-right-mirror"));
+        assert!(!backend.calls().contains(&WorkflowCall::Enable));
+        assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn experimental_raw_clock_custom_loaded_calibration_map_rejects_gravity() {
+        let temp = tempfile::tempdir().unwrap();
+        let cal_path = temp.path().join("calibration.toml");
+        write_calibration_file_with_map(
+            &cal_path,
+            JointMirrorMap {
+                permutation: piper_client::types::Joint::ALL,
+                position_sign: [1.0; 6],
+                velocity_sign: [1.0; 6],
+                torque_sign: [-1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            },
+        );
+        let slave_model = temp.path().join("slave.model.toml");
+        write_gravity_model_file(&slave_model, "slave", "identity", "empty");
+        let backend = FakeTeleopBackend::default();
+        let args = TeleopDualArmArgs {
+            calibration_file: Some(cal_path),
+            slave_gravity_model: Some(slave_model),
+            gravity_reflection_compensation: true,
+            ..experimental_args()
+        };
+
+        let err = run_workflow_for_test(args, backend.clone())
+            .expect_err("custom loaded calibration map must reject gravity compensation");
+
+        assert!(err.to_string().contains("canonical identity or left-right-mirror"));
+        assert!(!backend.calls().contains(&WorkflowCall::Enable));
+        assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn strict_runtime_rejects_enabled_gravity_before_connect() {
+        let temp = tempfile::tempdir().unwrap();
+        let slave_model = temp.path().join("slave.model.toml");
+        write_gravity_model_file(&slave_model, "slave", "identity", "empty");
+        let backend = FakeTeleopBackend::default();
+        let args = TeleopDualArmArgs {
+            slave_gravity_model: Some(slave_model),
+            gravity_reflection_compensation: true,
+            joint_map: Some(TeleopJointMap::Identity),
+            ..valid_args()
+        };
+
+        let err = run_workflow_for_test(args, backend.clone())
+            .expect_err("strict runtime must reject enabled gravity compensation");
+
+        assert!(
+            err.to_string()
+                .contains("gravity compensation currently requires --experimental-calibrated-raw")
+        );
+        assert_eq!(backend.calls(), Vec::<WorkflowCall>::new());
+    }
+
+    #[test]
     fn experimental_raw_clock_captures_calibration_from_active_snapshot_after_enable() {
         let temp = tempfile::tempdir().unwrap();
         let save_path = temp.path().join("calibration.toml");
@@ -3945,6 +4069,16 @@ mod tests {
 
     fn write_sample_calibration_file(path: &Path) {
         CalibrationFile::from_calibration(&sample_calibration(), None, 123)
+            .save_new(path)
+            .expect("sample calibration file should be saved");
+    }
+
+    fn write_calibration_file_with_map(path: &Path, map: JointMirrorMap) {
+        let calibration = DualArmCalibration {
+            map,
+            ..sample_calibration()
+        };
+        CalibrationFile::from_calibration(&calibration, None, 123)
             .save_new(path)
             .expect("sample calibration file should be saved");
     }
