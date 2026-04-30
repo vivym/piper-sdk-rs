@@ -81,9 +81,19 @@ impl<'a> RawCommander<'a> {
         timeout: Duration,
     ) -> Result<piper_driver::MitBatchTxFinished> {
         let frames_array = commands.map(MitControlCommand::to_frame);
-        self.driver
-            .send_realtime_package_confirmed_finished(frames_array, timeout)
-            .map_err(Into::into)
+        match self.driver.backend_capability() {
+            piper_driver::BackendCapability::StrictRealtime => self
+                .driver
+                .send_realtime_package_confirmed_finished(frames_array, timeout)
+                .map_err(Into::into),
+            piper_driver::BackendCapability::SoftRealtime => self
+                .driver
+                .send_soft_realtime_package_confirmed_finished(frames_array, timeout)
+                .map_err(Into::into),
+            piper_driver::BackendCapability::MonitorOnly => Err(RobotError::realtime_unsupported(
+                "monitor-only backends cannot send MIT command batches",
+            )),
+        }
     }
 
     /// 批量发送位置控制指令（一次性发送所有 6 个关节）

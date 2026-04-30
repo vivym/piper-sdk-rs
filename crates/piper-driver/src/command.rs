@@ -74,7 +74,7 @@ pub enum DeliveryPhase {
 pub type RealtimeAck = Sender<DeliveryPhase>;
 pub type ReliableAck = Sender<DeliveryPhase>;
 pub type ShutdownAck = Sender<Result<(), DriverError>>;
-pub type SoftRealtimeAck = Sender<Result<(), DriverError>>;
+pub type SoftRealtimeAck = Sender<Result<DeliveryReceipt, DriverError>>;
 
 pub(crate) const SOFT_REALTIME_MAILBOX_CAPACITY: usize = 4;
 
@@ -474,7 +474,7 @@ impl SoftRealtimeCommand {
     }
 
     #[inline]
-    pub fn complete(self, result: Result<(), DriverError>) {
+    pub fn complete(self, result: Result<DeliveryReceipt, DriverError>) {
         let _ = self.ack.send(result);
     }
 }

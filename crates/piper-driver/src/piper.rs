@@ -4289,6 +4289,27 @@ impl Piper {
         frames: impl IntoIterator<Item = PiperFrame>,
         timeout: Duration,
     ) -> Result<(), DriverError> {
+        self.send_soft_realtime_package_confirmed_receipt(frames, timeout).map(|_| ())
+    }
+
+    /// 发送 SoftRealtime 原始批命令并返回 TX 线程完成整包发送后的主机单调时间戳。
+    pub fn send_soft_realtime_package_confirmed_finished(
+        &self,
+        frames: impl IntoIterator<Item = PiperFrame>,
+        timeout: Duration,
+    ) -> Result<MitBatchTxFinished, DriverError> {
+        let receipt = self.send_soft_realtime_package_confirmed_receipt(frames, timeout)?;
+        let host_finished_mono_us = receipt.host_finished_mono_us.ok_or(DriverError::Timeout)?;
+        Ok(MitBatchTxFinished {
+            host_finished_mono_us,
+        })
+    }
+
+    fn send_soft_realtime_package_confirmed_receipt(
+        &self,
+        frames: impl IntoIterator<Item = PiperFrame>,
+        timeout: Duration,
+    ) -> Result<DeliveryReceipt, DriverError> {
         use crate::command::FrameBuffer;
 
         if !self.backend_capability.is_soft_realtime() {
@@ -7718,6 +7739,24 @@ mod tests {
         let package =
             piper.send_realtime_package([PiperFrame::new_standard(0x155, [0x01]).unwrap()]);
         assert!(matches!(package, Err(DriverError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_soft_realtime_confirmed_finished_returns_tx_thread_timestamp() {
+        let piper = Piper::new_dual_thread_parts(SoftRxAdapter, MockTxAdapter, None).unwrap();
+        let frames = [
+            PiperFrame::new_standard(0x155, [0x01]).unwrap(),
+            PiperFrame::new_standard(0x156, [0x02]).unwrap(),
+        ];
+
+        let receipt = piper
+            .send_soft_realtime_package_confirmed_finished(frames, Duration::from_millis(200))
+            .expect("soft realtime confirmed-finished package should return a TX receipt");
+
+        assert!(
+            receipt.host_finished_mono_us > 0,
+            "soft realtime confirmed-finished receipt must carry a nonzero TX-thread timestamp",
+        );
     }
 
     #[test]

@@ -2096,7 +2096,14 @@ pub(crate) fn tx_loop_mailbox(
                 }
             }
 
-            let _ = ack.send(send_result);
+            let receipt = if send_result.is_ok() && sent_count == total_frames {
+                crate::command::DeliveryReceipt::finished_at(
+                    crate::heartbeat::monotonic_micros().max(1),
+                )
+            } else {
+                crate::command::DeliveryReceipt::none()
+            };
+            let _ = ack.send(send_result.map(|_| receipt));
             if deadline_missed {
                 record_soft_deadline_miss(
                     &metrics,

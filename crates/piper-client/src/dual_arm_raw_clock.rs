@@ -18,21 +18,24 @@ use thiserror::Error;
 use crate::dual_arm::{
     BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
     BilateralDynamicsCompensator, BilateralFinalTorques, BilateralLoopTelemetrySink,
-    BilateralOutputShapingConfig, BilateralOutputShapingState, DualArmCalibration, DualArmSnapshot,
-    GripperTeleopConfig, MasterFollowerController, StopAttemptResult, apply_output_shaping,
-    assemble_final_torques, clamp_control_dt_us, duration_micros_u64,
+    BilateralLoopTimingTelemetry, BilateralOutputShapingConfig, BilateralOutputShapingState,
+    DualArmCalibration, DualArmSnapshot, GripperTeleopConfig, MasterFollowerController,
+    StopAttemptResult, apply_output_shaping, assemble_final_torques, build_gripper_telemetry,
+    clamp_control_dt_us, deadline_missed_after_submission, duration_micros_u64,
 };
 use crate::observer::{
     ControlReadPolicy, ControlSnapshot, ControlSnapshotFull, DEFAULT_CONTROL_MAX_FEEDBACK_AGE,
     RuntimeHealthSnapshot,
 };
 use crate::raw_commander::RawCommander;
-use crate::state::machine::{DriverModeDropPolicy, DropPolicy};
+use crate::state::machine::{ConfirmedMitBatch, DriverModeDropPolicy, DropPolicy};
 use crate::state::{
     Active, DisableConfig, ErrorState, MitModeConfig, MitPassthroughMode, Piper, SoftRealtime,
     Standby,
 };
-use crate::types::{JointArray, NewtonMeter, Rad, RadPerSecond, Result as RobotResult, RobotError};
+use crate::types::{
+    Joint, JointArray, NewtonMeter, Rad, RadPerSecond, Result as RobotResult, RobotError,
+};
 
 const FAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(20);
 const RAW_CLOCK_STATE_TRANSITION_SEND_TIMEOUT: Duration = Duration::from_millis(50);
@@ -383,6 +386,14 @@ pub enum RawClockRuntimeExitReason {
     RuntimeTransportFault,
     RuntimeManualFault,
     TelemetrySinkFault,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RawClockSubmitReceipt {
+    pub master_tx_finished_host_mono_us: Option<u64>,
+    pub slave_tx_finished_host_mono_us: Option<u64>,
+    pub master_t_ref_nm: Option<[f64; 6]>,
+    pub slave_t_ref_nm: Option<[f64; 6]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1588,6 +1599,23 @@ trait RawClockRuntimeIo: Sized {
         timeout: Duration,
     ) -> Result<(), RawClockRuntimeError>;
 
+    fn gripper_states(&self) -> (crate::observer::GripperState, crate::observer::GripperState) {
+        (
+            crate::observer::GripperState::default(),
+            crate::observer::GripperState::default(),
+        )
+    }
+
+    fn submit_command_with_receipt(
+        &mut self,
+        command: &BilateralCommand,
+        final_torques: &BilateralFinalTorques,
+        timeout: Duration,
+    ) -> Result<RawClockSubmitReceipt, RawClockRuntimeError> {
+        self.submit_command(command, final_torques, timeout)?;
+        Ok(RawClockSubmitReceipt::default())
+    }
+
     fn disable_both(
         self,
         cfg: DisableConfig,
@@ -1595,6 +1623,75 @@ trait RawClockRuntimeIo: Sized {
     ) -> RawClockDisableOutcome<Self::StandbyArms, Self::ErrorArms>;
 
     fn fault_shutdown(self, timeout: Duration) -> RawClockFaultExit<Self::ErrorArms>;
+}
+
+trait SoftRealtimeMitFinishedExt {
+    fn command_torques_confirmed_finished(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> RobotResult<ConfirmedMitBatch>;
+}
+
+impl SoftRealtimeMitFinishedExt for Piper<Active<MitPassthroughMode>, SoftRealtime> {
+    fn command_torques_confirmed_finished(
+        &self,
+        positions: &JointArray<Rad>,
+        velocities: &JointArray<f64>,
+        kp: &JointArray<f64>,
+        kd: &JointArray<f64>,
+        torques: &JointArray<NewtonMeter>,
+        timeout: Duration,
+    ) -> RobotResult<ConfirmedMitBatch> {
+        let raw = RawCommander::new(&self.driver);
+        let (commands, mit_t_ref_nm) = build_validated_mit_command_batch_with_t_refs(
+            self, positions, velocities, kp, kd, torques,
+        )?;
+        let tx_finished =
+            raw.send_validated_mit_command_batch_confirmed_finished(commands, timeout)?;
+
+        Ok(ConfirmedMitBatch {
+            tx_finished,
+            mit_t_ref_nm,
+        })
+    }
+}
+
+fn build_validated_mit_command_batch_with_t_refs(
+    piper: &Piper<Active<MitPassthroughMode>, SoftRealtime>,
+    positions: &JointArray<Rad>,
+    velocities: &JointArray<f64>,
+    kp: &JointArray<f64>,
+    kd: &JointArray<f64>,
+    torques: &JointArray<NewtonMeter>,
+) -> RobotResult<([piper_protocol::control::MitControlCommand; 6], [f64; 6])> {
+    let mut commands =
+        [piper_protocol::control::MitControlCommand::try_new(1, 0.0, 0.0, 0.0, 0.0, 0.0)?; 6];
+    let mut t_refs = [0.0; 6];
+
+    for (index, joint) in Joint::ALL.into_iter().enumerate() {
+        let joint_index = joint.index() as u8 + 1;
+        let (position, flipped_torque) =
+            piper.quirks.apply_flip(joint, positions[joint].0, torques[joint].0);
+        let torque = piper.quirks.scale_torque(joint, flipped_torque);
+        let torque_ref = torque as f32;
+
+        commands[index] = piper_protocol::control::MitControlCommand::try_new(
+            joint_index,
+            position as f32,
+            velocities[joint] as f32,
+            kp[joint] as f32,
+            kd[joint] as f32,
+            torque_ref,
+        )?;
+        t_refs[index] = f64::from(torque_ref);
+    }
+
+    Ok((commands, t_refs))
 }
 
 trait RawClockDynamicsCompensator {
@@ -1665,6 +1762,13 @@ impl RawClockRuntimeIo for RealRawClockRuntimeIo {
         }
     }
 
+    fn gripper_states(&self) -> (crate::observer::GripperState, crate::observer::GripperState) {
+        (
+            self.master.observer().gripper_state(),
+            self.slave.observer().gripper_state(),
+        )
+    }
+
     fn submit_command(
         &mut self,
         command: &BilateralCommand,
@@ -1678,6 +1782,52 @@ impl RawClockRuntimeIo for RealRawClockRuntimeIo {
             final_torques,
             timeout,
         )
+    }
+
+    fn submit_command_with_receipt(
+        &mut self,
+        command: &BilateralCommand,
+        final_torques: &BilateralFinalTorques,
+        timeout: Duration,
+    ) -> Result<RawClockSubmitReceipt, RawClockRuntimeError> {
+        let slave = self
+            .slave
+            .command_torques_confirmed_finished(
+                &command.slave_position,
+                &command.slave_velocity,
+                &command.slave_kp,
+                &command.slave_kd,
+                &final_torques.slave,
+                timeout,
+            )
+            .map_err(|source| RawClockRuntimeError::SubmissionFault {
+                side: RawClockSide::Slave.as_str(),
+                peer_command_may_have_applied: false,
+                source,
+            })?;
+
+        let master = self
+            .master
+            .command_torques_confirmed_finished(
+                &command.master_position,
+                &command.master_velocity,
+                &command.master_kp,
+                &command.master_kd,
+                &final_torques.master,
+                timeout,
+            )
+            .map_err(|source| RawClockRuntimeError::SubmissionFault {
+                side: RawClockSide::Master.as_str(),
+                peer_command_may_have_applied: true,
+                source,
+            })?;
+
+        Ok(RawClockSubmitReceipt {
+            master_tx_finished_host_mono_us: Some(master.tx_finished.host_finished_mono_us),
+            slave_tx_finished_host_mono_us: Some(slave.tx_finished.host_finished_mono_us),
+            master_t_ref_nm: Some(master.mit_t_ref_nm),
+            slave_t_ref_nm: Some(slave.mit_t_ref_nm),
+        })
     }
 
     fn disable_both(
@@ -2206,6 +2356,7 @@ where
             std::thread::sleep(next_tick - now);
         }
         next_tick += nominal_period;
+        let scheduler_tick_start_host_mono_us = piper_can::monotonic_micros();
 
         let health = io.runtime_health();
         if let Some(exit_reason) = classify_runtime_fault_exit_reason(health) {
@@ -2496,7 +2647,7 @@ where
             },
         };
         let collect_telemetry = cfg.telemetry_sink.is_some();
-        let _controller_command = collect_telemetry.then(|| command.clone());
+        let controller_command = collect_telemetry.then(|| command.clone());
         if let Some(shaping_cfg) = &cfg.output_shaping {
             apply_output_shaping(
                 shaping_cfg,
@@ -2506,38 +2657,112 @@ where
                 &mut command,
             );
         }
-        let _shaped_command = collect_telemetry.then(|| command.clone());
+        let shaped_command = collect_telemetry.then(|| command.clone());
         let final_torques = assemble_final_torques(&command, frame.compensation);
         joint_motion.record(&frame.snapshot, &command);
 
-        if let Err(err) = io.submit_command(&command, &final_torques, cfg.command_timeout) {
-            let report = fault_report_from_timing(
-                &timing,
-                iterations,
-                &joint_motion,
-                RawClockRuntimeExitReason::SubmissionFault,
-                err.to_string(),
-                |report| {
-                    report.submission_faults = report.submission_faults.saturating_add(1);
-                    if let RawClockRuntimeError::SubmissionFault {
-                        side,
-                        peer_command_may_have_applied,
-                        ..
-                    } = &err
-                    {
-                        report.last_submission_failed_side = RawClockSide::from_str(side);
-                        report.peer_command_may_have_applied = *peer_command_may_have_applied;
-                    }
-                },
-            );
-            let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
-            return Ok(RawClockCoreExit::Faulted {
-                arms: fault.arms,
-                report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
-            });
-        }
+        let timing_telemetry = BilateralLoopTimingTelemetry {
+            scheduler_tick_start_host_mono_us,
+            control_frame_host_mono_us,
+            previous_control_frame_host_mono_us,
+            raw_dt_us,
+            clamped_dt_us,
+            nominal_period_us,
+            submission_deadline_mono_us: scheduler_tick_start_host_mono_us
+                .saturating_add(nominal_period_us),
+            deadline_missed: raw_dt_us > max_dt_us,
+        };
+        let gripper = if collect_telemetry {
+            let (master_gripper, slave_gripper) = io.gripper_states();
+            Some(build_gripper_telemetry(
+                &cfg.gripper,
+                false,
+                master_gripper,
+                slave_gripper,
+                control_frame_host_mono_us,
+            ))
+        } else {
+            None
+        };
+
+        let receipt_result = if collect_telemetry {
+            io.submit_command_with_receipt(&command, &final_torques, cfg.command_timeout)
+        } else {
+            io.submit_command(&command, &final_torques, cfg.command_timeout)
+                .map(|_| RawClockSubmitReceipt::default())
+        };
+        let receipt = match receipt_result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let report = fault_report_from_timing(
+                    &timing,
+                    iterations,
+                    &joint_motion,
+                    RawClockRuntimeExitReason::SubmissionFault,
+                    error.to_string(),
+                    |report| {
+                        report.submission_faults = report.submission_faults.saturating_add(1);
+                        if let RawClockRuntimeError::SubmissionFault {
+                            side,
+                            peer_command_may_have_applied,
+                            ..
+                        } = &error
+                        {
+                            report.last_submission_failed_side = RawClockSide::from_str(side);
+                            report.peer_command_may_have_applied = *peer_command_may_have_applied;
+                        }
+                    },
+                );
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                return Ok(RawClockCoreExit::Faulted {
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+                });
+            },
+        };
 
         previous_control_frame_host_mono_us = Some(control_frame_host_mono_us);
+
+        if let Some(sink) = cfg.telemetry_sink.as_ref() {
+            let mut telemetry = crate::dual_arm::BilateralLoopTelemetry {
+                control_frame: frame,
+                controller_command: controller_command.expect("telemetry command clone exists"),
+                shaped_command: shaped_command.expect("telemetry shaped command clone exists"),
+                compensation: frame.compensation,
+                gripper: gripper.expect("telemetry gripper exists"),
+                final_torques,
+                master_t_ref_nm: receipt.master_t_ref_nm,
+                slave_t_ref_nm: receipt.slave_t_ref_nm,
+                master_tx_finished_host_mono_us: receipt.master_tx_finished_host_mono_us,
+                slave_tx_finished_host_mono_us: receipt.slave_tx_finished_host_mono_us,
+                timing: timing_telemetry,
+            };
+            telemetry.timing.deadline_missed |= deadline_missed_after_submission(
+                telemetry.timing.submission_deadline_mono_us,
+                telemetry.master_tx_finished_host_mono_us,
+                telemetry.slave_tx_finished_host_mono_us,
+                piper_can::monotonic_micros(),
+            );
+            if let Err(error) = sink.on_tick(&telemetry) {
+                let report = fault_report_from_timing(
+                    &timing,
+                    iterations,
+                    &joint_motion,
+                    RawClockRuntimeExitReason::TelemetrySinkFault,
+                    error.message,
+                    |report| {
+                        report.telemetry_sink_faults =
+                            report.telemetry_sink_faults.saturating_add(1);
+                    },
+                );
+                let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                return Ok(RawClockCoreExit::Faulted {
+                    arms: fault.arms,
+                    report: report.with_shutdown(fault.shutdown).with_telemetry(fault.telemetry),
+                });
+            }
+        }
+
         iterations = iterations.saturating_add(1);
     }
 }
@@ -3085,7 +3310,7 @@ mod tests {
     use super::*;
     use crate::dual_arm::{
         BilateralDynamicsCompensation, BilateralDynamicsCompensator, BilateralFinalTorques,
-        JointMirrorMap,
+        BilateralLoopTelemetry, BilateralTelemetrySinkError, JointMirrorMap,
     };
     use crate::observer::{ControlSnapshot, Observer};
     use crate::types::{DeviceQuirks, JointArray, NewtonMeter, Rad, RadPerSecond};
@@ -4083,6 +4308,58 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingRawClockTelemetrySink {
+        rows: Mutex<Vec<BilateralLoopTelemetry>>,
+    }
+
+    impl RecordingRawClockTelemetrySink {
+        fn rows(&self) -> Vec<BilateralLoopTelemetry> {
+            self.rows.lock().expect("rows lock").clone()
+        }
+    }
+
+    impl BilateralLoopTelemetrySink for RecordingRawClockTelemetrySink {
+        fn on_tick(
+            &self,
+            telemetry: &BilateralLoopTelemetry,
+        ) -> std::result::Result<(), BilateralTelemetrySinkError> {
+            self.rows.lock().expect("rows lock").push(telemetry.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingRawClockTelemetrySink;
+
+    impl BilateralLoopTelemetrySink for FailingRawClockTelemetrySink {
+        fn on_tick(
+            &self,
+            _telemetry: &BilateralLoopTelemetry,
+        ) -> std::result::Result<(), BilateralTelemetrySinkError> {
+            Err(BilateralTelemetrySinkError {
+                message: "sink failed".to_string(),
+            })
+        }
+    }
+
+    struct RequiresTxFinishedTelemetrySink;
+
+    impl BilateralLoopTelemetrySink for RequiresTxFinishedTelemetrySink {
+        fn on_tick(
+            &self,
+            telemetry: &BilateralLoopTelemetry,
+        ) -> std::result::Result<(), BilateralTelemetrySinkError> {
+            if telemetry.master_tx_finished_host_mono_us.filter(|value| *value > 0).is_none()
+                || telemetry.slave_tx_finished_host_mono_us.filter(|value| *value > 0).is_none()
+            {
+                return Err(BilateralTelemetrySinkError {
+                    message: "missing nonzero tx-finished timestamp".to_string(),
+                });
+            }
+            Ok(())
+        }
+    }
+
     struct RecordingSkewController {
         seen_skew: Arc<Mutex<Vec<Duration>>>,
     }
@@ -4132,11 +4409,14 @@ mod tests {
     struct FakeRuntimeIo {
         state: Arc<FakeIoState>,
         reads: VecDeque<FakeRead>,
+        submit_receipts: VecDeque<RawClockSubmitReceipt>,
         pending_slave: Option<ExperimentalRawClockSnapshot>,
         command_failure: Option<FakeCommandFailure>,
         disable_failure: bool,
         health: ExperimentalRawClockRuntimeHealth,
         telemetry: RawClockRuntimeTelemetry,
+        master_gripper: crate::observer::GripperState,
+        slave_gripper: crate::observer::GripperState,
     }
 
     impl FakeRuntimeIo {
@@ -4144,11 +4424,14 @@ mod tests {
             Self {
                 state: Arc::new(FakeIoState::default()),
                 reads: VecDeque::new(),
+                submit_receipts: VecDeque::new(),
                 pending_slave: None,
                 command_failure: None,
                 disable_failure: false,
                 health: healthy_runtime_for_tests(),
                 telemetry: RawClockRuntimeTelemetry::default(),
+                master_gripper: crate::observer::GripperState::default(),
+                slave_gripper: crate::observer::GripperState::default(),
             }
         }
 
@@ -4159,6 +4442,24 @@ mod tests {
 
         fn with_command_failure(mut self, failure: FakeCommandFailure) -> Self {
             self.command_failure = Some(failure);
+            self
+        }
+
+        fn with_submit_receipts(
+            mut self,
+            receipts: impl IntoIterator<Item = RawClockSubmitReceipt>,
+        ) -> Self {
+            self.submit_receipts = receipts.into_iter().collect();
+            self
+        }
+
+        fn with_gripper_states(
+            mut self,
+            master: crate::observer::GripperState,
+            slave: crate::observer::GripperState,
+        ) -> Self {
+            self.master_gripper = master;
+            self.slave_gripper = slave;
             self
         }
 
@@ -4228,6 +4529,10 @@ mod tests {
             self.health
         }
 
+        fn gripper_states(&self) -> (crate::observer::GripperState, crate::observer::GripperState) {
+            (self.master_gripper, self.slave_gripper)
+        }
+
         fn submit_command(
             &mut self,
             command: &BilateralCommand,
@@ -4258,6 +4563,23 @@ mod tests {
                 });
             }
             Ok(())
+        }
+
+        fn submit_command_with_receipt(
+            &mut self,
+            command: &BilateralCommand,
+            final_torques: &BilateralFinalTorques,
+            timeout: Duration,
+        ) -> Result<RawClockSubmitReceipt, RawClockRuntimeError> {
+            self.submit_command(command, final_torques, timeout)?;
+            Ok(
+                self.submit_receipts.pop_front().unwrap_or(RawClockSubmitReceipt {
+                    master_tx_finished_host_mono_us: Some(10_000),
+                    slave_tx_finished_host_mono_us: Some(9_900),
+                    master_t_ref_nm: Some([0.0; 6]),
+                    slave_t_ref_nm: Some([0.0; 6]),
+                }),
+            )
         }
 
         fn disable_both(
@@ -4575,6 +4897,196 @@ mod tests {
         );
         assert_eq!(report.compensation_faults, 1);
         assert_eq!(report.iterations, 0);
+    }
+
+    #[test]
+    fn raw_clock_telemetry_sink_receives_tx_finished_and_final_torques() {
+        let sink = Arc::new(RecordingRawClockTelemetrySink::default());
+        let io = FakeRuntimeIo::new()
+            .with_reads(ready_reads_for_iterations(1))
+            .with_gripper_states(
+                crate::observer::GripperState {
+                    position: 0.25,
+                    effort: 0.10,
+                    enabled: true,
+                    hardware_timestamp_us: 106_000,
+                    host_rx_mono_us: 107_000,
+                },
+                crate::observer::GripperState {
+                    position: 0.20,
+                    effort: 0.08,
+                    enabled: true,
+                    hardware_timestamp_us: 106_800,
+                    host_rx_mono_us: 107_800,
+                },
+            )
+            .with_submit_receipts([RawClockSubmitReceipt {
+                master_tx_finished_host_mono_us: Some(123_000),
+                slave_tx_finished_host_mono_us: Some(122_000),
+                master_t_ref_nm: Some([1.0; 6]),
+                slave_t_ref_nm: Some([2.0; 6]),
+            }]);
+
+        let (_state, report) = run_fake_runtime_with_controller_and_config(
+            io,
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            ExperimentalRawClockRunConfig {
+                telemetry_sink: Some(sink.clone()),
+                output_shaping: Some(BilateralOutputShapingConfig::default()),
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        let rows = sink.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].master_tx_finished_host_mono_us, Some(123_000));
+        assert_eq!(rows[0].slave_tx_finished_host_mono_us, Some(122_000));
+        assert_eq!(rows[0].master_t_ref_nm, Some([1.0; 6]));
+        assert_eq!(rows[0].slave_t_ref_nm, Some([2.0; 6]));
+        assert_eq!(
+            rows[0].final_torques.master.as_array(),
+            &[NewtonMeter(0.0); 6]
+        );
+        assert_eq!(
+            rows[0].final_torques.slave.as_array(),
+            &[NewtonMeter(0.0); 6]
+        );
+        assert!(!rows[0].gripper.mirror_enabled);
+        assert!(rows[0].gripper.master_available);
+        assert!(rows[0].gripper.slave_available);
+        assert_eq!(rows[0].gripper.master_host_rx_mono_us, 107_000);
+        assert_eq!(rows[0].gripper.slave_host_rx_mono_us, 107_800);
+        assert_eq!(rows[0].gripper.master_position, 0.25);
+        assert_eq!(rows[0].gripper.slave_position, 0.20);
+    }
+
+    #[test]
+    fn raw_clock_telemetry_sink_receives_compensation_and_compensated_final_torques() {
+        let sink = Arc::new(RecordingRawClockTelemetrySink::default());
+        let compensation = BilateralDynamicsCompensation {
+            master_model_torque: JointArray::splat(NewtonMeter(0.7)),
+            slave_model_torque: JointArray::splat(NewtonMeter(0.9)),
+            master_external_torque_est: JointArray::splat(NewtonMeter(0.3)),
+            slave_external_torque_est: JointArray::splat(NewtonMeter(0.4)),
+        };
+        let compensator = RecordingCompensator {
+            compensation,
+            ..RecordingCompensator::default()
+        };
+
+        let (_state, report) = run_fake_runtime_with_controller_and_compensation(
+            FakeRuntimeIo::new()
+                .with_reads(ready_reads_for_iterations(1))
+                .with_submit_receipts([RawClockSubmitReceipt {
+                    master_tx_finished_host_mono_us: Some(123_000),
+                    slave_tx_finished_host_mono_us: Some(122_000),
+                    master_t_ref_nm: Some([0.7; 6]),
+                    slave_t_ref_nm: Some([0.9; 6]),
+                }]),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            compensator,
+            ExperimentalRawClockRunConfig {
+                telemetry_sink: Some(sink.clone()),
+                output_shaping: Some(BilateralOutputShapingConfig::default()),
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        let rows = sink.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].control_frame.compensation, Some(compensation));
+        assert_eq!(rows[0].compensation, Some(compensation));
+        assert_eq!(
+            rows[0].final_torques.master,
+            JointArray::splat(NewtonMeter(0.7))
+        );
+        assert_eq!(
+            rows[0].final_torques.slave,
+            JointArray::splat(NewtonMeter(0.9))
+        );
+        assert_eq!(rows[0].master_tx_finished_host_mono_us, Some(123_000));
+        assert_eq!(rows[0].slave_tx_finished_host_mono_us, Some(122_000));
+    }
+
+    #[test]
+    fn raw_clock_telemetry_sink_failure_faults_report() {
+        let sink = Arc::new(FailingRawClockTelemetrySink);
+        let (_state, report) = run_fake_runtime_with_controller_and_config(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(1)),
+            ready_timing_with_seeded_alignment_for_tests(),
+            1,
+            RawClockRuntimeThresholds::for_tests(),
+            TestCommandController,
+            ExperimentalRawClockRunConfig {
+                telemetry_sink: Some(sink),
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::TelemetrySinkFault)
+        );
+        assert_eq!(report.telemetry_sink_faults, 1);
+    }
+
+    #[test]
+    fn raw_clock_missing_tx_finished_timestamps_fault_through_sink() {
+        for receipt in [
+            RawClockSubmitReceipt {
+                master_tx_finished_host_mono_us: None,
+                slave_tx_finished_host_mono_us: Some(122_000),
+                master_t_ref_nm: Some([1.0; 6]),
+                slave_t_ref_nm: Some([2.0; 6]),
+            },
+            RawClockSubmitReceipt {
+                master_tx_finished_host_mono_us: Some(0),
+                slave_tx_finished_host_mono_us: Some(122_000),
+                master_t_ref_nm: Some([1.0; 6]),
+                slave_t_ref_nm: Some([2.0; 6]),
+            },
+            RawClockSubmitReceipt {
+                master_tx_finished_host_mono_us: Some(123_000),
+                slave_tx_finished_host_mono_us: Some(0),
+                master_t_ref_nm: Some([1.0; 6]),
+                slave_t_ref_nm: Some([2.0; 6]),
+            },
+        ] {
+            let sink = Arc::new(RequiresTxFinishedTelemetrySink);
+            let (_state, report) = run_fake_runtime_with_controller_and_config(
+                FakeRuntimeIo::new()
+                    .with_reads(ready_reads_for_iterations(1))
+                    .with_submit_receipts([receipt]),
+                ready_timing_with_seeded_alignment_for_tests(),
+                1,
+                RawClockRuntimeThresholds::for_tests(),
+                TestCommandController,
+                ExperimentalRawClockRunConfig {
+                    telemetry_sink: Some(sink),
+                    ..ExperimentalRawClockRunConfig::default()
+                },
+            );
+
+            assert_eq!(
+                report.exit_reason,
+                Some(RawClockRuntimeExitReason::TelemetrySinkFault)
+            );
+            assert_eq!(report.telemetry_sink_faults, 1);
+        }
     }
 
     #[test]
