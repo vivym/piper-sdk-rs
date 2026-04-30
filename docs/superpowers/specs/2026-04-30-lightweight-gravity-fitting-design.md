@@ -148,6 +148,7 @@ The JSONL file should use explicit row types. The first row is a header:
 - resolved target
 - joint map
 - load profile
+- torque convention
 - operator notes
 - SDK/git version where available
 
@@ -246,11 +247,22 @@ The replay output JSONL must have its own header:
 - `artifact_kind = "quasi-static-samples"`
 - source path file and content hash
 - role, resolved target, joint map, and load profile
+- torque convention
 - replay parameters and stability thresholds
 - waypoint count, accepted waypoint count, and rejected waypoint count
 
 Replay sample rows should use `type = "quasi-static-sample"` so `fit` can
-reject manual path rows unambiguously.
+reject manual path rows unambiguously. Each accepted sample row should include:
+
+- `waypoint_id`
+- `segment_id` or `null`
+- `pass_direction = "forward" | "backward"`
+- host monotonic timestamp
+- optional hardware/raw timestamp where available
+- `q_rad[6]`
+- `dq_rad_s[6]`
+- `tau_nm[6]`
+- feedback masks and stability metrics used for acceptance
 
 ### fit
 
@@ -295,7 +307,11 @@ that gravity-like torques vary smoothly and periodically with joint angles.
 
 The holdout split must be path/segment based, not random row based. Adjacent
 stable-window samples are strongly correlated; random row holdout would
-overstate generalization. The fitter should reject models with too few
+overstate generalization. When segment labels are present, whole segments should
+be assigned to train or holdout. When no segment labels are present, the fitter
+should split blocked waypoint groups, never individual rows. The selected split
+must be deterministic and stored in the model so `eval` and the Python reference
+tool can reproduce it exactly. The fitter should reject models with too few
 independent waypoints per coefficient, with a first-version default of at least
 10 independent accepted waypoints per feature. It should report the feature
 matrix condition number or an equivalent conditioning metric.
@@ -305,6 +321,57 @@ collected bidirectionally. The first model does not attempt to identify a
 friction model; large direction-dependent residuals should be surfaced as a
 quality warning and may require slower replay, more settle time, or future
 friction modeling.
+
+The production fitter should be implemented in Rust. Use a small linear algebra
+dependency such as `nalgebra` and keep the fitting algorithm explicit in the CLI
+or tooling crate:
+
+```text
+G = X^T X
+B = X^T Y
+(G + lambda I) C = B
+```
+
+The implementation should stream samples into `G` and `B` rather than requiring
+all replay rows in memory. The bias term should not be regularized by default.
+The primary solve path should use a positive-definite solve after ridge
+regularization, with a deterministic fallback and explicit diagnostics when the
+matrix is ill-conditioned.
+
+### Python reference validation
+
+The repository must also include a Python reference validation tool managed by
+`uv`. This tool is not the production fitting path and must not be required for
+normal teleop use. Its purpose is to verify that the Rust solver, feature
+generation, holdout split, coefficient layout, and residual metrics match an
+independent NumPy implementation.
+
+Suggested layout:
+
+```text
+tools/gravity-reference/
+  pyproject.toml
+  uv.lock
+  gravity_fit_reference.py
+```
+
+The script should support at least:
+
+```bash
+uv run --project tools/gravity-reference \
+  python tools/gravity-reference/gravity_fit_reference.py \
+  --samples artifacts/gravity/slave-d405.samples.jsonl \
+  --rust-model artifacts/gravity/slave-d405.model.toml \
+  --out artifacts/gravity/slave-d405.reference-check.json
+```
+
+It should independently parse the JSONL samples, build the same `trig-v1`
+feature matrix, solve the same ridge regression with NumPy, and compare against
+the Rust model. The comparison report should include coefficient max-abs
+difference, per-joint residual metric differences, holdout split identity, and a
+clear pass/fail result with configured tolerances. CI and local verification
+should be able to run this tool with `uv run --project tools/gravity-reference`;
+no global Python environment should be assumed.
 
 ### eval
 
@@ -351,6 +418,16 @@ frequency_hz = 100.0
 Required safety/quality sections:
 
 ```toml
+[fit]
+ridge_lambda = 1e-4
+regularize_bias = false
+solver = "nalgebra-cholesky"
+fallback_solver = "nalgebra-svd"
+holdout_strategy = "segment-or-blocked-waypoint"
+holdout_ratio = 0.2
+train_group_ids = [...]
+holdout_group_ids = [...]
+
 [training_range]
 q_min_rad = [...]
 q_max_rad = [...]
@@ -533,11 +610,19 @@ apps/cli/src/gravity/
   model.rs
   eval.rs
   compensation.rs
+tools/gravity-reference/
+  pyproject.toml
+  uv.lock
+  gravity_fit_reference.py
 ```
 
 `model.rs` should contain the serializable model and pure `eval(q)` logic.
 `compensation.rs` should adapt loaded models into `BilateralDynamicsCompensator`
 for teleop.
+
+`fit.rs` should contain the Rust production regression implementation. The
+Python reference tool should remain test/validation support only and should not
+be linked into the CLI runtime path.
 
 The implementation should keep MuJoCo and SVS addon crates out of this path.
 
@@ -569,6 +654,9 @@ Validation:
   after velocity/tracking/variance stability gates pass.
 - Fit tests use segment-based holdout and verify random-row leakage is not the
   implemented default.
+- A `uv`-managed Python reference validation script independently fits the same
+  samples and verifies Rust coefficients and residual metrics within explicit
+  tolerances.
 - A hardware runbook validates:
   - raw torque decreases after reflection compensation in free-space replay
   - assist ratio 0.2 is stable before higher ratios are tried
