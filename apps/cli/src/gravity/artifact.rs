@@ -89,8 +89,7 @@ pub fn read_quasi_static_samples(paths: &[PathBuf]) -> Result<LoadedSamples> {
     let mut rows = Vec::new();
 
     for path in paths {
-        let (header, mut file_rows) = read_quasi_static_samples_file(path)?;
-        validate_header_matches(&loaded_header, &header, path)?;
+        let (header, mut file_rows) = read_quasi_static_samples_file(path, loaded_header.as_ref())?;
         if loaded_header.is_none() {
             loaded_header = Some(header);
         }
@@ -105,6 +104,7 @@ pub fn read_quasi_static_samples(paths: &[PathBuf]) -> Result<LoadedSamples> {
 
 fn read_quasi_static_samples_file(
     path: &Path,
+    loaded_header: Option<&SamplesHeader>,
 ) -> Result<(SamplesHeader, Vec<QuasiStaticSampleRow>)> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut lines = BufReader::new(file).lines();
@@ -142,6 +142,7 @@ fn read_quasi_static_samples_file(
         )
     })?;
     validate_samples_header(&header, path)?;
+    validate_header_matches(loaded_header, &header, path)?;
 
     let mut rows = Vec::new();
     for (index, line) in lines.enumerate() {
@@ -185,7 +186,7 @@ fn validate_samples_header(header: &SamplesHeader, path: &Path) -> Result<()> {
 }
 
 fn validate_header_matches(
-    loaded_header: &Option<SamplesHeader>,
+    loaded_header: Option<&SamplesHeader>,
     header: &SamplesHeader,
     path: &Path,
 ) -> Result<()> {
@@ -288,5 +289,32 @@ mod tests {
         assert_eq!(loaded.rows[0].waypoint_id, 7);
         assert_eq!(loaded.rows[0].segment_id.as_deref(), Some("seg-a"));
         assert_eq!(loaded.rows[0].pass_direction, PassDirection::Forward);
+    }
+
+    #[test]
+    fn multi_file_role_mismatch_is_reported_before_row_errors() {
+        let dir = tempdir().unwrap();
+        let first_path = dir.path().join("first.jsonl");
+        let second_path = dir.path().join("second.jsonl");
+        std::fs::write(
+            &first_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"quasi-static-samples\",\"schema_version\":1,\"source_path\":\"p.jsonl\",\"source_sha256\":\"abc\",\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\",\"frequency_hz\":100.0,\"max_velocity_rad_s\":0.08,\"max_step_rad\":0.02,\"settle_ms\":500,\"sample_ms\":300,\"stable_velocity_rad_s\":0.01,\"stable_tracking_error_rad\":0.03,\"stable_torque_std_nm\":0.08,\"waypoint_count\":1,\"accepted_waypoint_count\":1,\"rejected_waypoint_count\":0}\n",
+                "{\"type\":\"quasi-static-sample\",\"waypoint_id\":1,\"segment_id\":\"seg-a\",\"pass_direction\":\"forward\",\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":63,\"dynamic_valid_mask\":63,\"stable_velocity_rad_s\":0.0,\"stable_tracking_error_rad\":0.0,\"stable_torque_std_nm\":0.0}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"quasi-static-samples\",\"schema_version\":1,\"source_path\":\"p.jsonl\",\"source_sha256\":\"abc\",\"role\":\"master\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\",\"frequency_hz\":100.0,\"max_velocity_rad_s\":0.08,\"max_step_rad\":0.02,\"settle_ms\":500,\"sample_ms\":300,\"stable_velocity_rad_s\":0.01,\"stable_tracking_error_rad\":0.03,\"stable_torque_std_nm\":0.08,\"waypoint_count\":1,\"accepted_waypoint_count\":1,\"rejected_waypoint_count\":0}\n",
+                "{\"type\":\"quasi-static-sample\"\n"
+            ),
+        )
+        .unwrap();
+
+        let err = read_quasi_static_samples(&[first_path, second_path]).unwrap_err();
+
+        assert!(err.to_string().contains("role"), "{err:#}");
     }
 }
