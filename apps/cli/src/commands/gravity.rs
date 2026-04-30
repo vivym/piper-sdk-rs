@@ -31,6 +31,10 @@ pub struct GravityRecordPathArgs {
     pub load_profile: String,
     #[arg(long)]
     pub out: PathBuf,
+    #[arg(long, default_value_t = 50.0)]
+    pub frequency_hz: f64,
+    #[arg(long)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -124,6 +128,37 @@ mod tests {
                 assert_eq!(args.ridge_lambda, 1e-4);
             },
             _ => panic!("expected fit action"),
+        }
+    }
+
+    #[test]
+    fn gravity_record_path_parses_frequency_and_notes() {
+        let cmd = GravityCommand::try_parse_from([
+            "gravity",
+            "record-path",
+            "--role",
+            "slave",
+            "--target",
+            "socketcan:can0",
+            "--joint-map",
+            "identity",
+            "--load-profile",
+            "normal-gripper-d405",
+            "--out",
+            "artifacts/gravity/slave.path.jsonl",
+            "--frequency-hz",
+            "25.0",
+            "--notes",
+            "operator note",
+        ])
+        .expect("gravity record-path command should parse");
+
+        match cmd.action {
+            GravityAction::RecordPath(args) => {
+                assert_eq!(args.frequency_hz, 25.0);
+                assert_eq!(args.notes.as_deref(), Some("operator note"));
+            },
+            _ => panic!("expected record-path action"),
         }
     }
 }

@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
 };
 
@@ -10,8 +10,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 const SAMPLE_ARTIFACT_KIND: &str = "quasi-static-samples";
+const PATH_ARTIFACT_KIND: &str = "path";
 const SAMPLE_ROW_TYPE: &str = "quasi-static-sample";
 const HEADER_ROW_TYPE: &str = "header";
+const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -49,6 +51,21 @@ pub struct SamplesHeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PathHeader {
+    #[serde(rename = "type")]
+    pub row_type: String,
+    pub artifact_kind: String,
+    pub schema_version: u32,
+    pub role: String,
+    pub target: String,
+    pub joint_map: String,
+    pub load_profile: String,
+    pub torque_convention: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuasiStaticSampleRow {
     #[serde(rename = "type")]
     pub row_type: String,
@@ -67,6 +84,22 @@ pub struct QuasiStaticSampleRow {
     pub stable_torque_std_nm: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathSampleRow {
+    #[serde(rename = "type")]
+    pub row_type: String,
+    pub sample_index: u64,
+    pub host_mono_us: u64,
+    pub raw_timestamp_us: Option<u64>,
+    pub q_rad: [f64; 6],
+    pub dq_rad_s: [f64; 6],
+    pub tau_nm: [f64; 6],
+    pub position_valid_mask: u8,
+    pub dynamic_valid_mask: u8,
+    pub segment_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedSamples {
     pub header: SamplesHeader,
@@ -78,6 +111,38 @@ struct HeaderProbe {
     #[serde(rename = "type")]
     row_type: String,
     artifact_kind: String,
+}
+
+impl PathHeader {
+    pub fn new(
+        role: impl Into<String>,
+        target: impl Into<String>,
+        joint_map: impl Into<String>,
+        load_profile: impl Into<String>,
+        notes: Option<String>,
+    ) -> Self {
+        Self {
+            row_type: HEADER_ROW_TYPE.to_string(),
+            artifact_kind: PATH_ARTIFACT_KIND.to_string(),
+            schema_version: SCHEMA_VERSION,
+            role: role.into(),
+            target: target.into(),
+            joint_map: joint_map.into(),
+            load_profile: load_profile.into(),
+            torque_convention: crate::gravity::TORQUE_CONVENTION.to_string(),
+            notes,
+        }
+    }
+}
+
+pub fn write_jsonl_row<W, T>(writer: &mut W, row: &T) -> Result<()>
+where
+    W: Write,
+    T: Serialize,
+{
+    serde_json::to_writer(&mut *writer, row)?;
+    writer.write_all(b"\n")?;
+    Ok(())
 }
 
 pub fn read_quasi_static_samples(paths: &[PathBuf]) -> Result<LoadedSamples> {
@@ -257,6 +322,62 @@ fn validate_sample_row(row: &QuasiStaticSampleRow, path: &Path, line_number: usi
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn path_header_jsonl_row_uses_path_schema_and_notes() {
+        let header = PathHeader {
+            row_type: "header".to_string(),
+            artifact_kind: "path".to_string(),
+            schema_version: 1,
+            role: "slave".to_string(),
+            target: "socketcan:can0".to_string(),
+            joint_map: "identity".to_string(),
+            load_profile: "normal-gripper-d405".to_string(),
+            torque_convention: crate::gravity::TORQUE_CONVENTION.to_string(),
+            notes: Some("operator note".to_string()),
+        };
+
+        let mut encoded = Vec::new();
+        write_jsonl_row(&mut encoded, &header).unwrap();
+
+        let line = String::from_utf8(encoded).unwrap();
+        assert!(line.ends_with('\n'));
+
+        let value: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(value["type"], "header");
+        assert_eq!(value["artifact_kind"], "path");
+        assert_eq!(
+            value["torque_convention"],
+            crate::gravity::TORQUE_CONVENTION
+        );
+        assert_eq!(value["notes"], "operator note");
+    }
+
+    #[test]
+    fn path_sample_jsonl_row_preserves_state_vectors_and_masks() {
+        let row = PathSampleRow {
+            row_type: "path-sample".to_string(),
+            sample_index: 7,
+            host_mono_us: 123_456,
+            raw_timestamp_us: Some(654_321),
+            q_rad: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            dq_rad_s: [1.1, 1.2, 1.3, 1.4, 1.5, 1.6],
+            tau_nm: [2.1, 2.2, 2.3, 2.4, 2.5, 2.6],
+            position_valid_mask: 0b0000_0111,
+            dynamic_valid_mask: 0b0011_1111,
+            segment_id: None,
+        };
+
+        let mut encoded = Vec::new();
+        write_jsonl_row(&mut encoded, &row).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(value["type"], "path-sample");
+        assert_eq!(value["sample_index"], 7);
+        assert_eq!(value["q_rad"].as_array().unwrap().len(), 6);
+        assert_eq!(value["dynamic_valid_mask"], 0b0011_1111);
+    }
 
     #[test]
     fn fit_reader_rejects_manual_path_artifact() {
