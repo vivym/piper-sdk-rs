@@ -47,6 +47,11 @@ MAX_ITERATIONS="${MAX_ITERATIONS:-300}"
 DISABLE_GRIPPER_MIRROR="${DISABLE_GRIPPER_MIRROR:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+MASTER_GRAVITY_MODEL="${MASTER_GRAVITY_MODEL:-}"
+SLAVE_GRAVITY_MODEL="${SLAVE_GRAVITY_MODEL:-}"
+GRAVITY_REFLECTION_COMPENSATION="${GRAVITY_REFLECTION_COMPENSATION:-0}"
+MASTER_GRAVITY_ASSIST_RATIO="${MASTER_GRAVITY_ASSIST_RATIO:-}"
+SLAVE_GRAVITY_ASSIST_RATIO="${SLAVE_GRAVITY_ASSIST_RATIO:-}"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -86,6 +91,26 @@ if [[ "${DISABLE_GRIPPER_MIRROR}" == "1" ]]; then
     cmd+=(--disable-gripper-mirror)
 fi
 
+if [[ -n "${MASTER_GRAVITY_MODEL}" ]]; then
+    cmd+=(--master-gravity-model "${MASTER_GRAVITY_MODEL}")
+fi
+
+if [[ -n "${SLAVE_GRAVITY_MODEL}" ]]; then
+    cmd+=(--slave-gravity-model "${SLAVE_GRAVITY_MODEL}")
+fi
+
+if [[ "${GRAVITY_REFLECTION_COMPENSATION}" == "1" ]]; then
+    cmd+=(--gravity-reflection-compensation)
+fi
+
+if [[ -n "${MASTER_GRAVITY_ASSIST_RATIO}" ]]; then
+    cmd+=(--master-gravity-assist-ratio "${MASTER_GRAVITY_ASSIST_RATIO}")
+fi
+
+if [[ -n "${SLAVE_GRAVITY_ASSIST_RATIO}" ]]; then
+    cmd+=(--slave-gravity-assist-ratio "${SLAVE_GRAVITY_ASSIST_RATIO}")
+fi
+
 {
     echo "timestamp=${TIMESTAMP}"
     echo "output_dir=${OUTPUT_DIR}"
@@ -112,6 +137,11 @@ fi
     echo "max_iterations=${MAX_ITERATIONS}"
     echo "disable_gripper_mirror=${DISABLE_GRIPPER_MIRROR}"
     echo "skip_build=${SKIP_BUILD}"
+    echo "master_gravity_model=${MASTER_GRAVITY_MODEL}"
+    echo "slave_gravity_model=${SLAVE_GRAVITY_MODEL}"
+    echo "gravity_reflection_compensation=${GRAVITY_REFLECTION_COMPENSATION}"
+    echo "master_gravity_assist_ratio=${MASTER_GRAVITY_ASSIST_RATIO}"
+    echo "slave_gravity_assist_ratio=${SLAVE_GRAVITY_ASSIST_RATIO}"
     echo "git_revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 } > "${ENV_FILE}"
 
@@ -203,6 +233,7 @@ if [[ -f "${REPORT_JSON}" && -x "$(command -v jq 2>/dev/null)" ]]; then
         timing,
         control,
         calibration,
+        gravity,
         j4_motion_delta_rad: (
             if .metrics.joint_motion then {
                 master_feedback: .metrics.joint_motion.master_feedback_delta_rad[3],

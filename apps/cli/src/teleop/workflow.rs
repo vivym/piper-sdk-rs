@@ -37,8 +37,9 @@ use crate::teleop::controller::{
     RuntimeTeleopController, RuntimeTeleopSettings, RuntimeTeleopSettingsHandle,
 };
 use crate::teleop::report::{
-    ReportCalibration, ReportJointMotion, ReportTiming, ReportTorqueDiagnostics, TeleopExitStatus,
-    TeleopJsonReport, TeleopReportInput, classify_exit, print_human_report,
+    ReportCalibration, ReportGravity, ReportGravityModel, ReportJointMotion, ReportTiming,
+    ReportTorqueDiagnostics, TeleopExitStatus, TeleopJsonReport, TeleopReportInput, classify_exit,
+    print_human_report,
 };
 use crate::teleop::target::{
     ConcreteTeleopTarget, RoleTargets, TeleopPlatform, resolve_role_targets,
@@ -202,6 +203,8 @@ pub struct StartupGravityModelSummary {
     pub role: String,
     pub joint_map: String,
     pub load_profile: String,
+    pub rms_residual_nm: [f64; 6],
+    pub p95_residual_nm: [f64; 6],
 }
 
 impl StartupSummary {
@@ -446,6 +449,7 @@ where
         control: resolved.control.clone(),
         safety: resolved.safety.clone(),
         calibration: report_calibration,
+        gravity: None,
         timing: None,
         joint_motion: None,
         torque_diagnostics: None,
@@ -694,6 +698,8 @@ where
     let timing = report_timing_from_raw_clock(&warmup, &loop_exit.report);
     let faulted = loop_exit.faulted || timing.clock_health_failures > 0;
     let bilateral_report = bilateral_report_from_raw_clock(&loop_exit.report);
+    let gravity =
+        report_gravity_from_startup_summary(loaded_gravity.summary.as_ref(), &loop_exit.report);
     let report = TeleopJsonReport::from_run(TeleopReportInput {
         platform,
         targets,
@@ -703,6 +709,7 @@ where
         control: resolved.control.clone(),
         safety: resolved.safety.clone(),
         calibration: report_calibration,
+        gravity,
         timing: Some(timing.clone()),
         joint_motion: report_joint_motion_from_raw_clock(&loop_exit.report),
         torque_diagnostics: report_torque_diagnostics_from_raw_clock(&loop_exit.report),
@@ -878,9 +885,38 @@ fn load_gravity_model_for_role(
         role: model.role.clone(),
         joint_map: model.joint_map.clone(),
         load_profile: model.load_profile.clone(),
+        rms_residual_nm: model.fit_quality.rms_residual_nm,
+        p95_residual_nm: model.fit_quality.p95_residual_nm,
     };
 
     Ok(LoadedGravityModel { model, summary })
+}
+
+fn report_gravity_from_startup_summary(
+    summary: Option<&StartupGravitySummary>,
+    report: &RawClockRuntimeReport,
+) -> Option<ReportGravity> {
+    summary.map(|summary| ReportGravity {
+        reflection_compensation: summary.reflection_compensation,
+        master_assist_ratio: summary.master_assist_ratio,
+        slave_assist_ratio: summary.slave_assist_ratio,
+        master_model: summary.master_model.as_ref().map(report_gravity_model_from_startup_summary),
+        slave_model: summary.slave_model.as_ref().map(report_gravity_model_from_startup_summary),
+        compensation_faults: report.compensation_faults,
+        range_violations: 0,
+    })
+}
+
+fn report_gravity_model_from_startup_summary(
+    summary: &StartupGravityModelSummary,
+) -> ReportGravityModel {
+    ReportGravityModel {
+        path: summary.path.display().to_string(),
+        role: summary.role.clone(),
+        load_profile: summary.load_profile.clone(),
+        rms_residual_nm: summary.rms_residual_nm,
+        p95_residual_nm: summary.p95_residual_nm,
+    }
 }
 
 fn classify_experimental_raw_clock_exit(
@@ -3085,6 +3121,51 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raw_clock_report_includes_gravity_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let slave_model = temp.path().join("slave.model.toml");
+        write_gravity_model_file_with_quality(
+            &slave_model,
+            "slave",
+            "identity",
+            "loaded",
+            [0.30, 0.31, 0.32, 0.33, 0.34, 0.35],
+            [0.40, 0.41, 0.42, 0.43, 0.44, 0.45],
+        );
+        let mut backend = FakeTeleopBackend::default().with_experimental_raw_clock_success();
+        backend.experimental_run_exit.report.compensation_faults = 2;
+        let io = FakeTeleopIo::default();
+        let report_slot = io.last_report.clone();
+        let args = TeleopDualArmArgs {
+            slave_gravity_model: Some(slave_model),
+            gravity_reflection_compensation: true,
+            joint_map: Some(TeleopJointMap::Identity),
+            report_json: Some(PathBuf::from("report.json")),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test_with_io(args, backend, io)
+            .expect("raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        let report = report_slot
+            .lock()
+            .expect("report lock poisoned")
+            .clone()
+            .expect("report should be written");
+        let gravity = report.gravity.expect("gravity diagnostics should be reported");
+        assert!(gravity.reflection_compensation);
+        assert_eq!(gravity.master_assist_ratio, 0.0);
+        assert_eq!(gravity.compensation_faults, 2);
+        assert_eq!(gravity.range_violations, 0);
+        let slave = gravity.slave_model.expect("slave gravity model should be reported");
+        assert_eq!(slave.role, "slave");
+        assert_eq!(slave.load_profile, "loaded");
+        assert_eq!(slave.rms_residual_nm[0], 0.30);
+        assert_eq!(slave.p95_residual_nm[5], 0.45);
+    }
+
+    #[test]
     fn experimental_raw_clock_loaded_calibration_map_controls_gravity_model_validation() {
         let temp = tempfile::tempdir().unwrap();
         let cal_path = temp.path().join("calibration.toml");
@@ -4084,10 +4165,30 @@ mod tests {
     }
 
     fn write_gravity_model_file(path: &Path, role: &str, joint_map: &str, load_profile: &str) {
+        write_gravity_model_file_with_quality(
+            path,
+            role,
+            joint_map,
+            load_profile,
+            [0.0; 6],
+            [0.0; 6],
+        );
+    }
+
+    fn write_gravity_model_file_with_quality(
+        path: &Path,
+        role: &str,
+        joint_map: &str,
+        load_profile: &str,
+        rms_residual_nm: [f64; 6],
+        p95_residual_nm: [f64; 6],
+    ) {
         let mut model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
         model.role = role.to_string();
         model.joint_map = joint_map.to_string();
         model.load_profile = load_profile.to_string();
+        model.fit_quality.rms_residual_nm = rms_residual_nm;
+        model.fit_quality.p95_residual_nm = p95_residual_nm;
         std::fs::write(path, toml::to_string_pretty(&model).unwrap())
             .expect("gravity model file should be written");
     }

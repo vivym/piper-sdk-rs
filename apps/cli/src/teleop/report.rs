@@ -33,6 +33,8 @@ pub struct TeleopJsonReport {
     pub control: ReportControl,
     pub calibration: ReportCalibration,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gravity: Option<ReportGravity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<ReportTiming>,
     pub exit: ReportExit,
     pub metrics: ReportMetrics,
@@ -67,6 +69,26 @@ pub struct ReportCalibration {
     pub path: Option<String>,
     pub created_at_unix_ms: Option<u64>,
     pub max_error_rad: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReportGravity {
+    pub reflection_compensation: bool,
+    pub master_assist_ratio: f64,
+    pub slave_assist_ratio: f64,
+    pub master_model: Option<ReportGravityModel>,
+    pub slave_model: Option<ReportGravityModel>,
+    pub compensation_faults: u32,
+    pub range_violations: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReportGravityModel {
+    pub path: String,
+    pub role: String,
+    pub load_profile: String,
+    pub rms_residual_nm: [f64; 6],
+    pub p95_residual_nm: [f64; 6],
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -169,6 +191,7 @@ pub struct TeleopReportInput<'a> {
     pub control: TeleopControlSettings,
     pub safety: TeleopSafetySettings,
     pub calibration: ReportCalibration,
+    pub gravity: Option<ReportGravity>,
     pub timing: Option<ReportTiming>,
     pub joint_motion: Option<ReportJointMotion>,
     pub torque_diagnostics: Option<ReportTorqueDiagnostics>,
@@ -216,6 +239,7 @@ impl TeleopJsonReport {
                 gripper_mirror: input.safety.gripper_mirror,
             },
             calibration: input.calibration,
+            gravity: input.gravity,
             timing: input.timing,
             exit: ReportExit {
                 clean,
@@ -366,6 +390,21 @@ pub fn write_human_report<W: Write>(
     if let Some(last_error) = &report.exit.last_error {
         writeln!(writer, "last_error: {last_error}")?;
     }
+    if let Some(gravity) = &report.gravity {
+        writeln!(
+            writer,
+            "gravity: reflection_compensation={} master_assist={:.2} slave_assist={:.2}",
+            gravity.reflection_compensation,
+            gravity.master_assist_ratio,
+            gravity.slave_assist_ratio
+        )?;
+        if let Some(model) = &gravity.master_model {
+            write_human_gravity_model(&mut writer, "master", model)?;
+        }
+        if let Some(model) = &gravity.slave_model {
+            write_human_gravity_model(&mut writer, "slave", model)?;
+        }
+    }
     if let Some(joint_motion) = &report.metrics.joint_motion {
         writeln!(
             writer,
@@ -406,6 +445,22 @@ pub fn write_human_report<W: Write>(
         )?;
     }
     Ok(())
+}
+
+fn write_human_gravity_model<W: Write>(
+    writer: &mut W,
+    label: &str,
+    model: &ReportGravityModel,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "gravity {label}_model={} role={} load_profile={} rms={} p95={}",
+        model.path,
+        model.role,
+        model.load_profile,
+        format_joint_array(model.rms_residual_nm),
+        format_joint_array(model.p95_residual_nm)
+    )
 }
 
 pub fn write_json_report(path: &Path, report: &TeleopJsonReport) -> Result<()> {
@@ -823,10 +878,44 @@ mod tests {
     }
 
     #[test]
+    fn teleop_json_report_includes_gravity_diagnostics_when_enabled() {
+        let report = TeleopJsonReport::from_run(report_input_with_gravity_for_tests());
+        let json = serde_json::to_value(report).unwrap();
+
+        assert_eq!(json["gravity"]["reflection_compensation"], true);
+        assert_eq!(json["gravity"]["master_assist_ratio"], 0.2);
+        assert_eq!(json["gravity"]["slave_model"]["role"], "slave");
+    }
+
+    #[test]
+    fn human_report_includes_gravity_diagnostics_when_enabled() {
+        let report = TeleopJsonReport::from_run(report_input_with_gravity_for_tests());
+        let mut output = Vec::new();
+
+        write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(
+            "gravity: reflection_compensation=true master_assist=0.20 slave_assist=0.00"
+        ));
+        assert!(output.contains("gravity master_model=artifacts/gravity/master.model.toml"));
+        assert!(output.contains("rms=[0.100000, 0.110000, 0.120000"));
+        assert!(output.contains("gravity slave_model=artifacts/gravity/slave.model.toml"));
+        assert!(output.contains("p95=[0.400000, 0.410000, 0.420000"));
+    }
+
+    #[test]
     fn normal_report_omits_timing() {
         let value = serde_json::to_value(sample_json_report()).unwrap();
 
         assert!(value.get("timing").is_none());
+    }
+
+    #[test]
+    fn normal_report_omits_gravity() {
+        let value = serde_json::to_value(sample_json_report()).unwrap();
+
+        assert!(value.get("gravity").is_none());
     }
 
     #[test]
@@ -1143,11 +1232,42 @@ mod tests {
                 created_at_unix_ms: Some(1_770_000_000_000),
                 max_error_rad: 0.05,
             },
+            gravity: None,
             timing: None,
             joint_motion: None,
             torque_diagnostics: None,
             faulted,
             report,
         }
+    }
+
+    fn report_input_with_gravity_for_tests() -> TeleopReportInput<'static> {
+        let sdk_report = Box::leak(Box::new(BilateralRunReport {
+            exit_reason: Some(BilateralExitReason::MaxIterations),
+            ..BilateralRunReport::default()
+        }));
+        let mut input = sample_input(false, sdk_report);
+        input.gravity = Some(ReportGravity {
+            reflection_compensation: true,
+            master_assist_ratio: 0.2,
+            slave_assist_ratio: 0.0,
+            master_model: Some(ReportGravityModel {
+                path: "artifacts/gravity/master.model.toml".to_string(),
+                role: "master".to_string(),
+                load_profile: "empty".to_string(),
+                rms_residual_nm: [0.10, 0.11, 0.12, 0.13, 0.14, 0.15],
+                p95_residual_nm: [0.20, 0.21, 0.22, 0.23, 0.24, 0.25],
+            }),
+            slave_model: Some(ReportGravityModel {
+                path: "artifacts/gravity/slave.model.toml".to_string(),
+                role: "slave".to_string(),
+                load_profile: "loaded".to_string(),
+                rms_residual_nm: [0.30, 0.31, 0.32, 0.33, 0.34, 0.35],
+                p95_residual_nm: [0.40, 0.41, 0.42, 0.43, 0.44, 0.45],
+            }),
+            compensation_faults: 0,
+            range_violations: 0,
+        });
+        input
     }
 }
