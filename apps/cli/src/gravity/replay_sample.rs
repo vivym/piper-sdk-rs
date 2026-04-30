@@ -1111,21 +1111,42 @@ where
 {
     let position = observer.raw_joint_position_state();
     let dynamic = observer.raw_joint_dynamic_state();
-    let latest_host_mono_us = position.host_rx_mono_us.max(dynamic.group_host_rx_mono_us);
-    if latest_host_mono_us == 0 {
-        bail!("joint feedback is not available yet");
-    }
-
     let now_us = piper_sdk::driver::heartbeat::monotonic_micros();
-    let age_us = now_us.saturating_sub(latest_host_mono_us);
-    if age_us > ACTIVE_MAX_FEEDBACK_AGE.as_micros() as u64 {
+    replay_snapshot_from_states(position, dynamic, now_us, ACTIVE_MAX_FEEDBACK_AGE)
+}
+
+fn replay_snapshot_from_states(
+    position: piper_sdk::driver::JointPositionState,
+    dynamic: piper_sdk::driver::JointDynamicState,
+    now_us: u64,
+    max_feedback_age: Duration,
+) -> Result<ReplaySnapshot> {
+    if (position.frame_valid_mask & COMPLETE_JOINT_MASK) != COMPLETE_JOINT_MASK {
         bail!(
-            "stale joint feedback age {:.3}ms exceeds {:.3}ms",
-            age_us as f64 / 1000.0,
-            ACTIVE_MAX_FEEDBACK_AGE.as_secs_f64() * 1000.0
+            "position feedback incomplete: mask={:#04x}",
+            position.frame_valid_mask
         );
     }
+    if (dynamic.valid_mask & COMPLETE_JOINT_MASK) != COMPLETE_JOINT_MASK {
+        bail!(
+            "dynamic feedback incomplete: mask={:#04x}",
+            dynamic.valid_mask
+        );
+    }
+    ensure_feedback_stream_fresh(
+        "position",
+        position.host_rx_mono_us,
+        now_us,
+        max_feedback_age,
+    )?;
+    ensure_feedback_stream_fresh(
+        "dynamic",
+        dynamic.group_host_rx_mono_us,
+        now_us,
+        max_feedback_age,
+    )?;
 
+    let latest_host_mono_us = position.host_rx_mono_us.max(dynamic.group_host_rx_mono_us);
     let latest_raw_timestamp_us = position.hardware_timestamp_us.max(dynamic.group_timestamp_us);
 
     Ok(ReplaySnapshot {
@@ -1137,6 +1158,29 @@ where
         position_valid_mask: position.frame_valid_mask,
         dynamic_valid_mask: dynamic.valid_mask,
     })
+}
+
+fn ensure_feedback_stream_fresh(
+    stream_name: &str,
+    host_rx_mono_us: u64,
+    now_us: u64,
+    max_feedback_age: Duration,
+) -> Result<()> {
+    if host_rx_mono_us == 0 {
+        bail!("{stream_name} feedback is not available yet");
+    }
+
+    let max_age_us = u64::try_from(max_feedback_age.as_micros()).unwrap_or(u64::MAX);
+    let age_us = now_us.saturating_sub(host_rx_mono_us);
+    if age_us > max_age_us {
+        bail!(
+            "stale {stream_name} feedback age {:.3}ms exceeds {:.3}ms",
+            age_us as f64 / 1000.0,
+            max_feedback_age.as_secs_f64() * 1000.0
+        );
+    }
+
+    Ok(())
 }
 
 fn ensure_snapshot_complete(snapshot: &ReplaySnapshot) -> Result<()> {
@@ -1600,6 +1644,40 @@ mod tests {
     }
 
     #[test]
+    fn replay_snapshot_rejects_stale_required_feedback_streams() {
+        let now_us = 1_000_000;
+        let max_age = Duration::from_millis(200);
+        let fresh_host_us = now_us;
+        let stale_host_us = now_us - max_age.as_micros() as u64 - 1;
+
+        let stale_position = replay_snapshot_from_states(
+            replay_position_state(stale_host_us, 0x3f),
+            replay_dynamic_state(fresh_host_us, 0x3f),
+            now_us,
+            max_age,
+        )
+        .expect_err("stale position feedback must be rejected even when dynamic is fresh");
+        assert!(stale_position.to_string().contains("position"));
+
+        let stale_dynamic = replay_snapshot_from_states(
+            replay_position_state(fresh_host_us, 0x3f),
+            replay_dynamic_state(stale_host_us, 0x3f),
+            now_us,
+            max_age,
+        )
+        .expect_err("stale dynamic feedback must be rejected even when position is fresh");
+        assert!(stale_dynamic.to_string().contains("dynamic"));
+
+        replay_snapshot_from_states(
+            replay_position_state(fresh_host_us, 0x3f),
+            replay_dynamic_state(fresh_host_us, 0x3f),
+            now_us,
+            max_age,
+        )
+        .expect("fresh complete feedback streams should be accepted");
+    }
+
+    #[test]
     fn replay_records_only_stable_hold_samples() {
         let criteria = StableSampleCriteria {
             stable_velocity_rad_s: 0.02,
@@ -1801,6 +1879,33 @@ mod tests {
             self.snapshots
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("no fake snapshot available"))
+        }
+    }
+
+    fn replay_position_state(
+        host_rx_mono_us: u64,
+        frame_valid_mask: u8,
+    ) -> piper_sdk::driver::JointPositionState {
+        piper_sdk::driver::JointPositionState {
+            hardware_timestamp_us: host_rx_mono_us,
+            host_rx_mono_us,
+            joint_pos: [0.0; 6],
+            frame_valid_mask,
+            ..Default::default()
+        }
+    }
+
+    fn replay_dynamic_state(
+        group_host_rx_mono_us: u64,
+        valid_mask: u8,
+    ) -> piper_sdk::driver::JointDynamicState {
+        piper_sdk::driver::JointDynamicState {
+            group_timestamp_us: group_host_rx_mono_us,
+            group_host_rx_mono_us,
+            joint_vel: [0.0; 6],
+            joint_current: [0.0; 6],
+            valid_mask,
+            ..Default::default()
         }
     }
 
