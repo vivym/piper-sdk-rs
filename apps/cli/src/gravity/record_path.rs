@@ -18,6 +18,8 @@ use tokio::task::spawn_blocking;
 
 const FLUSH_EVERY_SAMPLES: u64 = 50;
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MIN_FREQUENCY_HZ: f64 = 0.001;
+const MAX_FREQUENCY_HZ: f64 = 1_000.0;
 
 #[derive(Debug, Clone)]
 struct PathRecordingStats {
@@ -117,8 +119,6 @@ where
 {
     wait_for_initial_monitor_snapshot(|| observer.joint_positions())
         .context("timed out waiting for initial joint position feedback")?;
-    wait_for_initial_monitor_snapshot(|| observer.joint_velocities())
-        .context("timed out waiting for initial joint dynamic feedback")?;
 
     let file = OpenOptions::new()
         .write(true)
@@ -203,6 +203,15 @@ where
 {
     let position = observer.raw_joint_position_state();
     let dynamic = observer.raw_joint_dynamic_state();
+    build_path_sample_row(sample_index, position, Some(dynamic))
+}
+
+fn build_path_sample_row(
+    sample_index: u64,
+    position: piper_sdk::driver::JointPositionState,
+    dynamic: Option<piper_sdk::driver::JointDynamicState>,
+) -> PathSampleRow {
+    let dynamic = dynamic.unwrap_or_default();
     let latest_raw_timestamp_us = position.hardware_timestamp_us.max(dynamic.group_timestamp_us);
     let raw_timestamp_us = (latest_raw_timestamp_us != 0).then_some(latest_raw_timestamp_us);
 
@@ -249,11 +258,20 @@ fn resolve_record_path_target(args: &GravityRecordPathArgs) -> Result<TargetSpec
 }
 
 fn sample_period_from_frequency_hz(frequency_hz: f64) -> Result<Duration> {
-    if !frequency_hz.is_finite() || frequency_hz <= 0.0 {
-        bail!("frequency_hz must be finite and greater than zero");
+    if !frequency_hz.is_finite() {
+        bail!("frequency_hz must be finite");
+    }
+    if !(MIN_FREQUENCY_HZ..=MAX_FREQUENCY_HZ).contains(&frequency_hz) {
+        bail!("frequency_hz must be between {MIN_FREQUENCY_HZ} and {MAX_FREQUENCY_HZ}");
     }
 
-    let period = Duration::from_secs_f64(1.0 / frequency_hz);
+    let period_secs = 1.0 / frequency_hz;
+    if !period_secs.is_finite() || period_secs <= 0.0 {
+        bail!("frequency_hz produced an invalid sample period");
+    }
+
+    let period = Duration::try_from_secs_f64(period_secs)
+        .map_err(|_| anyhow!("frequency_hz produced an invalid sample period"))?;
     if period.is_zero() {
         bail!("frequency_hz is too high for the system timer");
     }
@@ -341,6 +359,43 @@ mod tests {
         let err = sample_period_from_frequency_hz(0.0).unwrap_err();
 
         assert!(err.to_string().contains("frequency"));
+    }
+
+    #[test]
+    fn sample_period_rejects_tiny_positive_frequency_without_panicking() {
+        let result =
+            std::panic::catch_unwind(|| sample_period_from_frequency_hz(f64::from_bits(1)));
+
+        assert!(result.is_ok(), "tiny positive frequency must not panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn sample_period_rejects_too_high_frequency() {
+        let err = sample_period_from_frequency_hz(10_000.0).unwrap_err();
+
+        assert!(err.to_string().contains("frequency"));
+    }
+
+    #[test]
+    fn path_sample_row_uses_default_dynamic_when_unavailable() {
+        let position = piper_sdk::driver::JointPositionState {
+            hardware_timestamp_us: 123,
+            host_rx_mono_us: 456,
+            raw_feedback_timing: None,
+            joint_pos: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            frame_valid_mask: 0b111,
+        };
+
+        let row = build_path_sample_row(9, position, None);
+
+        assert_eq!(row.sample_index, 9);
+        assert_eq!(row.q_rad, position.joint_pos);
+        assert_eq!(row.dq_rad_s, [0.0; 6]);
+        assert_eq!(row.tau_nm, [0.0; 6]);
+        assert_eq!(row.position_valid_mask, 0b111);
+        assert_eq!(row.dynamic_valid_mask, 0);
+        assert_eq!(row.raw_timestamp_us, Some(123));
     }
 
     #[test]
