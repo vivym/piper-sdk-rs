@@ -283,3 +283,286 @@ fn cancel_during_active_control_uses_loop_cancel_signal_and_disables() {
     let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
     assert_eq!(manifest.status, EpisodeStatus::Cancelled);
 }
+
+#[test]
+fn raw_clock_fake_workflow_writes_optional_raw_clock_sections() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_iterations(2)
+        .with_raw_clock_runtime();
+
+    let result = harness.run(out.path()).expect("collector should complete");
+
+    assert_eq!(result.status, EpisodeStatus::Complete);
+    let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
+    assert!(manifest.raw_clock.is_some());
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert!(report.raw_clock.is_some());
+    assert_eq!(
+        report.raw_clock.as_ref().unwrap().timing_source,
+        "calibrated_hw_raw"
+    );
+}
+
+#[test]
+fn strict_fake_workflow_keeps_raw_clock_sections_absent() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_iterations(1);
+
+    let result = harness.run(out.path()).expect("collector should complete");
+    let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+
+    assert!(manifest.raw_clock.is_none());
+    assert!(report.raw_clock.is_none());
+}
+
+#[test]
+fn raw_clock_cancel_before_enable_still_writes_raw_clock_report_section() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_raw_clock_runtime_before_loop()
+        .with_cancel_before_enable_mit();
+
+    let result = harness.run(out.path()).expect("collector should finalize cancellation");
+
+    assert_eq!(result.status, EpisodeStatus::Cancelled);
+    let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert!(manifest.raw_clock.is_some());
+    assert!(report.raw_clock.is_some());
+    assert_eq!(
+        report.raw_clock.as_ref().unwrap().final_failure_kind.as_deref(),
+        Some("Cancelled")
+    );
+}
+
+#[test]
+fn raw_clock_cancel_during_active_control_finalizes_partial_episode() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_iterations(3)
+        .with_raw_clock_runtime()
+        .with_cancel_during_active_control_after_steps(1);
+
+    let result = harness.run(out.path()).expect("collector should finalize cancelled episode");
+
+    assert_eq!(result.status, EpisodeStatus::Cancelled);
+    assert!(result.disable_called);
+    let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
+    assert_eq!(manifest.status, EpisodeStatus::Cancelled);
+    assert!(manifest.raw_clock.is_some());
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert_eq!(report.status, EpisodeStatus::Cancelled);
+    assert!(report.raw_clock.is_some());
+    assert_eq!(
+        report.raw_clock.as_ref().unwrap().final_failure_kind.as_deref(),
+        Some("Cancelled")
+    );
+    let steps = read_steps_file(result.path.join("steps.bin")).unwrap();
+    assert_eq!(steps.steps.len(), 1);
+}
+
+#[test]
+fn raw_clock_gripper_telemetry_maps_into_svs_step() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_iterations(1)
+        .with_raw_clock_runtime()
+        .with_gripper_feedback_at_step(0, GripperTiming::stale_by_ms(10));
+
+    let result = harness.run(out.path()).expect("collector should complete");
+    let steps = read_steps_file(result.path.join("steps.bin")).unwrap();
+
+    assert_eq!(steps.steps.len(), 1);
+    assert_eq!(steps.steps[0].gripper.master_available, 1);
+    assert_eq!(steps.steps[0].gripper.slave_available, 1);
+    assert!(steps.steps[0].gripper.master_host_rx_mono_us > 0);
+    assert!(steps.steps[0].gripper.slave_host_rx_mono_us > 0);
+    assert_eq!(steps.steps[0].gripper.master_position, 0.25);
+    assert_eq!(steps.steps[0].gripper.slave_position, 0.25);
+}
+
+#[test]
+fn raw_clock_fake_workflow_writes_compensation_and_dynamics_steps() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco_sequence([
+            FakeMujocoFrame::new(10_000, 10_100)
+                .with_master_residual_nm([0.7, 0.0, 0.0, 0.0, 0.0, 0.0])
+                .with_slave_residual_nm([1.1, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            FakeMujocoFrame::new(20_000, 20_100)
+                .with_master_residual_nm([0.9, 0.0, 0.0, 0.0, 0.0, 0.0])
+                .with_slave_residual_nm([1.3, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ])
+        .with_iterations(2)
+        .with_raw_clock_runtime();
+
+    let result = harness.run(out.path()).expect("collector should complete");
+    let steps = read_steps_file(result.path.join("steps.bin")).unwrap();
+
+    assert_eq!(steps.steps.len(), 2);
+    assert_eq!(steps.steps[0].master.dynamic_host_rx_mono_us, 10_000);
+    assert_eq!(steps.steps[1].master.dynamic_host_rx_mono_us, 20_000);
+    assert_eq!(steps.steps[0].master.tau_model_mujoco_nm, [0.1; 6]);
+    assert_eq!(steps.steps[0].slave.tau_model_mujoco_nm, [0.2; 6]);
+    assert_eq!(steps.steps[0].master.tau_residual_nm[0], 0.7);
+    assert_eq!(steps.steps[1].slave.tau_residual_nm[0], 1.3);
+    assert!(steps.steps[1].r_ee[0] > steps.steps[0].r_ee[0]);
+    assert!(steps.steps[0].command.master_tx_finished_host_mono_us > 0);
+    assert_ne!(steps.steps[0].command.mit_master_t_ref_nm, [0.0; 6]);
+}
+
+#[test]
+fn raw_clock_missing_tx_finished_finalizes_faulted_episode() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_iterations(3)
+        .with_raw_clock_runtime()
+        .with_master_tx_finished_timeout_at_step(1);
+
+    let result = harness.run(out.path()).expect("collector should finalize faulted episode");
+
+    assert_eq!(result.status, EpisodeStatus::Faulted);
+    assert_eq!(
+        result.dual_arm_exit_reason,
+        Some(BilateralExitReason::TelemetrySinkFault)
+    );
+    let steps = read_steps_file(result.path.join("steps.bin")).unwrap();
+    assert_eq!(steps.steps.len(), 1);
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert_eq!(report.status, EpisodeStatus::Faulted);
+    assert!(report.raw_clock.is_some());
+}
+
+#[test]
+fn raw_clock_loaded_calibration_pre_enable_mismatch_fails_before_enable() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_raw_clock_loaded_calibration_pre_enable_mismatch();
+
+    let result = harness.run(out.path()).expect("collector should finalize faulted episode");
+
+    assert_eq!(result.status, EpisodeStatus::Faulted);
+    assert_eq!(result.enable_mit_calls, 0);
+    assert!(!result.disable_called);
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert!(report.dual_arm.last_error.as_deref().unwrap_or_default().contains("pre-enable"));
+    assert!(report.raw_clock.is_some());
+}
+
+#[test]
+fn raw_clock_loaded_calibration_post_enable_mismatch_disables_without_loop() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_raw_clock_loaded_calibration_post_enable_mismatch();
+
+    let result = harness.run(out.path()).expect("collector should finalize faulted episode");
+
+    assert_eq!(result.status, EpisodeStatus::Faulted);
+    assert_eq!(result.enable_mit_calls, 1);
+    assert!(result.disable_called);
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert!(
+        report
+            .dual_arm
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("post-enable")
+    );
+    assert!(report.raw_clock.is_some());
+}
+
+#[test]
+fn raw_clock_capture_replaces_provisional_calibration_with_active_zero_and_save_copy() {
+    let out = tempfile::tempdir().unwrap();
+    let save_dir = tempfile::tempdir().unwrap();
+    let save_path = save_dir.path().join("saved-active.toml");
+    let startup_master = [0.10, 0.11, 0.12, 0.13, 0.14, 0.15];
+    let startup_slave = [0.20, 0.21, 0.22, 0.23, 0.24, 0.25];
+    let active_master = [1.10, 1.11, 1.12, 1.13, 1.14, 1.15];
+    let active_slave = [1.20, 1.21, 1.22, 1.23, 1.24, 1.25];
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_iterations(1)
+        .with_raw_clock_runtime()
+        .with_raw_clock_capture_positions(
+            startup_master,
+            startup_slave,
+            active_master,
+            active_slave,
+        )
+        .with_save_calibration_path(save_path.clone());
+
+    let result = harness.run(out.path()).expect("collector should complete");
+
+    assert_eq!(result.status, EpisodeStatus::Complete);
+    let calibration_path = result.path.join("calibration.toml");
+    let calibration_bytes = std::fs::read(&calibration_path).unwrap();
+    let episode_calibration =
+        piper_svs_collect::calibration::CalibrationFile::from_canonical_bytes(&calibration_bytes)
+            .unwrap();
+    assert_eq!(episode_calibration.master_zero_rad, active_master);
+    assert_eq!(episode_calibration.slave_zero_rad, active_slave);
+    assert_ne!(episode_calibration.master_zero_rad, startup_master);
+    assert_ne!(episode_calibration.slave_zero_rad, startup_slave);
+
+    let saved_bytes = std::fs::read(&save_path).unwrap();
+    assert_eq!(saved_bytes, calibration_bytes);
+
+    let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
+    assert_eq!(manifest.calibration.master_zero_rad, active_master);
+    assert_eq!(manifest.calibration.slave_zero_rad, active_slave);
+    assert_eq!(
+        manifest.calibration.sha256_hex,
+        piper_svs_collect::calibration::sha256_hex(&calibration_bytes)
+    );
+    assert!(manifest.raw_clock.is_some());
+}
+
+#[test]
+fn raw_clock_gripper_mirror_enabled_rejects_before_enable() {
+    let out = tempfile::tempdir().unwrap();
+    let harness = FakeCollectorHarness::new()
+        .with_two_socketcan_targets()
+        .with_fake_mujoco()
+        .with_raw_clock_gripper_mirror_enabled();
+
+    let result = harness
+        .run(out.path())
+        .expect("collector should reject unsupported gripper mirror");
+
+    assert_eq!(result.status, EpisodeStatus::Faulted);
+    assert_eq!(result.enable_mit_calls, 0);
+    assert!(!result.disable_called);
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert!(
+        report
+            .dual_arm
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--disable-gripper-mirror")
+    );
+    assert!(report.raw_clock.is_some());
+}

@@ -15,7 +15,7 @@ use piper_client::dual_arm::{
     BilateralLoopTimingTelemetry, BilateralRunReport, BilateralSubmissionMode,
     BilateralTelemetrySinkError, DualArmActiveMit, DualArmBuilder, DualArmCalibration,
     DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby, GripperTeleopConfig,
-    JointMirrorMap, LoopTimingMode, SubmissionArm,
+    JointMirrorMap, LoopTimingMode, StopAttemptResult, SubmissionArm,
 };
 use piper_client::dual_arm_raw_clock::{
     ExperimentalRawClockDualArmActive, ExperimentalRawClockDualArmStandby,
@@ -44,9 +44,9 @@ use crate::episode::manifest::{
     DynamicsManifest, EffectiveProfileManifest, EpisodeId, EpisodeStatus, FixedEpisodeRng,
     GripperMirrorManifest, HashedArtifactManifest, JointMirrorMapManifest, ManifestV1,
     MirrorMapManifest, MujocoManifest, OsEpisodeRng, PayloadManifest, ProfileSourceKind,
-    RawCanManifest, ReportJson, SourceArtifactManifest, StepFileManifest, TargetSpecManifest,
-    TargetSpecsManifest, TaskManifest, UtcTimestamp, WriterFlushResultJson, WriterReportJson,
-    slugify_task_name,
+    RawCanManifest, RawClockManifest, ReportJson, SourceArtifactManifest, StepFileManifest,
+    TargetSpecManifest, TargetSpecsManifest, TaskManifest, UtcTimestamp, WriterFlushResultJson,
+    WriterReportJson, slugify_task_name,
 };
 use crate::episode::wire::{
     SvsArmStepV1, SvsCommandStepV1, SvsGripperStepV1, SvsHeaderV1, SvsStepV1,
@@ -104,6 +104,14 @@ pub struct CollectorRunResult {
 pub struct FakeCollectorHarness {
     targets_configured: bool,
     mujoco_configured: bool,
+    runtime_kind: crate::raw_clock::SvsRuntimeKind,
+    raw_clock_report: Option<RawClockRuntimeReport>,
+    raw_clock_loaded_calibration_pre_enable_mismatch: bool,
+    raw_clock_loaded_calibration_post_enable_mismatch: bool,
+    raw_clock_gripper_mirror_enabled: bool,
+    raw_clock_startup_positions: Option<([f64; 6], [f64; 6])>,
+    raw_clock_active_positions: Option<([f64; 6], [f64; 6])>,
+    save_calibration_path: Option<PathBuf>,
     mujoco_sequence: Vec<FakeMujocoFrame>,
     iterations: usize,
     master_tx_finished_timeout_at_step: Option<usize>,
@@ -318,6 +326,14 @@ impl Default for FakeCollectorHarness {
         Self {
             targets_configured: false,
             mujoco_configured: false,
+            runtime_kind: crate::raw_clock::SvsRuntimeKind::StrictRealtime,
+            raw_clock_report: None,
+            raw_clock_loaded_calibration_pre_enable_mismatch: false,
+            raw_clock_loaded_calibration_post_enable_mismatch: false,
+            raw_clock_gripper_mirror_enabled: false,
+            raw_clock_startup_positions: None,
+            raw_clock_active_positions: None,
+            save_calibration_path: None,
             mujoco_sequence: Vec::new(),
             iterations: 2,
             master_tx_finished_timeout_at_step: None,
@@ -558,6 +574,60 @@ impl FakeCollectorHarness {
         self
     }
 
+    pub fn with_raw_clock_runtime(mut self) -> Self {
+        self.runtime_kind = crate::raw_clock::SvsRuntimeKind::CalibratedRawClock;
+        self.raw_clock_report = None;
+        self
+    }
+
+    pub fn with_raw_clock_runtime_before_loop(mut self) -> Self {
+        self.runtime_kind = crate::raw_clock::SvsRuntimeKind::CalibratedRawClock;
+        self.raw_clock_report = None;
+        self
+    }
+
+    pub fn with_raw_clock_fault_report(mut self, report: RawClockRuntimeReport) -> Self {
+        self.runtime_kind = crate::raw_clock::SvsRuntimeKind::CalibratedRawClock;
+        self.raw_clock_report = Some(report);
+        self
+    }
+
+    pub fn with_raw_clock_loaded_calibration_pre_enable_mismatch(mut self) -> Self {
+        self.runtime_kind = crate::raw_clock::SvsRuntimeKind::CalibratedRawClock;
+        self.raw_clock_loaded_calibration_pre_enable_mismatch = true;
+        self
+    }
+
+    pub fn with_raw_clock_loaded_calibration_post_enable_mismatch(mut self) -> Self {
+        self.runtime_kind = crate::raw_clock::SvsRuntimeKind::CalibratedRawClock;
+        self.raw_clock_loaded_calibration_post_enable_mismatch = true;
+        self
+    }
+
+    pub fn with_raw_clock_gripper_mirror_enabled(mut self) -> Self {
+        self.runtime_kind = crate::raw_clock::SvsRuntimeKind::CalibratedRawClock;
+        self.raw_clock_gripper_mirror_enabled = true;
+        self
+    }
+
+    pub fn with_raw_clock_capture_positions(
+        mut self,
+        startup_master: [f64; 6],
+        startup_slave: [f64; 6],
+        active_master: [f64; 6],
+        active_slave: [f64; 6],
+    ) -> Self {
+        self.runtime_kind = crate::raw_clock::SvsRuntimeKind::CalibratedRawClock;
+        self.raw_clock_startup_positions = Some((startup_master, startup_slave));
+        self.raw_clock_active_positions = Some((active_master, active_slave));
+        self
+    }
+
+    pub fn with_save_calibration_path(mut self, path: PathBuf) -> Self {
+        self.save_calibration_path = Some(path);
+        self
+    }
+
     pub fn with_startup_fault_before_enable_mit(mut self) -> Self {
         self.startup_fault_before_enable_mit = true;
         self
@@ -592,7 +662,11 @@ impl FakeCollectorHarness {
         let episode_id = reservation.id.episode_id.clone();
         let episode_dir = reservation.absolute_dir;
 
-        let artifacts = persist_episode_inputs(&episode_dir)?;
+        let mut artifacts = persist_episode_inputs(
+            &episode_dir,
+            (self.runtime_kind == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock)
+                .then_some(self.raw_clock_startup_positions.unwrap_or(([0.0; 6], [0.0; 6]))),
+        )?;
         let initial_summary = crate::episode::wire::StepFileSummary {
             episode_id: episode_id.clone(),
             step_count: 0,
@@ -604,6 +678,12 @@ impl FakeCollectorHarness {
             EPISODE_START_HOST_MONO_US,
         )?;
         let fake_profile = fake_effective_profile();
+        let fake_raw_clock_settings = (self.runtime_kind
+            == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock)
+            .then(|| fake_raw_clock_settings_from_profile(&fake_profile));
+        let fake_raw_clock_manifest = fake_raw_clock_settings
+            .as_ref()
+            .map(crate::raw_clock::SvsRawClockSettings::to_manifest);
         let fake_monitor = writer_backpressure_monitor_from_profile(&fake_profile);
         let raw_can = Arc::new(if self.raw_can_degraded_after_step.is_some() {
             RawCanStatusTracker::ok()
@@ -641,6 +721,8 @@ impl FakeCollectorHarness {
                     final_flush_result,
                     writer_stats: &writer_stats,
                     last_error: Some(error.to_string()),
+                    raw_clock_report: None,
+                    raw_clock_settings: fake_raw_clock_settings,
                 })?;
                 write_manifest(FakeManifestWrite {
                     episode_dir: &episode_dir,
@@ -651,6 +733,7 @@ impl FakeCollectorHarness {
                     artifacts: &artifacts,
                     raw_can_enabled: raw_can.raw_can_status() != RawCanCaptureStatus::Disabled,
                     raw_can_finalizer_status: raw_can.finalizer_status(),
+                    raw_clock: fake_raw_clock_manifest,
                 })?;
                 return Ok(CollectorRunResult {
                     status: EpisodeStatus::Faulted,
@@ -671,6 +754,7 @@ impl FakeCollectorHarness {
             artifacts: &artifacts,
             raw_can_enabled: self.raw_can_requested(),
             raw_can_finalizer_status: "running".to_string(),
+            raw_clock: fake_raw_clock_manifest.clone(),
         })?;
         if self.pause_writer_until_shutdown {
             writer.pause_worker_for_test();
@@ -683,6 +767,7 @@ impl FakeCollectorHarness {
         let mut enable_mit_calls = 0_u32;
         let mut disable_called = false;
         let mut attempted_iterations = 0_u64;
+        let mut report_last_error: Option<String> = None;
         let stager = Arc::new(SvsTickStager::new());
         let dynamics_slot = Arc::new(SvsDynamicsSlot::new());
         let feedback_history = Arc::new(Mutex::new(AppliedMasterFeedbackHistory::default()));
@@ -703,29 +788,78 @@ impl FakeCollectorHarness {
             Arc::clone(&feedback_history),
         )?;
 
-        if self.startup_fault_before_enable_mit {
+        if self.raw_clock_gripper_mirror_enabled {
+            status = EpisodeStatus::Faulted;
+            dual_arm_exit_reason = Some(BilateralExitReason::RuntimeTransportFault);
+            loop_stopped_before_requested_iterations = true;
+            report_last_error = Some(
+                "SVS raw-clock gripper mirroring is not implemented yet; pass --disable-gripper-mirror"
+                    .to_string(),
+            );
+        } else if self.raw_clock_loaded_calibration_pre_enable_mismatch {
+            status = EpisodeStatus::Faulted;
+            dual_arm_exit_reason = Some(BilateralExitReason::RuntimeTransportFault);
+            loop_stopped_before_requested_iterations = true;
+            report_last_error =
+                Some("raw-clock loaded calibration pre-enable posture mismatch".to_string());
+        } else if self.startup_fault_before_enable_mit {
             status = EpisodeStatus::Faulted;
             loop_stopped_before_requested_iterations = true;
         } else if self.cancel_before_enable_mit || !self.operator_confirmation {
             status = EpisodeStatus::Cancelled;
+            if self.runtime_kind == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock {
+                dual_arm_exit_reason = Some(BilateralExitReason::Cancelled);
+            }
         } else {
             let active = backend.enable_mit(standby)?;
             enable_mit_calls = 1;
-            let outcome = backend.run_loop(
-                active,
-                FakeCollectorRuntime {
-                    dynamics_slot,
-                    controller,
-                    sink,
-                    raw_can: Arc::clone(&raw_can),
-                },
-            )?;
-            status = outcome.status;
-            dual_arm_exit_reason = outcome.report.exit_reason;
-            loop_stopped_before_requested_iterations =
-                outcome.loop_stopped_before_requested_iterations;
-            disable_called = outcome.disable_called;
-            attempted_iterations = outcome.attempted_iterations;
+            if self.raw_clock_loaded_calibration_post_enable_mismatch {
+                status = EpisodeStatus::Faulted;
+                dual_arm_exit_reason = Some(BilateralExitReason::RuntimeTransportFault);
+                loop_stopped_before_requested_iterations = true;
+                disable_called = true;
+                report_last_error =
+                    Some("raw-clock loaded calibration post-enable posture mismatch".to_string());
+            } else {
+                if self.runtime_kind == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock {
+                    let active_positions =
+                        self.raw_clock_active_positions.unwrap_or(([0.0; 6], [0.0; 6]));
+                    replace_fake_capture_calibration(
+                        &episode_dir,
+                        &mut artifacts,
+                        active_positions,
+                        self.save_calibration_path.as_deref(),
+                    )?;
+                    write_manifest(FakeManifestWrite {
+                        episode_dir: &episode_dir,
+                        episode_id: &episode_id,
+                        status: EpisodeStatus::Running,
+                        ended_unix_ns: None,
+                        summary: &initial_summary,
+                        artifacts: &artifacts,
+                        raw_can_enabled: self.raw_can_requested(),
+                        raw_can_finalizer_status: "running".to_string(),
+                        raw_clock: fake_raw_clock_manifest.clone(),
+                    })?;
+                }
+
+                let outcome = backend.run_loop(
+                    active,
+                    FakeCollectorRuntime {
+                        dynamics_slot,
+                        controller,
+                        sink,
+                        raw_can: Arc::clone(&raw_can),
+                    },
+                )?;
+                status = outcome.status;
+                dual_arm_exit_reason = outcome.report.exit_reason;
+                loop_stopped_before_requested_iterations =
+                    outcome.loop_stopped_before_requested_iterations;
+                disable_called = outcome.disable_called;
+                attempted_iterations = outcome.attempted_iterations;
+                report_last_error = outcome.report.last_error;
+            }
         }
 
         if self.writer_flush_failure {
@@ -760,7 +894,9 @@ impl FakeCollectorHarness {
         if self.corrupt_steps_after_finish {
             fs::write(episode_dir.join("steps.bin"), b"corrupt steps after flush")?;
         }
-        let mut report_last_error = writer_stats.flush_error.clone();
+        if let Some(error) = writer_stats.flush_error.clone() {
+            report_last_error = Some(error);
+        }
         let summary = read_final_step_summary(
             episode_dir.join("steps.bin"),
             &episode_id,
@@ -769,6 +905,38 @@ impl FakeCollectorHarness {
             &mut report_last_error,
         );
         let raw_finalizer_status = raw_can.finalizer_status();
+        let synthesized_raw_clock_report = (self.runtime_kind
+            == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock)
+            .then(|| {
+                let reason = match dual_arm_exit_reason {
+                    Some(BilateralExitReason::Cancelled) => RawClockRuntimeExitReason::Cancelled,
+                    Some(BilateralExitReason::TelemetrySinkFault) => {
+                        RawClockRuntimeExitReason::TelemetrySinkFault
+                    },
+                    Some(BilateralExitReason::CompensationFault) => {
+                        RawClockRuntimeExitReason::CompensationFault
+                    },
+                    Some(BilateralExitReason::ControllerFault) => {
+                        RawClockRuntimeExitReason::ControllerFault
+                    },
+                    Some(BilateralExitReason::SubmissionFault) => {
+                        RawClockRuntimeExitReason::SubmissionFault
+                    },
+                    Some(BilateralExitReason::RuntimeTransportFault) => {
+                        RawClockRuntimeExitReason::RuntimeTransportFault
+                    },
+                    Some(_) => RawClockRuntimeExitReason::RuntimeTransportFault,
+                    None if status == EpisodeStatus::Complete => {
+                        RawClockRuntimeExitReason::MaxIterations
+                    },
+                    None if status == EpisodeStatus::Cancelled => {
+                        RawClockRuntimeExitReason::Cancelled
+                    },
+                    None => RawClockRuntimeExitReason::RuntimeTransportFault,
+                };
+                raw_clock_report_for_fake(attempted_iterations as usize, reason)
+            });
+        let raw_clock_report = self.raw_clock_report.clone().or(synthesized_raw_clock_report);
         write_report(FakeReportWrite {
             episode_dir: &episode_dir,
             episode_id: &episode_id,
@@ -782,6 +950,8 @@ impl FakeCollectorHarness {
             final_flush_result,
             writer_stats: &writer_stats,
             last_error: report_last_error,
+            raw_clock_report,
+            raw_clock_settings: fake_raw_clock_settings,
         })?;
         write_manifest(FakeManifestWrite {
             episode_dir: &episode_dir,
@@ -792,6 +962,7 @@ impl FakeCollectorHarness {
             artifacts: &artifacts,
             raw_can_enabled: raw_can.raw_can_status() != RawCanCaptureStatus::Disabled,
             raw_can_finalizer_status: raw_finalizer_status,
+            raw_clock: fake_raw_clock_manifest,
         })?;
 
         Ok(CollectorRunResult {
@@ -3318,6 +3489,7 @@ fn gripper_step(gripper: &BilateralLoopGripperTelemetry) -> SvsGripperStepV1 {
 #[derive(Debug)]
 struct PersistedArtifacts {
     effective_profile_hash: String,
+    calibration: CalibrationFile,
     calibration_hash: String,
 }
 
@@ -3330,6 +3502,7 @@ struct FakeManifestWrite<'a> {
     artifacts: &'a PersistedArtifacts,
     raw_can_enabled: bool,
     raw_can_finalizer_status: String,
+    raw_clock: Option<RawClockManifest>,
 }
 
 struct FakeReportWrite<'a> {
@@ -3345,9 +3518,137 @@ struct FakeReportWrite<'a> {
     final_flush_result: WriterFlushResultJson,
     writer_stats: &'a WriterStats,
     last_error: Option<String>,
+    raw_clock_report: Option<RawClockRuntimeReport>,
+    raw_clock_settings: Option<crate::raw_clock::SvsRawClockSettings>,
 }
 
-fn persist_episode_inputs(episode_dir: &Path) -> Result<PersistedArtifacts> {
+fn fake_calibration_file(positions: Option<([f64; 6], [f64; 6])>) -> CalibrationFile {
+    let mut calibration = CalibrationFile::identity_for_tests();
+    if let Some((master_zero_rad, slave_zero_rad)) = positions {
+        calibration.master_zero_rad = master_zero_rad;
+        calibration.slave_zero_rad = slave_zero_rad;
+    }
+    calibration
+}
+
+fn replace_fake_capture_calibration(
+    episode_dir: &Path,
+    artifacts: &mut PersistedArtifacts,
+    positions: ([f64; 6], [f64; 6]),
+    save_calibration_path: Option<&Path>,
+) -> Result<()> {
+    let calibration = fake_calibration_file(Some(positions));
+    let calibration_bytes = calibration.to_canonical_toml_bytes()?;
+    let calibration_hash = sha256_hex(&calibration_bytes);
+    write_replace_file(episode_dir.join("calibration.toml"), &calibration_bytes)?;
+    if let Some(path) = save_calibration_path {
+        crate::calibration::persist_calibration_no_overwrite(path, &calibration_bytes)
+            .with_context(|| format!("failed to save calibration to {}", path.display()))?;
+    }
+    artifacts.calibration = calibration;
+    artifacts.calibration_hash = calibration_hash;
+    Ok(())
+}
+
+fn fake_raw_clock_settings_from_profile(
+    profile: &EffectiveProfile,
+) -> crate::raw_clock::SvsRawClockSettings {
+    let raw = &profile.raw_clock;
+    crate::raw_clock::SvsRawClockSettings {
+        warmup_secs: raw.warmup_secs,
+        residual_p95_us: raw.residual_p95_us,
+        residual_max_us: raw.residual_max_us,
+        drift_abs_ppm: raw.drift_abs_ppm,
+        sample_gap_max_ms: raw.sample_gap_max_ms,
+        last_sample_age_ms: raw.last_sample_age_ms,
+        selected_sample_age_ms: raw.selected_sample_age_ms,
+        inter_arm_skew_max_us: raw.inter_arm_skew_max_us,
+        state_skew_max_us: raw.state_skew_max_us,
+        residual_max_consecutive_failures: raw.residual_max_consecutive_failures,
+        alignment_lag_us: raw.alignment_lag_us,
+        alignment_search_window_us: raw.alignment_search_window_us,
+        alignment_buffer_miss_consecutive_failures: raw.alignment_buffer_miss_consecutive_failures,
+    }
+}
+
+fn raw_clock_health_for_fake() -> piper_tools::raw_clock::RawClockHealth {
+    piper_tools::raw_clock::RawClockHealth {
+        healthy: true,
+        sample_count: 2_000,
+        window_duration_us: 20_000_000,
+        drift_ppm: 0.0,
+        residual_p50_us: 50,
+        residual_p95_us: 100,
+        residual_p99_us: 150,
+        residual_max_us: 200,
+        sample_gap_max_us: 10_000,
+        last_sample_age_us: 1_000,
+        raw_timestamp_regressions: 0,
+        failure_kind: None,
+        reason: None,
+    }
+}
+
+fn raw_clock_report_for_fake(
+    iterations: usize,
+    exit_reason: RawClockRuntimeExitReason,
+) -> RawClockRuntimeReport {
+    fn flag(value: bool) -> u32 {
+        if value { 1 } else { 0 }
+    }
+
+    RawClockRuntimeReport {
+        master: raw_clock_health_for_fake(),
+        slave: raw_clock_health_for_fake(),
+        joint_motion: None,
+        max_inter_arm_skew_us: 2_000,
+        inter_arm_skew_p95_us: 1_000,
+        alignment_lag_us: 5_000,
+        latest_inter_arm_skew_max_us: 2_000,
+        latest_inter_arm_skew_p95_us: 1_000,
+        selected_inter_arm_skew_max_us: 2_000,
+        selected_inter_arm_skew_p95_us: 1_000,
+        clock_health_failures: 0,
+        compensation_faults: flag(exit_reason == RawClockRuntimeExitReason::CompensationFault),
+        controller_faults: flag(exit_reason == RawClockRuntimeExitReason::ControllerFault),
+        telemetry_sink_faults: flag(exit_reason == RawClockRuntimeExitReason::TelemetrySinkFault),
+        alignment_buffer_misses: 0,
+        alignment_buffer_miss_consecutive_max: 0,
+        alignment_buffer_miss_consecutive_failures: 0,
+        master_residual_max_spikes: 0,
+        slave_residual_max_spikes: 0,
+        master_residual_max_consecutive_failures: 0,
+        slave_residual_max_consecutive_failures: 0,
+        read_faults: flag(exit_reason == RawClockRuntimeExitReason::ReadFault),
+        submission_faults: flag(exit_reason == RawClockRuntimeExitReason::SubmissionFault),
+        last_submission_failed_side: None,
+        peer_command_may_have_applied: false,
+        runtime_faults: flag(matches!(
+            exit_reason,
+            RawClockRuntimeExitReason::RuntimeTransportFault
+                | RawClockRuntimeExitReason::RuntimeManualFault
+        )),
+        master_tx_realtime_overwrites_total: 0,
+        slave_tx_realtime_overwrites_total: 0,
+        master_tx_frames_sent_total: iterations as u64,
+        slave_tx_frames_sent_total: iterations as u64,
+        master_tx_fault_aborts_total: 0,
+        slave_tx_fault_aborts_total: 0,
+        last_runtime_fault_master: None,
+        last_runtime_fault_slave: None,
+        iterations,
+        exit_reason: Some(exit_reason),
+        master_stop_attempt: StopAttemptResult::NotAttempted,
+        slave_stop_attempt: StopAttemptResult::NotAttempted,
+        last_error: (exit_reason != RawClockRuntimeExitReason::MaxIterations)
+            .then(|| format!("{exit_reason:?}")),
+    }
+}
+
+fn persist_episode_inputs(
+    episode_dir: &Path,
+    raw_clock_startup_positions: Option<([f64; 6], [f64; 6])>,
+) -> Result<PersistedArtifacts> {
     let profile = fake_effective_profile();
     let effective_profile_bytes = profile.to_canonical_toml_bytes()?;
     let effective_profile_hash = sha256_hex(&effective_profile_bytes);
@@ -3356,13 +3657,14 @@ fn persist_episode_inputs(episode_dir: &Path) -> Result<PersistedArtifacts> {
         &effective_profile_bytes,
     )?;
 
-    let calibration = CalibrationFile::identity_for_tests();
+    let calibration = fake_calibration_file(raw_clock_startup_positions);
     let calibration_bytes = calibration.to_canonical_toml_bytes()?;
     let calibration_hash = sha256_hex(&calibration_bytes);
     write_new_file(episode_dir.join("calibration.toml"), &calibration_bytes)?;
 
     Ok(PersistedArtifacts {
         effective_profile_hash,
+        calibration,
         calibration_hash,
     })
 }
@@ -3378,9 +3680,11 @@ fn write_manifest(input: FakeManifestWrite<'_>) -> Result<()> {
     manifest.effective_profile.sha256_hex = input.artifacts.effective_profile_hash.clone();
     manifest.calibration.source_path = Some(PathBuf::from("calibration.toml"));
     manifest.calibration.sha256_hex = input.artifacts.calibration_hash.clone();
+    manifest.calibration.master_zero_rad = input.artifacts.calibration.master_zero_rad;
+    manifest.calibration.slave_zero_rad = input.artifacts.calibration.slave_zero_rad;
     manifest.raw_can.enabled = input.raw_can_enabled;
     manifest.raw_can.finalizer_status = Some(input.raw_can_finalizer_status);
-    manifest.raw_clock = None;
+    manifest.raw_clock = input.raw_clock;
     manifest.step_file.step_count = input.summary.step_count;
     manifest.step_file.last_step_index = input.summary.last_step_index;
     manifest.validate()?;
@@ -3391,6 +3695,33 @@ fn write_manifest(input: FakeManifestWrite<'_>) -> Result<()> {
 }
 
 fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
+    let raw_clock = match (
+        input.raw_clock_report.as_ref(),
+        input.raw_clock_settings.as_ref(),
+    ) {
+        (_, Some(settings)) if input.status == EpisodeStatus::Cancelled => {
+            Some(crate::raw_clock::raw_clock_startup_report_json(
+                settings,
+                Some("Cancelled".to_string()),
+            ))
+        },
+        (Some(report), Some(settings)) => {
+            Some(crate::raw_clock::raw_clock_report_json(report, settings))
+        },
+        (None, Some(settings)) => Some(crate::raw_clock::raw_clock_startup_report_json(
+            settings,
+            input
+                .exit_reason
+                .map(|reason| format!("{reason:?}"))
+                .or_else(|| input.last_error.clone()),
+        )),
+        (Some(_), None) => {
+            return Err(anyhow!(
+                "raw-clock report is present but raw-clock settings are missing"
+            ));
+        },
+        (None, None) => None,
+    };
     let report = ReportJson {
         schema_version: 1,
         episode_id: input.episode_id.to_string(),
@@ -3412,7 +3743,7 @@ fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
         ended_unix_ns: ENDED_UNIX_NS,
         step_count: input.summary.step_count,
         last_step_index: input.summary.last_step_index,
-        raw_clock: None,
+        raw_clock,
         dual_arm: DualArmReportJson {
             iterations: input.attempted_iterations.max(input.summary.step_count),
             read_faults: 0,
@@ -3870,6 +4201,8 @@ mod tests {
             },
             writer_stats: &writer_stats,
             last_error: Some("startup failed".to_string()),
+            raw_clock_report: None,
+            raw_clock_settings: None,
         });
 
         assert!(result.is_err());
