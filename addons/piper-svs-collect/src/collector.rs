@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
 use piper_client::dual_arm::{
     BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
     BilateralExitReason, BilateralFinalTorques, BilateralGripperCommandStatus, BilateralLoopConfig,
@@ -16,16 +15,17 @@ use piper_client::dual_arm::{
     BilateralLoopTimingTelemetry, BilateralRunReport, BilateralSubmissionMode,
     BilateralTelemetrySinkError, DualArmActiveMit, DualArmBuilder, DualArmCalibration,
     DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby, GripperTeleopConfig,
-    JointMirrorMap, LoopTimingMode,
+    JointMirrorMap, LoopTimingMode, SubmissionArm,
 };
 use piper_client::dual_arm_raw_clock::{
     ExperimentalRawClockDualArmActive, ExperimentalRawClockDualArmStandby,
     ExperimentalRawClockRunExit, RawClockRuntimeError, RawClockRuntimeExitReason,
-    RawClockRuntimeReport,
+    RawClockRuntimeReport, RawClockSide,
 };
 use piper_client::observer::{ControlSnapshot, ControlSnapshotFull};
 use piper_client::state::{DisableConfig, MitModeConfig, Piper, SoftRealtime, Standby};
 use piper_client::types::{Joint, JointArray, NewtonMeter, Rad, RadPerSecond};
+use piper_client::{MotionConnectedPiper, MotionConnectedState, PiperBuilder};
 use piper_physics::{
     DualArmMujocoCompensatorConfig, DynamicsMode, EndEffectorKinematics, PayloadSpec,
     SharedModeState, SharedPayloadState,
@@ -1414,10 +1414,14 @@ fn run_raw_clock_collector(args: Args, cancel: CollectorCancelToken) -> Result<C
         slave_firmware = %slave_quirks.firmware_version,
         "SVS raw-clock firmware/profile context"
     );
+    let raw_clock_warmup_cycles = resolved_profile.profile.control.warmup_cycles as usize;
     let raw_config = raw_clock_settings.to_experimental_config(
         resolved_profile.profile.control.loop_frequency_hz,
-        args.max_iterations
-            .map(|value| usize::try_from(value).unwrap_or(usize::MAX)),
+        args.max_iterations.map(|value| {
+            usize::try_from(value)
+                .unwrap_or(usize::MAX)
+                .saturating_add(raw_clock_warmup_cycles)
+        }),
     );
     raw_config.validate()?;
     let standby = ExperimentalRawClockDualArmStandby::new(master, slave, raw_config)?;
@@ -1629,10 +1633,7 @@ fn run_raw_clock_collector(args: Args, cancel: CollectorCancelToken) -> Result<C
             "pre-enable",
             &loaded.resolved.calibration,
             &standby_snapshot,
-            resolved_profile
-                .profile
-                .calibration
-                .calibration_max_error_rad,
+            resolved_profile.profile.calibration.calibration_max_error_rad,
         ) {
             let mut report = BilateralRunReport {
                 exit_reason: Some(BilateralExitReason::RuntimeTransportFault),
@@ -1778,10 +1779,7 @@ fn run_raw_clock_collector(args: Args, cancel: CollectorCancelToken) -> Result<C
         loaded_calibration.as_ref(),
         resolved_profile.runtime_mirror_map,
         started_unix_ns / 1_000_000,
-        resolved_profile
-            .profile
-            .calibration
-            .calibration_max_error_rad,
+        resolved_profile.profile.calibration.calibration_max_error_rad,
     ) {
         Ok(calibration) => calibration,
         Err(error) => {
@@ -1802,7 +1800,8 @@ fn run_raw_clock_collector(args: Args, cancel: CollectorCancelToken) -> Result<C
     };
 
     if loaded_calibration.is_none() {
-        if let Err(error) = replace_raw_clock_capture_calibration(&mut context, &resolved_calibration)
+        if let Err(error) =
+            replace_raw_clock_capture_calibration(&mut context, &resolved_calibration)
         {
             let (_error_state, shutdown) = active.fault_shutdown(Duration::from_millis(20));
             let mut report = raw_clock_startup_fault_report(error);
@@ -1938,7 +1937,8 @@ fn run_raw_clock_collector(args: Args, cancel: CollectorCancelToken) -> Result<C
     }
 
     print_raw_clock_startup_stage("startup: starting SVS raw-clock bilateral loop...");
-    let loop_exit = match active.run_with_controller_and_compensation(controller, bridge, run_config)
+    let loop_exit = match active
+        .run_with_controller_and_compensation(controller, bridge, run_config)
     {
         Ok(exit) => exit,
         Err(error) => {
@@ -2208,8 +2208,8 @@ fn load_raw_clock_calibration_if_present(
     let Some(path) = args.calibration_file.as_ref() else {
         return Ok(None);
     };
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read calibration {}", path.display()))?;
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read calibration {}", path.display()))?;
     let loaded = CalibrationFile::from_canonical_bytes(&bytes)
         .with_context(|| format!("failed to parse calibration {}", path.display()))?;
     let resolved = resolve_episode_calibration(Some(loaded), runtime_map, None)?;
@@ -2376,11 +2376,21 @@ fn bilateral_report_from_raw_clock_for_svs(report: &RawClockRuntimeReport) -> Bi
         right_tx_fault_aborts_total: report.slave_tx_fault_aborts_total,
         last_runtime_fault_left: report.last_runtime_fault_master,
         last_runtime_fault_right: report.last_runtime_fault_slave,
+        last_submission_failed_arm: report
+            .last_submission_failed_side
+            .map(raw_clock_submission_side_to_arm),
         exit_reason: report.exit_reason.map(raw_clock_exit_to_bilateral_exit),
         left_stop_attempt: report.master_stop_attempt,
         right_stop_attempt: report.slave_stop_attempt,
         last_error: report.last_error.clone(),
         ..BilateralRunReport::default()
+    }
+}
+
+fn raw_clock_submission_side_to_arm(side: RawClockSide) -> SubmissionArm {
+    match side {
+        RawClockSide::Master => SubmissionArm::Left,
+        RawClockSide::Slave => SubmissionArm::Right,
     }
 }
 
@@ -2695,9 +2705,9 @@ fn write_real_report(
         context.raw_clock_report.as_ref(),
         context.raw_clock_settings.as_ref(),
     ) {
-        (Some(raw_report), Some(settings)) => {
-            Some(crate::raw_clock::raw_clock_report_json(raw_report, settings))
-        },
+        (Some(raw_report), Some(settings)) => Some(crate::raw_clock::raw_clock_report_json(
+            raw_report, settings,
+        )),
         (None, Some(settings)) => Some(crate::raw_clock::raw_clock_startup_report_json(
             settings,
             raw_clock_startup_final_failure_kind(report),
@@ -3004,12 +3014,10 @@ fn episode_status_from_report(report: &BilateralRunReport, faulted_variant: bool
 
 fn joint_mirror_map_from_profile(profile: &EffectiveProfile) -> Result<JointMirrorMap> {
     let mut permutation = [Joint::J1; 6];
-    for (output, index) in permutation
-        .iter_mut()
-        .zip(profile.calibration.mirror_map.permutation)
-    {
-        *output = Joint::from_index(index)
-            .ok_or_else(|| anyhow!("calibration.mirror_map.permutation contains invalid joint index {index}"))?;
+    for (output, index) in permutation.iter_mut().zip(profile.calibration.mirror_map.permutation) {
+        *output = Joint::from_index(index).ok_or_else(|| {
+            anyhow!("calibration.mirror_map.permutation contains invalid joint index {index}")
+        })?;
     }
     Ok(JointMirrorMap {
         permutation,
@@ -3772,6 +3780,68 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn raw_clock_runtime_report_for_tests() -> RawClockRuntimeReport {
+        fn healthy() -> piper_tools::raw_clock::RawClockHealth {
+            piper_tools::raw_clock::RawClockHealth {
+                healthy: true,
+                sample_count: 2_000,
+                window_duration_us: 20_000_000,
+                drift_ppm: 0.0,
+                residual_p50_us: 10,
+                residual_p95_us: 100,
+                residual_p99_us: 120,
+                residual_max_us: 130,
+                sample_gap_max_us: 10_000,
+                last_sample_age_us: 500,
+                raw_timestamp_regressions: 0,
+                failure_kind: None,
+                reason: None,
+            }
+        }
+
+        RawClockRuntimeReport {
+            master: healthy(),
+            slave: healthy(),
+            joint_motion: None,
+            max_inter_arm_skew_us: 0,
+            inter_arm_skew_p95_us: 0,
+            alignment_lag_us: 0,
+            latest_inter_arm_skew_max_us: 0,
+            latest_inter_arm_skew_p95_us: 0,
+            selected_inter_arm_skew_max_us: 0,
+            selected_inter_arm_skew_p95_us: 0,
+            clock_health_failures: 0,
+            compensation_faults: 0,
+            controller_faults: 0,
+            telemetry_sink_faults: 0,
+            alignment_buffer_misses: 0,
+            alignment_buffer_miss_consecutive_max: 0,
+            alignment_buffer_miss_consecutive_failures: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
+            read_faults: 0,
+            submission_faults: 0,
+            last_submission_failed_side: None,
+            peer_command_may_have_applied: false,
+            runtime_faults: 0,
+            master_tx_realtime_overwrites_total: 0,
+            slave_tx_realtime_overwrites_total: 0,
+            master_tx_frames_sent_total: 0,
+            slave_tx_frames_sent_total: 0,
+            master_tx_fault_aborts_total: 0,
+            slave_tx_fault_aborts_total: 0,
+            last_runtime_fault_master: None,
+            last_runtime_fault_slave: None,
+            iterations: 0,
+            exit_reason: None,
+            master_stop_attempt: piper_client::dual_arm::StopAttemptResult::NotAttempted,
+            slave_stop_attempt: piper_client::dual_arm::StopAttemptResult::NotAttempted,
+            last_error: None,
+        }
+    }
+
     #[test]
     fn write_report_refuses_existing_report() {
         let dir = tempfile::tempdir().unwrap();
@@ -3839,6 +3909,34 @@ mod tests {
     }
 
     #[test]
+    fn raw_clock_report_conversion_preserves_submission_failed_side() {
+        let mut report = raw_clock_runtime_report_for_tests();
+        report.submission_faults = 1;
+        report.last_submission_failed_side =
+            Some(piper_client::dual_arm_raw_clock::RawClockSide::Master);
+        report.peer_command_may_have_applied = true;
+
+        let converted = bilateral_report_from_raw_clock_for_svs(&report);
+
+        assert_eq!(
+            converted.last_submission_failed_arm,
+            Some(piper_client::dual_arm::SubmissionArm::Left)
+        );
+        assert_eq!(converted.submission_faults, 1);
+        assert!(converted.peer_command_may_have_applied);
+
+        report.last_submission_failed_side =
+            Some(piper_client::dual_arm_raw_clock::RawClockSide::Slave);
+
+        let converted = bilateral_report_from_raw_clock_for_svs(&report);
+
+        assert_eq!(
+            converted.last_submission_failed_arm,
+            Some(piper_client::dual_arm::SubmissionArm::Right)
+        );
+    }
+
+    #[test]
     fn write_real_report_rejects_raw_clock_report_without_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let context = RealRunContext {
@@ -3888,10 +3986,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("raw-clock manifest and report metadata")
-        );
+        assert!(err.to_string().contains("raw-clock manifest and report metadata"));
     }
 
     #[test]
@@ -3925,10 +4020,7 @@ calibration_max_error_rad = 0.0
 
         let resolved = resolve_profile_from_args(&args).unwrap();
 
-        assert_eq!(
-            resolved.profile.calibration.calibration_max_error_rad,
-            0.05
-        );
+        assert_eq!(resolved.profile.calibration.calibration_max_error_rad, 0.05);
     }
 
     #[test]

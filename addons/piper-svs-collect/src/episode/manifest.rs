@@ -1056,8 +1056,14 @@ impl RawClockReportJson {
             ));
         }
         validate_report_finite("raw_clock.drift_abs_ppm", self.drift_abs_ppm)?;
-        validate_report_finite("raw_clock.master_clock_drift_ppm", self.master_clock_drift_ppm)?;
-        validate_report_finite("raw_clock.slave_clock_drift_ppm", self.slave_clock_drift_ppm)
+        validate_report_finite(
+            "raw_clock.master_clock_drift_ppm",
+            self.master_clock_drift_ppm,
+        )?;
+        validate_report_finite(
+            "raw_clock.slave_clock_drift_ppm",
+            self.slave_clock_drift_ppm,
+        )
     }
 }
 
@@ -1230,9 +1236,7 @@ fn require_option_nonempty(value: Option<&str>, field: &str) -> Result<(), Manif
 
 fn require_report_nonempty(value: &str, field: &str) -> Result<(), ManifestError> {
     if value.trim().is_empty() {
-        Err(ManifestError::InvalidReport(format!(
-            "{field} is required"
-        )))
+        Err(ManifestError::InvalidReport(format!("{field} is required")))
     } else {
         Ok(())
     }
@@ -1250,7 +1254,9 @@ fn validate_finite(field: &str, value: f64) -> Result<(), ManifestError> {
 
 fn validate_report_finite(name: &str, value: f64) -> Result<(), ManifestError> {
     if !value.is_finite() {
-        return Err(ManifestError::InvalidReport(format!("{name} must be finite")));
+        return Err(ManifestError::InvalidReport(format!(
+            "{name} must be finite"
+        )));
     }
     Ok(())
 }

@@ -255,6 +255,8 @@ impl SvsRawClockSettings {
             disable_config: loop_config.disable_config.clone(),
             cancel_signal: loop_config.cancel_signal.clone(),
             dt_clamp_multiplier: loop_config.dt_clamp_multiplier,
+            warmup_cycles: loop_config.warmup_cycles,
+            safety: loop_config.safety.clone(),
             telemetry_sink: loop_config.telemetry_sink.clone(),
             gripper: GripperTeleopConfig {
                 enabled: false,
@@ -333,9 +335,7 @@ pub fn raw_clock_report_json(
         controller_faults: report.controller_faults,
         telemetry_sink_faults: report.telemetry_sink_faults,
         final_failure_kind: report.exit_reason.and_then(|reason| match reason {
-            RawClockRuntimeExitReason::MaxIterations | RawClockRuntimeExitReason::Cancelled => {
-                None
-            },
+            RawClockRuntimeExitReason::MaxIterations | RawClockRuntimeExitReason::Cancelled => None,
             other => Some(format!("{other:?}")),
         }),
     }
@@ -432,10 +432,7 @@ pub(crate) fn apply_cli_profile_overrides(args: &Args, profile: &mut EffectivePr
     }
 }
 
-pub(crate) fn effective_gripper_mirror_enabled(
-    args: &Args,
-    profile: &EffectiveProfile,
-) -> bool {
+pub(crate) fn effective_gripper_mirror_enabled(args: &Args, profile: &EffectiveProfile) -> bool {
     profile.gripper.mirror_enabled && !args.disable_gripper_mirror
 }
 
@@ -577,7 +574,10 @@ mod tests {
     fn runtime_kind_requires_explicit_raw_clock_opt_in() {
         let mut args = args_for_raw_clock_resolve_tests();
         args.experimental_calibrated_raw = false;
-        assert_eq!(SvsRuntimeKind::from_args(&args), SvsRuntimeKind::StrictRealtime);
+        assert_eq!(
+            SvsRuntimeKind::from_args(&args),
+            SvsRuntimeKind::StrictRealtime
+        );
         args.experimental_calibrated_raw = true;
         assert_eq!(
             SvsRuntimeKind::from_args(&args),
@@ -659,8 +659,15 @@ mod tests {
         let telemetry_sink: Arc<dyn BilateralLoopTelemetrySink> = Arc::new(NoopTelemetrySink);
         let loop_config = BilateralLoopConfig {
             dt_clamp_multiplier: 3.5,
+            warmup_cycles: 11,
             cancel_signal: Some(cancel_signal.clone()),
             telemetry_sink: Some(telemetry_sink.clone()),
+            safety: piper_client::dual_arm::DualArmSafetyConfig {
+                safe_hold_kp: JointArray::splat(8.0),
+                safe_hold_kd: JointArray::splat(0.6),
+                safe_hold_max_duration: Duration::from_millis(345),
+                consecutive_read_failures_before_disable: 6,
+            },
             disable_config: piper_client::state::DisableConfig {
                 timeout: Duration::from_millis(123),
                 debounce_threshold: 7,
@@ -699,6 +706,19 @@ mod tests {
         assert_eq!(
             run_config.disable_config.poll_interval,
             loop_config.disable_config.poll_interval
+        );
+        assert_eq!(run_config.warmup_cycles, 11);
+        assert_eq!(
+            run_config.safety.safe_hold_kp,
+            loop_config.safety.safe_hold_kp
+        );
+        assert_eq!(
+            run_config.safety.safe_hold_kd,
+            loop_config.safety.safe_hold_kd
+        );
+        assert_eq!(
+            run_config.safety.safe_hold_max_duration,
+            loop_config.safety.safe_hold_max_duration
         );
         assert!(Arc::ptr_eq(
             run_config.cancel_signal.as_ref().unwrap(),
@@ -835,7 +855,10 @@ mod tests {
         assert_eq!(json.controller_faults, 2);
         assert_eq!(json.telemetry_sink_faults, 3);
         assert_eq!(json.clock_health_failures, 7);
-        assert_eq!(json.final_failure_kind.as_deref(), Some("TelemetrySinkFault"));
+        assert_eq!(
+            json.final_failure_kind.as_deref(),
+            Some("TelemetrySinkFault")
+        );
     }
 
     #[test]

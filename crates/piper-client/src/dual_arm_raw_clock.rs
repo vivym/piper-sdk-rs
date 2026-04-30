@@ -19,9 +19,10 @@ use crate::dual_arm::{
     BilateralCommand, BilateralControlFrame, BilateralController, BilateralDynamicsCompensation,
     BilateralDynamicsCompensator, BilateralFinalTorques, BilateralLoopTelemetrySink,
     BilateralLoopTimingTelemetry, BilateralOutputShapingConfig, BilateralOutputShapingState,
-    DualArmCalibration, DualArmSnapshot, GripperTeleopConfig, MasterFollowerController,
-    StopAttemptResult, apply_output_shaping, assemble_final_torques, build_gripper_telemetry,
-    clamp_control_dt_us, deadline_missed_after_submission, duration_micros_u64,
+    DualArmCalibration, DualArmSafetyConfig, DualArmSnapshot, GripperTeleopConfig,
+    MasterFollowerController, StopAttemptResult, apply_output_shaping, assemble_final_torques,
+    build_gripper_telemetry, clamp_control_dt_us, deadline_missed_after_submission,
+    duration_micros_u64,
 };
 use crate::observer::{
     ControlReadPolicy, ControlSnapshot, ControlSnapshotFull, DEFAULT_CONTROL_MAX_FEEDBACK_AGE,
@@ -2054,6 +2055,8 @@ pub struct ExperimentalRawClockRunConfig {
     pub disable_config: DisableConfig,
     pub cancel_signal: Option<Arc<AtomicBool>>,
     pub dt_clamp_multiplier: f64,
+    pub warmup_cycles: usize,
+    pub safety: DualArmSafetyConfig,
     pub telemetry_sink: Option<Arc<dyn BilateralLoopTelemetrySink>>,
     pub gripper: GripperTeleopConfig,
     pub output_shaping: Option<BilateralOutputShapingConfig>,
@@ -2070,6 +2073,8 @@ impl std::fmt::Debug for ExperimentalRawClockRunConfig {
                 &self.cancel_signal.as_ref().map(|_| "<set>"),
             )
             .field("dt_clamp_multiplier", &self.dt_clamp_multiplier)
+            .field("warmup_cycles", &self.warmup_cycles)
+            .field("safety", &self.safety)
             .field(
                 "telemetry_sink",
                 &self.telemetry_sink.as_ref().map(|_| "<set>"),
@@ -2091,6 +2096,8 @@ impl Default for ExperimentalRawClockRunConfig {
             disable_config: DisableConfig::default(),
             cancel_signal: None,
             dt_clamp_multiplier: 2.0,
+            warmup_cycles: 0,
+            safety: DualArmSafetyConfig::default(),
             telemetry_sink: None,
             gripper: GripperTeleopConfig {
                 enabled: false,
@@ -2592,6 +2599,46 @@ where
             &selection.slave.snapshot,
             inter_arm_skew_us,
         );
+        if iterations < cfg.warmup_cycles {
+            if !raw_clock_is_last_allowed_iteration(iterations, config.max_iterations) {
+                let command = raw_clock_hold_command(&snapshot, &cfg.safety);
+                let final_torques = assemble_final_torques(&command, None);
+                joint_motion.record(&snapshot, &command);
+                if let Err(error) = io.submit_command(&command, &final_torques, cfg.command_timeout)
+                {
+                    let report = fault_report_from_timing(
+                        &timing,
+                        iterations,
+                        &joint_motion,
+                        RawClockRuntimeExitReason::SubmissionFault,
+                        error.to_string(),
+                        |report| {
+                            report.submission_faults = report.submission_faults.saturating_add(1);
+                            if let RawClockRuntimeError::SubmissionFault {
+                                side,
+                                peer_command_may_have_applied,
+                                ..
+                            } = &error
+                            {
+                                report.last_submission_failed_side = RawClockSide::from_str(side);
+                                report.peer_command_may_have_applied =
+                                    *peer_command_may_have_applied;
+                            }
+                        },
+                    );
+                    let fault = io.fault_shutdown(FAULT_SHUTDOWN_TIMEOUT);
+                    return Ok(RawClockCoreExit::Faulted {
+                        arms: fault.arms,
+                        report: report
+                            .with_shutdown(fault.shutdown)
+                            .with_telemetry(fault.telemetry),
+                    });
+                }
+            }
+
+            iterations = iterations.saturating_add(1);
+            continue;
+        }
         let control_frame_host_mono_us =
             selection.master.host_rx_mono_us.max(selection.slave.host_rx_mono_us);
         let raw_dt_us = previous_control_frame_host_mono_us
@@ -2822,6 +2869,28 @@ fn fault_report_from_timing(
     attach_joint_motion(&mut report, joint_motion);
     update(&mut report);
     report
+}
+
+fn raw_clock_is_last_allowed_iteration(iteration: usize, max_iterations: Option<usize>) -> bool {
+    max_iterations.is_some_and(|max_iterations| iteration.saturating_add(1) >= max_iterations)
+}
+
+fn raw_clock_hold_command(
+    snapshot: &DualArmSnapshot,
+    cfg: &DualArmSafetyConfig,
+) -> BilateralCommand {
+    BilateralCommand {
+        slave_position: snapshot.right.state.position,
+        slave_velocity: JointArray::splat(0.0),
+        slave_kp: cfg.safe_hold_kp,
+        slave_kd: cfg.safe_hold_kd,
+        slave_feedforward_torque: JointArray::splat(NewtonMeter::ZERO),
+        master_position: snapshot.left.state.position,
+        master_velocity: JointArray::splat(0.0),
+        master_kp: cfg.safe_hold_kp,
+        master_kd: cfg.safe_hold_kd,
+        master_interaction_torque: JointArray::splat(NewtonMeter::ZERO),
+    }
 }
 
 fn attach_joint_motion(
@@ -4338,6 +4407,32 @@ mod tests {
             _snapshot: &DualArmSnapshot,
             _dt: Duration,
         ) -> std::result::Result<BilateralCommand, Self::Error> {
+            Ok(test_command())
+        }
+    }
+
+    struct CountingCommandController {
+        tick_calls: Arc<AtomicUsize>,
+    }
+
+    impl BilateralController for CountingCommandController {
+        type Error = Infallible;
+
+        fn tick(
+            &mut self,
+            _snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            self.tick_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(test_command())
+        }
+
+        fn tick_with_compensation(
+            &mut self,
+            _frame: &BilateralControlFrame,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            self.tick_calls.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(test_command())
         }
     }
@@ -6729,6 +6824,46 @@ mod tests {
         );
         assert!(!report.peer_command_may_have_applied);
         assert_eq!(state.fault_shutdowns.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn raw_clock_runtime_holds_during_warmup_before_controller_ticks() {
+        let tick_calls = Arc::new(AtomicUsize::new(0));
+        let controller = CountingCommandController {
+            tick_calls: tick_calls.clone(),
+        };
+
+        let (state, report) = run_fake_runtime_with_controller_and_config(
+            FakeRuntimeIo::new().with_reads(ready_reads_for_iterations(2)),
+            ready_timing_with_seeded_alignment_for_tests(),
+            2,
+            RawClockRuntimeThresholds::for_tests(),
+            controller,
+            ExperimentalRawClockRunConfig {
+                warmup_cycles: 2,
+                safety: crate::dual_arm::DualArmSafetyConfig {
+                    safe_hold_kp: JointArray::splat(7.0),
+                    safe_hold_kd: JointArray::splat(0.9),
+                    ..crate::dual_arm::DualArmSafetyConfig::default()
+                },
+                ..ExperimentalRawClockRunConfig::default()
+            },
+        );
+
+        assert_eq!(
+            report.exit_reason,
+            Some(RawClockRuntimeExitReason::MaxIterations)
+        );
+        assert_eq!(report.iterations, 2);
+        assert_eq!(tick_calls.load(AtomicOrdering::SeqCst), 0);
+        let commands = state.commands.lock().expect("commands lock").clone();
+        assert!(!commands.is_empty());
+        for command in commands {
+            assert_eq!(command.slave_kp, JointArray::splat(7.0));
+            assert_eq!(command.slave_kd, JointArray::splat(0.9));
+            assert_eq!(command.master_kp, JointArray::splat(7.0));
+            assert_eq!(command.master_kd, JointArray::splat(0.9));
+        }
     }
 
     #[test]
