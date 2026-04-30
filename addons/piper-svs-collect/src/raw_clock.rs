@@ -333,7 +333,9 @@ pub fn raw_clock_report_json(
         controller_faults: report.controller_faults,
         telemetry_sink_faults: report.telemetry_sink_faults,
         final_failure_kind: report.exit_reason.and_then(|reason| match reason {
-            RawClockRuntimeExitReason::MaxIterations => None,
+            RawClockRuntimeExitReason::MaxIterations | RawClockRuntimeExitReason::Cancelled => {
+                None
+            },
             other => Some(format!("{other:?}")),
         }),
     }
@@ -831,6 +833,23 @@ mod tests {
         assert!(
             !serialized.contains("final_failure_kind"),
             "clean raw-clock report should omit final_failure_kind instead of serializing null: {serialized}"
+        );
+    }
+
+    #[test]
+    fn raw_clock_report_json_omits_failure_kind_for_cancelled() {
+        let args = args_for_raw_clock_resolve_tests();
+        let profile = EffectiveProfile::default_for_tests();
+        let settings = SvsRawClockSettings::resolve(&args, &profile).unwrap();
+        let report = raw_clock_report_for_tests(RawClockRuntimeExitReason::Cancelled);
+
+        let json = raw_clock_report_json(&report, &settings);
+        let serialized = serde_json::to_string(&json).unwrap();
+
+        assert!(json.final_failure_kind.is_none());
+        assert!(
+            !serialized.contains("final_failure_kind"),
+            "cancelled raw-clock report should omit final_failure_kind instead of serializing null: {serialized}"
         );
     }
 

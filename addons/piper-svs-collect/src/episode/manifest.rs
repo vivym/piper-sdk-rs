@@ -1044,7 +1044,7 @@ impl ReportJson {
 
 impl RawClockReportJson {
     fn validate(&self) -> Result<(), ManifestError> {
-        require_nonempty(&self.timing_source, "raw_clock.timing_source")?;
+        require_report_nonempty(&self.timing_source, "raw_clock.timing_source")?;
         if self.timing_source != "calibrated_hw_raw" {
             return Err(ManifestError::InvalidReport(
                 "raw_clock.timing_source must be calibrated_hw_raw".to_string(),
@@ -1228,6 +1228,16 @@ fn require_option_nonempty(value: Option<&str>, field: &str) -> Result<(), Manif
     }
 }
 
+fn require_report_nonempty(value: &str, field: &str) -> Result<(), ManifestError> {
+    if value.trim().is_empty() {
+        Err(ManifestError::InvalidReport(format!(
+            "{field} is required"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_finite(field: &str, value: f64) -> Result<(), ManifestError> {
     if value.is_finite() {
         Ok(())
@@ -1399,6 +1409,18 @@ mod tests {
     }
 
     #[test]
+    fn raw_clock_report_validation_uses_report_errors() {
+        let mut report = ReportJson::for_test_faulted();
+        let mut raw_clock = raw_clock_report_for_tests();
+        raw_clock.timing_source.clear();
+        report.raw_clock = Some(raw_clock);
+
+        let err = report.validate().unwrap_err();
+
+        assert!(matches!(err, ManifestError::InvalidReport(_)));
+    }
+
+    #[test]
     fn complete_report_rejects_writer_fault_indicators() {
         let mut report = ReportJson::for_test_faulted();
         report.status = EpisodeStatus::Complete;
@@ -1441,6 +1463,50 @@ mod tests {
         let mut manifest = ManifestV1::for_test_complete();
         manifest.step_file.relative_path = PathBuf::from("nested/steps.bin");
         assert!(manifest.validate().is_err());
+    }
+
+    fn raw_clock_report_for_tests() -> RawClockReportJson {
+        RawClockReportJson {
+            timing_source: "calibrated_hw_raw".to_string(),
+            strict_realtime: false,
+            experimental: true,
+            warmup_secs: 10,
+            residual_p95_us: 2_000,
+            residual_max_us: 3_000,
+            drift_abs_ppm: 500.0,
+            sample_gap_max_ms: 50,
+            last_sample_age_ms: 20,
+            selected_sample_age_ms: 50,
+            inter_arm_skew_max_us: 20_000,
+            state_skew_max_us: 10_000,
+            residual_max_consecutive_failures: 3,
+            alignment_buffer_miss_consecutive_failure_threshold: 3,
+            master_clock_drift_ppm: 0.0,
+            slave_clock_drift_ppm: 0.0,
+            master_residual_p95_us: 0,
+            slave_residual_p95_us: 0,
+            selected_inter_arm_skew_max_us: 0,
+            selected_inter_arm_skew_p95_us: 0,
+            latest_inter_arm_skew_max_us: 0,
+            latest_inter_arm_skew_p95_us: 0,
+            alignment_lag_us: 5_000,
+            alignment_search_window_us: 25_000,
+            alignment_buffer_misses: 0,
+            alignment_buffer_miss_consecutive_max: 0,
+            alignment_buffer_miss_consecutive_failures: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
+            clock_health_failures: 0,
+            read_faults: 0,
+            submission_faults: 0,
+            runtime_faults: 0,
+            compensation_faults: 0,
+            controller_faults: 0,
+            telemetry_sink_faults: 0,
+            final_failure_kind: None,
+        }
     }
 
     #[test]

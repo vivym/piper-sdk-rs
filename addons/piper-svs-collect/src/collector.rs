@@ -1877,10 +1877,7 @@ fn write_real_report(
         },
         (None, Some(settings)) => Some(crate::raw_clock::raw_clock_startup_report_json(
             settings,
-            report
-                .exit_reason
-                .map(|reason| format!("{reason:?}"))
-                .or_else(|| report.last_error.clone()),
+            raw_clock_startup_final_failure_kind(report),
         )),
         (Some(_), None) => {
             return Err(anyhow!(
@@ -1889,6 +1886,11 @@ fn write_real_report(
         },
         (None, _) => None,
     };
+    if raw_clock_json.is_some() != context.base.raw_clock.is_some() {
+        return Err(anyhow!(
+            "raw-clock manifest and report metadata must be present together"
+        ));
+    }
     let report_json = ReportJson {
         schema_version: 1,
         episode_id: context.episode_id.clone(),
@@ -1949,6 +1951,14 @@ fn write_real_report(
     let text = serde_json::to_string_pretty(&report_json)?;
     write_new_file(context.episode_dir.join("report.json"), text.as_bytes())?;
     Ok(())
+}
+
+fn raw_clock_startup_final_failure_kind(report: &BilateralRunReport) -> Option<String> {
+    match report.exit_reason {
+        Some(BilateralExitReason::MaxIterations | BilateralExitReason::Cancelled) => None,
+        Some(reason) => Some(format!("{reason:?}")),
+        None => report.last_error.clone(),
+    }
 }
 
 fn bilateral_loop_config_from_profile(
@@ -2930,6 +2940,73 @@ mod tests {
         write_replace_file(&path, b"new").unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn raw_clock_startup_final_failure_kind_omits_cancelled() {
+        let report = BilateralRunReport {
+            exit_reason: Some(BilateralExitReason::Cancelled),
+            last_error: Some("cancel requested".to_string()),
+            ..BilateralRunReport::default()
+        };
+
+        assert!(raw_clock_startup_final_failure_kind(&report).is_none());
+    }
+
+    #[test]
+    fn write_real_report_rejects_raw_clock_report_without_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = RealRunContext {
+            episode_id: "20260428T010203Z-test-000000000000".to_string(),
+            episode_dir: dir.path().to_path_buf(),
+            base: RealEpisodeBase {
+                manifest: ManifestV1::for_test_complete(),
+                started_unix_ns: STARTED_UNIX_NS,
+                raw_clock: None,
+            },
+            raw_can: Arc::new(RawCanStatusTracker::disabled()),
+            writer_flush_timeout: Duration::from_millis(100),
+            raw_clock_report: None,
+            raw_clock_settings: Some(crate::raw_clock::SvsRawClockSettings {
+                warmup_secs: 10,
+                residual_p95_us: 2_000,
+                residual_max_us: 3_000,
+                drift_abs_ppm: 500.0,
+                sample_gap_max_ms: 50,
+                last_sample_age_ms: 20,
+                selected_sample_age_ms: 50,
+                inter_arm_skew_max_us: 20_000,
+                state_skew_max_us: 10_000,
+                residual_max_consecutive_failures: 3,
+                alignment_lag_us: 5_000,
+                alignment_search_window_us: 25_000,
+                alignment_buffer_miss_consecutive_failures: 3,
+            }),
+        };
+        let summary = crate::episode::wire::StepFileSummary {
+            episode_id: context.episode_id.clone(),
+            step_count: 0,
+            last_step_index: None,
+        };
+
+        let err = write_real_report(
+            &context,
+            EpisodeStatus::Faulted,
+            ENDED_UNIX_NS,
+            &summary,
+            &BilateralRunReport::default(),
+            WriterFlushResultJson {
+                success: false,
+                error: Some("startup failed".to_string()),
+            },
+            &WriterStats::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("raw-clock manifest and report metadata")
+        );
     }
 
     #[test]
