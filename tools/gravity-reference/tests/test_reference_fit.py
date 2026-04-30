@@ -61,6 +61,60 @@ def test_compare_rejects_missing_fit_metadata_instead_of_defaulting():
         compare_model(samples, model, _tolerances())
 
 
+@pytest.mark.parametrize(
+    "value",
+    [0.0, -1e-4, float("inf"), float("nan")],
+)
+def test_compare_rejects_invalid_ridge_lambda(value):
+    samples = _valid_samples()
+    model = _valid_rust_model()
+    model["fit"]["ridge_lambda"] = value
+
+    with pytest.raises(ValueError, match="fit.ridge_lambda"):
+        compare_model(samples, model, _tolerances())
+
+
+@pytest.mark.parametrize(
+    "value",
+    [1.0, 1.5, -0.1, float("inf"), float("nan")],
+)
+def test_compare_rejects_invalid_holdout_ratio(value):
+    samples = _valid_samples()
+    model = _valid_rust_model()
+    model["fit"]["holdout_ratio"] = value
+
+    with pytest.raises(ValueError, match="fit.holdout_ratio"):
+        compare_model(samples, model, _tolerances())
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_compare_rejects_invalid_regularize_bias_type(value):
+    samples = _valid_samples()
+    model = _valid_rust_model()
+    model["fit"]["regularize_bias"] = value
+
+    with pytest.raises(ValueError, match="fit.regularize_bias"):
+        compare_model(samples, model, _tolerances())
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("train_group_ids", "segment:segment-0"),
+        ("train_group_ids", ["segment:segment-0", 7]),
+        ("holdout_group_ids", "segment:segment-2"),
+        ("holdout_group_ids", ["segment:segment-2", None]),
+    ],
+)
+def test_compare_rejects_invalid_group_id_lists(key, value):
+    samples = _valid_samples()
+    model = _valid_rust_model()
+    model["fit"][key] = value
+
+    with pytest.raises(ValueError, match=f"fit.{key}"):
+        compare_model(samples, model, _tolerances())
+
+
 def test_load_samples_rejects_invalid_schema_version(tmp_path):
     path = tmp_path / "samples.jsonl"
     header, rows = _valid_samples()
@@ -74,8 +128,70 @@ def test_load_samples_rejects_invalid_schema_version(tmp_path):
 @pytest.mark.parametrize(
     ("key", "value"),
     [
+        ("frequency_hz", float("inf")),
+        ("stable_velocity_rad_s", float("nan")),
+        ("stable_tracking_error_rad", "not-a-number"),
+        ("stable_torque_std_nm", None),
+    ],
+)
+def test_load_samples_rejects_non_finite_header_numeric_fields(tmp_path, key, value):
+    path = tmp_path / "samples.jsonl"
+    header, rows = _valid_samples()
+    header[key] = value
+    _write_jsonl(path, header, rows)
+
+    with pytest.raises(ValueError, match=key):
+        load_samples([path])
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("settle_ms", -1),
+        ("settle_ms", 1.5),
+        ("sample_ms", -1),
+        ("sample_ms", "300"),
+        ("waypoint_count", -1),
+        ("accepted_waypoint_count", 1.5),
+        ("rejected_waypoint_count", "0"),
+    ],
+)
+def test_load_samples_rejects_invalid_header_counters(tmp_path, key, value):
+    path = tmp_path / "samples.jsonl"
+    header, rows = _valid_samples()
+    header[key] = value
+    _write_jsonl(path, header, rows)
+
+    with pytest.raises(ValueError, match=key):
+        load_samples([path])
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("waypoint_id", -1),
+        ("waypoint_id", 1.5),
+        ("host_mono_us", -1),
+        ("host_mono_us", "10000"),
+    ],
+)
+def test_load_samples_rejects_invalid_row_ids_and_times(tmp_path, key, value):
+    path = tmp_path / "samples.jsonl"
+    header, rows = _valid_samples()
+    rows[0][key] = value
+    _write_jsonl(path, header, rows)
+
+    with pytest.raises(ValueError, match=key):
+        load_samples([path])
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
         ("position_valid_mask", 256),
+        ("dynamic_valid_mask", -1),
         ("raw_timestamp_us", "not-an-integer"),
+        ("raw_timestamp_us", -1),
     ],
 )
 def test_load_samples_rejects_invalid_mask_or_raw_timestamp_type(tmp_path, key, value):
