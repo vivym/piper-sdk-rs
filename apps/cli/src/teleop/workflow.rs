@@ -26,10 +26,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::commands::teleop::TeleopDualArmArgs;
+use crate::gravity::compensation::{GravityCompensationSettings, GravityCompensator};
+use crate::gravity::model::QuasiStaticTorqueModel;
 use crate::teleop::calibration::{CalibrationFile, check_posture_compatibility};
 use crate::teleop::config::{
-    ResolvedTeleopConfig, TeleopConfigFile, TeleopJointMap, TeleopMode, TeleopProfile,
-    TeleopRawClockSettings,
+    ResolvedTeleopConfig, TeleopConfigFile, TeleopGravitySettings, TeleopJointMap, TeleopMode,
+    TeleopProfile, TeleopRawClockSettings,
 };
 use crate::teleop::controller::{
     RuntimeTeleopController, RuntimeTeleopSettings, RuntimeTeleopSettingsHandle,
@@ -102,6 +104,7 @@ pub trait ExperimentalRawClockTeleopBackend {
         &mut self,
         settings: RuntimeTeleopSettingsHandle,
         raw_clock: TeleopRawClockSettings,
+        compensator: Option<GravityCompensator>,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<ExperimentalRawClockRunExit>;
 }
@@ -178,7 +181,27 @@ pub struct StartupSummary {
     pub strict_realtime: bool,
     pub timing_source: Option<String>,
     pub report_path: Option<PathBuf>,
+    pub gravity: Option<StartupGravitySummary>,
     pub yes: bool,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct StartupGravitySummary {
+    pub reflection_compensation: bool,
+    pub master_assist_ratio: f64,
+    pub slave_assist_ratio: f64,
+    pub master_model: Option<StartupGravityModelSummary>,
+    pub slave_model: Option<StartupGravityModelSummary>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct StartupGravityModelSummary {
+    pub path: PathBuf,
+    pub role: String,
+    pub joint_map: String,
+    pub load_profile: String,
 }
 
 impl StartupSummary {
@@ -201,6 +224,7 @@ impl StartupSummary {
             strict_realtime: false,
             timing_source: Some(CALIBRATED_HW_RAW_TIMING_SOURCE.to_string()),
             report_path: None,
+            gravity: None,
             yes: true,
         }
     }
@@ -315,6 +339,7 @@ where
         strict_realtime: true,
         timing_source: None,
         report_path: args.report_json.clone(),
+        gravity: None,
         yes: args.yes,
     };
     if !io.confirm_start(&summary)? {
@@ -469,6 +494,8 @@ where
 
     let loaded_calibration =
         resolved.calibration.file.as_deref().map(load_calibration).transpose()?;
+    let loaded_gravity =
+        load_gravity_compensation(&resolved.gravity, resolved.calibration.joint_map)?;
     let summary_calibration_source = if loaded_calibration.is_some() {
         "file"
     } else {
@@ -496,6 +523,7 @@ where
         strict_realtime: false,
         timing_source: Some(CALIBRATED_HW_RAW_TIMING_SOURCE.to_string()),
         report_path: args.report_json.clone(),
+        gravity: loaded_gravity.summary.clone(),
         yes: args.yes,
     };
     if !io.confirm_start(&summary)? {
@@ -648,6 +676,7 @@ where
     let loop_exit = backend.run_raw_clock(
         settings_handle.clone(),
         resolved.raw_clock.clone(),
+        loaded_gravity.compensator,
         cancel_signal,
     )?;
 
@@ -687,6 +716,125 @@ where
         bail!("{message}");
     }
     Ok(status)
+}
+
+#[derive(Debug, Clone)]
+struct LoadedGravityCompensation {
+    compensator: Option<GravityCompensator>,
+    summary: Option<StartupGravitySummary>,
+}
+
+fn load_gravity_compensation(
+    settings: &TeleopGravitySettings,
+    calibration_joint_map: TeleopJointMap,
+) -> Result<LoadedGravityCompensation> {
+    let enabled = settings.reflection_compensation
+        || settings.master_assist_ratio > 0.0
+        || settings.slave_assist_ratio > 0.0;
+    if !enabled {
+        return Ok(LoadedGravityCompensation {
+            compensator: None,
+            summary: None,
+        });
+    }
+
+    let expected_joint_map = calibration_joint_map.as_str();
+    let master_model = if settings.master_assist_ratio > 0.0 {
+        Some(load_gravity_model_for_role(
+            "master",
+            settings
+                .master_model
+                .as_deref()
+                .context("master gravity assist requires --master-gravity-model")?,
+            expected_joint_map,
+        )?)
+    } else {
+        None
+    };
+    let slave_model = if settings.reflection_compensation || settings.slave_assist_ratio > 0.0 {
+        Some(load_gravity_model_for_role(
+            "slave",
+            settings
+                .slave_model
+                .as_deref()
+                .context("slave gravity compensation requires --slave-gravity-model")?,
+            expected_joint_map,
+        )?)
+    } else {
+        None
+    };
+
+    let summary = StartupGravitySummary {
+        reflection_compensation: settings.reflection_compensation,
+        master_assist_ratio: settings.master_assist_ratio,
+        slave_assist_ratio: settings.slave_assist_ratio,
+        master_model: master_model.as_ref().map(|loaded| loaded.summary.clone()),
+        slave_model: slave_model.as_ref().map(|loaded| loaded.summary.clone()),
+    };
+    let compensator = GravityCompensator::new(
+        master_model.map(|loaded| loaded.model),
+        slave_model.map(|loaded| loaded.model),
+        GravityCompensationSettings {
+            reflection_compensation: settings.reflection_compensation,
+            master_assist_ratio: settings.master_assist_ratio,
+            slave_assist_ratio: settings.slave_assist_ratio,
+        },
+    );
+
+    Ok(LoadedGravityCompensation {
+        compensator: Some(compensator),
+        summary: Some(summary),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct LoadedGravityModel {
+    model: QuasiStaticTorqueModel,
+    summary: StartupGravityModelSummary,
+}
+
+fn load_gravity_model_for_role(
+    expected_role: &'static str,
+    path: &Path,
+    expected_joint_map: &str,
+) -> Result<LoadedGravityModel> {
+    let contents = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read {expected_role} gravity model {}",
+            path.display()
+        )
+    })?;
+    let model: QuasiStaticTorqueModel = toml::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse {expected_role} gravity model {}",
+            path.display()
+        )
+    })?;
+    model
+        .validate_for_eval()
+        .with_context(|| format!("invalid {expected_role} gravity model {}", path.display()))?;
+    if model.role != expected_role {
+        bail!(
+            "{expected_role} gravity model role {} does not match expected {expected_role}",
+            model.role
+        );
+    }
+    if model.joint_map != expected_joint_map {
+        bail!(
+            "{expected_role} gravity model joint_map {} does not match calibration joint map {}",
+            model.joint_map,
+            expected_joint_map
+        );
+    }
+
+    let summary = StartupGravityModelSummary {
+        path: path.to_path_buf(),
+        role: model.role.clone(),
+        joint_map: model.joint_map.clone(),
+        load_profile: model.load_profile.clone(),
+    };
+
+    Ok(LoadedGravityModel { model, summary })
 }
 
 fn classify_experimental_raw_clock_exit(
@@ -1397,6 +1545,7 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
         &mut self,
         settings: RuntimeTeleopSettingsHandle,
         raw_clock: TeleopRawClockSettings,
+        compensator: Option<GravityCompensator>,
         cancel_signal: Arc<AtomicBool>,
     ) -> Result<ExperimentalRawClockRunExit> {
         let controller = RuntimeTeleopController::new(settings.clone());
@@ -1414,7 +1563,13 @@ impl ExperimentalRawClockTeleopBackend for RealTeleopBackend {
             ..ExperimentalRawClockRunConfig::default()
         };
 
-        match active.run_with_controller(controller, run_config) {
+        let run_result = if let Some(compensator) = compensator {
+            active.run_with_controller_and_compensation(controller, compensator, run_config)
+        } else {
+            active.run_with_controller(controller, run_config)
+        };
+
+        match run_result {
             Ok(PiperRawClockRunExit::Standby { arms, report }) => {
                 self.experimental_standby = Some(*arms);
                 self.experimental_phase = ExperimentalBackendPhase::WarmedStandby;
@@ -1821,6 +1976,43 @@ fn write_startup_summary<W: Write>(mut writer: W, summary: &StartupSummary) -> R
     if let Some(timing_source) = &summary.timing_source {
         writeln!(writer, "  timing_source={timing_source}")?;
     }
+    if let Some(gravity) = &summary.gravity {
+        writeln!(
+            writer,
+            "  gravity reflection compensation: {}",
+            gravity.reflection_compensation
+        )?;
+        writeln!(
+            writer,
+            "  master gravity assist ratio: {:.3}",
+            gravity.master_assist_ratio
+        )?;
+        writeln!(
+            writer,
+            "  slave gravity assist ratio: {:.3}",
+            gravity.slave_assist_ratio
+        )?;
+        if let Some(model) = &gravity.master_model {
+            writeln!(
+                writer,
+                "  master gravity model: {} (role={}, joint_map={}, load_profile={})",
+                model.path.display(),
+                model.role,
+                model.joint_map,
+                model.load_profile
+            )?;
+        }
+        if let Some(model) = &gravity.slave_model {
+            writeln!(
+                writer,
+                "  slave gravity model: {} (role={}, joint_map={}, load_profile={})",
+                model.path.display(),
+                model.role,
+                model.joint_map,
+                model.load_profile
+            )?;
+        }
+    }
     if let Some(path) = &summary.report_path {
         writeln!(writer, "  report json: {}", path.display())?;
     }
@@ -1914,6 +2106,7 @@ pub async fn run_dual_arm(args: TeleopDualArmArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gravity::model::QuasiStaticTorqueModel;
     use crate::teleop::report::TeleopExitStatus;
     use crate::teleop::target::{ConcreteTeleopTarget, TeleopPlatform};
     use anyhow::{Result, bail};
@@ -1968,6 +2161,7 @@ mod tests {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     struct FakeBackendCallCounts {
         experimental_raw_clock_runs: usize,
+        experimental_raw_clock_compensated_runs: usize,
         strict_runs: usize,
         fault_shutdown_attempted: bool,
         master_stop_attempts: usize,
@@ -2243,6 +2437,7 @@ mod tests {
             &mut self,
             settings: RuntimeTeleopSettingsHandle,
             _raw_clock: TeleopRawClockSettings,
+            compensator: Option<GravityCompensator>,
             _cancel_signal: Arc<AtomicBool>,
         ) -> Result<ExperimentalRawClockRunExit> {
             self.trace.push(WorkflowCall::RunLoop);
@@ -2252,6 +2447,9 @@ mod tests {
                 .expect("experimental settings lock poisoned") = Some(settings.snapshot());
             let mut counts = self.call_counts.lock().expect("call counts lock poisoned");
             counts.experimental_raw_clock_runs += 1;
+            if compensator.is_some() {
+                counts.experimental_raw_clock_compensated_runs += 1;
+            }
             if self.experimental_run_exit.faulted {
                 counts.fault_shutdown_attempted = true;
                 if self.experimental_run_exit.report.master_stop_attempt
@@ -2279,6 +2477,7 @@ mod tests {
         cancel_on_confirm: bool,
         cancel_during_enable: bool,
         cancel_checks: Arc<Mutex<usize>>,
+        last_summary: Arc<Mutex<Option<StartupSummary>>>,
         report_write_error: bool,
         console_start_error: bool,
         console_finished_error: bool,
@@ -2295,6 +2494,7 @@ mod tests {
                 cancel_on_confirm: false,
                 cancel_during_enable: false,
                 cancel_checks: Arc::new(Mutex::new(0)),
+                last_summary: Arc::new(Mutex::new(None)),
                 report_write_error: false,
                 console_start_error: false,
                 console_finished_error: false,
@@ -2380,8 +2580,9 @@ mod tests {
             self.cancel.clone()
         }
 
-        fn confirm_start(&mut self, _summary: &StartupSummary) -> Result<bool> {
+        fn confirm_start(&mut self, summary: &StartupSummary) -> Result<bool> {
             self.trace.push(WorkflowCall::ConfirmStart);
+            *self.last_summary.lock().expect("last summary lock poisoned") = Some(summary.clone());
             if self.cancel_on_confirm {
                 self.cancel.store(true, Ordering::SeqCst);
             }
@@ -2752,6 +2953,88 @@ mod tests {
                 WorkflowCall::Enable,
                 WorkflowCall::RunLoop,
             ],
+        );
+    }
+
+    #[test]
+    fn experimental_raw_clock_gravity_model_role_mismatch_fails_before_enable() {
+        let temp = tempfile::tempdir().unwrap();
+        let master_model = temp.path().join("wrong-role.model.toml");
+        write_gravity_model_file(&master_model, "slave", "identity", "empty");
+        let args = TeleopDualArmArgs {
+            master_gravity_model: Some(master_model),
+            master_gravity_assist_ratio: Some(0.25),
+            joint_map: Some(TeleopJointMap::Identity),
+            ..experimental_args()
+        };
+        let backend = FakeTeleopBackend::default();
+
+        let err = run_workflow_for_test(args, backend.clone())
+            .expect_err("master model with slave role must fail before enable");
+
+        assert!(err.to_string().contains("master gravity model role"));
+        assert!(!backend.calls().contains(&WorkflowCall::Enable));
+        assert!(!backend.calls().contains(&WorkflowCall::RunLoop));
+    }
+
+    #[test]
+    fn experimental_raw_clock_gravity_assist_ratio_appears_in_startup_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let master_model = temp.path().join("master.model.toml");
+        write_gravity_model_file(&master_model, "master", "identity", "empty");
+        let trace = WorkflowTrace::default();
+        let backend =
+            FakeTeleopBackend::with_trace(trace.clone()).with_experimental_raw_clock_success();
+        let io = FakeTeleopIo {
+            trace: trace.clone(),
+            ..FakeTeleopIo::default()
+        };
+        let summary_slot = io.last_summary.clone();
+        let args = TeleopDualArmArgs {
+            master_gravity_model: Some(master_model),
+            master_gravity_assist_ratio: Some(0.25),
+            joint_map: Some(TeleopJointMap::Identity),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test_with_io(args, backend, io)
+            .expect("gravity assist raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        let summary = summary_slot
+            .lock()
+            .expect("summary lock poisoned")
+            .clone()
+            .expect("startup summary should be captured");
+        let mut rendered = Vec::new();
+        write_startup_summary(&mut rendered, &summary).expect("summary should render");
+        let rendered = String::from_utf8(rendered).expect("summary should be UTF-8");
+        assert!(rendered.contains("master gravity assist ratio: 0.250"));
+        assert!(rendered.contains("master gravity model:"));
+        assert!(rendered.contains("load_profile=empty"));
+    }
+
+    #[test]
+    fn experimental_raw_clock_gravity_enabled_calls_compensation_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let slave_model = temp.path().join("slave.model.toml");
+        write_gravity_model_file(&slave_model, "slave", "identity", "empty");
+        let backend = FakeTeleopBackend::default().with_experimental_raw_clock_success();
+        let args = TeleopDualArmArgs {
+            slave_gravity_model: Some(slave_model),
+            gravity_reflection_compensation: true,
+            joint_map: Some(TeleopJointMap::Identity),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test(args, backend.clone())
+            .expect("raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        assert_eq!(backend.call_counts().experimental_raw_clock_runs, 1);
+        assert_eq!(
+            backend.call_counts().experimental_raw_clock_compensated_runs,
+            1
         );
     }
 
@@ -3664,6 +3947,15 @@ mod tests {
         CalibrationFile::from_calibration(&sample_calibration(), None, 123)
             .save_new(path)
             .expect("sample calibration file should be saved");
+    }
+
+    fn write_gravity_model_file(path: &Path, role: &str, joint_map: &str, load_profile: &str) {
+        let mut model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
+        model.role = role.to_string();
+        model.joint_map = joint_map.to_string();
+        model.load_profile = load_profile.to_string();
+        std::fs::write(path, toml::to_string_pretty(&model).unwrap())
+            .expect("gravity model file should be written");
     }
 
     fn sample_snapshot(mismatch: bool) -> DualArmSnapshot {
