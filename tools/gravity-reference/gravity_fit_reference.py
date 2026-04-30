@@ -184,10 +184,13 @@ def compare_model(
     if not rows:
         raise ValueError("expected at least one quasi-static sample row")
 
-    fit = rust_model.get("fit", {})
-    ridge_lambda = float(fit.get("ridge_lambda", 1e-4))
-    regularize_bias = bool(fit.get("regularize_bias", False))
-    holdout_ratio = float(fit.get("holdout_ratio", 0.0))
+    (
+        ridge_lambda,
+        regularize_bias,
+        holdout_ratio,
+        rust_train_group_ids,
+        rust_holdout_group_ids,
+    ) = _validate_fit_metadata(rust_model)
 
     train_group_ids, holdout_group_ids = make_holdout_groups(rows, holdout_ratio)
     holdout_group_set = set(holdout_group_ids)
@@ -221,8 +224,8 @@ def compare_model(
     )
 
     holdout_split_matches = (
-        train_group_ids == list(fit.get("train_group_ids", []))
-        and holdout_group_ids == list(fit.get("holdout_group_ids", []))
+        train_group_ids == rust_train_group_ids
+        and holdout_group_ids == rust_holdout_group_ids
     )
     pass_ = (
         coefficient_max_abs_diff <= float(tolerances["coefficient_atol"])
@@ -364,6 +367,8 @@ def _load_samples_file(
 
 def _validate_header(header: dict[str, Any], path: Path) -> None:
     _validate_keys(header, HEADER_KEYS, set(), f"{path} header")
+    if _require_nonnegative_int(header.get("schema_version"), f"{path} schema_version") != 1:
+        raise ValueError(f"{path} schema_version must be 1")
     if header.get("artifact_kind") != SAMPLE_ARTIFACT_KIND:
         raise ValueError(
             f"{path} artifact_kind must be {SAMPLE_ARTIFACT_KIND!r}, "
@@ -374,9 +379,23 @@ def _validate_header(header: dict[str, Any], path: Path) -> None:
             f"{path} torque_convention must be {TORQUE_CONVENTION!r}, "
             f"got {header.get('torque_convention')!r}"
         )
-    frequency_hz = header.get("frequency_hz")
-    if not isinstance(frequency_hz, (int, float)) or not math.isfinite(float(frequency_hz)):
-        raise ValueError(f"{path} frequency_hz must be finite")
+    for key in (
+        "frequency_hz",
+        "max_velocity_rad_s",
+        "max_step_rad",
+        "stable_velocity_rad_s",
+        "stable_tracking_error_rad",
+        "stable_torque_std_nm",
+    ):
+        _require_finite_number(header.get(key), f"{path} {key}")
+    for key in (
+        "settle_ms",
+        "sample_ms",
+        "waypoint_count",
+        "accepted_waypoint_count",
+        "rejected_waypoint_count",
+    ):
+        _require_nonnegative_int(header.get(key), f"{path} {key}")
 
 
 def _validate_header_matches(
@@ -406,6 +425,21 @@ def _validate_sample_row(row: dict[str, Any], path: Path, line_number: int) -> N
         )
     if row.get("pass_direction") not in {"forward", "backward"}:
         raise ValueError(f"{path} row {line_number} pass_direction is invalid")
+    for key in ("waypoint_id", "host_mono_us"):
+        _require_nonnegative_int(row.get(key), f"{path} row {line_number} {key}")
+    for key in ("position_valid_mask", "dynamic_valid_mask"):
+        _require_mask_u8(row.get(key), f"{path} row {line_number} {key}")
+    raw_timestamp_us = row.get("raw_timestamp_us")
+    if raw_timestamp_us is not None:
+        _require_nonnegative_int(
+            raw_timestamp_us, f"{path} row {line_number} raw_timestamp_us"
+        )
+    for key in (
+        "stable_velocity_rad_s",
+        "stable_tracking_error_rad",
+        "stable_torque_std_nm",
+    ):
+        _require_finite_number(row.get(key), f"{path} row {line_number} {key}")
     for key in ("q_rad", "dq_rad_s", "tau_nm"):
         _joint_array(row, key, label=f"{path} row {line_number} {key}")
 
@@ -420,6 +454,28 @@ def _validate_keys(
     extra = sorted(keys - required - optional)
     if extra:
         raise ValueError(f"{label} has unknown field(s): {', '.join(extra)}")
+
+
+def _require_finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be finite")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{label} must be finite")
+    return value
+
+
+def _require_nonnegative_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} must be a nonnegative integer")
+    return value
+
+
+def _require_mask_u8(value: Any, label: str) -> int:
+    value = _require_nonnegative_int(value, label)
+    if value > 255:
+        raise ValueError(f"{label} must be in 0..255")
+    return value
 
 
 def _joint_array(row: dict[str, Any], key: str, label: str | None = None) -> np.ndarray:
@@ -458,6 +514,54 @@ def _validate_rust_model(model: dict[str, Any]) -> None:
         )
     if not np.all(np.isfinite(coefficients)):
         raise ValueError("gravity model coefficients must be finite")
+
+
+def _validate_fit_metadata(
+    model: dict[str, Any],
+) -> tuple[float, bool, float, list[str], list[str]]:
+    fit = model.get("fit")
+    if not isinstance(fit, dict):
+        raise ValueError("fit must be an object")
+
+    for key in (
+        "ridge_lambda",
+        "regularize_bias",
+        "holdout_ratio",
+        "train_group_ids",
+        "holdout_group_ids",
+    ):
+        if key not in fit:
+            raise ValueError(f"fit.{key} is required")
+
+    ridge_lambda = _require_finite_number(fit["ridge_lambda"], "fit.ridge_lambda")
+    if ridge_lambda <= 0.0:
+        raise ValueError("fit.ridge_lambda must be > 0.0")
+    regularize_bias = fit["regularize_bias"]
+    if not isinstance(regularize_bias, bool):
+        raise ValueError("fit.regularize_bias must be a boolean")
+    holdout_ratio = _require_finite_number(fit["holdout_ratio"], "fit.holdout_ratio")
+    if holdout_ratio < 0.0 or holdout_ratio >= 1.0:
+        raise ValueError("fit.holdout_ratio must be in [0.0, 1.0)")
+
+    train_group_ids = _require_string_list(
+        fit["train_group_ids"], "fit.train_group_ids"
+    )
+    holdout_group_ids = _require_string_list(
+        fit["holdout_group_ids"], "fit.holdout_group_ids"
+    )
+    return (
+        ridge_lambda,
+        regularize_bias,
+        holdout_ratio,
+        train_group_ids,
+        holdout_group_ids,
+    )
+
+
+def _require_string_list(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{label} must be a list of strings")
+    return list(value)
 
 
 def _residual_metrics(
@@ -512,13 +616,22 @@ def _residual_metric_max_abs_diff(
     ]
     max_diff = 0.0
     for key, python_values in comparisons:
-        if key not in fit_quality:
-            continue
-        rust_values = np.asarray(fit_quality[key], dtype=np.float64)
-        if rust_values.shape != (JOINT_COUNT,):
-            raise ValueError(f"expected fit_quality.{key} to contain {JOINT_COUNT} values")
+        rust_values = _fit_quality_array(fit_quality, key)
         max_diff = max(max_diff, float(np.max(np.abs(python_values - rust_values))))
     return max_diff
+
+
+def _fit_quality_array(fit_quality: dict[str, Any], key: str) -> np.ndarray:
+    if not isinstance(fit_quality, dict):
+        raise ValueError("fit_quality must be an object")
+    if key not in fit_quality:
+        raise ValueError(f"fit_quality.{key} is required")
+    values = np.asarray(fit_quality[key], dtype=np.float64)
+    if values.shape != (JOINT_COUNT,):
+        raise ValueError(f"expected fit_quality.{key} to contain {JOINT_COUNT} values")
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"fit_quality.{key} must be finite")
+    return values
 
 
 def _synthetic_truth_coefficients() -> np.ndarray:
