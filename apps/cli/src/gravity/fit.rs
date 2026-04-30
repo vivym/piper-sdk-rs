@@ -552,6 +552,63 @@ mod tests {
     }
 
     #[test]
+    fn fit_run_writes_reproducible_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = dir.path().join("synthetic.samples.jsonl");
+        let out = dir.path().join("synthetic.model.toml");
+
+        let mut truth = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
+        truth[0][0] = 0.5;
+        truth[0][1] = 2.0;
+        truth[1][3] = -1.25;
+        truth[2][22] = 0.75;
+
+        let rows = synthetic_rows_from_coefficients(&truth, 240);
+        let mut header = sample_header_for_tests();
+        header.source_path = samples.display().to_string();
+        header.waypoint_count = rows.len();
+        header.accepted_waypoint_count = rows.len();
+        write_samples_jsonl(&samples, &header, &rows);
+
+        run(GravityFitArgs {
+            samples: vec![samples],
+            out: out.clone(),
+            basis: Some(crate::gravity::BASIS_TRIG_V1.to_string()),
+            ridge_lambda: 1e-8,
+            holdout_ratio: 0.25,
+        })
+        .unwrap();
+
+        let model_text = std::fs::read_to_string(out).unwrap();
+        let model: QuasiStaticTorqueModel = toml::from_str(&model_text).unwrap();
+
+        assert_eq!(
+            model.fit.train_group_ids,
+            [
+                "segment:segment-1",
+                "segment:segment-10",
+                "segment:segment-11",
+                "segment:segment-3",
+                "segment:segment-4",
+                "segment:segment-5",
+                "segment:segment-7",
+                "segment:segment-8",
+                "segment:segment-9",
+            ]
+        );
+        assert_eq!(
+            model.fit.holdout_group_ids,
+            [
+                "segment:segment-0",
+                "segment:segment-2",
+                "segment:segment-6",
+            ]
+        );
+        assert_eq!(model.fit.solver, "cholesky");
+        assert_eq!(model.fit.fallback_solver, None);
+    }
+
+    #[test]
     fn svd_fallback_records_primary_solver_and_fallback_used() {
         let mut g = nalgebra::DMatrix::identity(TRIG_V1_FEATURE_COUNT, TRIG_V1_FEATURE_COUNT);
         g[(0, 0)] = -1.0;
@@ -615,6 +672,18 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn write_samples_jsonl(
+        path: &std::path::Path,
+        header: &SamplesHeader,
+        rows: &[QuasiStaticSampleRow],
+    ) {
+        let mut file = std::fs::File::create(path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(header).unwrap()).unwrap();
+        for row in rows {
+            writeln!(file, "{}", serde_json::to_string(row).unwrap()).unwrap();
+        }
     }
 
     fn synthetic_q(sample_index: usize) -> [f64; 6] {
