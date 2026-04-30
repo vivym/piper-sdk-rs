@@ -122,6 +122,9 @@ impl QuasiStaticTorqueModel {
         if self.torque_convention != crate::gravity::TORQUE_CONVENTION {
             bail!("unsupported torque convention {}", self.torque_convention);
         }
+        if self.model.feature_names != trig_v1_feature_names() {
+            bail!("gravity model feature_names do not match trig-v1 layout");
+        }
         if self.model.coefficients_nm.len() != JOINT_COUNT {
             bail!("expected {JOINT_COUNT} output coefficient rows");
         }
@@ -129,11 +132,17 @@ impl QuasiStaticTorqueModel {
             if row.len() != TRIG_V1_FEATURE_COUNT {
                 bail!("expected {TRIG_V1_FEATURE_COUNT} coefficients per joint");
             }
+            if row.iter().any(|coefficient| !coefficient.is_finite()) {
+                bail!("gravity model coefficients must be finite");
+            }
         }
         Ok(())
     }
 
     pub fn eval(&self, q: [f64; JOINT_COUNT]) -> Result<[f64; JOINT_COUNT]> {
+        if q.iter().any(|value| !value.is_finite()) {
+            bail!("gravity model input q must be finite");
+        }
         self.validate_for_eval()?;
         let features = trig_v1_features(q);
         let mut out = [0.0; JOINT_COUNT];
@@ -150,7 +159,7 @@ impl QuasiStaticTorqueModel {
 
 #[cfg(test)]
 impl QuasiStaticTorqueModel {
-    fn for_tests_with_constant_output(output_nm: [f64; JOINT_COUNT]) -> Self {
+    pub(crate) fn for_tests_with_constant_output(output_nm: [f64; JOINT_COUNT]) -> Self {
         let mut coefficients_nm = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; JOINT_COUNT];
         for (joint, output) in output_nm.into_iter().enumerate() {
             coefficients_nm[joint][0] = output;
@@ -240,5 +249,28 @@ mod tests {
             model.eval([0.3; 6]).unwrap(),
             [1.0, -2.0, 0.5, 0.0, 3.0, -4.0]
         );
+    }
+
+    #[test]
+    fn validate_for_eval_rejects_feature_name_mismatch() {
+        let mut model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
+        model.model.feature_names.swap(0, 1);
+
+        assert!(model.validate_for_eval().is_err());
+    }
+
+    #[test]
+    fn validate_for_eval_rejects_non_finite_coefficients() {
+        let mut model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
+        model.model.coefficients_nm[0][0] = f64::NAN;
+
+        assert!(model.validate_for_eval().is_err());
+    }
+
+    #[test]
+    fn eval_rejects_non_finite_q() {
+        let model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
+
+        assert!(model.eval([f64::INFINITY; 6]).is_err());
     }
 }
