@@ -15,6 +15,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+const MIN_TRAINING_WAYPOINTS_PER_FEATURE: usize = 10;
+
 #[derive(Debug, Clone, Copy)]
 pub struct FitOptions {
     pub ridge_lambda: f64,
@@ -105,6 +107,7 @@ fn fit_from_rows(
 
     let mut normal = NormalEquations::new();
     let mut train_count = 0usize;
+    let mut training_waypoint_ids = BTreeSet::new();
     for row in &rows {
         let group_id = group_id_for_row(row);
         if holdout_groups.contains(group_id.as_str()) {
@@ -112,14 +115,16 @@ fn fit_from_rows(
         }
         normal.accumulate(row);
         train_count += 1;
+        training_waypoint_ids.insert(row.waypoint_id);
     }
     if train_count == 0 {
         bail!("holdout split left no training samples");
     }
-    if train_count < TRIG_V1_FEATURE_COUNT {
+    let minimum_training_waypoints = TRIG_V1_FEATURE_COUNT * MIN_TRAINING_WAYPOINTS_PER_FEATURE;
+    if training_waypoint_ids.len() < minimum_training_waypoints {
         bail!(
-            "expected at least {} training samples, got {train_count}",
-            TRIG_V1_FEATURE_COUNT
+            "expected at least {minimum_training_waypoints} training waypoints, got {}",
+            training_waypoint_ids.len()
         );
     }
 
@@ -497,13 +502,16 @@ mod tests {
     }
 
     #[test]
-    fn fitter_rejects_fewer_training_samples_than_feature_count() {
+    fn fitter_rejects_fewer_than_ten_training_waypoints_per_feature() {
         let truth = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
-        let rows = synthetic_rows_from_coefficients(&truth, TRIG_V1_FEATURE_COUNT - 1);
+        let required_waypoints = TRIG_V1_FEATURE_COUNT * 10;
+        let rows = synthetic_rows_from_coefficients(&truth, required_waypoints - 1);
 
         let err = fit_from_rows(sample_header_for_tests(), rows, no_holdout_options()).unwrap_err();
 
-        assert!(err.to_string().contains("training samples"), "{err:#}");
+        let message = err.to_string();
+        assert!(message.contains("training waypoints"), "{err:#}");
+        assert!(message.contains(&required_waypoints.to_string()), "{err:#}");
     }
 
     #[test]
@@ -563,7 +571,7 @@ mod tests {
         truth[1][3] = -1.25;
         truth[2][22] = 0.75;
 
-        let rows = synthetic_rows_from_coefficients(&truth, 240);
+        let rows = synthetic_rows_from_coefficients(&truth, 320);
         let mut header = sample_header_for_tests();
         header.source_path = samples.display().to_string();
         header.waypoint_count = rows.len();
@@ -588,6 +596,9 @@ mod tests {
                 "segment:segment-1",
                 "segment:segment-10",
                 "segment:segment-11",
+                "segment:segment-13",
+                "segment:segment-14",
+                "segment:segment-15",
                 "segment:segment-3",
                 "segment:segment-4",
                 "segment:segment-5",
@@ -600,6 +611,7 @@ mod tests {
             model.fit.holdout_group_ids,
             [
                 "segment:segment-0",
+                "segment:segment-12",
                 "segment:segment-2",
                 "segment:segment-6",
             ]

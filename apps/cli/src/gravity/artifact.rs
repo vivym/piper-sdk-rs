@@ -317,12 +317,44 @@ fn read_quasi_static_samples_file(
 }
 
 fn validate_samples_header(header: &SamplesHeader, path: &Path) -> Result<()> {
+    if header.row_type != HEADER_ROW_TYPE {
+        bail!(
+            "{} header type must be {HEADER_ROW_TYPE:?}, got {:?}",
+            path.display(),
+            header.row_type
+        );
+    }
     if header.artifact_kind != SAMPLE_ARTIFACT_KIND {
         bail!(
             "{} artifact_kind must be {SAMPLE_ARTIFACT_KIND:?}, got {:?}",
             path.display(),
             header.artifact_kind
         );
+    }
+    if header.schema_version != SCHEMA_VERSION {
+        bail!(
+            "{} schema_version must be {SCHEMA_VERSION}, got {}",
+            path.display(),
+            header.schema_version
+        );
+    }
+    if header.source_path.trim().is_empty() {
+        bail!("{} source_path must not be empty", path.display());
+    }
+    if header.source_sha256.trim().is_empty() {
+        bail!("{} source_sha256 must not be empty", path.display());
+    }
+    if header.role.trim().is_empty() {
+        bail!("{} role must not be empty", path.display());
+    }
+    if header.target.trim().is_empty() {
+        bail!("{} target must not be empty", path.display());
+    }
+    if header.joint_map.trim().is_empty() {
+        bail!("{} joint_map must not be empty", path.display());
+    }
+    if header.load_profile.trim().is_empty() {
+        bail!("{} load_profile must not be empty", path.display());
     }
     if header.torque_convention != crate::gravity::TORQUE_CONVENTION {
         bail!(
@@ -331,6 +363,36 @@ fn validate_samples_header(header: &SamplesHeader, path: &Path) -> Result<()> {
             crate::gravity::TORQUE_CONVENTION,
             header.torque_convention
         );
+    }
+    validate_finite_header_field(path, "frequency_hz", header.frequency_hz)?;
+    validate_finite_header_field(path, "max_velocity_rad_s", header.max_velocity_rad_s)?;
+    validate_finite_header_field(path, "max_step_rad", header.max_step_rad)?;
+    validate_finite_header_field(path, "stable_velocity_rad_s", header.stable_velocity_rad_s)?;
+    validate_finite_header_field(
+        path,
+        "stable_tracking_error_rad",
+        header.stable_tracking_error_rad,
+    )?;
+    validate_finite_header_field(path, "stable_torque_std_nm", header.stable_torque_std_nm)?;
+    let total_outcomes = header
+        .accepted_waypoint_count
+        .checked_add(header.rejected_waypoint_count)
+        .with_context(|| format!("{} waypoint outcome counts overflow", path.display()))?;
+    if total_outcomes != header.waypoint_count {
+        bail!(
+            "{} accepted_waypoint_count + rejected_waypoint_count must equal waypoint_count ({} + {} != {})",
+            path.display(),
+            header.accepted_waypoint_count,
+            header.rejected_waypoint_count,
+            header.waypoint_count
+        );
+    }
+    Ok(())
+}
+
+fn validate_finite_header_field(path: &Path, name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() {
+        bail!("{} {name} must be finite", path.display());
     }
     Ok(())
 }
@@ -444,6 +506,50 @@ fn validate_sample_row(row: &QuasiStaticSampleRow, path: &Path, line_number: usi
     }
     if row.tau_nm.iter().any(|value| !value.is_finite()) {
         bail!("{} row {line_number} tau_nm must be finite", path.display());
+    }
+    validate_joint_mask(
+        "position_valid_mask",
+        row.position_valid_mask,
+        path,
+        line_number,
+    )?;
+    if row.position_valid_mask != VALID_JOINT_MASK {
+        bail!(
+            "{} row {line_number} position_valid_mask must be {VALID_JOINT_MASK:#04x}, got {:#04x}",
+            path.display(),
+            row.position_valid_mask
+        );
+    }
+    validate_joint_mask(
+        "dynamic_valid_mask",
+        row.dynamic_valid_mask,
+        path,
+        line_number,
+    )?;
+    if row.dynamic_valid_mask != VALID_JOINT_MASK {
+        bail!(
+            "{} row {line_number} dynamic_valid_mask must be {VALID_JOINT_MASK:#04x}, got {:#04x}",
+            path.display(),
+            row.dynamic_valid_mask
+        );
+    }
+    if !row.stable_velocity_rad_s.is_finite() {
+        bail!(
+            "{} row {line_number} stable_velocity_rad_s must be finite",
+            path.display()
+        );
+    }
+    if !row.stable_tracking_error_rad.is_finite() {
+        bail!(
+            "{} row {line_number} stable_tracking_error_rad must be finite",
+            path.display()
+        );
+    }
+    if !row.stable_torque_std_nm.is_finite() {
+        bail!(
+            "{} row {line_number} stable_torque_std_nm must be finite",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -674,6 +780,42 @@ mod tests {
 
         let err = read_quasi_static_samples(&[path]).unwrap_err();
         assert!(err.to_string().contains("quasi-static-samples"));
+    }
+
+    #[test]
+    fn sample_reader_rejects_unsupported_schema_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unsupported-schema.samples.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"quasi-static-samples\",\"schema_version\":2,\"source_path\":\"p.jsonl\",\"source_sha256\":\"abc\",\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\",\"frequency_hz\":100.0,\"max_velocity_rad_s\":0.08,\"max_step_rad\":0.02,\"settle_ms\":500,\"sample_ms\":300,\"stable_velocity_rad_s\":0.01,\"stable_tracking_error_rad\":0.03,\"stable_torque_std_nm\":0.08,\"waypoint_count\":1,\"accepted_waypoint_count\":1,\"rejected_waypoint_count\":0}\n",
+                "{\"type\":\"quasi-static-sample\",\"waypoint_id\":7,\"segment_id\":\"seg-a\",\"pass_direction\":\"forward\",\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":63,\"dynamic_valid_mask\":63,\"stable_velocity_rad_s\":0.0,\"stable_tracking_error_rad\":0.0,\"stable_torque_std_nm\":0.0}\n"
+            ),
+        )
+        .unwrap();
+
+        let err = read_quasi_static_samples(&[path]).unwrap_err();
+
+        assert!(err.to_string().contains("schema_version"), "{err:#}");
+    }
+
+    #[test]
+    fn sample_reader_rejects_incomplete_sample_masks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("incomplete-mask.samples.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"quasi-static-samples\",\"schema_version\":1,\"source_path\":\"p.jsonl\",\"source_sha256\":\"abc\",\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\",\"frequency_hz\":100.0,\"max_velocity_rad_s\":0.08,\"max_step_rad\":0.02,\"settle_ms\":500,\"sample_ms\":300,\"stable_velocity_rad_s\":0.01,\"stable_tracking_error_rad\":0.03,\"stable_torque_std_nm\":0.08,\"waypoint_count\":1,\"accepted_waypoint_count\":1,\"rejected_waypoint_count\":0}\n",
+                "{\"type\":\"quasi-static-sample\",\"waypoint_id\":7,\"segment_id\":\"seg-a\",\"pass_direction\":\"forward\",\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":31,\"dynamic_valid_mask\":63,\"stable_velocity_rad_s\":0.0,\"stable_tracking_error_rad\":0.0,\"stable_torque_std_nm\":0.0}\n"
+            ),
+        )
+        .unwrap();
+
+        let err = read_quasi_static_samples(&[path]).unwrap_err();
+
+        assert!(err.to_string().contains("position_valid_mask"), "{err:#}");
     }
 
     #[test]
