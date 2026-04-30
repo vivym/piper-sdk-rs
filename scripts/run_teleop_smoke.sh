@@ -229,7 +229,9 @@ if [[ -f "${REPORT_JSON}" && -x "$(command -v jq 2>/dev/null)" ]]; then
     echo
     echo "Report summary:"
     jq '{
-        faulted,
+        faulted: .exit.faulted,
+        clean: .exit.clean,
+        reason: .exit.reason,
         timing,
         control,
         calibration,

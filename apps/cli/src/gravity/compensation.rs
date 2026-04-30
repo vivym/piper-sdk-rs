@@ -5,6 +5,10 @@ use piper_client::dual_arm::{
 use piper_client::types::{JointArray, NewtonMeter, Rad};
 use std::error::Error;
 use std::fmt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 const CONFIDENCE_TOLERANCE_RAD: f64 = 0.05;
@@ -14,6 +18,7 @@ pub struct GravityCompensator {
     master_model: Option<QuasiStaticTorqueModel>,
     slave_model: Option<QuasiStaticTorqueModel>,
     settings: GravityCompensationSettings,
+    telemetry: GravityCompensationTelemetry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,6 +26,21 @@ pub struct GravityCompensationSettings {
     pub reflection_compensation: bool,
     pub master_assist_ratio: f64,
     pub slave_assist_ratio: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GravityCompensationTelemetry {
+    range_violations: Arc<AtomicU64>,
+}
+
+impl GravityCompensationTelemetry {
+    pub fn range_violations(&self) -> u64 {
+        self.range_violations.load(Ordering::Relaxed)
+    }
+
+    fn record_range_violation(&self) {
+        self.range_violations.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -45,15 +65,17 @@ impl GravityCompensationError {
 }
 
 impl GravityCompensator {
-    pub fn new(
+    pub fn new_with_telemetry(
         master_model: Option<QuasiStaticTorqueModel>,
         slave_model: Option<QuasiStaticTorqueModel>,
         settings: GravityCompensationSettings,
+        telemetry: GravityCompensationTelemetry,
     ) -> Self {
         Self {
             master_model,
             slave_model,
             settings,
+            telemetry,
         }
     }
 
@@ -63,7 +85,22 @@ impl GravityCompensator {
         slave_model: Option<QuasiStaticTorqueModel>,
         settings: GravityCompensationSettings,
     ) -> Self {
-        Self::new(master_model, slave_model, settings)
+        Self::new_with_telemetry(
+            master_model,
+            slave_model,
+            settings,
+            GravityCompensationTelemetry::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_telemetry(
+        master_model: Option<QuasiStaticTorqueModel>,
+        slave_model: Option<QuasiStaticTorqueModel>,
+        settings: GravityCompensationSettings,
+        telemetry: GravityCompensationTelemetry,
+    ) -> Self {
+        Self::new_with_telemetry(master_model, slave_model, settings, telemetry)
     }
 }
 
@@ -83,6 +120,9 @@ impl BilateralDynamicsCompensator for GravityCompensator {
         let slave_hat = eval_or_zero(self.slave_model.as_ref(), q_slave, "slave")?;
         let master_confidence = confidence_or_zero(self.master_model.as_ref(), q_master);
         let slave_confidence = confidence_or_zero(self.slave_model.as_ref(), q_slave);
+        if self.compute_has_range_violation(&master_confidence, &slave_confidence) {
+            self.telemetry.record_range_violation();
+        }
 
         let mut master_model_torque = [NewtonMeter::ZERO; JOINT_COUNT];
         let mut slave_model_torque = [NewtonMeter::ZERO; JOINT_COUNT];
@@ -110,6 +150,25 @@ impl BilateralDynamicsCompensator for GravityCompensator {
             master_external_torque_est: JointArray::splat(NewtonMeter::ZERO),
             slave_external_torque_est: JointArray::new(slave_external_torque_est),
         })
+    }
+}
+
+impl GravityCompensator {
+    fn compute_has_range_violation(
+        &self,
+        master_confidence: &[f64; JOINT_COUNT],
+        slave_confidence: &[f64; JOINT_COUNT],
+    ) -> bool {
+        let master_assist_uses_model =
+            self.settings.master_assist_ratio > 0.0 && self.master_model.is_some();
+        let slave_assist_uses_model =
+            self.settings.slave_assist_ratio > 0.0 && self.slave_model.is_some();
+        let reflection_uses_model =
+            self.settings.reflection_compensation && self.slave_model.is_some();
+
+        (master_assist_uses_model && confidence_below_one(master_confidence))
+            || ((slave_assist_uses_model || reflection_uses_model)
+                && confidence_below_one(slave_confidence))
     }
 }
 
@@ -166,6 +225,10 @@ fn confidence_for_joint(q: f64, min: f64, max: f64) -> f64 {
     } else {
         1.0 - outside / CONFIDENCE_TOLERANCE_RAD
     }
+}
+
+fn confidence_below_one(confidence: &[f64; JOINT_COUNT]) -> bool {
+    confidence.iter().any(|value| *value < 1.0)
 }
 
 fn rad_array(values: JointArray<Rad>) -> [f64; JOINT_COUNT] {
@@ -257,6 +320,53 @@ mod tests {
             [3.0; 6]
         );
         assert_eq!(out.slave_model_torque.map(|nm| nm.0).into_array(), [0.0; 6]);
+    }
+
+    #[test]
+    fn telemetry_counts_one_range_violation_per_out_of_range_compute() {
+        let telemetry = GravityCompensationTelemetry::default();
+        let mut model = QuasiStaticTorqueModel::for_tests_with_constant_output([1.0; 6]);
+        model.training_range.q_min_rad = [-0.1; 6];
+        model.training_range.q_max_rad = [0.1; 6];
+        let compensator = GravityCompensator::for_tests_with_telemetry(
+            None,
+            Some(model),
+            GravityCompensationSettings {
+                reflection_compensation: true,
+                master_assist_ratio: 0.0,
+                slave_assist_ratio: 0.5,
+            },
+            telemetry.clone(),
+        );
+        let mut snapshot = dual_arm_snapshot_with_slave_torque([3.0; 6]);
+        snapshot.right.state.position = JointArray::splat(Rad(0.2));
+
+        let _ = compute_once(compensator, &snapshot);
+
+        assert_eq!(telemetry.range_violations(), 1);
+    }
+
+    #[test]
+    fn telemetry_does_not_count_in_range_compute() {
+        let telemetry = GravityCompensationTelemetry::default();
+        let mut model = QuasiStaticTorqueModel::for_tests_with_constant_output([1.0; 6]);
+        model.training_range.q_min_rad = [-0.1; 6];
+        model.training_range.q_max_rad = [0.1; 6];
+        let compensator = GravityCompensator::for_tests_with_telemetry(
+            None,
+            Some(model),
+            GravityCompensationSettings {
+                reflection_compensation: true,
+                master_assist_ratio: 0.0,
+                slave_assist_ratio: 0.5,
+            },
+            telemetry.clone(),
+        );
+        let snapshot = dual_arm_snapshot_with_slave_torque([3.0; 6]);
+
+        let _ = compute_once(compensator, &snapshot);
+
+        assert_eq!(telemetry.range_violations(), 0);
     }
 
     fn compute_once(

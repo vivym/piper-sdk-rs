@@ -26,7 +26,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::commands::teleop::TeleopDualArmArgs;
-use crate::gravity::compensation::{GravityCompensationSettings, GravityCompensator};
+use crate::gravity::compensation::{
+    GravityCompensationSettings, GravityCompensationTelemetry, GravityCompensator,
+};
 use crate::gravity::model::QuasiStaticTorqueModel;
 use crate::teleop::calibration::{CalibrationFile, check_posture_compatibility};
 use crate::teleop::config::{
@@ -698,8 +700,11 @@ where
     let timing = report_timing_from_raw_clock(&warmup, &loop_exit.report);
     let faulted = loop_exit.faulted || timing.clock_health_failures > 0;
     let bilateral_report = bilateral_report_from_raw_clock(&loop_exit.report);
-    let gravity =
-        report_gravity_from_startup_summary(loaded_gravity.summary.as_ref(), &loop_exit.report);
+    let gravity = report_gravity_from_startup_summary(
+        loaded_gravity.summary.as_ref(),
+        &loop_exit.report,
+        loaded_gravity.telemetry.as_ref(),
+    );
     let report = TeleopJsonReport::from_run(TeleopReportInput {
         platform,
         targets,
@@ -739,6 +744,7 @@ where
 struct LoadedGravityCompensation {
     compensator: Option<GravityCompensator>,
     summary: Option<StartupGravitySummary>,
+    telemetry: Option<GravityCompensationTelemetry>,
 }
 
 fn gravity_compensation_enabled(settings: &TeleopGravitySettings) -> bool {
@@ -788,6 +794,7 @@ fn load_gravity_compensation(
         return Ok(LoadedGravityCompensation {
             compensator: None,
             summary: None,
+            telemetry: None,
         });
     }
 
@@ -824,7 +831,8 @@ fn load_gravity_compensation(
         master_model: master_model.as_ref().map(|loaded| loaded.summary.clone()),
         slave_model: slave_model.as_ref().map(|loaded| loaded.summary.clone()),
     };
-    let compensator = GravityCompensator::new(
+    let telemetry = GravityCompensationTelemetry::default();
+    let compensator = GravityCompensator::new_with_telemetry(
         master_model.map(|loaded| loaded.model),
         slave_model.map(|loaded| loaded.model),
         GravityCompensationSettings {
@@ -832,11 +840,13 @@ fn load_gravity_compensation(
             master_assist_ratio: settings.master_assist_ratio,
             slave_assist_ratio: settings.slave_assist_ratio,
         },
+        telemetry.clone(),
     );
 
     Ok(LoadedGravityCompensation {
         compensator: Some(compensator),
         summary: Some(summary),
+        telemetry: Some(telemetry),
     })
 }
 
@@ -895,6 +905,7 @@ fn load_gravity_model_for_role(
 fn report_gravity_from_startup_summary(
     summary: Option<&StartupGravitySummary>,
     report: &RawClockRuntimeReport,
+    telemetry: Option<&GravityCompensationTelemetry>,
 ) -> Option<ReportGravity> {
     summary.map(|summary| ReportGravity {
         reflection_compensation: summary.reflection_compensation,
@@ -903,7 +914,7 @@ fn report_gravity_from_startup_summary(
         master_model: summary.master_model.as_ref().map(report_gravity_model_from_startup_summary),
         slave_model: summary.slave_model.as_ref().map(report_gravity_model_from_startup_summary),
         compensation_faults: report.compensation_faults,
-        range_violations: 0,
+        range_violations: telemetry.map_or(0, GravityCompensationTelemetry::range_violations),
     })
 }
 
@@ -2194,8 +2205,9 @@ mod tests {
     use anyhow::{Result, bail};
     use piper_client::RuntimeFaultKind;
     use piper_client::dual_arm::{
-        BilateralExitReason, BilateralLoopConfig, BilateralRunReport, DualArmCalibration,
-        DualArmReadPolicy, DualArmSnapshot, JointMirrorMap, StopAttemptResult, SubmissionArm,
+        BilateralDynamicsCompensator, BilateralExitReason, BilateralLoopConfig, BilateralRunReport,
+        DualArmCalibration, DualArmReadPolicy, DualArmSnapshot, JointMirrorMap, StopAttemptResult,
+        SubmissionArm,
     };
     use piper_client::observer::{ControlSnapshot, ControlSnapshotFull};
     use piper_client::state::MitModeConfig;
@@ -2263,6 +2275,7 @@ mod tests {
         disabled_or_faulted: Arc<AtomicBool>,
         loop_exit: TeleopLoopExit,
         experimental_run_exit: ExperimentalRawClockRunExit,
+        experimental_compensation_snapshot: Option<Arc<DualArmSnapshot>>,
     }
 
     impl Default for FakeTeleopBackend {
@@ -2288,6 +2301,7 @@ mod tests {
                     faulted: false,
                     report: raw_clock_report_success(),
                 },
+                experimental_compensation_snapshot: None,
             }
         }
     }
@@ -2546,6 +2560,13 @@ mod tests {
                 }
             }
             drop(counts);
+
+            if let (Some(mut compensator), Some(snapshot)) = (
+                compensator,
+                self.experimental_compensation_snapshot.as_ref(),
+            ) {
+                compensator.compute(snapshot.as_ref(), Duration::from_millis(10))?;
+            }
 
             self.disabled_or_faulted.store(true, Ordering::SeqCst);
             Ok(self.experimental_run_exit.clone())
@@ -3163,6 +3184,47 @@ mod tests {
         assert_eq!(slave.load_profile, "loaded");
         assert_eq!(slave.rms_residual_nm[0], 0.30);
         assert_eq!(slave.p95_residual_nm[5], 0.45);
+    }
+
+    #[test]
+    fn experimental_raw_clock_report_includes_gravity_range_violations_from_telemetry() {
+        let temp = tempfile::tempdir().unwrap();
+        let slave_model = temp.path().join("slave.model.toml");
+        write_gravity_model_file_with_training_range(
+            &slave_model,
+            "slave",
+            "identity",
+            "empty",
+            [0.2; 6],
+            [0.3; 6],
+        );
+        let backend = FakeTeleopBackend {
+            experimental_compensation_snapshot: Some(Arc::new(sample_snapshot(false))),
+            ..FakeTeleopBackend::default().with_experimental_raw_clock_success()
+        };
+        let io = FakeTeleopIo::default();
+        let report_slot = io.last_report.clone();
+        let args = TeleopDualArmArgs {
+            slave_gravity_model: Some(slave_model),
+            gravity_reflection_compensation: true,
+            joint_map: Some(TeleopJointMap::Identity),
+            report_json: Some(PathBuf::from("report.json")),
+            ..experimental_args()
+        };
+
+        let status = run_workflow_for_test_with_io(args, backend, io)
+            .expect("raw-clock workflow should succeed");
+
+        assert_eq!(status, TeleopExitStatus::Success);
+        let report = report_slot
+            .lock()
+            .expect("report lock poisoned")
+            .clone()
+            .expect("report should be written");
+        assert_eq!(
+            report.gravity.expect("gravity diagnostics should be reported").range_violations,
+            1
+        );
     }
 
     #[test]
@@ -4189,6 +4251,24 @@ mod tests {
         model.load_profile = load_profile.to_string();
         model.fit_quality.rms_residual_nm = rms_residual_nm;
         model.fit_quality.p95_residual_nm = p95_residual_nm;
+        std::fs::write(path, toml::to_string_pretty(&model).unwrap())
+            .expect("gravity model file should be written");
+    }
+
+    fn write_gravity_model_file_with_training_range(
+        path: &Path,
+        role: &str,
+        joint_map: &str,
+        load_profile: &str,
+        q_min_rad: [f64; 6],
+        q_max_rad: [f64; 6],
+    ) {
+        let mut model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
+        model.role = role.to_string();
+        model.joint_map = joint_map.to_string();
+        model.load_profile = load_profile.to_string();
+        model.training_range.q_min_rad = q_min_rad;
+        model.training_range.q_max_rad = q_max_rad;
         std::fs::write(path, toml::to_string_pretty(&model).unwrap())
             .expect("gravity model file should be written");
     }

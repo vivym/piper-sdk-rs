@@ -393,10 +393,11 @@ pub fn write_human_report<W: Write>(
     if let Some(gravity) = &report.gravity {
         writeln!(
             writer,
-            "gravity: reflection_compensation={} master_assist={:.2} slave_assist={:.2}",
+            "gravity: reflection_compensation={} master_assist={:.2} slave_assist={:.2} range_violations={}",
             gravity.reflection_compensation,
             gravity.master_assist_ratio,
-            gravity.slave_assist_ratio
+            gravity.slave_assist_ratio,
+            gravity.range_violations
         )?;
         if let Some(model) = &gravity.master_model {
             write_human_gravity_model(&mut writer, "master", model)?;
@@ -879,24 +880,29 @@ mod tests {
 
     #[test]
     fn teleop_json_report_includes_gravity_diagnostics_when_enabled() {
-        let report = TeleopJsonReport::from_run(report_input_with_gravity_for_tests());
+        let mut input = report_input_with_gravity_for_tests();
+        input.gravity.as_mut().unwrap().range_violations = 7;
+        let report = TeleopJsonReport::from_run(input);
         let json = serde_json::to_value(report).unwrap();
 
         assert_eq!(json["gravity"]["reflection_compensation"], true);
         assert_eq!(json["gravity"]["master_assist_ratio"], 0.2);
         assert_eq!(json["gravity"]["slave_model"]["role"], "slave");
+        assert_eq!(json["gravity"]["range_violations"], 7);
     }
 
     #[test]
     fn human_report_includes_gravity_diagnostics_when_enabled() {
-        let report = TeleopJsonReport::from_run(report_input_with_gravity_for_tests());
+        let mut input = report_input_with_gravity_for_tests();
+        input.gravity.as_mut().unwrap().range_violations = 7;
+        let report = TeleopJsonReport::from_run(input);
         let mut output = Vec::new();
 
         write_human_report(&mut output, &report, Duration::from_micros(9876)).unwrap();
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains(
-            "gravity: reflection_compensation=true master_assist=0.20 slave_assist=0.00"
+            "gravity: reflection_compensation=true master_assist=0.20 slave_assist=0.00 range_violations=7"
         ));
         assert!(output.contains("gravity master_model=artifacts/gravity/master.model.toml"));
         assert!(output.contains("rms=[0.100000, 0.110000, 0.120000"));
