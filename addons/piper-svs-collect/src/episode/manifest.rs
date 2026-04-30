@@ -95,6 +95,8 @@ pub struct ManifestV1 {
     pub mirror_map: MirrorMapManifest,
     pub collector: CollectorIdentityManifest,
     pub raw_can: RawCanManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_clock: Option<RawClockManifest>,
     pub step_file: StepFileManifest,
 }
 
@@ -247,7 +249,27 @@ pub struct StepFileManifest {
     pub last_step_index: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawClockManifest {
+    pub timing_source: String,
+    pub strict_realtime: bool,
+    pub experimental: bool,
+    pub warmup_secs: u64,
+    pub residual_p95_us: u64,
+    pub residual_max_us: u64,
+    pub drift_abs_ppm: f64,
+    pub sample_gap_max_ms: u64,
+    pub last_sample_age_ms: u64,
+    pub selected_sample_age_ms: u64,
+    pub inter_arm_skew_max_us: u64,
+    pub state_skew_max_us: u64,
+    pub residual_max_consecutive_failures: u32,
+    pub alignment_lag_us: u64,
+    pub alignment_search_window_us: u64,
+    pub alignment_buffer_miss_consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReportJson {
     pub schema_version: u32,
     pub episode_id: String,
@@ -261,8 +283,54 @@ pub struct ReportJson {
     pub ended_unix_ns: u64,
     pub step_count: u64,
     pub last_step_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_clock: Option<RawClockReportJson>,
     pub dual_arm: DualArmReportJson,
     pub writer: WriterReportJson,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawClockReportJson {
+    pub timing_source: String,
+    pub strict_realtime: bool,
+    pub experimental: bool,
+    pub warmup_secs: u64,
+    pub residual_p95_us: u64,
+    pub residual_max_us: u64,
+    pub drift_abs_ppm: f64,
+    pub sample_gap_max_ms: u64,
+    pub last_sample_age_ms: u64,
+    pub selected_sample_age_ms: u64,
+    pub inter_arm_skew_max_us: u64,
+    pub state_skew_max_us: u64,
+    pub residual_max_consecutive_failures: u32,
+    pub alignment_buffer_miss_consecutive_failure_threshold: u32,
+    pub master_clock_drift_ppm: f64,
+    pub slave_clock_drift_ppm: f64,
+    pub master_residual_p95_us: u64,
+    pub slave_residual_p95_us: u64,
+    pub selected_inter_arm_skew_max_us: u64,
+    pub selected_inter_arm_skew_p95_us: u64,
+    pub latest_inter_arm_skew_max_us: u64,
+    pub latest_inter_arm_skew_p95_us: u64,
+    pub alignment_lag_us: u64,
+    pub alignment_search_window_us: u64,
+    pub alignment_buffer_misses: u64,
+    pub alignment_buffer_miss_consecutive_max: u32,
+    pub alignment_buffer_miss_consecutive_failures: u32,
+    pub master_residual_max_spikes: u64,
+    pub slave_residual_max_spikes: u64,
+    pub master_residual_max_consecutive_failures: u32,
+    pub slave_residual_max_consecutive_failures: u32,
+    pub clock_health_failures: u64,
+    pub read_faults: u32,
+    pub submission_faults: u32,
+    pub runtime_faults: u32,
+    pub compensation_faults: u32,
+    pub controller_faults: u32,
+    pub telemetry_sink_faults: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_failure_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -435,6 +503,9 @@ impl ManifestV1 {
         self.calibration.validate()?;
         self.mirror_map.validate()?;
         self.collector.validate()?;
+        if let Some(raw_clock) = &self.raw_clock {
+            raw_clock.validate()?;
+        }
         self.step_file.validate()?;
         Ok(())
     }
@@ -530,6 +601,7 @@ impl ManifestV1 {
                 enabled: false,
                 finalizer_status: Some("not_enabled".to_string()),
             },
+            raw_clock: None,
             step_file: StepFileManifest {
                 relative_path: PathBuf::from("steps.bin"),
                 step_count: 1,
@@ -828,6 +900,23 @@ impl StepFileManifest {
     }
 }
 
+impl RawClockManifest {
+    fn validate(&self) -> Result<(), ManifestError> {
+        require_nonempty(&self.timing_source, "raw_clock.timing_source")?;
+        if self.timing_source != "calibrated_hw_raw" {
+            return Err(ManifestError::InvalidManifest(
+                "raw_clock.timing_source must be calibrated_hw_raw".to_string(),
+            ));
+        }
+        if self.strict_realtime || !self.experimental {
+            return Err(ManifestError::InvalidManifest(
+                "raw_clock must be experimental and non-strict".to_string(),
+            ));
+        }
+        validate_finite("raw_clock.drift_abs_ppm", self.drift_abs_ppm)
+    }
+}
+
 impl ReportJson {
     pub fn validate(&self) -> Result<(), ManifestError> {
         if self.schema_version != SCHEMA_VERSION {
@@ -864,6 +953,9 @@ impl ReportJson {
             return Err(ManifestError::InvalidReport(
                 "dual_arm.iterations must be >= step_count".to_string(),
             ));
+        }
+        if let Some(raw_clock) = &self.raw_clock {
+            raw_clock.validate()?;
         }
         let has_writer_fault_indicator = !self.final_flush_result.success
             || self.final_flush_result.error.is_some()
@@ -910,6 +1002,7 @@ impl ReportJson {
             ended_unix_ns: 1_777_292_524_000_000_000,
             step_count: 10,
             last_step_index: Some(9),
+            raw_clock: None,
             dual_arm: DualArmReportJson {
                 iterations: 10,
                 read_faults: 0,
@@ -946,6 +1039,25 @@ impl ReportJson {
                 flush_failed: false,
             },
         }
+    }
+}
+
+impl RawClockReportJson {
+    fn validate(&self) -> Result<(), ManifestError> {
+        require_nonempty(&self.timing_source, "raw_clock.timing_source")?;
+        if self.timing_source != "calibrated_hw_raw" {
+            return Err(ManifestError::InvalidReport(
+                "raw_clock.timing_source must be calibrated_hw_raw".to_string(),
+            ));
+        }
+        if self.strict_realtime || !self.experimental {
+            return Err(ManifestError::InvalidReport(
+                "raw_clock report must be experimental and non-strict".to_string(),
+            ));
+        }
+        validate_report_finite("raw_clock.drift_abs_ppm", self.drift_abs_ppm)?;
+        validate_report_finite("raw_clock.master_clock_drift_ppm", self.master_clock_drift_ppm)?;
+        validate_report_finite("raw_clock.slave_clock_drift_ppm", self.slave_clock_drift_ppm)
     }
 }
 
@@ -1126,6 +1238,13 @@ fn validate_finite(field: &str, value: f64) -> Result<(), ManifestError> {
     }
 }
 
+fn validate_report_finite(name: &str, value: f64) -> Result<(), ManifestError> {
+    if !value.is_finite() {
+        return Err(ManifestError::InvalidReport(format!("{name} must be finite")));
+    }
+    Ok(())
+}
+
 fn validate_finite_array<const N: usize>(
     field: &str,
     values: &[f64; N],
@@ -1245,6 +1364,17 @@ mod tests {
     }
 
     #[test]
+    fn strict_realtime_test_manifest_has_no_raw_clock_section() {
+        let manifest = ManifestV1::for_test_complete();
+        assert!(manifest.raw_clock.is_none());
+
+        let text = toml::to_string_pretty(&manifest).expect("manifest should serialize");
+        assert!(!text.contains("[raw_clock]"));
+        let decoded: ManifestV1 = toml::from_str(&text).expect("manifest should deserialize");
+        assert!(decoded.raw_clock.is_none());
+    }
+
+    #[test]
     fn report_records_run_and_writer_summary() {
         let report = ReportJson::for_test_faulted();
 
@@ -1255,6 +1385,17 @@ mod tests {
         assert!(report.writer.max_queue_depth >= report.writer.final_queue_depth);
         assert_eq!(report.writer.queue_full_stop_events, 2);
         assert_eq!(report.writer.queue_full_stop_duration_ms, 100);
+    }
+
+    #[test]
+    fn strict_realtime_test_report_has_no_raw_clock_section() {
+        let report = ReportJson::for_test_faulted();
+        assert!(report.raw_clock.is_none());
+
+        let text = serde_json::to_string_pretty(&report).expect("report should serialize");
+        assert!(!text.contains("\"raw_clock\""));
+        let decoded: ReportJson = serde_json::from_str(&text).expect("report should deserialize");
+        assert!(decoded.raw_clock.is_none());
     }
 
     #[test]

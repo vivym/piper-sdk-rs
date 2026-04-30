@@ -6,12 +6,13 @@ use piper_client::dual_arm::{
 };
 use piper_client::dual_arm_raw_clock::{
     ExperimentalRawClockConfig, ExperimentalRawClockMode, ExperimentalRawClockRunConfig,
-    RawClockRuntimeThresholds,
+    RawClockRuntimeExitReason, RawClockRuntimeReport, RawClockRuntimeThresholds,
 };
 use piper_client::observer::ControlReadPolicy;
 use piper_tools::raw_clock::RawClockThresholds;
 
 use crate::args::Args;
+use crate::episode::manifest::{RawClockManifest, RawClockReportJson};
 use crate::profile::EffectiveProfile;
 
 pub const DEFAULT_RAW_CLOCK_WARMUP_SECS: u64 = 10;
@@ -262,6 +263,128 @@ impl SvsRawClockSettings {
             output_shaping: Some(BilateralOutputShapingConfig::from_loop_config(loop_config)),
         }
     }
+
+    pub fn to_manifest(&self) -> RawClockManifest {
+        RawClockManifest {
+            timing_source: "calibrated_hw_raw".to_string(),
+            strict_realtime: false,
+            experimental: true,
+            warmup_secs: self.warmup_secs,
+            residual_p95_us: self.residual_p95_us,
+            residual_max_us: self.residual_max_us,
+            drift_abs_ppm: self.drift_abs_ppm,
+            sample_gap_max_ms: self.sample_gap_max_ms,
+            last_sample_age_ms: self.last_sample_age_ms,
+            selected_sample_age_ms: self.selected_sample_age_ms,
+            inter_arm_skew_max_us: self.inter_arm_skew_max_us,
+            state_skew_max_us: self.state_skew_max_us,
+            residual_max_consecutive_failures: self.residual_max_consecutive_failures,
+            alignment_lag_us: self.alignment_lag_us,
+            alignment_search_window_us: self.alignment_search_window_us,
+            alignment_buffer_miss_consecutive_failures: self
+                .alignment_buffer_miss_consecutive_failures,
+        }
+    }
+}
+
+pub fn raw_clock_report_json(
+    report: &RawClockRuntimeReport,
+    settings: &SvsRawClockSettings,
+) -> RawClockReportJson {
+    RawClockReportJson {
+        timing_source: "calibrated_hw_raw".to_string(),
+        strict_realtime: false,
+        experimental: true,
+        warmup_secs: settings.warmup_secs,
+        residual_p95_us: settings.residual_p95_us,
+        residual_max_us: settings.residual_max_us,
+        drift_abs_ppm: settings.drift_abs_ppm,
+        sample_gap_max_ms: settings.sample_gap_max_ms,
+        last_sample_age_ms: settings.last_sample_age_ms,
+        selected_sample_age_ms: settings.selected_sample_age_ms,
+        inter_arm_skew_max_us: settings.inter_arm_skew_max_us,
+        state_skew_max_us: settings.state_skew_max_us,
+        residual_max_consecutive_failures: settings.residual_max_consecutive_failures,
+        alignment_buffer_miss_consecutive_failure_threshold: settings
+            .alignment_buffer_miss_consecutive_failures,
+        master_clock_drift_ppm: report.master.drift_ppm,
+        slave_clock_drift_ppm: report.slave.drift_ppm,
+        master_residual_p95_us: report.master.residual_p95_us,
+        slave_residual_p95_us: report.slave.residual_p95_us,
+        selected_inter_arm_skew_max_us: report.selected_inter_arm_skew_max_us,
+        selected_inter_arm_skew_p95_us: report.selected_inter_arm_skew_p95_us,
+        latest_inter_arm_skew_max_us: report.latest_inter_arm_skew_max_us,
+        latest_inter_arm_skew_p95_us: report.latest_inter_arm_skew_p95_us,
+        alignment_lag_us: report.alignment_lag_us,
+        alignment_search_window_us: settings.alignment_search_window_us,
+        alignment_buffer_misses: report.alignment_buffer_misses,
+        alignment_buffer_miss_consecutive_max: report.alignment_buffer_miss_consecutive_max,
+        alignment_buffer_miss_consecutive_failures: report
+            .alignment_buffer_miss_consecutive_failures,
+        master_residual_max_spikes: report.master_residual_max_spikes,
+        slave_residual_max_spikes: report.slave_residual_max_spikes,
+        master_residual_max_consecutive_failures: report.master_residual_max_consecutive_failures,
+        slave_residual_max_consecutive_failures: report.slave_residual_max_consecutive_failures,
+        clock_health_failures: report.clock_health_failures,
+        read_faults: report.read_faults,
+        submission_faults: report.submission_faults,
+        runtime_faults: report.runtime_faults,
+        compensation_faults: report.compensation_faults,
+        controller_faults: report.controller_faults,
+        telemetry_sink_faults: report.telemetry_sink_faults,
+        final_failure_kind: report.exit_reason.and_then(|reason| match reason {
+            RawClockRuntimeExitReason::MaxIterations => None,
+            other => Some(format!("{other:?}")),
+        }),
+    }
+}
+
+pub fn raw_clock_startup_report_json(
+    settings: &SvsRawClockSettings,
+    final_failure_kind: Option<String>,
+) -> RawClockReportJson {
+    RawClockReportJson {
+        timing_source: "calibrated_hw_raw".to_string(),
+        strict_realtime: false,
+        experimental: true,
+        warmup_secs: settings.warmup_secs,
+        residual_p95_us: settings.residual_p95_us,
+        residual_max_us: settings.residual_max_us,
+        drift_abs_ppm: settings.drift_abs_ppm,
+        sample_gap_max_ms: settings.sample_gap_max_ms,
+        last_sample_age_ms: settings.last_sample_age_ms,
+        selected_sample_age_ms: settings.selected_sample_age_ms,
+        inter_arm_skew_max_us: settings.inter_arm_skew_max_us,
+        state_skew_max_us: settings.state_skew_max_us,
+        residual_max_consecutive_failures: settings.residual_max_consecutive_failures,
+        alignment_buffer_miss_consecutive_failure_threshold: settings
+            .alignment_buffer_miss_consecutive_failures,
+        master_clock_drift_ppm: 0.0,
+        slave_clock_drift_ppm: 0.0,
+        master_residual_p95_us: 0,
+        slave_residual_p95_us: 0,
+        selected_inter_arm_skew_max_us: 0,
+        selected_inter_arm_skew_p95_us: 0,
+        latest_inter_arm_skew_max_us: 0,
+        latest_inter_arm_skew_p95_us: 0,
+        alignment_lag_us: settings.alignment_lag_us,
+        alignment_search_window_us: settings.alignment_search_window_us,
+        alignment_buffer_misses: 0,
+        alignment_buffer_miss_consecutive_max: 0,
+        alignment_buffer_miss_consecutive_failures: 0,
+        master_residual_max_spikes: 0,
+        slave_residual_max_spikes: 0,
+        master_residual_max_consecutive_failures: 0,
+        slave_residual_max_consecutive_failures: 0,
+        clock_health_failures: 0,
+        read_faults: 0,
+        submission_faults: 0,
+        runtime_faults: 0,
+        compensation_faults: 0,
+        controller_faults: 0,
+        telemetry_sink_faults: 0,
+        final_failure_kind,
+    }
 }
 
 pub(crate) fn apply_cli_profile_overrides(args: &Args, profile: &mut EffectiveProfile) {
@@ -335,9 +458,11 @@ mod tests {
     use crate::{args::Args, profile::EffectiveProfile};
     use piper_client::dual_arm::{
         BilateralLoopConfig, BilateralLoopTelemetry, BilateralLoopTelemetrySink,
-        BilateralOutputShapingConfig, GripperTeleopConfig,
+        BilateralOutputShapingConfig, GripperTeleopConfig, StopAttemptResult,
     };
+    use piper_client::dual_arm_raw_clock::{RawClockRuntimeExitReason, RawClockRuntimeReport};
     use piper_client::types::{JointArray, NewtonMeter};
+    use piper_tools::raw_clock::RawClockHealth;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -576,5 +701,198 @@ mod tests {
             shaping,
             BilateralOutputShapingConfig::from_loop_config(&loop_config)
         );
+    }
+
+    #[test]
+    fn raw_clock_settings_conversion_copies_manifest_fields() {
+        let mut args = args_for_raw_clock_resolve_tests();
+        args.raw_clock_warmup_secs = Some(12);
+        args.raw_clock_alignment_buffer_miss_consecutive_failures = Some(5);
+        let profile = EffectiveProfile::default_for_tests();
+
+        let settings = SvsRawClockSettings::resolve(&args, &profile).unwrap();
+        let manifest = settings.to_manifest();
+
+        assert_eq!(manifest.timing_source, "calibrated_hw_raw");
+        assert!(!manifest.strict_realtime);
+        assert!(manifest.experimental);
+        assert_eq!(manifest.warmup_secs, 12);
+        assert_eq!(manifest.alignment_buffer_miss_consecutive_failures, 5);
+    }
+
+    #[test]
+    fn raw_clock_report_json_copies_runtime_counters_and_failure_kind() {
+        let args = args_for_raw_clock_resolve_tests();
+        let profile = EffectiveProfile::default_for_tests();
+        let settings = SvsRawClockSettings::resolve(&args, &profile).unwrap();
+        let report = RawClockRuntimeReport {
+            master: RawClockHealth {
+                healthy: true,
+                sample_count: 2_000,
+                window_duration_us: 20_000_000,
+                drift_ppm: -12.5,
+                residual_p50_us: 10,
+                residual_p95_us: 111,
+                residual_p99_us: 120,
+                residual_max_us: 130,
+                sample_gap_max_us: 10_000,
+                last_sample_age_us: 500,
+                raw_timestamp_regressions: 0,
+                failure_kind: None,
+                reason: None,
+            },
+            slave: RawClockHealth {
+                drift_ppm: 34.5,
+                residual_p95_us: 222,
+                ..RawClockHealth {
+                    healthy: true,
+                    sample_count: 2_000,
+                    window_duration_us: 20_000_000,
+                    drift_ppm: 0.0,
+                    residual_p50_us: 10,
+                    residual_p95_us: 100,
+                    residual_p99_us: 120,
+                    residual_max_us: 130,
+                    sample_gap_max_us: 10_000,
+                    last_sample_age_us: 500,
+                    raw_timestamp_regressions: 0,
+                    failure_kind: None,
+                    reason: None,
+                }
+            },
+            joint_motion: None,
+            max_inter_arm_skew_us: 4_321,
+            inter_arm_skew_p95_us: 2_345,
+            alignment_lag_us: 5_000,
+            latest_inter_arm_skew_max_us: 4_000,
+            latest_inter_arm_skew_p95_us: 2_000,
+            selected_inter_arm_skew_max_us: 4_321,
+            selected_inter_arm_skew_p95_us: 2_345,
+            clock_health_failures: 7,
+            compensation_faults: 1,
+            controller_faults: 2,
+            telemetry_sink_faults: 3,
+            alignment_buffer_misses: 11,
+            alignment_buffer_miss_consecutive_max: 4,
+            alignment_buffer_miss_consecutive_failures: 5,
+            master_residual_max_spikes: 6,
+            slave_residual_max_spikes: 8,
+            master_residual_max_consecutive_failures: 2,
+            slave_residual_max_consecutive_failures: 3,
+            read_faults: 9,
+            submission_faults: 10,
+            last_submission_failed_side: None,
+            peer_command_may_have_applied: false,
+            runtime_faults: 12,
+            master_tx_realtime_overwrites_total: 0,
+            slave_tx_realtime_overwrites_total: 0,
+            master_tx_frames_sent_total: 100,
+            slave_tx_frames_sent_total: 100,
+            master_tx_fault_aborts_total: 0,
+            slave_tx_fault_aborts_total: 0,
+            last_runtime_fault_master: None,
+            last_runtime_fault_slave: None,
+            iterations: 100,
+            exit_reason: Some(RawClockRuntimeExitReason::TelemetrySinkFault),
+            master_stop_attempt: StopAttemptResult::NotAttempted,
+            slave_stop_attempt: StopAttemptResult::NotAttempted,
+            last_error: Some("sink failed".to_string()),
+        };
+
+        let json = raw_clock_report_json(&report, &settings);
+
+        assert_eq!(json.master_clock_drift_ppm, -12.5);
+        assert_eq!(json.slave_clock_drift_ppm, 34.5);
+        assert_eq!(json.master_residual_p95_us, 111);
+        assert_eq!(json.slave_residual_p95_us, 222);
+        assert_eq!(json.selected_inter_arm_skew_max_us, 4_321);
+        assert_eq!(json.latest_inter_arm_skew_p95_us, 2_000);
+        assert_eq!(json.alignment_buffer_misses, 11);
+        assert_eq!(json.alignment_buffer_miss_consecutive_max, 4);
+        assert_eq!(json.alignment_buffer_miss_consecutive_failures, 5);
+        assert_eq!(json.compensation_faults, 1);
+        assert_eq!(json.controller_faults, 2);
+        assert_eq!(json.telemetry_sink_faults, 3);
+        assert_eq!(json.clock_health_failures, 7);
+        assert_eq!(json.final_failure_kind.as_deref(), Some("TelemetrySinkFault"));
+    }
+
+    #[test]
+    fn raw_clock_report_json_omits_failure_kind_for_clean_max_iterations() {
+        let args = args_for_raw_clock_resolve_tests();
+        let profile = EffectiveProfile::default_for_tests();
+        let settings = SvsRawClockSettings::resolve(&args, &profile).unwrap();
+        let report = raw_clock_report_for_tests(RawClockRuntimeExitReason::MaxIterations);
+
+        let json = raw_clock_report_json(&report, &settings);
+        let serialized = serde_json::to_string(&json).unwrap();
+
+        assert!(json.final_failure_kind.is_none());
+        assert!(
+            !serialized.contains("final_failure_kind"),
+            "clean raw-clock report should omit final_failure_kind instead of serializing null: {serialized}"
+        );
+    }
+
+    fn raw_clock_report_for_tests(exit_reason: RawClockRuntimeExitReason) -> RawClockRuntimeReport {
+        fn health() -> RawClockHealth {
+            RawClockHealth {
+                healthy: true,
+                sample_count: 2_000,
+                window_duration_us: 20_000_000,
+                drift_ppm: 0.0,
+                residual_p50_us: 0,
+                residual_p95_us: 0,
+                residual_p99_us: 0,
+                residual_max_us: 0,
+                sample_gap_max_us: 10_000,
+                last_sample_age_us: 1_000,
+                raw_timestamp_regressions: 0,
+                failure_kind: None,
+                reason: None,
+            }
+        }
+
+        RawClockRuntimeReport {
+            master: health(),
+            slave: health(),
+            joint_motion: None,
+            max_inter_arm_skew_us: 0,
+            inter_arm_skew_p95_us: 0,
+            alignment_lag_us: 0,
+            latest_inter_arm_skew_max_us: 0,
+            latest_inter_arm_skew_p95_us: 0,
+            selected_inter_arm_skew_max_us: 0,
+            selected_inter_arm_skew_p95_us: 0,
+            clock_health_failures: 0,
+            compensation_faults: 0,
+            controller_faults: 0,
+            telemetry_sink_faults: 0,
+            alignment_buffer_misses: 0,
+            alignment_buffer_miss_consecutive_max: 0,
+            alignment_buffer_miss_consecutive_failures: 0,
+            master_residual_max_spikes: 0,
+            slave_residual_max_spikes: 0,
+            master_residual_max_consecutive_failures: 0,
+            slave_residual_max_consecutive_failures: 0,
+            read_faults: 0,
+            submission_faults: 0,
+            last_submission_failed_side: None,
+            peer_command_may_have_applied: false,
+            runtime_faults: 0,
+            master_tx_realtime_overwrites_total: 0,
+            slave_tx_realtime_overwrites_total: 0,
+            master_tx_frames_sent_total: 0,
+            slave_tx_frames_sent_total: 0,
+            master_tx_fault_aborts_total: 0,
+            slave_tx_fault_aborts_total: 0,
+            last_runtime_fault_master: None,
+            last_runtime_fault_slave: None,
+            iterations: 0,
+            exit_reason: Some(exit_reason),
+            master_stop_attempt: StopAttemptResult::NotAttempted,
+            slave_stop_attempt: StopAttemptResult::NotAttempted,
+            last_error: None,
+        }
     }
 }

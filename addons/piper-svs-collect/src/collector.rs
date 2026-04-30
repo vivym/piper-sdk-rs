@@ -18,6 +18,7 @@ use piper_client::dual_arm::{
     DualArmLoopExit, DualArmReadPolicy, DualArmSnapshot, DualArmStandby, GripperTeleopConfig,
     JointMirrorMap, LoopTimingMode,
 };
+use piper_client::dual_arm_raw_clock::RawClockRuntimeReport;
 use piper_client::observer::{ControlSnapshot, ControlSnapshotFull};
 use piper_client::state::{DisableConfig, MitModeConfig};
 use piper_client::types::{Joint, JointArray, NewtonMeter, Rad, RadPerSecond};
@@ -192,6 +193,7 @@ struct ResolvedRealCalibration {
 struct RealEpisodeBase {
     manifest: ManifestV1,
     started_unix_ns: u64,
+    raw_clock: Option<crate::episode::manifest::RawClockManifest>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +203,8 @@ struct RealRunContext {
     base: RealEpisodeBase,
     raw_can: Arc<RawCanStatusTracker>,
     writer_flush_timeout: Duration,
+    raw_clock_report: Option<RawClockRuntimeReport>,
+    raw_clock_settings: Option<crate::raw_clock::SvsRawClockSettings>,
 }
 
 trait CollectorBackend {
@@ -1147,6 +1151,8 @@ fn run_real_collector(args: Args, cancel: CollectorCancelToken) -> Result<Collec
         base,
         raw_can: Arc::clone(&raw_can),
         writer_flush_timeout,
+        raw_clock_report: None,
+        raw_clock_settings: None,
     };
     let initial_summary = crate::episode::wire::StepFileSummary {
         episode_id: episode_id.clone(),
@@ -1657,6 +1663,7 @@ fn build_real_manifest_base(inputs: RealManifestInputs<'_>) -> Result<RealEpisod
             enabled: inputs.raw_can_enabled,
             finalizer_status: Some("running".to_string()),
         },
+        raw_clock: None,
         step_file: StepFileManifest {
             relative_path: PathBuf::from("steps.bin"),
             step_count: 0,
@@ -1668,6 +1675,7 @@ fn build_real_manifest_base(inputs: RealManifestInputs<'_>) -> Result<RealEpisod
     Ok(RealEpisodeBase {
         manifest,
         started_unix_ns: inputs.started_unix_ns,
+        raw_clock: None,
     })
 }
 
@@ -1683,6 +1691,7 @@ fn write_real_manifest(
     manifest.status = status;
     manifest.timestamps.ended_unix_ns = ended_unix_ns;
     manifest.raw_can.finalizer_status = Some(raw_can_finalizer_status);
+    manifest.raw_clock = context.base.raw_clock.clone();
     manifest.step_file.step_count = summary.step_count;
     manifest.step_file.last_step_index = summary.last_step_index;
     manifest.validate()?;
@@ -1859,6 +1868,27 @@ fn write_real_report(
     final_flush_result: WriterFlushResultJson,
     writer_stats: &WriterStats,
 ) -> Result<()> {
+    let raw_clock_json = match (
+        context.raw_clock_report.as_ref(),
+        context.raw_clock_settings.as_ref(),
+    ) {
+        (Some(raw_report), Some(settings)) => {
+            Some(crate::raw_clock::raw_clock_report_json(raw_report, settings))
+        },
+        (None, Some(settings)) => Some(crate::raw_clock::raw_clock_startup_report_json(
+            settings,
+            report
+                .exit_reason
+                .map(|reason| format!("{reason:?}"))
+                .or_else(|| report.last_error.clone()),
+        )),
+        (Some(_), None) => {
+            return Err(anyhow!(
+                "raw-clock report is present but raw-clock settings are missing"
+            ));
+        },
+        (None, _) => None,
+    };
     let report_json = ReportJson {
         schema_version: 1,
         episode_id: context.episode_id.clone(),
@@ -1883,6 +1913,7 @@ fn write_real_report(
         ended_unix_ns,
         step_count: summary.step_count,
         last_step_index: summary.last_step_index,
+        raw_clock: raw_clock_json,
         dual_arm: DualArmReportJson {
             iterations: report.iterations as u64,
             read_faults: report.read_faults,
@@ -2446,6 +2477,7 @@ fn write_manifest(input: FakeManifestWrite<'_>) -> Result<()> {
     manifest.calibration.sha256_hex = input.artifacts.calibration_hash.clone();
     manifest.raw_can.enabled = input.raw_can_enabled;
     manifest.raw_can.finalizer_status = Some(input.raw_can_finalizer_status);
+    manifest.raw_clock = None;
     manifest.step_file.step_count = input.summary.step_count;
     manifest.step_file.last_step_index = input.summary.last_step_index;
     manifest.validate()?;
@@ -2477,6 +2509,7 @@ fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
         ended_unix_ns: ENDED_UNIX_NS,
         step_count: input.summary.step_count,
         last_step_index: input.summary.last_step_index,
+        raw_clock: None,
         dual_arm: DualArmReportJson {
             iterations: input.attempted_iterations.max(input.summary.step_count),
             read_faults: 0,

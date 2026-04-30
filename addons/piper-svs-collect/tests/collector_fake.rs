@@ -27,6 +27,14 @@ fn fake_workflow_writes_complete_episode() {
     assert!(result.path.join("effective_profile.toml").exists());
     assert!(result.path.join("calibration.toml").exists());
     assert!(result.path.join("steps.bin").exists());
+    let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
+    assert!(manifest.raw_clock.is_none());
+    let manifest_text = std::fs::read_to_string(result.path.join("manifest.toml")).unwrap();
+    assert!(!manifest_text.contains("[raw_clock]"));
+    let report = read_report_json(&result.path.join("report.json")).unwrap();
+    assert!(report.raw_clock.is_none());
+    let report_text = std::fs::read_to_string(result.path.join("report.json")).unwrap();
+    assert!(!report_text.contains("\"raw_clock\""));
     assert_eq!(
         read_steps_file(result.path.join("steps.bin")).unwrap().steps.len(),
         3
