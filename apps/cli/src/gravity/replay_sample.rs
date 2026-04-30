@@ -14,14 +14,16 @@ use piper_client::types::{JointArray, NewtonMeter, Rad};
 use piper_client::{ConnectedPiper, MotionConnectedState};
 use piper_control::TargetSpec;
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::spawn_blocking;
 
 const MAX_SAFE_STEP_RAD: f64 = 0.2;
@@ -66,7 +68,6 @@ pub async fn run(args: GravityReplaySampleArgs) -> Result<()> {
         bail!("operator confirmation not received; aborted before connecting");
     }
 
-    let target_spec = resolve_replay_target_spec(&args)?;
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
     tokio::spawn(async move {
@@ -77,6 +78,8 @@ pub async fn run(args: GravityReplaySampleArgs) -> Result<()> {
         }
     });
 
+    let output = PendingSamplesArtifact::create(&args.out)?;
+    let target_spec = resolve_replay_target_spec(&args)?;
     let source_sha256 = sha256_file_hex(&args.path)?;
     let task = spawn_blocking(move || {
         replay_sample_sync(
@@ -86,6 +89,7 @@ pub async fn run(args: GravityReplaySampleArgs) -> Result<()> {
             target_spec,
             source_sha256,
             running,
+            output,
         )
     });
     let stats = task
@@ -166,6 +170,141 @@ struct ReplaySampleStats {
     output_path: PathBuf,
     accepted_waypoint_count: usize,
     rejected_waypoint_count: usize,
+}
+
+struct PendingSamplesArtifact {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    file: Option<File>,
+    cleanup_temp: bool,
+    #[cfg(test)]
+    force_persist_error: bool,
+}
+
+impl PendingSamplesArtifact {
+    fn create(final_path: &Path) -> Result<Self> {
+        ensure_output_path_available(final_path)?;
+
+        let parent = artifact_parent(final_path);
+        let file_name = final_path
+            .file_name()
+            .ok_or_else(|| anyhow!("--out must include a file name"))?;
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+
+        for attempt in 0..100 {
+            let mut temp_name = OsString::from(".");
+            temp_name.push(file_name);
+            temp_name.push(format!(".tmp.{}.{}.{}", process::id(), nonce, attempt));
+            let temp_path = parent.join(temp_name);
+
+            match OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        final_path: final_path.to_path_buf(),
+                        temp_path,
+                        file: Some(file),
+                        cleanup_temp: true,
+                        #[cfg(test)]
+                        force_persist_error: false,
+                    });
+                },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create temporary samples artifact in {}",
+                            parent.display()
+                        )
+                    });
+                },
+            }
+        }
+
+        bail!(
+            "failed to allocate a unique temporary samples artifact for {}",
+            final_path.display()
+        );
+    }
+
+    fn temp_path(&self) -> &Path {
+        &self.temp_path
+    }
+
+    fn take_file(&mut self) -> Result<File> {
+        self.file.take().ok_or_else(|| {
+            anyhow!(
+                "temporary samples artifact file is already closed: {}",
+                self.temp_path.display()
+            )
+        })
+    }
+
+    fn preserve_temp(&mut self) {
+        self.cleanup_temp = false;
+    }
+
+    fn persist(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.force_persist_error {
+            bail!(
+                "forced samples artifact persist failure; temporary samples artifact retained at {}",
+                self.temp_path.display()
+            );
+        }
+
+        if self.final_path.exists() {
+            bail!(
+                "{} already exists; temporary samples artifact retained at {}",
+                self.final_path.display(),
+                self.temp_path.display()
+            );
+        }
+
+        fs::hard_link(&self.temp_path, &self.final_path).with_context(|| {
+            format!(
+                "failed to persist temporary samples artifact {} to {}; temporary file retained",
+                self.temp_path.display(),
+                self.final_path.display()
+            )
+        })?;
+        sync_parent_directory(&self.final_path)?;
+        let _ = fs::remove_file(&self.temp_path);
+        self.cleanup_temp = false;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn force_persist_error_for_test(&mut self) {
+        self.force_persist_error = true;
+    }
+}
+
+impl Drop for PendingSamplesArtifact {
+    fn drop(&mut self) {
+        if self.cleanup_temp {
+            let _ = fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+fn artifact_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = artifact_parent(path);
+    let dir = File::open(parent)
+        .with_context(|| format!("failed to open output directory {}", parent.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("failed to sync output directory {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -386,7 +525,9 @@ fn replay_sample_sync(
     target_spec: TargetSpec,
     source_sha256: String,
     running: Arc<AtomicBool>,
+    output: PendingSamplesArtifact,
 ) -> Result<ReplaySampleStats> {
+    ensure_replay_running(&running, "connect")?;
     let target = target_spec.clone().into_connection_target();
     let connected = client_builder(&target)
         .build()
@@ -419,7 +560,7 @@ fn replay_sample_sync(
         rejected_waypoint_count,
         criteria,
     );
-    write_samples_artifact(&args.out, &header, &rows)?;
+    write_samples_artifact(output, &header, &rows)?;
 
     Ok(ReplaySampleStats {
         output_path: args.out,
@@ -438,10 +579,16 @@ fn run_strict_replay(
 ) -> Result<Vec<QuasiStaticSampleRow>> {
     wait_for_initial_monitor_snapshot(|| standby.observer().joint_positions())
         .context("timed out waiting for initial joint position feedback")?;
-    let active = standby
-        .enable_mit_mode(conservative_mit_config())
-        .context("failed to enable strict MIT mode for active replay sampling")?;
-    let mut stepper = HardwareReplayStepper::new(active, args, running);
+    let active = enable_replay_arm(
+        &running,
+        || {
+            standby
+                .enable_mit_mode(conservative_mit_config())
+                .context("failed to enable strict MIT mode for active replay sampling")
+        },
+        |active| active.disable(DisableConfig::default()).map(|_| ()).map_err(Into::into),
+    )?;
+    let mut stepper = HardwareReplayStepper::new(active, args, Arc::clone(&running));
     let rows =
         replay_quasi_static_samples(&mut stepper, &plan.waypoints, criteria, settle_duration)?;
     stepper.disable().context("failed to disable robot after replay sampling")?;
@@ -458,14 +605,45 @@ fn run_soft_replay(
 ) -> Result<Vec<QuasiStaticSampleRow>> {
     wait_for_initial_monitor_snapshot(|| standby.observer().joint_positions())
         .context("timed out waiting for initial joint position feedback")?;
-    let active = standby
-        .enable_mit_passthrough(conservative_mit_config())
-        .context("failed to enable soft MIT passthrough mode for active replay sampling")?;
-    let mut stepper = HardwareReplayStepper::new(active, args, running);
+    let active = enable_replay_arm(
+        &running,
+        || {
+            standby
+                .enable_mit_passthrough(conservative_mit_config())
+                .context("failed to enable soft MIT passthrough mode for active replay sampling")
+        },
+        |active| active.disable(DisableConfig::default()).map(|_| ()).map_err(Into::into),
+    )?;
+    let mut stepper = HardwareReplayStepper::new(active, args, Arc::clone(&running));
     let rows =
         replay_quasi_static_samples(&mut stepper, &plan.waypoints, criteria, settle_duration)?;
     stepper.disable().context("failed to disable robot after replay sampling")?;
     Ok(rows)
+}
+
+fn ensure_replay_running(running: &Arc<AtomicBool>, phase: &str) -> Result<()> {
+    if !running.load(Ordering::SeqCst) {
+        bail!("gravity replay sampling cancelled before {phase}");
+    }
+    Ok(())
+}
+
+fn enable_replay_arm<ActiveArm, Enable, Disable>(
+    running: &Arc<AtomicBool>,
+    enable: Enable,
+    disable: Disable,
+) -> Result<ActiveArm>
+where
+    Enable: FnOnce() -> Result<ActiveArm>,
+    Disable: FnOnce(ActiveArm) -> Result<()>,
+{
+    ensure_replay_running(running, "enable")?;
+    let active = enable()?;
+    if !running.load(Ordering::SeqCst) {
+        disable(active).context("failed to disable robot after cancellation raced with enable")?;
+        bail!("gravity replay sampling cancelled after enable");
+    }
+    Ok(active)
 }
 
 fn conservative_mit_config() -> MitModeConfig {
@@ -529,15 +707,29 @@ fn build_samples_header(
 }
 
 fn write_samples_artifact(
-    path: &Path,
+    mut pending: PendingSamplesArtifact,
     header: &SamplesHeader,
     rows: &[QuasiStaticSampleRow],
 ) -> Result<()> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+    let temp_path = pending.temp_path().to_path_buf();
+    match write_samples_artifact_inner(&mut pending, header, rows) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            pending.preserve_temp();
+            Err(error.context(format!(
+                "samples temp artifact retained at {}",
+                temp_path.display()
+            )))
+        },
+    }
+}
+
+fn write_samples_artifact_inner(
+    pending: &mut PendingSamplesArtifact,
+    header: &SamplesHeader,
+    rows: &[QuasiStaticSampleRow],
+) -> Result<()> {
+    let file = pending.take_file()?;
     let mut writer = BufWriter::new(file);
 
     write_jsonl_row(&mut writer, header)?;
@@ -545,6 +737,13 @@ fn write_samples_artifact(
         write_jsonl_row(&mut writer, row)?;
     }
     writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(|error| anyhow!("failed to finish writing samples artifact: {}", error))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", pending.temp_path().display()))?;
+    drop(file);
+    pending.persist()?;
     Ok(())
 }
 
@@ -1512,8 +1711,10 @@ fn max_abs_delta(left: &[f64; 6], right: &[f64; 6]) -> f64 {
 mod tests {
     use super::*;
     use crate::gravity::artifact::{LoadedPath, PathHeader, PathSampleRow};
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn simplify_path_preserves_order_and_max_deviation() {
@@ -1675,6 +1876,117 @@ mod tests {
             max_age,
         )
         .expect("fresh complete feedback streams should be accepted");
+    }
+
+    #[test]
+    fn samples_artifact_prepares_same_directory_temp_before_hardware() {
+        let dir = tempdir().unwrap();
+        let final_path = dir.path().join("samples.jsonl");
+
+        let pending = PendingSamplesArtifact::create(&final_path).unwrap();
+
+        assert!(!final_path.exists());
+        assert!(pending.temp_path().exists());
+        assert_eq!(pending.temp_path().parent(), Some(dir.path()));
+    }
+
+    #[test]
+    fn samples_artifact_persist_failure_keeps_recoverable_temp_without_final_output() {
+        let dir = tempdir().unwrap();
+        let final_path = dir.path().join("samples.jsonl");
+        let mut pending = PendingSamplesArtifact::create(&final_path).unwrap();
+        let temp_path = pending.temp_path().to_path_buf();
+        pending.force_persist_error_for_test();
+
+        let err = write_samples_artifact(
+            pending,
+            &sample_header_for_tests(),
+            &[sample_row_for_tests()],
+        )
+        .expect_err("forced persist failure should not create the final artifact");
+
+        assert!(!final_path.exists());
+        assert!(temp_path.exists());
+        assert!(
+            err.to_string().contains(&temp_path.display().to_string()),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn samples_artifact_persist_does_not_overwrite_existing_final_path() {
+        let dir = tempdir().unwrap();
+        let final_path = dir.path().join("samples.jsonl");
+        let pending = PendingSamplesArtifact::create(&final_path).unwrap();
+        let temp_path = pending.temp_path().to_path_buf();
+        std::fs::write(&final_path, "operator data\n").unwrap();
+
+        let err = write_samples_artifact(
+            pending,
+            &sample_header_for_tests(),
+            &[sample_row_for_tests()],
+        )
+        .expect_err("final path race should not overwrite existing data");
+
+        assert_eq!(
+            std::fs::read_to_string(&final_path).unwrap(),
+            "operator data\n"
+        );
+        assert!(temp_path.exists());
+        assert!(
+            err.to_string().contains(&temp_path.display().to_string()),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn replay_enable_gate_skips_enable_when_cancelled_before_enable() {
+        let running = Arc::new(AtomicBool::new(false));
+        let enable_calls = Cell::new(0);
+        let disable_calls = Cell::new(0);
+
+        let err = enable_replay_arm(
+            &running,
+            || {
+                enable_calls.set(enable_calls.get() + 1);
+                Ok(42_u8)
+            },
+            |_active| {
+                disable_calls.set(disable_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("pre-enable cancellation should abort");
+
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+        assert_eq!(enable_calls.get(), 0);
+        assert_eq!(disable_calls.get(), 0);
+    }
+
+    #[test]
+    fn replay_enable_gate_disables_when_cancelled_after_enable() {
+        let running = Arc::new(AtomicBool::new(true));
+        let enable_calls = Cell::new(0);
+        let disable_calls = Cell::new(0);
+
+        let err = enable_replay_arm(
+            &running,
+            || {
+                enable_calls.set(enable_calls.get() + 1);
+                running.store(false, Ordering::SeqCst);
+                Ok(42_u8)
+            },
+            |active| {
+                assert_eq!(active, 42);
+                disable_calls.set(disable_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("post-enable cancellation should disable and abort");
+
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+        assert_eq!(enable_calls.get(), 1);
+        assert_eq!(disable_calls.get(), 1);
     }
 
     #[test]
@@ -1906,6 +2218,51 @@ mod tests {
             joint_current: [0.0; 6],
             valid_mask,
             ..Default::default()
+        }
+    }
+
+    fn sample_header_for_tests() -> SamplesHeader {
+        SamplesHeader {
+            row_type: "header".to_string(),
+            artifact_kind: "quasi-static-samples".to_string(),
+            schema_version: 1,
+            source_path: "path.jsonl".to_string(),
+            source_sha256: "abc".to_string(),
+            role: "slave".to_string(),
+            target: "socketcan:can0".to_string(),
+            joint_map: "identity".to_string(),
+            load_profile: "load".to_string(),
+            torque_convention: crate::gravity::TORQUE_CONVENTION.to_string(),
+            frequency_hz: REPLAY_SAMPLE_FREQUENCY_HZ,
+            max_velocity_rad_s: 0.08,
+            max_step_rad: 0.02,
+            settle_ms: 500,
+            sample_ms: 300,
+            stable_velocity_rad_s: DEFAULT_STABLE_VELOCITY_RAD_S,
+            stable_tracking_error_rad: DEFAULT_STABLE_TRACKING_ERROR_RAD,
+            stable_torque_std_nm: DEFAULT_STABLE_TORQUE_STD_NM,
+            waypoint_count: 1,
+            accepted_waypoint_count: 1,
+            rejected_waypoint_count: 0,
+        }
+    }
+
+    fn sample_row_for_tests() -> QuasiStaticSampleRow {
+        QuasiStaticSampleRow {
+            row_type: "quasi-static-sample".to_string(),
+            waypoint_id: 0,
+            segment_id: None,
+            pass_direction: PassDirection::Forward,
+            host_mono_us: 1,
+            raw_timestamp_us: None,
+            q_rad: [0.0; 6],
+            dq_rad_s: [0.0; 6],
+            tau_nm: [0.0; 6],
+            position_valid_mask: 0x3f,
+            dynamic_valid_mask: 0x3f,
+            stable_velocity_rad_s: 0.0,
+            stable_tracking_error_rad: 0.0,
+            stable_torque_std_nm: 0.0,
         }
     }
 
