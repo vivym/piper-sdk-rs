@@ -226,6 +226,12 @@ impl EffectiveProfile {
     }
 
     pub fn from_overlay_toml(overlay_text: &str) -> Result<Self, ProfileError> {
+        let profile = Self::from_overlay_toml_unvalidated(overlay_text)?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub(crate) fn from_overlay_toml_unvalidated(overlay_text: &str) -> Result<Self, ProfileError> {
         let default_text = String::from_utf8(Self::default().to_canonical_toml_bytes()?)
             .map_err(|error| ProfileError::Invalid(error.to_string()))?;
         let mut merged: toml::Value = toml::from_str(&default_text)
@@ -233,11 +239,9 @@ impl EffectiveProfile {
         let overlay: toml::Value = toml::from_str(overlay_text)
             .map_err(|error| ProfileError::Invalid(error.to_string()))?;
         merge_toml_overlay(&mut merged, overlay)?;
-        let profile: Self = merged
+        merged
             .try_into()
-            .map_err(|error: toml::de::Error| ProfileError::Invalid(error.to_string()))?;
-        profile.validate()?;
-        Ok(profile)
+            .map_err(|error: toml::de::Error| ProfileError::Invalid(error.to_string()))
     }
 
     pub fn to_canonical_toml_bytes(&self) -> Result<Vec<u8>, ProfileError> {

@@ -264,6 +264,49 @@ impl SvsRawClockSettings {
     }
 }
 
+pub(crate) fn apply_cli_profile_overrides(args: &Args, profile: &mut EffectiveProfile) {
+    let raw = &mut profile.raw_clock;
+    if let Some(value) = args.raw_clock_warmup_secs {
+        raw.warmup_secs = value;
+    }
+    if let Some(value) = args.raw_clock_residual_p95_us {
+        raw.residual_p95_us = value;
+    }
+    if let Some(value) = args.raw_clock_residual_max_us {
+        raw.residual_max_us = value;
+    }
+    if let Some(value) = args.raw_clock_drift_abs_ppm {
+        raw.drift_abs_ppm = value;
+    }
+    if let Some(value) = args.raw_clock_sample_gap_max_ms {
+        raw.sample_gap_max_ms = value;
+    }
+    if let Some(value) = args.raw_clock_last_sample_age_ms {
+        raw.last_sample_age_ms = value;
+    }
+    if let Some(value) = args.raw_clock_selected_sample_age_ms {
+        raw.selected_sample_age_ms = value;
+    }
+    if let Some(value) = args.raw_clock_inter_arm_skew_max_us {
+        raw.inter_arm_skew_max_us = value;
+    }
+    if let Some(value) = args.raw_clock_state_skew_max_us {
+        raw.state_skew_max_us = value;
+    }
+    if let Some(value) = args.raw_clock_residual_max_consecutive_failures {
+        raw.residual_max_consecutive_failures = value;
+    }
+    if let Some(value) = args.raw_clock_alignment_lag_us {
+        raw.alignment_lag_us = value;
+    }
+    if let Some(value) = args.raw_clock_alignment_search_window_us {
+        raw.alignment_search_window_us = value;
+    }
+    if let Some(value) = args.raw_clock_alignment_buffer_miss_consecutive_failures {
+        raw.alignment_buffer_miss_consecutive_failures = value;
+    }
+}
+
 pub fn raw_clock_warmup_sample_threshold(settings: &SvsRawClockSettings) -> usize {
     let warmup_ms = settings.warmup_secs.saturating_mul(1_000);
     let sample_gap_max_ms = settings.sample_gap_max_ms.max(1);

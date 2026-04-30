@@ -55,6 +55,7 @@ use crate::profile::EffectiveProfile;
 use crate::raw_can::{
     RawCanCaptureStatus, RawCanRecordingHandle, RawCanStatusSource, RawCanStatusTracker,
 };
+use crate::raw_clock::apply_cli_profile_overrides as apply_raw_clock_profile_overrides;
 use crate::target::{SocketCanTarget, validate_targets};
 use crate::tick_frame::{
     SnapshotKey, SvsDynamicsFrame, SvsDynamicsSlot, SvsPendingTick, SvsTickStager,
@@ -1388,6 +1389,7 @@ fn resolve_profile_from_args(args: &Args) -> Result<ResolvedProfile> {
     if args.disable_gripper_mirror {
         profile.gripper.mirror_enabled = false;
     }
+    apply_raw_clock_profile_overrides(args, &mut profile);
     profile.validate()?;
     let runtime_mirror_map = joint_mirror_map_from_profile(&profile)?;
     let effective_profile_bytes = profile.to_canonical_toml_bytes()?;
@@ -1404,7 +1406,7 @@ fn resolve_profile_from_args(args: &Args) -> Result<ResolvedProfile> {
 }
 
 fn load_effective_profile_overlay(overlay_text: &str) -> Result<EffectiveProfile> {
-    EffectiveProfile::from_overlay_toml(overlay_text).map_err(anyhow::Error::from)
+    EffectiveProfile::from_overlay_toml_unvalidated(overlay_text).map_err(anyhow::Error::from)
 }
 
 fn apply_mirror_map_override(
@@ -2075,12 +2077,16 @@ fn episode_status_from_report(report: &BilateralRunReport, faulted_variant: bool
 }
 
 fn joint_mirror_map_from_profile(profile: &EffectiveProfile) -> Result<JointMirrorMap> {
+    let mut permutation = [Joint::J1; 6];
+    for (output, index) in permutation
+        .iter_mut()
+        .zip(profile.calibration.mirror_map.permutation)
+    {
+        *output = Joint::from_index(index)
+            .ok_or_else(|| anyhow!("calibration.mirror_map.permutation contains invalid joint index {index}"))?;
+    }
     Ok(JointMirrorMap {
-        permutation: profile
-            .calibration
-            .mirror_map
-            .permutation
-            .map(|index| Joint::from_index(index).expect("profile validation ensures 0..6")),
+        permutation,
         position_sign: profile.calibration.mirror_map.position_sign,
         velocity_sign: profile.calibration.mirror_map.velocity_sign,
         torque_sign: profile.calibration.mirror_map.torque_sign,
@@ -2836,6 +2842,7 @@ fn flatten3x6(values: [[f64; 6]; 3]) -> [f64; 18] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn write_report_refuses_existing_report() {
@@ -2890,5 +2897,117 @@ mod tests {
         write_replace_file(&path, b"new").unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn profile_validation_runs_after_cli_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_profile = dir.path().join("profile.toml");
+        fs::write(
+            &task_profile,
+            r#"
+[calibration]
+calibration_max_error_rad = 0.0
+"#,
+        )
+        .unwrap();
+
+        let args = Args::try_parse_from([
+            "piper-svs-collect",
+            "--master-target",
+            "socketcan:can0",
+            "--slave-target",
+            "socketcan:can1",
+            "--output-dir",
+            dir.path().to_str().unwrap(),
+            "--task-profile",
+            task_profile.to_str().unwrap(),
+            "--calibration-max-error-rad",
+            "0.05",
+            "--yes",
+        ])
+        .unwrap();
+
+        let resolved = resolve_profile_from_args(&args).unwrap();
+
+        assert_eq!(
+            resolved.profile.calibration.calibration_max_error_rad,
+            0.05
+        );
+    }
+
+    #[test]
+    fn raw_clock_profile_validation_runs_after_cli_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_profile = dir.path().join("profile.toml");
+        fs::write(
+            &task_profile,
+            r#"
+[raw_clock]
+residual_p95_us = 4000
+residual_max_us = 3000
+"#,
+        )
+        .unwrap();
+
+        let args = Args::try_parse_from([
+            "piper-svs-collect",
+            "--master-target",
+            "socketcan:can0",
+            "--slave-target",
+            "socketcan:can1",
+            "--output-dir",
+            dir.path().to_str().unwrap(),
+            "--task-profile",
+            task_profile.to_str().unwrap(),
+            "--experimental-calibrated-raw",
+            "--raw-clock-residual-p95-us",
+            "2000",
+            "--yes",
+        ])
+        .unwrap();
+
+        let resolved = resolve_profile_from_args(&args).unwrap();
+
+        assert_eq!(resolved.profile.raw_clock.residual_p95_us, 2_000);
+        assert_eq!(resolved.profile.raw_clock.residual_max_us, 3_000);
+    }
+
+    #[test]
+    fn invalid_profile_mirror_map_returns_error_before_cli_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_profile = dir.path().join("profile.toml");
+        fs::write(
+            &task_profile,
+            r#"
+[calibration]
+mirror_map_kind = "custom"
+
+[calibration.mirror_map]
+permutation = [0, 1, 2, 3, 4, 6]
+position_sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+velocity_sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+torque_sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+"#,
+        )
+        .unwrap();
+
+        let args = Args::try_parse_from([
+            "piper-svs-collect",
+            "--master-target",
+            "socketcan:can0",
+            "--slave-target",
+            "socketcan:can1",
+            "--output-dir",
+            dir.path().to_str().unwrap(),
+            "--task-profile",
+            task_profile.to_str().unwrap(),
+            "--yes",
+        ])
+        .unwrap();
+
+        let err = resolve_profile_from_args(&args).unwrap_err();
+
+        assert!(err.to_string().contains("invalid joint index 6"));
     }
 }
