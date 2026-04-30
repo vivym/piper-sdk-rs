@@ -60,6 +60,8 @@ pub struct FitQuality {
     pub max_residual_nm: [f64; JOINT_COUNT],
     pub holdout_rms_residual_nm: [f64; JOINT_COUNT],
     pub holdout_p95_residual_nm: [f64; JOINT_COUNT],
+    #[serde(default)]
+    pub holdout_max_residual_nm: [f64; JOINT_COUNT],
     pub condition_number: f64,
 }
 
@@ -201,6 +203,7 @@ impl QuasiStaticTorqueModel {
                 max_residual_nm: [0.0; JOINT_COUNT],
                 holdout_rms_residual_nm: [0.0; JOINT_COUNT],
                 holdout_p95_residual_nm: [0.0; JOINT_COUNT],
+                holdout_max_residual_nm: [0.0; JOINT_COUNT],
                 condition_number: 1.0,
             },
             model: LinearModelSection {
