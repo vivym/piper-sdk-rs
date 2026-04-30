@@ -296,6 +296,7 @@ fn raw_clock_fake_workflow_writes_optional_raw_clock_sections() {
     let result = harness.run(out.path()).expect("collector should complete");
 
     assert_eq!(result.status, EpisodeStatus::Complete);
+    assert!(result.disable_called);
     let manifest = read_manifest_toml(&result.path.join("manifest.toml")).unwrap();
     assert!(manifest.raw_clock.is_some());
     let report = read_report_json(&result.path.join("report.json")).unwrap();
@@ -338,10 +339,7 @@ fn raw_clock_cancel_before_enable_still_writes_raw_clock_report_section() {
     let report = read_report_json(&result.path.join("report.json")).unwrap();
     assert!(manifest.raw_clock.is_some());
     assert!(report.raw_clock.is_some());
-    assert_eq!(
-        report.raw_clock.as_ref().unwrap().final_failure_kind.as_deref(),
-        Some("Cancelled")
-    );
+    assert!(report.raw_clock.as_ref().unwrap().final_failure_kind.is_none());
 }
 
 #[test]
@@ -364,10 +362,7 @@ fn raw_clock_cancel_during_active_control_finalizes_partial_episode() {
     let report = read_report_json(&result.path.join("report.json")).unwrap();
     assert_eq!(report.status, EpisodeStatus::Cancelled);
     assert!(report.raw_clock.is_some());
-    assert_eq!(
-        report.raw_clock.as_ref().unwrap().final_failure_kind.as_deref(),
-        Some("Cancelled")
-    );
+    assert!(report.raw_clock.as_ref().unwrap().final_failure_kind.is_none());
     let steps = read_steps_file(result.path.join("steps.bin")).unwrap();
     assert_eq!(steps.steps.len(), 1);
 }
@@ -442,11 +437,16 @@ fn raw_clock_missing_tx_finished_finalizes_faulted_episode() {
         result.dual_arm_exit_reason,
         Some(BilateralExitReason::TelemetrySinkFault)
     );
+    assert!(result.disable_called);
     let steps = read_steps_file(result.path.join("steps.bin")).unwrap();
     assert_eq!(steps.steps.len(), 1);
     let report = read_report_json(&result.path.join("report.json")).unwrap();
     assert_eq!(report.status, EpisodeStatus::Faulted);
-    assert!(report.raw_clock.is_some());
+    let raw_clock = report.raw_clock.as_ref().expect("raw-clock report");
+    assert_eq!(
+        raw_clock.final_failure_kind.as_deref(),
+        Some("TelemetrySinkFault")
+    );
 }
 
 #[test]
@@ -464,7 +464,13 @@ fn raw_clock_loaded_calibration_pre_enable_mismatch_fails_before_enable() {
     assert!(!result.disable_called);
     let report = read_report_json(&result.path.join("report.json")).unwrap();
     assert!(report.dual_arm.last_error.as_deref().unwrap_or_default().contains("pre-enable"));
-    assert!(report.raw_clock.is_some());
+    let raw_clock = report.raw_clock.as_ref().expect("raw-clock report");
+    assert_eq!(
+        raw_clock.final_failure_kind.as_deref(),
+        Some("RuntimeTransportFault")
+    );
+    assert_eq!(raw_clock.master_residual_p95_us, 0);
+    assert_eq!(raw_clock.runtime_faults, 0);
 }
 
 #[test]
@@ -489,7 +495,13 @@ fn raw_clock_loaded_calibration_post_enable_mismatch_disables_without_loop() {
             .unwrap_or_default()
             .contains("post-enable")
     );
-    assert!(report.raw_clock.is_some());
+    let raw_clock = report.raw_clock.as_ref().expect("raw-clock report");
+    assert_eq!(
+        raw_clock.final_failure_kind.as_deref(),
+        Some("RuntimeTransportFault")
+    );
+    assert_eq!(raw_clock.master_residual_p95_us, 0);
+    assert_eq!(raw_clock.runtime_faults, 0);
 }
 
 #[test]

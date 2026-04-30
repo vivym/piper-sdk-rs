@@ -488,7 +488,7 @@ impl<'a> CollectorBackend for FakeCollectorBackend<'a> {
                     report,
                     attempted_iterations,
                     loop_stopped_before_requested_iterations: true,
-                    disable_called: false,
+                    disable_called: true,
                 });
             }
         }
@@ -499,7 +499,7 @@ impl<'a> CollectorBackend for FakeCollectorBackend<'a> {
             report,
             attempted_iterations,
             loop_stopped_before_requested_iterations: false,
-            disable_called: false,
+            disable_called: true,
         })
     }
 }
@@ -768,6 +768,7 @@ impl FakeCollectorHarness {
         let mut disable_called = false;
         let mut attempted_iterations = 0_u64;
         let mut report_last_error: Option<String> = None;
+        let mut raw_clock_runtime_report = self.raw_clock_report.clone();
         let stager = Arc::new(SvsTickStager::new());
         let dynamics_slot = Arc::new(SvsDynamicsSlot::new());
         let feedback_history = Arc::new(Mutex::new(AppliedMasterFeedbackHistory::default()));
@@ -852,6 +853,14 @@ impl FakeCollectorHarness {
                         raw_can: Arc::clone(&raw_can),
                     },
                 )?;
+                if self.runtime_kind == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock
+                    && raw_clock_runtime_report.is_none()
+                {
+                    raw_clock_runtime_report = Some(raw_clock_report_for_fake(
+                        outcome.attempted_iterations as usize,
+                        raw_clock_reason_from_fake_loop(outcome.status, outcome.report.exit_reason),
+                    ));
+                }
                 status = outcome.status;
                 dual_arm_exit_reason = outcome.report.exit_reason;
                 loop_stopped_before_requested_iterations =
@@ -905,38 +914,6 @@ impl FakeCollectorHarness {
             &mut report_last_error,
         );
         let raw_finalizer_status = raw_can.finalizer_status();
-        let synthesized_raw_clock_report = (self.runtime_kind
-            == crate::raw_clock::SvsRuntimeKind::CalibratedRawClock)
-            .then(|| {
-                let reason = match dual_arm_exit_reason {
-                    Some(BilateralExitReason::Cancelled) => RawClockRuntimeExitReason::Cancelled,
-                    Some(BilateralExitReason::TelemetrySinkFault) => {
-                        RawClockRuntimeExitReason::TelemetrySinkFault
-                    },
-                    Some(BilateralExitReason::CompensationFault) => {
-                        RawClockRuntimeExitReason::CompensationFault
-                    },
-                    Some(BilateralExitReason::ControllerFault) => {
-                        RawClockRuntimeExitReason::ControllerFault
-                    },
-                    Some(BilateralExitReason::SubmissionFault) => {
-                        RawClockRuntimeExitReason::SubmissionFault
-                    },
-                    Some(BilateralExitReason::RuntimeTransportFault) => {
-                        RawClockRuntimeExitReason::RuntimeTransportFault
-                    },
-                    Some(_) => RawClockRuntimeExitReason::RuntimeTransportFault,
-                    None if status == EpisodeStatus::Complete => {
-                        RawClockRuntimeExitReason::MaxIterations
-                    },
-                    None if status == EpisodeStatus::Cancelled => {
-                        RawClockRuntimeExitReason::Cancelled
-                    },
-                    None => RawClockRuntimeExitReason::RuntimeTransportFault,
-                };
-                raw_clock_report_for_fake(attempted_iterations as usize, reason)
-            });
-        let raw_clock_report = self.raw_clock_report.clone().or(synthesized_raw_clock_report);
         write_report(FakeReportWrite {
             episode_dir: &episode_dir,
             episode_id: &episode_id,
@@ -950,7 +927,7 @@ impl FakeCollectorHarness {
             final_flush_result,
             writer_stats: &writer_stats,
             last_error: report_last_error,
-            raw_clock_report,
+            raw_clock_report: raw_clock_runtime_report,
             raw_clock_settings: fake_raw_clock_settings,
         })?;
         write_manifest(FakeManifestWrite {
@@ -3645,6 +3622,30 @@ fn raw_clock_report_for_fake(
     }
 }
 
+fn raw_clock_reason_from_fake_loop(
+    status: EpisodeStatus,
+    exit_reason: Option<BilateralExitReason>,
+) -> RawClockRuntimeExitReason {
+    match exit_reason {
+        Some(BilateralExitReason::Cancelled) => RawClockRuntimeExitReason::Cancelled,
+        Some(BilateralExitReason::TelemetrySinkFault) => {
+            RawClockRuntimeExitReason::TelemetrySinkFault
+        },
+        Some(BilateralExitReason::CompensationFault) => {
+            RawClockRuntimeExitReason::CompensationFault
+        },
+        Some(BilateralExitReason::ControllerFault) => RawClockRuntimeExitReason::ControllerFault,
+        Some(BilateralExitReason::SubmissionFault) => RawClockRuntimeExitReason::SubmissionFault,
+        Some(BilateralExitReason::RuntimeTransportFault) => {
+            RawClockRuntimeExitReason::RuntimeTransportFault
+        },
+        Some(_) => RawClockRuntimeExitReason::RuntimeTransportFault,
+        None if status == EpisodeStatus::Complete => RawClockRuntimeExitReason::MaxIterations,
+        None if status == EpisodeStatus::Cancelled => RawClockRuntimeExitReason::Cancelled,
+        None => RawClockRuntimeExitReason::RuntimeTransportFault,
+    }
+}
+
 fn persist_episode_inputs(
     episode_dir: &Path,
     raw_clock_startup_positions: Option<([f64; 6], [f64; 6])>,
@@ -3699,21 +3700,16 @@ fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
         input.raw_clock_report.as_ref(),
         input.raw_clock_settings.as_ref(),
     ) {
-        (_, Some(settings)) if input.status == EpisodeStatus::Cancelled => {
-            Some(crate::raw_clock::raw_clock_startup_report_json(
-                settings,
-                Some("Cancelled".to_string()),
-            ))
-        },
         (Some(report), Some(settings)) => {
             Some(crate::raw_clock::raw_clock_report_json(report, settings))
         },
         (None, Some(settings)) => Some(crate::raw_clock::raw_clock_startup_report_json(
             settings,
-            input
-                .exit_reason
-                .map(|reason| format!("{reason:?}"))
-                .or_else(|| input.last_error.clone()),
+            raw_clock_startup_final_failure_kind_for_fake(
+                input.status,
+                input.exit_reason,
+                input.last_error.as_ref(),
+            ),
         )),
         (Some(_), None) => {
             return Err(anyhow!(
@@ -3773,6 +3769,19 @@ fn write_report(input: FakeReportWrite<'_>) -> Result<()> {
     let text = serde_json::to_string_pretty(&report)?;
     write_new_file(input.episode_dir.join("report.json"), text.as_bytes())?;
     Ok(())
+}
+
+fn raw_clock_startup_final_failure_kind_for_fake(
+    status: EpisodeStatus,
+    exit_reason: Option<BilateralExitReason>,
+    last_error: Option<&String>,
+) -> Option<String> {
+    match exit_reason {
+        Some(BilateralExitReason::MaxIterations | BilateralExitReason::Cancelled) => None,
+        Some(reason) => Some(format!("{reason:?}")),
+        None if status == EpisodeStatus::Cancelled => None,
+        None => last_error.cloned(),
+    }
 }
 
 fn write_new_file(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
