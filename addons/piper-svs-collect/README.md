@@ -60,6 +60,32 @@ cargo run --manifest-path addons/piper-svs-collect/Cargo.toml -- \
   --yes
 ```
 
+## Experimental Calibrated Raw-Clock SVS
+
+Use this only after the general teleop raw-clock smoke script is stable on the same interfaces.
+
+```bash
+cargo run --manifest-path addons/piper-svs-collect/Cargo.toml -- \
+  --master-target socketcan:can1 \
+  --slave-target socketcan:can0 \
+  --use-embedded-model \
+  --output-dir artifacts/svs \
+  --mirror-map identity \
+  --disable-gripper-mirror \
+  --experimental-calibrated-raw \
+  --raw-clock-warmup-secs 10 \
+  --raw-clock-residual-p95-us 2000 \
+  --raw-clock-residual-max-us 3000 \
+  --raw-clock-residual-max-consecutive-failures 3 \
+  --raw-clock-sample-gap-max-ms 50 \
+  --raw-clock-inter-arm-skew-max-us 20000 \
+  --raw-clock-state-skew-max-us 10000 \
+  --raw-clock-alignment-lag-us 5000 \
+  --raw-clock-alignment-search-window-us 25000
+```
+
+The raw-clock backend is explicit and never falls back to StrictRealtime. The first implementation requires `--disable-gripper-mirror`.
+
 ## Starter Profiles
 
 The files in `profiles/` are conservative starting points. They use explicit placeholder MuJoCo site names:
