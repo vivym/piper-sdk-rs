@@ -126,6 +126,8 @@ pub struct ReportMetrics {
     pub slave_runtime_fault: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub joint_motion: Option<ReportJointMotion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub torque_diagnostics: Option<ReportTorqueDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -141,6 +143,22 @@ pub struct ReportJointMotion {
     pub slave_feedback_delta_rad: [f64; 6],
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReportTorqueDiagnostics {
+    pub slave_feedback_torque_min_nm: [f64; 6],
+    pub slave_feedback_torque_max_nm: [f64; 6],
+    pub slave_feedback_torque_delta_nm: [f64; 6],
+    pub controller_master_interaction_torque_min_nm: [f64; 6],
+    pub controller_master_interaction_torque_max_nm: [f64; 6],
+    pub controller_master_interaction_torque_delta_nm: [f64; 6],
+    pub shaped_master_interaction_torque_min_nm: [f64; 6],
+    pub shaped_master_interaction_torque_max_nm: [f64; 6],
+    pub shaped_master_interaction_torque_delta_nm: [f64; 6],
+    pub final_master_t_ref_min_nm: [f64; 6],
+    pub final_master_t_ref_max_nm: [f64; 6],
+    pub final_master_t_ref_delta_nm: [f64; 6],
+}
+
 #[derive(Debug, Clone)]
 pub struct TeleopReportInput<'a> {
     pub platform: TeleopPlatform,
@@ -153,6 +171,7 @@ pub struct TeleopReportInput<'a> {
     pub calibration: ReportCalibration,
     pub timing: Option<ReportTiming>,
     pub joint_motion: Option<ReportJointMotion>,
+    pub torque_diagnostics: Option<ReportTorqueDiagnostics>,
     pub faulted: bool,
     pub report: &'a BilateralRunReport,
 }
@@ -234,6 +253,7 @@ impl TeleopJsonReport {
                     .map(format_runtime_fault)
                     .map(str::to_string),
                 joint_motion: input.joint_motion,
+                torque_diagnostics: input.torque_diagnostics,
             },
         }
     }
@@ -361,6 +381,28 @@ pub fn write_human_report<W: Write>(
             writer,
             "joint_motion slave_feedback_delta_rad={}",
             format_joint_array(joint_motion.slave_feedback_delta_rad)
+        )?;
+    }
+    if let Some(torque) = &report.metrics.torque_diagnostics {
+        writeln!(
+            writer,
+            "torque_diagnostics slave_feedback_delta_nm={}",
+            format_joint_array(torque.slave_feedback_torque_delta_nm)
+        )?;
+        writeln!(
+            writer,
+            "torque_diagnostics controller_master_interaction_delta_nm={}",
+            format_joint_array(torque.controller_master_interaction_torque_delta_nm)
+        )?;
+        writeln!(
+            writer,
+            "torque_diagnostics shaped_master_interaction_delta_nm={}",
+            format_joint_array(torque.shaped_master_interaction_torque_delta_nm)
+        )?;
+        writeln!(
+            writer,
+            "torque_diagnostics final_master_t_ref_delta_nm={}",
+            format_joint_array(torque.final_master_t_ref_delta_nm)
         )?;
     }
     Ok(())
@@ -741,6 +783,46 @@ mod tests {
     }
 
     #[test]
+    fn json_report_serializes_torque_diagnostics() {
+        let sdk_report = BilateralRunReport::default();
+        let mut input = sample_input(false, &sdk_report);
+        input.torque_diagnostics = Some(ReportTorqueDiagnostics {
+            slave_feedback_torque_delta_nm: [0.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+            controller_master_interaction_torque_delta_nm: [0.0, 0.0, 0.0, 0.30, 0.0, 0.0],
+            shaped_master_interaction_torque_delta_nm: [0.0, 0.0, 0.0, 0.05, 0.0, 0.0],
+            final_master_t_ref_delta_nm: [0.0, 0.0, 0.0, 0.10, 0.0, 0.0],
+            slave_feedback_torque_min_nm: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            slave_feedback_torque_max_nm: [0.0, 0.0, 0.0, 3.0, 0.0, 0.0],
+            controller_master_interaction_torque_min_nm: [0.0, 0.0, 0.0, -0.10, 0.0, 0.0],
+            controller_master_interaction_torque_max_nm: [0.0, 0.0, 0.0, 0.20, 0.0, 0.0],
+            shaped_master_interaction_torque_min_nm: [0.0, 0.0, 0.0, 0.05, 0.0, 0.0],
+            shaped_master_interaction_torque_max_nm: [0.0, 0.0, 0.0, 0.10, 0.0, 0.0],
+            final_master_t_ref_min_nm: [0.0, 0.0, 0.0, 0.15, 0.0, 0.0],
+            final_master_t_ref_max_nm: [0.0, 0.0, 0.0, 0.25, 0.0, 0.0],
+        });
+
+        let value = serde_json::to_value(TeleopJsonReport::from_run(input)).unwrap();
+
+        assert_eq!(
+            value["metrics"]["torque_diagnostics"]["slave_feedback_torque_delta_nm"][3],
+            2.0
+        );
+        assert_eq!(
+            value["metrics"]["torque_diagnostics"]["controller_master_interaction_torque_delta_nm"]
+                [3],
+            0.30
+        );
+        assert_eq!(
+            value["metrics"]["torque_diagnostics"]["shaped_master_interaction_torque_delta_nm"][3],
+            0.05
+        );
+        assert_eq!(
+            value["metrics"]["torque_diagnostics"]["final_master_t_ref_delta_nm"][3],
+            0.10
+        );
+    }
+
+    #[test]
     fn normal_report_omits_timing() {
         let value = serde_json::to_value(sample_json_report()).unwrap();
 
@@ -1063,6 +1145,7 @@ mod tests {
             },
             timing: None,
             joint_motion: None,
+            torque_diagnostics: None,
             faulted,
             report,
         }

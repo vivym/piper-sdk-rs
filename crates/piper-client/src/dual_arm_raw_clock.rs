@@ -222,6 +222,7 @@ pub struct RawClockRuntimeReport {
     pub master: RawClockHealth,
     pub slave: RawClockHealth,
     pub joint_motion: Option<RawClockJointMotionStats>,
+    pub torque_diagnostics: Option<RawClockTorqueDiagnosticsStats>,
     pub max_inter_arm_skew_us: u64,
     pub inter_arm_skew_p95_us: u64,
     pub alignment_lag_us: u64,
@@ -271,6 +272,22 @@ pub struct RawClockJointMotionStats {
     pub slave_feedback_min_rad: [f64; 6],
     pub slave_feedback_max_rad: [f64; 6],
     pub slave_feedback_delta_rad: [f64; 6],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawClockTorqueDiagnosticsStats {
+    pub slave_feedback_torque_min_nm: [f64; 6],
+    pub slave_feedback_torque_max_nm: [f64; 6],
+    pub slave_feedback_torque_delta_nm: [f64; 6],
+    pub controller_master_interaction_torque_min_nm: [f64; 6],
+    pub controller_master_interaction_torque_max_nm: [f64; 6],
+    pub controller_master_interaction_torque_delta_nm: [f64; 6],
+    pub shaped_master_interaction_torque_min_nm: [f64; 6],
+    pub shaped_master_interaction_torque_max_nm: [f64; 6],
+    pub shaped_master_interaction_torque_delta_nm: [f64; 6],
+    pub final_master_t_ref_min_nm: [f64; 6],
+    pub final_master_t_ref_max_nm: [f64; 6],
+    pub final_master_t_ref_delta_nm: [f64; 6],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -359,6 +376,139 @@ impl RawClockJointMotionAccumulator {
 }
 
 fn rad_array(values: JointArray<Rad>) -> [f64; 6] {
+    values.map(|value| value.0).into_array()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RawClockTorqueDiagnosticsBounds {
+    slave_feedback_torque_min_nm: [f64; 6],
+    slave_feedback_torque_max_nm: [f64; 6],
+    controller_master_interaction_torque_min_nm: [f64; 6],
+    controller_master_interaction_torque_max_nm: [f64; 6],
+    shaped_master_interaction_torque_min_nm: [f64; 6],
+    shaped_master_interaction_torque_max_nm: [f64; 6],
+    final_master_t_ref_min_nm: [f64; 6],
+    final_master_t_ref_max_nm: [f64; 6],
+}
+
+impl RawClockTorqueDiagnosticsBounds {
+    fn new(
+        snapshot: &DualArmSnapshot,
+        controller_command: &BilateralCommand,
+        shaped_command: &BilateralCommand,
+        final_torques: &BilateralFinalTorques,
+    ) -> Self {
+        let slave_feedback = newton_meter_array(snapshot.right.state.torque);
+        let controller_master = newton_meter_array(controller_command.master_interaction_torque);
+        let shaped_master = newton_meter_array(shaped_command.master_interaction_torque);
+        let final_master = newton_meter_array(final_torques.master);
+        Self {
+            slave_feedback_torque_min_nm: slave_feedback,
+            slave_feedback_torque_max_nm: slave_feedback,
+            controller_master_interaction_torque_min_nm: controller_master,
+            controller_master_interaction_torque_max_nm: controller_master,
+            shaped_master_interaction_torque_min_nm: shaped_master,
+            shaped_master_interaction_torque_max_nm: shaped_master,
+            final_master_t_ref_min_nm: final_master,
+            final_master_t_ref_max_nm: final_master,
+        }
+    }
+
+    fn record(
+        &mut self,
+        snapshot: &DualArmSnapshot,
+        controller_command: &BilateralCommand,
+        shaped_command: &BilateralCommand,
+        final_torques: &BilateralFinalTorques,
+    ) {
+        update_bounds(
+            &mut self.slave_feedback_torque_min_nm,
+            &mut self.slave_feedback_torque_max_nm,
+            newton_meter_array(snapshot.right.state.torque),
+        );
+        update_bounds(
+            &mut self.controller_master_interaction_torque_min_nm,
+            &mut self.controller_master_interaction_torque_max_nm,
+            newton_meter_array(controller_command.master_interaction_torque),
+        );
+        update_bounds(
+            &mut self.shaped_master_interaction_torque_min_nm,
+            &mut self.shaped_master_interaction_torque_max_nm,
+            newton_meter_array(shaped_command.master_interaction_torque),
+        );
+        update_bounds(
+            &mut self.final_master_t_ref_min_nm,
+            &mut self.final_master_t_ref_max_nm,
+            newton_meter_array(final_torques.master),
+        );
+    }
+
+    fn snapshot(self) -> RawClockTorqueDiagnosticsStats {
+        RawClockTorqueDiagnosticsStats {
+            slave_feedback_torque_min_nm: self.slave_feedback_torque_min_nm,
+            slave_feedback_torque_max_nm: self.slave_feedback_torque_max_nm,
+            slave_feedback_torque_delta_nm: delta_array(
+                self.slave_feedback_torque_min_nm,
+                self.slave_feedback_torque_max_nm,
+            ),
+            controller_master_interaction_torque_min_nm: self
+                .controller_master_interaction_torque_min_nm,
+            controller_master_interaction_torque_max_nm: self
+                .controller_master_interaction_torque_max_nm,
+            controller_master_interaction_torque_delta_nm: delta_array(
+                self.controller_master_interaction_torque_min_nm,
+                self.controller_master_interaction_torque_max_nm,
+            ),
+            shaped_master_interaction_torque_min_nm: self.shaped_master_interaction_torque_min_nm,
+            shaped_master_interaction_torque_max_nm: self.shaped_master_interaction_torque_max_nm,
+            shaped_master_interaction_torque_delta_nm: delta_array(
+                self.shaped_master_interaction_torque_min_nm,
+                self.shaped_master_interaction_torque_max_nm,
+            ),
+            final_master_t_ref_min_nm: self.final_master_t_ref_min_nm,
+            final_master_t_ref_max_nm: self.final_master_t_ref_max_nm,
+            final_master_t_ref_delta_nm: delta_array(
+                self.final_master_t_ref_min_nm,
+                self.final_master_t_ref_max_nm,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RawClockTorqueDiagnosticsAccumulator {
+    bounds: Option<RawClockTorqueDiagnosticsBounds>,
+}
+
+impl RawClockTorqueDiagnosticsAccumulator {
+    fn record(
+        &mut self,
+        snapshot: &DualArmSnapshot,
+        controller_command: &BilateralCommand,
+        shaped_command: &BilateralCommand,
+        final_torques: &BilateralFinalTorques,
+    ) {
+        match &mut self.bounds {
+            Some(bounds) => {
+                bounds.record(snapshot, controller_command, shaped_command, final_torques)
+            },
+            None => {
+                self.bounds = Some(RawClockTorqueDiagnosticsBounds::new(
+                    snapshot,
+                    controller_command,
+                    shaped_command,
+                    final_torques,
+                ));
+            },
+        }
+    }
+
+    fn snapshot(&self) -> Option<RawClockTorqueDiagnosticsStats> {
+        self.bounds.map(RawClockTorqueDiagnosticsBounds::snapshot)
+    }
+}
+
+fn newton_meter_array(values: JointArray<NewtonMeter>) -> [f64; 6] {
     values.map(|value| value.0).into_array()
 }
 
@@ -1334,6 +1484,7 @@ impl RawClockRuntimeTiming {
             master: self.report_health(RawClockSide::Master, now_host_us),
             slave: self.report_health(RawClockSide::Slave, now_host_us),
             joint_motion: None,
+            torque_diagnostics: None,
             max_inter_arm_skew_us: self.max_inter_arm_skew_us,
             inter_arm_skew_p95_us: percentile(self.skew_samples_us.iter().copied(), 95),
             alignment_lag_us: self.alignment_lag_us,
@@ -2262,6 +2413,7 @@ where
             &timing,
             0,
             &RawClockJointMotionAccumulator::default(),
+            &RawClockTorqueDiagnosticsAccumulator::default(),
             RawClockRuntimeExitReason::RuntimeConfigFault,
             error.to_string(),
             |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
@@ -2277,6 +2429,7 @@ where
             &timing,
             0,
             &RawClockJointMotionAccumulator::default(),
+            &RawClockTorqueDiagnosticsAccumulator::default(),
             RawClockRuntimeExitReason::RuntimeConfigFault,
             error.to_string(),
             |report| report.runtime_faults = report.runtime_faults.saturating_add(1),
@@ -2292,6 +2445,7 @@ where
             &timing,
             0,
             &RawClockJointMotionAccumulator::default(),
+            &RawClockTorqueDiagnosticsAccumulator::default(),
             RawClockRuntimeExitReason::RuntimeConfigFault,
             "raw-clock gripper mirroring is not implemented; pass disabled gripper config"
                 .to_string(),
@@ -2312,6 +2466,7 @@ where
     let mut iterations = 0usize;
     let mut next_tick = Instant::now();
     let mut joint_motion = RawClockJointMotionAccumulator::default();
+    let mut torque_diagnostics = RawClockTorqueDiagnosticsAccumulator::default();
     let mut previous_control_frame_host_mono_us: Option<u64> = None;
     let mut shaping_state = BilateralOutputShapingState::default();
 
@@ -2322,6 +2477,7 @@ where
             &timing,
             0,
             &joint_motion,
+            &torque_diagnostics,
             RawClockRuntimeExitReason::CompensationFault,
             error,
             |report| report.compensation_faults = report.compensation_faults.saturating_add(1),
@@ -2343,7 +2499,7 @@ where
                 Some(RawClockRuntimeExitReason::MaxIterations),
             );
             report.iterations = iterations;
-            attach_joint_motion(&mut report, &joint_motion);
+            attach_runtime_diagnostics(&mut report, &joint_motion, &torque_diagnostics);
             return match io.disable_both(cfg.disable_config.clone(), FAULT_SHUTDOWN_TIMEOUT) {
                 RawClockDisableOutcome::Standby(standby) => {
                     report.apply_telemetry(standby.telemetry);
@@ -2375,7 +2531,7 @@ where
                 Some(RawClockRuntimeExitReason::Cancelled),
             );
             report.last_error = Some("raw-clock runtime cancelled".to_string());
-            attach_joint_motion(&mut report, &joint_motion);
+            attach_runtime_diagnostics(&mut report, &joint_motion, &torque_diagnostics);
             return match io.disable_both(cfg.disable_config.clone(), FAULT_SHUTDOWN_TIMEOUT) {
                 RawClockDisableOutcome::Standby(standby) => {
                     report.apply_telemetry(standby.telemetry);
@@ -2416,6 +2572,7 @@ where
                 &timing,
                 iterations,
                 &joint_motion,
+                &torque_diagnostics,
                 exit_reason,
                 err.to_string(),
                 |report| {
@@ -2438,6 +2595,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::ReadFault,
                     err.to_string(),
                     |report| report.read_faults = report.read_faults.saturating_add(1),
@@ -2456,6 +2614,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::ReadFault,
                     err.to_string(),
                     |report| report.read_faults = report.read_faults.saturating_add(1),
@@ -2476,6 +2635,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::RawClockFault,
                     err.to_string(),
                     |_| {},
@@ -2510,6 +2670,7 @@ where
                         &timing,
                         iterations,
                         &joint_motion,
+                        &torque_diagnostics,
                         RawClockRuntimeExitReason::ClockHealthFault,
                         err.to_string(),
                         |_| {},
@@ -2530,6 +2691,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::RawClockFault,
                     err.to_string(),
                     |_| {},
@@ -2556,6 +2718,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::RawClockFault,
                     err.to_string(),
                     |_| {},
@@ -2583,6 +2746,7 @@ where
                 &timing,
                 iterations,
                 &joint_motion,
+                &torque_diagnostics,
                 exit_reason,
                 err.to_string(),
                 |_| {},
@@ -2604,12 +2768,14 @@ where
                 let command = raw_clock_hold_command(&snapshot, &cfg.safety);
                 let final_torques = assemble_final_torques(&command, None);
                 joint_motion.record(&snapshot, &command);
+                torque_diagnostics.record(&snapshot, &command, &command, &final_torques);
                 if let Err(error) = io.submit_command(&command, &final_torques, cfg.command_timeout)
                 {
                     let report = fault_report_from_timing(
                         &timing,
                         iterations,
                         &joint_motion,
+                        &torque_diagnostics,
                         RawClockRuntimeExitReason::SubmissionFault,
                         error.to_string(),
                         |report| {
@@ -2653,6 +2819,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::ControllerFault,
                     err.to_string(),
                     |report| {
@@ -2672,6 +2839,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::CompensationFault,
                     error,
                     |report| {
@@ -2693,6 +2861,7 @@ where
                         &timing,
                         iterations,
                         &joint_motion,
+                        &torque_diagnostics,
                         RawClockRuntimeExitReason::CompensationFault,
                         error,
                         |report| {
@@ -2722,6 +2891,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::ControllerFault,
                     err.to_string(),
                     |report| {
@@ -2736,7 +2906,7 @@ where
             },
         };
         let collect_telemetry = cfg.telemetry_sink.is_some();
-        let controller_command = collect_telemetry.then(|| command.clone());
+        let controller_command = command.clone();
         if let Some(shaping_cfg) = &cfg.output_shaping {
             apply_output_shaping(
                 shaping_cfg,
@@ -2746,9 +2916,15 @@ where
                 &mut command,
             );
         }
-        let shaped_command = collect_telemetry.then(|| command.clone());
+        let shaped_command = command.clone();
         let final_torques = assemble_final_torques(&command, frame.compensation);
         joint_motion.record(&frame.snapshot, &command);
+        torque_diagnostics.record(
+            &frame.snapshot,
+            &controller_command,
+            &shaped_command,
+            &final_torques,
+        );
 
         let timing_telemetry = BilateralLoopTimingTelemetry {
             scheduler_tick_start_host_mono_us,
@@ -2787,6 +2963,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::SubmissionFault,
                     error.to_string(),
                     |report| {
@@ -2815,8 +2992,8 @@ where
         if let Some(sink) = cfg.telemetry_sink.as_ref() {
             let mut telemetry = crate::dual_arm::BilateralLoopTelemetry {
                 control_frame: frame,
-                controller_command: controller_command.expect("telemetry command clone exists"),
-                shaped_command: shaped_command.expect("telemetry shaped command clone exists"),
+                controller_command,
+                shaped_command,
                 compensation: frame.compensation,
                 gripper: gripper.expect("telemetry gripper exists"),
                 final_torques,
@@ -2837,6 +3014,7 @@ where
                     &timing,
                     iterations,
                     &joint_motion,
+                    &torque_diagnostics,
                     RawClockRuntimeExitReason::TelemetrySinkFault,
                     error.message,
                     |report| {
@@ -2860,13 +3038,14 @@ fn fault_report_from_timing(
     timing: &RawClockRuntimeTiming,
     iterations: usize,
     joint_motion: &RawClockJointMotionAccumulator,
+    torque_diagnostics: &RawClockTorqueDiagnosticsAccumulator,
     exit_reason: RawClockRuntimeExitReason,
     error: String,
     update: impl FnOnce(&mut RawClockRuntimeReport),
 ) -> RawClockRuntimeReport {
     let mut report = timing.report(piper_can::monotonic_micros(), iterations, Some(exit_reason));
     report.last_error = Some(error);
-    attach_joint_motion(&mut report, joint_motion);
+    attach_runtime_diagnostics(&mut report, joint_motion, torque_diagnostics);
     update(&mut report);
     report
 }
@@ -2893,11 +3072,13 @@ fn raw_clock_hold_command(
     }
 }
 
-fn attach_joint_motion(
+fn attach_runtime_diagnostics(
     report: &mut RawClockRuntimeReport,
     joint_motion: &RawClockJointMotionAccumulator,
+    torque_diagnostics: &RawClockTorqueDiagnosticsAccumulator,
 ) {
     report.joint_motion = joint_motion.snapshot();
+    report.torque_diagnostics = torque_diagnostics.snapshot();
 }
 
 fn submit_soft_realtime_command(
@@ -4655,6 +4836,22 @@ mod tests {
         ) -> std::result::Result<BilateralCommand, Self::Error> {
             let mut command = test_command();
             command.slave_position[3] = Rad(-snapshot.left.state.position[3].0);
+            Ok(command)
+        }
+    }
+
+    struct MirrorJ4TorqueController;
+
+    impl BilateralController for MirrorJ4TorqueController {
+        type Error = Infallible;
+
+        fn tick(
+            &mut self,
+            snapshot: &DualArmSnapshot,
+            _dt: Duration,
+        ) -> std::result::Result<BilateralCommand, Self::Error> {
+            let mut command = test_command();
+            command.master_interaction_torque[3] = NewtonMeter(-snapshot.left.state.position[3].0);
             Ok(command)
         }
     }
@@ -6530,6 +6727,52 @@ mod tests {
     }
 
     #[test]
+    fn raw_clock_torque_diagnostics_capture_feedback_command_and_final_ranges() {
+        let mut diagnostics = RawClockTorqueDiagnosticsAccumulator::default();
+        let mut snapshot = raw_dual_arm_snapshot(
+            &raw_clock_snapshot_for_tests(10_000, 110_000),
+            &raw_clock_snapshot_for_tests(20_000, 110_500),
+            500,
+        );
+        let mut controller_command = test_command();
+        let mut shaped_command = test_command();
+        let mut final_torques = BilateralFinalTorques {
+            master: JointArray::splat(NewtonMeter::ZERO),
+            slave: JointArray::splat(NewtonMeter::ZERO),
+        };
+
+        snapshot.right.state.torque[3] = NewtonMeter(1.0);
+        controller_command.master_interaction_torque[3] = NewtonMeter(0.20);
+        shaped_command.master_interaction_torque[3] = NewtonMeter(0.10);
+        final_torques.master[3] = NewtonMeter(0.15);
+        diagnostics.record(
+            &snapshot,
+            &controller_command,
+            &shaped_command,
+            &final_torques,
+        );
+
+        snapshot.right.state.torque[3] = NewtonMeter(3.0);
+        controller_command.master_interaction_torque[3] = NewtonMeter(-0.10);
+        shaped_command.master_interaction_torque[3] = NewtonMeter(0.05);
+        final_torques.master[3] = NewtonMeter(0.25);
+        diagnostics.record(
+            &snapshot,
+            &controller_command,
+            &shaped_command,
+            &final_torques,
+        );
+
+        let stats = diagnostics.snapshot().expect("torque diagnostics should be present");
+        assert_close(stats.slave_feedback_torque_delta_nm[3], 2.0);
+        assert_close(stats.controller_master_interaction_torque_delta_nm[3], 0.30);
+        assert_close(stats.shaped_master_interaction_torque_delta_nm[3], 0.05);
+        assert_close(stats.final_master_t_ref_delta_nm[3], 0.10);
+        assert_close(stats.slave_feedback_torque_min_nm[3], 1.0);
+        assert_close(stats.slave_feedback_torque_max_nm[3], 3.0);
+    }
+
+    #[test]
     fn raw_clock_runtime_report_includes_joint_motion_stats() {
         let (mut timing, first_host_us) = ready_timing_near_now_for_tests();
         push_alignment_sample_for_tests(
@@ -6589,6 +6832,52 @@ mod tests {
         assert_close(stats.master_feedback_delta_rad[3], 0.5);
         assert_close(stats.slave_command_delta_rad[3], 0.5);
         assert_close(stats.slave_feedback_delta_rad[3], 0.0);
+    }
+
+    #[test]
+    fn raw_clock_runtime_report_includes_torque_diagnostics_without_telemetry_sink() {
+        let (mut timing, first_host_us) = ready_timing_near_now_for_tests();
+        let mut seeded_master = raw_clock_snapshot_for_tests(10_000, first_host_us - 1_000);
+        seeded_master.state.position[3] = Rad(-0.2);
+        let mut seeded_slave = raw_clock_snapshot_for_tests(20_000, first_host_us - 1_000);
+        seeded_slave.state.torque[3] = NewtonMeter(1.0);
+        push_alignment_sample_for_tests(
+            &mut timing,
+            first_host_us - 1_000,
+            seeded_master,
+            first_host_us - 1_000,
+            seeded_slave,
+        );
+
+        let mut first_master = raw_clock_snapshot_for_tests(11_000, first_host_us);
+        first_master.state.position[3] = Rad(-0.6);
+        let mut first_slave = raw_clock_snapshot_for_tests(20_500, first_host_us);
+        first_slave.state.torque[3] = NewtonMeter(3.0);
+        let mut second_master = raw_clock_snapshot_for_tests(12_000, first_host_us + 1_000);
+        second_master.state.position[3] = Rad(-0.6);
+        let mut second_slave = raw_clock_snapshot_for_tests(21_500, first_host_us + 1_000);
+        second_slave.state.torque[3] = NewtonMeter(3.0);
+        let io = FakeRuntimeIo::new().with_reads([
+            FakeRead::pair(first_master, first_slave),
+            FakeRead::pair(second_master, second_slave),
+        ]);
+
+        let (_state, report) = run_fake_runtime_with_controller(
+            io,
+            timing,
+            2,
+            RawClockRuntimeThresholds {
+                alignment_lag_us: 1_000,
+                ..RawClockRuntimeThresholds::for_tests()
+            },
+            MirrorJ4TorqueController,
+        );
+
+        let stats = report.torque_diagnostics.expect("torque diagnostics should be present");
+        assert_close(stats.slave_feedback_torque_delta_nm[3], 2.0);
+        assert_close(stats.controller_master_interaction_torque_delta_nm[3], 0.4);
+        assert_close(stats.shaped_master_interaction_torque_delta_nm[3], 0.4);
+        assert_close(stats.final_master_t_ref_delta_nm[3], 0.4);
     }
 
     #[test]

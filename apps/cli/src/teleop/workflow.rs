@@ -35,8 +35,8 @@ use crate::teleop::controller::{
     RuntimeTeleopController, RuntimeTeleopSettings, RuntimeTeleopSettingsHandle,
 };
 use crate::teleop::report::{
-    ReportCalibration, ReportJointMotion, ReportTiming, TeleopExitStatus, TeleopJsonReport,
-    TeleopReportInput, classify_exit, print_human_report,
+    ReportCalibration, ReportJointMotion, ReportTiming, ReportTorqueDiagnostics, TeleopExitStatus,
+    TeleopJsonReport, TeleopReportInput, classify_exit, print_human_report,
 };
 use crate::teleop::target::{
     ConcreteTeleopTarget, RoleTargets, TeleopPlatform, resolve_role_targets,
@@ -417,6 +417,7 @@ where
         calibration: report_calibration,
         timing: None,
         joint_motion: None,
+        torque_diagnostics: None,
         faulted: loop_exit.faulted,
         report: &loop_exit.report,
     });
@@ -665,6 +666,7 @@ where
         calibration: report_calibration,
         timing: Some(timing.clone()),
         joint_motion: report_joint_motion_from_raw_clock(&loop_exit.report),
+        torque_diagnostics: report_torque_diagnostics_from_raw_clock(&loop_exit.report),
         faulted,
         report: &bilateral_report,
     });
@@ -761,6 +763,29 @@ fn report_joint_motion_from_raw_clock(report: &RawClockRuntimeReport) -> Option<
         slave_feedback_min_rad: stats.slave_feedback_min_rad,
         slave_feedback_max_rad: stats.slave_feedback_max_rad,
         slave_feedback_delta_rad: stats.slave_feedback_delta_rad,
+    })
+}
+
+fn report_torque_diagnostics_from_raw_clock(
+    report: &RawClockRuntimeReport,
+) -> Option<ReportTorqueDiagnostics> {
+    let stats = report.torque_diagnostics?;
+    Some(ReportTorqueDiagnostics {
+        slave_feedback_torque_min_nm: stats.slave_feedback_torque_min_nm,
+        slave_feedback_torque_max_nm: stats.slave_feedback_torque_max_nm,
+        slave_feedback_torque_delta_nm: stats.slave_feedback_torque_delta_nm,
+        controller_master_interaction_torque_min_nm: stats
+            .controller_master_interaction_torque_min_nm,
+        controller_master_interaction_torque_max_nm: stats
+            .controller_master_interaction_torque_max_nm,
+        controller_master_interaction_torque_delta_nm: stats
+            .controller_master_interaction_torque_delta_nm,
+        shaped_master_interaction_torque_min_nm: stats.shaped_master_interaction_torque_min_nm,
+        shaped_master_interaction_torque_max_nm: stats.shaped_master_interaction_torque_max_nm,
+        shaped_master_interaction_torque_delta_nm: stats.shaped_master_interaction_torque_delta_nm,
+        final_master_t_ref_min_nm: stats.final_master_t_ref_min_nm,
+        final_master_t_ref_max_nm: stats.final_master_t_ref_max_nm,
+        final_master_t_ref_delta_nm: stats.final_master_t_ref_delta_nm,
     })
 }
 
@@ -1573,6 +1598,7 @@ fn raw_clock_error_report(
         master: empty_raw_clock_health_for_error(),
         slave: empty_raw_clock_health_for_error(),
         joint_motion: None,
+        torque_diagnostics: None,
         max_inter_arm_skew_us: 0,
         inter_arm_skew_p95_us: 0,
         alignment_lag_us: 0,
@@ -3145,6 +3171,43 @@ mod tests {
     }
 
     #[test]
+    fn raw_clock_report_torque_diagnostics_maps_to_cli_report_shape() {
+        let report = RawClockRuntimeReport {
+            torque_diagnostics: Some(
+                piper_client::dual_arm_raw_clock::RawClockTorqueDiagnosticsStats {
+                    slave_feedback_torque_min_nm: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    slave_feedback_torque_max_nm: [0.0, 0.0, 0.0, 3.0, 0.0, 0.0],
+                    slave_feedback_torque_delta_nm: [0.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+                    controller_master_interaction_torque_min_nm: [0.0, 0.0, 0.0, -0.10, 0.0, 0.0],
+                    controller_master_interaction_torque_max_nm: [0.0, 0.0, 0.0, 0.20, 0.0, 0.0],
+                    controller_master_interaction_torque_delta_nm: [0.0, 0.0, 0.0, 0.30, 0.0, 0.0],
+                    shaped_master_interaction_torque_min_nm: [0.0, 0.0, 0.0, 0.05, 0.0, 0.0],
+                    shaped_master_interaction_torque_max_nm: [0.0, 0.0, 0.0, 0.10, 0.0, 0.0],
+                    shaped_master_interaction_torque_delta_nm: [0.0, 0.0, 0.0, 0.05, 0.0, 0.0],
+                    final_master_t_ref_min_nm: [0.0, 0.0, 0.0, 0.15, 0.0, 0.0],
+                    final_master_t_ref_max_nm: [0.0, 0.0, 0.0, 0.25, 0.0, 0.0],
+                    final_master_t_ref_delta_nm: [0.0, 0.0, 0.0, 0.10, 0.0, 0.0],
+                },
+            ),
+            ..raw_clock_report_success()
+        };
+
+        let diagnostics = report_torque_diagnostics_from_raw_clock(&report)
+            .expect("torque diagnostics should be mapped");
+
+        assert_eq!(diagnostics.slave_feedback_torque_delta_nm[3], 2.0);
+        assert_eq!(
+            diagnostics.controller_master_interaction_torque_delta_nm[3],
+            0.30
+        );
+        assert_eq!(
+            diagnostics.shaped_master_interaction_torque_delta_nm[3],
+            0.05
+        );
+        assert_eq!(diagnostics.final_master_t_ref_delta_nm[3], 0.10);
+    }
+
+    #[test]
     fn raw_clock_bilateral_report_preserves_submission_fault_contract() {
         let slave_failed = RawClockRuntimeReport {
             submission_faults: 1,
@@ -3515,6 +3578,7 @@ mod tests {
             master: raw_clock_health_for_tests(1.0, 12),
             slave: raw_clock_health_for_tests(1.5, 14),
             joint_motion: None,
+            torque_diagnostics: None,
             max_inter_arm_skew_us: 100,
             inter_arm_skew_p95_us: 80,
             alignment_lag_us: 5_000,

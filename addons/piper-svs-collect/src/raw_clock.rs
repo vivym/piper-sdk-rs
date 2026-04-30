@@ -802,6 +802,7 @@ mod tests {
                 }
             },
             joint_motion: None,
+            torque_diagnostics: None,
             max_inter_arm_skew_us: 4_321,
             inter_arm_skew_p95_us: 2_345,
             alignment_lag_us: 5_000,
@@ -918,6 +919,7 @@ mod tests {
             master: health(),
             slave: health(),
             joint_motion: None,
+            torque_diagnostics: None,
             max_inter_arm_skew_us: 0,
             inter_arm_skew_p95_us: 0,
             alignment_lag_us: 0,

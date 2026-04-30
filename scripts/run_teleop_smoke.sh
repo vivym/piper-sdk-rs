@@ -210,6 +210,15 @@ if [[ -f "${REPORT_JSON}" && -x "$(command -v jq 2>/dev/null)" ]]; then
                 slave_feedback: .metrics.joint_motion.slave_feedback_delta_rad[3]
             } else null end
         ),
+        j4_torque_delta_nm: (
+            if .metrics.torque_diagnostics then {
+                slave_feedback: .metrics.torque_diagnostics.slave_feedback_torque_delta_nm[3],
+                controller_master_interaction: .metrics.torque_diagnostics.controller_master_interaction_torque_delta_nm[3],
+                shaped_master_interaction: .metrics.torque_diagnostics.shaped_master_interaction_torque_delta_nm[3],
+                final_master_t_ref: .metrics.torque_diagnostics.final_master_t_ref_delta_nm[3]
+            } else null end
+        ),
+        torque_diagnostics: .metrics.torque_diagnostics,
         joint_motion: .metrics.joint_motion
     }' "${REPORT_JSON}"
 fi
