@@ -131,8 +131,11 @@ pub struct EventEntry {
     pub id: String,
     pub kind: String,
     pub created_at_unix_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub profile_identity_sha256: String,
+    pub profile_config_sha256_before: Option<String>,
+    pub profile_config_sha256_after: Option<String>,
+    pub round_id: Option<String>,
+    pub artifact_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub details: Value,
 }
@@ -297,8 +300,16 @@ impl EventEntry {
             id: id.into(),
             kind: "profile_config_changed".to_string(),
             created_at_unix_ms: 0,
-            message: Some("profile config changed".to_string()),
-            details: Value::Object(Default::default()),
+            profile_identity_sha256: "identity-hash".to_string(),
+            profile_config_sha256_before: Some("old-config-hash".to_string()),
+            profile_config_sha256_after: Some("config-hash".to_string()),
+            round_id: None,
+            artifact_ids: Vec::new(),
+            details: serde_json::json!({
+                "changed_sections": ["gate.strict_v1"],
+                "status_before": "passed",
+                "status_after": "ready_to_fit"
+            }),
         }
     }
 }
@@ -393,6 +404,20 @@ mod tests {
 
         assert_eq!(loaded.events.len(), 1);
         assert_eq!(loaded.schema_version, 1);
+        let event = &loaded.events[0];
+        assert_eq!(event.profile_identity_sha256, "identity-hash");
+        assert_eq!(
+            event.profile_config_sha256_before.as_deref(),
+            Some("old-config-hash")
+        );
+        assert_eq!(
+            event.profile_config_sha256_after.as_deref(),
+            Some("config-hash")
+        );
+        assert_eq!(event.round_id, None);
+        assert!(event.artifact_ids.is_empty());
+        let event_json = serde_json::to_value(event).unwrap();
+        assert!(event_json["message"].is_null());
     }
 
     #[test]
