@@ -183,7 +183,7 @@ impl ProfileConfig {
             bail!("replay.sample_ms must be > 0");
         }
         validate_positive_f64("fit.ridge_lambda", self.fit.ridge_lambda)?;
-        validate_ratio("fit.holdout_ratio", self.fit.holdout_ratio)?;
+        validate_holdout_ratio("fit.holdout_ratio", self.fit.holdout_ratio)?;
         validate_non_empty("fit.holdout_group_key", &self.fit.holdout_group_key)?;
 
         let strict = &self.gate.strict_v1;
@@ -200,11 +200,11 @@ impl ProfileConfig {
             "gate.strict_v1.min_validation_waypoints",
             strict.min_validation_waypoints,
         )?;
-        validate_finite_array(
+        validate_positive_f64_array(
             "gate.strict_v1.max_validation_p95_residual_nm",
             strict.max_validation_p95_residual_nm,
         )?;
-        validate_finite_array(
+        validate_positive_f64_array(
             "gate.strict_v1.max_validation_rms_residual_nm",
             strict.max_validation_rms_residual_nm,
         )?;
@@ -296,9 +296,16 @@ fn validate_ratio(field: &str, value: f64) -> Result<()> {
     Ok(())
 }
 
-fn validate_finite_array(field: &str, values: [f64; 6]) -> Result<()> {
-    if values.iter().any(|value| !value.is_finite()) {
-        bail!("{field} values must be finite");
+fn validate_holdout_ratio(field: &str, value: f64) -> Result<()> {
+    if !value.is_finite() || !(0.0..1.0).contains(&value) {
+        bail!("{field} must be finite and in [0.0, 1.0)");
+    }
+    Ok(())
+}
+
+fn validate_positive_f64_array(field: &str, values: [f64; 6]) -> Result<()> {
+    if values.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+        bail!("{field} values must be finite and > 0.0");
     }
     Ok(())
 }
@@ -411,6 +418,30 @@ mod tests {
 
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("arm_id"));
+    }
+
+    #[test]
+    fn config_rejects_holdout_ratio_one() {
+        let mut config = config_for_tests();
+        config.fit.holdout_ratio = 1.0;
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("fit.holdout_ratio"));
+    }
+
+    #[test]
+    fn config_rejects_non_positive_residual_thresholds() {
+        let mut p95_config = config_for_tests();
+        p95_config.gate.strict_v1.max_validation_p95_residual_nm[0] = 0.0;
+
+        let err = p95_config.validate().unwrap_err();
+        assert!(err.to_string().contains("gate.strict_v1.max_validation_p95_residual_nm"));
+
+        let mut rms_config = config_for_tests();
+        rms_config.gate.strict_v1.max_validation_rms_residual_nm[0] = -0.1;
+
+        let err = rms_config.validate().unwrap_err();
+        assert!(err.to_string().contains("gate.strict_v1.max_validation_rms_residual_nm"));
     }
 
     #[test]
