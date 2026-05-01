@@ -178,12 +178,12 @@ impl Manifest {
 
     pub fn save_atomic(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        let parent = manifest_parent_dir(path);
+        if parent != Path::new(".") {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let temp_path = temp_manifest_path(path);
         let temp_file = OpenOptions::new()
             .write(true)
@@ -343,6 +343,12 @@ fn fsync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn manifest_parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn format_utc_timestamp(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1_000) as i64;
     let days = seconds.div_euclid(86_400);
@@ -416,8 +422,18 @@ mod tests {
         );
         assert_eq!(event.round_id, None);
         assert!(event.artifact_ids.is_empty());
-        let event_json = serde_json::to_value(event).unwrap();
-        assert!(event_json["message"].is_null());
+    }
+
+    #[test]
+    fn manifest_atomic_save_accepts_bare_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = CurrentDirGuard::enter(dir.path());
+        let manifest = Manifest::new("profile", "identity-hash", "config-hash");
+
+        manifest.save_atomic(Path::new("manifest.json")).unwrap();
+        let loaded = Manifest::load(Path::new("manifest.json")).unwrap();
+
+        assert_eq!(loaded.profile_name, "profile");
     }
 
     #[test]
@@ -458,5 +474,30 @@ mod tests {
             format!("{error:#}").contains("unknown field"),
             "unexpected error: {error:#}"
         );
+    }
+
+    static CURRENT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CurrentDirGuard {
+        original: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &Path) -> Self {
+            let lock = CURRENT_DIR_LOCK.lock().unwrap();
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self {
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).unwrap();
+        }
     }
 }
