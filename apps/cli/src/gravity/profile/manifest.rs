@@ -1,10 +1,13 @@
 #![allow(dead_code)]
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::fs::File;
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,7 @@ pub enum Split {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: u32,
     pub profile_name: String,
@@ -46,6 +50,7 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactEntry {
     pub id: String,
     pub kind: String,
@@ -74,12 +79,14 @@ pub struct ArtifactEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PreviousPathEntry {
     pub split: Split,
     pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RoundEntry {
     pub id: String,
     pub status: ProfileStatus,
@@ -101,12 +108,14 @@ pub struct RoundEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RoundFailure {
     pub kind: String,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CurrentBestModel {
     pub round_id: String,
     pub path: String,
@@ -117,6 +126,7 @@ pub struct CurrentBestModel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EventEntry {
     pub id: String,
     pub kind: String,
@@ -310,10 +320,16 @@ fn unique_temp_suffix() -> u128 {
         .unwrap_or(0)
 }
 
+#[cfg(unix)]
 fn fsync_dir(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|dir| dir.sync_all())
         .with_context(|| format!("failed to sync directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn format_utc_timestamp(unix_ms: u64) -> String {
@@ -377,5 +393,24 @@ mod tests {
 
         assert_eq!(loaded.events.len(), 1);
         assert_eq!(loaded.schema_version, 1);
+    }
+
+    #[test]
+    fn manifest_load_rejects_unknown_top_level_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let mut json =
+            serde_json::to_value(Manifest::new("profile", "identity", "config")).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!(true));
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let error = Manifest::load(&path).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("unknown field"),
+            "unexpected error: {error:#}"
+        );
     }
 }

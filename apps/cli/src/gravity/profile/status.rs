@@ -79,6 +79,57 @@ mod tests {
     }
 
     #[test]
+    fn readiness_status_ignores_inactive_samples_and_non_sample_artifacts() {
+        let mut manifest = Manifest::new("profile", "identity", "config");
+        manifest.artifacts.push(ArtifactEntry::sample_for_tests(
+            "inactive-train",
+            Split::Train,
+            false,
+            10,
+            4,
+        ));
+        manifest.artifacts.push(ArtifactEntry::sample_for_tests(
+            "inactive-validation",
+            Split::Validation,
+            false,
+            8,
+            3,
+        ));
+
+        let mut train_path =
+            ArtifactEntry::sample_for_tests("active-train-path", Split::Train, true, 10, 4);
+        train_path.kind = "path".to_string();
+        manifest.artifacts.push(train_path);
+
+        let mut validation_path = ArtifactEntry::sample_for_tests(
+            "active-validation-path",
+            Split::Validation,
+            true,
+            8,
+            3,
+        );
+        validation_path.kind = "path".to_string();
+        manifest.artifacts.push(validation_path);
+
+        assert_eq!(
+            derive_readiness_status(&manifest),
+            ProfileStatus::NeedsTrainData
+        );
+
+        manifest.artifacts.push(ArtifactEntry::sample_for_tests(
+            "active-train",
+            Split::Train,
+            true,
+            10,
+            4,
+        ));
+        assert_eq!(
+            derive_readiness_status(&manifest),
+            ProfileStatus::NeedsValidationData
+        );
+    }
+
+    #[test]
     fn fit_failed_round_entry_allows_missing_model_and_report_outputs() {
         let round = RoundEntry::fit_failed_for_tests("round-0001", "solver singular matrix");
         let json = serde_json::to_value(&round).unwrap();
