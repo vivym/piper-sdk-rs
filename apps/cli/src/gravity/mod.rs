@@ -3,6 +3,7 @@ pub mod compensation;
 pub mod eval;
 pub mod fit;
 pub mod model;
+pub mod profile;
 pub mod record_path;
 pub mod replay_sample;
 

@@ -15,6 +15,81 @@ pub enum GravityAction {
     ReplaySample(GravityReplaySampleArgs),
     Fit(GravityFitArgs),
     Eval(GravityEvalArgs),
+    Profile(GravityProfileArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GravityProfileArgs {
+    #[command(subcommand)]
+    pub action: GravityProfileAction,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum GravityProfileAction {
+    Init(GravityProfileInitArgs),
+    Status(GravityProfilePathArgs),
+    Next(GravityProfilePathArgs),
+    RecordPath(GravityProfileRecordPathArgs),
+    ReplaySample(GravityProfileReplaySampleArgs),
+    ImportSamples(GravityProfileImportSamplesArgs),
+    FitAssess(GravityProfilePathArgs),
+    PromoteValidation(GravityProfilePathArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GravityProfilePathArgs {
+    #[arg(long)]
+    pub profile: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GravityProfileInitArgs {
+    #[arg(long)]
+    pub profile: Option<PathBuf>,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub role: String,
+    #[arg(long)]
+    pub arm_id: String,
+    #[arg(long)]
+    pub target: String,
+    #[arg(long)]
+    pub joint_map: String,
+    #[arg(long)]
+    pub load_profile: String,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GravityProfileRecordPathArgs {
+    #[arg(long)]
+    pub profile: PathBuf,
+    #[arg(long, value_parser = ["train", "validation"])]
+    pub split: String,
+    #[arg(long)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GravityProfileReplaySampleArgs {
+    #[arg(long)]
+    pub profile: PathBuf,
+    #[arg(long, value_parser = ["train", "validation"])]
+    pub split: String,
+    #[arg(long, default_value = "latest")]
+    pub path: String,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GravityProfileImportSamplesArgs {
+    #[arg(long)]
+    pub profile: PathBuf,
+    #[arg(long, value_parser = ["train", "validation"])]
+    pub split: String,
+    #[arg(long, required = true)]
+    pub samples: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -92,6 +167,7 @@ impl GravityCommand {
             GravityAction::ReplaySample(args) => crate::gravity::replay_sample::run(args).await,
             GravityAction::Fit(args) => crate::gravity::fit::run(args),
             GravityAction::Eval(args) => crate::gravity::eval::run(args),
+            GravityAction::Profile(args) => crate::gravity::profile::run(args).await,
         }
     }
 }
@@ -160,5 +236,58 @@ mod tests {
             },
             _ => panic!("expected record-path action"),
         }
+    }
+
+    #[test]
+    fn gravity_profile_init_command_parses_identity_and_target() {
+        let cmd = GravityCommand::try_parse_from([
+            "gravity",
+            "profile",
+            "init",
+            "--role",
+            "slave",
+            "--arm-id",
+            "piper-left",
+            "--target",
+            "socketcan:can1",
+            "--joint-map",
+            "identity",
+            "--load-profile",
+            "normal-gripper-d405",
+        ])
+        .expect("gravity profile init should parse");
+
+        match cmd.action {
+            GravityAction::Profile(args) => match args.action {
+                GravityProfileAction::Init(init) => {
+                    assert_eq!(init.arm_id, "piper-left");
+                    assert_eq!(init.target, "socketcan:can1");
+                    assert_eq!(init.name, None);
+                    assert_eq!(init.profile, None);
+                },
+                _ => panic!("expected profile init"),
+            },
+            _ => panic!("expected profile action"),
+        }
+    }
+
+    #[test]
+    fn gravity_profile_fit_assess_command_parses_profile_path() {
+        let cmd = GravityCommand::try_parse_from([
+            "gravity",
+            "profile",
+            "fit-assess",
+            "--profile",
+            "artifacts/gravity/profiles/slave-piper-left-normal-gripper-d405",
+        ])
+        .expect("gravity profile fit-assess should parse");
+
+        assert!(matches!(
+            cmd.action,
+            GravityAction::Profile(GravityProfileArgs {
+                action: GravityProfileAction::FitAssess(_),
+                ..
+            })
+        ));
     }
 }
