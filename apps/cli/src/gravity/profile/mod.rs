@@ -1,3 +1,4 @@
+pub mod artifacts;
 pub mod config;
 pub mod context;
 pub mod manifest;
@@ -19,8 +20,8 @@ pub async fn run(args: crate::commands::gravity::GravityProfileArgs) -> Result<(
         crate::commands::gravity::GravityProfileAction::ReplaySample(_) => {
             anyhow::bail!("gravity profile replay-sample is not implemented yet")
         },
-        crate::commands::gravity::GravityProfileAction::ImportSamples(_) => {
-            anyhow::bail!("gravity profile import-samples is not implemented yet")
+        crate::commands::gravity::GravityProfileAction::ImportSamples(args) => {
+            workflow::import_samples(args)
         },
         crate::commands::gravity::GravityProfileAction::FitAssess(_) => {
             anyhow::bail!("gravity profile fit-assess is not implemented yet")

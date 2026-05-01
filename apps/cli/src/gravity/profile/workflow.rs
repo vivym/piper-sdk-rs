@@ -7,8 +7,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    commands::gravity::{GravityProfileInitArgs, GravityProfilePathArgs},
+    commands::gravity::{
+        GravityProfileImportSamplesArgs, GravityProfileInitArgs, GravityProfilePathArgs,
+    },
     gravity::profile::{
+        artifacts::register_imported_samples,
         config::ProfileConfig,
         context::load_profile_context,
         manifest::{Manifest, ProfileStatus, Split},
@@ -147,6 +150,17 @@ pub fn print_next(args: GravityProfilePathArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn import_samples(args: GravityProfileImportSamplesArgs) -> Result<()> {
+    let split = parse_split(&args.split)?;
+    register_imported_samples(&args.profile, split, &args.samples)?;
+    println!(
+        "Imported {} samples artifact(s) into {}",
+        args.samples.len(),
+        args.profile.display()
+    );
+    Ok(())
+}
+
 pub(crate) fn resolve_init_profile_location(
     args: &GravityProfileInitArgs,
 ) -> Result<ResolvedInitProfileLocation> {
@@ -206,6 +220,14 @@ fn active_sample_counts(manifest: &Manifest) -> ActiveSampleCounts {
 fn status_label(status: ProfileStatus) -> Result<String> {
     let json = serde_json::to_string(&status).context("failed to serialize profile status")?;
     Ok(json.trim_matches('"').to_string())
+}
+
+fn parse_split(split: &str) -> Result<Split> {
+    match split {
+        "train" => Ok(Split::Train),
+        "validation" => Ok(Split::Validation),
+        _ => bail!("unsupported split {split:?}; expected \"train\" or \"validation\""),
+    }
 }
 
 #[cfg(test)]
