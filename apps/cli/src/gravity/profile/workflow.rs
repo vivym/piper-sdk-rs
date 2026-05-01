@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -146,16 +150,21 @@ pub fn print_next(args: GravityProfilePathArgs) -> Result<()> {
 pub(crate) fn resolve_init_profile_location(
     args: &GravityProfileInitArgs,
 ) -> Result<ResolvedInitProfileLocation> {
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    resolve_init_profile_location_from_cwd(args, &cwd)
+}
+
+fn resolve_init_profile_location_from_cwd(
+    args: &GravityProfileInitArgs,
+    cwd: &Path,
+) -> Result<ResolvedInitProfileLocation> {
     let name = args
         .name
         .clone()
         .unwrap_or_else(|| format!("{}-{}-{}", args.role, args.arm_id, args.load_profile));
     let profile_dir = match &args.profile {
         Some(profile) => profile.clone(),
-        None => std::env::current_dir()
-            .context("failed to resolve current directory")?
-            .join("artifacts/gravity/profiles")
-            .join(&name),
+        None => cwd.join("artifacts/gravity/profiles").join(&name),
     };
 
     Ok(ResolvedInitProfileLocation { name, profile_dir })
@@ -203,6 +212,10 @@ fn status_label(status: ProfileStatus) -> Result<String> {
 mod tests {
     use super::*;
     use crate::commands::gravity::GravityProfileInitArgs;
+    use crate::gravity::profile::{
+        config::ProfileConfig,
+        manifest::{Manifest, ProfileStatus},
+    };
 
     #[test]
     fn init_creates_profile_layout_config_and_manifest() {
@@ -230,21 +243,10 @@ mod tests {
     #[test]
     fn init_derives_default_name_and_profile_path() {
         let dir = tempfile::tempdir().unwrap();
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
 
-        let resolved = resolve_init_profile_location(&GravityProfileInitArgs {
-            profile: None,
-            name: None,
-            role: "slave".to_string(),
-            arm_id: "piper-left".to_string(),
-            target: "socketcan:can1".to_string(),
-            joint_map: "identity".to_string(),
-            load_profile: "normal-gripper-d405".to_string(),
-        })
-        .unwrap();
-
-        std::env::set_current_dir(current).unwrap();
+        let resolved =
+            resolve_init_profile_location_from_cwd(&init_args_without_profile(), dir.path())
+                .unwrap();
 
         assert_eq!(resolved.name, "slave-piper-left-normal-gripper-d405");
         assert_eq!(
@@ -264,6 +266,78 @@ mod tests {
         let err = init_profile(init_args_for_tests(profile)).unwrap_err();
 
         assert!(err.to_string().contains("manifest.json"));
+    }
+
+    #[test]
+    fn init_refuses_existing_profile_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("profile.toml"), "").unwrap();
+
+        let err = init_profile(init_args_for_tests(profile)).unwrap_err();
+
+        assert!(err.to_string().contains("profile.toml"));
+    }
+
+    #[test]
+    fn init_manifest_hashes_match_loaded_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+
+        init_profile(init_args_for_tests(profile.clone())).unwrap();
+
+        let config = ProfileConfig::load(profile.join("profile.toml")).unwrap();
+        let manifest = Manifest::load(profile.join("manifest.json")).unwrap();
+
+        assert_eq!(
+            manifest.profile_identity_sha256,
+            config.identity_sha256().unwrap()
+        );
+        assert_eq!(
+            manifest.profile_config_sha256,
+            config.config_sha256().unwrap()
+        );
+        assert_eq!(
+            manifest.profile_config_sections_sha256,
+            Some(config.section_sha256().unwrap())
+        );
+    }
+
+    #[test]
+    fn print_next_applies_context_loader_config_change_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        init_profile(init_args_for_tests(profile.clone())).unwrap();
+
+        let mut config = ProfileConfig::load(profile.join("profile.toml")).unwrap();
+        config.target = "socketcan:can0".to_string();
+        config.save(profile.join("profile.toml")).unwrap();
+
+        print_next(crate::commands::gravity::GravityProfilePathArgs {
+            profile: profile.clone(),
+        })
+        .unwrap();
+
+        let manifest = Manifest::load(profile.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.profile_config_sha256,
+            config.config_sha256().unwrap()
+        );
+        assert_eq!(manifest.status, ProfileStatus::NeedsTrainData);
+        assert!(manifest.events.iter().any(|event| event.kind == "profile_config_changed"));
+    }
+
+    fn init_args_without_profile() -> GravityProfileInitArgs {
+        GravityProfileInitArgs {
+            profile: None,
+            name: None,
+            role: "slave".to_string(),
+            arm_id: "piper-left".to_string(),
+            target: "socketcan:can1".to_string(),
+            joint_map: "identity".to_string(),
+            load_profile: "normal-gripper-d405".to_string(),
+        }
     }
 
     fn init_args_for_tests(profile: std::path::PathBuf) -> GravityProfileInitArgs {
