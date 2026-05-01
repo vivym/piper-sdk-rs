@@ -1,3 +1,5 @@
+pub mod config;
+
 use anyhow::Result;
 
 pub async fn run(args: crate::commands::gravity::GravityProfileArgs) -> Result<()> {
