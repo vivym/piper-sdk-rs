@@ -20,6 +20,8 @@ const FLUSH_EVERY_SAMPLES: u64 = 50;
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MIN_FREQUENCY_HZ: f64 = 0.001;
 const MAX_FREQUENCY_HZ: f64 = 1_000.0;
+const COMPLETE_POSITION_FRAME_MASK: u8 = 0b0000_0111;
+const COMPLETE_JOINT_MASK: u8 = 0b0011_1111;
 
 #[derive(Debug, Clone)]
 struct PathRecordingStats {
@@ -163,14 +165,15 @@ where
             break;
         }
 
-        let row = sample_observer_state(observer, sample_count);
-        write_jsonl_row(writer, &row)?;
-        sample_count += 1;
+        if let Some(row) = sample_observer_state(observer, sample_count) {
+            write_jsonl_row(writer, &row)?;
+            sample_count += 1;
 
-        if sample_count.is_multiple_of(FLUSH_EVERY_SAMPLES) {
-            writer.flush()?;
-            print!("\rrecorded {sample_count} path samples");
-            std::io::stdout().flush()?;
+            if sample_count.is_multiple_of(FLUSH_EVERY_SAMPLES) {
+                writer.flush()?;
+                print!("\rrecorded {sample_count} path samples");
+                std::io::stdout().flush()?;
+            }
         }
 
         let now = Instant::now();
@@ -197,7 +200,7 @@ fn sleep_until_or_cancelled(deadline: Instant, running: &Arc<AtomicBool>) {
 fn sample_observer_state<Capability>(
     observer: &Observer<Capability>,
     sample_index: u64,
-) -> PathSampleRow
+) -> Option<PathSampleRow>
 where
     Capability: CapabilityMarker,
 {
@@ -210,12 +213,16 @@ fn build_path_sample_row(
     sample_index: u64,
     position: piper_sdk::driver::JointPositionState,
     dynamic: Option<piper_sdk::driver::JointDynamicState>,
-) -> PathSampleRow {
+) -> Option<PathSampleRow> {
+    if position.frame_valid_mask != COMPLETE_POSITION_FRAME_MASK {
+        return None;
+    }
+
     let dynamic = dynamic.unwrap_or_default();
     let latest_raw_timestamp_us = position.hardware_timestamp_us.max(dynamic.group_timestamp_us);
     let raw_timestamp_us = (latest_raw_timestamp_us != 0).then_some(latest_raw_timestamp_us);
 
-    PathSampleRow {
+    Some(PathSampleRow {
         row_type: "path-sample".to_string(),
         sample_index,
         host_mono_us: position.host_rx_mono_us.max(dynamic.group_host_rx_mono_us),
@@ -223,10 +230,10 @@ fn build_path_sample_row(
         q_rad: position.joint_pos,
         dq_rad_s: dynamic.joint_vel,
         tau_nm: dynamic.get_all_torques(),
-        position_valid_mask: position.frame_valid_mask,
+        position_valid_mask: COMPLETE_JOINT_MASK,
         dynamic_valid_mask: dynamic.valid_mask,
         segment_id: None,
-    }
+    })
 }
 
 fn build_path_header(
@@ -387,15 +394,30 @@ mod tests {
             frame_valid_mask: 0b111,
         };
 
-        let row = build_path_sample_row(9, position, None);
+        let row = build_path_sample_row(9, position, None).unwrap();
 
         assert_eq!(row.sample_index, 9);
         assert_eq!(row.q_rad, position.joint_pos);
         assert_eq!(row.dq_rad_s, [0.0; 6]);
         assert_eq!(row.tau_nm, [0.0; 6]);
-        assert_eq!(row.position_valid_mask, 0b111);
+        assert_eq!(row.position_valid_mask, 0x3f);
         assert_eq!(row.dynamic_valid_mask, 0);
         assert_eq!(row.raw_timestamp_us, Some(123));
+    }
+
+    #[test]
+    fn path_sample_row_skips_incomplete_position_frame_group() {
+        let position = piper_sdk::driver::JointPositionState {
+            hardware_timestamp_us: 123,
+            host_rx_mono_us: 456,
+            raw_feedback_timing: None,
+            joint_pos: [0.1, 0.2, 0.0, 0.0, 0.0, 0.0],
+            frame_valid_mask: 0b001,
+        };
+
+        let row = build_path_sample_row(9, position, None);
+
+        assert!(row.is_none());
     }
 
     #[test]

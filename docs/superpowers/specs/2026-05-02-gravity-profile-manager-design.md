@@ -196,6 +196,7 @@ Top-level shape:
   "profile_config_sha256": "...",
   "status": "needs_train_data",
   "next_artifact_seq": 1,
+  "next_event_seq": 1,
   "next_round_seq": 1,
   "current_best_model": null,
   "artifacts": [],
@@ -209,6 +210,19 @@ On command startup, the manager recomputes both profile hashes. If
 the directory is for a different profile. If only `profile_config_sha256`
 differs, the manager records a config-change event and updates the manifest hash
 before running the requested action.
+
+Config changes are classified before updating the manifest:
+
+- identity changes: fail, because the directory describes a different profile
+- `target` and `replay` defaults: record a config-change event but keep the
+  current status and `current_best_model`
+- `fit` or `gate` changes: record a config-change event, keep
+  `current_best_model` as historical provenance, and invalidate the current
+  round-result status by recomputing data readiness from active samples
+
+After `fit` or `gate` changes, a previously `passed` profile normally becomes
+`ready_to_fit` when train and validation samples still exist. The operator must
+run `fit-assess` again before the status can return to `passed`.
 
 IDs are allocated monotonically from manifest counters. Round IDs use
 `round-0001`, `round-0002`, and so on. Artifact IDs use exactly
@@ -375,6 +389,33 @@ Each `rounds/round-N.json` file contains the full immutable round provenance:
 `validation_path_artifact_ids` contains the non-null `source_path_id` values for
 the validation sample artifacts used by that round. It may be empty when all
 validation samples were imported without known source paths.
+
+Event entries use a common envelope:
+
+```json
+{
+  "id": "event-0001",
+  "kind": "profile_config_changed",
+  "created_at_unix_ms": 1770000000000,
+  "profile_identity_sha256": "...",
+  "profile_config_sha256_before": "...",
+  "profile_config_sha256_after": "...",
+  "round_id": null,
+  "artifact_ids": [],
+  "details": {
+    "changed_sections": ["gate.strict_v1"],
+    "status_before": "passed",
+    "status_after": "ready_to_fit"
+  }
+}
+```
+
+Event IDs use `event-0001`, `event-0002`, and so on from
+`next_event_seq`. `validation_promoted` events set `round_id` to the source
+failed round and `artifact_ids` to the moved artifact IDs. Their `details`
+contain original and destination paths for each moved artifact. For non-config
+events, `profile_config_sha256_before` and `profile_config_sha256_after` may be
+`null`.
 
 ## CLI
 
@@ -657,6 +698,7 @@ Derived metrics:
   "validation_train_rms_ratio": [],
   "compensated_delta_ratio": [],
   "compensated_delta_ratio_meaningful": [true, true, true, true, true, true],
+  "meaningful_compensated_delta_joint_count": 6,
   "worst_joint_by_p95": "J3",
   "worst_joint_p95_nm": 1.62
 }
@@ -676,6 +718,7 @@ Decision:
       "threshold": 1.2
     }
   ],
+  "skipped_checks": [],
   "next_action": "promote_validation_then_collect_new_validation"
 }
 ```
@@ -692,8 +735,9 @@ bad    -> insufficient data, range violations, or large residuals
 Pass is true only for `good` or `usable`.
 
 The default good margin is 25 percent. A passing metric is `good` if it is at or
-below `0.75 * threshold`. Count and coverage minimums are `good` if they are at
-or above `1.25 * threshold`. The margin is configurable in `profile.toml`:
+below `0.75 * threshold`. Sample and waypoint count minimums are `good` if they
+are at or above `1.25 * threshold`. The margin is configurable in
+`profile.toml`:
 
 ```toml
 [gate.strict_v1]
@@ -737,8 +781,12 @@ The default `epsilon` is `gate.strict_v1.torque_delta_epsilon_nm`, initially
   `compensated_delta_ratio_meaningful[j] = false`, and skip that joint for the
   compensated-delta gate
 
-Skipping a near-zero joint is not a pass by itself; the model still must pass
-all residual and range gates.
+The report also records `meaningful_compensated_delta_joint_count`. If this
+count is zero, the compensated-delta check status is `skipped`, not `passed`.
+Skipped checks are omitted from `failed_checks`, but they must be visible in a
+separate `skipped_checks` list in the decision object. A skipped
+compensated-delta check does not block overall pass by itself; the model still
+must pass all residual and range gates.
 
 ## Iteration Policy
 
@@ -782,6 +830,8 @@ Unit tests should cover:
 - profile name and directory initialization
 - profile config parsing and validation
 - manifest round-trip and atomic write behavior
+- event schema and event counter allocation
+- config-change status invalidation rules
 - artifact registration and hash mismatch detection
 - split mismatch rejection
 - arm-id/joint-map/load-profile/torque-convention/basis mismatch rejection

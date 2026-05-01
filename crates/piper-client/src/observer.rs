@@ -300,6 +300,16 @@ where
         &self,
         policy: MonitorReadPolicy,
     ) -> Result<JointArray<Rad>> {
+        let latest_complete = self.joint_position_state_with_policy(policy)?;
+
+        Ok(JointArray::new(latest_complete.joint_pos.map(Rad)))
+    }
+
+    /// 获取关节位置底层状态（完整且新鲜的监控快照）
+    pub fn joint_position_state_with_policy(
+        &self,
+        policy: MonitorReadPolicy,
+    ) -> Result<piper_driver::JointPositionState> {
         let joint_pos = self.driver.get_joint_position_monitor_snapshot();
         let latest_complete = Self::fresh_joint_position_state(
             &joint_pos,
@@ -307,7 +317,7 @@ where
             policy,
         )?;
 
-        Ok(JointArray::new(latest_complete.joint_pos.map(Rad)))
+        Ok(*latest_complete)
     }
 
     /// 获取最近一份完整关节位置监控快照（允许过期）
@@ -339,11 +349,21 @@ where
         &self,
         policy: MonitorReadPolicy,
     ) -> Result<JointArray<RadPerSecond>> {
+        let latest_complete = self.joint_dynamic_state_with_policy(policy)?;
+
+        Ok(JointArray::new(latest_complete.joint_vel.map(RadPerSecond)))
+    }
+
+    /// 获取关节动态底层状态（完整且新鲜的监控快照）
+    pub fn joint_dynamic_state_with_policy(
+        &self,
+        policy: MonitorReadPolicy,
+    ) -> Result<piper_driver::JointDynamicState> {
         let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
         let latest_complete =
             Self::fresh_joint_dynamic_state(&dyn_state, MonitorStateSource::JointDynamic, policy)?;
 
-        Ok(JointArray::new(latest_complete.joint_vel.map(RadPerSecond)))
+        Ok(*latest_complete)
     }
 
     /// 获取最近一份完整关节速度监控快照（允许过期）
@@ -371,9 +391,7 @@ where
         &self,
         policy: MonitorReadPolicy,
     ) -> Result<JointArray<NewtonMeter>> {
-        let dyn_state = self.driver.get_joint_dynamic_monitor_snapshot();
-        let latest_complete =
-            Self::fresh_joint_dynamic_state(&dyn_state, MonitorStateSource::JointDynamic, policy)?;
+        let latest_complete = self.joint_dynamic_state_with_policy(policy)?;
 
         Ok(JointArray::new(
             latest_complete.get_all_torques().map(NewtonMeter),
@@ -2090,9 +2108,14 @@ mod tests {
         let positions = observer
             .joint_positions()
             .expect("latest complete snapshot should stay readable");
+        let position_state = observer
+            .joint_position_state_with_policy(MonitorReadPolicy::default())
+            .expect("latest complete position state should stay readable");
         let raw = observer.raw_joint_position_state();
 
         assert_eq!(positions, JointArray::splat(Rad(0.0)));
+        assert_eq!(position_state.frame_valid_mask, 0b111);
+        assert_eq!(position_state.joint_pos, [0.0; 6]);
         assert_eq!(raw.frame_valid_mask, 0b001);
         assert!(raw.joint_pos[0] > 0.0);
     }
@@ -2119,9 +2142,14 @@ mod tests {
         let velocities = observer
             .joint_velocities()
             .expect("latest complete snapshot should stay readable");
+        let dynamic_state = observer
+            .joint_dynamic_state_with_policy(MonitorReadPolicy::default())
+            .expect("latest complete dynamic state should stay readable");
         let raw = observer.raw_joint_dynamic_state();
 
         assert_eq!(velocities, JointArray::splat(RadPerSecond(1.0)));
+        assert_eq!(dynamic_state.valid_mask, 0b11_1111);
+        assert_eq!(dynamic_state.joint_vel, [1.0; 6]);
         assert_eq!(raw.valid_mask, 0b000001);
         assert_eq!(raw.joint_vel[0], 2.0);
     }

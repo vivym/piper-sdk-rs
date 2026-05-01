@@ -5,7 +5,7 @@ use crate::gravity::artifact::{
     write_jsonl_row,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use piper_client::observer::Observer;
+use piper_client::observer::{MonitorReadPolicy, Observer};
 use piper_client::state::{
     Active, CapabilityMarker, DisableConfig, MitMode, MitModeConfig, MitPassthroughMode, Piper,
     SoftRealtime, Standby, StrictCapability, StrictRealtime,
@@ -42,6 +42,7 @@ const REPLAY_SAMPLE_FREQUENCY_HZ: f64 = 100.0;
 const DEFAULT_STABLE_VELOCITY_RAD_S: f64 = 0.01;
 const DEFAULT_STABLE_TRACKING_ERROR_RAD: f64 = 0.03;
 const DEFAULT_STABLE_TORQUE_STD_NM: f64 = 0.08;
+const COMPLETE_POSITION_FRAME_MASK: u8 = 0x07;
 const CONSERVATIVE_MIT_SPEED_PERCENT: u8 = 10;
 const CONSERVATIVE_KP: f64 = 8.0;
 const CONSERVATIVE_KD: f64 = 1.0;
@@ -1308,8 +1309,15 @@ fn replay_snapshot_from_observer<Capability>(
 where
     Capability: CapabilityMarker,
 {
-    let position = observer.raw_joint_position_state();
-    let dynamic = observer.raw_joint_dynamic_state();
+    let policy = MonitorReadPolicy {
+        max_feedback_age: ACTIVE_MAX_FEEDBACK_AGE,
+    };
+    let position = observer
+        .joint_position_state_with_policy(policy)
+        .context("failed to read complete position feedback")?;
+    let dynamic = observer
+        .joint_dynamic_state_with_policy(policy)
+        .context("failed to read complete dynamic feedback")?;
     let now_us = piper_sdk::driver::heartbeat::monotonic_micros();
     replay_snapshot_from_states(position, dynamic, now_us, ACTIVE_MAX_FEEDBACK_AGE)
 }
@@ -1320,7 +1328,7 @@ fn replay_snapshot_from_states(
     now_us: u64,
     max_feedback_age: Duration,
 ) -> Result<ReplaySnapshot> {
-    if (position.frame_valid_mask & COMPLETE_JOINT_MASK) != COMPLETE_JOINT_MASK {
+    if position.frame_valid_mask != COMPLETE_POSITION_FRAME_MASK {
         bail!(
             "position feedback incomplete: mask={:#04x}",
             position.frame_valid_mask
@@ -1354,7 +1362,7 @@ fn replay_snapshot_from_states(
         q_rad: position.joint_pos,
         dq_rad_s: dynamic.joint_vel,
         tau_nm: dynamic.get_all_torques(),
-        position_valid_mask: position.frame_valid_mask,
+        position_valid_mask: COMPLETE_JOINT_MASK,
         dynamic_valid_mask: dynamic.valid_mask,
     })
 }
@@ -1852,7 +1860,7 @@ mod tests {
         let stale_host_us = now_us - max_age.as_micros() as u64 - 1;
 
         let stale_position = replay_snapshot_from_states(
-            replay_position_state(stale_host_us, 0x3f),
+            replay_position_state(stale_host_us, 0x07),
             replay_dynamic_state(fresh_host_us, 0x3f),
             now_us,
             max_age,
@@ -1861,7 +1869,7 @@ mod tests {
         assert!(stale_position.to_string().contains("position"));
 
         let stale_dynamic = replay_snapshot_from_states(
-            replay_position_state(fresh_host_us, 0x3f),
+            replay_position_state(fresh_host_us, 0x07),
             replay_dynamic_state(stale_host_us, 0x3f),
             now_us,
             max_age,
@@ -1870,12 +1878,25 @@ mod tests {
         assert!(stale_dynamic.to_string().contains("dynamic"));
 
         replay_snapshot_from_states(
-            replay_position_state(fresh_host_us, 0x3f),
+            replay_position_state(fresh_host_us, 0x07),
             replay_dynamic_state(fresh_host_us, 0x3f),
             now_us,
             max_age,
         )
         .expect("fresh complete feedback streams should be accepted");
+    }
+
+    #[test]
+    fn replay_snapshot_accepts_complete_position_frame_group_as_all_joints() {
+        let snapshot = replay_snapshot_from_states(
+            replay_position_state(1_000_000, 0x07),
+            replay_dynamic_state(1_000_000, 0x3f),
+            1_000_000,
+            Duration::from_millis(200),
+        )
+        .expect("complete 0x2A5-0x2A7 position frame group should be accepted");
+
+        assert_eq!(snapshot.position_valid_mask, 0x3f);
     }
 
     #[test]
