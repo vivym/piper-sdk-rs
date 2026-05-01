@@ -233,7 +233,6 @@ impl ProfileConfig {
 
     pub fn identity_sha256(&self) -> Result<String> {
         let identity = ProfileIdentityHash {
-            name: &self.name,
             role: &self.role,
             arm_id: &self.arm_id,
             joint_map: &self.joint_map,
@@ -251,7 +250,6 @@ impl ProfileConfig {
 
 #[derive(Serialize)]
 struct ProfileIdentityHash<'a> {
-    name: &'a str,
     role: &'a str,
     arm_id: &'a str,
     joint_map: &'a str,
@@ -392,6 +390,22 @@ mod tests {
         assert_ne!(
             left.identity_sha256().unwrap(),
             right.identity_sha256().unwrap()
+        );
+    }
+
+    #[test]
+    fn identity_hash_ignores_name_but_config_hash_does_not() {
+        let left = config_for_tests();
+        let mut right = config_for_tests();
+        right.name = "display-name-only".to_string();
+
+        assert_eq!(
+            left.identity_sha256().unwrap(),
+            right.identity_sha256().unwrap()
+        );
+        assert_ne!(
+            left.config_sha256().unwrap(),
+            right.config_sha256().unwrap()
         );
     }
 
