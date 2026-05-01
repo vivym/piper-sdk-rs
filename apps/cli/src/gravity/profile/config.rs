@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::gravity::profile::manifest::ProfileConfigSectionHashes;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
@@ -245,6 +247,16 @@ impl ProfileConfig {
 
     pub fn config_sha256(&self) -> Result<String> {
         sha256_canonical_json(self)
+    }
+
+    pub fn section_sha256(&self) -> Result<ProfileConfigSectionHashes> {
+        Ok(ProfileConfigSectionHashes {
+            name: sha256_canonical_json(&self.name)?,
+            target: sha256_canonical_json(&self.target)?,
+            replay: sha256_canonical_json(&self.replay)?,
+            fit: sha256_canonical_json(&self.fit)?,
+            gate_strict_v1: sha256_canonical_json(&self.gate.strict_v1)?,
+        })
     }
 }
 
@@ -553,5 +565,21 @@ mod tests {
         write_canonical_json(&serde_json::json!([1, 2]), &mut canonical).unwrap();
 
         assert_eq!(canonical, "[1,2]");
+    }
+
+    #[test]
+    fn config_section_hashes_identify_changed_sections() {
+        let left = config_for_tests();
+        let mut right = config_for_tests();
+        right.target = "socketcan:can0".to_string();
+
+        let left_sections = left.section_sha256().unwrap();
+        let right_sections = right.section_sha256().unwrap();
+
+        assert_eq!(left_sections.name, right_sections.name);
+        assert_ne!(left_sections.target, right_sections.target);
+        assert_eq!(left_sections.replay, right_sections.replay);
+        assert_eq!(left_sections.fit, right_sections.fit);
+        assert_eq!(left_sections.gate_strict_v1, right_sections.gate_strict_v1);
     }
 }

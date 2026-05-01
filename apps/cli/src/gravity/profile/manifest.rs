@@ -39,6 +39,8 @@ pub struct Manifest {
     pub profile_name: String,
     pub profile_identity_sha256: String,
     pub profile_config_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_config_sections_sha256: Option<ProfileConfigSectionHashes>,
     pub status: ProfileStatus,
     pub next_artifact_seq: u64,
     pub next_event_seq: u64,
@@ -47,6 +49,17 @@ pub struct Manifest {
     pub artifacts: Vec<ArtifactEntry>,
     pub rounds: Vec<RoundEntry>,
     pub events: Vec<EventEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfigSectionHashes {
+    pub name: String,
+    pub target: String,
+    pub replay: String,
+    pub fit: String,
+    #[serde(rename = "gate.strict_v1")]
+    pub gate_strict_v1: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -151,6 +164,7 @@ impl Manifest {
             profile_name: profile_name.into(),
             profile_identity_sha256: profile_identity_sha256.into(),
             profile_config_sha256: profile_config_sha256.into(),
+            profile_config_sections_sha256: None,
             status: ProfileStatus::NeedsTrainData,
             next_artifact_seq: 1,
             next_event_seq: 1,
@@ -535,6 +549,42 @@ mod tests {
         assert!(
             format!("{error:#}").contains("unknown field"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn manifest_load_accepts_missing_profile_config_section_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let mut json =
+            serde_json::to_value(Manifest::new("profile", "identity", "config")).unwrap();
+        json.as_object_mut().unwrap().remove("profile_config_sections_sha256");
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let manifest = Manifest::load(&path).unwrap();
+
+        assert!(manifest.profile_config_sections_sha256.is_none());
+    }
+
+    #[test]
+    fn manifest_round_trip_preserves_profile_config_section_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let mut manifest = Manifest::new("profile", "identity", "config");
+        manifest.profile_config_sections_sha256 = Some(ProfileConfigSectionHashes {
+            name: "name-hash".to_string(),
+            target: "target-hash".to_string(),
+            replay: "replay-hash".to_string(),
+            fit: "fit-hash".to_string(),
+            gate_strict_v1: "gate-hash".to_string(),
+        });
+
+        manifest.save_atomic(&path).unwrap();
+        let loaded = Manifest::load(&path).unwrap();
+
+        assert_eq!(
+            loaded.profile_config_sections_sha256.unwrap().gate_strict_v1,
+            "gate-hash"
         );
     }
 

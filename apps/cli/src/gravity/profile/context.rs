@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::gravity::profile::{
     config::ProfileConfig,
-    manifest::{EventEntry, Manifest, ProfileStatus},
+    manifest::{EventEntry, Manifest, ProfileConfigSectionHashes, ProfileStatus},
     status::derive_readiness_status,
 };
 
@@ -33,9 +33,18 @@ pub fn load_profile_context(profile_dir: &Path) -> Result<ProfileContext> {
     }
 
     let config_sha256 = config.config_sha256()?;
+    let section_hashes = config.section_sha256()?;
     let mut mutated = false;
     if manifest.profile_config_sha256 != config_sha256 {
-        apply_config_change(&config, &mut manifest, &identity_sha256, &config_sha256)?;
+        apply_config_change(
+            &mut manifest,
+            &identity_sha256,
+            &config_sha256,
+            section_hashes,
+        )?;
+        mutated = true;
+    } else if manifest.profile_config_sections_sha256.is_none() {
+        manifest.profile_config_sections_sha256 = Some(section_hashes);
         mutated = true;
     }
 
@@ -69,25 +78,26 @@ pub fn save_profile_context(context: &ProfileContext) -> Result<()> {
 }
 
 fn apply_config_change(
-    config: &ProfileConfig,
     manifest: &mut Manifest,
     identity_sha256: &str,
     config_sha256: &str,
+    section_hashes: ProfileConfigSectionHashes,
 ) -> Result<()> {
     let previous_config_sha256 = manifest.profile_config_sha256.clone();
     let status_before = manifest.status;
-    let changed_sections = changed_config_sections(config, manifest)?;
+    let changed_sections = changed_config_sections(
+        manifest.profile_config_sections_sha256.as_ref(),
+        &section_hashes,
+    );
 
-    if changed_sections
-        .iter()
-        .any(|section| matches!(section.as_str(), "fit" | "gate.strict_v1"))
-    {
+    if config_change_invalidates_round_status(&changed_sections) {
         manifest.status = derive_readiness_status(manifest);
     }
 
     let event_id = manifest.next_event_id();
     let status_after = manifest.status;
     manifest.profile_config_sha256 = config_sha256.to_string();
+    manifest.profile_config_sections_sha256 = Some(section_hashes);
     manifest.events.push(EventEntry {
         id: event_id,
         kind: "profile_config_changed".to_string(),
@@ -106,37 +116,43 @@ fn apply_config_change(
     Ok(())
 }
 
-fn changed_config_sections(config: &ProfileConfig, manifest: &Manifest) -> Result<Vec<String>> {
-    let default_config = ProfileConfig::new(
-        &config.name,
-        &config.role,
-        &config.arm_id,
-        &config.target,
-        &config.joint_map,
-        &config.load_profile,
-    );
+fn changed_config_sections(
+    previous: Option<&ProfileConfigSectionHashes>,
+    current: &ProfileConfigSectionHashes,
+) -> Vec<String> {
+    let Some(previous) = previous else {
+        return vec!["legacy_unknown".to_string()];
+    };
+
     let mut changed_sections = Vec::new();
 
-    if config.fit != default_config.fit {
+    if previous.name != current.name {
+        changed_sections.push("name".to_string());
+    }
+    if previous.target != current.target {
+        changed_sections.push("target".to_string());
+    }
+    if previous.replay != current.replay {
+        changed_sections.push("replay".to_string());
+    }
+    if previous.fit != current.fit {
         changed_sections.push("fit".to_string());
     }
-
-    let gate_changed = match manifest.rounds.last() {
-        Some(round) => {
-            serde_json::to_value(&config.gate).context("failed to serialize gate config")?
-                != round.gate_config
-        },
-        None => config.gate != default_config.gate,
-    };
-    if gate_changed {
+    if previous.gate_strict_v1 != current.gate_strict_v1 {
         changed_sections.push("gate.strict_v1".to_string());
     }
 
     if changed_sections.is_empty() {
-        changed_sections.push("target_or_replay".to_string());
+        changed_sections.push("unknown".to_string());
     }
 
-    Ok(changed_sections)
+    changed_sections
+}
+
+fn config_change_invalidates_round_status(changed_sections: &[String]) -> bool {
+    changed_sections
+        .iter()
+        .any(|section| !matches!(section.as_str(), "name" | "target" | "replay"))
 }
 
 fn status_json(status: ProfileStatus) -> Result<Value> {
@@ -187,6 +203,7 @@ mod tests {
                 config.identity_sha256().unwrap(),
                 config.config_sha256().unwrap(),
             );
+            manifest.profile_config_sections_sha256 = Some(config.section_sha256().unwrap());
             manifest.status = status;
             if status == ProfileStatus::Passed {
                 manifest.artifacts.push(ArtifactEntry::sample_for_tests(
@@ -240,6 +257,23 @@ mod tests {
             let mut config = config_for_tests();
             config.gate.strict_v1.min_validation_samples = min_validation_samples;
             config.save(self.profile_dir.join("profile.toml")).unwrap();
+        }
+
+        fn write_custom_fit_config_with_section_hashes(&self) {
+            let mut config = config_for_tests();
+            config.fit.ridge_lambda = 0.25;
+            config.save(self.profile_dir.join("profile.toml")).unwrap();
+
+            let mut manifest = Manifest::load(self.profile_dir.join("manifest.json")).unwrap();
+            manifest.profile_config_sha256 = config.config_sha256().unwrap();
+            manifest.profile_config_sections_sha256 = Some(config.section_sha256().unwrap());
+            manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
+        }
+
+        fn remove_section_hashes(&self) {
+            let mut manifest = Manifest::load(self.profile_dir.join("manifest.json")).unwrap();
+            manifest.profile_config_sections_sha256 = None;
+            manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
         }
     }
 
@@ -297,6 +331,74 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| event.kind == "profile_config_changed")
+        );
+    }
+
+    #[test]
+    fn target_change_with_preexisting_custom_fit_preserves_round_status() {
+        let fixture = ProfileFixture::new_passed();
+        fixture.write_custom_fit_config_with_section_hashes();
+
+        let mut config = ProfileConfig::load(fixture.profile_dir().join("profile.toml")).unwrap();
+        config.target = "socketcan:can0".to_string();
+        config.save(fixture.profile_dir().join("profile.toml")).unwrap();
+
+        let context = load_profile_context(fixture.profile_dir()).unwrap();
+
+        assert_eq!(context.manifest.status, ProfileStatus::Passed);
+        assert!(context.manifest.current_best_model.is_some());
+        let event = context.manifest.events.last().unwrap();
+        assert_eq!(
+            event.details["changed_sections"],
+            serde_json::json!(["target"])
+        );
+    }
+
+    #[test]
+    fn missing_section_hashes_with_config_mismatch_conservatively_recomputes_status() {
+        let fixture = ProfileFixture::new_passed();
+        fixture.remove_section_hashes();
+        fixture.write_config_with_target("socketcan:can0");
+
+        let context = load_profile_context(fixture.profile_dir()).unwrap();
+
+        assert_eq!(context.manifest.status, ProfileStatus::ReadyToFit);
+        assert!(context.manifest.current_best_model.is_some());
+        let event = context.manifest.events.last().unwrap();
+        assert_eq!(
+            event.details["changed_sections"],
+            serde_json::json!(["legacy_unknown"])
+        );
+        assert!(context.manifest.profile_config_sections_sha256.is_some());
+    }
+
+    #[test]
+    fn unchanged_config_backfills_missing_section_hashes_without_event() {
+        let fixture = ProfileFixture::new_passed();
+        fixture.remove_section_hashes();
+
+        let context = load_profile_context(fixture.profile_dir()).unwrap();
+
+        assert_eq!(context.manifest.status, ProfileStatus::Passed);
+        assert!(context.manifest.profile_config_sections_sha256.is_some());
+        assert!(context.manifest.events.is_empty());
+    }
+
+    #[test]
+    fn name_only_change_preserves_status_and_updates_profile_name() {
+        let fixture = ProfileFixture::new_passed();
+        let mut config = config_for_tests();
+        config.name = "renamed-profile".to_string();
+        config.save(fixture.profile_dir().join("profile.toml")).unwrap();
+
+        let context = load_profile_context(fixture.profile_dir()).unwrap();
+
+        assert_eq!(context.manifest.status, ProfileStatus::Passed);
+        assert_eq!(context.manifest.profile_name, "renamed-profile");
+        let event = context.manifest.events.last().unwrap();
+        assert_eq!(
+            event.details["changed_sections"],
+            serde_json::json!(["name"])
         );
     }
 }
