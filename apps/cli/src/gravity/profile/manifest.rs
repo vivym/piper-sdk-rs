@@ -200,13 +200,7 @@ impl Manifest {
             .sync_all()
             .with_context(|| format!("failed to sync {}", temp_path.display()))?;
 
-        fs::rename(&temp_path, path).with_context(|| {
-            format!(
-                "failed to rename {} to {}",
-                temp_path.display(),
-                path.display()
-            )
-        })?;
+        replace_file_atomic(&temp_path, path)?;
         fsync_dir(parent)?;
         Ok(())
     }
@@ -349,6 +343,60 @@ fn manifest_parent_dir(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+#[cfg(not(windows))]
+fn replace_file_atomic(temp_path: &Path, path: &Path) -> Result<()> {
+    fs::rename(temp_path, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp_path.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn replace_file_atomic(temp_path: &Path, path: &Path) -> Result<()> {
+    let temp_path_wide = path_to_wide(temp_path);
+    let path_wide = path_to_wide(path);
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+
+    // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers that live for
+    // the duration of the call, and the flags request an atomic replacement.
+    let replaced = unsafe { move_file_ex_w(temp_path_wide.as_ptr(), path_wide.as_ptr(), flags) };
+    if replaced == 0 {
+        let result: std::io::Result<()> = Err(std::io::Error::last_os_error());
+        return result.with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn path_to_wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+#[cfg(windows)]
+unsafe extern "system" {
+    #[link_name = "MoveFileExW"]
+    fn move_file_ex_w(existing_file_name: *const u16, new_file_name: *const u16, flags: u32)
+    -> i32;
+}
+
 fn format_utc_timestamp(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1_000) as i64;
     let days = seconds.div_euclid(86_400);
@@ -434,6 +482,20 @@ mod tests {
         let loaded = Manifest::load(Path::new("manifest.json")).unwrap();
 
         assert_eq!(loaded.profile_name, "profile");
+    }
+
+    #[test]
+    fn manifest_atomic_save_replaces_existing_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let first = Manifest::new("profile-one", "identity-hash", "config-hash");
+        let second = Manifest::new("profile-two", "identity-hash", "config-hash");
+
+        first.save_atomic(&path).unwrap();
+        second.save_atomic(&path).unwrap();
+        let loaded = Manifest::load(&path).unwrap();
+
+        assert_eq!(loaded.profile_name, "profile-two");
     }
 
     #[test]
