@@ -1,4 +1,6 @@
 pub mod config;
+pub mod manifest;
+pub mod status;
 
 use anyhow::Result;
 
