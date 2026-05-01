@@ -34,6 +34,8 @@ pub struct SamplesHeader {
     pub source_path: String,
     pub source_sha256: String,
     pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_id: Option<String>,
     pub target: String,
     pub joint_map: String,
     pub load_profile: String,
@@ -59,6 +61,8 @@ pub struct PathHeader {
     pub artifact_kind: String,
     pub schema_version: u32,
     pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_id: Option<String>,
     pub target: String,
     pub joint_map: String,
     pub load_profile: String,
@@ -140,6 +144,7 @@ impl PathHeader {
             artifact_kind: PATH_ARTIFACT_KIND.to_string(),
             schema_version: SCHEMA_VERSION,
             role: role.into(),
+            arm_id: None,
             target: target.into(),
             joint_map: joint_map.into(),
             load_profile: load_profile.into(),
@@ -347,6 +352,7 @@ fn validate_samples_header(header: &SamplesHeader, path: &Path) -> Result<()> {
     if header.role.trim().is_empty() {
         bail!("{} role must not be empty", path.display());
     }
+    validate_optional_non_empty_header_field(path, "arm_id", header.arm_id.as_deref())?;
     if header.target.trim().is_empty() {
         bail!("{} target must not be empty", path.display());
     }
@@ -422,6 +428,7 @@ fn validate_path_header(header: &PathHeader, path: &Path) -> Result<()> {
     if header.role.trim().is_empty() {
         bail!("{} role must not be empty", path.display());
     }
+    validate_optional_non_empty_header_field(path, "arm_id", header.arm_id.as_deref())?;
     if header.target.trim().is_empty() {
         bail!("{} target must not be empty", path.display());
     }
@@ -442,6 +449,17 @@ fn validate_path_header(header: &PathHeader, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_optional_non_empty_header_field(
+    path: &Path,
+    name: &str,
+    value: Option<&str>,
+) -> Result<()> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        bail!("{} {name} must not be empty when present", path.display());
+    }
+    Ok(())
+}
+
 fn validate_header_matches(
     loaded_header: Option<&SamplesHeader>,
     header: &SamplesHeader,
@@ -457,6 +475,14 @@ fn validate_header_matches(
             path.display(),
             header.role,
             first_header.role
+        );
+    }
+    if first_header.arm_id != header.arm_id {
+        bail!(
+            "{} arm_id {:?} does not match first artifact arm_id {:?}",
+            path.display(),
+            header.arm_id,
+            first_header.arm_id
         );
     }
     if first_header.joint_map != header.joint_map {
@@ -618,6 +644,7 @@ mod tests {
             artifact_kind: "path".to_string(),
             schema_version: 1,
             role: "slave".to_string(),
+            arm_id: None,
             target: "socketcan:can0".to_string(),
             joint_map: "identity".to_string(),
             load_profile: "normal-gripper-d405".to_string(),
@@ -639,6 +666,7 @@ mod tests {
             crate::gravity::TORQUE_CONVENTION
         );
         assert_eq!(value["notes"], "operator note");
+        assert!(value.get("arm_id").is_none());
     }
 
     #[test]
@@ -835,6 +863,62 @@ mod tests {
         assert_eq!(loaded.rows[0].waypoint_id, 7);
         assert_eq!(loaded.rows[0].segment_id.as_deref(), Some("seg-a"));
         assert_eq!(loaded.rows[0].pass_direction, PassDirection::Forward);
+    }
+
+    #[test]
+    fn sample_reader_accepts_legacy_missing_arm_id_and_preserves_present_arm_id() {
+        let dir = tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.samples.jsonl");
+        std::fs::write(
+            &legacy_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"quasi-static-samples\",\"schema_version\":1,\"source_path\":\"p.jsonl\",\"source_sha256\":\"abc\",\"role\":\"slave\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\",\"frequency_hz\":100.0,\"max_velocity_rad_s\":0.08,\"max_step_rad\":0.02,\"settle_ms\":500,\"sample_ms\":300,\"stable_velocity_rad_s\":0.01,\"stable_tracking_error_rad\":0.03,\"stable_torque_std_nm\":0.08,\"waypoint_count\":1,\"accepted_waypoint_count\":1,\"rejected_waypoint_count\":0}\n",
+                "{\"type\":\"quasi-static-sample\",\"waypoint_id\":7,\"segment_id\":\"seg-a\",\"pass_direction\":\"forward\",\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":63,\"dynamic_valid_mask\":63,\"stable_velocity_rad_s\":0.0,\"stable_tracking_error_rad\":0.0,\"stable_torque_std_nm\":0.0}\n"
+            ),
+        )
+        .unwrap();
+        let arm_path = dir.path().join("arm.samples.jsonl");
+        std::fs::write(
+            &arm_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"quasi-static-samples\",\"schema_version\":1,\"source_path\":\"p.jsonl\",\"source_sha256\":\"abc\",\"role\":\"slave\",\"arm_id\":\"piper-left\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\",\"frequency_hz\":100.0,\"max_velocity_rad_s\":0.08,\"max_step_rad\":0.02,\"settle_ms\":500,\"sample_ms\":300,\"stable_velocity_rad_s\":0.01,\"stable_tracking_error_rad\":0.03,\"stable_torque_std_nm\":0.08,\"waypoint_count\":1,\"accepted_waypoint_count\":1,\"rejected_waypoint_count\":0}\n",
+                "{\"type\":\"quasi-static-sample\",\"waypoint_id\":7,\"segment_id\":\"seg-a\",\"pass_direction\":\"forward\",\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":63,\"dynamic_valid_mask\":63,\"stable_velocity_rad_s\":0.0,\"stable_tracking_error_rad\":0.0,\"stable_torque_std_nm\":0.0}\n"
+            ),
+        )
+        .unwrap();
+
+        let legacy = read_quasi_static_samples(&[legacy_path]).unwrap();
+        let with_arm = read_quasi_static_samples(&[arm_path]).unwrap();
+
+        assert_eq!(legacy.header.arm_id, None);
+        assert_eq!(with_arm.header.arm_id.as_deref(), Some("piper-left"));
+    }
+
+    #[test]
+    fn multi_file_arm_id_mismatch_is_reported_before_row_errors() {
+        let dir = tempdir().unwrap();
+        let first_path = dir.path().join("first.jsonl");
+        let second_path = dir.path().join("second.jsonl");
+        std::fs::write(
+            &first_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"quasi-static-samples\",\"schema_version\":1,\"source_path\":\"p.jsonl\",\"source_sha256\":\"abc\",\"role\":\"slave\",\"arm_id\":\"piper-left\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\",\"frequency_hz\":100.0,\"max_velocity_rad_s\":0.08,\"max_step_rad\":0.02,\"settle_ms\":500,\"sample_ms\":300,\"stable_velocity_rad_s\":0.01,\"stable_tracking_error_rad\":0.03,\"stable_torque_std_nm\":0.08,\"waypoint_count\":1,\"accepted_waypoint_count\":1,\"rejected_waypoint_count\":0}\n",
+                "{\"type\":\"quasi-static-sample\",\"waypoint_id\":1,\"segment_id\":\"seg-a\",\"pass_direction\":\"forward\",\"host_mono_us\":1,\"q_rad\":[0,0,0,0,0,0],\"dq_rad_s\":[0,0,0,0,0,0],\"tau_nm\":[1,2,3,4,5,6],\"position_valid_mask\":63,\"dynamic_valid_mask\":63,\"stable_velocity_rad_s\":0.0,\"stable_tracking_error_rad\":0.0,\"stable_torque_std_nm\":0.0}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_path,
+            concat!(
+                "{\"type\":\"header\",\"artifact_kind\":\"quasi-static-samples\",\"schema_version\":1,\"source_path\":\"p.jsonl\",\"source_sha256\":\"abc\",\"role\":\"slave\",\"arm_id\":\"piper-right\",\"target\":\"socketcan:can0\",\"joint_map\":\"identity\",\"load_profile\":\"load\",\"torque_convention\":\"piper-sdk-normalized-nm-v1\",\"frequency_hz\":100.0,\"max_velocity_rad_s\":0.08,\"max_step_rad\":0.02,\"settle_ms\":500,\"sample_ms\":300,\"stable_velocity_rad_s\":0.01,\"stable_tracking_error_rad\":0.03,\"stable_torque_std_nm\":0.08,\"waypoint_count\":1,\"accepted_waypoint_count\":1,\"rejected_waypoint_count\":0}\n",
+                "{\"type\":\"quasi-static-sample\"\n"
+            ),
+        )
+        .unwrap();
+
+        let err = read_quasi_static_samples(&[first_path, second_path]).unwrap_err();
+
+        assert!(err.to_string().contains("arm_id"), "{err:#}");
     }
 
     #[test]

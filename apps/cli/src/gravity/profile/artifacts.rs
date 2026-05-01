@@ -65,7 +65,7 @@ pub fn analyze_path_artifact(path: &Path) -> Result<ArtifactSummary> {
         kind: ArtifactKind::Path,
         sha256: file_sha256(path)?,
         role: loaded.header.role,
-        arm_id: None,
+        arm_id: loaded.header.arm_id,
         target: loaded.header.target,
         joint_map: loaded.header.joint_map,
         load_profile: loaded.header.load_profile,
@@ -82,7 +82,7 @@ pub fn analyze_samples_artifact(path: &Path) -> Result<ArtifactSummary> {
         kind: ArtifactKind::Samples,
         sha256: file_sha256(path)?,
         role: loaded.header.role,
-        arm_id: None,
+        arm_id: loaded.header.arm_id,
         target: loaded.header.target,
         joint_map: loaded.header.joint_map,
         load_profile: loaded.header.load_profile,
@@ -318,6 +318,38 @@ mod tests {
     }
 
     #[test]
+    fn analyze_samples_propagates_optional_arm_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = write_samples_artifact_with_arm_id_for_tests(
+            dir.path(),
+            "arm.samples.jsonl",
+            "piper-left",
+        );
+
+        let summary = analyze_samples_artifact(&samples).unwrap();
+
+        assert_eq!(summary.arm_id.as_deref(), Some("piper-left"));
+    }
+
+    #[test]
+    fn validate_artifact_summary_rejects_arm_id_mismatch() {
+        let config = ProfileConfig::new(
+            "profile",
+            "slave",
+            "piper-left",
+            "socketcan:can1",
+            "identity",
+            "normal-gripper-d405",
+        );
+        let mut summary = ArtifactSummary::sample_for_tests();
+        summary.arm_id = Some("piper-right".to_string());
+
+        let err = validate_artifact_summary(&config, &summary).unwrap_err();
+
+        assert!(err.to_string().contains("arm_id"));
+    }
+
+    #[test]
     fn register_samples_rejects_identity_mismatch() {
         let config = ProfileConfig::new(
             "profile",
@@ -466,6 +498,36 @@ mod tests {
         sample_count: usize,
         waypoint_count: usize,
     ) -> PathBuf {
+        write_samples_artifact_with_optional_arm_id_for_tests(
+            dir,
+            name,
+            sample_count,
+            waypoint_count,
+            None,
+        )
+    }
+
+    fn write_samples_artifact_with_arm_id_for_tests(
+        dir: &Path,
+        name: &str,
+        arm_id: &str,
+    ) -> PathBuf {
+        write_samples_artifact_with_optional_arm_id_for_tests(
+            dir,
+            name,
+            12,
+            4,
+            Some(arm_id.to_string()),
+        )
+    }
+
+    fn write_samples_artifact_with_optional_arm_id_for_tests(
+        dir: &Path,
+        name: &str,
+        sample_count: usize,
+        waypoint_count: usize,
+        arm_id: Option<String>,
+    ) -> PathBuf {
         let path = dir.join(name);
         let mut file = std::fs::File::create(&path).unwrap();
         let header = SamplesHeader {
@@ -475,6 +537,7 @@ mod tests {
             source_path: "legacy.path.jsonl".to_string(),
             source_sha256: "source-sha256".to_string(),
             role: "slave".to_string(),
+            arm_id,
             target: "socketcan:can1".to_string(),
             joint_map: "identity".to_string(),
             load_profile: "normal-gripper-d405".to_string(),

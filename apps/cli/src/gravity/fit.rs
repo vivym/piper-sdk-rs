@@ -718,6 +718,7 @@ mod tests {
             source_path: "synthetic".to_string(),
             source_sha256: "synthetic".to_string(),
             role: "slave".to_string(),
+            arm_id: None,
             target: "synthetic".to_string(),
             joint_map: "piper_default".to_string(),
             load_profile: "unloaded".to_string(),

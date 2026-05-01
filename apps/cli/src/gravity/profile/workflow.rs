@@ -373,4 +373,90 @@ mod tests {
             load_profile: "normal-gripper-d405".to_string(),
         }
     }
+
+    mod import {
+        use std::path::{Path, PathBuf};
+
+        use super::*;
+        use crate::{
+            commands::gravity::GravityProfileImportSamplesArgs,
+            gravity::{
+                artifact::{PassDirection, QuasiStaticSampleRow, SamplesHeader, write_jsonl_row},
+                profile::manifest::Split,
+            },
+        };
+
+        #[test]
+        fn import_samples_registers_train_artifact_and_updates_readiness() {
+            let dir = tempfile::tempdir().unwrap();
+            let profile = dir.path().join("profile");
+            init_profile(init_args_for_tests(profile.clone())).unwrap();
+            let samples = write_samples_artifact_for_tests(dir.path(), "train.samples.jsonl");
+
+            import_samples(GravityProfileImportSamplesArgs {
+                profile: profile.clone(),
+                split: "train".to_string(),
+                samples: vec![samples],
+            })
+            .unwrap();
+
+            let manifest = Manifest::load(profile.join("manifest.json")).unwrap();
+            assert_eq!(manifest.status, ProfileStatus::NeedsValidationData);
+            let artifact = manifest.artifacts.first().unwrap();
+            assert_eq!(artifact.kind, "samples");
+            assert_eq!(artifact.split, Split::Train);
+            assert!(profile.join(&artifact.path).exists());
+        }
+
+        fn write_samples_artifact_for_tests(dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            let mut file = std::fs::File::create(&path).unwrap();
+            let header = SamplesHeader {
+                row_type: "header".to_string(),
+                artifact_kind: "quasi-static-samples".to_string(),
+                schema_version: 1,
+                source_path: "legacy.path.jsonl".to_string(),
+                source_sha256: "source-sha256".to_string(),
+                role: "slave".to_string(),
+                arm_id: None,
+                target: "socketcan:can1".to_string(),
+                joint_map: "identity".to_string(),
+                load_profile: "normal-gripper-d405".to_string(),
+                torque_convention: crate::gravity::TORQUE_CONVENTION.to_string(),
+                frequency_hz: 100.0,
+                max_velocity_rad_s: 0.08,
+                max_step_rad: 0.02,
+                settle_ms: 500,
+                sample_ms: 300,
+                stable_velocity_rad_s: 0.01,
+                stable_tracking_error_rad: 0.03,
+                stable_torque_std_nm: 0.08,
+                waypoint_count: 1,
+                accepted_waypoint_count: 1,
+                rejected_waypoint_count: 0,
+            };
+            write_jsonl_row(&mut file, &header).unwrap();
+            write_jsonl_row(&mut file, &sample_row_for_tests()).unwrap();
+            path
+        }
+
+        fn sample_row_for_tests() -> QuasiStaticSampleRow {
+            QuasiStaticSampleRow {
+                row_type: "quasi-static-sample".to_string(),
+                waypoint_id: 0,
+                segment_id: Some("seg-a".to_string()),
+                pass_direction: PassDirection::Forward,
+                host_mono_us: 0,
+                raw_timestamp_us: None,
+                q_rad: [0.0; 6],
+                dq_rad_s: [0.0; 6],
+                tau_nm: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                position_valid_mask: 63,
+                dynamic_valid_mask: 63,
+                stable_velocity_rad_s: 0.0,
+                stable_tracking_error_rad: 0.0,
+                stable_torque_std_nm: 0.0,
+            }
+        }
+    }
 }
