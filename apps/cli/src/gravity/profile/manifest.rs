@@ -136,7 +136,7 @@ pub struct EventEntry {
     pub profile_config_sha256_after: Option<String>,
     pub round_id: Option<String>,
     pub artifact_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Value::is_null")]
+    #[serde(default)]
     pub details: Value,
 }
 
@@ -418,6 +418,27 @@ mod tests {
         assert!(event.artifact_ids.is_empty());
         let event_json = serde_json::to_value(event).unwrap();
         assert!(event_json["message"].is_null());
+    }
+
+    #[test]
+    fn event_details_null_serializes_as_present_null_field() {
+        let event = EventEntry {
+            id: "event-0001".to_string(),
+            kind: "validation_promoted".to_string(),
+            created_at_unix_ms: 0,
+            profile_identity_sha256: "identity-hash".to_string(),
+            profile_config_sha256_before: None,
+            profile_config_sha256_after: None,
+            round_id: Some("round-0001".to_string()),
+            artifact_ids: vec!["samples-1".to_string()],
+            details: Value::Null,
+        };
+
+        let event_json = serde_json::to_value(&event).unwrap();
+        let event_object = event_json.as_object().unwrap();
+
+        assert!(event_object.contains_key("details"));
+        assert!(event_json["details"].is_null());
     }
 
     #[test]
