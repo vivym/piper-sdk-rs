@@ -170,6 +170,13 @@ pub fn register_imported_samples(
             .with_context(|| format!("failed to analyze {}", destination.display()))?;
         validate_artifact_summary(&context.config, &copied_summary)?;
         reject_active_other_split_duplicate(&context.manifest, split, &copied_summary)?;
+        let (arm_id, arm_id_source) = match copied_summary.arm_id.clone() {
+            Some(arm_id) => (arm_id, Some("artifact_header".to_string())),
+            None => (
+                context.config.arm_id.clone(),
+                Some("legacy_import_profile_asserted".to_string()),
+            ),
+        };
 
         context.manifest.artifacts.push(ArtifactEntry {
             id: artifact_id,
@@ -180,8 +187,8 @@ pub fn register_imported_samples(
             sha256: copied_summary.sha256,
             source_path_id: None,
             role: copied_summary.role,
-            arm_id: context.config.arm_id.clone(),
-            arm_id_source: Some("legacy_import_profile_asserted".to_string()),
+            arm_id,
+            arm_id_source,
             target: copied_summary.target,
             joint_map: copied_summary.joint_map,
             load_profile: copied_summary.load_profile,
@@ -388,6 +395,30 @@ mod tests {
             artifact.arm_id_source.as_deref(),
             Some("legacy_import_profile_asserted")
         );
+    }
+
+    #[test]
+    fn import_with_arm_id_records_artifact_header_arm_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let samples = write_samples_artifact_with_arm_id_for_tests(
+            dir.path(),
+            "arm.samples.jsonl",
+            "piper-left",
+        );
+
+        import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![samples],
+        })
+        .unwrap();
+
+        let manifest = fixture.load_manifest();
+        let artifact =
+            manifest.artifacts.iter().find(|artifact| artifact.kind == "samples").unwrap();
+        assert_eq!(artifact.arm_id, "piper-left");
+        assert_eq!(artifact.arm_id_source.as_deref(), Some("artifact_header"));
     }
 
     #[test]
