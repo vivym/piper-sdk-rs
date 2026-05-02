@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod assessment;
 pub mod config;
 pub mod context;
 pub mod holdout;
