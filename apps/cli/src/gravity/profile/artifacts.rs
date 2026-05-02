@@ -125,6 +125,10 @@ pub fn verify_registered_artifacts(profile_dir: &Path, artifacts: &[ArtifactEntr
     Ok(())
 }
 
+pub fn registered_artifact_path(profile_dir: &Path, artifact: &ArtifactEntry) -> Result<PathBuf> {
+    resolve_registered_artifact_path(profile_dir, &artifact.path)
+}
+
 fn resolve_registered_artifact_path(profile_dir: &Path, artifact_path: &str) -> Result<PathBuf> {
     let relative = Path::new(artifact_path);
     if relative.is_absolute()
@@ -152,6 +156,89 @@ fn resolve_registered_artifact_path(profile_dir: &Path, artifact_path: &str) -> 
         );
     }
     Ok(resolved)
+}
+
+pub fn register_profile_generated_path(
+    profile_dir: &Path,
+    split: Split,
+    artifact_id: &str,
+    output_path: &Path,
+    unix_ms: u64,
+) -> Result<()> {
+    let mut context = load_profile_context(profile_dir)?;
+    let summary = analyze_path_artifact(output_path)
+        .with_context(|| format!("failed to analyze {}", output_path.display()))?;
+    if summary.kind != ArtifactKind::Path {
+        bail!("expected path artifact summary");
+    }
+    validate_artifact_summary(&context.config, &summary)?;
+    let relative_path = profile_relative_artifact_path(&context.profile_dir, output_path)?;
+    reserve_planned_artifact_id(&mut context.manifest, "path", artifact_id, unix_ms)?;
+
+    context.manifest.artifacts.push(profile_generated_entry(
+        &context.config,
+        GeneratedArtifactEntryInput {
+            id: artifact_id.to_string(),
+            kind: "path".to_string(),
+            split,
+            path: relative_path,
+            source_path_id: None,
+            unix_ms,
+        },
+        summary,
+    ));
+    context
+        .manifest
+        .save_atomic(profile_dir.join("manifest.json"))
+        .with_context(|| {
+            format!(
+                "failed to save {}",
+                profile_dir.join("manifest.json").display()
+            )
+        })
+}
+
+pub fn register_profile_generated_samples(
+    profile_dir: &Path,
+    split: Split,
+    artifact_id: &str,
+    source_path_id: &str,
+    output_path: &Path,
+    unix_ms: u64,
+) -> Result<()> {
+    let mut context = load_profile_context(profile_dir)?;
+    let summary = analyze_samples_artifact(output_path)
+        .with_context(|| format!("failed to analyze {}", output_path.display()))?;
+    if summary.kind != ArtifactKind::Samples {
+        bail!("expected samples artifact summary");
+    }
+    validate_artifact_summary(&context.config, &summary)?;
+    reject_active_other_split_duplicate(&context.manifest, split, &summary)?;
+    let relative_path = profile_relative_artifact_path(&context.profile_dir, output_path)?;
+    reserve_planned_artifact_id(&mut context.manifest, "samples", artifact_id, unix_ms)?;
+
+    context.manifest.artifacts.push(profile_generated_entry(
+        &context.config,
+        GeneratedArtifactEntryInput {
+            id: artifact_id.to_string(),
+            kind: "samples".to_string(),
+            split,
+            path: relative_path,
+            source_path_id: Some(source_path_id.to_string()),
+            unix_ms,
+        },
+        summary,
+    ));
+    context.manifest.status = derive_readiness_status(&context.manifest);
+    context
+        .manifest
+        .save_atomic(profile_dir.join("manifest.json"))
+        .with_context(|| {
+            format!(
+                "failed to save {}",
+                profile_dir.join("manifest.json").display()
+            )
+        })
 }
 
 pub fn register_imported_samples(
@@ -264,6 +351,96 @@ fn reject_active_other_split_duplicate(
     Ok(())
 }
 
+fn reserve_planned_artifact_id(
+    manifest: &mut Manifest,
+    kind: &str,
+    artifact_id: &str,
+    unix_ms: u64,
+) -> Result<()> {
+    if manifest.artifacts.iter().any(|artifact| artifact.id == artifact_id) {
+        bail!("artifact id {artifact_id:?} is already registered");
+    }
+
+    let allocated = manifest.next_artifact_id(kind, unix_ms);
+    if allocated != artifact_id {
+        bail!("planned artifact id {artifact_id:?} no longer matches next id {allocated:?}");
+    }
+    Ok(())
+}
+
+struct GeneratedArtifactEntryInput {
+    id: String,
+    kind: String,
+    split: Split,
+    path: String,
+    source_path_id: Option<String>,
+    unix_ms: u64,
+}
+
+fn profile_generated_entry(
+    config: &ProfileConfig,
+    input: GeneratedArtifactEntryInput,
+    summary: ArtifactSummary,
+) -> ArtifactEntry {
+    ArtifactEntry {
+        id: input.id,
+        kind: input.kind,
+        split: input.split,
+        active: true,
+        path: input.path,
+        sha256: summary.sha256,
+        source_path_id: input.source_path_id,
+        role: summary.role,
+        arm_id: config.arm_id.clone(),
+        arm_id_source: Some("profile_generated".to_string()),
+        target: summary.target,
+        joint_map: summary.joint_map,
+        load_profile: summary.load_profile,
+        torque_convention: summary.torque_convention,
+        basis: config.basis.clone(),
+        sample_count: summary.sample_count,
+        waypoint_count: Some(summary.waypoint_count),
+        created_at_unix_ms: input.unix_ms,
+        promoted_from_round_id: None,
+        previous_paths: Vec::new(),
+    }
+}
+
+fn profile_relative_artifact_path(profile_dir: &Path, path: &Path) -> Result<String> {
+    let relative = match path.strip_prefix(profile_dir) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => {
+            let canonical_profile = profile_dir
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize {}", profile_dir.display()))?;
+            let canonical_path = path
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+            canonical_path
+                .strip_prefix(&canonical_profile)
+                .with_context(|| {
+                    format!(
+                        "{} is not under profile directory {}",
+                        path.display(),
+                        profile_dir.display()
+                    )
+                })?
+                .to_path_buf()
+        },
+    };
+
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        bail!("unsafe generated artifact path {}", path.display());
+    }
+
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
 fn validate_field(name: &str, expected: &str, actual: &str) -> Result<()> {
     if expected != actual {
         bail!("{name} mismatch: profile has {expected:?}, artifact has {actual:?}");
@@ -318,7 +495,7 @@ mod tests {
             },
             profile::{
                 config::ProfileConfig,
-                manifest::Manifest,
+                manifest::{Manifest, Split},
                 workflow::{import_samples, init_profile},
             },
         },
@@ -528,6 +705,73 @@ mod tests {
         assert!(err.to_string().contains("unsafe"));
     }
 
+    #[test]
+    fn register_generated_path_records_profile_generated_arm_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let artifact_id = "path-20260502-001530-0001";
+        let path = fixture
+            .profile_dir()
+            .join("data/train/paths")
+            .join(format!("{artifact_id}.path.jsonl"));
+        let path_dir = path.parent().unwrap();
+        std::fs::create_dir_all(path_dir).unwrap();
+        write_path_artifact_for_tests(path_dir, &format!("{artifact_id}.path.jsonl"), 4);
+
+        register_profile_generated_path(
+            fixture.profile_dir(),
+            Split::Train,
+            artifact_id,
+            &path,
+            unix_ms_for_tests(),
+        )
+        .unwrap();
+
+        let manifest = fixture.load_manifest();
+        let artifact = manifest.artifacts.first().unwrap();
+        assert_eq!(artifact.kind, "path");
+        assert_eq!(artifact.arm_id, "piper-left");
+        assert_eq!(artifact.arm_id_source.as_deref(), Some("profile_generated"));
+    }
+
+    #[test]
+    fn register_generated_samples_records_source_path_and_profile_generated_arm_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let artifact_id = "samples-20260502-001530-0001";
+        let samples = fixture
+            .profile_dir()
+            .join("data/train/samples")
+            .join(format!("{artifact_id}.samples.jsonl"));
+        std::fs::create_dir_all(samples.parent().unwrap()).unwrap();
+        write_samples_artifact_for_tests(
+            samples.parent().unwrap(),
+            &format!("{artifact_id}.samples.jsonl"),
+            12,
+            4,
+        );
+
+        register_profile_generated_samples(
+            fixture.profile_dir(),
+            Split::Train,
+            artifact_id,
+            "path-20260502-001000-0001",
+            &samples,
+            unix_ms_for_tests(),
+        )
+        .unwrap();
+
+        let manifest = fixture.load_manifest();
+        let artifact = manifest.artifacts.first().unwrap();
+        assert_eq!(artifact.kind, "samples");
+        assert_eq!(
+            artifact.source_path_id.as_deref(),
+            Some("path-20260502-001000-0001")
+        );
+        assert_eq!(artifact.arm_id, "piper-left");
+        assert_eq!(artifact.arm_id_source.as_deref(), Some("profile_generated"));
+    }
+
     struct ProfileFixture {
         _temp_dir: tempfile::TempDir,
         profile_dir: PathBuf,
@@ -587,6 +831,10 @@ mod tests {
         fn load_manifest(&self) -> Manifest {
             Manifest::load(self.profile_dir.join("manifest.json")).unwrap()
         }
+    }
+
+    fn unix_ms_for_tests() -> u64 {
+        1_777_680_930_000
     }
 
     fn write_samples_artifact_for_tests(

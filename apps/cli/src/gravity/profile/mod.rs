@@ -14,11 +14,11 @@ pub async fn run(args: crate::commands::gravity::GravityProfileArgs) -> Result<(
             workflow::print_status(args)
         },
         crate::commands::gravity::GravityProfileAction::Next(args) => workflow::print_next(args),
-        crate::commands::gravity::GravityProfileAction::RecordPath(_) => {
-            anyhow::bail!("gravity profile record-path is not implemented yet")
+        crate::commands::gravity::GravityProfileAction::RecordPath(args) => {
+            workflow::record_path(args).await
         },
-        crate::commands::gravity::GravityProfileAction::ReplaySample(_) => {
-            anyhow::bail!("gravity profile replay-sample is not implemented yet")
+        crate::commands::gravity::GravityProfileAction::ReplaySample(args) => {
+            workflow::replay_sample(args).await
         },
         crate::commands::gravity::GravityProfileAction::ImportSamples(args) => {
             workflow::import_samples(args)
