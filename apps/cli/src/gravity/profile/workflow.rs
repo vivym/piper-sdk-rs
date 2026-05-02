@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
-    io::{BufWriter, Write},
+    io::{BufWriter, ErrorKind, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1195,6 +1195,16 @@ fn write_bytes_create_new_via_temp(
     parent: &Path,
     bytes: &[u8],
 ) -> Result<()> {
+    write_bytes_create_new_via_temp_with_hook(path, temp_path, parent, bytes, || Ok(()))
+}
+
+fn write_bytes_create_new_via_temp_with_hook(
+    path: &Path,
+    temp_path: &Path,
+    parent: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1214,14 +1224,26 @@ fn write_bytes_create_new_via_temp(
     if path.exists() {
         bail!("{} already exists; refusing to overwrite", path.display());
     }
-    fs::rename(temp_path, path).with_context(|| {
-        format!(
-            "failed to rename temporary {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
+    before_publish()?;
+    match fs::hard_link(temp_path, path) {
+        Ok(()) => {},
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            bail!("{} already exists; refusing to overwrite", path.display());
+        },
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to publish temporary {} to {}",
+                    temp_path.display(),
+                    path.display()
+                )
+            });
+        },
+    }
     fsync_output_dir(parent)?;
+    if fs::remove_file(temp_path).is_ok() {
+        fsync_output_dir(parent)?;
+    }
     Ok(())
 }
 
@@ -1733,6 +1755,33 @@ mod tests {
 
         assert!(err.to_string().contains("already exists"), "{err:#}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing");
+    }
+
+    #[test]
+    fn fit_assess_atomic_create_new_writer_refuses_racing_final_path_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.json");
+        let temp_path = dir.path().join(".artifact.json.tmp-test");
+
+        let err = write_bytes_create_new_via_temp_with_hook(
+            &path,
+            &temp_path,
+            dir.path(),
+            b"replacement",
+            || {
+                std::fs::write(&path, "racing create")
+                    .with_context(|| format!("failed to create {}", path.display()))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("already exists")
+                || format!("{err:#}").contains("File exists")
+                || format!("{err:#}").contains("os error 17"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "racing create");
     }
 
     #[test]
