@@ -1,9 +1,8 @@
 #![allow(dead_code)]
 
 use std::{
-    fs,
-    fs::File,
-    io::Read,
+    fs::{self, File, OpenOptions},
+    io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -20,6 +19,8 @@ use crate::gravity::{
         status::derive_readiness_status,
     },
 };
+
+const MANIFEST_LOCK_FILE: &str = ".manifest.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactKind {
@@ -38,6 +39,8 @@ pub struct ArtifactSummary {
     pub load_profile: String,
     pub torque_convention: String,
     pub source_path_id: Option<String>,
+    pub source_path: Option<String>,
+    pub source_sha256: Option<String>,
     pub sample_count: Option<u64>,
     pub waypoint_count: u64,
 }
@@ -71,6 +74,8 @@ pub fn analyze_path_artifact(path: &Path) -> Result<ArtifactSummary> {
         load_profile: loaded.header.load_profile,
         torque_convention: loaded.header.torque_convention,
         source_path_id: None,
+        source_path: None,
+        source_sha256: None,
         sample_count: None,
         waypoint_count: loaded.rows.len() as u64,
     })
@@ -88,6 +93,8 @@ pub fn analyze_samples_artifact(path: &Path) -> Result<ArtifactSummary> {
         load_profile: loaded.header.load_profile,
         torque_convention: loaded.header.torque_convention,
         source_path_id: None,
+        source_path: Some(loaded.header.source_path),
+        source_sha256: Some(loaded.header.source_sha256),
         sample_count: Some(loaded.rows.len() as u64),
         waypoint_count: loaded.header.waypoint_count as u64,
     })
@@ -129,6 +136,16 @@ pub fn registered_artifact_path(profile_dir: &Path, artifact: &ArtifactEntry) ->
     resolve_registered_artifact_path(profile_dir, &artifact.path)
 }
 
+pub fn validate_profile_generated_output_path(
+    profile_dir: &Path,
+    output_path: &Path,
+) -> Result<PathBuf> {
+    let canonical_profile = canonical_profile_dir(profile_dir)?;
+    let resolved = canonical_existing_or_planned_path(output_path)?;
+    ensure_resolved_under_profile(output_path, &resolved, &canonical_profile)?;
+    Ok(resolved)
+}
+
 fn resolve_registered_artifact_path(profile_dir: &Path, artifact_path: &str) -> Result<PathBuf> {
     let relative = Path::new(artifact_path);
     if relative.is_absolute()
@@ -165,7 +182,9 @@ pub fn register_profile_generated_path(
     output_path: &Path,
     unix_ms: u64,
 ) -> Result<()> {
+    let _lock = ManifestLock::acquire(profile_dir)?;
     let mut context = load_profile_context(profile_dir)?;
+    validate_profile_generated_output_path(&context.profile_dir, output_path)?;
     let summary = analyze_path_artifact(output_path)
         .with_context(|| format!("failed to analyze {}", output_path.display()))?;
     if summary.kind != ArtifactKind::Path {
@@ -206,13 +225,23 @@ pub fn register_profile_generated_samples(
     output_path: &Path,
     unix_ms: u64,
 ) -> Result<()> {
+    let _lock = ManifestLock::acquire(profile_dir)?;
     let mut context = load_profile_context(profile_dir)?;
+    validate_profile_generated_output_path(&context.profile_dir, output_path)?;
     let summary = analyze_samples_artifact(output_path)
         .with_context(|| format!("failed to analyze {}", output_path.display()))?;
     if summary.kind != ArtifactKind::Samples {
         bail!("expected samples artifact summary");
     }
     validate_artifact_summary(&context.config, &summary)?;
+    validate_generated_samples_source(
+        &context.profile_dir,
+        split,
+        source_path_id,
+        output_path,
+        &summary,
+        &context.manifest,
+    )?;
     reject_active_other_split_duplicate(&context.manifest, split, &summary)?;
     let relative_path = profile_relative_artifact_path(&context.profile_dir, output_path)?;
     reserve_planned_artifact_id(&mut context.manifest, "samples", artifact_id, unix_ms)?;
@@ -368,6 +397,93 @@ fn reserve_planned_artifact_id(
     Ok(())
 }
 
+fn validate_generated_samples_source(
+    profile_dir: &Path,
+    split: Split,
+    source_path_id: &str,
+    output_path: &Path,
+    summary: &ArtifactSummary,
+    manifest: &Manifest,
+) -> Result<()> {
+    let source_artifact = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == source_path_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("source path artifact {source_path_id:?} is not registered")
+        })?;
+    if source_artifact.kind != "path" {
+        bail!(
+            "source artifact {} must be kind \"path\", got {:?}",
+            source_artifact.id,
+            source_artifact.kind
+        );
+    }
+    if source_artifact.split != split {
+        bail!(
+            "source path artifact {} is in {:?} split, requested {:?}",
+            source_artifact.id,
+            source_artifact.split,
+            split
+        );
+    }
+    if !source_artifact.active {
+        bail!("source path artifact {} is not active", source_artifact.id);
+    }
+
+    verify_registered_artifacts(profile_dir, std::slice::from_ref(source_artifact))?;
+
+    let source_sha256 = summary
+        .source_sha256
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("generated samples missing source_sha256"))?;
+    if source_sha256 != source_artifact.sha256 {
+        bail!(
+            "generated samples source_sha256 mismatch for source path {}: samples header has {}, manifest has {}",
+            source_artifact.id,
+            source_sha256,
+            source_artifact.sha256
+        );
+    }
+
+    if let Some(source_path) = summary.source_path.as_deref()
+        && let Some(resolved_source_path) =
+            resolve_samples_header_source_path(profile_dir, output_path, source_path)
+    {
+        let registered_source_path = registered_artifact_path(profile_dir, source_artifact)?;
+        if resolved_source_path != registered_source_path {
+            bail!(
+                "generated samples source_path {:?} resolves to {}, expected registered source path {}",
+                source_path,
+                resolved_source_path.display(),
+                registered_source_path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_samples_header_source_path(
+    profile_dir: &Path,
+    output_path: &Path,
+    source_path: &str,
+) -> Option<PathBuf> {
+    let source_path = Path::new(source_path);
+    if source_path.is_absolute() {
+        return source_path.canonicalize().ok();
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(profile_dir.join(source_path));
+    if let Some(output_parent) = output_path.parent() {
+        candidates.push(output_parent.join(source_path));
+    }
+    candidates.push(source_path.to_path_buf());
+
+    candidates.into_iter().find_map(|candidate| candidate.canonicalize().ok())
+}
+
 struct GeneratedArtifactEntryInput {
     id: String,
     kind: String,
@@ -407,26 +523,22 @@ fn profile_generated_entry(
 }
 
 fn profile_relative_artifact_path(profile_dir: &Path, path: &Path) -> Result<String> {
+    let canonical_profile = canonical_profile_dir(profile_dir)?;
+    let resolved = canonical_existing_or_planned_path(path)?;
+    ensure_resolved_under_profile(path, &resolved, &canonical_profile)?;
+
     let relative = match path.strip_prefix(profile_dir) {
         Ok(relative) => relative.to_path_buf(),
-        Err(_) => {
-            let canonical_profile = profile_dir
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize {}", profile_dir.display()))?;
-            let canonical_path = path
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-            canonical_path
-                .strip_prefix(&canonical_profile)
-                .with_context(|| {
-                    format!(
-                        "{} is not under profile directory {}",
-                        path.display(),
-                        profile_dir.display()
-                    )
-                })?
-                .to_path_buf()
-        },
+        Err(_) => resolved
+            .strip_prefix(&canonical_profile)
+            .with_context(|| {
+                format!(
+                    "{} is not under profile directory {}",
+                    path.display(),
+                    profile_dir.display()
+                )
+            })?
+            .to_path_buf(),
     };
 
     if relative.as_os_str().is_empty()
@@ -439,6 +551,78 @@ fn profile_relative_artifact_path(profile_dir: &Path, path: &Path) -> Result<Str
     }
 
     Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn canonical_profile_dir(profile_dir: &Path) -> Result<PathBuf> {
+    profile_dir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", profile_dir.display()))
+}
+
+fn canonical_existing_or_planned_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!("generated output path must not be empty");
+    }
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", path.display()));
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("generated output path must include a file name"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("generated output path must include a parent directory"))?;
+    let canonical_parent = parent.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize parent directory {}",
+            parent.display()
+        )
+    })?;
+    Ok(canonical_parent.join(file_name))
+}
+
+fn ensure_resolved_under_profile(
+    original_path: &Path,
+    resolved_path: &Path,
+    canonical_profile: &Path,
+) -> Result<()> {
+    if !resolved_path.starts_with(canonical_profile) {
+        bail!(
+            "generated output path {} resolves outside profile directory {}",
+            original_path.display(),
+            canonical_profile.display()
+        );
+    }
+    Ok(())
+}
+
+struct ManifestLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl ManifestLock {
+    fn acquire(profile_dir: &Path) -> Result<Self> {
+        let path = profile_dir.join(MANIFEST_LOCK_FILE);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => Ok(Self { path, _file: file }),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                bail!("profile manifest lock already exists: {}", path.display())
+            },
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to create manifest lock {}", path.display())),
+        }
+    }
+}
+
+impl Drop for ManifestLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn validate_field(name: &str, expected: &str, actual: &str) -> Result<()> {
@@ -475,6 +659,8 @@ impl ArtifactSummary {
             load_profile: "normal-gripper-d405".to_string(),
             torque_convention: crate::gravity::TORQUE_CONVENTION.to_string(),
             source_path_id: None,
+            source_path: Some("source.path.jsonl".to_string()),
+            source_sha256: Some("source-sha256".to_string()),
             sample_count: Some(12),
             waypoint_count: 4,
         }
@@ -495,7 +681,7 @@ mod tests {
             },
             profile::{
                 config::ProfileConfig,
-                manifest::{Manifest, Split},
+                manifest::{ArtifactEntry, Manifest, Split},
                 workflow::{import_samples, init_profile},
             },
         },
@@ -738,38 +924,98 @@ mod tests {
     fn register_generated_samples_records_source_path_and_profile_generated_arm_identity() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = ProfileFixture::new_at(dir.path());
-        let artifact_id = "samples-20260502-001530-0001";
+        let source = fixture.register_path_artifact_for_tests(Split::Train);
+        let artifact_id = "samples-20260502-001530-0002";
         let samples = fixture
             .profile_dir()
             .join("data/train/samples")
             .join(format!("{artifact_id}.samples.jsonl"));
         std::fs::create_dir_all(samples.parent().unwrap()).unwrap();
-        write_samples_artifact_for_tests(
+        write_samples_artifact_with_source_for_tests(
             samples.parent().unwrap(),
             &format!("{artifact_id}.samples.jsonl"),
             12,
             4,
+            &source.path.canonicalize().unwrap().display().to_string(),
+            &source.sha256,
         );
 
         register_profile_generated_samples(
             fixture.profile_dir(),
             Split::Train,
             artifact_id,
-            "path-20260502-001000-0001",
+            &source.id,
             &samples,
             unix_ms_for_tests(),
         )
         .unwrap();
 
         let manifest = fixture.load_manifest();
-        let artifact = manifest.artifacts.first().unwrap();
+        let artifact =
+            manifest.artifacts.iter().find(|artifact| artifact.kind == "samples").unwrap();
         assert_eq!(artifact.kind, "samples");
-        assert_eq!(
-            artifact.source_path_id.as_deref(),
-            Some("path-20260502-001000-0001")
-        );
+        assert_eq!(artifact.source_path_id.as_deref(), Some(source.id.as_str()));
         assert_eq!(artifact.arm_id, "piper-left");
         assert_eq!(artifact.arm_id_source.as_deref(), Some("profile_generated"));
+    }
+
+    #[test]
+    fn register_generated_samples_rejects_source_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let source = fixture.register_path_artifact_for_tests(Split::Train);
+        let artifact_id = "samples-20260502-001530-0002";
+        let samples = fixture
+            .profile_dir()
+            .join("data/train/samples")
+            .join(format!("{artifact_id}.samples.jsonl"));
+        std::fs::create_dir_all(samples.parent().unwrap()).unwrap();
+        write_samples_artifact_with_source_for_tests(
+            samples.parent().unwrap(),
+            &format!("{artifact_id}.samples.jsonl"),
+            12,
+            4,
+            &source.path.canonicalize().unwrap().display().to_string(),
+            "wrong-source-sha256",
+        );
+
+        let err = register_profile_generated_samples(
+            fixture.profile_dir(),
+            Split::Train,
+            artifact_id,
+            &source.id,
+            &samples,
+            unix_ms_for_tests(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("source_sha256"));
+    }
+
+    #[test]
+    fn register_generated_path_rejects_existing_manifest_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let artifact_id = "path-20260502-001530-0001";
+        let path = fixture
+            .profile_dir()
+            .join("data/train/paths")
+            .join(format!("{artifact_id}.path.jsonl"));
+        let path_dir = path.parent().unwrap();
+        std::fs::create_dir_all(path_dir).unwrap();
+        write_path_artifact_for_tests(path_dir, &format!("{artifact_id}.path.jsonl"), 4);
+        std::fs::write(fixture.profile_dir().join(".manifest.lock"), "locked").unwrap();
+
+        let err = register_profile_generated_path(
+            fixture.profile_dir(),
+            Split::Train,
+            artifact_id,
+            &path,
+            unix_ms_for_tests(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("manifest lock"));
     }
 
     struct ProfileFixture {
@@ -831,6 +1077,50 @@ mod tests {
         fn load_manifest(&self) -> Manifest {
             Manifest::load(self.profile_dir.join("manifest.json")).unwrap()
         }
+
+        fn register_path_artifact_for_tests(&self, split: Split) -> RegisteredPathForTests {
+            let split_dir = split_dir_for_tests(split);
+            let id = "path-20260502-001000-0001".to_string();
+            let relative_path = format!("data/{split_dir}/paths/{id}.path.jsonl");
+            let path = self.profile_dir.join(&relative_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_path_artifact_for_tests(path.parent().unwrap(), &format!("{id}.path.jsonl"), 4);
+            let sha256 = file_sha256(&path).unwrap();
+
+            let mut manifest = self.load_manifest();
+            manifest.next_artifact_seq = 2;
+            manifest.artifacts.push(ArtifactEntry {
+                id: id.clone(),
+                kind: "path".to_string(),
+                split,
+                active: true,
+                path: relative_path,
+                sha256: sha256.clone(),
+                source_path_id: None,
+                role: "slave".to_string(),
+                arm_id: "piper-left".to_string(),
+                arm_id_source: Some("profile_generated".to_string()),
+                target: "socketcan:can1".to_string(),
+                joint_map: "identity".to_string(),
+                load_profile: "normal-gripper-d405".to_string(),
+                torque_convention: crate::gravity::TORQUE_CONVENTION.to_string(),
+                basis: crate::gravity::BASIS_TRIG_V1.to_string(),
+                sample_count: None,
+                waypoint_count: Some(4),
+                created_at_unix_ms: unix_ms_for_tests() - 30_000,
+                promoted_from_round_id: None,
+                previous_paths: Vec::new(),
+            });
+            manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
+
+            RegisteredPathForTests { id, path, sha256 }
+        }
+    }
+
+    struct RegisteredPathForTests {
+        id: String,
+        path: PathBuf,
+        sha256: String,
     }
 
     fn unix_ms_for_tests() -> u64 {
@@ -873,14 +1163,53 @@ mod tests {
         waypoint_count: usize,
         arm_id: Option<String>,
     ) -> PathBuf {
+        write_samples_artifact_with_source_and_optional_arm_id_for_tests(
+            dir,
+            name,
+            sample_count,
+            waypoint_count,
+            "legacy.path.jsonl",
+            "source-sha256",
+            arm_id,
+        )
+    }
+
+    fn write_samples_artifact_with_source_for_tests(
+        dir: &Path,
+        name: &str,
+        sample_count: usize,
+        waypoint_count: usize,
+        source_path: &str,
+        source_sha256: &str,
+    ) -> PathBuf {
+        write_samples_artifact_with_source_and_optional_arm_id_for_tests(
+            dir,
+            name,
+            sample_count,
+            waypoint_count,
+            source_path,
+            source_sha256,
+            None,
+        )
+    }
+
+    fn write_samples_artifact_with_source_and_optional_arm_id_for_tests(
+        dir: &Path,
+        name: &str,
+        sample_count: usize,
+        waypoint_count: usize,
+        source_path: &str,
+        source_sha256: &str,
+        arm_id: Option<String>,
+    ) -> PathBuf {
         let path = dir.join(name);
         let mut file = std::fs::File::create(&path).unwrap();
         let header = SamplesHeader {
             row_type: "header".to_string(),
             artifact_kind: "quasi-static-samples".to_string(),
             schema_version: 1,
-            source_path: "legacy.path.jsonl".to_string(),
-            source_sha256: "source-sha256".to_string(),
+            source_path: source_path.to_string(),
+            source_sha256: source_sha256.to_string(),
             role: "slave".to_string(),
             arm_id,
             target: "socketcan:can1".to_string(),
@@ -904,6 +1233,13 @@ mod tests {
             write_jsonl_row(&mut file, &sample_row_for_tests(index as u64)).unwrap();
         }
         path
+    }
+
+    fn split_dir_for_tests(split: Split) -> &'static str {
+        match split {
+            Split::Train => "train",
+            Split::Validation => "validation",
+        }
     }
 
     fn write_path_artifact_for_tests(dir: &Path, name: &str, sample_count: usize) -> PathBuf {

@@ -17,7 +17,7 @@ use crate::{
         artifacts::{
             register_imported_samples, register_profile_generated_path,
             register_profile_generated_samples, registered_artifact_path,
-            verify_registered_artifacts,
+            validate_profile_generated_output_path, verify_registered_artifacts,
         },
         config::ProfileConfig,
         context::load_profile_context,
@@ -252,6 +252,7 @@ pub(crate) fn plan_record_path(
         .join(split_dir(split))
         .join("paths")
         .join(format!("{artifact_id}.path.jsonl"));
+    validate_profile_generated_output_path(&context.profile_dir, &output)?;
 
     Ok(PlannedRecordPath {
         artifact_id,
@@ -287,6 +288,7 @@ pub(crate) fn plan_replay_sample(
         .join(split_dir(split))
         .join("samples")
         .join(format!("{artifact_id}.samples.jsonl"));
+    validate_profile_generated_output_path(&context.profile_dir, &output)?;
 
     Ok(PlannedReplaySample {
         artifact_id,
@@ -469,6 +471,27 @@ mod tests {
         assert_eq!(planned.artifact_id, "path-20260502-001530-0001");
         assert!(planned.args.out.starts_with(fixture.profile_dir().join("data/train/paths")));
         assert!(planned.args.out.ends_with("path-20260502-001530-0001.path.jsonl"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_record_path_rejects_data_directory_symlink_escape() {
+        let fixture = ProfileFixture::new();
+        let outside_data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside_data.path().join("train/paths")).unwrap();
+        std::fs::remove_dir_all(fixture.profile_dir().join("data")).unwrap();
+        std::os::unix::fs::symlink(outside_data.path(), fixture.profile_dir().join("data"))
+            .unwrap();
+
+        let err = plan_record_path(
+            fixture.profile_dir(),
+            Split::Train,
+            None,
+            unix_ms_for_tests(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("outside profile directory"));
     }
 
     #[test]
