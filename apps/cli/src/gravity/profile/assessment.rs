@@ -60,10 +60,11 @@ pub struct DerivedMetrics {
     pub validation_train_rms_ratio: [Option<f64>; JOINT_COUNT],
     pub validation_train_p95_ratio: [Option<f64>; JOINT_COUNT],
     pub compensated_delta_ratio: [Option<f64>; JOINT_COUNT],
+    pub compensated_delta_ratio_meaningful: [bool; JOINT_COUNT],
     pub meaningful_compensated_delta_joint_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AssessmentDecision {
     pub pass: bool,
     pub grade: AssessmentGrade,
@@ -81,11 +82,13 @@ pub enum AssessmentGrade {
     Bad,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AssessmentCheck {
     pub check: String,
     pub joint: Option<usize>,
-    pub message: String,
+    pub value: Option<f64>,
+    pub threshold: Option<f64>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +122,7 @@ impl DiagnosticHoldoutMetrics {
 
 pub fn build_assessment_report(
     gate: &StrictGateConfig,
+    counts: AssessmentCounts,
     train_eval: &GravityEvalReport,
     validation_eval: &GravityEvalReport,
     diagnostic_holdout: &DiagnosticHoldoutMetrics,
@@ -127,15 +131,15 @@ pub fn build_assessment_report(
     let derived = derive_metrics(gate, train_eval, validation_eval);
     let mut report = AssessmentReport {
         train: MetricsSection {
-            sample_count: train_eval.sample_count,
-            waypoint_count: model.training_range.waypoint_count,
+            sample_count: counts.train_samples,
+            waypoint_count: counts.train_waypoints,
             residual_rms_nm: Some(train_eval.rms_residual_nm),
             residual_p95_nm: Some(train_eval.p95_residual_nm),
             residual_max_nm: Some(train_eval.max_residual_nm),
         },
         validation: ValidationMetricsSection {
-            sample_count: validation_eval.sample_count,
-            waypoint_count: validation_eval.sample_count,
+            sample_count: counts.validation_samples,
+            waypoint_count: counts.validation_waypoints,
             residual_rms_nm: Some(validation_eval.rms_residual_nm),
             residual_p95_nm: Some(validation_eval.p95_residual_nm),
             residual_max_nm: Some(validation_eval.max_residual_nm),
@@ -200,6 +204,7 @@ pub fn build_count_only_assessment_report(
             validation_train_rms_ratio: [None; JOINT_COUNT],
             validation_train_p95_ratio: [None; JOINT_COUNT],
             compensated_delta_ratio: [None; JOINT_COUNT],
+            compensated_delta_ratio_meaningful: [false; JOINT_COUNT],
             meaningful_compensated_delta_joint_count: 0,
         },
         decision: undecided(),
@@ -287,10 +292,12 @@ pub fn decide_strict_v1(gate: &StrictGateConfig, report: &AssessmentReport) -> A
             failed_checks.push(AssessmentCheck {
                 check: "training_range_violations".to_string(),
                 joint: None,
-                message: format!(
+                value: Some(violations as f64),
+                threshold: Some(gate.max_training_range_violations as f64),
+                message: Some(format!(
                     "{violations} validation rows exceed training range, max allowed {}",
                     gate.max_training_range_violations
-                ),
+                )),
             });
         },
         Some(_) => {},
@@ -346,6 +353,7 @@ fn derive_metrics(
     let mut rms_ratio = [None; JOINT_COUNT];
     let mut p95_ratio = [None; JOINT_COUNT];
     let mut compensated_delta_ratio = [None; JOINT_COUNT];
+    let mut compensated_delta_ratio_meaningful = [false; JOINT_COUNT];
     let mut meaningful_compensated_delta_joint_count = 0;
 
     for joint in 0..JOINT_COUNT {
@@ -360,6 +368,7 @@ fn derive_metrics(
 
         let raw_delta = validation_eval.raw_torque_delta_nm[joint];
         if raw_delta >= gate.torque_delta_epsilon_nm {
+            compensated_delta_ratio_meaningful[joint] = true;
             compensated_delta_ratio[joint] =
                 Some(validation_eval.compensated_external_torque_delta_nm[joint] / raw_delta);
             meaningful_compensated_delta_joint_count += 1;
@@ -370,6 +379,7 @@ fn derive_metrics(
         validation_train_rms_ratio: rms_ratio,
         validation_train_p95_ratio: p95_ratio,
         compensated_delta_ratio,
+        compensated_delta_ratio_meaningful,
         meaningful_compensated_delta_joint_count,
     }
 }
@@ -394,7 +404,9 @@ fn check_min_count(
         failed_checks.push(AssessmentCheck {
             check: check.to_string(),
             joint: None,
-            message: format!("{value} is below minimum {minimum}"),
+            value: Some(value as f64),
+            threshold: Some(minimum as f64),
+            message: Some(format!("{value} is below minimum {minimum}")),
         });
     }
 }
@@ -416,12 +428,14 @@ fn check_array_max(
             failed_checks.push(AssessmentCheck {
                 check: check.to_string(),
                 joint: Some(joint),
-                message: format!(
+                value: Some(values[joint]),
+                threshold: Some(limits[joint]),
+                message: Some(format!(
                     "joint {} value {} exceeds limit {}",
                     joint + 1,
                     values[joint],
                     limits[joint]
-                ),
+                )),
             });
         }
     }
@@ -444,7 +458,12 @@ fn check_optional_ratio_max(
             failed_checks.push(AssessmentCheck {
                 check: check.to_string(),
                 joint: Some(joint),
-                message: format!("joint {} ratio {value} exceeds limit {limit}", joint + 1),
+                value: Some(value),
+                threshold: Some(limit),
+                message: Some(format!(
+                    "joint {} ratio {value} exceeds limit {limit}",
+                    joint + 1
+                )),
             });
         }
     }
@@ -455,11 +474,13 @@ fn check_optional_ratio_max(
 
 fn passes_good_margin(gate: &StrictGateConfig, report: &AssessmentReport) -> bool {
     let margin = 1.0 - gate.good_margin_fraction;
+    let count_margin = 1.0 + gate.good_margin_fraction;
 
-    if report.train.sample_count < scaled_min(gate.min_train_samples, margin)
-        || report.validation.sample_count < scaled_min(gate.min_validation_samples, margin)
-        || report.train.waypoint_count < scaled_min(gate.min_train_waypoints, margin)
-        || report.validation.waypoint_count < scaled_min(gate.min_validation_waypoints, margin)
+    if report.train.sample_count < scaled_min(gate.min_train_samples, count_margin)
+        || report.validation.sample_count < scaled_min(gate.min_validation_samples, count_margin)
+        || report.train.waypoint_count < scaled_min(gate.min_train_waypoints, count_margin)
+        || report.validation.waypoint_count
+            < scaled_min(gate.min_validation_waypoints, count_margin)
     {
         return false;
     }
@@ -488,7 +509,7 @@ fn passes_good_margin(gate: &StrictGateConfig, report: &AssessmentReport) -> boo
 }
 
 fn scaled_min(minimum: usize, margin: f64) -> usize {
-    ((minimum as f64) / margin).ceil() as usize
+    ((minimum as f64) * margin).ceil() as usize
 }
 
 fn array_within_margin(
@@ -514,7 +535,9 @@ fn skip_check(check: &str, message: &str) -> AssessmentCheck {
     AssessmentCheck {
         check: check.to_string(),
         joint: None,
-        message: message.to_string(),
+        value: None,
+        threshold: None,
+        message: Some(message.to_string()),
     }
 }
 
@@ -611,6 +634,7 @@ mod tests {
 
         let report = build_assessment_report(
             &gate,
+            assessment_counts_for_tests(),
             &train_eval,
             &validation_eval,
             &holdout,
@@ -623,6 +647,10 @@ mod tests {
         assert_eq!(
             json["derived"]["meaningful_compensated_delta_joint_count"],
             0
+        );
+        assert_eq!(
+            json["derived"]["compensated_delta_ratio_meaningful"],
+            serde_json::json!([false, false, false, false, false, false])
         );
         assert!(
             json["decision"]["skipped_checks"]
@@ -656,17 +684,93 @@ mod tests {
         assert!(json["model"].is_null());
     }
 
+    #[test]
+    fn build_report_uses_explicit_validation_waypoint_count_for_gate() {
+        let gate = StrictGateConfig::default();
+        let train_eval = eval_report_for_tests();
+        let validation_eval = eval_report_for_tests();
+        let counts = AssessmentCounts {
+            validation_samples: validation_eval.sample_count,
+            validation_waypoints: gate.min_validation_waypoints - 1,
+            ..assessment_counts_for_tests()
+        };
+
+        let report = build_assessment_report(
+            &gate,
+            counts,
+            &train_eval,
+            &validation_eval,
+            &DiagnosticHoldoutMetrics::unavailable(),
+            &QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]),
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            report.validation.sample_count, validation_eval.sample_count,
+            "test setup requires validation sample count to remain sufficient"
+        );
+        assert_eq!(
+            report.validation.waypoint_count,
+            gate.min_validation_waypoints - 1
+        );
+        assert_eq!(report.decision.grade, AssessmentGrade::Bad);
+        let failed_check = json["decision"]["failed_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["check"] == "validation_waypoint_count")
+            .expect("validation waypoint count should fail");
+        assert_eq!(
+            failed_check["value"],
+            (gate.min_validation_waypoints - 1) as f64
+        );
+        assert_eq!(
+            failed_check["threshold"],
+            gate.min_validation_waypoints as f64
+        );
+    }
+
+    #[test]
+    fn good_margin_count_threshold_uses_one_plus_fraction() {
+        let gate = StrictGateConfig {
+            min_validation_samples: 80,
+            ..StrictGateConfig::default()
+        };
+
+        let good_report = assessment_report_for_tests().with_validation_counts(100, 50);
+        let usable_report = assessment_report_for_tests().with_validation_counts(99, 50);
+
+        assert_eq!(
+            decide_strict_v1(&gate, &good_report).grade,
+            AssessmentGrade::Good
+        );
+        assert_eq!(
+            decide_strict_v1(&gate, &usable_report).grade,
+            AssessmentGrade::Usable
+        );
+    }
+
     fn assessment_report_for_tests() -> AssessmentReport {
         let gate = StrictGateConfig::default();
         let train_eval = eval_report_for_tests();
         let validation_eval = eval_report_for_tests();
         build_assessment_report(
             &gate,
+            assessment_counts_for_tests(),
             &train_eval,
             &validation_eval,
             &DiagnosticHoldoutMetrics::unavailable(),
             &QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]),
         )
+    }
+
+    fn assessment_counts_for_tests() -> AssessmentCounts {
+        AssessmentCounts {
+            train_samples: 400,
+            train_waypoints: 200,
+            validation_samples: 100,
+            validation_waypoints: 50,
+        }
     }
 
     fn eval_report_for_tests() -> GravityEvalReport {
