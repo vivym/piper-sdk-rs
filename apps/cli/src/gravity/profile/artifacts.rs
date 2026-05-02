@@ -4,7 +4,7 @@ use std::{
     fs,
     fs::File,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -110,7 +110,7 @@ pub fn validate_artifact_summary(config: &ProfileConfig, summary: &ArtifactSumma
 
 pub fn verify_registered_artifacts(profile_dir: &Path, artifacts: &[ArtifactEntry]) -> Result<()> {
     for artifact in artifacts {
-        let path = profile_dir.join(&artifact.path);
+        let path = resolve_registered_artifact_path(profile_dir, &artifact.path)?;
         let actual_sha256 = file_sha256(&path)?;
         if actual_sha256 != artifact.sha256 {
             bail!(
@@ -123,6 +123,35 @@ pub fn verify_registered_artifacts(profile_dir: &Path, artifacts: &[ArtifactEntr
         }
     }
     Ok(())
+}
+
+fn resolve_registered_artifact_path(profile_dir: &Path, artifact_path: &str) -> Result<PathBuf> {
+    let relative = Path::new(artifact_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        bail!("unsafe registered artifact path {artifact_path:?}");
+    }
+
+    let profile_dir = profile_dir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", profile_dir.display()))?;
+    let resolved = profile_dir.join(relative).canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize registered artifact path {}",
+            profile_dir.join(relative).display()
+        )
+    })?;
+    if !resolved.starts_with(&profile_dir) {
+        bail!(
+            "unsafe registered artifact path {:?}: resolved outside {}",
+            artifact_path,
+            profile_dir.display()
+        );
+    }
+    Ok(resolved)
 }
 
 pub fn register_imported_samples(
@@ -460,6 +489,43 @@ mod tests {
         let err = verify_registered_artifacts(fixture.profile_dir(), &[artifact]).unwrap_err();
 
         assert!(err.to_string().contains("sha256"));
+    }
+
+    #[test]
+    fn verify_registered_artifacts_rejects_absolute_manifest_path() {
+        let fixture = ProfileFixture::new_with_train_samples();
+        let mut artifact = fixture
+            .load_manifest()
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "samples" && artifact.active)
+            .unwrap()
+            .clone();
+        artifact.path = fixture.profile_dir().join(&artifact.path).to_string_lossy().to_string();
+
+        let err = verify_registered_artifacts(fixture.profile_dir(), &[artifact]).unwrap_err();
+
+        assert!(err.to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn verify_registered_artifacts_rejects_parent_dir_manifest_path() {
+        let fixture = ProfileFixture::new_with_train_samples();
+        let mut artifact = fixture
+            .load_manifest()
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "samples" && artifact.active)
+            .unwrap()
+            .clone();
+        let original_path = fixture.profile_dir().join(&artifact.path);
+        let escaped_path = fixture.profile_dir().join("../outside.samples.jsonl");
+        std::fs::copy(original_path, escaped_path).unwrap();
+        artifact.path = "../outside.samples.jsonl".to_string();
+
+        let err = verify_registered_artifacts(fixture.profile_dir(), &[artifact]).unwrap_err();
+
+        assert!(err.to_string().contains("unsafe"));
     }
 
     struct ProfileFixture {
