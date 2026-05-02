@@ -28,8 +28,8 @@ pub async fn run(args: crate::commands::gravity::GravityProfileArgs) -> Result<(
         crate::commands::gravity::GravityProfileAction::FitAssess(args) => {
             workflow::fit_assess(args)
         },
-        crate::commands::gravity::GravityProfileAction::PromoteValidation(_) => {
-            anyhow::bail!("gravity profile promote-validation is not implemented yet")
+        crate::commands::gravity::GravityProfileAction::PromoteValidation(args) => {
+            workflow::promote_validation(args)
         },
     }
 }
