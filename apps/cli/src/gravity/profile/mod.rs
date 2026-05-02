@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod config;
 pub mod context;
+pub mod holdout;
 pub mod manifest;
 pub mod status;
 pub mod workflow;
