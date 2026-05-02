@@ -96,14 +96,18 @@ pub fn select_diagnostic_holdout_groups(
     let holdout_group_set = holdout_group_keys.iter().collect::<HashSet<_>>();
     let mut train_group_keys = Vec::new();
     let mut train_sample_artifact_ids = Vec::new();
+    let mut train_sample_count = 0_u64;
     let mut holdout_sample_artifact_ids = Vec::new();
+    let mut holdout_sample_count = 0_u64;
 
     for (group_key, group) in &groups {
         if holdout_group_set.contains(group_key) {
             holdout_sample_artifact_ids.extend(group.artifact_ids.clone());
+            holdout_sample_count += group.sample_count;
         } else {
             train_group_keys.push(group_key.clone());
             train_sample_artifact_ids.extend(group.artifact_ids.clone());
+            train_sample_count += group.sample_count;
         }
     }
 
@@ -111,6 +115,8 @@ pub fn select_diagnostic_holdout_groups(
         && !holdout_group_keys.is_empty()
         && !train_sample_artifact_ids.is_empty()
         && !holdout_sample_artifact_ids.is_empty()
+        && train_sample_count > 0
+        && holdout_sample_count > 0
         && (selected_sample_count as f64) >= target_holdout_samples;
     if !available {
         let mut all_group_keys = Vec::new();
@@ -264,6 +270,79 @@ mod tests {
         assert_eq!(split.holdout_sample_artifact_ids, ["samples-c"]);
         assert!(!split.train_group_keys.is_empty());
         assert!(!split.train_sample_artifact_ids.is_empty());
+    }
+
+    #[test]
+    fn holdout_unavailable_when_remaining_train_has_no_effective_samples() {
+        let mut zero_train = sample_artifact_for_tests("samples-a", Some("path-a"), 0);
+        zero_train.sample_count = None;
+        let artifacts = vec![
+            zero_train,
+            sample_artifact_for_tests("samples-c", Some("path-c"), 100),
+        ];
+
+        let split = select_diagnostic_holdout_groups(
+            "identity-hash",
+            "round-0001",
+            "source_path_id",
+            0.5,
+            &artifacts,
+        )
+        .unwrap();
+
+        assert!(!split.available);
+        assert_eq!(split.train_group_keys, ["path-a", "path-c"]);
+        assert!(split.holdout_group_keys.is_empty());
+        assert_eq!(split.train_sample_artifact_ids, ["samples-a", "samples-c"]);
+        assert!(split.holdout_sample_artifact_ids.is_empty());
+    }
+
+    #[test]
+    fn missing_source_path_id_uses_artifact_id_group_key() {
+        let artifacts = vec![
+            sample_artifact_for_tests("samples-a", None, 30),
+            sample_artifact_for_tests("samples-b", Some("path-b"), 70),
+        ];
+
+        let split = select_diagnostic_holdout_groups(
+            "identity-hash",
+            "round-0001",
+            "source_path_id",
+            0.3,
+            &artifacts,
+        )
+        .unwrap();
+
+        assert!(
+            split.train_group_keys.iter().any(|key| key == "samples-a")
+                || split.holdout_group_keys.iter().any(|key| key == "samples-a")
+        );
+    }
+
+    #[test]
+    fn invalid_ratio_or_unsupported_group_key_returns_error() {
+        let artifacts = vec![sample_artifact_for_tests("samples-a", Some("path-a"), 50)];
+
+        assert!(
+            select_diagnostic_holdout_groups(
+                "identity-hash",
+                "round-0001",
+                "source_path_id",
+                1.0,
+                &artifacts,
+            )
+            .is_err()
+        );
+        assert!(
+            select_diagnostic_holdout_groups(
+                "identity-hash",
+                "round-0001",
+                "unsupported",
+                0.2,
+                &artifacts,
+            )
+            .is_err()
+        );
     }
 
     fn sample_artifact_for_tests(
