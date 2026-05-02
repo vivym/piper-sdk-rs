@@ -35,14 +35,14 @@ pub fn run(args: GravityEvalArgs) -> Result<()> {
     let loaded = read_quasi_static_samples(&args.samples)?;
     validate_model_matches_samples(&model, &loaded.header)?;
 
-    let report = evaluate_rows(&model, &loaded.rows)?;
+    let report = evaluate_model_on_rows(&model, &loaded.rows)?;
     let json =
         serde_json::to_string_pretty(&report).context("failed to serialize eval report JSON")?;
     println!("{json}");
     Ok(())
 }
 
-fn validate_model_matches_samples(
+pub(crate) fn validate_model_matches_samples(
     model: &QuasiStaticTorqueModel,
     header: &SamplesHeader,
 ) -> Result<()> {
@@ -68,7 +68,7 @@ fn validate_metadata_field(name: &str, model_value: &str, samples_value: &str) -
     Ok(())
 }
 
-fn evaluate_rows(
+pub(crate) fn evaluate_model_on_rows(
     model: &QuasiStaticTorqueModel,
     rows: &[QuasiStaticSampleRow],
 ) -> Result<GravityEvalReport> {
@@ -223,7 +223,7 @@ mod tests {
             [0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
             [0.0; 6],
         )];
-        let report = evaluate_rows(&model, &rows).unwrap();
+        let report = evaluate_model_on_rows(&model, &rows).unwrap();
         assert_eq!(report.training_range_violations, 1);
         assert!(report.max_range_violation_rad > 0.09);
     }
@@ -232,7 +232,18 @@ mod tests {
     fn eval_reports_residual_metrics_for_known_model() {
         let model = QuasiStaticTorqueModel::for_tests_with_constant_output([1.0; 6]);
         let rows = vec![sample_row_for_tests([0.0; 6], [1.0; 6])];
-        let report = evaluate_rows(&model, &rows).unwrap();
+        let report = evaluate_model_on_rows(&model, &rows).unwrap();
+        assert_eq!(report.rms_residual_nm, [0.0; 6]);
+    }
+
+    #[test]
+    fn evaluate_model_on_rows_is_reusable_by_profile_manager() {
+        let model = QuasiStaticTorqueModel::for_tests_with_constant_output([1.0; 6]);
+        let rows = vec![sample_row_for_tests([0.0; 6], [1.0; 6])];
+
+        let report = evaluate_model_on_rows(&model, &rows).unwrap();
+
+        assert_eq!(report.sample_count, 1);
         assert_eq!(report.rms_residual_nm, [0.0; 6]);
     }
 
@@ -245,7 +256,7 @@ mod tests {
             sample_row_for_tests([0.0; 6], [4.0; 6]),
         ];
 
-        let report = evaluate_rows(&model, &rows).unwrap();
+        let report = evaluate_model_on_rows(&model, &rows).unwrap();
 
         assert_eq!(report.sample_count, 3);
         assert_eq!(report.p95_residual_nm, [3.0; 6]);
@@ -258,7 +269,7 @@ mod tests {
     fn eval_rejects_empty_rows() {
         let model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
 
-        let err = evaluate_rows(&model, &[]).unwrap_err();
+        let err = evaluate_model_on_rows(&model, &[]).unwrap_err();
 
         assert!(err.to_string().contains("at least one"));
     }

@@ -62,7 +62,7 @@ pub fn run(args: GravityFitArgs) -> Result<()> {
         holdout_ratio: args.holdout_ratio,
         regularize_bias: false,
     };
-    let model = fit_from_rows(loaded.header, loaded.rows, options)?;
+    let model = fit_model_from_rows(loaded.header, loaded.rows, options)?;
 
     if let Some(parent) = args.out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
@@ -91,7 +91,7 @@ pub fn run(args: GravityFitArgs) -> Result<()> {
     Ok(())
 }
 
-fn fit_from_rows(
+pub(crate) fn fit_model_from_rows(
     header: SamplesHeader,
     rows: Vec<QuasiStaticSampleRow>,
     options: FitOptions,
@@ -99,7 +99,7 @@ fn fit_from_rows(
     validate_fit_inputs(&header, &rows, options)?;
 
     let group_split = split_train_holdout_groups(&rows, options.holdout_ratio)?;
-    if group_split.train_group_ids.len() < 2 {
+    if options.holdout_ratio > 0.0 && group_split.train_group_ids.len() < 2 {
         bail!("expected at least 2 training groups");
     }
     let holdout_groups: BTreeSet<&str> =
@@ -493,7 +493,7 @@ mod tests {
             regularize_bias: false,
         };
 
-        let fitted = fit_from_rows(sample_header_for_tests(), rows, options).unwrap();
+        let fitted = fit_model_from_rows(sample_header_for_tests(), rows, options).unwrap();
         assert_eq!(fitted.model.coefficients_nm.len(), 6);
         assert!((fitted.model.coefficients_nm[0][1] - 2.0).abs() < 1e-6);
         assert!((fitted.model.coefficients_nm[1][3] + 1.25).abs() < 1e-6);
@@ -507,7 +507,8 @@ mod tests {
         let required_waypoints = TRIG_V1_FEATURE_COUNT * 10;
         let rows = synthetic_rows_from_coefficients(&truth, required_waypoints - 1);
 
-        let err = fit_from_rows(sample_header_for_tests(), rows, no_holdout_options()).unwrap_err();
+        let err =
+            fit_model_from_rows(sample_header_for_tests(), rows, no_holdout_options()).unwrap_err();
 
         let message = err.to_string();
         assert!(message.contains("training waypoints"), "{err:#}");
@@ -515,14 +516,35 @@ mod tests {
     }
 
     #[test]
-    fn fitter_rejects_single_training_group_without_holdout() {
+    fn fit_all_train_policy_records_empty_holdout() {
         let truth = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
-        let mut rows = synthetic_rows_from_coefficients(&truth, 120);
+        let rows = synthetic_rows_from_coefficients(&truth, 260);
+
+        let model = fit_model_from_rows(
+            sample_header_for_tests(),
+            rows,
+            FitOptions {
+                ridge_lambda: 1e-8,
+                holdout_ratio: 0.0,
+                regularize_bias: false,
+            },
+        )
+        .unwrap();
+
+        assert!(model.fit.holdout_group_ids.is_empty());
+        assert_eq!(model.sample_count, 260);
+    }
+
+    #[test]
+    fn fit_all_train_policy_allows_single_group_when_waypoints_are_sufficient() {
+        let truth = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
+        let mut rows = synthetic_rows_from_coefficients(&truth, TRIG_V1_FEATURE_COUNT * 10);
         force_single_segment(&mut rows);
 
-        let err = fit_from_rows(sample_header_for_tests(), rows, no_holdout_options()).unwrap_err();
+        let model =
+            fit_model_from_rows(sample_header_for_tests(), rows, no_holdout_options()).unwrap();
 
-        assert!(err.to_string().contains("training groups"), "{err:#}");
+        assert!(model.fit.holdout_group_ids.is_empty());
     }
 
     #[test]
@@ -535,7 +557,7 @@ mod tests {
             ..no_holdout_options()
         };
 
-        let err = fit_from_rows(sample_header_for_tests(), rows, options).unwrap_err();
+        let err = fit_model_from_rows(sample_header_for_tests(), rows, options).unwrap_err();
 
         assert!(err.to_string().contains("holdout"), "{err:#}");
     }
