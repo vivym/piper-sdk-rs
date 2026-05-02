@@ -1172,20 +1172,73 @@ fn write_json_create_new<T: Serialize>(
 }
 
 fn write_bytes_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    if path.exists() {
+        bail!("{} already exists; refusing to overwrite", path.display());
     }
+
+    let temp_path = temp_output_path(path);
+    let result = write_bytes_create_new_via_temp(path, &temp_path, parent, bytes);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_bytes_create_new_via_temp(
+    path: &Path,
+    temp_path: &Path,
+    parent: &Path,
+    bytes: &[u8],
+) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+        .open(temp_path)
+        .with_context(|| format!("failed to create temporary {}", temp_path.display()))?;
     let mut writer = BufWriter::new(file);
     writer
         .write_all(bytes)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    writer.flush().with_context(|| format!("failed to flush {}", path.display()))?;
+        .with_context(|| format!("failed to write temporary {}", temp_path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush temporary {}", temp_path.display()))?;
+    let file = writer.into_inner().context("failed to finish output write buffer")?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync temporary {}", temp_path.display()))?;
+
+    if path.exists() {
+        bail!("{} already exists; refusing to overwrite", path.display());
+    }
+    fs::rename(temp_path, path).with_context(|| {
+        format!(
+            "failed to rename temporary {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    fsync_output_dir(parent)?;
+    Ok(())
+}
+
+fn temp_output_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("artifact");
+    path.with_file_name(format!(".{file_name}.tmp-{}", unique_path_suffix()))
+}
+
+#[cfg(unix)]
+fn fsync_output_dir(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("failed to sync directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn fsync_output_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1668,6 +1721,18 @@ mod tests {
             std::fs::read_to_string(fixture.profile_dir().join("models/best.model.toml")).unwrap(),
             "old-best"
         );
+    }
+
+    #[test]
+    fn fit_assess_atomic_create_new_writer_refuses_existing_final_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.json");
+        std::fs::write(&path, "existing").unwrap();
+
+        let err = write_bytes_create_new(&path, b"replacement").unwrap_err();
+
+        assert!(err.to_string().contains("already exists"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing");
     }
 
     #[test]
