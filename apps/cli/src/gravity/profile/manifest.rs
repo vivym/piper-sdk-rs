@@ -111,6 +111,10 @@ pub struct RoundEntry {
     pub train_sample_artifact_ids: Vec<String>,
     pub validation_sample_artifact_ids: Vec<String>,
     pub validation_path_artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_train_group_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_holdout_group_keys: Vec<String>,
     pub profile_identity_sha256: String,
     pub profile_config_sha256: String,
     pub gate_config: Value,
@@ -313,6 +317,8 @@ impl RoundEntry {
             train_sample_artifact_ids: Vec::new(),
             validation_sample_artifact_ids: Vec::new(),
             validation_path_artifact_ids: Vec::new(),
+            diagnostic_train_group_keys: Vec::new(),
+            diagnostic_holdout_group_keys: Vec::new(),
             profile_identity_sha256: "identity".to_string(),
             profile_config_sha256: "config".to_string(),
             gate_config: Value::Object(Default::default()),
