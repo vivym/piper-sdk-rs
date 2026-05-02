@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{ErrorKind, Read},
+    fs::{self, File},
+    io::Read,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,13 +14,11 @@ use crate::gravity::{
     artifact::{read_path, read_quasi_static_samples},
     profile::{
         config::ProfileConfig,
-        context::load_profile_context,
-        manifest::{ArtifactEntry, Manifest, Split},
+        context::load_profile_context_unlocked,
+        manifest::{ArtifactEntry, Manifest, ManifestLock, Split},
         status::derive_readiness_status,
     },
 };
-
-const MANIFEST_LOCK_FILE: &str = ".manifest.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactKind {
@@ -183,7 +181,7 @@ pub fn register_profile_generated_path(
     unix_ms: u64,
 ) -> Result<()> {
     let _lock = ManifestLock::acquire(profile_dir)?;
-    let mut context = load_profile_context(profile_dir)?;
+    let mut context = load_profile_context_unlocked(profile_dir)?;
     validate_profile_generated_output_path(&context.profile_dir, output_path)?;
     let summary = analyze_path_artifact(output_path)
         .with_context(|| format!("failed to analyze {}", output_path.display()))?;
@@ -226,7 +224,7 @@ pub fn register_profile_generated_samples(
     unix_ms: u64,
 ) -> Result<()> {
     let _lock = ManifestLock::acquire(profile_dir)?;
-    let mut context = load_profile_context(profile_dir)?;
+    let mut context = load_profile_context_unlocked(profile_dir)?;
     validate_profile_generated_output_path(&context.profile_dir, output_path)?;
     let summary = analyze_samples_artifact(output_path)
         .with_context(|| format!("failed to analyze {}", output_path.display()))?;
@@ -275,7 +273,8 @@ pub fn register_imported_samples(
     split: Split,
     samples: &[PathBuf],
 ) -> Result<()> {
-    let mut context = load_profile_context(profile_dir)?;
+    let _lock = ManifestLock::acquire(profile_dir)?;
+    let mut context = load_profile_context_unlocked(profile_dir)?;
     let summaries = samples
         .iter()
         .map(|path| {
@@ -446,19 +445,20 @@ fn validate_generated_samples_source(
         );
     }
 
-    if let Some(source_path) = summary.source_path.as_deref()
-        && let Some(resolved_source_path) =
-            resolve_samples_header_source_path(profile_dir, output_path, source_path)
-    {
-        let registered_source_path = registered_artifact_path(profile_dir, source_artifact)?;
-        if resolved_source_path != registered_source_path {
-            bail!(
-                "generated samples source_path {:?} resolves to {}, expected registered source path {}",
-                source_path,
-                resolved_source_path.display(),
-                registered_source_path.display()
-            );
-        }
+    let source_path = summary
+        .source_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("generated samples missing source_path"))?;
+    let resolved_source_path =
+        resolve_samples_header_source_path(profile_dir, output_path, source_path)?;
+    let registered_source_path = registered_artifact_path(profile_dir, source_artifact)?;
+    if resolved_source_path != registered_source_path {
+        bail!(
+            "generated samples source_path {:?} resolves to {}, expected registered source path {}",
+            source_path,
+            resolved_source_path.display(),
+            registered_source_path.display()
+        );
     }
 
     Ok(())
@@ -468,10 +468,15 @@ fn resolve_samples_header_source_path(
     profile_dir: &Path,
     output_path: &Path,
     source_path: &str,
-) -> Option<PathBuf> {
+) -> Result<PathBuf> {
     let source_path = Path::new(source_path);
     if source_path.is_absolute() {
-        return source_path.canonicalize().ok();
+        return source_path.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve samples source_path {}",
+                source_path.display()
+            )
+        });
     }
 
     let mut candidates = Vec::new();
@@ -481,7 +486,16 @@ fn resolve_samples_header_source_path(
     }
     candidates.push(source_path.to_path_buf());
 
-    candidates.into_iter().find_map(|candidate| candidate.canonicalize().ok())
+    for candidate in candidates {
+        if let Ok(resolved) = candidate.canonicalize() {
+            return Ok(resolved);
+        }
+    }
+
+    bail!(
+        "failed to resolve samples source_path {}",
+        source_path.display()
+    )
 }
 
 struct GeneratedArtifactEntryInput {
@@ -598,31 +612,6 @@ fn ensure_resolved_under_profile(
         );
     }
     Ok(())
-}
-
-struct ManifestLock {
-    path: PathBuf,
-    _file: File,
-}
-
-impl ManifestLock {
-    fn acquire(profile_dir: &Path) -> Result<Self> {
-        let path = profile_dir.join(MANIFEST_LOCK_FILE);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => Ok(Self { path, _file: file }),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                bail!("profile manifest lock already exists: {}", path.display())
-            },
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to create manifest lock {}", path.display())),
-        }
-    }
-}
-
-impl Drop for ManifestLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }
 
 fn validate_field(name: &str, expected: &str, actual: &str) -> Result<()> {
@@ -993,6 +982,39 @@ mod tests {
     }
 
     #[test]
+    fn register_generated_samples_rejects_unresolved_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let source = fixture.register_path_artifact_for_tests(Split::Train);
+        let artifact_id = "samples-20260502-001530-0002";
+        let samples = fixture
+            .profile_dir()
+            .join("data/train/samples")
+            .join(format!("{artifact_id}.samples.jsonl"));
+        std::fs::create_dir_all(samples.parent().unwrap()).unwrap();
+        write_samples_artifact_with_source_for_tests(
+            samples.parent().unwrap(),
+            &format!("{artifact_id}.samples.jsonl"),
+            12,
+            4,
+            "missing-source.path.jsonl",
+            &source.sha256,
+        );
+
+        let err = register_profile_generated_samples(
+            fixture.profile_dir(),
+            Split::Train,
+            artifact_id,
+            &source.id,
+            &samples,
+            unix_ms_for_tests(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("source_path"));
+    }
+
+    #[test]
     fn register_generated_path_rejects_existing_manifest_lock() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = ProfileFixture::new_at(dir.path());
@@ -1013,6 +1035,23 @@ mod tests {
             &path,
             unix_ms_for_tests(),
         )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("manifest lock"));
+    }
+
+    #[test]
+    fn import_samples_rejects_existing_manifest_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let samples = write_samples_artifact_for_tests(dir.path(), "legacy.samples.jsonl", 12, 4);
+        std::fs::write(fixture.profile_dir().join(".manifest.lock"), "locked").unwrap();
+
+        let err = import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![samples],
+        })
         .unwrap_err();
 
         assert!(err.to_string().contains("manifest lock"));

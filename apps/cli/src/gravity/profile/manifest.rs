@@ -1,17 +1,16 @@
 #![allow(dead_code)]
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{BufWriter, Write},
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, ErrorKind, Write},
     path::{Path, PathBuf},
 };
-
-#[cfg(unix)]
-use std::fs::File;
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+const PROFILE_MANIFEST_LOCK_FILE: &str = ".manifest.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -236,6 +235,31 @@ impl Manifest {
         let seq = self.next_event_seq;
         self.next_event_seq += 1;
         format!("event-{seq:04}")
+    }
+}
+
+pub(crate) struct ManifestLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl ManifestLock {
+    pub(crate) fn acquire(profile_dir: &Path) -> Result<Self> {
+        let path = profile_dir.join(PROFILE_MANIFEST_LOCK_FILE);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => Ok(Self { path, _file: file }),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                anyhow::bail!("profile manifest lock already exists: {}", path.display())
+            },
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to create manifest lock {}", path.display())),
+        }
+    }
+}
+
+impl Drop for ManifestLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 

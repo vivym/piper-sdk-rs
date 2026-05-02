@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::gravity::profile::{
     config::ProfileConfig,
-    manifest::{EventEntry, Manifest, ProfileConfigSectionHashes, ProfileStatus},
+    manifest::{EventEntry, Manifest, ManifestLock, ProfileConfigSectionHashes, ProfileStatus},
     status::derive_readiness_status,
 };
 
@@ -22,6 +22,11 @@ pub struct ProfileContext {
 }
 
 pub fn load_profile_context(profile_dir: &Path) -> Result<ProfileContext> {
+    let _lock = ManifestLock::acquire(profile_dir)?;
+    load_profile_context_unlocked(profile_dir)
+}
+
+pub(crate) fn load_profile_context_unlocked(profile_dir: &Path) -> Result<ProfileContext> {
     let config_path = profile_dir.join("profile.toml");
     let manifest_path = profile_dir.join("manifest.json");
     let config = ProfileConfig::load(&config_path)?;
@@ -67,6 +72,7 @@ pub fn load_profile_context(profile_dir: &Path) -> Result<ProfileContext> {
 }
 
 pub fn save_profile_context(context: &ProfileContext) -> Result<()> {
+    let _lock = ManifestLock::acquire(&context.profile_dir)?;
     context
         .config
         .save(context.profile_dir.join("profile.toml"))
@@ -382,6 +388,16 @@ mod tests {
         assert_eq!(context.manifest.status, ProfileStatus::Passed);
         assert!(context.manifest.profile_config_sections_sha256.is_some());
         assert!(context.manifest.events.is_empty());
+    }
+
+    #[test]
+    fn load_profile_context_rejects_existing_manifest_lock() {
+        let fixture = ProfileFixture::new();
+        std::fs::write(fixture.profile_dir().join(".manifest.lock"), "locked").unwrap();
+
+        let err = load_profile_context(fixture.profile_dir()).unwrap_err();
+
+        assert!(err.to_string().contains("manifest lock"));
     }
 
     #[test]
