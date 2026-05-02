@@ -32,7 +32,7 @@ use crate::{
                 build_count_only_assessment_report,
             },
             config::{ProfileConfig, StrictGateConfig},
-            context::{load_profile_context, load_profile_context_unlocked},
+            context::{ProfileContext, load_profile_context, load_profile_context_unlocked},
             holdout::select_diagnostic_holdout_groups,
             manifest::{
                 ArtifactEntry, CurrentBestModel, EventEntry, Manifest, ManifestLock,
@@ -122,18 +122,30 @@ pub fn init_profile(args: GravityProfileInitArgs) -> Result<()> {
 }
 
 pub fn print_status(args: GravityProfilePathArgs) -> Result<()> {
-    let context = load_profile_context(&args.profile)?;
+    for line in status_lines(&args.profile)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub(crate) fn status_lines(profile_dir: &Path) -> Result<Vec<String>> {
+    let context = load_profile_context(profile_dir)?;
+    render_status_lines(&context)
+}
+
+fn render_status_lines(context: &ProfileContext) -> Result<Vec<String>> {
     let config = &context.config;
     let manifest = &context.manifest;
     let counts = active_sample_counts(manifest);
+    let mut lines = Vec::new();
 
-    println!("Profile: {}", manifest.profile_name);
-    println!("Directory: {}", context.profile_dir.display());
-    println!(
+    lines.push(format!("Profile: {}", manifest.profile_name));
+    lines.push(format!("Directory: {}", context.profile_dir.display()));
+    lines.push(format!(
         "Identity: role={} arm_id={} joint_map={} load_profile={} basis={}",
         config.role, config.arm_id, config.joint_map, config.load_profile, config.basis
-    );
-    println!("Current target: {}", config.target);
+    ));
+    lines.push(format!("Current target: {}", config.target));
 
     let artifact_targets: BTreeSet<_> = manifest
         .artifacts
@@ -142,43 +154,140 @@ pub fn print_status(args: GravityProfilePathArgs) -> Result<()> {
         .map(|artifact| artifact.target.as_str())
         .collect();
     if !artifact_targets.is_empty() {
-        println!(
+        lines.push(format!(
             "Active artifact targets: {}",
             artifact_targets.into_iter().collect::<Vec<_>>().join(", ")
-        );
+        ));
     }
 
-    println!(
+    lines.push(format!(
         "Train samples: {} artifacts, {} samples, {} waypoints",
         counts.train_artifacts, counts.train_samples, counts.train_waypoints
-    );
-    println!(
+    ));
+    lines.push(format!(
         "Validation samples: {} artifacts, {} samples, {} waypoints",
         counts.validation_artifacts, counts.validation_samples, counts.validation_waypoints
-    );
+    ));
 
     if let Some(round) = manifest.rounds.last() {
-        println!(
+        lines.push(format!(
             "Latest round: {} ({})",
             round.id,
             status_label(round.status)?
-        );
+        ));
+        append_latest_round_diagnostics(&mut lines, context, round)?;
     } else {
-        println!("Latest round: none");
+        lines.push("Latest round: none".to_string());
     }
 
     if let Some(best) = &manifest.current_best_model {
-        println!("Best model: {} ({})", best.path, best.round_id);
+        lines.push(format!("Best model: {} ({})", best.path, best.round_id));
     } else {
-        println!("Best model: none");
+        lines.push("Best model: none".to_string());
     }
 
-    println!("Status: {}", status_label(manifest.status)?);
+    lines.push(format!("Status: {}", status_label(manifest.status)?));
     if let Some(failure) = manifest.rounds.iter().rev().find_map(|round| round.failure.as_ref()) {
-        println!("Last failed checks: {}: {}", failure.kind, failure.message);
+        lines.push(format!(
+            "Last failed checks: {}: {}",
+            failure.kind, failure.message
+        ));
     }
 
+    Ok(lines)
+}
+
+fn append_latest_round_diagnostics(
+    lines: &mut Vec<String>,
+    context: &ProfileContext,
+    round: &RoundEntry,
+) -> Result<()> {
+    let Some(report_path) = &round.report_path else {
+        return Ok(());
+    };
+    lines.push(format!("Latest report: {report_path}"));
+
+    let resolved = context.profile_dir.join(report_path);
+    let input = match fs::read_to_string(&resolved) {
+        Ok(input) => input,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            lines.push(format!(
+                "Latest report status: missing ({})",
+                resolved.display()
+            ));
+            return Ok(());
+        },
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read latest report {}", resolved.display()));
+        },
+    };
+    let report: Value = serde_json::from_str(&input)
+        .with_context(|| format!("failed to parse latest report {}", resolved.display()))?;
+    append_assessment_report_summary(lines, &report);
     Ok(())
+}
+
+fn append_assessment_report_summary(lines: &mut Vec<String>, report: &Value) {
+    if let Some(range_violations) =
+        report.pointer("/validation/training_range_violations").and_then(Value::as_u64)
+    {
+        let max_range =
+            report.pointer("/validation/max_range_violation_rad").and_then(Value::as_f64);
+        match max_range {
+            Some(max_range) => lines.push(format!(
+                "Validation range violations: {range_violations} (max {max_range:.6} rad)"
+            )),
+            None => lines.push(format!("Validation range violations: {range_violations}")),
+        }
+    }
+
+    if let Some(next_action) = report.pointer("/decision/next_action").and_then(Value::as_str) {
+        lines.push(format!("Decision next action: {next_action}"));
+    }
+
+    let Some(failed_checks) = report.pointer("/decision/failed_checks").and_then(Value::as_array)
+    else {
+        return;
+    };
+    if failed_checks.is_empty() {
+        return;
+    }
+
+    lines.push(format!("Failed checks ({}):", failed_checks.len()));
+    const MAX_STATUS_FAILED_CHECKS: usize = 8;
+    for check in failed_checks.iter().take(MAX_STATUS_FAILED_CHECKS) {
+        lines.push(format!("  - {}", format_assessment_check(check)));
+    }
+    if failed_checks.len() > MAX_STATUS_FAILED_CHECKS {
+        lines.push(format!(
+            "  - ... {} more failed checks in report",
+            failed_checks.len() - MAX_STATUS_FAILED_CHECKS
+        ));
+    }
+}
+
+fn format_assessment_check(check: &Value) -> String {
+    let name = check.get("check").and_then(Value::as_str).unwrap_or("unknown_check");
+    let joint = check
+        .get("joint")
+        .and_then(Value::as_u64)
+        .map(|joint| format!(" J{}", joint + 1))
+        .unwrap_or_default();
+    if let Some(message) = check.get("message").and_then(Value::as_str) {
+        return format!("{name}{joint}: {message}");
+    }
+
+    match (
+        check.get("value").and_then(Value::as_f64),
+        check.get("threshold").and_then(Value::as_f64),
+    ) {
+        (Some(value), Some(threshold)) => {
+            format!("{name}{joint}: value {value:.6}, threshold {threshold:.6}")
+        },
+        (Some(value), None) => format!("{name}{joint}: value {value:.6}"),
+        _ => format!("{name}{joint}"),
+    }
 }
 
 pub fn print_next(args: GravityProfilePathArgs) -> Result<()> {
@@ -1747,6 +1856,55 @@ mod tests {
     }
 
     #[test]
+    fn profile_status_lines_include_latest_failed_assessment_checks() {
+        let fixture = ProfileFixture::new();
+        fixture.set_validation_failed_round(
+            "round-0001",
+            &["samples-train-0001"],
+            &["samples-validation-0001"],
+            &["path-validation-0001"],
+        );
+        fixture.write_assessment_report_for_round(
+            "round-0001",
+            serde_json::json!({
+                "validation": {
+                    "training_range_violations": 459,
+                    "max_range_violation_rad": 0.41465532368881286
+                },
+                "decision": {
+                    "next_action": "collect_more_training_and_validation",
+                    "failed_checks": [
+                        {
+                            "check": "compensated_delta_ratio",
+                            "joint": 0,
+                            "value": 1.4700998410080803,
+                            "threshold": 0.65,
+                            "message": "joint 1 ratio 1.4700998410080803 exceeds limit 0.65"
+                        },
+                        {
+                            "check": "training_range_violations",
+                            "joint": null,
+                            "value": 459.0,
+                            "threshold": 0.0,
+                            "message": "459 validation rows exceed training range, max allowed 0"
+                        }
+                    ]
+                }
+            }),
+        );
+
+        let lines = status_lines(fixture.profile_dir()).unwrap();
+        let output = lines.join("\n");
+
+        assert!(output.contains("Latest report: reports/round-0001.assess.json"));
+        assert!(output.contains("Failed checks (2):"));
+        assert!(output.contains("compensated_delta_ratio J1"));
+        assert!(output.contains("training_range_violations"));
+        assert!(output.contains("Validation range violations: 459"));
+        assert!(output.contains("Decision next action: collect_more_training_and_validation"));
+    }
+
+    #[test]
     fn profile_replay_sample_accepts_explicit_path_artifact_id() {
         let fixture = ProfileFixture::new_with_registered_path(Split::Train);
 
@@ -2924,6 +3082,13 @@ mod tests {
                 failure: None,
             });
             manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
+        }
+
+        fn write_assessment_report_for_round(&self, round_id: &str, report: serde_json::Value) {
+            let report_path =
+                self.profile_dir.join("reports").join(format!("{round_id}.assess.json"));
+            std::fs::create_dir_all(report_path.parent().unwrap()).unwrap();
+            std::fs::write(&report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         }
 
         fn update_sample_source_path_id(&self, sample_artifact_id: &str, source_path_id: &str) {
