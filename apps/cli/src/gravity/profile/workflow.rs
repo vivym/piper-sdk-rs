@@ -2172,23 +2172,66 @@ mod tests {
 
         let manifest = Manifest::load(profile.join("manifest.json")).unwrap();
         assert!(!manifest.rounds.is_empty());
-        assert!(matches!(
-            manifest.status,
-            ProfileStatus::Passed
-                | ProfileStatus::ValidationFailed
-                | ProfileStatus::InsufficientData
-        ));
-
-        if manifest.status == ProfileStatus::ValidationFailed {
-            promote_validation(crate::commands::gravity::GravityProfilePathArgs {
-                profile: profile.clone(),
+        assert_eq!(manifest.status, ProfileStatus::ValidationFailed);
+        let failed_round = manifest.rounds.last().unwrap();
+        assert_eq!(failed_round.status, ProfileStatus::ValidationFailed);
+        let failed_round_id = failed_round.id.clone();
+        let validation_artifacts = manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.active && artifact.kind == "samples" && artifact.split == Split::Validation
             })
-            .unwrap();
+            .collect::<Vec<_>>();
+        assert_eq!(validation_artifacts.len(), 1);
+        let validation_artifact_id = validation_artifacts[0].id.clone();
+        let validation_artifact_path = validation_artifacts[0].path.clone();
+        assert!(profile.join(&validation_artifact_path).exists());
 
-            let manifest = Manifest::load(profile.join("manifest.json")).unwrap();
-            assert_eq!(manifest.status, ProfileStatus::NeedsValidationData);
-            assert!(manifest.events.iter().any(|event| event.kind == "validation_promoted"));
-        }
+        promote_validation(crate::commands::gravity::GravityProfilePathArgs {
+            profile: profile.clone(),
+        })
+        .unwrap();
+
+        let manifest = Manifest::load(profile.join("manifest.json")).unwrap();
+        assert_eq!(manifest.status, ProfileStatus::NeedsValidationData);
+        let promotion_event = manifest
+            .events
+            .iter()
+            .find(|event| event.kind == "validation_promoted")
+            .expect("validation promotion event should be recorded");
+        assert_eq!(
+            promotion_event.round_id.as_deref(),
+            Some(failed_round_id.as_str())
+        );
+        assert_eq!(
+            promotion_event.artifact_ids.as_slice(),
+            std::slice::from_ref(&validation_artifact_id)
+        );
+
+        let promoted_samples = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id == validation_artifact_id)
+            .expect("promoted validation artifact should remain registered");
+        assert_eq!(promoted_samples.split, Split::Train);
+        assert!(promoted_samples.active);
+        assert_eq!(
+            promoted_samples.promoted_from_round_id.as_deref(),
+            Some(failed_round_id.as_str())
+        );
+        assert_eq!(promoted_samples.previous_paths.len(), 1);
+        assert_eq!(promoted_samples.previous_paths[0].split, Split::Validation);
+        assert_eq!(
+            promoted_samples.previous_paths[0].path,
+            validation_artifact_path
+        );
+        assert!(promoted_samples.path.starts_with("data/train/samples/"));
+        assert!(profile.join(&promoted_samples.path).exists());
+        assert!(!profile.join(&validation_artifact_path).exists());
+        assert!(!manifest.artifacts.iter().any(|artifact| {
+            artifact.active && artifact.kind == "samples" && artifact.split == Split::Validation
+        }));
     }
 
     #[test]
