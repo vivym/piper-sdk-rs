@@ -464,8 +464,10 @@ pub fn promote_validation(args: GravityProfilePathArgs) -> Result<()> {
         &round.validation_sample_artifact_ids,
     );
     let current_validation_path_set = current_validation_path_ids.iter().collect::<BTreeSet<_>>();
+    let round_validation_path_artifact_ids =
+        dedupe_preserving_order(&round.validation_path_artifact_ids);
     let round_validation_path_set =
-        round.validation_path_artifact_ids.iter().collect::<BTreeSet<_>>();
+        round_validation_path_artifact_ids.iter().collect::<BTreeSet<_>>();
     if current_validation_path_set != round_validation_path_set {
         bail!(
             "active validation path set changed since {}; rerun fit-assess before promote-validation",
@@ -485,7 +487,7 @@ pub fn promote_validation(args: GravityProfilePathArgs) -> Result<()> {
             "data/train/samples",
         )?);
     }
-    for artifact_id in &round.validation_path_artifact_ids {
+    for artifact_id in &round_validation_path_artifact_ids {
         plans.push(plan_validation_promotion(
             &context.manifest,
             &profile_dir,
@@ -1348,7 +1350,7 @@ pub(crate) fn validation_path_ids_for_sample_ids(
     validation_sample_ids: &[String],
 ) -> Vec<String> {
     let validation_sample_ids = validation_sample_ids.iter().collect::<BTreeSet<_>>();
-    manifest
+    let path_ids = manifest
         .artifacts
         .iter()
         .filter(|artifact| {
@@ -1357,7 +1359,19 @@ pub(crate) fn validation_path_ids_for_sample_ids(
                 && validation_sample_ids.contains(&artifact.id)
         })
         .filter_map(|artifact| artifact.source_path_id.clone())
-        .collect()
+        .collect::<Vec<_>>();
+    dedupe_preserving_order(&path_ids)
+}
+
+fn dedupe_preserving_order(values: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::with_capacity(values.len());
+    for value in values {
+        if seen.insert(value.as_str()) {
+            deduped.push(value.clone());
+        }
+    }
+    deduped
 }
 
 fn sample_paths_for_ids(
@@ -2209,6 +2223,120 @@ mod tests {
         assert_eq!(promoted_path.sha256, old_path_sha256);
         assert!(!validation_path.exists());
         assert!(fixture.profile_dir().join(&promoted_path.path).exists());
+    }
+
+    #[test]
+    fn promote_validation_moves_shared_validation_path_once_for_multiple_samples() {
+        let fixture = ProfileFixture::new();
+        fixture.register_samples_artifact(Split::Train, "samples-train-0001", 320);
+        let validation_path = fixture.register_path_artifact(
+            Split::Validation,
+            "path-validation-0001",
+            "data/validation/paths/path-validation-0001.path.jsonl",
+        );
+        let first_validation_samples = fixture.register_samples_artifact_with_source(
+            Split::Validation,
+            "samples-validation-0001",
+            100,
+            "path-validation-0001",
+        );
+        let second_validation_samples = fixture.register_samples_artifact_with_source(
+            Split::Validation,
+            "samples-validation-0002",
+            80,
+            "path-validation-0001",
+        );
+        fixture.set_validation_failed_round(
+            "round-0001",
+            &["samples-train-0001"],
+            &["samples-validation-0001", "samples-validation-0002"],
+            &["path-validation-0001", "path-validation-0001"],
+        );
+
+        promote_validation(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap();
+
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        for artifact_id in ["samples-validation-0001", "samples-validation-0002"] {
+            let artifact =
+                manifest.artifacts.iter().find(|artifact| artifact.id == artifact_id).unwrap();
+            assert_eq!(artifact.split, Split::Train);
+            assert_eq!(
+                artifact.promoted_from_round_id.as_deref(),
+                Some("round-0001")
+            );
+            assert!(artifact.path.starts_with("data/train/samples/"));
+            assert!(fixture.profile_dir().join(&artifact.path).exists());
+        }
+
+        let promoted_paths = manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.id == "path-validation-0001")
+            .collect::<Vec<_>>();
+        assert_eq!(promoted_paths.len(), 1);
+        let promoted_path = promoted_paths[0];
+        assert_eq!(promoted_path.split, Split::Train);
+        assert_eq!(
+            promoted_path.path,
+            "data/train/paths/path-validation-0001.path.jsonl"
+        );
+        assert_eq!(
+            promoted_path.promoted_from_round_id.as_deref(),
+            Some("round-0001")
+        );
+        assert_eq!(promoted_path.previous_paths.len(), 1);
+        assert!(!validation_path.exists());
+        assert!(!first_validation_samples.exists());
+        assert!(!second_validation_samples.exists());
+        assert!(fixture.profile_dir().join(&promoted_path.path).exists());
+    }
+
+    #[test]
+    fn validation_path_ids_for_sample_ids_dedupes_shared_sources_in_order() {
+        let fixture = ProfileFixture::new();
+        fixture.register_path_artifact(
+            Split::Validation,
+            "path-validation-0001",
+            "data/validation/paths/path-validation-0001.path.jsonl",
+        );
+        fixture.register_path_artifact(
+            Split::Validation,
+            "path-validation-0002",
+            "data/validation/paths/path-validation-0002.path.jsonl",
+        );
+        fixture.register_samples_artifact_with_source(
+            Split::Validation,
+            "samples-validation-0001",
+            20,
+            "path-validation-0001",
+        );
+        fixture.register_samples_artifact_with_source(
+            Split::Validation,
+            "samples-validation-0002",
+            20,
+            "path-validation-0001",
+        );
+        fixture.register_samples_artifact_with_source(
+            Split::Validation,
+            "samples-validation-0003",
+            20,
+            "path-validation-0002",
+        );
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+
+        let path_ids = validation_path_ids_for_sample_ids(
+            &manifest,
+            &[
+                "samples-validation-0001".to_string(),
+                "samples-validation-0002".to_string(),
+                "samples-validation-0003".to_string(),
+            ],
+        );
+
+        assert_eq!(path_ids, ["path-validation-0001", "path-validation-0002"]);
     }
 
     #[test]
