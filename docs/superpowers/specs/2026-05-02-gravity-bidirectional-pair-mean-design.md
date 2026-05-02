@@ -30,12 +30,15 @@ direction-dependent component as a diagnostic.
 
 ## Design Summary
 
-Add a sample reduction layer between raw quasi-static samples and fit/eval. The default profile
-reduction mode is:
+Add a sample reduction layer between raw quasi-static samples and fit/eval. New gravity profiles
+created by `gravity profile init` should write this profile setting explicitly:
 
 ```text
-bidirectional_pair_mean_v1
+bidirectional-pair-mean-v1
 ```
+
+Profiles that omit `fit.sample_reduction` must load as `raw-rows` for backward compatibility.
+Existing profiles opt in by editing `profile.toml` or by a future migration command.
 
 For each source sample artifact, group accepted samples by waypoint identity. If a group has both
 `forward` and `backward` rows, create one effective gravity row:
@@ -69,6 +72,13 @@ pub enum ReductionMode {
     BidirectionalPairMeanV1,
 }
 
+pub struct SourceSampleArtifact {
+    pub source_id: String,
+    pub path: PathBuf,
+    pub header: SamplesHeader,
+    pub rows: Vec<QuasiStaticSampleRow>,
+}
+
 pub struct EffectiveSampleRow {
     pub source_id: String,
     pub group_id: String,
@@ -85,6 +95,8 @@ pub struct ReductionReport {
     pub paired_waypoint_count: usize,
     pub unpaired_waypoint_count: usize,
     pub skipped_pair_q_error_count: usize,
+    pub duplicate_forward_count: usize,
+    pub duplicate_backward_count: usize,
     pub pair_q_error_p95_rad: [f64; 6],
     pub pair_q_error_max_rad: [f64; 6],
     pub direction_torque_delta_p95_nm: [f64; 6],
@@ -96,11 +108,28 @@ The reducer must preserve file/source identity, because separate sample artifact
 `waypoint_id`. A pair key is:
 
 ```text
-source_id + segment_id_or_waypoint_id
+(source_id, waypoint_id)
 ```
 
-For generated profile samples, `source_id` should be the sample artifact id. For standalone fit/eval
-commands that do not know manifest IDs, use the input file path as the source id.
+Do not use `segment_id` alone as a pairing key. `segment_id` can identify a path segment containing
+many waypoints, while `waypoint_id` identifies the replay waypoint. If `segment_id` is useful for
+diagnostics, include it in diagnostic output only, or use it as part of a non-pairing label.
+
+For generated/imported profile samples, `source_id` must be the profile sample artifact id. For
+standalone fit/eval commands that do not know manifest IDs, use a canonical input file path as the
+source id.
+
+If a pair key contains multiple accepted rows for the same direction, average all forward rows first
+and all backward rows first, then average the two direction means into the effective gravity row.
+Record duplicate direction counts in `ReductionReport`.
+
+A pair is valid iff:
+
+```text
+max_j abs(q_forward_mean[j] - q_backward_mean[j]) <= pair_q_error_max_rad
+```
+
+Pairs above that threshold are skipped and counted in `skipped_pair_q_error_count`.
 
 ### Fit
 
@@ -110,12 +139,17 @@ than directly on `QuasiStaticSampleRow`.
 Profile `fit-assess` should:
 
 1. Load active train artifacts with source IDs.
-2. Reduce train rows with `bidirectional_pair_mean_v1`.
+2. Reduce train rows with `bidirectional-pair-mean-v1`.
 3. Fit the final model on effective train rows.
 4. Record both raw sample count and effective sample count.
 
 Low-level `gravity fit` can keep raw behavior initially for compatibility, but the reusable internal
 function should support effective rows so the profile workflow uses the reduced target.
+
+Do not add reduction fields to the model TOML in the first implementation. `QuasiStaticTorqueModel`
+uses strict schema validation. Store raw/effective counts and reduction diagnostics in assessment
+reports and round provenance. `model.sample_count` should remain the number of rows actually used
+for fitting, which is the effective row count in pair-mean mode.
 
 ### Eval
 
@@ -130,7 +164,7 @@ reduction. Add explicit diagnostic sections for raw rows and hysteresis:
 ```json
 {
   "reduction": {
-    "mode": "bidirectional_pair_mean_v1",
+    "mode": "bidirectional-pair-mean-v1",
     "train": { "...": "ReductionReport" },
     "validation": { "...": "ReductionReport" }
   },
@@ -151,8 +185,8 @@ reduction. Add explicit diagnostic sections for raw rows and hysteresis:
 
 ### Gate
 
-`compensated_delta_ratio` should be computed from the gravity-target validation rows. Rename or
-alias it in reports as:
+`gravity_compensated_delta_ratio` should be computed from the gravity-target validation rows. This is
+the metric that participates in strict gate decisions:
 
 ```text
 gravity_compensated_delta_ratio
@@ -164,20 +198,47 @@ The raw row compensated ratio should be reported as:
 raw_row_compensated_delta_ratio
 ```
 
-Only `gravity_compensated_delta_ratio` participates in strict gate decisions. Raw row ratio and
+For rollout compatibility, keep the old `compensated_delta_ratio` report field as an alias of
+`gravity_compensated_delta_ratio` for at least one implementation cycle. New code and status output
+should prefer the explicit gravity/raw-row names.
+
+Define the same meaningful/skipped semantics for gravity ratio as the old ratio:
+
+```text
+gravity_compensated_delta_ratio_meaningful[j] =
+  gravity_raw_torque_delta_nm[j] >= torque_delta_epsilon_nm
+```
+
+If a joint is not meaningful, skip that joint and show the skip in the decision output. A strict pass
+requires at least one meaningful gravity-ratio joint. Zero meaningful joints should be `usable` at
+most, not `good`.
+
+Only `gravity_compensated_delta_ratio` participates in strict pass/fail decisions. Raw row ratio and
 hysteresis are diagnostics.
 
-Add a minimum effective data gate so profiles cannot pass with too few pairs:
+Add a minimum effective pair gate so profiles cannot pass with too few reduced rows. In pair-mean
+mode, one effective row equals one valid paired waypoint, so do not add duplicate sample and waypoint
+thresholds:
 
 ```toml
 [gate.strict_v1]
-min_train_effective_samples = 300
-min_validation_effective_samples = 80
-min_train_effective_waypoints = 150
-min_validation_effective_waypoints = 40
+min_train_effective_pairs = 300
+min_validation_effective_pairs = 80
 ```
 
-For compatibility, these can default to the existing sample/waypoint thresholds if omitted.
+For compatibility, omitted fields default to conservative values. These fields only apply when
+`sample_reduction = "bidirectional-pair-mean-v1"`.
+
+`fit-assess` workflow order must change for pair-mean mode:
+
+1. Verify active artifacts.
+2. Load source-aware train and validation samples.
+3. Reduce train and validation samples.
+4. Gate on effective pair counts.
+5. Fit/evaluate only if effective counts pass.
+
+This prevents “raw counts pass, reduction yields zero pairs” from being recorded as a solver or
+fit failure.
 
 ### Status UX
 
@@ -229,23 +290,70 @@ pair_q_error_max_rad = 0.05
 
 `sample_reduction = "raw-rows"` remains available for debugging and legacy behavior.
 
+Use kebab-case strings in TOML and report JSON:
+
+```text
+raw-rows
+bidirectional-pair-mean-v1
+```
+
+The Rust enum variants may stay `RawRows` and `BidirectionalPairMeanV1`.
+
+Because profile config structs use strict field validation, all new config fields must have serde
+defaults. Existing `profile.toml` files without these fields must continue to load.
+
+Diagnostic holdout should use the same sample reduction mode as the final fit. Holdout selection may
+still choose artifact groups using existing manifest metadata, but once train/holdout artifacts are
+chosen, each side must be reduced before fitting or evaluating holdout metrics.
+
+## Operator Next Actions
+
+`gravity profile next` and status summaries should distinguish these cases:
+
+- Too few effective pairs: collect bidirectional samples or improve acceptance.
+- High q-error skips: lower replay velocity, increase settle time, or loosen tracking only after
+  inspecting safety.
+- High unpaired count but enough pairs: continue; report unpaired as diagnostic.
+- Gravity gates pass but raw-row hysteresis remains high: model is usable for gravity compensation,
+  and hysteresis is expected unmodeled friction.
+- Gravity compensated ratio fails: promote validation to train and collect a new validation path, or
+  inspect whether the path is outside training range.
+
+## Acceptance Criteria
+
+The implementation should be validated against the existing failing profile artifacts, not only
+synthetic tests. For the current slave follower profile data:
+
+- Re-assessment should report effective train/validation pair counts.
+- Re-assessment should report pair q-error p95/max and hysteresis p95/max.
+- `gravity_compensated_delta_ratio` should be the strict gate metric.
+- `raw_row_compensated_delta_ratio` may remain high and must be diagnostic only.
+- If any gravity ratio still fails, the report must show whether the failure is caused by gravity
+  target residuals, training range, or insufficient effective pairs.
+
 ## Testing
 
 Unit tests:
 
 - Reducer averages matched forward/backward rows.
 - Reducer keeps source IDs separate when two files reuse the same waypoint IDs.
+- Reducer does not pair rows that only share `segment_id`.
 - Reducer reports unpaired rows and q-error skips.
+- Reducer averages duplicate rows per direction before pair-meaning.
 - Fitter recovers a synthetic gravity model when raw rows include opposite direction friction.
 - Raw-row fitting fails or has worse span on the same synthetic friction data, proving the regression.
 - Assessment gates on gravity compensated ratio and reports raw-row ratio only as diagnostic.
 - Status output includes effective sample counts and failed gravity checks.
+- Existing profiles without `fit.sample_reduction` load as `raw-rows`.
 
 Integration-style profile workflow tests:
 
 - Existing train/validation artifacts can be re-assessed without data migration.
 - A validation set with paired data and high raw hysteresis can pass if gravity target metrics pass.
 - A validation set with too few pairs fails with an actionable insufficient-data report.
+- Raw manifest counts passing but effective pair counts failing is recorded as insufficient data, not
+  `fit_failed`.
+- Diagnostic holdout is reduced before fitting/evaluation in pair-mean mode.
 
 ## Rollout
 
@@ -257,4 +365,3 @@ Integration-style profile workflow tests:
 6. Compare round reports before/after:
    - `gravity_compensated_delta_ratio` should improve.
    - `raw_row_compensated_delta_ratio` may remain high and should be interpreted as hysteresis.
-
