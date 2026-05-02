@@ -127,7 +127,10 @@ contact.
 
 Replay speed comes from `profile.toml` under `[replay]`. The defaults are
 intentionally low: `max_velocity_rad_s = 0.08`, `max_step_rad = 0.02`,
-`settle_ms = 500`, `sample_ms = 300`, and `bidirectional = true`.
+`settle_ms = 500`, `sample_ms = 300`,
+`stable_tracking_error_rad = 0.05`, and `bidirectional = true`.
+The tracking threshold only decides whether a replay waypoint is accepted as
+quasi-static; the fitted sample still uses the measured feedback pose.
 
 ## Import Offline Samples
 

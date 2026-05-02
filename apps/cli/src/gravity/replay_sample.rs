@@ -40,7 +40,7 @@ const SAMPLE_SCHEMA_VERSION: u32 = 1;
 const REPLAY_SAMPLE_PERIOD_MS: u64 = 10;
 const REPLAY_SAMPLE_FREQUENCY_HZ: f64 = 100.0;
 const DEFAULT_STABLE_VELOCITY_RAD_S: f64 = 0.01;
-const DEFAULT_STABLE_TRACKING_ERROR_RAD: f64 = 0.03;
+pub const DEFAULT_STABLE_TRACKING_ERROR_RAD: f64 = 0.05;
 const DEFAULT_STABLE_TORQUE_STD_NM: f64 = 0.08;
 const COMPLETE_POSITION_FRAME_MASK: u8 = 0x07;
 const CONSERVATIVE_MIT_SPEED_PERCENT: u8 = 10;
@@ -421,6 +421,7 @@ pub(crate) fn validate_replay_args(args: &GravityReplaySampleArgs) -> Result<()>
         bail!("max_velocity_rad_s must be <= {MAX_SAFE_VELOCITY_RAD_S}");
     }
     validate_max_step_rad(args.max_step_rad)?;
+    validate_positive_finite("stable_tracking_error_rad", args.stable_tracking_error_rad)?;
     if args.settle_ms == 0 {
         bail!("settle_ms must be positive");
     }
@@ -659,7 +660,7 @@ fn stable_sample_criteria_from_args(
 ) -> Result<StableSampleCriteria> {
     Ok(StableSampleCriteria {
         stable_velocity_rad_s: DEFAULT_STABLE_VELOCITY_RAD_S,
-        stable_tracking_error_rad: DEFAULT_STABLE_TRACKING_ERROR_RAD,
+        stable_tracking_error_rad: args.stable_tracking_error_rad,
         stable_torque_std_nm: DEFAULT_STABLE_TORQUE_STD_NM,
         sample_count: sample_count_from_sample_ms(args.sample_ms)?,
     })
@@ -2187,6 +2188,25 @@ mod tests {
         args = replay_args("slave", Some("socketcan:can0"), None);
         args.sample_ms = 0;
         assert!(validate_replay_args(&args).unwrap_err().to_string().contains("sample_ms"));
+
+        args = replay_args("slave", Some("socketcan:can0"), None);
+        args.stable_tracking_error_rad = 0.0;
+        assert!(
+            validate_replay_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("stable_tracking_error_rad")
+        );
+    }
+
+    #[test]
+    fn stable_sample_criteria_uses_configured_tracking_error() {
+        let mut args = replay_args("slave", Some("socketcan:can0"), None);
+        args.stable_tracking_error_rad = 0.05;
+
+        let criteria = stable_sample_criteria_from_args(&args).unwrap();
+
+        assert_eq!(criteria.stable_tracking_error_rad, 0.05);
     }
 
     struct FakeStepper {
@@ -2326,6 +2346,7 @@ mod tests {
             max_step_rad: 0.02,
             settle_ms: 500,
             sample_ms: 300,
+            stable_tracking_error_rad: DEFAULT_STABLE_TRACKING_ERROR_RAD,
             bidirectional: true,
             dry_run: true,
         }

@@ -37,6 +37,8 @@ pub struct ReplayConfig {
     pub settle_ms: u64,
     pub max_step_rad: f64,
     pub max_velocity_rad_s: f64,
+    #[serde(default = "default_stable_tracking_error_rad")]
+    pub stable_tracking_error_rad: f64,
     pub bidirectional: bool,
 }
 
@@ -78,6 +80,7 @@ impl Default for ReplayConfig {
             settle_ms: 500,
             max_step_rad: 0.02,
             max_velocity_rad_s: 0.08,
+            stable_tracking_error_rad: default_stable_tracking_error_rad(),
             bidirectional: true,
         }
     }
@@ -178,6 +181,10 @@ impl ProfileConfig {
         }
         validate_positive_f64("replay.max_velocity_rad_s", self.replay.max_velocity_rad_s)?;
         validate_positive_f64("replay.max_step_rad", self.replay.max_step_rad)?;
+        validate_positive_f64(
+            "replay.stable_tracking_error_rad",
+            self.replay.stable_tracking_error_rad,
+        )?;
         if self.replay.settle_ms == 0 {
             bail!("replay.settle_ms must be > 0");
         }
@@ -276,6 +283,10 @@ fn default_torque_convention() -> String {
 
 fn default_basis() -> String {
     crate::gravity::BASIS_TRIG_V1.to_string()
+}
+
+fn default_stable_tracking_error_rad() -> f64 {
+    crate::gravity::replay_sample::DEFAULT_STABLE_TRACKING_ERROR_RAD
 }
 
 fn validate_non_empty(field: &str, value: &str) -> Result<()> {
@@ -431,6 +442,7 @@ mod tests {
         assert_eq!(config.replay.max_step_rad, 0.02);
         assert_eq!(config.replay.settle_ms, 500);
         assert_eq!(config.replay.sample_ms, 300);
+        assert_eq!(config.replay.stable_tracking_error_rad, 0.05);
         assert_eq!(config.fit.ridge_lambda, 1e-4);
         assert_eq!(config.fit.holdout_group_key, "source_path_id");
         assert_eq!(config.gate.strict_v1.min_train_samples, 300);
@@ -494,6 +506,7 @@ mod tests {
             max_step_rad = 0.02
             max_velocity_rad_s = 0.08
             bidirectional = true
+            stable_tracking_error_rad = 0.05
 
             [gate.strict_v1]
             min_train_samples = 300
@@ -539,6 +552,7 @@ mod tests {
             max_step_rad = 0.02
             settle_ms = 500
             sample_ms = 300
+            stable_tracking_error_rad = 0.05
 
             [fit]
             holdout_group_key = "source_path_id"

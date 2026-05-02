@@ -132,6 +132,8 @@ pub struct GravityReplaySampleArgs {
     pub settle_ms: u64,
     #[arg(long, default_value_t = 300)]
     pub sample_ms: u64,
+    #[arg(long, default_value_t = crate::gravity::replay_sample::DEFAULT_STABLE_TRACKING_ERROR_RAD)]
+    pub stable_tracking_error_rad: f64,
     #[arg(long = "no-bidirectional", action = clap::ArgAction::SetFalse, default_value_t = true)]
     pub bidirectional: bool,
     #[arg(long)]
@@ -235,6 +237,32 @@ mod tests {
                 assert_eq!(args.notes.as_deref(), Some("operator note"));
             },
             _ => panic!("expected record-path action"),
+        }
+    }
+
+    #[test]
+    fn gravity_replay_sample_parses_stability_tracking_error() {
+        let cmd = GravityCommand::try_parse_from([
+            "gravity",
+            "replay-sample",
+            "--role",
+            "slave",
+            "--target",
+            "socketcan:can1",
+            "--path",
+            "artifacts/gravity/slave.path.jsonl",
+            "--out",
+            "artifacts/gravity/slave.samples.jsonl",
+            "--stable-tracking-error-rad",
+            "0.05",
+        ])
+        .expect("gravity replay-sample command should parse");
+
+        match cmd.action {
+            GravityAction::ReplaySample(args) => {
+                assert_eq!(args.stable_tracking_error_rad, 0.05);
+            },
+            _ => panic!("expected replay-sample action"),
         }
     }
 

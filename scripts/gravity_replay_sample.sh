@@ -17,6 +17,7 @@ MAX_VELOCITY_RAD_S="${MAX_VELOCITY_RAD_S:-0.08}"
 MAX_STEP_RAD="${MAX_STEP_RAD:-0.02}"
 SETTLE_MS="${SETTLE_MS:-500}"
 SAMPLE_MS="${SAMPLE_MS:-300}"
+STABLE_TRACKING_ERROR_RAD="${STABLE_TRACKING_ERROR_RAD:-0.05}"
 BIDIRECTIONAL="${BIDIRECTIONAL:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
@@ -51,6 +52,7 @@ cmd=(
     --max-step-rad "${MAX_STEP_RAD}"
     --settle-ms "${SETTLE_MS}"
     --sample-ms "${SAMPLE_MS}"
+    --stable-tracking-error-rad "${STABLE_TRACKING_ERROR_RAD}"
 )
 
 if [[ -n "${TARGET}" ]]; then
@@ -79,6 +81,7 @@ fi
     echo "max_step_rad=${MAX_STEP_RAD}"
     echo "settle_ms=${SETTLE_MS}"
     echo "sample_ms=${SAMPLE_MS}"
+    echo "stable_tracking_error_rad=${STABLE_TRACKING_ERROR_RAD}"
     echo "bidirectional=${BIDIRECTIONAL}"
     echo "dry_run=${DRY_RUN}"
     echo "skip_build=${SKIP_BUILD}"

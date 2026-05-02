@@ -48,8 +48,13 @@ cargo run -p piper-cli -- gravity replay-sample \
   --role slave \
   --interface can0 \
   --path artifacts/gravity/slave-d405.path.jsonl \
-  --out artifacts/gravity/slave-d405.samples.jsonl
+  --out artifacts/gravity/slave-d405.samples.jsonl \
+  --stable-tracking-error-rad 0.05
 ```
+
+For heavier payloads, `0.05 rad` is the recommended starting point. Keep
+velocity and torque stability strict; the fitted row uses measured feedback
+pose, so moderate target tracking error mostly affects waypoint acceptance.
 
 Fit the Rust model:
 

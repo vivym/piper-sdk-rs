@@ -638,6 +638,7 @@ pub(crate) fn plan_replay_sample(
             max_step_rad: context.config.replay.max_step_rad,
             settle_ms: context.config.replay.settle_ms,
             sample_ms: context.config.replay.sample_ms,
+            stable_tracking_error_rad: context.config.replay.stable_tracking_error_rad,
             bidirectional: context.config.replay.bidirectional,
             dry_run,
         },
@@ -1733,6 +1734,7 @@ mod tests {
         assert_eq!(planned.args.max_step_rad, 0.02);
         assert_eq!(planned.args.settle_ms, 500);
         assert_eq!(planned.args.sample_ms, 300);
+        assert_eq!(planned.args.stable_tracking_error_rad, 0.05);
         assert!(planned.args.bidirectional);
         assert!(planned.args.dry_run);
         assert!(
