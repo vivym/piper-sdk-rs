@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
@@ -232,6 +233,10 @@ pub fn register_profile_generated_samples(
         bail!("expected samples artifact summary");
     }
     validate_artifact_summary(&context.config, &summary)?;
+    reject_legacy_explicit_arm_id_mixing(
+        &context.manifest,
+        std::iter::once(SampleArmIdMode::AssertedArmId),
+    )?;
     validate_generated_samples_source(
         &context.profile_dir,
         split,
@@ -240,7 +245,7 @@ pub fn register_profile_generated_samples(
         &summary,
         &context.manifest,
     )?;
-    reject_active_other_split_duplicate(&context.manifest, split, &summary)?;
+    reject_active_sample_duplicate(&context.manifest, &summary)?;
     let relative_path = profile_relative_artifact_path(&context.profile_dir, output_path)?;
     reserve_planned_artifact_id(&mut context.manifest, "samples", artifact_id, unix_ms)?;
 
@@ -285,8 +290,13 @@ pub fn register_imported_samples(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    reject_duplicate_import_batch_samples(samples, &summaries)?;
+    reject_legacy_explicit_arm_id_mixing(
+        &context.manifest,
+        summaries.iter().map(sample_arm_id_mode_for_summary),
+    )?;
     for summary in &summaries {
-        reject_active_other_split_duplicate(&context.manifest, split, summary)?;
+        reject_active_sample_duplicate(&context.manifest, summary)?;
     }
 
     let now = current_unix_ms();
@@ -313,7 +323,7 @@ pub fn register_imported_samples(
         let copied_summary = analyze_samples_artifact(&destination)
             .with_context(|| format!("failed to analyze {}", destination.display()))?;
         validate_artifact_summary(&context.config, &copied_summary)?;
-        reject_active_other_split_duplicate(&context.manifest, split, &copied_summary)?;
+        reject_active_sample_duplicate(&context.manifest, &copied_summary)?;
         let (arm_id, arm_id_source) = match copied_summary.arm_id.clone() {
             Some(arm_id) => (arm_id, Some("artifact_header".to_string())),
             None => (
@@ -358,16 +368,71 @@ pub fn register_imported_samples(
         })
 }
 
-fn reject_active_other_split_duplicate(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SampleArmIdMode {
+    LegacyMissingArmId,
+    AssertedArmId,
+}
+
+fn sample_arm_id_mode_for_summary(summary: &ArtifactSummary) -> SampleArmIdMode {
+    match summary.arm_id {
+        Some(_) => SampleArmIdMode::AssertedArmId,
+        None => SampleArmIdMode::LegacyMissingArmId,
+    }
+}
+
+fn sample_arm_id_mode_for_artifact(artifact: &ArtifactEntry) -> Option<SampleArmIdMode> {
+    if !artifact.active || artifact.kind != "samples" {
+        return None;
+    }
+    match artifact.arm_id_source.as_deref() {
+        Some("legacy_import_profile_asserted") => Some(SampleArmIdMode::LegacyMissingArmId),
+        _ => Some(SampleArmIdMode::AssertedArmId),
+    }
+}
+
+fn reject_legacy_explicit_arm_id_mixing(
     manifest: &Manifest,
-    split: Split,
-    summary: &ArtifactSummary,
+    new_modes: impl IntoIterator<Item = SampleArmIdMode>,
 ) -> Result<()> {
+    let mut modes = manifest
+        .artifacts
+        .iter()
+        .filter_map(sample_arm_id_mode_for_artifact)
+        .collect::<HashSet<_>>();
+    modes.extend(new_modes);
+
+    if modes.contains(&SampleArmIdMode::LegacyMissingArmId)
+        && modes.contains(&SampleArmIdMode::AssertedArmId)
+    {
+        bail!(
+            "cannot mix legacy samples missing arm_id with samples that have explicit or profile-generated arm_id; import legacy-only samples into a separate profile"
+        );
+    }
+    Ok(())
+}
+
+fn reject_duplicate_import_batch_samples(
+    samples: &[PathBuf],
+    summaries: &[ArtifactSummary],
+) -> Result<()> {
+    let mut first_path_by_sha = HashMap::new();
+    for (path, summary) in samples.iter().zip(summaries) {
+        if let Some(first_path) = first_path_by_sha.insert(summary.sha256.as_str(), path) {
+            bail!(
+                "duplicate samples artifact content sha256 {} in import batch: {} and {}",
+                summary.sha256,
+                first_path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reject_active_sample_duplicate(manifest: &Manifest, summary: &ArtifactSummary) -> Result<()> {
     if let Some(existing) = manifest.artifacts.iter().find(|artifact| {
-        artifact.active
-            && artifact.kind == "samples"
-            && artifact.split != split
-            && artifact.sha256 == summary.sha256
+        artifact.active && artifact.kind == "samples" && artifact.sha256 == summary.sha256
     }) {
         bail!(
             "samples artifact content sha256 {} is already active in {:?} as {}",
@@ -823,6 +888,189 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("already active"));
+    }
+
+    #[test]
+    fn register_samples_rejects_same_file_content_in_same_active_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let samples = write_samples_artifact_for_tests(dir.path(), "same.samples.jsonl", 12, 4);
+
+        import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![samples.clone()],
+        })
+        .unwrap();
+
+        let err = import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![samples],
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("already active"));
+    }
+
+    #[test]
+    fn register_samples_rejects_duplicate_file_content_in_one_import_batch_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let samples = write_samples_artifact_for_tests(dir.path(), "same.samples.jsonl", 12, 4);
+
+        let err = import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![samples.clone(), samples],
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("duplicate"));
+        assert!(fixture.load_manifest().artifacts.is_empty());
+    }
+
+    #[test]
+    fn register_samples_rejects_duplicate_content_from_distinct_files_in_one_import_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let first = write_samples_artifact_for_tests(dir.path(), "first.samples.jsonl", 12, 4);
+        let second = dir.path().join("second.samples.jsonl");
+        std::fs::copy(&first, &second).unwrap();
+
+        let err = import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![first, second],
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("duplicate"));
+        assert!(fixture.load_manifest().artifacts.is_empty());
+    }
+
+    #[test]
+    fn importing_legacy_sample_rejects_existing_explicit_arm_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let explicit = write_samples_artifact_with_arm_id_for_tests(
+            dir.path(),
+            "explicit.samples.jsonl",
+            "piper-left",
+        );
+        let legacy = write_samples_artifact_for_tests(dir.path(), "legacy.samples.jsonl", 12, 4);
+
+        import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![explicit],
+        })
+        .unwrap();
+
+        let err = import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "validation".to_string(),
+            samples: vec![legacy],
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("arm_id"));
+        assert!(err.to_string().contains("legacy"));
+    }
+
+    #[test]
+    fn importing_explicit_arm_sample_rejects_existing_legacy_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let legacy = write_samples_artifact_for_tests(dir.path(), "legacy.samples.jsonl", 12, 4);
+        let explicit = write_samples_artifact_with_arm_id_for_tests(
+            dir.path(),
+            "explicit.samples.jsonl",
+            "piper-left",
+        );
+
+        import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![legacy],
+        })
+        .unwrap();
+
+        let err = import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "validation".to_string(),
+            samples: vec![explicit],
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("arm_id"));
+        assert!(err.to_string().contains("legacy"));
+    }
+
+    #[test]
+    fn importing_mixed_legacy_and_explicit_samples_in_one_batch_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let legacy = write_samples_artifact_for_tests(dir.path(), "legacy.samples.jsonl", 12, 4);
+        let explicit = write_samples_artifact_with_arm_id_for_tests(
+            dir.path(),
+            "explicit.samples.jsonl",
+            "piper-left",
+        );
+
+        let err = import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![legacy, explicit],
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("arm_id"));
+        assert!(err.to_string().contains("legacy"));
+        assert!(fixture.load_manifest().artifacts.is_empty());
+    }
+
+    #[test]
+    fn register_generated_samples_rejects_existing_legacy_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let legacy = write_samples_artifact_for_tests(dir.path(), "legacy.samples.jsonl", 12, 4);
+
+        import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![legacy],
+        })
+        .unwrap();
+
+        let source = fixture.register_path_artifact_for_tests(Split::Train);
+        let artifact_id = "samples-20260502-001530-0003";
+        let samples = fixture
+            .profile_dir()
+            .join("data/train/samples")
+            .join(format!("{artifact_id}.samples.jsonl"));
+        std::fs::create_dir_all(samples.parent().unwrap()).unwrap();
+        write_samples_artifact_with_source_for_tests(
+            samples.parent().unwrap(),
+            &format!("{artifact_id}.samples.jsonl"),
+            12,
+            4,
+            &source.path.canonicalize().unwrap().display().to_string(),
+            &source.sha256,
+        );
+
+        let err = register_profile_generated_samples(
+            fixture.profile_dir(),
+            Split::Train,
+            artifact_id,
+            &source.id,
+            &samples,
+            unix_ms_for_tests(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("arm_id"));
+        assert!(err.to_string().contains("legacy"));
     }
 
     #[test]

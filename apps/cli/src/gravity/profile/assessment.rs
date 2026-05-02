@@ -570,7 +570,7 @@ fn reason_check(check: &str, message: &str) -> AssessmentCheck {
 fn next_action_for_grade(grade: AssessmentGrade) -> &'static str {
     match grade {
         AssessmentGrade::Good => "ready_to_use",
-        AssessmentGrade::Usable => "promote_validation_then_collect_new_validation",
+        AssessmentGrade::Usable => "ready_to_use_with_caution",
         AssessmentGrade::Risky => "collect_more_validation_or_refit",
         AssessmentGrade::Bad => "collect_more_training_and_validation",
     }
@@ -811,6 +811,7 @@ mod tests {
 
         assert!(decision.pass);
         assert_eq!(decision.grade, AssessmentGrade::Usable);
+        assert_eq!(decision.next_action, "ready_to_use_with_caution");
     }
 
     #[test]
