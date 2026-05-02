@@ -352,7 +352,9 @@ pub(crate) fn fit_assess(args: GravityProfilePathArgs) -> Result<()> {
     }) {
         Ok(completed) => {
             context.manifest.status = completed.status;
-            context.manifest.current_best_model = completed.current_best_model;
+            if completed.current_best_model.is_some() {
+                context.manifest.current_best_model = completed.current_best_model;
+            }
             context.manifest.rounds.push(completed.round_entry);
             context
                 .manifest
@@ -585,10 +587,13 @@ fn fit_assess_after_count_gate(input: PostGateFitInput<'_>) -> Result<CompletedF
         Vec::with_capacity(input.train_artifacts.len() + input.validation_artifacts.len());
     all_artifacts.extend_from_slice(input.train_artifacts);
     all_artifacts.extend_from_slice(input.validation_artifacts);
-    verify_registered_artifacts(profile_dir, &all_artifacts)?;
+    for artifact in &all_artifacts {
+        verify_registered_artifacts(profile_dir, std::slice::from_ref(artifact))
+            .with_context(|| format!("failed to verify active sample artifact {}", artifact.id))?;
+    }
 
-    let train_paths = active_sample_paths(manifest, profile_dir, Split::Train);
-    let validation_paths = active_sample_paths(manifest, profile_dir, Split::Validation);
+    let train_paths = active_sample_paths(manifest, profile_dir, Split::Train)?;
+    let validation_paths = active_sample_paths(manifest, profile_dir, Split::Validation)?;
     let train_loaded = read_quasi_static_samples(&train_paths)
         .with_context(|| "failed to read active train sample artifacts")?;
     let validation_loaded = read_quasi_static_samples(&validation_paths)
@@ -606,12 +611,12 @@ fn fit_assess_after_count_gate(input: PostGateFitInput<'_>) -> Result<CompletedF
             manifest,
             profile_dir,
             &diagnostic_split.train_sample_artifact_ids,
-        );
+        )?;
         let diagnostic_holdout_paths = sample_paths_for_ids(
             input.manifest,
             input.profile_dir,
             &diagnostic_split.holdout_sample_artifact_ids,
-        );
+        )?;
         let diagnostic_train_loaded = read_quasi_static_samples(&diagnostic_train_paths)
             .with_context(|| "failed to read diagnostic train sample artifacts")?;
         let diagnostic_holdout_loaded = read_quasi_static_samples(&diagnostic_holdout_paths)
@@ -853,10 +858,16 @@ pub(crate) fn active_sample_paths(
     manifest: &Manifest,
     profile_dir: &Path,
     split: Split,
-) -> Vec<PathBuf> {
-    active_sample_artifacts(manifest, split)
+) -> Result<Vec<PathBuf>> {
+    manifest
+        .artifacts
         .iter()
-        .filter_map(|artifact| registered_artifact_path(profile_dir, artifact).ok())
+        .filter(|artifact| artifact.active && artifact.kind == "samples" && artifact.split == split)
+        .map(|artifact| {
+            registered_artifact_path(profile_dir, artifact).with_context(|| {
+                format!("failed to resolve active sample artifact {}", artifact.id)
+            })
+        })
         .collect()
 }
 
@@ -886,7 +897,11 @@ pub(crate) fn validation_path_ids_for_sample_ids(
         .collect()
 }
 
-fn sample_paths_for_ids(manifest: &Manifest, profile_dir: &Path, ids: &[String]) -> Vec<PathBuf> {
+fn sample_paths_for_ids(
+    manifest: &Manifest,
+    profile_dir: &Path,
+    ids: &[String],
+) -> Result<Vec<PathBuf>> {
     let ids = ids.iter().collect::<BTreeSet<_>>();
     manifest
         .artifacts
@@ -894,7 +909,11 @@ fn sample_paths_for_ids(manifest: &Manifest, profile_dir: &Path, ids: &[String])
         .filter(|artifact| {
             artifact.active && artifact.kind == "samples" && ids.contains(&artifact.id)
         })
-        .filter_map(|artifact| registered_artifact_path(profile_dir, artifact).ok())
+        .map(|artifact| {
+            registered_artifact_path(profile_dir, artifact).with_context(|| {
+                format!("failed to resolve selected sample artifact {}", artifact.id)
+            })
+        })
         .collect()
 }
 
@@ -1063,13 +1082,12 @@ fn current_unix_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::commands::gravity::GravityProfileInitArgs;
+    use crate::gravity::artifact::{
+        PassDirection, QuasiStaticSampleRow, SamplesHeader, write_jsonl_row,
+    };
     use crate::gravity::profile::{
         config::ProfileConfig,
-        manifest::{ArtifactEntry, Manifest, ProfileStatus, Split},
-    };
-    use crate::gravity::{
-        artifact::{PassDirection, QuasiStaticSampleRow, SamplesHeader, write_jsonl_row},
-        model::{TRIG_V1_FEATURE_COUNT, trig_v1_features},
+        manifest::{ArtifactEntry, CurrentBestModel, Manifest, ProfileStatus, Split},
     };
 
     #[test]
@@ -1407,6 +1425,64 @@ mod tests {
         assert!(manifest.current_best_model.is_none());
     }
 
+    #[test]
+    fn fit_assess_preserves_existing_best_model_when_validation_fails() {
+        let fixture = ProfileFixture::new();
+        fixture.register_samples_artifact(Split::Train, "samples-train-0001", 320);
+        fixture.register_samples_artifact_with_torque(
+            Split::Validation,
+            "samples-validation-0001",
+            100,
+            [10.0; 6],
+        );
+        fixture.install_existing_best_model("round-0000", "old-best-sha");
+
+        fit_assess(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap();
+
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        assert_eq!(manifest.status, ProfileStatus::ValidationFailed);
+        assert_eq!(
+            manifest.current_best_model,
+            Some(existing_best_model_for_tests("round-0000", "old-best-sha"))
+        );
+    }
+
+    #[test]
+    fn fit_assess_sets_fit_failed_when_active_sample_path_is_unsafe_after_count_gate() {
+        let fixture = ProfileFixture::new();
+        fixture.register_samples_artifact(Split::Train, "samples-train-0001", 320);
+        fixture.register_samples_artifact(Split::Validation, "samples-validation-0001", 100);
+        let mut manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.id == "samples-validation-0001")
+            .unwrap()
+            .path = "../outside.samples.jsonl".to_string();
+        manifest.save_atomic(fixture.profile_dir().join("manifest.json")).unwrap();
+
+        let err = fit_assess(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("samples-validation-0001"));
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        assert_eq!(manifest.status, ProfileStatus::FitFailed);
+        assert_eq!(manifest.rounds.len(), 1);
+        assert!(
+            manifest.rounds[0]
+                .failure
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("samples-validation-0001")
+        );
+    }
+
     fn init_args_without_profile() -> GravityProfileInitArgs {
         GravityProfileInitArgs {
             profile: None,
@@ -1510,11 +1586,21 @@ mod tests {
         }
 
         fn register_samples_artifact(&self, split: Split, artifact_id: &str, sample_count: usize) {
+            self.register_samples_artifact_with_torque(split, artifact_id, sample_count, [0.0; 6]);
+        }
+
+        fn register_samples_artifact_with_torque(
+            &self,
+            split: Split,
+            artifact_id: &str,
+            sample_count: usize,
+            torque_nm: [f64; 6],
+        ) {
             let split_dir = split_dir_for_tests(split);
             let relative_path = format!("data/{split_dir}/samples/{artifact_id}.samples.jsonl");
             let samples_path = self.profile_dir.join(&relative_path);
             std::fs::create_dir_all(samples_path.parent().unwrap()).unwrap();
-            write_samples_artifact_for_tests(&samples_path, sample_count);
+            write_samples_artifact_for_tests(&samples_path, sample_count, torque_nm);
 
             let mut manifest = Manifest::load(self.profile_dir.join("manifest.json")).unwrap();
             manifest.artifacts.push(ArtifactEntry {
@@ -1543,6 +1629,13 @@ mod tests {
                 Split::Train => ProfileStatus::NeedsValidationData,
                 Split::Validation => ProfileStatus::ReadyToFit,
             };
+            manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
+        }
+
+        fn install_existing_best_model(&self, round_id: &str, sha256: &str) {
+            std::fs::write(self.profile_dir.join("models/best.model.toml"), "old-best").unwrap();
+            let mut manifest = Manifest::load(self.profile_dir.join("manifest.json")).unwrap();
+            manifest.current_best_model = Some(existing_best_model_for_tests(round_id, sha256));
             manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
         }
     }
@@ -1585,7 +1678,11 @@ mod tests {
         }
     }
 
-    fn write_samples_artifact_for_tests(path: &std::path::Path, sample_count: usize) {
+    fn write_samples_artifact_for_tests(
+        path: &std::path::Path,
+        sample_count: usize,
+        torque_nm: [f64; 6],
+    ) {
         let mut file = std::fs::File::create(path).unwrap();
         let header = SamplesHeader {
             row_type: "header".to_string(),
@@ -1613,17 +1710,19 @@ mod tests {
         };
         write_jsonl_row(&mut file, &header).unwrap();
         for sample_index in 0..sample_count {
-            write_jsonl_row(&mut file, &synthetic_sample_row_for_tests(sample_index)).unwrap();
+            write_jsonl_row(
+                &mut file,
+                &synthetic_sample_row_for_tests(sample_index, torque_nm),
+            )
+            .unwrap();
         }
     }
 
-    fn synthetic_sample_row_for_tests(sample_index: usize) -> QuasiStaticSampleRow {
+    fn synthetic_sample_row_for_tests(
+        sample_index: usize,
+        torque_nm: [f64; 6],
+    ) -> QuasiStaticSampleRow {
         let q_rad = synthetic_q_for_tests(sample_index);
-        let features = trig_v1_features(q_rad);
-        let mut tau_nm = [0.0; 6];
-        for joint in 0..6 {
-            tau_nm[joint] = features[joint % TRIG_V1_FEATURE_COUNT] * 0.0;
-        }
         QuasiStaticSampleRow {
             row_type: "quasi-static-sample".to_string(),
             waypoint_id: sample_index as u64,
@@ -1633,7 +1732,7 @@ mod tests {
             raw_timestamp_us: None,
             q_rad,
             dq_rad_s: [0.0; 6],
-            tau_nm,
+            tau_nm: torque_nm,
             position_valid_mask: 0x3f,
             dynamic_valid_mask: 0x3f,
             stable_velocity_rad_s: 0.0,
@@ -1652,6 +1751,17 @@ mod tests {
             ((i * 0.041) + (i * 0.011).sin()).sin() * 1.3,
             ((i * 0.047) + 1.2).cos(),
         ]
+    }
+
+    fn existing_best_model_for_tests(round_id: &str, sha256: &str) -> CurrentBestModel {
+        CurrentBestModel {
+            round_id: round_id.to_string(),
+            path: "models/best.model.toml".to_string(),
+            sha256: sha256.to_string(),
+            source_model_path: "models/old.model.toml".to_string(),
+            source_model_sha256: sha256.to_string(),
+            promoted_at_unix_ms: unix_ms_for_tests(),
+        }
     }
 
     mod import {
