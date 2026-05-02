@@ -6,9 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     commands::gravity::{
@@ -35,8 +35,8 @@ use crate::{
             context::{load_profile_context, load_profile_context_unlocked},
             holdout::select_diagnostic_holdout_groups,
             manifest::{
-                ArtifactEntry, CurrentBestModel, Manifest, ManifestLock, ProfileStatus, RoundEntry,
-                RoundFailure, Split,
+                ArtifactEntry, CurrentBestModel, EventEntry, Manifest, ManifestLock, ProfileStatus,
+                RoundEntry, RoundFailure, Split,
             },
             status::next_action,
         },
@@ -352,23 +352,39 @@ pub(crate) fn fit_assess(args: GravityProfilePathArgs) -> Result<()> {
     }) {
         Ok(completed) => {
             context.manifest.status = completed.status;
-            if completed.current_best_model.is_some() {
-                context.manifest.current_best_model = completed.current_best_model;
-            }
             context.manifest.rounds.push(completed.round_entry);
-            context
-                .manifest
-                .save_atomic(&manifest_path)
-                .with_context(|| format!("failed to save {}", manifest_path.display()))?;
+            if let Some(pending_best) = completed.current_best_model {
+                let promotion =
+                    BestModelPromotion::promote(&profile_dir, &pending_best.source_model_path)?;
+                context.manifest.current_best_model = Some(pending_best);
+                if let Err(save_error) = context.manifest.save_atomic(&manifest_path) {
+                    let rollback_result = promotion.rollback();
+                    let mut message = format!(
+                        "failed to save {} after best model promotion: {save_error:#}",
+                        manifest_path.display()
+                    );
+                    if let Err(rollback_error) = rollback_result {
+                        message.push_str(&format!("; rollback failed: {rollback_error:#}"));
+                    }
+                    return Err(anyhow!(message));
+                }
+                promotion.commit()?;
+            } else {
+                context
+                    .manifest
+                    .save_atomic(&manifest_path)
+                    .with_context(|| format!("failed to save {}", manifest_path.display()))?;
+            }
             Ok(())
         },
         Err(error) => {
+            let original_error = format!("{error:#}");
             let failure = RoundFailure {
                 kind: "fit".to_string(),
-                message: format!("{error:#}"),
+                message: original_error.clone(),
             };
             context.manifest.status = ProfileStatus::FitFailed;
-            let round_entry = write_failure_round(FailureRoundInput {
+            let failure_persistence = write_failure_round(FailureRoundInput {
                 profile_dir: &profile_dir,
                 manifest: &context.manifest,
                 gate: &context.config.gate.strict_v1,
@@ -384,12 +400,30 @@ pub(crate) fn fit_assess(args: GravityProfilePathArgs) -> Result<()> {
                 unix_ms,
                 failure,
             });
-            context.manifest.rounds.push(round_entry);
-            context
+            context.manifest.rounds.push(failure_persistence.round_entry);
+            if !failure_persistence.persistence_errors.is_empty() {
+                append_fit_failed_event(
+                    &mut context.manifest,
+                    &round_id,
+                    &train_sample_artifact_ids,
+                    &validation_sample_artifact_ids,
+                    &failure_persistence.persistence_errors,
+                    unix_ms,
+                );
+            }
+            let save_result = context
                 .manifest
                 .save_atomic(&manifest_path)
-                .with_context(|| format!("failed to save {}", manifest_path.display()))?;
-            Err(error).with_context(|| format!("fit-assess failed for {round_id}"))
+                .with_context(|| format!("failed to save {}", manifest_path.display()));
+            let mut message = format!("fit-assess failed for {round_id}: {original_error}");
+            if !failure_persistence.persistence_errors.is_empty() {
+                message.push_str("; failure round persistence errors: ");
+                message.push_str(&failure_persistence.persistence_errors.join("; "));
+            }
+            if let Err(save_error) = save_result {
+                message.push_str(&format!("; manifest save error: {save_error:#}"));
+            }
+            Err(anyhow!(message))
         },
     }
 }
@@ -493,6 +527,103 @@ struct CompletedFitAssess {
     status: ProfileStatus,
     current_best_model: Option<CurrentBestModel>,
     round_entry: RoundEntry,
+}
+
+#[derive(Debug)]
+struct BestModelPromotion {
+    best_path: PathBuf,
+    backup_path: Option<PathBuf>,
+}
+
+impl BestModelPromotion {
+    fn promote(profile_dir: &Path, source_model_relative: &str) -> Result<Self> {
+        let source_path = profile_dir.join(source_model_relative);
+        let best_path = profile_dir.join("models/best.model.toml");
+        validate_profile_generated_output_path(profile_dir, &source_path)?;
+        validate_profile_generated_output_path(profile_dir, &best_path)?;
+
+        let suffix = unique_path_suffix();
+        let temp_path = profile_dir.join(format!("models/.best.model.toml.tmp-{suffix}"));
+        let backup_path = profile_dir.join(format!("models/.best.model.toml.bak-{suffix}"));
+        validate_profile_generated_output_path(profile_dir, &temp_path)?;
+        validate_profile_generated_output_path(profile_dir, &backup_path)?;
+
+        let bytes = fs::read(&source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?;
+        write_bytes_create_new(&temp_path, &bytes)
+            .with_context(|| format!("failed to create best model temp {}", temp_path.display()))?;
+
+        let backup_path = if best_path.exists() {
+            fs::rename(&best_path, &backup_path).with_context(|| {
+                format!(
+                    "failed to backup existing best model {} to {}",
+                    best_path.display(),
+                    backup_path.display()
+                )
+            })?;
+            Some(backup_path)
+        } else {
+            None
+        };
+
+        if let Err(error) = fs::rename(&temp_path, &best_path) {
+            let rollback_result = rollback_best_model_paths(&best_path, backup_path.as_deref());
+            let _ = fs::remove_file(&temp_path);
+            let mut message = format!(
+                "failed to promote best model temp {} to {}: {error}",
+                temp_path.display(),
+                best_path.display()
+            );
+            if let Err(rollback_error) = rollback_result {
+                message.push_str(&format!("; rollback failed: {rollback_error:#}"));
+            }
+            return Err(anyhow!(message));
+        }
+
+        Ok(Self {
+            best_path,
+            backup_path,
+        })
+    }
+
+    fn rollback(self) -> Result<()> {
+        rollback_best_model_paths(&self.best_path, self.backup_path.as_deref())
+    }
+
+    fn commit(self) -> Result<()> {
+        if let Some(backup_path) = self.backup_path
+            && backup_path.exists()
+        {
+            fs::remove_file(&backup_path).with_context(|| {
+                format!(
+                    "failed to remove best model backup {}",
+                    backup_path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn rollback_best_model_paths(best_path: &Path, backup_path: Option<&Path>) -> Result<()> {
+    if best_path.exists() {
+        fs::remove_file(best_path).with_context(|| {
+            format!(
+                "failed to remove promoted best model {}",
+                best_path.display()
+            )
+        })?;
+    }
+    if let Some(backup_path) = backup_path.filter(|path| path.exists()) {
+        fs::rename(backup_path, best_path).with_context(|| {
+            format!(
+                "failed to restore best model backup {} to {}",
+                backup_path.display(),
+                best_path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -610,11 +741,13 @@ fn fit_assess_after_count_gate(input: PostGateFitInput<'_>) -> Result<CompletedF
         let diagnostic_train_paths = sample_paths_for_ids(
             manifest,
             profile_dir,
+            Split::Train,
             &diagnostic_split.train_sample_artifact_ids,
         )?;
         let diagnostic_holdout_paths = sample_paths_for_ids(
             input.manifest,
             input.profile_dir,
+            Split::Train,
             &diagnostic_split.holdout_sample_artifact_ids,
         )?;
         let diagnostic_train_loaded = read_quasi_static_samples(&diagnostic_train_paths)
@@ -702,12 +835,6 @@ fn fit_assess_after_count_gate(input: PostGateFitInput<'_>) -> Result<CompletedF
     let report_sha256 = file_sha256(&profile_dir.join(&report_relative))?;
     let round_sha256 = file_sha256(&profile_dir.join(&round_relative))?;
     let status = if report.decision.pass {
-        let best_relative = "models/best.model.toml".to_string();
-        fs::copy(
-            profile_dir.join(&model_relative),
-            profile_dir.join(&best_relative),
-        )
-        .with_context(|| format!("failed to promote best model to {best_relative}"))?;
         ProfileStatus::Passed
     } else {
         ProfileStatus::ValidationFailed
@@ -716,7 +843,7 @@ fn fit_assess_after_count_gate(input: PostGateFitInput<'_>) -> Result<CompletedF
         Some(CurrentBestModel {
             round_id: round_id.to_string(),
             path: "models/best.model.toml".to_string(),
-            sha256: file_sha256(&profile_dir.join("models/best.model.toml"))?,
+            sha256: model_sha256.clone(),
             source_model_path: model_relative.clone(),
             source_model_sha256: model_sha256.clone(),
             promoted_at_unix_ms: unix_ms,
@@ -768,13 +895,19 @@ struct FailureRoundInput<'a> {
     failure: RoundFailure,
 }
 
-fn write_failure_round(input: FailureRoundInput<'_>) -> RoundEntry {
+struct FailureRoundPersistence {
+    round_entry: RoundEntry,
+    persistence_errors: Vec<String>,
+}
+
+fn write_failure_round(input: FailureRoundInput<'_>) -> FailureRoundPersistence {
     let profile_dir = input.profile_dir;
     let manifest = input.manifest;
     let round_id = input.round_id;
     let failure = input.failure;
     let report_relative = format!("reports/{round_id}.assess.json");
     let round_relative = format!("rounds/{round_id}.json");
+    let mut persistence_errors = Vec::new();
     let diagnostic_split = select_diagnostic_holdout_groups(
         &manifest.profile_identity_sha256,
         round_id,
@@ -792,9 +925,23 @@ fn write_failure_round(input: FailureRoundInput<'_>) -> RoundEntry {
         .map(|split| split.holdout_group_keys.clone())
         .unwrap_or_default();
     let report = build_count_only_assessment_report(input.gate, input.counts, &failure.message);
-    let report_sha256 = write_json_create_new(profile_dir, &report_relative, &report)
-        .ok()
-        .and_then(|_| file_sha256(&profile_dir.join(&report_relative)).ok());
+    let report_sha256 = match write_json_create_new(profile_dir, &report_relative, &report)
+        .with_context(|| format!("failed to persist failure report {report_relative}"))
+    {
+        Ok(()) => match file_sha256(&profile_dir.join(&report_relative))
+            .with_context(|| format!("failed to hash failure report {report_relative}"))
+        {
+            Ok(sha256) => Some(sha256),
+            Err(error) => {
+                persistence_errors.push(format!("{error:#}"));
+                None
+            },
+        },
+        Err(error) => {
+            persistence_errors.push(format!("{error:#}"));
+            None
+        },
+    };
     let provenance = RoundProvenance::new(RoundProvenanceInput {
         round_id,
         status: ProfileStatus::FitFailed,
@@ -809,30 +956,75 @@ fn write_failure_round(input: FailureRoundInput<'_>) -> RoundEntry {
         failure: Some(&failure),
         created_at_unix_ms: input.unix_ms,
     });
-    let round_sha256 = write_json_create_new(profile_dir, &round_relative, &provenance)
-        .ok()
-        .and_then(|_| file_sha256(&profile_dir.join(&round_relative)).ok());
+    let round_sha256 = match write_json_create_new(profile_dir, &round_relative, &provenance)
+        .with_context(|| format!("failed to persist failure provenance {round_relative}"))
+    {
+        Ok(()) => match file_sha256(&profile_dir.join(&round_relative))
+            .with_context(|| format!("failed to hash failure provenance {round_relative}"))
+        {
+            Ok(sha256) => Some(sha256),
+            Err(error) => {
+                persistence_errors.push(format!("{error:#}"));
+                None
+            },
+        },
+        Err(error) => {
+            persistence_errors.push(format!("{error:#}"));
+            None
+        },
+    };
 
-    RoundEntry {
-        id: round_id.to_string(),
-        status: ProfileStatus::FitFailed,
-        model_path: None,
-        model_sha256: None,
-        report_path: report_sha256.as_ref().map(|_| report_relative),
-        report_sha256,
-        round_path: round_sha256.as_ref().map(|_| round_relative),
-        round_sha256,
-        train_sample_artifact_ids: input.train_sample_artifact_ids.to_vec(),
-        validation_sample_artifact_ids: input.validation_sample_artifact_ids.to_vec(),
-        validation_path_artifact_ids: input.validation_path_artifact_ids.to_vec(),
-        diagnostic_train_group_keys,
-        diagnostic_holdout_group_keys,
-        profile_identity_sha256: manifest.profile_identity_sha256.clone(),
-        profile_config_sha256: manifest.profile_config_sha256.clone(),
-        gate_config: input.gate_config.clone(),
-        created_at_unix_ms: input.unix_ms,
-        failure: Some(failure),
+    FailureRoundPersistence {
+        round_entry: RoundEntry {
+            id: round_id.to_string(),
+            status: ProfileStatus::FitFailed,
+            model_path: None,
+            model_sha256: None,
+            report_path: report_sha256.as_ref().map(|_| report_relative),
+            report_sha256,
+            round_path: round_sha256.as_ref().map(|_| round_relative),
+            round_sha256,
+            train_sample_artifact_ids: input.train_sample_artifact_ids.to_vec(),
+            validation_sample_artifact_ids: input.validation_sample_artifact_ids.to_vec(),
+            validation_path_artifact_ids: input.validation_path_artifact_ids.to_vec(),
+            diagnostic_train_group_keys,
+            diagnostic_holdout_group_keys,
+            profile_identity_sha256: manifest.profile_identity_sha256.clone(),
+            profile_config_sha256: manifest.profile_config_sha256.clone(),
+            gate_config: input.gate_config.clone(),
+            created_at_unix_ms: input.unix_ms,
+            failure: Some(failure),
+        },
+        persistence_errors,
     }
+}
+
+fn append_fit_failed_event(
+    manifest: &mut Manifest,
+    round_id: &str,
+    train_sample_artifact_ids: &[String],
+    validation_sample_artifact_ids: &[String],
+    persistence_errors: &[String],
+    unix_ms: u64,
+) {
+    let mut artifact_ids =
+        Vec::with_capacity(train_sample_artifact_ids.len() + validation_sample_artifact_ids.len());
+    artifact_ids.extend_from_slice(train_sample_artifact_ids);
+    artifact_ids.extend_from_slice(validation_sample_artifact_ids);
+    let event_id = manifest.next_event_id();
+    manifest.events.push(EventEntry {
+        id: event_id,
+        kind: "fit_failed".to_string(),
+        created_at_unix_ms: unix_ms,
+        profile_identity_sha256: manifest.profile_identity_sha256.clone(),
+        profile_config_sha256_before: None,
+        profile_config_sha256_after: Some(manifest.profile_config_sha256.clone()),
+        round_id: Some(round_id.to_string()),
+        artifact_ids,
+        details: json!({
+            "persistence_errors": persistence_errors,
+        }),
+    });
 }
 
 fn active_sample_artifacts(manifest: &Manifest, split: Split) -> Vec<ArtifactEntry> {
@@ -900,21 +1092,39 @@ pub(crate) fn validation_path_ids_for_sample_ids(
 fn sample_paths_for_ids(
     manifest: &Manifest,
     profile_dir: &Path,
+    split: Split,
     ids: &[String],
 ) -> Result<Vec<PathBuf>> {
-    let ids = ids.iter().collect::<BTreeSet<_>>();
-    manifest
-        .artifacts
-        .iter()
-        .filter(|artifact| {
-            artifact.active && artifact.kind == "samples" && ids.contains(&artifact.id)
-        })
-        .map(|artifact| {
+    let mut paths = Vec::with_capacity(ids.len());
+    for id in ids {
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id == *id)
+            .ok_or_else(|| anyhow!("selected sample artifact {id} is not registered"))?;
+        if artifact.kind != "samples" {
+            bail!(
+                "selected artifact {id} is kind {}, expected samples",
+                artifact.kind
+            );
+        }
+        if artifact.split != split {
+            bail!(
+                "selected sample artifact {id} is in {:?} split, expected {:?}",
+                artifact.split,
+                split
+            );
+        }
+        if !artifact.active {
+            bail!("selected sample artifact {id} is not active");
+        }
+        paths.push(
             registered_artifact_path(profile_dir, artifact).with_context(|| {
                 format!("failed to resolve selected sample artifact {}", artifact.id)
-            })
-        })
-        .collect()
+            })?,
+        );
+    }
+    Ok(paths)
 }
 
 fn counts_below_gate(counts: &AssessmentCounts, gate: &StrictGateConfig) -> bool {
@@ -1076,6 +1286,14 @@ fn current_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+fn unique_path_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
 }
 
 #[cfg(test)]
@@ -1423,6 +1641,80 @@ mod tests {
         assert!(round.failure.is_some());
         assert!(round.model_path.is_none());
         assert!(manifest.current_best_model.is_none());
+    }
+
+    #[test]
+    fn fit_assess_best_model_promotion_rollback_restores_existing_best_file() {
+        let fixture = ProfileFixture::new();
+        let source_model = fixture.profile_dir().join("models/round-0001.model.toml");
+        std::fs::write(&source_model, "new-best").unwrap();
+        std::fs::write(
+            fixture.profile_dir().join("models/best.model.toml"),
+            "old-best",
+        )
+        .unwrap();
+
+        let promotion =
+            BestModelPromotion::promote(fixture.profile_dir(), "models/round-0001.model.toml")
+                .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.profile_dir().join("models/best.model.toml")).unwrap(),
+            "new-best"
+        );
+
+        promotion.rollback().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(fixture.profile_dir().join("models/best.model.toml")).unwrap(),
+            "old-best"
+        );
+    }
+
+    #[test]
+    fn fit_assess_records_fit_failed_event_when_failure_round_persistence_fails() {
+        let fixture = ProfileFixture::new();
+        fixture.register_samples_artifact(Split::Train, "samples-train-0001", 320);
+        fixture.register_samples_artifact(Split::Validation, "samples-validation-0001", 100);
+        std::fs::write(
+            fixture.profile_dir().join("models/round-0001.model.toml"),
+            "existing model",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.profile_dir().join("rounds/round-0001.json"),
+            "existing round",
+        )
+        .unwrap();
+
+        let err = fit_assess(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("failed to write model"), "{message}");
+        assert!(message.contains("failure round persistence"), "{message}");
+        assert!(message.contains("rounds/round-0001.json"), "{message}");
+
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        assert_eq!(manifest.status, ProfileStatus::FitFailed);
+        let event = manifest
+            .events
+            .iter()
+            .find(|event| event.kind == "fit_failed")
+            .expect("fit_failed event should be recorded");
+        assert_eq!(event.round_id.as_deref(), Some("round-0001"));
+        assert_eq!(
+            event.artifact_ids,
+            ["samples-train-0001", "samples-validation-0001"]
+        );
+        assert!(
+            event.details["persistence_errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| error.as_str().unwrap().contains("rounds/round-0001.json"))
+        );
     }
 
     #[test]
