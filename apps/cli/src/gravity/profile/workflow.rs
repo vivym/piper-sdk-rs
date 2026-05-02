@@ -2142,6 +2142,56 @@ mod tests {
     }
 
     #[test]
+    fn profile_workflow_runs_end_to_end_without_hardware() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        init_profile(init_args_for_tests(profile.clone())).unwrap();
+
+        let train_samples = dir.path().join("train.samples.jsonl");
+        let validation_samples = dir.path().join("validation.samples.jsonl");
+        write_samples_artifact_for_tests(&train_samples, 320, [0.0; 6]);
+        write_samples_artifact_for_tests(&validation_samples, 100, [10.0; 6]);
+
+        import_samples(GravityProfileImportSamplesArgs {
+            profile: profile.clone(),
+            split: "train".to_string(),
+            samples: vec![train_samples],
+        })
+        .unwrap();
+        import_samples(GravityProfileImportSamplesArgs {
+            profile: profile.clone(),
+            split: "validation".to_string(),
+            samples: vec![validation_samples],
+        })
+        .unwrap();
+
+        fit_assess(crate::commands::gravity::GravityProfilePathArgs {
+            profile: profile.clone(),
+        })
+        .unwrap();
+
+        let manifest = Manifest::load(profile.join("manifest.json")).unwrap();
+        assert!(!manifest.rounds.is_empty());
+        assert!(matches!(
+            manifest.status,
+            ProfileStatus::Passed
+                | ProfileStatus::ValidationFailed
+                | ProfileStatus::InsufficientData
+        ));
+
+        if manifest.status == ProfileStatus::ValidationFailed {
+            promote_validation(crate::commands::gravity::GravityProfilePathArgs {
+                profile: profile.clone(),
+            })
+            .unwrap();
+
+            let manifest = Manifest::load(profile.join("manifest.json")).unwrap();
+            assert_eq!(manifest.status, ProfileStatus::NeedsValidationData);
+            assert!(manifest.events.iter().any(|event| event.kind == "validation_promoted"));
+        }
+    }
+
+    #[test]
     fn promote_validation_moves_failed_round_validation_artifacts_to_train() {
         let fixture = ProfileFixture::new();
         fixture.register_samples_artifact(Split::Train, "samples-train-0001", 320);
