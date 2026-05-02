@@ -80,7 +80,11 @@ pub fn select_diagnostic_holdout_groups(
     let mut selected_sample_count = 0_u64;
     let mut holdout_group_keys = Vec::new();
     if target_holdout_samples > 0.0 {
+        let max_holdout_groups = candidates.len().saturating_sub(1);
         for (_, group_key, sample_count) in candidates {
+            if holdout_group_keys.len() >= max_holdout_groups {
+                break;
+            }
             holdout_group_keys.push(group_key);
             selected_sample_count += sample_count;
             if (selected_sample_count as f64) >= target_holdout_samples {
@@ -103,8 +107,28 @@ pub fn select_diagnostic_holdout_groups(
         }
     }
 
+    let available = !train_group_keys.is_empty()
+        && !holdout_group_keys.is_empty()
+        && !train_sample_artifact_ids.is_empty()
+        && !holdout_sample_artifact_ids.is_empty();
+    if !available {
+        let mut all_group_keys = Vec::new();
+        let mut all_artifact_ids = Vec::new();
+        for (group_key, group) in &groups {
+            all_group_keys.push(group_key.clone());
+            all_artifact_ids.extend(group.artifact_ids.clone());
+        }
+        return Ok(DiagnosticHoldoutSplit {
+            available: false,
+            train_group_keys: all_group_keys,
+            holdout_group_keys: Vec::new(),
+            train_sample_artifact_ids: all_artifact_ids,
+            holdout_sample_artifact_ids: Vec::new(),
+        });
+    }
+
     Ok(DiagnosticHoldoutSplit {
-        available: !holdout_group_keys.is_empty(),
+        available,
         train_group_keys,
         holdout_group_keys,
         train_sample_artifact_ids,
@@ -192,6 +216,31 @@ mod tests {
         assert!(!split.available);
         assert!(split.holdout_group_keys.is_empty());
         assert_eq!(split.train_group_keys, ["path-a"]);
+    }
+
+    #[test]
+    fn holdout_never_consumes_all_groups() {
+        let artifacts = vec![
+            sample_artifact_for_tests("samples-a", Some("path-a"), 50),
+            sample_artifact_for_tests("samples-b", Some("path-b"), 50),
+        ];
+
+        let split = select_diagnostic_holdout_groups(
+            "identity-hash",
+            "round-0001",
+            "source_path_id",
+            0.99,
+            &artifacts,
+        )
+        .unwrap();
+
+        assert_eq!(
+            split.available,
+            !split.train_group_keys.is_empty() && !split.holdout_group_keys.is_empty()
+        );
+        assert!(!split.train_group_keys.is_empty());
+        assert!(!split.train_sample_artifact_ids.is_empty());
+        assert!(!split.holdout_group_keys.is_empty());
     }
 
     fn sample_artifact_for_tests(
