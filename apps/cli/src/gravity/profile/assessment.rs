@@ -22,8 +22,11 @@ pub struct AssessmentReport {
 pub struct MetricsSection {
     pub sample_count: usize,
     pub waypoint_count: usize,
+    #[serde(rename = "rms_residual_nm")]
     pub residual_rms_nm: Option<[f64; JOINT_COUNT]>,
+    #[serde(rename = "p95_residual_nm")]
     pub residual_p95_nm: Option<[f64; JOINT_COUNT]>,
+    #[serde(rename = "max_residual_nm")]
     pub residual_max_nm: Option<[f64; JOINT_COUNT]>,
 }
 
@@ -31,8 +34,11 @@ pub struct MetricsSection {
 pub struct ValidationMetricsSection {
     pub sample_count: usize,
     pub waypoint_count: usize,
+    #[serde(rename = "rms_residual_nm")]
     pub residual_rms_nm: Option<[f64; JOINT_COUNT]>,
+    #[serde(rename = "p95_residual_nm")]
     pub residual_p95_nm: Option<[f64; JOINT_COUNT]>,
+    #[serde(rename = "max_residual_nm")]
     pub residual_max_nm: Option<[f64; JOINT_COUNT]>,
     pub raw_torque_delta_nm: Option<[f64; JOINT_COUNT]>,
     pub compensated_external_torque_delta_nm: Option<[f64; JOINT_COUNT]>,
@@ -44,8 +50,11 @@ pub struct ValidationMetricsSection {
 pub struct HoldoutMetricsSection {
     pub available: bool,
     pub sample_count: Option<usize>,
+    #[serde(rename = "rms_residual_nm")]
     pub residual_rms_nm: Option<[f64; JOINT_COUNT]>,
+    #[serde(rename = "p95_residual_nm")]
     pub residual_p95_nm: Option<[f64; JOINT_COUNT]>,
+    #[serde(rename = "max_residual_nm")]
     pub residual_max_nm: Option<[f64; JOINT_COUNT]>,
 }
 
@@ -210,6 +219,9 @@ pub fn build_count_only_assessment_report(
         decision: undecided(),
     };
     report.decision = decide_strict_v1(gate, &report);
+    report.decision.pass = false;
+    report.decision.grade = AssessmentGrade::Bad;
+    report.decision.failed_checks.push(reason_check("count_only_report", reason));
     report.decision.next_action = reason.to_string();
     report
 }
@@ -390,7 +402,7 @@ fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
     } else if numerator == 0.0 {
         Some(0.0)
     } else {
-        None
+        Some(f64::INFINITY)
     }
 }
 
@@ -458,7 +470,7 @@ fn check_optional_ratio_max(
             failed_checks.push(AssessmentCheck {
                 check: check.to_string(),
                 joint: Some(joint),
-                value: Some(value),
+                value: value.is_finite().then_some(value),
                 threshold: Some(limit),
                 message: Some(format!(
                     "joint {} ratio {value} exceeds limit {limit}",
@@ -475,6 +487,10 @@ fn check_optional_ratio_max(
 fn passes_good_margin(gate: &StrictGateConfig, report: &AssessmentReport) -> bool {
     let margin = 1.0 - gate.good_margin_fraction;
     let count_margin = 1.0 + gate.good_margin_fraction;
+
+    if report.derived.meaningful_compensated_delta_joint_count == 0 {
+        return false;
+    }
 
     if report.train.sample_count < scaled_min(gate.min_train_samples, count_margin)
         || report.validation.sample_count < scaled_min(gate.min_validation_samples, count_margin)
@@ -532,6 +548,16 @@ fn optional_ratios_within_margin(
 }
 
 fn skip_check(check: &str, message: &str) -> AssessmentCheck {
+    AssessmentCheck {
+        check: check.to_string(),
+        joint: None,
+        value: None,
+        threshold: None,
+        message: Some(message.to_string()),
+    }
+}
+
+fn reason_check(check: &str, message: &str) -> AssessmentCheck {
     AssessmentCheck {
         check: check.to_string(),
         joint: None,
@@ -685,6 +711,109 @@ mod tests {
     }
 
     #[test]
+    fn report_serializes_spec_metric_field_names() {
+        let gate = StrictGateConfig::default();
+        let train_eval = eval_report_for_tests();
+        let validation_eval = eval_report_for_tests();
+        let holdout = DiagnosticHoldoutMetrics {
+            available: true,
+            sample_count: Some(25),
+            rms_residual_nm: Some([0.2; JOINT_COUNT]),
+            p95_residual_nm: Some([0.3; JOINT_COUNT]),
+            max_residual_nm: Some([0.4; JOINT_COUNT]),
+        };
+
+        let report = build_assessment_report(
+            &gate,
+            assessment_counts_for_tests(),
+            &train_eval,
+            &validation_eval,
+            &holdout,
+            &QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]),
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            json["train"]["rms_residual_nm"],
+            serde_json::json!([0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
+        );
+        assert!(json["train"].get("residual_rms_nm").is_none());
+        assert_eq!(
+            json["validation"]["p95_residual_nm"],
+            serde_json::json!([0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
+        );
+        assert!(json["validation"].get("residual_p95_nm").is_none());
+        assert_eq!(
+            json["fit_internal_holdout"]["max_residual_nm"],
+            serde_json::json!([0.4, 0.4, 0.4, 0.4, 0.4, 0.4])
+        );
+        assert!(json["fit_internal_holdout"].get("residual_max_nm").is_none());
+    }
+
+    #[test]
+    fn count_only_sufficient_counts_still_fails_with_reason() {
+        let gate = StrictGateConfig::default();
+        let report = build_count_only_assessment_report(
+            &gate,
+            assessment_counts_for_tests(),
+            "model has not been fitted",
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["decision"]["pass"], false);
+        assert_eq!(json["decision"]["grade"], "bad");
+        assert_eq!(json["decision"]["next_action"], "model has not been fitted");
+        assert!(
+            json["decision"]["failed_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["check"] == "count_only_report"
+                    && check["message"] == "model has not been fitted")
+        );
+    }
+
+    #[test]
+    fn zero_train_residual_positive_validation_residual_fails_ratio_check() {
+        let gate = StrictGateConfig::default();
+        let train_eval = eval_report_for_tests().with_rms([0.0; JOINT_COUNT]);
+        let validation_eval = eval_report_for_tests().with_rms([0.1; JOINT_COUNT]);
+
+        let report = build_assessment_report(
+            &gate,
+            assessment_counts_for_tests(),
+            &train_eval,
+            &validation_eval,
+            &DiagnosticHoldoutMetrics::unavailable(),
+            &QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]),
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["decision"]["pass"], false);
+        assert!(
+            json["decision"]["failed_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["check"] == "validation_train_rms_ratio"
+                    && check["threshold"] == gate.max_validation_train_rms_ratio)
+        );
+    }
+
+    #[test]
+    fn all_compensated_delta_skipped_cannot_grade_good() {
+        let gate = StrictGateConfig::default();
+        let report = assessment_report_for_tests()
+            .with_meaningful_compensated_delta_count(0)
+            .with_compensated_delta_ratio([None; JOINT_COUNT]);
+
+        let decision = decide_strict_v1(&gate, &report);
+
+        assert!(decision.pass);
+        assert_eq!(decision.grade, AssessmentGrade::Usable);
+    }
+
+    #[test]
     fn build_report_uses_explicit_validation_waypoint_count_for_gate() {
         let gate = StrictGateConfig::default();
         let train_eval = eval_report_for_tests();
@@ -789,6 +918,7 @@ mod tests {
     trait EvalReportForTests {
         fn with_training_range_violations(self, training_range_violations: usize) -> Self;
         fn with_raw_torque_delta(self, raw_torque_delta_nm: [f64; JOINT_COUNT]) -> Self;
+        fn with_rms(self, rms_residual_nm: [f64; JOINT_COUNT]) -> Self;
     }
 
     impl EvalReportForTests for GravityEvalReport {
@@ -799,6 +929,11 @@ mod tests {
 
         fn with_raw_torque_delta(mut self, raw_torque_delta_nm: [f64; JOINT_COUNT]) -> Self {
             self.raw_torque_delta_nm = raw_torque_delta_nm;
+            self
+        }
+
+        fn with_rms(mut self, rms_residual_nm: [f64; JOINT_COUNT]) -> Self {
+            self.rms_residual_nm = rms_residual_nm;
             self
         }
     }
