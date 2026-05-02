@@ -235,7 +235,7 @@ pub fn register_profile_generated_samples(
     validate_artifact_summary(&context.config, &summary)?;
     reject_legacy_explicit_arm_id_mixing(
         &context.manifest,
-        std::iter::once(SampleArmIdMode::AssertedArmId),
+        std::iter::once(sample_arm_id_mode_for_summary(&summary)),
     )?;
     validate_generated_samples_source(
         &context.profile_dir,
@@ -577,6 +577,12 @@ fn profile_generated_entry(
     input: GeneratedArtifactEntryInput,
     summary: ArtifactSummary,
 ) -> ArtifactEntry {
+    let arm_id_source = if input.kind == "samples" && summary.arm_id.is_none() {
+        Some("legacy_import_profile_asserted".to_string())
+    } else {
+        Some("profile_generated".to_string())
+    };
+
     ArtifactEntry {
         id: input.id,
         kind: input.kind,
@@ -587,7 +593,7 @@ fn profile_generated_entry(
         source_path_id: input.source_path_id,
         role: summary.role,
         arm_id: config.arm_id.clone(),
-        arm_id_source: Some("profile_generated".to_string()),
+        arm_id_source,
         target: summary.target,
         joint_map: summary.joint_map,
         load_profile: summary.load_profile,
@@ -1031,15 +1037,19 @@ mod tests {
     }
 
     #[test]
-    fn register_generated_samples_rejects_existing_legacy_samples() {
+    fn register_generated_samples_with_missing_arm_id_rejects_existing_explicit_samples() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = ProfileFixture::new_at(dir.path());
-        let legacy = write_samples_artifact_for_tests(dir.path(), "legacy.samples.jsonl", 12, 4);
+        let explicit = write_samples_artifact_with_arm_id_for_tests(
+            dir.path(),
+            "explicit.samples.jsonl",
+            "piper-left",
+        );
 
         import_samples(GravityProfileImportSamplesArgs {
             profile: fixture.profile_dir().to_path_buf(),
             split: "train".to_string(),
-            samples: vec![legacy],
+            samples: vec![explicit],
         })
         .unwrap();
 
@@ -1158,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn register_generated_samples_records_source_path_and_profile_generated_arm_identity() {
+    fn register_generated_samples_with_missing_arm_id_records_profile_asserted_arm_identity() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = ProfileFixture::new_at(dir.path());
         let source = fixture.register_path_artifact_for_tests(Split::Train);
@@ -1193,7 +1203,102 @@ mod tests {
         assert_eq!(artifact.kind, "samples");
         assert_eq!(artifact.source_path_id.as_deref(), Some(source.id.as_str()));
         assert_eq!(artifact.arm_id, "piper-left");
+        assert_eq!(
+            artifact.arm_id_source.as_deref(),
+            Some("legacy_import_profile_asserted")
+        );
+        assert_eq!(
+            sample_arm_id_mode_for_artifact(artifact),
+            Some(SampleArmIdMode::LegacyMissingArmId)
+        );
+    }
+
+    #[test]
+    fn register_generated_samples_with_explicit_arm_id_records_profile_generated_arm_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let source = fixture.register_path_artifact_for_tests(Split::Train);
+        let artifact_id = "samples-20260502-001530-0002";
+        let samples = fixture
+            .profile_dir()
+            .join("data/train/samples")
+            .join(format!("{artifact_id}.samples.jsonl"));
+        std::fs::create_dir_all(samples.parent().unwrap()).unwrap();
+        write_samples_artifact_with_source_and_optional_arm_id_for_tests(
+            samples.parent().unwrap(),
+            &format!("{artifact_id}.samples.jsonl"),
+            12,
+            4,
+            &source.path.canonicalize().unwrap().display().to_string(),
+            &source.sha256,
+            Some("piper-left".to_string()),
+        );
+
+        register_profile_generated_samples(
+            fixture.profile_dir(),
+            Split::Train,
+            artifact_id,
+            &source.id,
+            &samples,
+            unix_ms_for_tests(),
+        )
+        .unwrap();
+
+        let manifest = fixture.load_manifest();
+        let artifact =
+            manifest.artifacts.iter().find(|artifact| artifact.kind == "samples").unwrap();
+        assert_eq!(artifact.kind, "samples");
+        assert_eq!(artifact.source_path_id.as_deref(), Some(source.id.as_str()));
+        assert_eq!(artifact.arm_id, "piper-left");
         assert_eq!(artifact.arm_id_source.as_deref(), Some("profile_generated"));
+        assert_eq!(
+            sample_arm_id_mode_for_artifact(artifact),
+            Some(SampleArmIdMode::AssertedArmId)
+        );
+    }
+
+    #[test]
+    fn register_generated_samples_with_explicit_arm_id_rejects_existing_legacy_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = ProfileFixture::new_at(dir.path());
+        let legacy = write_samples_artifact_for_tests(dir.path(), "legacy.samples.jsonl", 12, 4);
+
+        import_samples(GravityProfileImportSamplesArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+            split: "train".to_string(),
+            samples: vec![legacy],
+        })
+        .unwrap();
+
+        let source = fixture.register_path_artifact_for_tests(Split::Train);
+        let artifact_id = "samples-20260502-001530-0003";
+        let samples = fixture
+            .profile_dir()
+            .join("data/train/samples")
+            .join(format!("{artifact_id}.samples.jsonl"));
+        std::fs::create_dir_all(samples.parent().unwrap()).unwrap();
+        write_samples_artifact_with_source_and_optional_arm_id_for_tests(
+            samples.parent().unwrap(),
+            &format!("{artifact_id}.samples.jsonl"),
+            12,
+            4,
+            &source.path.canonicalize().unwrap().display().to_string(),
+            &source.sha256,
+            Some("piper-left".to_string()),
+        );
+
+        let err = register_profile_generated_samples(
+            fixture.profile_dir(),
+            Split::Train,
+            artifact_id,
+            &source.id,
+            &samples,
+            unix_ms_for_tests(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("arm_id"));
+        assert!(err.to_string().contains("legacy"));
     }
 
     #[test]
