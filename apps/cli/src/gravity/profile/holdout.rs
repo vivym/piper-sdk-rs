@@ -110,7 +110,8 @@ pub fn select_diagnostic_holdout_groups(
     let available = !train_group_keys.is_empty()
         && !holdout_group_keys.is_empty()
         && !train_sample_artifact_ids.is_empty()
-        && !holdout_sample_artifact_ids.is_empty();
+        && !holdout_sample_artifact_ids.is_empty()
+        && (selected_sample_count as f64) >= target_holdout_samples;
     if !available {
         let mut all_group_keys = Vec::new();
         let mut all_artifact_ids = Vec::new();
@@ -219,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn holdout_never_consumes_all_groups() {
+    fn holdout_unavailable_when_ratio_requires_all_groups() {
         let artifacts = vec![
             sample_artifact_for_tests("samples-a", Some("path-a"), 50),
             sample_artifact_for_tests("samples-b", Some("path-b"), 50),
@@ -234,13 +235,35 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            split.available,
-            !split.train_group_keys.is_empty() && !split.holdout_group_keys.is_empty()
-        );
+        assert!(!split.available);
+        assert_eq!(split.train_group_keys, ["path-a", "path-b"]);
+        assert!(split.holdout_group_keys.is_empty());
+        assert_eq!(split.train_sample_artifact_ids, ["samples-a", "samples-b"]);
+        assert!(split.holdout_sample_artifact_ids.is_empty());
+    }
+
+    #[test]
+    fn high_ratio_holdout_available_when_target_can_be_met_with_train_remaining() {
+        let artifacts = vec![
+            sample_artifact_for_tests("samples-a", Some("path-a"), 10),
+            sample_artifact_for_tests("samples-b", Some("path-b"), 10),
+            sample_artifact_for_tests("samples-c", Some("path-c"), 80),
+        ];
+
+        let split = select_diagnostic_holdout_groups(
+            "identity-hash",
+            "round-0001",
+            "source_path_id",
+            0.8,
+            &artifacts,
+        )
+        .unwrap();
+
+        assert!(split.available);
+        assert_eq!(split.holdout_group_keys, ["path-c"]);
+        assert_eq!(split.holdout_sample_artifact_ids, ["samples-c"]);
         assert!(!split.train_group_keys.is_empty());
         assert!(!split.train_sample_artifact_ids.is_empty());
-        assert!(!split.holdout_group_keys.is_empty());
     }
 
     fn sample_artifact_for_tests(
