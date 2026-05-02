@@ -13,6 +13,10 @@ Keep separate profiles when payloads differ. For example, a master arm with a
 teaching handle and a follower arm with a gripper plus camera should not share
 one gravity profile, even if their joint map is the same.
 
+If the same arm moves to another CAN interface, you may update `target` in
+`profile.toml`. Keep identity fields stable: `role`, `arm_id`, `joint_map`, and
+`load_profile`.
+
 ## Create A Profile
 
 ```bash
@@ -59,6 +63,9 @@ cargo run -p piper-cli -- gravity profile record-path \
   --split train \
   --notes "broad workspace sweep"
 ```
+
+`record-path` opens a live hardware connection and records until Ctrl-C. Before
+recording, confirm the arm is in Standby and manually movable.
 
 Dry-run the replay before moving the arm:
 
@@ -111,10 +118,12 @@ cargo run -p piper-cli -- gravity profile replay-sample \
 
 ## Replay Safety
 
-`replay-sample` moves hardware unless `--dry-run` is set. Before every replay,
-confirm the recorded path is collision-free for the current payload, fixtures,
-and workspace. Keep an operator at the arm and stop on unexpected force,
-oscillation, or contact.
+`replay-sample` moves hardware unless `--dry-run` is set. A dry run only prints
+the replay plan, waypoints, and joint ranges; it does not perform collision
+checking. Operators must inspect that report and independently verify clearance
+for the current payload, fixtures, and workspace before running actual replay.
+Keep an operator at the arm and stop on unexpected force, oscillation, or
+contact.
 
 Replay speed comes from `profile.toml` under `[replay]`. The defaults are
 intentionally low: `max_velocity_rad_s = 0.08`, `max_step_rad = 0.02`,
