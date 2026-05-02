@@ -459,6 +459,19 @@ pub fn promote_validation(args: GravityProfilePathArgs) -> Result<()> {
             round.id
         );
     }
+    let current_validation_path_ids = validation_path_ids_for_sample_ids(
+        &context.manifest,
+        &round.validation_sample_artifact_ids,
+    );
+    let current_validation_path_set = current_validation_path_ids.iter().collect::<BTreeSet<_>>();
+    let round_validation_path_set =
+        round.validation_path_artifact_ids.iter().collect::<BTreeSet<_>>();
+    if current_validation_path_set != round_validation_path_set {
+        bail!(
+            "active validation path set changed since {}; rerun fit-assess before promote-validation",
+            round.id
+        );
+    }
 
     let mut plans = Vec::with_capacity(
         round.validation_sample_artifact_ids.len() + round.validation_path_artifact_ids.len(),
@@ -481,6 +494,7 @@ pub fn promote_validation(args: GravityProfilePathArgs) -> Result<()> {
             "data/train/paths",
         )?);
     }
+    ensure_unique_validation_promotion_destinations(&plans)?;
 
     let mut moved_plan_indices = Vec::with_capacity(plans.len());
     for (index, plan) in plans.iter().enumerate() {
@@ -541,13 +555,16 @@ pub fn promote_validation(args: GravityProfilePathArgs) -> Result<()> {
     });
     context.manifest.status = derive_readiness_status(&context.manifest);
     if let Err(save_error) = context.manifest.save_atomic(&manifest_path) {
-        let rollback_result = rollback_validation_promotion(&plans, &moved_plan_indices);
         let mut message = format!(
             "failed to save {} after validation promotion: {save_error:#}",
             manifest_path.display()
         );
-        if let Err(rollback_error) = rollback_result {
-            message.push_str(&format!("; rollback failed: {rollback_error:#}"));
+        if should_rollback_validation_promotion_after_save_error(&manifest_path, &context.manifest)
+        {
+            let rollback_result = rollback_validation_promotion(&plans, &moved_plan_indices);
+            if let Err(rollback_error) = rollback_result {
+                message.push_str(&format!("; rollback failed: {rollback_error:#}"));
+            }
         }
         return Err(anyhow!(message));
     }
@@ -1236,6 +1253,21 @@ fn plan_validation_promotion(
     })
 }
 
+fn ensure_unique_validation_promotion_destinations(
+    plans: &[ValidationPromotionPlan],
+) -> Result<()> {
+    let mut destinations = BTreeSet::new();
+    for plan in plans {
+        if !destinations.insert(plan.destination_relative.as_str()) {
+            bail!(
+                "duplicate validation promotion destination {}; refusing to move artifacts",
+                plan.destination_relative
+            );
+        }
+    }
+    Ok(())
+}
+
 fn rollback_validation_promotion(
     plans: &[ValidationPromotionPlan],
     moved_plan_indices: &[usize],
@@ -1254,6 +1286,16 @@ fn rollback_validation_promotion(
         }
     }
     Ok(())
+}
+
+fn should_rollback_validation_promotion_after_save_error(
+    manifest_path: &Path,
+    intended_manifest: &Manifest,
+) -> bool {
+    match Manifest::load(manifest_path) {
+        Ok(on_disk) => on_disk != *intended_manifest,
+        Err(_) => true,
+    }
 }
 
 fn active_sample_artifacts(manifest: &Manifest, split: Split) -> Vec<ArtifactEntry> {
@@ -2227,6 +2269,147 @@ mod tests {
     }
 
     #[test]
+    fn promote_validation_rejects_when_validation_path_set_changed() {
+        let fixture = ProfileFixture::new();
+        fixture.register_samples_artifact(Split::Train, "samples-train-0001", 320);
+        let old_validation_path = fixture.register_path_artifact(
+            Split::Validation,
+            "path-validation-0001",
+            "data/validation/paths/path-validation-0001.path.jsonl",
+        );
+        let new_validation_path = fixture.register_path_artifact(
+            Split::Validation,
+            "path-validation-0002",
+            "data/validation/paths/path-validation-0002.path.jsonl",
+        );
+        let validation_samples = fixture.register_samples_artifact_with_source(
+            Split::Validation,
+            "samples-validation-0001",
+            100,
+            "path-validation-0001",
+        );
+        fixture.set_validation_failed_round(
+            "round-0001",
+            &["samples-train-0001"],
+            &["samples-validation-0001"],
+            &["path-validation-0001"],
+        );
+        fixture.update_sample_source_path_id("samples-validation-0001", "path-validation-0002");
+
+        let err = promote_validation(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("rerun fit-assess"), "{message}");
+        assert!(validation_samples.exists());
+        assert!(old_validation_path.exists());
+        assert!(new_validation_path.exists());
+        assert!(
+            !fixture
+                .profile_dir()
+                .join("data/train/samples/samples-validation-0001.samples.jsonl")
+                .exists()
+        );
+        assert!(
+            !fixture
+                .profile_dir()
+                .join("data/train/paths/path-validation-0001.path.jsonl")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn promote_validation_rejects_duplicate_planned_destinations_before_moves() {
+        let fixture = ProfileFixture::new();
+        fixture.register_samples_artifact(Split::Train, "samples-train-0001", 320);
+        let first_path = fixture.register_path_artifact(
+            Split::Validation,
+            "path-validation-0001",
+            "data/validation/paths/a/colliding.path.jsonl",
+        );
+        let second_path = fixture.register_path_artifact(
+            Split::Validation,
+            "path-validation-0002",
+            "data/validation/paths/b/colliding.path.jsonl",
+        );
+        let validation_samples = fixture.register_samples_artifact_with_source(
+            Split::Validation,
+            "samples-validation-0001",
+            100,
+            "path-validation-0001",
+        );
+        let second_validation_samples = fixture.register_samples_artifact_with_source(
+            Split::Validation,
+            "samples-validation-0002",
+            100,
+            "path-validation-0002",
+        );
+        fixture.set_validation_failed_round(
+            "round-0001",
+            &["samples-train-0001"],
+            &["samples-validation-0001", "samples-validation-0002"],
+            &["path-validation-0001", "path-validation-0002"],
+        );
+
+        let err = promote_validation(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("duplicate") || message.contains("collision"),
+            "{message}"
+        );
+        assert!(validation_samples.exists());
+        assert!(second_validation_samples.exists());
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+        assert!(
+            !fixture
+                .profile_dir()
+                .join("data/train/samples/samples-validation-0001.samples.jsonl")
+                .exists()
+        );
+        assert!(
+            !fixture
+                .profile_dir()
+                .join("data/train/samples/samples-validation-0002.samples.jsonl")
+                .exists()
+        );
+        assert!(!fixture.profile_dir().join("data/train/paths/colliding.path.jsonl").exists());
+    }
+
+    #[test]
+    fn promote_validation_save_error_rollback_decision_uses_manifest_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let old_manifest = Manifest::new("profile", "identity", "old-config");
+        let mut intended_manifest = Manifest::new("profile", "identity", "config");
+        intended_manifest.status = ProfileStatus::NeedsValidationData;
+
+        intended_manifest.save_atomic(&manifest_path).unwrap();
+        assert!(!should_rollback_validation_promotion_after_save_error(
+            &manifest_path,
+            &intended_manifest
+        ));
+
+        old_manifest.save_atomic(&manifest_path).unwrap();
+        assert!(should_rollback_validation_promotion_after_save_error(
+            &manifest_path,
+            &intended_manifest
+        ));
+
+        std::fs::write(&manifest_path, "{not-json").unwrap();
+        assert!(should_rollback_validation_promotion_after_save_error(
+            &manifest_path,
+            &intended_manifest
+        ));
+    }
+
+    #[test]
     fn fit_assess_sets_fit_failed_when_active_sample_path_is_unsafe_after_count_gate() {
         let fixture = ProfileFixture::new();
         fixture.register_samples_artifact(Split::Train, "samples-train-0001", 320);
@@ -2517,6 +2700,17 @@ mod tests {
                 created_at_unix_ms: unix_ms_for_tests(),
                 failure: None,
             });
+            manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
+        }
+
+        fn update_sample_source_path_id(&self, sample_artifact_id: &str, source_path_id: &str) {
+            let mut manifest = Manifest::load(self.profile_dir.join("manifest.json")).unwrap();
+            let artifact = manifest
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.id == sample_artifact_id)
+                .unwrap();
+            artifact.source_path_id = Some(source_path_id.to_string());
             manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
         }
 
