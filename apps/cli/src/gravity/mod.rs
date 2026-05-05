@@ -6,6 +6,7 @@ pub mod model;
 pub mod profile;
 pub mod record_path;
 pub mod replay_sample;
+pub mod sample_reduction;
 
 #[allow(dead_code)]
 pub const TORQUE_CONVENTION: &str = "piper-sdk-normalized-nm-v1";
