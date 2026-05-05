@@ -5,7 +5,8 @@ use serde::Serialize;
 use crate::gravity::{
     eval::GravityEvalReport,
     model::{JOINT_COUNT, QuasiStaticTorqueModel},
-    profile::config::StrictGateConfig,
+    profile::config::{SampleReductionMode, StrictGateConfig},
+    sample_reduction::ReductionReport,
 };
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -15,7 +16,32 @@ pub struct AssessmentReport {
     pub fit_internal_holdout: HoldoutMetricsSection,
     pub model: Option<ModelMetricsSection>,
     pub derived: DerivedMetrics,
+    pub count_mode: AssessmentCountMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduction: Option<ReductionReportSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rows: Option<RawRowsReportSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hysteresis: Option<HysteresisReportSection>,
     pub decision: AssessmentDecision,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReductionReportSection {
+    pub mode: SampleReductionMode,
+    pub train: ReductionReport,
+    pub validation: ReductionReport,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawRowsReportSection {
+    pub validation: Option<ValidationMetricsSection>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct HysteresisReportSection {
+    pub validation_direction_torque_delta_p95_nm: [f64; JOINT_COUNT],
+    pub validation_direction_torque_delta_max_nm: [f64; JOINT_COUNT],
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -68,6 +94,9 @@ pub struct ModelMetricsSection {
 pub struct DerivedMetrics {
     pub validation_train_rms_ratio: [Option<f64>; JOINT_COUNT],
     pub validation_train_p95_ratio: [Option<f64>; JOINT_COUNT],
+    pub gravity_compensated_delta_ratio: [Option<f64>; JOINT_COUNT],
+    pub gravity_compensated_delta_ratio_meaningful: [bool; JOINT_COUNT],
+    pub raw_row_compensated_delta_ratio: [Option<f64>; JOINT_COUNT],
     pub compensated_delta_ratio: [Option<f64>; JOINT_COUNT],
     pub compensated_delta_ratio_meaningful: [bool; JOINT_COUNT],
     pub meaningful_compensated_delta_joint_count: usize,
@@ -108,6 +137,13 @@ pub struct AssessmentCounts {
     pub validation_waypoints: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentCountMode {
+    RawRows,
+    EffectivePairs,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DiagnosticHoldoutMetrics {
     pub available: bool,
@@ -137,7 +173,34 @@ pub fn build_assessment_report(
     diagnostic_holdout: &DiagnosticHoldoutMetrics,
     model: &QuasiStaticTorqueModel,
 ) -> AssessmentReport {
-    let derived = derive_metrics(gate, train_eval, validation_eval);
+    build_assessment_report_with_diagnostics(
+        gate,
+        counts,
+        train_eval,
+        validation_eval,
+        diagnostic_holdout,
+        model,
+        None,
+        None,
+        None,
+        AssessmentCountMode::RawRows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_assessment_report_with_diagnostics(
+    gate: &StrictGateConfig,
+    counts: AssessmentCounts,
+    train_eval: &GravityEvalReport,
+    validation_eval: &GravityEvalReport,
+    diagnostic_holdout: &DiagnosticHoldoutMetrics,
+    model: &QuasiStaticTorqueModel,
+    reduction: Option<ReductionReportSection>,
+    raw_rows: Option<RawRowsReportSection>,
+    hysteresis: Option<HysteresisReportSection>,
+    count_mode: AssessmentCountMode,
+) -> AssessmentReport {
+    let derived = derive_metrics(gate, train_eval, validation_eval, raw_rows.as_ref());
     let mut report = AssessmentReport {
         train: MetricsSection {
             sample_count: counts.train_samples,
@@ -171,9 +234,13 @@ pub fn build_assessment_report(
             waypoint_count: model.training_range.waypoint_count,
         }),
         derived,
+        count_mode,
+        reduction,
+        raw_rows,
+        hysteresis,
         decision: undecided(),
     };
-    report.decision = decide_strict_v1(gate, &report);
+    report.decision = decide_strict_v1_with_count_mode(gate, &report, count_mode);
     report
 }
 
@@ -181,6 +248,26 @@ pub fn build_count_only_assessment_report(
     gate: &StrictGateConfig,
     counts: AssessmentCounts,
     reason: &str,
+) -> AssessmentReport {
+    build_count_only_assessment_report_with_diagnostics(
+        gate,
+        counts,
+        reason,
+        None,
+        None,
+        None,
+        AssessmentCountMode::RawRows,
+    )
+}
+
+pub fn build_count_only_assessment_report_with_diagnostics(
+    gate: &StrictGateConfig,
+    counts: AssessmentCounts,
+    reason: &str,
+    reduction: Option<ReductionReportSection>,
+    raw_rows: Option<RawRowsReportSection>,
+    hysteresis: Option<HysteresisReportSection>,
+    count_mode: AssessmentCountMode,
 ) -> AssessmentReport {
     let mut report = AssessmentReport {
         train: MetricsSection {
@@ -212,13 +299,20 @@ pub fn build_count_only_assessment_report(
         derived: DerivedMetrics {
             validation_train_rms_ratio: [None; JOINT_COUNT],
             validation_train_p95_ratio: [None; JOINT_COUNT],
+            gravity_compensated_delta_ratio: [None; JOINT_COUNT],
+            gravity_compensated_delta_ratio_meaningful: [false; JOINT_COUNT],
+            raw_row_compensated_delta_ratio: [None; JOINT_COUNT],
             compensated_delta_ratio: [None; JOINT_COUNT],
             compensated_delta_ratio_meaningful: [false; JOINT_COUNT],
             meaningful_compensated_delta_joint_count: 0,
         },
+        count_mode,
+        reduction,
+        raw_rows,
+        hysteresis,
         decision: undecided(),
     };
-    report.decision = decide_strict_v1(gate, &report);
+    report.decision = decide_strict_v1_with_count_mode(gate, &report, count_mode);
     report.decision.pass = false;
     report.decision.grade = AssessmentGrade::Bad;
     report.decision.failed_checks.push(reason_check("count_only_report", reason));
@@ -227,33 +321,67 @@ pub fn build_count_only_assessment_report(
 }
 
 pub fn decide_strict_v1(gate: &StrictGateConfig, report: &AssessmentReport) -> AssessmentDecision {
+    decide_strict_v1_with_count_mode(gate, report, report.count_mode)
+}
+
+pub fn decide_strict_v1_with_count_mode(
+    gate: &StrictGateConfig,
+    report: &AssessmentReport,
+    count_mode: AssessmentCountMode,
+) -> AssessmentDecision {
     let mut failed_checks = Vec::new();
     let mut skipped_checks = Vec::new();
 
-    check_min_count(
-        &mut failed_checks,
-        "train_sample_count",
-        report.train.sample_count,
-        gate.min_train_samples,
-    );
-    check_min_count(
-        &mut failed_checks,
-        "validation_sample_count",
-        report.validation.sample_count,
-        gate.min_validation_samples,
-    );
-    check_min_count(
-        &mut failed_checks,
-        "train_waypoint_count",
-        report.train.waypoint_count,
-        gate.min_train_waypoints,
-    );
-    check_min_count(
-        &mut failed_checks,
-        "validation_waypoint_count",
-        report.validation.waypoint_count,
-        gate.min_validation_waypoints,
-    );
+    let count_mode_valid = validate_count_mode(&mut failed_checks, report, count_mode);
+    match count_mode {
+        AssessmentCountMode::RawRows => {
+            if count_mode_valid {
+                check_min_count(
+                    &mut failed_checks,
+                    "train_sample_count",
+                    report.train.sample_count,
+                    gate.min_train_samples,
+                );
+                check_min_count(
+                    &mut failed_checks,
+                    "validation_sample_count",
+                    report.validation.sample_count,
+                    gate.min_validation_samples,
+                );
+                check_min_count(
+                    &mut failed_checks,
+                    "train_waypoint_count",
+                    report.train.waypoint_count,
+                    gate.min_train_waypoints,
+                );
+                check_min_count(
+                    &mut failed_checks,
+                    "validation_waypoint_count",
+                    report.validation.waypoint_count,
+                    gate.min_validation_waypoints,
+                );
+            }
+        },
+        AssessmentCountMode::EffectivePairs => {
+            if count_mode_valid {
+                let (train_effective_pairs, validation_effective_pairs) =
+                    effective_pair_counts(report)
+                        .expect("valid effective pair count mode requires reduction counts");
+                check_min_count(
+                    &mut failed_checks,
+                    "train_effective_pair_count",
+                    train_effective_pairs,
+                    gate.min_train_effective_pairs,
+                );
+                check_min_count(
+                    &mut failed_checks,
+                    "validation_effective_pair_count",
+                    validation_effective_pairs,
+                    gate.min_validation_effective_pairs,
+                );
+            }
+        },
+    }
 
     check_array_max(
         &mut failed_checks,
@@ -286,15 +414,15 @@ pub fn decide_strict_v1(gate: &StrictGateConfig, report: &AssessmentReport) -> A
 
     if report.derived.meaningful_compensated_delta_joint_count == 0 {
         skipped_checks.push(skip_check(
-            "compensated_delta_ratio",
+            "gravity_compensated_delta_ratio",
             "no validation joint had a meaningful raw torque delta",
         ));
     } else {
         check_optional_ratio_max(
             &mut failed_checks,
             &mut skipped_checks,
-            "compensated_delta_ratio",
-            report.derived.compensated_delta_ratio,
+            "gravity_compensated_delta_ratio",
+            report.derived.gravity_compensated_delta_ratio,
             gate.max_compensated_delta_ratio,
         );
     }
@@ -326,6 +454,9 @@ pub fn decide_strict_v1(gate: &StrictGateConfig, report: &AssessmentReport) -> A
                 | "validation_sample_count"
                 | "train_waypoint_count"
                 | "validation_waypoint_count"
+                | "train_effective_pair_count"
+                | "validation_effective_pair_count"
+                | "assessment_count_mode"
         )
     });
     let range_failed = failed_checks.iter().any(|check| check.check == "training_range_violations");
@@ -337,7 +468,7 @@ pub fn decide_strict_v1(gate: &StrictGateConfig, report: &AssessmentReport) -> A
     });
 
     let grade = if failed_checks.is_empty() {
-        if passes_good_margin(gate, report) {
+        if passes_good_margin(gate, report, count_mode) {
             AssessmentGrade::Good
         } else {
             AssessmentGrade::Usable
@@ -361,12 +492,10 @@ fn derive_metrics(
     gate: &StrictGateConfig,
     train_eval: &GravityEvalReport,
     validation_eval: &GravityEvalReport,
+    raw_rows: Option<&RawRowsReportSection>,
 ) -> DerivedMetrics {
     let mut rms_ratio = [None; JOINT_COUNT];
     let mut p95_ratio = [None; JOINT_COUNT];
-    let mut compensated_delta_ratio = [None; JOINT_COUNT];
-    let mut compensated_delta_ratio_meaningful = [false; JOINT_COUNT];
-    let mut meaningful_compensated_delta_joint_count = 0;
 
     for joint in 0..JOINT_COUNT {
         rms_ratio[joint] = ratio(
@@ -377,23 +506,62 @@ fn derive_metrics(
             validation_eval.p95_residual_nm[joint],
             train_eval.p95_residual_nm[joint],
         );
-
-        let raw_delta = validation_eval.raw_torque_delta_nm[joint];
-        if raw_delta >= gate.torque_delta_epsilon_nm {
-            compensated_delta_ratio_meaningful[joint] = true;
-            compensated_delta_ratio[joint] =
-                Some(validation_eval.compensated_external_torque_delta_nm[joint] / raw_delta);
-            meaningful_compensated_delta_joint_count += 1;
-        }
     }
+
+    let (
+        gravity_compensated_delta_ratio,
+        gravity_compensated_delta_ratio_meaningful,
+        meaningful_compensated_delta_joint_count,
+    ) = compensated_delta_ratio(
+        gate,
+        validation_eval.raw_torque_delta_nm,
+        validation_eval.compensated_external_torque_delta_nm,
+    );
+    let raw_row_compensated_delta_ratio = raw_rows
+        .and_then(|raw_rows| raw_rows.validation.as_ref())
+        .and_then(|validation| {
+            Some(
+                compensated_delta_ratio(
+                    gate,
+                    validation.raw_torque_delta_nm?,
+                    validation.compensated_external_torque_delta_nm?,
+                )
+                .0,
+            )
+        })
+        .unwrap_or([None; JOINT_COUNT]);
 
     DerivedMetrics {
         validation_train_rms_ratio: rms_ratio,
         validation_train_p95_ratio: p95_ratio,
-        compensated_delta_ratio,
-        compensated_delta_ratio_meaningful,
+        gravity_compensated_delta_ratio,
+        gravity_compensated_delta_ratio_meaningful,
+        raw_row_compensated_delta_ratio,
+        compensated_delta_ratio: gravity_compensated_delta_ratio,
+        compensated_delta_ratio_meaningful: gravity_compensated_delta_ratio_meaningful,
         meaningful_compensated_delta_joint_count,
     }
+}
+
+fn compensated_delta_ratio(
+    gate: &StrictGateConfig,
+    raw_torque_delta_nm: [f64; JOINT_COUNT],
+    compensated_external_torque_delta_nm: [f64; JOINT_COUNT],
+) -> ([Option<f64>; JOINT_COUNT], [bool; JOINT_COUNT], usize) {
+    let mut ratio = [None; JOINT_COUNT];
+    let mut meaningful = [false; JOINT_COUNT];
+    let mut meaningful_count = 0;
+
+    for joint in 0..JOINT_COUNT {
+        let raw_delta = raw_torque_delta_nm[joint];
+        if raw_delta >= gate.torque_delta_epsilon_nm {
+            meaningful[joint] = true;
+            ratio[joint] = Some(compensated_external_torque_delta_nm[joint] / raw_delta);
+            meaningful_count += 1;
+        }
+    }
+
+    (ratio, meaningful, meaningful_count)
 }
 
 fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
@@ -421,6 +589,79 @@ fn check_min_count(
             message: Some(format!("{value} is below minimum {minimum}")),
         });
     }
+}
+
+fn validate_count_mode(
+    failed_checks: &mut Vec<AssessmentCheck>,
+    report: &AssessmentReport,
+    count_mode: AssessmentCountMode,
+) -> bool {
+    match count_mode {
+        AssessmentCountMode::RawRows => validate_raw_row_count_mode(failed_checks, report),
+        AssessmentCountMode::EffectivePairs => {
+            validate_effective_pair_count_mode(failed_checks, report.reduction.as_ref())
+        },
+    }
+}
+
+fn validate_raw_row_count_mode(
+    failed_checks: &mut Vec<AssessmentCheck>,
+    report: &AssessmentReport,
+) -> bool {
+    let Some(reduction) = report.reduction.as_ref() else {
+        return true;
+    };
+
+    if reduction.mode == SampleReductionMode::BidirectionalPairMeanV1 {
+        failed_checks.push(reason_check(
+            "assessment_count_mode",
+            "RawRows count mode cannot gate a bidirectional pair-mean reduction report",
+        ));
+        return false;
+    }
+
+    if reduction.train.mode != reduction.mode || reduction.validation.mode != reduction.mode {
+        failed_checks.push(reason_check(
+            "assessment_count_mode",
+            "RawRows count mode requires reduction.train.mode and reduction.validation.mode to match reduction.mode raw-rows",
+        ));
+        return false;
+    }
+
+    true
+}
+
+fn validate_effective_pair_count_mode(
+    failed_checks: &mut Vec<AssessmentCheck>,
+    reduction: Option<&ReductionReportSection>,
+) -> bool {
+    let Some(reduction) = reduction else {
+        failed_checks.push(reason_check(
+            "assessment_count_mode",
+            "EffectivePairs count mode requires a bidirectional pair-mean reduction report",
+        ));
+        return false;
+    };
+
+    if reduction.mode != SampleReductionMode::BidirectionalPairMeanV1 {
+        failed_checks.push(reason_check(
+            "assessment_count_mode",
+            "EffectivePairs count mode requires reduction.mode bidirectional-pair-mean-v1",
+        ));
+        return false;
+    }
+
+    if reduction.train.mode != SampleReductionMode::BidirectionalPairMeanV1
+        || reduction.validation.mode != SampleReductionMode::BidirectionalPairMeanV1
+    {
+        failed_checks.push(reason_check(
+            "assessment_count_mode",
+            "EffectivePairs count mode requires train and validation reduction reports to use bidirectional-pair-mean-v1",
+        ));
+        return false;
+    }
+
+    true
 }
 
 fn check_array_max(
@@ -484,7 +725,11 @@ fn check_optional_ratio_max(
     }
 }
 
-fn passes_good_margin(gate: &StrictGateConfig, report: &AssessmentReport) -> bool {
+fn passes_good_margin(
+    gate: &StrictGateConfig,
+    report: &AssessmentReport,
+    count_mode: AssessmentCountMode,
+) -> bool {
     let margin = 1.0 - gate.good_margin_fraction;
     let count_margin = 1.0 + gate.good_margin_fraction;
 
@@ -492,13 +737,31 @@ fn passes_good_margin(gate: &StrictGateConfig, report: &AssessmentReport) -> boo
         return false;
     }
 
-    if report.train.sample_count < scaled_min(gate.min_train_samples, count_margin)
-        || report.validation.sample_count < scaled_min(gate.min_validation_samples, count_margin)
-        || report.train.waypoint_count < scaled_min(gate.min_train_waypoints, count_margin)
-        || report.validation.waypoint_count
-            < scaled_min(gate.min_validation_waypoints, count_margin)
-    {
-        return false;
+    match count_mode {
+        AssessmentCountMode::RawRows => {
+            if report.train.sample_count < scaled_min(gate.min_train_samples, count_margin)
+                || report.validation.sample_count
+                    < scaled_min(gate.min_validation_samples, count_margin)
+                || report.train.waypoint_count < scaled_min(gate.min_train_waypoints, count_margin)
+                || report.validation.waypoint_count
+                    < scaled_min(gate.min_validation_waypoints, count_margin)
+            {
+                return false;
+            }
+        },
+        AssessmentCountMode::EffectivePairs => {
+            let Some((train_effective_pairs, validation_effective_pairs)) =
+                effective_pair_counts(report)
+            else {
+                return false;
+            };
+            if train_effective_pairs < scaled_min(gate.min_train_effective_pairs, count_margin)
+                || validation_effective_pairs
+                    < scaled_min(gate.min_validation_effective_pairs, count_margin)
+            {
+                return false;
+            }
+        },
     }
 
     array_within_margin(
@@ -518,10 +781,18 @@ fn passes_good_margin(gate: &StrictGateConfig, report: &AssessmentReport) -> boo
         gate.max_validation_train_p95_ratio,
         margin,
     ) && optional_ratios_within_margin(
-        report.derived.compensated_delta_ratio,
+        report.derived.gravity_compensated_delta_ratio,
         gate.max_compensated_delta_ratio,
         margin,
     )
+}
+
+fn effective_pair_counts(report: &AssessmentReport) -> Option<(usize, usize)> {
+    let reduction = report.reduction.as_ref()?;
+    Some((
+        reduction.train.effective_sample_count,
+        reduction.validation.effective_sample_count,
+    ))
 }
 
 fn scaled_min(minimum: usize, margin: f64) -> usize {
@@ -628,13 +899,13 @@ mod tests {
             decision
                 .skipped_checks
                 .iter()
-                .any(|check| check.check == "compensated_delta_ratio")
+                .any(|check| check.check == "gravity_compensated_delta_ratio")
         );
         assert!(
             !decision
                 .failed_checks
                 .iter()
-                .any(|check| check.check == "compensated_delta_ratio")
+                .any(|check| check.check == "gravity_compensated_delta_ratio")
         );
     }
 
@@ -668,6 +939,7 @@ mod tests {
         );
         let json = serde_json::to_value(&report).unwrap();
 
+        assert_eq!(json["count_mode"], "raw_rows");
         assert_eq!(json["fit_internal_holdout"]["available"], false);
         assert_eq!(json["validation"]["training_range_violations"], 2);
         assert_eq!(
@@ -683,7 +955,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|check| { check["check"] == "compensated_delta_ratio" })
+                .any(|check| { check["check"] == "gravity_compensated_delta_ratio" })
         );
     }
 
@@ -703,6 +975,7 @@ mod tests {
         );
         let json = serde_json::to_value(&report).unwrap();
 
+        assert_eq!(json["count_mode"], "raw_rows");
         assert_eq!(json["decision"]["grade"], "bad");
         assert_eq!(json["decision"]["pass"], false);
         assert_eq!(json["train"]["sample_count"], 3);
@@ -880,6 +1153,342 @@ mod tests {
         );
     }
 
+    #[test]
+    fn assessment_gates_on_gravity_ratio_and_keeps_raw_ratio_diagnostic() {
+        let gate = StrictGateConfig {
+            max_compensated_delta_ratio: 0.65,
+            ..StrictGateConfig::default()
+        };
+        let train_eval = eval_report_for_tests();
+        let validation_eval = eval_report_for_tests()
+            .with_raw_torque_delta([10.0; JOINT_COUNT])
+            .with_compensated_external_torque_delta([7.0; JOINT_COUNT]);
+        let raw_validation = eval_report_for_tests()
+            .with_raw_torque_delta([10.0; JOINT_COUNT])
+            .with_compensated_external_torque_delta([2.0; JOINT_COUNT]);
+
+        let report = build_assessment_report_with_diagnostics(
+            &gate,
+            assessment_counts_for_tests(),
+            &train_eval,
+            &validation_eval,
+            &DiagnosticHoldoutMetrics::unavailable(),
+            &QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]),
+            None,
+            Some(RawRowsReportSection {
+                validation: Some(ValidationMetricsSection {
+                    sample_count: 100,
+                    waypoint_count: 50,
+                    residual_rms_nm: Some(raw_validation.rms_residual_nm),
+                    residual_p95_nm: Some(raw_validation.p95_residual_nm),
+                    residual_max_nm: Some(raw_validation.max_residual_nm),
+                    raw_torque_delta_nm: Some(raw_validation.raw_torque_delta_nm),
+                    compensated_external_torque_delta_nm: Some(
+                        raw_validation.compensated_external_torque_delta_nm,
+                    ),
+                    training_range_violations: Some(raw_validation.training_range_violations),
+                    max_range_violation_rad: Some(raw_validation.max_range_violation_rad),
+                }),
+            }),
+            None,
+            AssessmentCountMode::RawRows,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            report.derived.gravity_compensated_delta_ratio,
+            [Some(0.7); JOINT_COUNT]
+        );
+        assert_eq!(
+            report.derived.raw_row_compensated_delta_ratio,
+            [Some(0.2); JOINT_COUNT]
+        );
+        assert_eq!(
+            report.derived.compensated_delta_ratio,
+            report.derived.gravity_compensated_delta_ratio
+        );
+        assert!(
+            report
+                .decision
+                .failed_checks
+                .iter()
+                .any(|check| check.check == "gravity_compensated_delta_ratio")
+        );
+        assert!(
+            !report
+                .decision
+                .failed_checks
+                .iter()
+                .any(|check| check.check == "raw_row_compensated_delta_ratio")
+        );
+        assert_eq!(
+            json["derived"]["compensated_delta_ratio"],
+            json["derived"]["gravity_compensated_delta_ratio"]
+        );
+        assert_eq!(
+            json["derived"]["compensated_delta_ratio_meaningful"],
+            json["derived"]["gravity_compensated_delta_ratio_meaningful"]
+        );
+        assert_eq!(
+            json["derived"]["raw_row_compensated_delta_ratio"],
+            serde_json::json!([0.2, 0.2, 0.2, 0.2, 0.2, 0.2])
+        );
+    }
+
+    #[test]
+    fn pair_mean_assessment_uses_effective_pair_gates_not_legacy_raw_count_gates() {
+        let gate = StrictGateConfig {
+            min_train_samples: 300,
+            min_validation_samples: 80,
+            min_train_waypoints: 150,
+            min_validation_waypoints: 40,
+            min_train_effective_pairs: 3,
+            min_validation_effective_pairs: 2,
+            ..StrictGateConfig::default()
+        };
+        let report = assessment_report_for_tests()
+            .with_train_counts(1, 1)
+            .with_validation_counts(1, 1)
+            .with_reduction_report(ReductionReportSection {
+                mode: SampleReductionMode::BidirectionalPairMeanV1,
+                train: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 4),
+                validation: reduction_report_for_tests(
+                    SampleReductionMode::BidirectionalPairMeanV1,
+                    3,
+                ),
+            });
+
+        let decision =
+            decide_strict_v1_with_count_mode(&gate, &report, AssessmentCountMode::EffectivePairs);
+
+        assert!(decision.pass);
+        assert_eq!(decision.grade, AssessmentGrade::Good);
+        assert!(!decision.failed_checks.iter().any(|check| matches!(
+            check.check.as_str(),
+            "train_sample_count"
+                | "validation_sample_count"
+                | "train_waypoint_count"
+                | "validation_waypoint_count"
+        )));
+
+        let insufficient_pairs = report.with_reduction_report(ReductionReportSection {
+            mode: SampleReductionMode::BidirectionalPairMeanV1,
+            train: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 2),
+            validation: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 1),
+        });
+        let failed = decide_strict_v1_with_count_mode(
+            &gate,
+            &insufficient_pairs,
+            AssessmentCountMode::EffectivePairs,
+        );
+
+        assert!(!failed.pass);
+        assert_eq!(failed.grade, AssessmentGrade::Bad);
+        assert!(
+            failed
+                .failed_checks
+                .iter()
+                .any(|check| check.check == "train_effective_pair_count"
+                    && check.value == Some(2.0)
+                    && check.threshold == Some(3.0))
+        );
+        assert!(
+            failed
+                .failed_checks
+                .iter()
+                .any(|check| check.check == "validation_effective_pair_count"
+                    && check.value == Some(1.0)
+                    && check.threshold == Some(2.0))
+        );
+    }
+
+    #[test]
+    fn pair_mean_report_serializes_effective_pair_count_mode() {
+        let gate = StrictGateConfig {
+            min_train_effective_pairs: 3,
+            min_validation_effective_pairs: 2,
+            ..StrictGateConfig::default()
+        };
+        let report = build_assessment_report_with_diagnostics(
+            &gate,
+            assessment_counts_for_tests(),
+            &eval_report_for_tests(),
+            &eval_report_for_tests(),
+            &DiagnosticHoldoutMetrics::unavailable(),
+            &QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]),
+            Some(ReductionReportSection {
+                mode: SampleReductionMode::BidirectionalPairMeanV1,
+                train: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 4),
+                validation: reduction_report_for_tests(
+                    SampleReductionMode::BidirectionalPairMeanV1,
+                    3,
+                ),
+            }),
+            None,
+            None,
+            AssessmentCountMode::EffectivePairs,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["count_mode"], "effective_pairs");
+    }
+
+    #[test]
+    fn decide_strict_v1_uses_report_count_mode_when_redeciding_pair_mean_report() {
+        let gate = StrictGateConfig {
+            min_train_samples: 300,
+            min_validation_samples: 80,
+            min_train_waypoints: 150,
+            min_validation_waypoints: 40,
+            min_train_effective_pairs: 3,
+            min_validation_effective_pairs: 2,
+            ..StrictGateConfig::default()
+        };
+        let report = build_assessment_report_with_diagnostics(
+            &gate,
+            AssessmentCounts {
+                train_samples: 1,
+                train_waypoints: 1,
+                validation_samples: 1,
+                validation_waypoints: 1,
+            },
+            &eval_report_for_tests(),
+            &eval_report_for_tests(),
+            &DiagnosticHoldoutMetrics::unavailable(),
+            &QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]),
+            Some(ReductionReportSection {
+                mode: SampleReductionMode::BidirectionalPairMeanV1,
+                train: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 4),
+                validation: reduction_report_for_tests(
+                    SampleReductionMode::BidirectionalPairMeanV1,
+                    3,
+                ),
+            }),
+            None,
+            None,
+            AssessmentCountMode::EffectivePairs,
+        );
+
+        let decision = decide_strict_v1(&gate, &report);
+
+        assert!(decision.pass);
+        assert!(!decision.failed_checks.iter().any(|check| matches!(
+            check.check.as_str(),
+            "train_sample_count"
+                | "validation_sample_count"
+                | "train_waypoint_count"
+                | "validation_waypoint_count"
+        )));
+    }
+
+    #[test]
+    fn effective_pairs_without_reduction_fails_assessment_count_mode() {
+        let gate = StrictGateConfig {
+            min_train_effective_pairs: 3,
+            min_validation_effective_pairs: 2,
+            ..StrictGateConfig::default()
+        };
+        let report = assessment_report_for_tests();
+
+        let decision =
+            decide_strict_v1_with_count_mode(&gate, &report, AssessmentCountMode::EffectivePairs);
+
+        assert_failed_check(
+            &decision,
+            "assessment_count_mode",
+            "EffectivePairs count mode requires a bidirectional pair-mean reduction report",
+        );
+        assert!(
+            !decision
+                .failed_checks
+                .iter()
+                .any(|check| check.check == "train_effective_pair_count")
+        );
+    }
+
+    #[test]
+    fn raw_rows_with_pair_mean_reduction_fails_assessment_count_mode() {
+        let gate = StrictGateConfig::default();
+        let report = assessment_report_for_tests().with_reduction_report(ReductionReportSection {
+            mode: SampleReductionMode::BidirectionalPairMeanV1,
+            train: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 4),
+            validation: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 3),
+        });
+
+        let decision =
+            decide_strict_v1_with_count_mode(&gate, &report, AssessmentCountMode::RawRows);
+
+        assert_failed_check(
+            &decision,
+            "assessment_count_mode",
+            "RawRows count mode cannot gate a bidirectional pair-mean reduction report",
+        );
+    }
+
+    #[test]
+    fn raw_rows_with_nested_pair_mean_reduction_fails_assessment_count_mode() {
+        let gate = StrictGateConfig::default();
+        let report = assessment_report_for_tests().with_reduction_report(ReductionReportSection {
+            mode: SampleReductionMode::RawRows,
+            train: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 4),
+            validation: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 3),
+        });
+
+        let decision =
+            decide_strict_v1_with_count_mode(&gate, &report, AssessmentCountMode::RawRows);
+
+        assert_failed_check(
+            &decision,
+            "assessment_count_mode",
+            "RawRows count mode requires reduction.train.mode and reduction.validation.mode to match reduction.mode raw-rows",
+        );
+    }
+
+    #[test]
+    fn inconsistent_reduction_modes_fail_assessment_count_mode() {
+        let gate = StrictGateConfig::default();
+        let top_level_inconsistent =
+            assessment_report_for_tests().with_reduction_report(ReductionReportSection {
+                mode: SampleReductionMode::RawRows,
+                train: reduction_report_for_tests(SampleReductionMode::BidirectionalPairMeanV1, 4),
+                validation: reduction_report_for_tests(
+                    SampleReductionMode::BidirectionalPairMeanV1,
+                    3,
+                ),
+            });
+        let nested_inconsistent =
+            assessment_report_for_tests().with_reduction_report(ReductionReportSection {
+                mode: SampleReductionMode::BidirectionalPairMeanV1,
+                train: reduction_report_for_tests(SampleReductionMode::RawRows, 4),
+                validation: reduction_report_for_tests(
+                    SampleReductionMode::BidirectionalPairMeanV1,
+                    3,
+                ),
+            });
+
+        let top_level_decision = decide_strict_v1_with_count_mode(
+            &gate,
+            &top_level_inconsistent,
+            AssessmentCountMode::EffectivePairs,
+        );
+        let nested_decision = decide_strict_v1_with_count_mode(
+            &gate,
+            &nested_inconsistent,
+            AssessmentCountMode::EffectivePairs,
+        );
+
+        assert_failed_check(
+            &top_level_decision,
+            "assessment_count_mode",
+            "EffectivePairs count mode requires reduction.mode bidirectional-pair-mean-v1",
+        );
+        assert_failed_check(
+            &nested_decision,
+            "assessment_count_mode",
+            "EffectivePairs count mode requires train and validation reduction reports to use bidirectional-pair-mean-v1",
+        );
+    }
+
     fn assessment_report_for_tests() -> AssessmentReport {
         let gate = StrictGateConfig::default();
         let train_eval = eval_report_for_tests();
@@ -916,9 +1525,43 @@ mod tests {
         }
     }
 
+    fn reduction_report_for_tests(
+        mode: SampleReductionMode,
+        effective_sample_count: usize,
+    ) -> ReductionReport {
+        ReductionReport {
+            mode,
+            raw_sample_count: effective_sample_count * 2,
+            effective_sample_count,
+            paired_waypoint_count: effective_sample_count,
+            unpaired_waypoint_count: 0,
+            skipped_pair_q_error_count: 0,
+            duplicate_forward_count: 0,
+            duplicate_backward_count: 0,
+            pair_q_error_p95_rad: [0.0; JOINT_COUNT],
+            pair_q_error_max_rad: [0.0; JOINT_COUNT],
+            direction_torque_delta_p95_nm: [0.0; JOINT_COUNT],
+            direction_torque_delta_max_nm: [0.0; JOINT_COUNT],
+        }
+    }
+
+    fn assert_failed_check(decision: &AssessmentDecision, check: &str, expected_message: &str) {
+        assert!(
+            decision.failed_checks.iter().any(|failed| {
+                failed.check == check && failed.message.as_deref() == Some(expected_message)
+            }),
+            "expected failed check {check:?} with message {expected_message:?}, got {:?}",
+            decision.failed_checks
+        );
+    }
+
     trait EvalReportForTests {
         fn with_training_range_violations(self, training_range_violations: usize) -> Self;
         fn with_raw_torque_delta(self, raw_torque_delta_nm: [f64; JOINT_COUNT]) -> Self;
+        fn with_compensated_external_torque_delta(
+            self,
+            compensated_external_torque_delta_nm: [f64; JOINT_COUNT],
+        ) -> Self;
         fn with_rms(self, rms_residual_nm: [f64; JOINT_COUNT]) -> Self;
     }
 
@@ -930,6 +1573,14 @@ mod tests {
 
         fn with_raw_torque_delta(mut self, raw_torque_delta_nm: [f64; JOINT_COUNT]) -> Self {
             self.raw_torque_delta_nm = raw_torque_delta_nm;
+            self
+        }
+
+        fn with_compensated_external_torque_delta(
+            mut self,
+            compensated_external_torque_delta_nm: [f64; JOINT_COUNT],
+        ) -> Self {
+            self.compensated_external_torque_delta_nm = compensated_external_torque_delta_nm;
             self
         }
 
@@ -949,6 +1600,7 @@ mod tests {
             compensated_delta_ratio: [Option<f64>; JOINT_COUNT],
         ) -> Self;
         fn with_meaningful_compensated_delta_count(self, count: usize) -> Self;
+        fn with_reduction_report(self, reduction: ReductionReportSection) -> Self;
     }
 
     impl AssessmentReportForTests for AssessmentReport {
@@ -978,12 +1630,18 @@ mod tests {
             mut self,
             compensated_delta_ratio: [Option<f64>; JOINT_COUNT],
         ) -> Self {
+            self.derived.gravity_compensated_delta_ratio = compensated_delta_ratio;
             self.derived.compensated_delta_ratio = compensated_delta_ratio;
             self
         }
 
         fn with_meaningful_compensated_delta_count(mut self, count: usize) -> Self {
             self.derived.meaningful_compensated_delta_joint_count = count;
+            self
+        }
+
+        fn with_reduction_report(mut self, reduction: ReductionReportSection) -> Self {
+            self.reduction = Some(reduction);
             self
         }
     }
