@@ -18,9 +18,12 @@ use crate::{
     },
     gravity::{
         artifact::read_quasi_static_samples,
-        eval::{evaluate_model_on_rows, validate_model_matches_samples},
-        fit::{FitOptions, fit_model_from_rows},
-        model::QuasiStaticTorqueModel,
+        eval::{
+            evaluate_model_on_effective_rows, evaluate_model_on_rows,
+            validate_model_matches_samples,
+        },
+        fit::{FitOptions, fit_model_from_effective_rows, fit_model_from_rows},
+        model::{QuasiStaticTorqueModel, TRIG_V1_FEATURE_COUNT},
         profile::{
             artifacts::{
                 file_sha256, register_imported_samples, register_profile_generated_path,
@@ -28,10 +31,13 @@ use crate::{
                 validate_profile_generated_output_path, verify_registered_artifacts,
             },
             assessment::{
-                AssessmentCounts, DiagnosticHoldoutMetrics, build_assessment_report,
-                build_count_only_assessment_report,
+                AssessmentCountMode, AssessmentCounts, DiagnosticHoldoutMetrics,
+                HysteresisReportSection, RawRowsReportSection, ReductionReportSection,
+                ValidationMetricsSection, build_assessment_report,
+                build_assessment_report_with_diagnostics, build_count_only_assessment_report,
+                build_count_only_assessment_report_with_diagnostics,
             },
-            config::{ProfileConfig, StrictGateConfig},
+            config::{ProfileConfig, SampleReductionMode, StrictGateConfig},
             context::{ProfileContext, load_profile_context, load_profile_context_unlocked},
             holdout::select_diagnostic_holdout_groups,
             manifest::{
@@ -40,8 +46,11 @@ use crate::{
             },
             status::{derive_readiness_status, next_action},
         },
+        sample_reduction::{ReductionOptions, SourceSampleArtifact, reduce_samples},
     },
 };
+
+const MIN_DIAGNOSTIC_EFFECTIVE_TRAINING_WAYPOINTS: usize = TRIG_V1_FEATURE_COUNT * 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedInitProfileLocation {
@@ -389,7 +398,9 @@ pub(crate) fn fit_assess(args: GravityProfilePathArgs) -> Result<()> {
     let gate_config = serde_json::to_value(&context.config.gate.strict_v1)
         .context("failed to serialize gate config")?;
 
-    if counts_below_gate(&counts, &context.config.gate.strict_v1) {
+    if context.config.fit.sample_reduction == SampleReductionMode::RawRows
+        && counts_below_gate(&counts, &context.config.gate.strict_v1)
+    {
         let reason = insufficient_data_reason(&counts, &context.config.gate.strict_v1);
         let report =
             build_count_only_assessment_report(&context.config.gate.strict_v1, counts, &reason);
@@ -507,6 +518,9 @@ pub(crate) fn fit_assess(args: GravityProfilePathArgs) -> Result<()> {
                 validation_path_artifact_ids: &validation_path_artifact_ids,
                 gate_config: &gate_config,
                 unix_ms,
+                count_mode: assessment_count_mode_for_sample_reduction(
+                    context.config.fit.sample_reduction,
+                ),
                 failure,
             });
             context.manifest.rounds.push(failure_persistence.round_entry);
@@ -958,6 +972,24 @@ struct PostGateFitInput<'a> {
 }
 
 fn fit_assess_after_count_gate(input: PostGateFitInput<'_>) -> Result<CompletedFitAssess> {
+    match input.config.fit.sample_reduction {
+        SampleReductionMode::RawRows => fit_assess_raw_after_count_gate(input),
+        SampleReductionMode::BidirectionalPairMeanV1 => {
+            fit_assess_pair_mean_after_count_gate(input)
+        },
+    }
+}
+
+fn assessment_count_mode_for_sample_reduction(
+    sample_reduction: SampleReductionMode,
+) -> AssessmentCountMode {
+    match sample_reduction {
+        SampleReductionMode::RawRows => AssessmentCountMode::RawRows,
+        SampleReductionMode::BidirectionalPairMeanV1 => AssessmentCountMode::EffectivePairs,
+    }
+}
+
+fn fit_assess_raw_after_count_gate(input: PostGateFitInput<'_>) -> Result<CompletedFitAssess> {
     let profile_dir = input.profile_dir;
     let config = input.config;
     let manifest = input.manifest;
@@ -1133,6 +1165,295 @@ fn fit_assess_after_count_gate(input: PostGateFitInput<'_>) -> Result<CompletedF
     })
 }
 
+fn fit_assess_pair_mean_after_count_gate(
+    input: PostGateFitInput<'_>,
+) -> Result<CompletedFitAssess> {
+    let profile_dir = input.profile_dir;
+    let config = input.config;
+    let manifest = input.manifest;
+    let round_id = input.round_id;
+    let train_sample_artifact_ids = input.train_sample_artifact_ids;
+    let validation_sample_artifact_ids = input.validation_sample_artifact_ids;
+    let validation_path_artifact_ids = input.validation_path_artifact_ids;
+    let gate_config = input.gate_config;
+    let unix_ms = input.unix_ms;
+    let reduction_mode = SampleReductionMode::BidirectionalPairMeanV1;
+    let reduction_options = ReductionOptions {
+        pair_q_error_max_rad: config.fit.pair_q_error_max_rad,
+    };
+
+    let train_sources = active_source_sample_artifacts(manifest, profile_dir, Split::Train)
+        .with_context(|| "failed to read active train sample artifacts")?;
+    let validation_sources =
+        active_source_sample_artifacts(manifest, profile_dir, Split::Validation)
+            .with_context(|| "failed to read active validation sample artifacts")?;
+    let train_reduced = reduce_samples(reduction_mode, &train_sources, reduction_options)
+        .with_context(|| "failed to reduce active train sample artifacts")?;
+    let validation_reduced = reduce_samples(reduction_mode, &validation_sources, reduction_options)
+        .with_context(|| "failed to reduce active validation sample artifacts")?;
+
+    let effective_counts = AssessmentCounts {
+        train_samples: train_reduced.rows.len(),
+        train_waypoints: train_reduced.report.paired_waypoint_count,
+        validation_samples: validation_reduced.rows.len(),
+        validation_waypoints: validation_reduced.report.paired_waypoint_count,
+    };
+    let reduction_section = ReductionReportSection {
+        mode: reduction_mode,
+        train: train_reduced.report.clone(),
+        validation: validation_reduced.report.clone(),
+    };
+    let hysteresis_section = HysteresisReportSection {
+        validation_direction_torque_delta_p95_nm: validation_reduced
+            .report
+            .direction_torque_delta_p95_nm,
+        validation_direction_torque_delta_max_nm: validation_reduced
+            .report
+            .direction_torque_delta_max_nm,
+    };
+
+    if effective_counts_below_gate(&effective_counts, &config.gate.strict_v1) {
+        let reason = insufficient_effective_pair_reason(&effective_counts, &config.gate.strict_v1);
+        let report = build_count_only_assessment_report_with_diagnostics(
+            &config.gate.strict_v1,
+            effective_counts,
+            &reason,
+            Some(reduction_section),
+            None,
+            Some(hysteresis_section),
+            AssessmentCountMode::EffectivePairs,
+        );
+        let report_relative = format!("reports/{round_id}.assess.json");
+        let round_relative = format!("rounds/{round_id}.json");
+        write_json_create_new(profile_dir, &report_relative, &report)
+            .with_context(|| format!("failed to write assessment report {report_relative}"))?;
+        let provenance = RoundProvenance::new(RoundProvenanceInput {
+            round_id,
+            status: ProfileStatus::InsufficientData,
+            train_sample_artifact_ids,
+            validation_sample_artifact_ids,
+            validation_path_artifact_ids,
+            diagnostic_train_group_keys: &[],
+            diagnostic_holdout_group_keys: &[],
+            profile_identity_sha256: &manifest.profile_identity_sha256,
+            profile_config_sha256: &manifest.profile_config_sha256,
+            gate_config,
+            failure: None,
+            created_at_unix_ms: unix_ms,
+        });
+        write_json_create_new(profile_dir, &round_relative, &provenance)
+            .with_context(|| format!("failed to write round provenance {round_relative}"))?;
+
+        let report_sha256 = file_sha256(&profile_dir.join(&report_relative))?;
+        let round_sha256 = file_sha256(&profile_dir.join(&round_relative))?;
+        return Ok(CompletedFitAssess {
+            status: ProfileStatus::InsufficientData,
+            current_best_model: None,
+            round_entry: RoundEntry {
+                id: round_id.to_string(),
+                status: ProfileStatus::InsufficientData,
+                model_path: None,
+                model_sha256: None,
+                report_path: Some(report_relative),
+                report_sha256: Some(report_sha256),
+                round_path: Some(round_relative),
+                round_sha256: Some(round_sha256),
+                train_sample_artifact_ids: train_sample_artifact_ids.to_vec(),
+                validation_sample_artifact_ids: validation_sample_artifact_ids.to_vec(),
+                validation_path_artifact_ids: validation_path_artifact_ids.to_vec(),
+                diagnostic_train_group_keys: Vec::new(),
+                diagnostic_holdout_group_keys: Vec::new(),
+                profile_identity_sha256: manifest.profile_identity_sha256.clone(),
+                profile_config_sha256: manifest.profile_config_sha256.clone(),
+                gate_config: gate_config.clone(),
+                created_at_unix_ms: unix_ms,
+                failure: None,
+            },
+        });
+    }
+
+    let diagnostic_split = select_diagnostic_holdout_groups(
+        &manifest.profile_identity_sha256,
+        round_id,
+        &config.fit.holdout_group_key,
+        config.fit.holdout_ratio,
+        input.train_artifacts,
+    )?;
+    let diagnostic_holdout = if diagnostic_split.available {
+        let diagnostic_train_sources = source_sample_artifacts_for_ids(
+            manifest,
+            profile_dir,
+            Split::Train,
+            &diagnostic_split.train_sample_artifact_ids,
+        )?;
+        let diagnostic_holdout_sources = source_sample_artifacts_for_ids(
+            manifest,
+            profile_dir,
+            Split::Train,
+            &diagnostic_split.holdout_sample_artifact_ids,
+        )?;
+        let diagnostic_train_reduced =
+            reduce_samples(reduction_mode, &diagnostic_train_sources, reduction_options)
+                .with_context(|| "failed to reduce diagnostic train sample artifacts")?;
+        let diagnostic_holdout_reduced = reduce_samples(
+            reduction_mode,
+            &diagnostic_holdout_sources,
+            reduction_options,
+        )
+        .with_context(|| "failed to reduce diagnostic holdout sample artifacts")?;
+        // Keep diagnostic holdout optional: the fitter requires TRIG_V1_FEATURE_COUNT * 10
+        // effective training waypoints, but the final fit-assess may still have enough data.
+        if diagnostic_train_reduced.report.paired_waypoint_count
+            < MIN_DIAGNOSTIC_EFFECTIVE_TRAINING_WAYPOINTS
+            || diagnostic_train_reduced.rows.is_empty()
+            || diagnostic_holdout_reduced.rows.is_empty()
+        {
+            DiagnosticHoldoutMetrics::unavailable()
+        } else {
+            let diagnostic_model = fit_model_from_effective_rows(
+                diagnostic_train_reduced.header,
+                diagnostic_train_reduced.rows,
+                FitOptions {
+                    ridge_lambda: config.fit.ridge_lambda,
+                    holdout_ratio: 0.0,
+                    regularize_bias: false,
+                },
+            )
+            .with_context(|| "diagnostic fit failed")?;
+            validate_model_matches_samples(&diagnostic_model, &diagnostic_holdout_reduced.header)?;
+            let eval = evaluate_model_on_effective_rows(
+                &diagnostic_model,
+                &diagnostic_holdout_reduced.rows,
+            )
+            .with_context(|| "diagnostic holdout evaluation failed")?;
+            DiagnosticHoldoutMetrics {
+                available: true,
+                sample_count: Some(eval.sample_count),
+                rms_residual_nm: Some(eval.rms_residual_nm),
+                p95_residual_nm: Some(eval.p95_residual_nm),
+                max_residual_nm: Some(eval.max_residual_nm),
+            }
+        }
+    } else {
+        DiagnosticHoldoutMetrics::unavailable()
+    };
+
+    let final_model = fit_model_from_effective_rows(
+        train_reduced.header.clone(),
+        train_reduced.rows.clone(),
+        FitOptions {
+            ridge_lambda: config.fit.ridge_lambda,
+            holdout_ratio: 0.0,
+            regularize_bias: false,
+        },
+    )
+    .with_context(|| "final fit failed")?;
+    validate_model_matches_samples(&final_model, &train_reduced.header)?;
+    validate_model_matches_samples(&final_model, &validation_reduced.header)?;
+    let train_eval = evaluate_model_on_effective_rows(&final_model, &train_reduced.rows)
+        .with_context(|| "train evaluation failed")?;
+    let validation_eval = evaluate_model_on_effective_rows(&final_model, &validation_reduced.rows)
+        .with_context(|| "validation evaluation failed")?;
+    let raw_validation_rows = validation_sources
+        .iter()
+        .flat_map(|source| source.rows.iter().cloned())
+        .collect::<Vec<_>>();
+    let raw_validation_eval = evaluate_model_on_rows(&final_model, &raw_validation_rows)
+        .with_context(|| "raw validation evaluation failed")?;
+    let raw_rows_section = RawRowsReportSection {
+        validation: Some(validation_metrics_section_from_eval(
+            &raw_validation_eval,
+            input.counts.validation_waypoints,
+        )),
+    };
+    let report = build_assessment_report_with_diagnostics(
+        &config.gate.strict_v1,
+        effective_counts,
+        &train_eval,
+        &validation_eval,
+        &diagnostic_holdout,
+        &final_model,
+        Some(reduction_section),
+        Some(raw_rows_section),
+        Some(hysteresis_section),
+        AssessmentCountMode::EffectivePairs,
+    );
+
+    let model_relative = format!("models/{round_id}.model.toml");
+    let report_relative = format!("reports/{round_id}.assess.json");
+    let round_relative = format!("rounds/{round_id}.json");
+    write_model_create_new(profile_dir, &model_relative, &final_model)
+        .with_context(|| format!("failed to write model {model_relative}"))?;
+    write_json_create_new(profile_dir, &report_relative, &report)
+        .with_context(|| format!("failed to write assessment report {report_relative}"))?;
+    let provenance = RoundProvenance::new(RoundProvenanceInput {
+        round_id,
+        status: if report.decision.pass {
+            ProfileStatus::Passed
+        } else {
+            ProfileStatus::ValidationFailed
+        },
+        train_sample_artifact_ids,
+        validation_sample_artifact_ids,
+        validation_path_artifact_ids,
+        diagnostic_train_group_keys: &diagnostic_split.train_group_keys,
+        diagnostic_holdout_group_keys: &diagnostic_split.holdout_group_keys,
+        profile_identity_sha256: &manifest.profile_identity_sha256,
+        profile_config_sha256: &manifest.profile_config_sha256,
+        gate_config,
+        failure: None,
+        created_at_unix_ms: unix_ms,
+    });
+    write_json_create_new(profile_dir, &round_relative, &provenance)
+        .with_context(|| format!("failed to write round provenance {round_relative}"))?;
+
+    let model_sha256 = file_sha256(&profile_dir.join(&model_relative))?;
+    let report_sha256 = file_sha256(&profile_dir.join(&report_relative))?;
+    let round_sha256 = file_sha256(&profile_dir.join(&round_relative))?;
+    let status = if report.decision.pass {
+        ProfileStatus::Passed
+    } else {
+        ProfileStatus::ValidationFailed
+    };
+    let current_best_model = if report.decision.pass {
+        Some(CurrentBestModel {
+            round_id: round_id.to_string(),
+            path: "models/best.model.toml".to_string(),
+            sha256: model_sha256.clone(),
+            source_model_path: model_relative.clone(),
+            source_model_sha256: model_sha256.clone(),
+            promoted_at_unix_ms: unix_ms,
+        })
+    } else {
+        None
+    };
+
+    Ok(CompletedFitAssess {
+        status,
+        current_best_model,
+        round_entry: RoundEntry {
+            id: round_id.to_string(),
+            status,
+            model_path: Some(model_relative),
+            model_sha256: Some(model_sha256),
+            report_path: Some(report_relative),
+            report_sha256: Some(report_sha256),
+            round_path: Some(round_relative),
+            round_sha256: Some(round_sha256),
+            train_sample_artifact_ids: train_sample_artifact_ids.to_vec(),
+            validation_sample_artifact_ids: validation_sample_artifact_ids.to_vec(),
+            validation_path_artifact_ids: validation_path_artifact_ids.to_vec(),
+            diagnostic_train_group_keys: diagnostic_split.train_group_keys,
+            diagnostic_holdout_group_keys: diagnostic_split.holdout_group_keys,
+            profile_identity_sha256: manifest.profile_identity_sha256.clone(),
+            profile_config_sha256: manifest.profile_config_sha256.clone(),
+            gate_config: gate_config.clone(),
+            created_at_unix_ms: unix_ms,
+            failure: None,
+        },
+    })
+}
+
 struct FailureRoundInput<'a> {
     profile_dir: &'a Path,
     manifest: &'a Manifest,
@@ -1147,6 +1468,7 @@ struct FailureRoundInput<'a> {
     validation_path_artifact_ids: &'a [String],
     gate_config: &'a Value,
     unix_ms: u64,
+    count_mode: AssessmentCountMode,
     failure: RoundFailure,
 }
 
@@ -1179,7 +1501,20 @@ fn write_failure_round(input: FailureRoundInput<'_>) -> FailureRoundPersistence 
         .as_ref()
         .map(|split| split.holdout_group_keys.clone())
         .unwrap_or_default();
-    let report = build_count_only_assessment_report(input.gate, input.counts, &failure.message);
+    let report = match input.count_mode {
+        AssessmentCountMode::RawRows => {
+            build_count_only_assessment_report(input.gate, input.counts, &failure.message)
+        },
+        AssessmentCountMode::EffectivePairs => build_count_only_assessment_report_with_diagnostics(
+            input.gate,
+            input.counts,
+            &failure.message,
+            None,
+            None,
+            None,
+            AssessmentCountMode::EffectivePairs,
+        ),
+    };
     let report_sha256 = match write_json_create_new(profile_dir, &report_relative, &report)
         .with_context(|| format!("failed to persist failure report {report_relative}"))
     {
@@ -1429,6 +1764,62 @@ fn assessment_counts(manifest: &Manifest) -> AssessmentCounts {
     }
 }
 
+fn active_source_sample_artifacts(
+    manifest: &Manifest,
+    profile_dir: &Path,
+    split: Split,
+) -> Result<Vec<SourceSampleArtifact>> {
+    let ids = active_sample_ids(manifest, split);
+    source_sample_artifacts_for_ids(manifest, profile_dir, split, &ids)
+}
+
+fn source_sample_artifacts_for_ids(
+    manifest: &Manifest,
+    profile_dir: &Path,
+    split: Split,
+    ids: &[String],
+) -> Result<Vec<SourceSampleArtifact>> {
+    let mut sources = Vec::with_capacity(ids.len());
+    for id in ids {
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id == *id)
+            .ok_or_else(|| anyhow!("selected sample artifact {id} is not registered"))?;
+        if artifact.kind != "samples" {
+            bail!(
+                "selected artifact {id} is kind {}, expected samples",
+                artifact.kind
+            );
+        }
+        if artifact.split != split {
+            bail!(
+                "selected sample artifact {id} is in {:?} split, expected {:?}",
+                artifact.split,
+                split
+            );
+        }
+        if !artifact.active {
+            bail!("selected sample artifact {id} is not active");
+        }
+        verify_registered_artifacts(profile_dir, std::slice::from_ref(artifact)).with_context(
+            || format!("failed to verify selected sample artifact {}", artifact.id),
+        )?;
+        let path = registered_artifact_path(profile_dir, artifact).with_context(|| {
+            format!("failed to resolve selected sample artifact {}", artifact.id)
+        })?;
+        let loaded = read_quasi_static_samples(std::slice::from_ref(&path))
+            .with_context(|| format!("failed to read selected sample artifact {}", artifact.id))?;
+        sources.push(SourceSampleArtifact {
+            source_id: artifact.id.clone(),
+            path,
+            header: loaded.header,
+            rows: loaded.rows,
+        });
+    }
+    Ok(sources)
+}
+
 pub(crate) fn active_sample_paths(
     manifest: &Manifest,
     profile_dir: &Path,
@@ -1529,6 +1920,11 @@ fn counts_below_gate(counts: &AssessmentCounts, gate: &StrictGateConfig) -> bool
         || counts.validation_waypoints < gate.min_validation_waypoints
 }
 
+fn effective_counts_below_gate(counts: &AssessmentCounts, gate: &StrictGateConfig) -> bool {
+    counts.train_samples < gate.min_train_effective_pairs
+        || counts.validation_samples < gate.min_validation_effective_pairs
+}
+
 fn insufficient_data_reason(counts: &AssessmentCounts, gate: &StrictGateConfig) -> String {
     format!(
         "insufficient data: train samples {}/{}, train waypoints {}/{}, validation samples {}/{}, validation waypoints {}/{}",
@@ -1541,6 +1937,36 @@ fn insufficient_data_reason(counts: &AssessmentCounts, gate: &StrictGateConfig) 
         counts.validation_waypoints,
         gate.min_validation_waypoints
     )
+}
+
+fn insufficient_effective_pair_reason(
+    counts: &AssessmentCounts,
+    gate: &StrictGateConfig,
+) -> String {
+    format!(
+        "insufficient data: train effective pairs {}/{}, validation effective pairs {}/{}",
+        counts.train_samples,
+        gate.min_train_effective_pairs,
+        counts.validation_samples,
+        gate.min_validation_effective_pairs
+    )
+}
+
+fn validation_metrics_section_from_eval(
+    eval: &crate::gravity::eval::GravityEvalReport,
+    waypoint_count: usize,
+) -> ValidationMetricsSection {
+    ValidationMetricsSection {
+        sample_count: eval.sample_count,
+        waypoint_count,
+        residual_rms_nm: Some(eval.rms_residual_nm),
+        residual_p95_nm: Some(eval.p95_residual_nm),
+        residual_max_nm: Some(eval.max_residual_nm),
+        raw_torque_delta_nm: Some(eval.raw_torque_delta_nm),
+        compensated_external_torque_delta_nm: Some(eval.compensated_external_torque_delta_nm),
+        training_range_violations: Some(eval.training_range_violations),
+        max_range_violation_rad: Some(eval.max_range_violation_rad),
+    }
 }
 
 fn write_model_create_new(
@@ -2306,6 +2732,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().join("profile");
         init_profile(init_args_for_tests(profile.clone())).unwrap();
+        set_sample_reduction_raw_rows(&profile);
 
         let train_samples = dir.path().join("train.samples.jsonl");
         let validation_samples = dir.path().join("validation.samples.jsonl");
@@ -2823,6 +3250,186 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pair_mean_fit_assess_records_insufficient_data_when_raw_counts_pass_but_pairs_missing() {
+        let fixture = ProfileFixture::new();
+        fixture.set_sample_reduction_pair_mean();
+        fixture.register_forward_only_samples(Split::Train, "samples-train-0001", 320);
+        fixture.register_forward_only_samples(Split::Validation, "samples-validation-0001", 100);
+
+        fit_assess(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap();
+
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        assert_eq!(manifest.status, ProfileStatus::InsufficientData);
+        let round = manifest.rounds.first().unwrap();
+        assert_eq!(round.status, ProfileStatus::InsufficientData);
+        assert!(round.model_path.is_none());
+
+        let report_path = fixture.profile_dir().join(round.report_path.as_ref().unwrap());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["count_mode"], "effective_pairs");
+        assert_eq!(report["reduction"]["mode"], "bidirectional-pair-mean-v1");
+        assert_eq!(report["reduction"]["train"]["effective_sample_count"], 0);
+        assert_eq!(
+            report["reduction"]["validation"]["effective_sample_count"],
+            0
+        );
+        assert!(
+            report["decision"]["failed_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["check"] == "train_effective_pair_count")
+        );
+    }
+
+    #[test]
+    fn pair_mean_fit_assess_skips_diagnostic_holdout_when_reduced_train_is_too_small() {
+        let fixture = ProfileFixture::new();
+        fixture.set_sample_reduction_pair_mean();
+        fixture.register_bidirectional_pair_samples_with_direction_friction(
+            Split::Train,
+            "samples-train-0001",
+            200,
+            0.0,
+        );
+        fixture.register_bidirectional_pair_samples_with_direction_friction(
+            Split::Train,
+            "samples-train-0002",
+            200,
+            0.0,
+        );
+        fixture.register_bidirectional_pair_samples_with_direction_friction(
+            Split::Validation,
+            "samples-validation-0001",
+            100,
+            0.0,
+        );
+
+        fit_assess(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap();
+
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        assert_eq!(manifest.status, ProfileStatus::Passed);
+        let round = manifest.rounds.first().unwrap();
+        assert_eq!(round.status, ProfileStatus::Passed);
+
+        let report_path = fixture.profile_dir().join(round.report_path.as_ref().unwrap());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["count_mode"], "effective_pairs");
+        assert_eq!(report["fit_internal_holdout"]["available"], false);
+        assert_eq!(report["decision"]["pass"], true);
+    }
+
+    #[test]
+    fn pair_mean_fit_failed_report_uses_effective_pair_count_mode() {
+        let fixture = ProfileFixture::new();
+        fixture.set_sample_reduction_pair_mean();
+        fixture.register_bidirectional_pair_samples_with_direction_friction(
+            Split::Train,
+            "samples-train-0001",
+            320,
+            0.0,
+        );
+        fixture.register_bidirectional_pair_samples_with_direction_friction(
+            Split::Validation,
+            "samples-validation-0001",
+            100,
+            0.0,
+        );
+        let mut manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.id == "samples-validation-0001")
+            .unwrap()
+            .path = "../outside.samples.jsonl".to_string();
+        manifest.save_atomic(fixture.profile_dir().join("manifest.json")).unwrap();
+
+        let err = fit_assess(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("samples-validation-0001"));
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        assert_eq!(manifest.status, ProfileStatus::FitFailed);
+        let round = manifest.rounds.first().unwrap();
+        assert_eq!(round.status, ProfileStatus::FitFailed);
+
+        let report_path = fixture.profile_dir().join(round.report_path.as_ref().unwrap());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["count_mode"], "effective_pairs");
+        assert!(
+            report["decision"]["failed_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["check"] == "assessment_count_mode")
+        );
+    }
+
+    #[test]
+    fn pair_mean_fit_assess_can_pass_when_raw_hysteresis_is_high() {
+        let fixture = ProfileFixture::new();
+        fixture.set_sample_reduction_pair_mean();
+        fixture.register_bidirectional_pair_samples_with_direction_friction(
+            Split::Train,
+            "samples-train-0001",
+            320,
+            8.0,
+        );
+        fixture.register_bidirectional_pair_samples_with_direction_friction(
+            Split::Validation,
+            "samples-validation-0001",
+            100,
+            8.0,
+        );
+
+        fit_assess(crate::commands::gravity::GravityProfilePathArgs {
+            profile: fixture.profile_dir().to_path_buf(),
+        })
+        .unwrap();
+
+        let manifest = Manifest::load(fixture.profile_dir().join("manifest.json")).unwrap();
+        assert_eq!(manifest.status, ProfileStatus::Passed);
+        let round = manifest.rounds.first().unwrap();
+        assert_eq!(round.status, ProfileStatus::Passed);
+        assert!(round.model_path.is_some());
+
+        let report_path = fixture.profile_dir().join(round.report_path.as_ref().unwrap());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["count_mode"], "effective_pairs");
+        assert_eq!(report["reduction"]["mode"], "bidirectional-pair-mean-v1");
+        assert!(report["hysteresis"].is_object());
+        assert!(report["raw_rows"]["validation"].is_object());
+        assert_eq!(report["decision"]["pass"], true);
+        assert_eq!(
+            report["derived"]["raw_row_compensated_delta_ratio"].as_array().unwrap().len(),
+            6
+        );
+        let raw_row_ratio =
+            report["derived"]["raw_row_compensated_delta_ratio"].as_array().unwrap()[0]
+                .as_f64()
+                .unwrap();
+        assert!(raw_row_ratio > 0.5, "{raw_row_ratio}");
+        let hysteresis_max = report["hysteresis"]["validation_direction_torque_delta_max_nm"]
+            .as_array()
+            .unwrap()[0]
+            .as_f64()
+            .unwrap();
+        assert!(hysteresis_max > 10.0, "{hysteresis_max}");
+    }
+
     fn init_args_without_profile() -> GravityProfileInitArgs {
         GravityProfileInitArgs {
             profile: None,
@@ -2863,6 +3470,7 @@ mod tests {
             let temp_dir = tempfile::tempdir().unwrap();
             let profile_dir = temp_dir.path().join("profile");
             init_profile(init_args_for_tests(profile_dir.clone())).unwrap();
+            set_sample_reduction_raw_rows(&profile_dir);
             Self {
                 _temp_dir: temp_dir,
                 profile_dir,
@@ -3006,6 +3614,107 @@ mod tests {
             samples_path
         }
 
+        fn set_sample_reduction_pair_mean(&self) {
+            set_sample_reduction_pair_mean(&self.profile_dir);
+        }
+
+        fn register_forward_only_samples(
+            &self,
+            split: Split,
+            artifact_id: &str,
+            sample_count: usize,
+        ) {
+            self.register_samples_artifact_with_source_and_rows(
+                split,
+                artifact_id,
+                &format!("source-{artifact_id}"),
+                (0..sample_count)
+                    .map(|sample_index| synthetic_sample_row_for_tests(sample_index, [0.0; 6]))
+                    .collect(),
+            );
+        }
+
+        fn register_bidirectional_pair_samples_with_direction_friction(
+            &self,
+            split: Split,
+            artifact_id: &str,
+            pair_count: usize,
+            friction_nm: f64,
+        ) {
+            let mut rows = Vec::with_capacity(pair_count * 2);
+            for waypoint_index in 0..pair_count {
+                let q_rad = synthetic_q_for_tests(waypoint_index);
+                let gravity = synthetic_gravity_target_for_tests(q_rad);
+                rows.push(synthetic_pair_sample_row_for_tests(
+                    waypoint_index,
+                    PassDirection::Forward,
+                    q_rad,
+                    add_joint_scalar_for_tests(gravity, friction_nm),
+                ));
+                rows.push(synthetic_pair_sample_row_for_tests(
+                    waypoint_index,
+                    PassDirection::Backward,
+                    q_rad,
+                    add_joint_scalar_for_tests(gravity, -friction_nm),
+                ));
+            }
+            self.register_samples_artifact_with_source_and_rows(
+                split,
+                artifact_id,
+                &format!("source-{artifact_id}"),
+                rows,
+            );
+        }
+
+        fn register_samples_artifact_with_source_and_rows(
+            &self,
+            split: Split,
+            artifact_id: &str,
+            source_path_id: &str,
+            rows: Vec<QuasiStaticSampleRow>,
+        ) -> std::path::PathBuf {
+            let split_dir = split_dir_for_tests(split);
+            let relative_path = format!("data/{split_dir}/samples/{artifact_id}.samples.jsonl");
+            let samples_path = self.profile_dir.join(&relative_path);
+            std::fs::create_dir_all(samples_path.parent().unwrap()).unwrap();
+            write_samples_artifact_rows_for_tests(&samples_path, &rows);
+
+            let mut manifest = Manifest::load(self.profile_dir.join("manifest.json")).unwrap();
+            manifest.artifacts.push(ArtifactEntry {
+                id: artifact_id.to_string(),
+                kind: "samples".to_string(),
+                split,
+                active: true,
+                path: relative_path,
+                sha256: crate::gravity::profile::artifacts::file_sha256(&samples_path).unwrap(),
+                source_path_id: Some(source_path_id.to_string()),
+                role: "slave".to_string(),
+                arm_id: "piper-left".to_string(),
+                arm_id_source: Some("profile_generated".to_string()),
+                target: "socketcan:can1".to_string(),
+                joint_map: "identity".to_string(),
+                load_profile: "normal-gripper-d405".to_string(),
+                torque_convention: crate::gravity::TORQUE_CONVENTION.to_string(),
+                basis: crate::gravity::BASIS_TRIG_V1.to_string(),
+                sample_count: Some(rows.len() as u64),
+                waypoint_count: Some(
+                    rows.iter()
+                        .map(|row| row.waypoint_id)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len() as u64,
+                ),
+                created_at_unix_ms: unix_ms_for_tests(),
+                promoted_from_round_id: None,
+                previous_paths: Vec::new(),
+            });
+            manifest.status = match split {
+                Split::Train => ProfileStatus::NeedsValidationData,
+                Split::Validation => ProfileStatus::ReadyToFit,
+            };
+            manifest.save_atomic(self.profile_dir.join("manifest.json")).unwrap();
+            samples_path
+        }
+
         fn register_path_artifact(
             &self,
             split: Split,
@@ -3110,6 +3819,35 @@ mod tests {
         }
     }
 
+    fn set_sample_reduction_raw_rows(profile_dir: &std::path::Path) {
+        let config_path = profile_dir.join("profile.toml");
+        let mut config = ProfileConfig::load(&config_path).unwrap();
+        config.fit.sample_reduction = crate::gravity::profile::config::SampleReductionMode::RawRows;
+        config.save(&config_path).unwrap();
+        sync_manifest_config_hashes_for_tests(profile_dir, &config);
+    }
+
+    fn set_sample_reduction_pair_mean(profile_dir: &std::path::Path) {
+        let config_path = profile_dir.join("profile.toml");
+        let mut config = ProfileConfig::load(&config_path).unwrap();
+        config.fit.sample_reduction =
+            crate::gravity::profile::config::SampleReductionMode::BidirectionalPairMeanV1;
+        config.fit.pair_q_error_max_rad = 0.05;
+        config.save(&config_path).unwrap();
+        sync_manifest_config_hashes_for_tests(profile_dir, &config);
+    }
+
+    fn sync_manifest_config_hashes_for_tests(
+        profile_dir: &std::path::Path,
+        config: &ProfileConfig,
+    ) {
+        let manifest_path = profile_dir.join("manifest.json");
+        let mut manifest = Manifest::load(&manifest_path).unwrap();
+        manifest.profile_config_sha256 = config.config_sha256().unwrap();
+        manifest.profile_config_sections_sha256 = Some(config.section_sha256().unwrap());
+        manifest.save_atomic(&manifest_path).unwrap();
+    }
+
     fn split_dir_for_tests(split: Split) -> &'static str {
         match split {
             Split::Train => "train",
@@ -3148,13 +3886,41 @@ mod tests {
         }
     }
 
+    fn write_samples_artifact_rows_for_tests(
+        path: &std::path::Path,
+        rows: &[QuasiStaticSampleRow],
+    ) {
+        let mut file = std::fs::File::create(path).unwrap();
+        let waypoint_count = rows
+            .iter()
+            .map(|row| row.waypoint_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        write_jsonl_row(&mut file, &samples_header_for_tests(waypoint_count)).unwrap();
+        for row in rows {
+            write_jsonl_row(&mut file, row).unwrap();
+        }
+    }
+
     fn write_samples_artifact_for_tests(
         path: &std::path::Path,
         sample_count: usize,
         torque_nm: [f64; 6],
     ) {
         let mut file = std::fs::File::create(path).unwrap();
-        let header = SamplesHeader {
+        let header = samples_header_for_tests(sample_count);
+        write_jsonl_row(&mut file, &header).unwrap();
+        for sample_index in 0..sample_count {
+            write_jsonl_row(
+                &mut file,
+                &synthetic_sample_row_for_tests(sample_index, torque_nm),
+            )
+            .unwrap();
+        }
+    }
+
+    fn samples_header_for_tests(waypoint_count: usize) -> SamplesHeader {
+        SamplesHeader {
             row_type: "header".to_string(),
             artifact_kind: "quasi-static-samples".to_string(),
             schema_version: 1,
@@ -3174,17 +3940,9 @@ mod tests {
             stable_velocity_rad_s: 0.01,
             stable_tracking_error_rad: 0.03,
             stable_torque_std_nm: 0.08,
-            waypoint_count: sample_count,
-            accepted_waypoint_count: sample_count,
+            waypoint_count,
+            accepted_waypoint_count: waypoint_count,
             rejected_waypoint_count: 0,
-        };
-        write_jsonl_row(&mut file, &header).unwrap();
-        for sample_index in 0..sample_count {
-            write_jsonl_row(
-                &mut file,
-                &synthetic_sample_row_for_tests(sample_index, torque_nm),
-            )
-            .unwrap();
         }
     }
 
@@ -3209,6 +3967,52 @@ mod tests {
             stable_tracking_error_rad: 0.0,
             stable_torque_std_nm: 0.0,
         }
+    }
+
+    fn synthetic_pair_sample_row_for_tests(
+        waypoint_index: usize,
+        pass_direction: PassDirection,
+        q_rad: [f64; 6],
+        torque_nm: [f64; 6],
+    ) -> QuasiStaticSampleRow {
+        let direction_offset_us = match pass_direction {
+            PassDirection::Forward => 0,
+            PassDirection::Backward => 5_000,
+        };
+        QuasiStaticSampleRow {
+            row_type: "quasi-static-sample".to_string(),
+            waypoint_id: waypoint_index as u64,
+            segment_id: Some(format!("segment-{}", waypoint_index / 20)),
+            pass_direction,
+            host_mono_us: waypoint_index as u64 * 10_000 + direction_offset_us,
+            raw_timestamp_us: None,
+            q_rad,
+            dq_rad_s: [0.0; 6],
+            tau_nm: torque_nm,
+            position_valid_mask: 0x3f,
+            dynamic_valid_mask: 0x3f,
+            stable_velocity_rad_s: 0.0,
+            stable_tracking_error_rad: 0.0,
+            stable_torque_std_nm: 0.0,
+        }
+    }
+
+    fn synthetic_gravity_target_for_tests(q_rad: [f64; 6]) -> [f64; 6] {
+        [
+            0.25 * q_rad[0].sin() + 0.10 * q_rad[1].cos(),
+            -0.18 * q_rad[1].sin() + 0.07 * q_rad[2].cos(),
+            0.16 * q_rad[2].sin() - 0.06 * q_rad[3].cos(),
+            0.12 * q_rad[3].sin() + 0.05 * q_rad[4].cos(),
+            -0.10 * q_rad[4].sin() + 0.04 * q_rad[5].cos(),
+            0.08 * q_rad[5].sin() + 0.03 * q_rad[0].cos(),
+        ]
+    }
+
+    fn add_joint_scalar_for_tests(mut values: [f64; 6], scalar: f64) -> [f64; 6] {
+        for value in &mut values {
+            *value += scalar;
+        }
+        values
     }
 
     fn synthetic_q_for_tests(sample_index: usize) -> [f64; 6] {
