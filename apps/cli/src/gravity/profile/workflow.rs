@@ -251,6 +251,9 @@ fn append_assessment_report_summary(lines: &mut Vec<String>, report: &Value) {
         }
     }
 
+    append_pair_mean_report_summary(lines, report);
+    append_assessment_ratio_summary(lines, report);
+
     if let Some(next_action) = report.pointer("/decision/next_action").and_then(Value::as_str) {
         lines.push(format!("Decision next action: {next_action}"));
     }
@@ -274,6 +277,78 @@ fn append_assessment_report_summary(lines: &mut Vec<String>, report: &Value) {
             failed_checks.len() - MAX_STATUS_FAILED_CHECKS
         ));
     }
+}
+
+fn append_pair_mean_report_summary(lines: &mut Vec<String>, report: &Value) {
+    let effective_sample_count = report
+        .pointer("/reduction/validation/effective_sample_count")
+        .and_then(Value::as_u64);
+    let paired_waypoint_count = report
+        .pointer("/reduction/validation/paired_waypoint_count")
+        .and_then(Value::as_u64);
+    let unpaired_waypoint_count = report
+        .pointer("/reduction/validation/unpaired_waypoint_count")
+        .and_then(Value::as_u64);
+
+    if effective_sample_count.is_some()
+        || paired_waypoint_count.is_some()
+        || unpaired_waypoint_count.is_some()
+    {
+        lines.push(format!(
+            "Pair-mean validation: effective_samples={} paired_waypoints={} unpaired_waypoints={}",
+            effective_sample_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            paired_waypoint_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            unpaired_waypoint_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+
+    append_report_json_line(
+        lines,
+        "Pair q error p95 rad",
+        report.pointer("/reduction/validation/pair_q_error_p95_rad"),
+    );
+    append_report_json_line(
+        lines,
+        "Direction torque delta p95 Nm",
+        report.pointer("/reduction/validation/direction_torque_delta_p95_nm"),
+    );
+}
+
+fn append_assessment_ratio_summary(lines: &mut Vec<String>, report: &Value) {
+    let gravity_ratio = report.pointer("/derived/gravity_compensated_delta_ratio");
+    append_report_json_line(lines, "Gravity compensated delta ratio", gravity_ratio);
+    append_report_json_line(
+        lines,
+        "Raw-row compensated delta ratio",
+        report.pointer("/derived/raw_row_compensated_delta_ratio"),
+    );
+    if gravity_ratio.is_none() {
+        append_report_json_line(
+            lines,
+            "Compensated delta ratio",
+            report.pointer("/derived/compensated_delta_ratio"),
+        );
+    }
+}
+
+fn append_report_json_line(lines: &mut Vec<String>, label: &str, value: Option<&Value>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    lines.push(format!("{label}: {}", compact_json_value(value)));
+}
+
+fn compact_json_value(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn format_assessment_check(check: &Value) -> String {
@@ -300,9 +375,42 @@ fn format_assessment_check(check: &Value) -> String {
 }
 
 pub fn print_next(args: GravityProfilePathArgs) -> Result<()> {
-    let context = load_profile_context(&args.profile)?;
-    println!("{}", next_action(context.manifest.status));
+    println!("{}", next_action_for_profile_dir(&args.profile)?);
     Ok(())
+}
+
+pub(crate) fn next_action_for_profile_dir(profile_dir: &Path) -> Result<String> {
+    let context = load_profile_context(profile_dir)?;
+    let action = latest_assessment_report_value(&context)?
+        .and_then(|report| {
+            report
+                .pointer("/decision/next_action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| next_action(context.manifest.status).to_string());
+    Ok(action)
+}
+
+pub(crate) fn latest_assessment_report_value(context: &ProfileContext) -> Result<Option<Value>> {
+    let Some(report_path) =
+        context.manifest.rounds.last().and_then(|round| round.report_path.as_deref())
+    else {
+        return Ok(None);
+    };
+
+    let resolved = context.profile_dir.join(report_path);
+    let input = match fs::read_to_string(&resolved) {
+        Ok(input) => input,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read latest report {}", resolved.display()));
+        },
+    };
+    let report: Value = serde_json::from_str(&input)
+        .with_context(|| format!("failed to parse latest report {}", resolved.display()))?;
+    Ok(Some(report))
 }
 
 pub fn import_samples(args: GravityProfileImportSamplesArgs) -> Result<()> {
@@ -2297,6 +2405,9 @@ mod tests {
                     "training_range_violations": 459,
                     "max_range_violation_rad": 0.41465532368881286
                 },
+                "derived": {
+                    "compensated_delta_ratio": [1.47, 0.20, 0.30, 0.40, 0.50, 0.60]
+                },
                 "decision": {
                     "next_action": "collect_more_training_and_validation",
                     "failed_checks": [
@@ -2327,7 +2438,138 @@ mod tests {
         assert!(output.contains("compensated_delta_ratio J1"));
         assert!(output.contains("training_range_violations"));
         assert!(output.contains("Validation range violations: 459"));
+        assert!(output.contains("Compensated delta ratio: [1.47,0.2,0.3,0.4,0.5,0.6]"));
         assert!(output.contains("Decision next action: collect_more_training_and_validation"));
+    }
+
+    #[test]
+    fn profile_status_lines_include_pair_mean_diagnostics() {
+        let fixture = ProfileFixture::new();
+        fixture.set_validation_failed_round(
+            "round-0001",
+            &["samples-train-0001"],
+            &["samples-validation-0001"],
+            &["path-validation-0001"],
+        );
+        fixture.write_assessment_report_for_round(
+            "round-0001",
+            serde_json::json!({
+                "reduction": {
+                    "validation": {
+                        "effective_sample_count": 96,
+                        "paired_waypoint_count": 96,
+                        "unpaired_waypoint_count": 4,
+                        "pair_q_error_p95_rad": [0.001, 0.002, 0.003, 0.004, 0.005, 0.006],
+                        "direction_torque_delta_p95_nm": [1.1, 1.2, 1.3, 1.4, 1.5, 1.6]
+                    }
+                },
+                "derived": {
+                    "gravity_compensated_delta_ratio": [0.10, 0.20, 0.30, 0.40, 0.50, 0.60],
+                    "raw_row_compensated_delta_ratio": [0.70, 0.80, 0.90, 1.00, 1.10, 1.20],
+                    "compensated_delta_ratio": [0.91, 0.92, 0.93, 0.94, 0.95, 0.96]
+                },
+                "decision": {
+                    "next_action": "collect_bidirectional_validation_pairs",
+                    "failed_checks": []
+                }
+            }),
+        );
+
+        let lines = status_lines(fixture.profile_dir()).unwrap();
+        let output = lines.join("\n");
+
+        assert!(output.contains(
+            "Pair-mean validation: effective_samples=96 paired_waypoints=96 unpaired_waypoints=4"
+        ));
+        assert!(output.contains("Pair q error p95 rad: [0.001,0.002,0.003,0.004,0.005,0.006]"));
+        assert!(output.contains("Direction torque delta p95 Nm: [1.1,1.2,1.3,1.4,1.5,1.6]"));
+        assert!(output.contains("Gravity compensated delta ratio: [0.1,0.2,0.3,0.4,0.5,0.6]"));
+        assert!(output.contains("Raw-row compensated delta ratio: [0.7,0.8,0.9,1.0,1.1,1.2]"));
+        assert!(!output.contains("Compensated delta ratio: [0.91"));
+    }
+
+    #[test]
+    fn profile_next_uses_latest_assessment_decision_next_action() {
+        let fixture = ProfileFixture::new();
+        fixture.set_validation_failed_round(
+            "round-0001",
+            &["samples-train-0001"],
+            &["samples-validation-0001"],
+            &["path-validation-0001"],
+        );
+        fixture.write_assessment_report_for_round(
+            "round-0001",
+            serde_json::json!({
+                "decision": {
+                    "next_action": "collect_bidirectional_validation_pairs",
+                    "failed_checks": []
+                }
+            }),
+        );
+
+        let action = next_action_for_profile_dir(fixture.profile_dir()).unwrap();
+
+        assert_eq!(action, "collect_bidirectional_validation_pairs");
+
+        let no_report_fixture = ProfileFixture::new();
+        let action = next_action_for_profile_dir(no_report_fixture.profile_dir()).unwrap();
+        assert_eq!(action, "collect train samples");
+
+        let no_decision_fixture = ProfileFixture::new();
+        no_decision_fixture.set_validation_failed_round(
+            "round-0001",
+            &["samples-train-0001"],
+            &["samples-validation-0001"],
+            &["path-validation-0001"],
+        );
+        no_decision_fixture.write_assessment_report_for_round(
+            "round-0001",
+            serde_json::json!({
+                "decision": {
+                    "failed_checks": []
+                }
+            }),
+        );
+        let action = next_action_for_profile_dir(no_decision_fixture.profile_dir()).unwrap();
+        assert_eq!(
+            action,
+            "run promote-validation, then collect new validation samples"
+        );
+    }
+
+    #[test]
+    fn profile_next_ignores_older_report_decision_when_latest_round_has_no_report() {
+        let fixture = ProfileFixture::new();
+        fixture.set_validation_failed_round(
+            "round-0001",
+            &["samples-train-0001"],
+            &["samples-validation-0001"],
+            &["path-validation-0001"],
+        );
+        fixture.write_assessment_report_for_round(
+            "round-0001",
+            serde_json::json!({
+                "decision": {
+                    "next_action": "collect_bidirectional_validation_pairs",
+                    "failed_checks": []
+                }
+            }),
+        );
+        let manifest_path = fixture.profile_dir().join("manifest.json");
+        let mut manifest = Manifest::load(&manifest_path).unwrap();
+        manifest.status = ProfileStatus::FitFailed;
+        manifest.rounds.push(RoundEntry::fit_failed_for_tests(
+            "round-0002",
+            "solver failed",
+        ));
+        manifest.save_atomic(&manifest_path).unwrap();
+
+        let action = next_action_for_profile_dir(fixture.profile_dir()).unwrap();
+
+        assert_eq!(
+            action,
+            "inspect fit error, fix data/config, rerun fit-assess"
+        );
     }
 
     #[test]
