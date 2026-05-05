@@ -42,12 +42,23 @@ pub struct ReplayConfig {
     pub bidirectional: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SampleReductionMode {
+    RawRows,
+    BidirectionalPairMeanV1,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FitConfig {
     pub ridge_lambda: f64,
     pub holdout_ratio: f64,
     pub holdout_group_key: String,
+    #[serde(default = "default_sample_reduction")]
+    pub sample_reduction: SampleReductionMode,
+    #[serde(default = "default_pair_q_error_max_rad")]
+    pub pair_q_error_max_rad: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -63,6 +74,10 @@ pub struct StrictGateConfig {
     pub min_validation_samples: usize,
     pub min_train_waypoints: usize,
     pub min_validation_waypoints: usize,
+    #[serde(default = "default_min_train_effective_pairs")]
+    pub min_train_effective_pairs: usize,
+    #[serde(default = "default_min_validation_effective_pairs")]
+    pub min_validation_effective_pairs: usize,
     pub max_validation_p95_residual_nm: [f64; 6],
     pub max_validation_rms_residual_nm: [f64; 6],
     pub max_validation_train_p95_ratio: f64,
@@ -92,6 +107,8 @@ impl Default for FitConfig {
             ridge_lambda: 1e-4,
             holdout_ratio: 0.2,
             holdout_group_key: "source_path_id".to_string(),
+            sample_reduction: SampleReductionMode::RawRows,
+            pair_q_error_max_rad: default_pair_q_error_max_rad(),
         }
     }
 }
@@ -103,6 +120,8 @@ impl Default for StrictGateConfig {
             min_validation_samples: 80,
             min_train_waypoints: 150,
             min_validation_waypoints: 40,
+            min_train_effective_pairs: default_min_train_effective_pairs(),
+            min_validation_effective_pairs: default_min_validation_effective_pairs(),
             max_validation_p95_residual_nm: [0.8, 1.2, 1.2, 0.8, 0.6, 0.4],
             max_validation_rms_residual_nm: [0.4, 0.7, 0.7, 0.4, 0.3, 0.2],
             max_validation_train_p95_ratio: 2.0,
@@ -124,6 +143,11 @@ impl ProfileConfig {
         joint_map: impl Into<String>,
         load_profile: impl Into<String>,
     ) -> Self {
+        let fit = FitConfig {
+            sample_reduction: SampleReductionMode::BidirectionalPairMeanV1,
+            ..FitConfig::default()
+        };
+
         Self {
             name: name.into(),
             role: role.into(),
@@ -134,7 +158,7 @@ impl ProfileConfig {
             torque_convention: crate::gravity::TORQUE_CONVENTION.to_string(),
             basis: crate::gravity::BASIS_TRIG_V1.to_string(),
             replay: ReplayConfig::default(),
-            fit: FitConfig::default(),
+            fit,
             gate: GateConfig::default(),
         }
     }
@@ -194,6 +218,7 @@ impl ProfileConfig {
         validate_positive_f64("fit.ridge_lambda", self.fit.ridge_lambda)?;
         validate_holdout_ratio("fit.holdout_ratio", self.fit.holdout_ratio)?;
         validate_non_empty("fit.holdout_group_key", &self.fit.holdout_group_key)?;
+        validate_positive_f64("fit.pair_q_error_max_rad", self.fit.pair_q_error_max_rad)?;
 
         let strict = &self.gate.strict_v1;
         validate_positive_usize("gate.strict_v1.min_train_samples", strict.min_train_samples)?;
@@ -208,6 +233,14 @@ impl ProfileConfig {
         validate_positive_usize(
             "gate.strict_v1.min_validation_waypoints",
             strict.min_validation_waypoints,
+        )?;
+        validate_positive_usize(
+            "gate.strict_v1.min_train_effective_pairs",
+            strict.min_train_effective_pairs,
+        )?;
+        validate_positive_usize(
+            "gate.strict_v1.min_validation_effective_pairs",
+            strict.min_validation_effective_pairs,
         )?;
         validate_positive_f64_array(
             "gate.strict_v1.max_validation_p95_residual_nm",
@@ -253,17 +286,41 @@ impl ProfileConfig {
     }
 
     pub fn config_sha256(&self) -> Result<String> {
-        sha256_canonical_json(self)
+        if self.is_legacy_raw_row_hash_compatible() {
+            sha256_canonical_json(&legacy_profile_hash(self))
+        } else {
+            sha256_canonical_json(self)
+        }
     }
 
     pub fn section_sha256(&self) -> Result<ProfileConfigSectionHashes> {
+        let legacy_raw_row_hash_compatible = self.is_legacy_raw_row_hash_compatible();
+        let fit = if legacy_raw_row_hash_compatible {
+            sha256_canonical_json(&legacy_fit_hash(&self.fit))?
+        } else {
+            sha256_canonical_json(&self.fit)?
+        };
+        let gate_strict_v1 = if legacy_raw_row_hash_compatible {
+            sha256_canonical_json(&legacy_strict_gate_hash(&self.gate.strict_v1))?
+        } else {
+            sha256_canonical_json(&self.gate.strict_v1)?
+        };
+
         Ok(ProfileConfigSectionHashes {
             name: sha256_canonical_json(&self.name)?,
             target: sha256_canonical_json(&self.target)?,
             replay: sha256_canonical_json(&self.replay)?,
-            fit: sha256_canonical_json(&self.fit)?,
-            gate_strict_v1: sha256_canonical_json(&self.gate.strict_v1)?,
+            fit,
+            gate_strict_v1,
         })
+    }
+
+    fn is_legacy_raw_row_hash_compatible(&self) -> bool {
+        self.fit.sample_reduction == SampleReductionMode::RawRows
+            && self.fit.pair_q_error_max_rad == default_pair_q_error_max_rad()
+            && self.gate.strict_v1.min_train_effective_pairs == default_min_train_effective_pairs()
+            && self.gate.strict_v1.min_validation_effective_pairs
+                == default_min_validation_effective_pairs()
     }
 }
 
@@ -277,6 +334,96 @@ struct ProfileIdentityHash<'a> {
     basis: &'a str,
 }
 
+#[derive(Serialize)]
+struct LegacyProfileConfigHash<'a> {
+    name: &'a str,
+    role: &'a str,
+    arm_id: &'a str,
+    target: &'a str,
+    joint_map: &'a str,
+    load_profile: &'a str,
+    torque_convention: &'a str,
+    basis: &'a str,
+    replay: &'a ReplayConfig,
+    fit: LegacyFitConfigHash<'a>,
+    gate: LegacyGateConfigHash,
+}
+
+#[derive(Serialize)]
+struct LegacyFitConfigHash<'a> {
+    ridge_lambda: f64,
+    holdout_ratio: f64,
+    holdout_group_key: &'a str,
+}
+
+#[derive(Serialize)]
+struct LegacyGateConfigHash {
+    strict_v1: LegacyStrictGateConfigHash,
+}
+
+#[derive(Serialize)]
+struct LegacyStrictGateConfigHash {
+    min_train_samples: usize,
+    min_validation_samples: usize,
+    min_train_waypoints: usize,
+    min_validation_waypoints: usize,
+    max_validation_p95_residual_nm: [f64; 6],
+    max_validation_rms_residual_nm: [f64; 6],
+    max_validation_train_p95_ratio: f64,
+    max_validation_train_rms_ratio: f64,
+    max_compensated_delta_ratio: f64,
+    max_training_range_violations: usize,
+    good_margin_fraction: f64,
+    torque_delta_epsilon_nm: f64,
+}
+
+fn legacy_profile_hash(config: &ProfileConfig) -> LegacyProfileConfigHash<'_> {
+    LegacyProfileConfigHash {
+        name: &config.name,
+        role: &config.role,
+        arm_id: &config.arm_id,
+        target: &config.target,
+        joint_map: &config.joint_map,
+        load_profile: &config.load_profile,
+        torque_convention: &config.torque_convention,
+        basis: &config.basis,
+        replay: &config.replay,
+        fit: legacy_fit_hash(&config.fit),
+        gate: legacy_gate_hash(&config.gate),
+    }
+}
+
+fn legacy_fit_hash(fit: &FitConfig) -> LegacyFitConfigHash<'_> {
+    LegacyFitConfigHash {
+        ridge_lambda: fit.ridge_lambda,
+        holdout_ratio: fit.holdout_ratio,
+        holdout_group_key: &fit.holdout_group_key,
+    }
+}
+
+fn legacy_gate_hash(gate: &GateConfig) -> LegacyGateConfigHash {
+    LegacyGateConfigHash {
+        strict_v1: legacy_strict_gate_hash(&gate.strict_v1),
+    }
+}
+
+fn legacy_strict_gate_hash(strict: &StrictGateConfig) -> LegacyStrictGateConfigHash {
+    LegacyStrictGateConfigHash {
+        min_train_samples: strict.min_train_samples,
+        min_validation_samples: strict.min_validation_samples,
+        min_train_waypoints: strict.min_train_waypoints,
+        min_validation_waypoints: strict.min_validation_waypoints,
+        max_validation_p95_residual_nm: strict.max_validation_p95_residual_nm,
+        max_validation_rms_residual_nm: strict.max_validation_rms_residual_nm,
+        max_validation_train_p95_ratio: strict.max_validation_train_p95_ratio,
+        max_validation_train_rms_ratio: strict.max_validation_train_rms_ratio,
+        max_compensated_delta_ratio: strict.max_compensated_delta_ratio,
+        max_training_range_violations: strict.max_training_range_violations,
+        good_margin_fraction: strict.good_margin_fraction,
+        torque_delta_epsilon_nm: strict.torque_delta_epsilon_nm,
+    }
+}
+
 fn default_torque_convention() -> String {
     crate::gravity::TORQUE_CONVENTION.to_string()
 }
@@ -287,6 +434,22 @@ fn default_basis() -> String {
 
 fn default_stable_tracking_error_rad() -> f64 {
     crate::gravity::replay_sample::DEFAULT_STABLE_TRACKING_ERROR_RAD
+}
+
+fn default_sample_reduction() -> SampleReductionMode {
+    SampleReductionMode::RawRows
+}
+
+fn default_pair_q_error_max_rad() -> f64 {
+    0.05
+}
+
+fn default_min_train_effective_pairs() -> usize {
+    300
+}
+
+fn default_min_validation_effective_pairs() -> usize {
+    80
 }
 
 fn validate_non_empty(field: &str, value: &str) -> Result<()> {
@@ -392,6 +555,127 @@ mod tests {
             "identity",
             "normal-gripper-d405",
         )
+    }
+
+    #[test]
+    fn missing_pair_mean_fields_default_to_raw_rows_for_legacy_profiles() {
+        let input = r#"
+name = "legacy"
+role = "slave"
+arm_id = "piper-follower"
+target = "socketcan:can1"
+joint_map = "identity"
+load_profile = "normal-gripper-d405"
+"#;
+
+        let config = ProfileConfig::from_toml_str(input).unwrap();
+
+        assert_eq!(config.fit.sample_reduction, SampleReductionMode::RawRows);
+        assert_eq!(config.fit.pair_q_error_max_rad, 0.05);
+        assert_eq!(config.gate.strict_v1.min_train_effective_pairs, 300);
+        assert_eq!(config.gate.strict_v1.min_validation_effective_pairs, 80);
+    }
+
+    #[test]
+    fn raw_row_default_hashes_match_legacy_serialization_shape() {
+        let mut config = config_for_tests();
+        config.fit = FitConfig::default();
+
+        let expected_config_hash = legacy_profile_hash(&config);
+        let section_hashes = config.section_sha256().unwrap();
+
+        assert_eq!(
+            config.config_sha256().unwrap(),
+            sha256_canonical_json(&expected_config_hash).unwrap()
+        );
+        assert_eq!(
+            section_hashes.fit,
+            sha256_canonical_json(&legacy_fit_hash(&config.fit)).unwrap()
+        );
+        assert_eq!(
+            section_hashes.gate_strict_v1,
+            sha256_canonical_json(&legacy_strict_gate_hash(&config.gate.strict_v1)).unwrap()
+        );
+    }
+
+    #[test]
+    fn pair_mean_config_round_trips_in_kebab_case() {
+        let mut config = ProfileConfig::new(
+            "pair-mean",
+            "slave",
+            "piper-follower",
+            "socketcan:can1",
+            "identity",
+            "normal-gripper-d405",
+        );
+        config.fit.sample_reduction = SampleReductionMode::BidirectionalPairMeanV1;
+        let toml = toml::to_string_pretty(&config).unwrap();
+
+        assert!(toml.contains("sample_reduction = \"bidirectional-pair-mean-v1\""));
+
+        let decoded = ProfileConfig::from_toml_str(&toml).unwrap();
+        assert_eq!(
+            decoded.fit.sample_reduction,
+            SampleReductionMode::BidirectionalPairMeanV1
+        );
+    }
+
+    #[test]
+    fn pair_mean_config_serializes_behavioral_defaults() {
+        let config = ProfileConfig::new(
+            "pair-mean",
+            "slave",
+            "piper-follower",
+            "socketcan:can1",
+            "identity",
+            "normal-gripper-d405",
+        );
+
+        let toml = toml::to_string_pretty(&config).unwrap();
+
+        assert!(toml.contains("pair_q_error_max_rad = 0.05"));
+        assert!(toml.contains("min_train_effective_pairs = 300"));
+        assert!(toml.contains("min_validation_effective_pairs = 80"));
+    }
+
+    #[test]
+    fn pair_mean_config_hash_changes_when_pair_q_error_max_rad_changes() {
+        let default_config = ProfileConfig::new(
+            "pair-mean",
+            "slave",
+            "piper-follower",
+            "socketcan:can1",
+            "identity",
+            "normal-gripper-d405",
+        );
+        let mut changed_config = default_config.clone();
+        changed_config.fit.pair_q_error_max_rad = 0.06;
+
+        assert_ne!(
+            default_config.config_sha256().unwrap(),
+            changed_config.config_sha256().unwrap()
+        );
+        assert_ne!(
+            default_config.section_sha256().unwrap().fit,
+            changed_config.section_sha256().unwrap().fit
+        );
+    }
+
+    #[test]
+    fn new_profiles_explicitly_default_to_pair_mean() {
+        let config = ProfileConfig::new(
+            "new-profile",
+            "slave",
+            "piper-follower",
+            "socketcan:can1",
+            "identity",
+            "normal-gripper-d405",
+        );
+
+        assert_eq!(
+            config.fit.sample_reduction,
+            SampleReductionMode::BidirectionalPairMeanV1
+        );
     }
 
     #[test]
