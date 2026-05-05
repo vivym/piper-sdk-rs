@@ -3,6 +3,7 @@ use crate::{
     gravity::{
         artifact::{QuasiStaticSampleRow, SamplesHeader, read_quasi_static_samples},
         model::{JOINT_COUNT, QuasiStaticTorqueModel},
+        sample_reduction::EffectiveSampleRow,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -71,6 +72,14 @@ fn validate_metadata_field(name: &str, model_value: &str, samples_value: &str) -
 pub(crate) fn evaluate_model_on_rows(
     model: &QuasiStaticTorqueModel,
     rows: &[QuasiStaticSampleRow],
+) -> Result<GravityEvalReport> {
+    let effective_rows = raw_rows_to_effective_rows(rows);
+    evaluate_model_on_effective_rows(model, &effective_rows)
+}
+
+pub(crate) fn evaluate_model_on_effective_rows(
+    model: &QuasiStaticTorqueModel,
+    rows: &[EffectiveSampleRow],
 ) -> Result<GravityEvalReport> {
     if rows.is_empty() {
         bail!("expected at least one quasi-static sample row");
@@ -188,14 +197,43 @@ fn validate_training_range(model: &QuasiStaticTorqueModel) -> Result<()> {
     Ok(())
 }
 
-fn validate_row_values(index: usize, row: &QuasiStaticSampleRow) -> Result<()> {
+fn validate_row_values(index: usize, row: &EffectiveSampleRow) -> Result<()> {
+    if row.source_id.trim().is_empty() {
+        bail!("row {index} source_id must not be blank");
+    }
+    if row.group_id.trim().is_empty() {
+        bail!("row {index} group_id must not be blank");
+    }
     if row.q_rad.iter().any(|value| !value.is_finite()) {
         bail!("row {index} q_rad must be finite");
+    }
+    if row.dq_rad_s.iter().any(|value| !value.is_finite()) {
+        bail!("row {index} dq_rad_s must be finite");
     }
     if row.tau_nm.iter().any(|value| !value.is_finite()) {
         bail!("row {index} tau_nm must be finite");
     }
     Ok(())
+}
+
+fn raw_rows_to_effective_rows(rows: &[QuasiStaticSampleRow]) -> Vec<EffectiveSampleRow> {
+    rows.iter()
+        .map(|row| EffectiveSampleRow {
+            source_id: "raw".to_string(),
+            group_id: group_id_for_row(row),
+            waypoint_id: row.waypoint_id,
+            q_rad: row.q_rad,
+            dq_rad_s: row.dq_rad_s,
+            tau_nm: row.tau_nm,
+        })
+        .collect()
+}
+
+fn group_id_for_row(row: &QuasiStaticSampleRow) -> String {
+    match &row.segment_id {
+        Some(segment_id) => format!("segment:{segment_id}"),
+        None => format!("waypoint-block:{}", row.waypoint_id / 10),
+    }
 }
 
 fn percentile_from_sorted(values: &[f64], quantile: f64) -> f64 {
@@ -214,6 +252,7 @@ mod tests {
     use crate::gravity::{
         artifact::{PassDirection, QuasiStaticSampleRow},
         model::QuasiStaticTorqueModel,
+        sample_reduction::EffectiveSampleRow,
     };
 
     #[test]
@@ -266,6 +305,38 @@ mod tests {
     }
 
     #[test]
+    fn eval_effective_rows_reports_delta_metrics() {
+        let model = QuasiStaticTorqueModel::for_tests_with_constant_output([1.0; 6]);
+        let rows = vec![
+            effective_row_for_tests("source-a", 7, [0.0; 6], [1.0; 6]),
+            effective_row_for_tests("source-b", 7, [0.0; 6], [2.0; 6]),
+            effective_row_for_tests("source-b", 8, [0.0; 6], [4.0; 6]),
+        ];
+
+        let report = evaluate_model_on_effective_rows(&model, &rows).unwrap();
+
+        assert_eq!(report.sample_count, 3);
+        assert_eq!(report.p95_residual_nm, [3.0; 6]);
+        assert_eq!(report.max_residual_nm, [3.0; 6]);
+        assert_eq!(report.raw_torque_delta_nm, [3.0; 6]);
+        assert_eq!(report.compensated_external_torque_delta_nm, [3.0; 6]);
+    }
+
+    #[test]
+    fn eval_effective_rows_rejects_non_finite_velocity() {
+        let model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
+        let mut row = effective_row_for_tests("source-a", 7, [0.0; 6], [0.0; 6]);
+        row.dq_rad_s[2] = f64::NAN;
+
+        let err = evaluate_model_on_effective_rows(&model, &[row]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("dq_rad_s must be finite"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn eval_rejects_empty_rows() {
         let model = QuasiStaticTorqueModel::for_tests_with_constant_output([0.0; 6]);
 
@@ -290,6 +361,22 @@ mod tests {
             stable_velocity_rad_s: 0.0,
             stable_tracking_error_rad: 0.0,
             stable_torque_std_nm: 0.0,
+        }
+    }
+
+    fn effective_row_for_tests(
+        source_id: &str,
+        waypoint_id: u64,
+        q_rad: [f64; 6],
+        tau_nm: [f64; 6],
+    ) -> EffectiveSampleRow {
+        EffectiveSampleRow {
+            source_id: source_id.to_string(),
+            group_id: format!("{source_id}:waypoint:{waypoint_id}"),
+            waypoint_id,
+            q_rad,
+            dq_rad_s: [0.0; 6],
+            tau_nm,
         }
     }
 }

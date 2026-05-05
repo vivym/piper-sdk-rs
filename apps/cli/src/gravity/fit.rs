@@ -5,6 +5,7 @@ use crate::gravity::{
         FitMetadata, FitQuality, JOINT_COUNT, LinearModelSection, QuasiStaticTorqueModel,
         TRIG_V1_FEATURE_COUNT, TrainingRange, trig_v1_feature_names, trig_v1_features,
     },
+    sample_reduction::EffectiveSampleRow,
 };
 use anyhow::{Context, Result, bail};
 use nalgebra::DMatrix;
@@ -96,6 +97,14 @@ pub(crate) fn fit_model_from_rows(
     rows: Vec<QuasiStaticSampleRow>,
     options: FitOptions,
 ) -> Result<QuasiStaticTorqueModel> {
+    fit_model_from_effective_rows(header, raw_rows_to_effective_rows(&rows), options)
+}
+
+pub(crate) fn fit_model_from_effective_rows(
+    header: SamplesHeader,
+    rows: Vec<EffectiveSampleRow>,
+    options: FitOptions,
+) -> Result<QuasiStaticTorqueModel> {
     validate_fit_inputs(&header, &rows, options)?;
 
     let group_split = split_train_holdout_groups(&rows, options.holdout_ratio)?;
@@ -107,24 +116,23 @@ pub(crate) fn fit_model_from_rows(
 
     let mut normal = NormalEquations::new();
     let mut train_count = 0usize;
-    let mut training_waypoint_ids = BTreeSet::new();
+    let mut training_waypoint_keys = BTreeSet::new();
     for row in &rows {
-        let group_id = group_id_for_row(row);
-        if holdout_groups.contains(group_id.as_str()) {
+        if holdout_groups.contains(row.group_id.as_str()) {
             continue;
         }
         normal.accumulate(row);
         train_count += 1;
-        training_waypoint_ids.insert(row.waypoint_id);
+        training_waypoint_keys.insert((row.source_id.as_str(), row.waypoint_id));
     }
     if train_count == 0 {
         bail!("holdout split left no training samples");
     }
     let minimum_training_waypoints = TRIG_V1_FEATURE_COUNT * MIN_TRAINING_WAYPOINTS_PER_FEATURE;
-    if training_waypoint_ids.len() < minimum_training_waypoints {
+    if training_waypoint_keys.len() < minimum_training_waypoints {
         bail!(
             "expected at least {minimum_training_waypoints} training waypoints, got {}",
-            training_waypoint_ids.len()
+            training_waypoint_keys.len()
         );
     }
 
@@ -134,13 +142,11 @@ pub(crate) fn fit_model_from_rows(
     let coefficients_nm = solution_to_coefficients(&solution)?;
 
     let train_metrics = residual_metrics(
-        rows.iter()
-            .filter(|row| !holdout_groups.contains(group_id_for_row(row).as_str())),
+        rows.iter().filter(|row| !holdout_groups.contains(row.group_id.as_str())),
         &coefficients_nm,
     )?;
     let holdout_metrics = residual_metrics(
-        rows.iter()
-            .filter(|row| holdout_groups.contains(group_id_for_row(row).as_str())),
+        rows.iter().filter(|row| holdout_groups.contains(row.group_id.as_str())),
         &coefficients_nm,
     )?;
     let training_range = training_range(&rows);
@@ -192,7 +198,7 @@ impl NormalEquations {
         }
     }
 
-    fn accumulate(&mut self, row: &QuasiStaticSampleRow) {
+    fn accumulate(&mut self, row: &EffectiveSampleRow) {
         let phi = trig_v1_features(row.q_rad);
         for i in 0..TRIG_V1_FEATURE_COUNT {
             for j in 0..TRIG_V1_FEATURE_COUNT {
@@ -216,7 +222,7 @@ impl NormalEquations {
 
 fn validate_fit_inputs(
     header: &SamplesHeader,
-    rows: &[QuasiStaticSampleRow],
+    rows: &[EffectiveSampleRow],
     options: FitOptions,
 ) -> Result<()> {
     if rows.is_empty() {
@@ -235,6 +241,12 @@ fn validate_fit_inputs(
         bail!("holdout_ratio must be finite and in [0.0, 1.0)");
     }
     for (index, row) in rows.iter().enumerate() {
+        if row.source_id.trim().is_empty() {
+            bail!("row {index} source_id must not be blank");
+        }
+        if row.group_id.trim().is_empty() {
+            bail!("row {index} group_id must not be blank");
+        }
         if row.q_rad.iter().any(|value| !value.is_finite()) {
             bail!("row {index} q_rad must be finite");
         }
@@ -249,12 +261,12 @@ fn validate_fit_inputs(
 }
 
 fn split_train_holdout_groups(
-    rows: &[QuasiStaticSampleRow],
+    rows: &[EffectiveSampleRow],
     holdout_ratio: f64,
 ) -> Result<GroupSplit> {
     let mut all_groups = BTreeSet::new();
     for row in rows {
-        all_groups.insert(group_id_for_row(row));
+        all_groups.insert(row.group_id.clone());
     }
 
     let mut holdout_groups = BTreeSet::new();
@@ -288,6 +300,19 @@ fn split_train_holdout_groups(
         train_group_ids,
         holdout_group_ids: holdout_groups.into_iter().collect(),
     })
+}
+
+fn raw_rows_to_effective_rows(rows: &[QuasiStaticSampleRow]) -> Vec<EffectiveSampleRow> {
+    rows.iter()
+        .map(|row| EffectiveSampleRow {
+            source_id: "raw".to_string(),
+            group_id: group_id_for_row(row),
+            waypoint_id: row.waypoint_id,
+            q_rad: row.q_rad,
+            dq_rad_s: row.dq_rad_s,
+            tau_nm: row.tau_nm,
+        })
+        .collect()
 }
 
 fn group_id_for_row(row: &QuasiStaticSampleRow) -> String {
@@ -357,7 +382,7 @@ fn condition_number(g: &DMatrix<f64>) -> f64 {
 }
 
 fn residual_metrics<'a>(
-    rows: impl IntoIterator<Item = &'a QuasiStaticSampleRow>,
+    rows: impl IntoIterator<Item = &'a EffectiveSampleRow>,
     coefficients_nm: &[Vec<f64>],
 ) -> Result<ResidualMetrics> {
     let mut count = 0usize;
@@ -377,8 +402,15 @@ fn residual_metrics<'a>(
             if !residual.is_finite() {
                 bail!("fit produced non-finite residual");
             }
+            let squared = residual * residual;
+            if !squared.is_finite() {
+                bail!("fit residual metric overflowed");
+            }
             let absolute_residual = residual.abs();
-            sum_squares[joint] += residual * residual;
+            sum_squares[joint] += squared;
+            if !sum_squares[joint].is_finite() {
+                bail!("fit residual metric overflowed");
+            }
             max_residual_nm[joint] = max_residual_nm[joint].max(absolute_residual);
             absolute_residuals[joint].push(absolute_residual);
         }
@@ -397,6 +429,9 @@ fn residual_metrics<'a>(
     let mut p95_residual_nm = [0.0; JOINT_COUNT];
     for joint in 0..JOINT_COUNT {
         rms_residual_nm[joint] = (sum_squares[joint] / count as f64).sqrt();
+        if !rms_residual_nm[joint].is_finite() {
+            bail!("fit rms residual must be finite");
+        }
         absolute_residuals[joint].sort_by(|left, right| {
             left.partial_cmp(right).expect("non-finite residuals are rejected")
         });
@@ -420,20 +455,20 @@ fn percentile_from_sorted(values: &[f64], quantile: f64) -> f64 {
     values[index]
 }
 
-fn training_range(rows: &[QuasiStaticSampleRow]) -> TrainingRange {
+fn training_range(rows: &[EffectiveSampleRow]) -> TrainingRange {
     let mut q_min_rad = [f64::INFINITY; JOINT_COUNT];
     let mut q_max_rad = [f64::NEG_INFINITY; JOINT_COUNT];
     let mut tau_min_nm = [f64::INFINITY; JOINT_COUNT];
     let mut tau_max_nm = [f64::NEG_INFINITY; JOINT_COUNT];
     let mut dq_abs_values =
         (0..JOINT_COUNT).map(|_| Vec::with_capacity(rows.len())).collect::<Vec<_>>();
-    let mut waypoint_ids = BTreeSet::new();
-    let mut segment_ids = BTreeSet::new();
+    let mut waypoint_keys = BTreeSet::new();
+    let mut segment_group_ids = BTreeSet::new();
 
     for row in rows {
-        waypoint_ids.insert(row.waypoint_id);
-        if let Some(segment_id) = &row.segment_id {
-            segment_ids.insert(segment_id.as_str());
+        waypoint_keys.insert((row.source_id.as_str(), row.waypoint_id));
+        if row.group_id.starts_with("segment:") {
+            segment_group_ids.insert(row.group_id.as_str());
         }
         for joint in 0..JOINT_COUNT {
             q_min_rad[joint] = q_min_rad[joint].min(row.q_rad[joint]);
@@ -458,8 +493,8 @@ fn training_range(rows: &[QuasiStaticSampleRow]) -> TrainingRange {
         dq_abs_p95_rad_s,
         tau_min_nm,
         tau_max_nm,
-        waypoint_count: waypoint_ids.len(),
-        segment_count: segment_ids.len(),
+        waypoint_count: waypoint_keys.len(),
+        segment_count: segment_group_ids.len(),
     }
 }
 
@@ -476,6 +511,7 @@ mod tests {
     use crate::gravity::{
         artifact::{PassDirection, QuasiStaticSampleRow, SamplesHeader},
         model::{TRIG_V1_FEATURE_COUNT, trig_v1_features},
+        sample_reduction::EffectiveSampleRow,
     };
 
     #[test]
@@ -499,6 +535,27 @@ mod tests {
         assert!((fitted.model.coefficients_nm[1][3] + 1.25).abs() < 1e-6);
         assert!(fitted.fit_quality.condition_number.is_finite());
         assert!(!fitted.fit.holdout_group_ids.is_empty());
+    }
+
+    #[test]
+    fn fitter_recovers_gravity_from_pair_mean_effective_rows_with_direction_friction() {
+        let mut truth = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
+        truth[0][0] = 0.5;
+        truth[0][1] = 2.0;
+        truth[1][3] = -1.25;
+        truth[2][22] = 0.75;
+
+        let rows = synthetic_effective_rows_from_coefficients(&truth, 600);
+
+        let fitted =
+            fit_model_from_effective_rows(sample_header_for_tests(), rows, no_holdout_options())
+                .unwrap();
+
+        assert_eq!(fitted.sample_count, 600);
+        assert_eq!(fitted.training_range.waypoint_count, 600);
+        assert!((fitted.model.coefficients_nm[0][1] - 2.0).abs() < 1e-6);
+        assert!((fitted.model.coefficients_nm[1][3] + 1.25).abs() < 1e-6);
+        assert!((fitted.model.coefficients_nm[2][22] - 0.75).abs() < 1e-6);
     }
 
     #[test]
@@ -657,6 +714,26 @@ mod tests {
         assert_eq!(fallback_solver.as_deref(), Some("svd"));
     }
 
+    #[test]
+    fn residual_metrics_rejects_squared_residual_overflow() {
+        let row = EffectiveSampleRow {
+            source_id: "source-a".to_string(),
+            group_id: "source-a:waypoint:7".to_string(),
+            waypoint_id: 7,
+            q_rad: [0.0; 6],
+            dq_rad_s: [0.0; 6],
+            tau_nm: [f64::MAX; 6],
+        };
+        let coefficients_nm = vec![vec![0.0; TRIG_V1_FEATURE_COUNT]; 6];
+
+        let err = match residual_metrics([&row], &coefficients_nm) {
+            Ok(_) => panic!("expected residual metrics overflow to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("overflowed"), "{err:#}");
+    }
+
     fn no_holdout_options() -> FitOptions {
         FitOptions {
             ridge_lambda: 1e-8,
@@ -703,6 +780,44 @@ mod tests {
                     stable_velocity_rad_s: 0.0,
                     stable_tracking_error_rad: 0.0,
                     stable_torque_std_nm: 0.0,
+                }
+            })
+            .collect()
+    }
+
+    fn synthetic_effective_rows_from_coefficients(
+        coefficients_nm: &[Vec<f64>],
+        sample_count: usize,
+    ) -> Vec<EffectiveSampleRow> {
+        let source_count = 3usize;
+        let waypoints_per_source = sample_count / source_count;
+        (0..sample_count)
+            .map(|sample_index| {
+                let source_index = sample_index / waypoints_per_source;
+                let waypoint_id = (sample_index % waypoints_per_source) as u64;
+                let source_id = format!("source-{source_index}");
+                let q_rad = synthetic_q(sample_index);
+                let features = trig_v1_features(q_rad);
+                let mut tau_nm = [0.0; 6];
+                for joint in 0..6 {
+                    let gravity_tau_nm = coefficients_nm[joint]
+                        .iter()
+                        .zip(features.iter())
+                        .map(|(coefficient, feature)| coefficient * feature)
+                        .sum::<f64>();
+                    let direction_friction_nm = if joint % 2 == 0 { 0.35 } else { -0.2 };
+                    let forward_tau_nm = gravity_tau_nm + direction_friction_nm;
+                    let backward_tau_nm = gravity_tau_nm - direction_friction_nm;
+                    tau_nm[joint] = (forward_tau_nm + backward_tau_nm) * 0.5;
+                }
+
+                EffectiveSampleRow {
+                    source_id: source_id.clone(),
+                    group_id: format!("{source_id}:waypoint:{waypoint_id}"),
+                    waypoint_id,
+                    q_rad,
+                    dq_rad_s: [0.0; 6],
+                    tau_nm,
                 }
             })
             .collect()
